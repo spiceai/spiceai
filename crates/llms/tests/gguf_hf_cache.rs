@@ -246,12 +246,11 @@ async fn what_the_cache_lacks_is_retried_and_says_how_to_fill_it() {
     }
 }
 
-/// A name several quantizations in the cache answer to is a mistake in the Spicepod, not a gap
-/// in the cache: the repository holds every quantization its cache holds, so no file the cache
-/// gains can make the name answer to one. It is not retried, and the error says only how to
-/// correct `files`.
+/// A name several quantizations in the cache answer to says so of the cache, and to name one of
+/// them, and is retried: the Hub's listing, once read, can make the name answer to one
+/// (`gguf_files::tests::a_name_can_be_ambiguous_in_the_cache_alone`).
 #[tokio::test]
-async fn a_name_several_quantizations_in_the_cache_answer_to_is_not_retried() {
+async fn a_name_several_quantizations_in_the_cache_answer_to_says_to_name_one() {
     crate::require_process_per_test(WHY);
     let cache = tempfile::tempdir().expect("creates a cache directory");
     let snapshot = offline_snapshot(cache.path());
@@ -270,10 +269,11 @@ async fn a_name_several_quantizations_in_the_cache_answer_to_is_not_retried() {
     assert_eq!(
         error.to_string(),
         format!(
-            "Failed to download model 'test' from Hugging Face repo '{REPO_ID}' (revision 'main'): 'gguf' matches 2 quantizations of the repository, Q4_K_M, Q8_0; name one of them. See: https://spiceai.org/docs/components/models/huggingface"
+            "Failed to download model 'test' from Hugging Face repo '{REPO_ID}' (revision 'main'): `HF_HUB_OFFLINE` is set, so Spice read only the Hugging Face cache at '{}', where 'gguf' matches 2 quantizations there, Q4_K_M, Q8_0; name one of them. Run `hf download {REPO_ID} --revision main` while online, or unset `HF_HUB_OFFLINE`. See: https://spiceai.org/docs/components/models/huggingface",
+            cache.path().display()
         )
     );
-    assert!(error.is_configuration_error());
+    assert!(!error.is_configuration_error());
 }
 
 /// A split model with no `files` loads, with the Hub out of reach, the default of what the

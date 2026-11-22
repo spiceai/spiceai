@@ -231,13 +231,9 @@ fn resolve_gguf(
     } else {
         ListedFrom::Repository
     };
-    if let Some(resolved) = gguf_files::resolve(&listing, files).map_err(|error| {
-        if error.is_ambiguous() {
-            DownloadError::invalid_selection(snapshot, error.to_string())
-        } else {
-            DownloadError::unusable(snapshot, error.clause(from))
-        }
-    })? {
+    if let Some(resolved) = gguf_files::resolve(&listing, files)
+        .map_err(|error| DownloadError::unusable(snapshot, error.clause(from)))?
+    {
         if files.iter().any(|file| !is_gguf_path(file)) {
             let line = format!(
                 "Model '{name}' loads {} from Hugging Face repo '{repo}'{}.",

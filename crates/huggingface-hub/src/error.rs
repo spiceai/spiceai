@@ -104,11 +104,6 @@ pub(crate) enum Cause {
         message: String,
         source: Source,
     },
-    /// What the component names among the repository's files cannot be loaded, whatever else
-    /// the repository or the cache holds: `message` says why.
-    InvalidSelection {
-        message: String,
-    },
     /// The repository id is not one the Hub allows.
     InvalidRepo,
     /// The Hub listed a path that would leave the snapshot directory.
@@ -194,25 +189,6 @@ impl DownloadError {
         )
     }
 
-    /// What the component names among the repository's files, as the snapshot lists them,
-    /// cannot be loaded, and no file the repository or the cache adds can change that: a name
-    /// several quantizations answer to, say, which is just as ambiguous among the repository's
-    /// files as among the cache's, since the cache holds only files of the repository. `message`
-    /// says why, as the clause after a colon. Unlike [`Self::unusable`], it is a configuration
-    /// error wherever the snapshot's files were listed from.
-    #[must_use]
-    pub fn invalid_selection(
-        snapshot: &crate::snapshot::Snapshot,
-        message: impl Into<String>,
-    ) -> Self {
-        snapshot.error(
-            None,
-            Cause::InvalidSelection {
-                message: message.into(),
-            },
-        )
-    }
-
     /// Whether the download cannot succeed until the Spicepod changes: a setting that is not
     /// valid, or a repository that does not hold what the component loads. A refusal from the
     /// Hub is not one: a missing or private repository, a rejected token and a gated
@@ -222,10 +198,7 @@ impl DownloadError {
     #[must_use]
     pub fn is_configuration_error(&self) -> bool {
         match self.cause.as_ref() {
-            Cause::Settings(_)
-            | Cause::InvalidPath
-            | Cause::InvalidRepo
-            | Cause::InvalidSelection { .. } => true,
+            Cause::Settings(_) | Cause::InvalidPath | Cause::InvalidRepo => true,
             Cause::Missing { source, .. } | Cause::Unusable { source, .. } => {
                 matches!(source, Source::Hub)
             }
@@ -337,8 +310,7 @@ impl DownloadError {
             Cause::Unusable {
                 message,
                 source: Source::Hub,
-            }
-            | Cause::InvalidSelection { message } => (message.clone(), None),
+            } => (message.clone(), None),
             Cause::Unusable {
                 message,
                 source: Source::OfflineCache,

@@ -175,6 +175,18 @@ impl ResolveError {
                 printable(path),
                 listed(missing)
             ),
+            (
+                Self::AmbiguousQuantization {
+                    name,
+                    quantizations,
+                },
+                ListedFrom::Cache,
+            ) => format!(
+                "'{}' matches {} quantizations there, {}; name one of them",
+                printable(name),
+                quantizations.len(),
+                listed(quantizations)
+            ),
             (Self::UnknownQuantization { name, available }, ListedFrom::Cache) => format!(
                 "there is no file or quantization '{}'; the quantizations there are {}",
                 printable(name),
@@ -182,14 +194,6 @@ impl ResolveError {
             ),
             _ => self.to_string(),
         }
-    }
-
-    /// Whether no file the listing gains can resolve it: a name several quantizations answer
-    /// to answers to them in any listing that holds them, and the repository holds every file
-    /// its cache does.
-    #[must_use]
-    pub fn is_ambiguous(&self) -> bool {
-        matches!(self, Self::AmbiguousQuantization { .. })
     }
 }
 
@@ -562,6 +566,9 @@ pub fn resolve(
     }
     let present: BTreeSet<&str> = listing.iter().map(|f| f.path.as_str()).collect();
     let quantizations = quantizations(listing);
+    // The importance matrices and drafters, named as quantizations, for a name that answers to
+    // none of the model's.
+    let sidecars = std::cell::LazyCell::new(|| quantizations_of(listing, true));
     let mut weights = Vec::new();
     let mut draft = Vec::new();
     let mut quantization = None;
@@ -591,15 +598,15 @@ pub fn resolve(
             if matched.is_empty() && !present.contains(entry) {
                 // Passed over, such a name would leave a repository that also offers safetensors
                 // to load those.
-                let sidecars: Vec<String> = quantizations_of(listing, true)
+                let named: Vec<String> = sidecars
                     .iter()
                     .filter(|q| answers_to(q, entry))
                     .flat_map(|q| q.files.iter().cloned())
                     .collect();
-                if !sidecars.is_empty() {
+                if !named.is_empty() {
                     return Err(ResolveError::NamedSidecar {
                         name: name.to_string(),
-                        files: sidecars,
+                        files: named,
                     });
                 }
             }
@@ -1073,6 +1080,37 @@ mod tests {
             .expect("Q8_0 resolves")
             .expect("Q8_0 names weights");
         assert_eq!(q8.weights, ["Model-Q8_0.gguf"]);
+    }
+
+    /// A name can answer to several quantizations in a listing of the cache alone and to one in
+    /// the Hub's, so an ambiguity read from the cache is retried, not taken for a mistake in
+    /// `files`: here a stray shard out of its series' range keeps `big/` from being a
+    /// quantization in the Hub's listing, and the cache lacks that shard.
+    #[test]
+    fn a_name_can_be_ambiguous_in_the_cache_alone() {
+        let hub = listing(&[
+            ("Model-Q4_K_M.gguf", GB),
+            ("Model-Q8_0.gguf", GB),
+            ("big/Model-Q4_K_M-00001-of-00002.gguf", GB),
+            ("big/Model-Q4_K_M-00002-of-00002.gguf", GB),
+            ("big/Model-Q4_K_M-00003-of-00002.gguf", GB),
+        ]);
+        let resolved = resolve(&hub, &["Q4_K_M"])
+            .expect("one quantization answers to Q4_K_M in the Hub's listing")
+            .expect("Q4_K_M names weights");
+        assert_eq!(resolved.weights, ["Model-Q4_K_M.gguf"]);
+        let cache = listing(&[
+            ("Model-Q4_K_M.gguf", GB),
+            ("big/Model-Q4_K_M-00001-of-00002.gguf", GB),
+            ("big/Model-Q4_K_M-00002-of-00002.gguf", GB),
+        ]);
+        assert_eq!(
+            resolve(&cache, &["Q4_K_M"]).map_err(|e| e.clause(ListedFrom::Cache)),
+            Err(
+                "'Q4_K_M' matches 2 quantizations there, big, Model-Q4_K_M; name one of them"
+                    .to_string()
+            )
+        );
     }
 
     #[test]
