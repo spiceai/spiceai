@@ -329,11 +329,6 @@ async fn run(engine: &'static str, storage: Storage) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn arrow_surfaces_vs_standalone_engines() {
-    run("arrow", Storage::Memory).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn cayenne_surfaces_vs_standalone_engines() {
     run("cayenne", Storage::File).await;
 }

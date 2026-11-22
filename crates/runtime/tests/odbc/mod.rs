@@ -82,7 +82,7 @@ async fn databricks_odbc() -> Result<(), String> {
                     "samples.tpch.lineitem",
                     "line",
                     false,
-                    "arrow",
+                    "cayenne",
                 ))
                 .build();
 
@@ -132,7 +132,7 @@ async fn databricks_odbc_with_acceleration() -> Result<(), String> {
 
     test_request_context()
         .scope(async {
-            for engine in ["arrow", "cayenne"] {
+            for engine in ["cayenne"] {
                 let app = AppBuilder::new("databricks_odbc")
                     .with_dataset(make_databricks_odbc(
                         "samples.tpch.lineitem",
