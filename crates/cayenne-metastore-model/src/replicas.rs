@@ -119,6 +119,32 @@ pub(crate) enum Action {
     ReplicaExpire(usize),
     ReplicaSweep(usize),
 }
+/// The replica reader's box: its held and confirmed heads and its query, red
+/// when the query broke a property (named by `query_outcome`) or the reader
+/// adopted a head it must not.
+fn reader_box(last: &State, n: usize) -> (String, Vec<String>, crate::explorer::Tone) {
+    use crate::explorer::Tone;
+    let mut lines = vec![format!("holds v{}", last.held)];
+    if let Some((at, v)) = last.confirmed {
+        lines.push(format!("confirmed v{v} at {at}"));
+    }
+    // A query keeps its start tick and the live set of the head it
+    // confirmed, not that head's version.
+    let (outcome, tone) =
+        crate::explorer::query_outcome(last.result, last.bad_availability, last.bad_rows);
+    if let Some((start, set)) = last.query {
+        lines.push(format!(
+            "query started {start} reads objects {}: {outcome}",
+            set_label(set, n),
+        ));
+    }
+    let tone = if tone == Tone::Bad || last.bad_adopt || last.lower_adopt {
+        Tone::Bad
+    } else {
+        Tone::Actor
+    };
+    ("REPLICA READER".into(), lines, tone)
+}
 /// The replica head's references, and the ones whose objects have not reached
 /// the replica yet.
 fn replica_head_lines(refs: u8, replica: u8, n: usize) -> Vec<String> {
@@ -532,24 +558,7 @@ impl Model for Protocol {
             ),
         ];
         if self.readers() {
-            let mut lines = vec![format!("holds v{}", last.held)];
-            if let Some((at, v)) = last.confirmed {
-                lines.push(format!("confirmed v{v} at {at}"));
-            }
-            // A query keeps its start tick and the live set of the head it
-            // confirmed, not that head's version.
-            if let Some((start, set)) = last.query {
-                lines.push(format!(
-                    "query started {start} reads objects {}: {}",
-                    set_label(set, n),
-                    match last.result {
-                        None => "running",
-                        Some(true) => "rows",
-                        Some(false) => "error",
-                    }
-                ));
-            }
-            boxes.push(("REPLICA READER".into(), lines, Tone::Actor));
+            boxes.push(reader_box(&last, n));
         }
         let (writer, source, replication, replica, reader, gc) = (0, 1, 2, 3, 4, 5);
         let lanes = ["writer", "source", "replication", "replica", "reader", "GC"]
@@ -698,6 +707,24 @@ mod explorer_tests {
         let line = format!("query started {start} reads objects {}", set_label(set, 1));
         assert!(svg.contains(&line), "{line} missing");
         assert!(!svg.contains("query on v"), "{svg}");
+    }
+
+    /// Wrong rows from a missing object read as empty turn the reader box red
+    /// and say so, like the query outcome elsewhere.
+    #[test]
+    fn wrong_rows_turn_the_reader_red() {
+        let state = super::State {
+            query: Some((0, 1)),
+            result: Some(true),
+            bad_rows: true,
+            ..super::State::default()
+        };
+        let (_, lines, tone) = super::reader_box(&state, 1);
+        assert_eq!(tone, crate::explorer::Tone::Bad);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("query started 0 reads objects {0}: WRONG ROWS (a missing object read as empty)")
+        );
     }
 
     /// A replicated head naming objects not yet copied is normal; the box says
