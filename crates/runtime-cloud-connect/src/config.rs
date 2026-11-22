@@ -99,9 +99,11 @@ pub const DEFAULT_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 /// query it is replacing.
 pub const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_secs(25);
 
-/// File name (relative to `$SPICE_CONFIG_DIR`) where the cloud-managed
+/// File name (relative to the state directory) where the cloud-managed
 /// spicepod is written when an `ApplySpicepod` command arrives.
 pub const CLOUD_MANAGED_SPICEPOD_FILE: &str = "spicepod-cloud-managed.yml";
+/// A delivered spicepod staged before it replaces [`CLOUD_MANAGED_SPICEPOD_FILE`].
+pub const INCOMING_CLOUD_MANAGED_SPICEPOD_FILE: &str = "spicepod-cloud-managed.incoming.yml";
 
 /// Write-ahead marker and inert staging files used to commit a cloud-managed
 /// Spicepod and its delivered-secret cache as one recoverable generation.
@@ -110,9 +112,13 @@ pub const DEPLOYMENT_TRANSACTION_INCOMING_FILE: &str = ".cloud-deployment-transa
 pub const PREVIOUS_CLOUD_MANAGED_SPICEPOD_FILE: &str = ".spicepod-cloud-managed.previous.yml";
 pub const PREVIOUS_SECRET_CACHE_FILE: &str = ".secrets-cache.previous.json";
 pub const INCOMING_SECRET_CACHE_FILE: &str = ".secrets-cache.incoming.json";
-/// File name (relative to `$SPICE_CONFIG_DIR`) where the runtime identity
+/// File name (relative to the state directory) where the runtime identity
 /// is persisted after enrollment.
 pub const IDENTITY_FILE: &str = "identity.json";
+
+/// The manifest `spice cloud service install` writes for the service it
+/// installed, in the state directory.
+pub const SERVICE_MANIFEST_FILE: &str = "service.json";
 
 /// A control-plane URL that would expose an enrollment authority or cannot be
 /// used as an HTTP base URL.
@@ -193,12 +199,14 @@ pub struct CloudConnectConfig {
     pub insecure: bool,
 
     /// Path to the on-disk identity file (typically
-    /// `$SPICE_CONFIG_DIR/identity.json`).
+    /// `$SPICE_CONFIG_DIR/cloud-connect/identity.json`).
     pub identity_path: PathBuf,
 
-    /// Directory where cloud-managed spicepod overlays should be written
-    /// when an `ApplySpicepod` command arrives, and where the enrollment
-    /// draft lives while an enrollment is in flight.
+    /// The Cloud Connect state directory (`<config dir>/cloud-connect`):
+    /// where cloud-managed spicepod overlays are written when an
+    /// `ApplySpicepod` command arrives, where the enrollment draft lives
+    /// while an enrollment is in flight, and where every other file Cloud
+    /// Connect keeps lives. See [`crate::state_dir`].
     pub config_dir: PathBuf,
 
     /// Where this instance runs (`--region`) — a customer-declared label,
@@ -430,11 +438,25 @@ impl CloudConnectConfig {
         }
     }
 
+    /// The directory that holds this instance's Cloud Connect state:
+    /// `<config dir>/cloud-connect`, created owner-only. See
+    /// [`crate::state_dir`].
+    #[must_use]
+    pub fn default_state_dir() -> PathBuf {
+        crate::state_dir::state_dir(&Self::default_config_dir())
+    }
+
+    /// [`Self::default_state_dir`] for an explicit instance directory.
+    #[must_use]
+    pub fn resolve_state_dir(instance_dir: Option<&std::path::Path>) -> PathBuf {
+        crate::state_dir::state_dir(&Self::resolve_config_dir(instance_dir))
+    }
+
     /// Resolve the canonical identity file path for the current
     /// environment.
     #[must_use]
     pub fn default_identity_path() -> PathBuf {
-        Self::default_config_dir().join(IDENTITY_FILE)
+        Self::default_state_dir().join(IDENTITY_FILE)
     }
 
     /// Returns a config bootstrap from the environment.
@@ -447,14 +469,16 @@ impl CloudConnectConfig {
     /// response; the `SPICE_CLOUD_GATEWAY_ENDPOINT` env var overrides it.
     #[must_use]
     pub fn from_env(runtime_version: impl Into<String>) -> Self {
-        Self::from_env_at(runtime_version, Self::default_config_dir())
+        Self::from_env_at(runtime_version, Self::default_state_dir())
     }
 
-    /// [`Self::from_env`] with the config directory pinned by the caller
+    /// [`Self::from_env`] with the state directory pinned by the caller
     /// instead of resolved from the environment, for callers that already
-    /// resolved an explicit instance directory.
+    /// resolved an explicit instance directory
+    /// ([`Self::resolve_state_dir`]) or hold it locked.
     #[must_use]
-    pub fn from_env_at(runtime_version: impl Into<String>, config_dir: PathBuf) -> Self {
+    pub fn from_env_at(runtime_version: impl Into<String>, state_dir: PathBuf) -> Self {
+        let config_dir = state_dir;
         let identity_path = config_dir.join(IDENTITY_FILE);
 
         let enroll_endpoint = std::env::var("SPICE_CLOUD_ENDPOINT")
@@ -618,6 +642,41 @@ mod tests {
         assert_eq!(
             dir, expected,
             "a relative instance directory must be resolved against the cwd at enroll time"
+        );
+    }
+
+    /// Every file Cloud Connect keeps lives in the owner-only state directory
+    /// inside the config directory, never in the config directory itself.
+    #[test]
+    fn cloud_connect_state_lives_in_the_state_directory() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        // SAFETY: tests gate env-var mutations behind a mutex.
+        unsafe {
+            std::env::set_var("SPICE_CONFIG_DIR", "/srv/app/.spice");
+        }
+        let config = CloudConnectConfig::from_env("v0.0.0-test");
+        assert_eq!(
+            CloudConnectConfig::default_state_dir(),
+            PathBuf::from("/srv/app/.spice/cloud-connect")
+        );
+        assert_eq!(
+            config.config_dir,
+            PathBuf::from("/srv/app/.spice/cloud-connect")
+        );
+        assert_eq!(
+            config.identity_path,
+            PathBuf::from("/srv/app/.spice/cloud-connect/identity.json")
+        );
+        assert_eq!(
+            CloudConnectConfig::default_identity_path(),
+            config.identity_path
+        );
+        unsafe {
+            std::env::remove_var("SPICE_CONFIG_DIR");
+        }
+        assert_eq!(
+            CloudConnectConfig::resolve_state_dir(Some(std::path::Path::new("/opt/edge-1"))),
+            PathBuf::from("/opt/edge-1/.spice/cloud-connect")
         );
     }
 
