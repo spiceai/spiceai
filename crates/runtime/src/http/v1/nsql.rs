@@ -698,6 +698,7 @@ async fn handle_nsql_query(
             res = chat_fut => match res {
                 Ok(r) => r,
                 Err(e) => {
+                    tracing::error!(target: "task_history", parent: &span, "Error running NQL model: {e}");
                     tracing::error!("Error running NQL model: {e}");
                     return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
                 }
@@ -747,6 +748,7 @@ async fn handle_nsql_query(
                             }
                             Err(e) => {
                                 if num_retries >= DEFAULT_NSQL_RETRIES {
+                                    tracing::error!(target: "task_history", parent: &span, "Error collecting query results: {e}");
                                     tracing::error!("Error collecting query results: {e}");
                                     return (StatusCode::BAD_REQUEST, headers, e.to_string());
                                 }
@@ -764,6 +766,7 @@ async fn handle_nsql_query(
                         // If query failed, retry with the updated context
 
                         if num_retries >= DEFAULT_NSQL_RETRIES {
+                            tracing::error!(target: "task_history", parent: &span, "Error executing query: {e}");
                             tracing::error!("Error executing query: {e}");
                             return (StatusCode::BAD_REQUEST, headers, e.to_string());
                         }
@@ -786,6 +789,7 @@ async fn handle_nsql_query(
                 );
             }
             Err(e) => {
+                tracing::error!(target: "task_history", parent: &span, "Error running NSQL model: {e}");
                 tracing::error!("Error running NSQL model: {e}");
                 return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
             }
