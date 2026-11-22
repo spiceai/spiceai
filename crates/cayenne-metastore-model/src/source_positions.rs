@@ -297,7 +297,7 @@ impl Model for Protocol {
         let lanes = ["source", "writer", "head"].map(String::from).to_vec();
         let mut events = vec![];
         for (before, action, after) in steps(path) {
-            events.push(match action {
+            let event = match action {
                 Action::Receive => {
                     let label = if after.buffer.len() > before.buffer.len() {
                         format!("deliver change {}", before.cursor)
@@ -336,7 +336,8 @@ impl Model for Protocol {
                 Action::Crash => Event::on(writer, "CRASH").tone(Tone::Bad),
                 Action::Takeover => Event::on(writer, "takeover (new lease)").to(head),
                 Action::Acquire => Event::on(writer, "reacquire lease").to(head),
-            });
+            };
+            events.push(event.breaking(&crate::explorer::broken(self, &before, &after)));
         }
         Some(state_and_trace(&boxes, &Timeline { lanes, events }))
     }

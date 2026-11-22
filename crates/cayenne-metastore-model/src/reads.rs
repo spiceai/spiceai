@@ -361,7 +361,7 @@ impl Model for Protocol {
         lanes.extend((0..QUERIES).map(|q| format!("query {q}")));
         let mut events = vec![];
         for (before, action, after) in steps(path) {
-            events.push(match action {
+            let event = match action {
                 Action::Tick => {
                     Event::on(writer, format!("clock -> {}", after.clock)).tone(Tone::Gone)
                 }
@@ -397,7 +397,8 @@ impl Model for Protocol {
                         .to(3 + q)
                         .tone(Tone::Actor)
                 }
-            });
+            };
+            events.push(event.breaking(&crate::explorer::broken(self, &before, &after)));
         }
         Some(state_and_trace(&boxes, &Timeline { lanes, events }))
     }

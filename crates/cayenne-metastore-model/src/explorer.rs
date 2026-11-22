@@ -553,6 +553,14 @@ impl Event {
         self.tone = tone;
         self
     }
+    /// Marks the step red and names the properties it breaks, if any.
+    pub(crate) fn breaking(mut self, properties: &[&str]) -> Self {
+        if !properties.is_empty() {
+            self.tone = Tone::Bad;
+            self.label = format!("{} - BREAKS {}", self.label, properties.join(", "));
+        }
+        self
+    }
 }
 impl Timeline {
     pub(crate) fn draw(&self, svg: &mut Svg, x: usize, y: usize) -> usize {
@@ -771,5 +779,81 @@ pub(crate) fn query_outcome(
         (None, false, false) => ("running", Tone::Actor),
         (Some(true), false, false) => ("rows", Tone::Actor),
         (Some(false), false, false) => ("error after the window (allowed)", Tone::Gone),
+    }
+}
+
+/// The model's `always` properties that hold before a step and fail after it,
+/// by name: the drawings mark such a step from the model's own checks rather
+/// than their own reading of it.
+pub(crate) fn broken<M: stateright::Model>(
+    model: &M,
+    before: &M::State,
+    after: &M::State,
+) -> Vec<&'static str> {
+    model
+        .properties()
+        .into_iter()
+        .filter(|p| {
+            p.expectation == stateright::Expectation::Always
+                && (p.condition)(model, before)
+                && !(p.condition)(model, after)
+        })
+        .map(|p| p.name)
+        .collect()
+}
+
+/// Whether the model's property `name` holds in `state`; `true` for a name the
+/// model does not have.
+pub(crate) fn holds<M: stateright::Model>(model: &M, state: &M::State, name: &str) -> bool {
+    model
+        .properties()
+        .into_iter()
+        .find(|p| p.name == name)
+        .is_none_or(|p| (p.condition)(model, state))
+}
+
+#[cfg(test)]
+mod tests {
+    use stateright::{Expectation, Model};
+
+    /// The first state, breadth first, where an `always` property fails.
+    fn first_violation<M: Model>(model: &M) -> stateright::Path<M::State, M::Action>
+    where
+        M::State: Clone + Eq + std::hash::Hash,
+        M::Action: Clone + PartialEq,
+    {
+        super::path_to(model, |s| {
+            model
+                .properties()
+                .iter()
+                .any(|p| p.expectation == Expectation::Always && !(p.condition)(model, s))
+        })
+        .expect("the control reaches a violation")
+    }
+
+    /// The step that breaks a property is drawn as breaking it, by name, in
+    /// models whose drawings decide nothing about that property themselves.
+    #[test]
+    fn violating_steps_name_the_property_they_break() {
+        let model = crate::data_files::Protocol::new("data-files-intent-sweep-ignores-intent", 2);
+        let svg = model
+            .as_svg(first_violation(&model))
+            .expect("data-files draws");
+        assert!(svg.contains("BREAKS committed files exist"), "{svg}");
+
+        let model = crate::reads::Protocol::new("reads-tick-only", 0);
+        let path = first_violation(&model);
+        let name = "query includes every commit completed more than S before it started";
+        // `holds` reads the same property: true initially, false here.
+        assert!(super::holds(&model, &model.init_states()[0], name));
+        assert!(!super::holds(&model, path.last_state(), name));
+        assert!(super::holds(&model, path.last_state(), "no such property"));
+        let svg = model.as_svg(path).expect("reads draws");
+        assert!(
+            svg.contains(
+                "BREAKS query includes every commit completed more than S before it started"
+            ),
+            "{svg}"
+        );
     }
 }

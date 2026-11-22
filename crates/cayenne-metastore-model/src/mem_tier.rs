@@ -1080,7 +1080,7 @@ impl Model for Protocol {
         for (before, action, after) in steps(path) {
             let label = self.format_action(&action);
             let published = after.durable_catalog != before.durable_catalog;
-            events.push(match action {
+            let event = match action {
                 Action::Upsert(..) | Action::Delete(_) => {
                     let replay =
                         before.replay.is_some() || before.source.len() == after.source.len();
@@ -1112,7 +1112,8 @@ impl Model for Protocol {
                     .tone(if published { Tone::Live } else { Tone::Gone }),
                 Action::Crash => Event::on(process, "CRASH").tone(Tone::Bad),
                 Action::Recover => Event::on(store, label).to(process),
-            });
+            };
+            events.push(event.breaking(&crate::explorer::broken(self, &before, &after)));
         }
         Timeline {
             lanes: lane_names,

@@ -82,7 +82,9 @@ green is an actor. Red follows the properties: an outcome a property allows, suc
 as a query error once its retention has passed or live rows that lag the source
 while recovery redelivers it, is not drawn red, and a red read says which property
 it breaks (a failure within the window, or wrong rows from a missing object read
-as empty). `position-deletes`,
+as empty). In every timeline, a step after which one of the model's `always`
+properties no longer holds is drawn red with `BREAKS <property>`, evaluated by the
+model's own property, not by the drawing. `position-deletes`,
 `state-rules`, `read-delivery`, `predicate-progress` and `action-compatibility`
 show text only.
 

@@ -702,7 +702,7 @@ impl Model for Protocol {
         let mut events = vec![];
         for (before, action, after) in steps(path) {
             let label = self.format_action(&action);
-            events.push(match action {
+            let event = match action {
                 Action::Tick | Action::Jump => {
                     Event::on(store, format!("clock -> {}", after.now)).tone(Tone::Gone)
                 }
@@ -757,7 +757,8 @@ impl Model for Protocol {
                     );
                     Event::on(reader, text).to(store).tone(tone)
                 }
-            });
+            };
+            events.push(event.breaking(&crate::explorer::broken(self, &before, &after)));
         }
         Some(state_and_trace(&boxes, &Timeline { lanes, events }))
     }

@@ -929,7 +929,7 @@ impl Model for Protocol {
         lane_names.extend(["A".to_string(), "B".to_string()]);
         let mut events = vec![];
         for (before, action, after) in steps(path) {
-            events.push(match action {
+            let event = match action {
                 Action::Ingest(w) => Event::on(w, "send Txn + intent")
                     .to(lane_a)
                     .tone(Tone::Staged),
@@ -981,7 +981,8 @@ impl Model for Protocol {
                     format!("receives partition {p} by handoff"),
                 )
                 .tone(Tone::Actor),
-            });
+            };
+            events.push(event.breaking(&crate::explorer::broken(self, &before, &after)));
         }
         Timeline {
             lanes: lane_names,
