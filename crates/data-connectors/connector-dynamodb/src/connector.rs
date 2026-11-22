@@ -734,14 +734,18 @@ async fn create_bootstrap_stream(
         "No existing checkpoint found for DynamoDB Streams table, starting initialization. Table will be marked as Ready once lag threshold is reached"
     );
 
-    emit_overwrite_then_live(
-        dynamodb,
-        dynamodb_sys,
-        checkpoint,
-        acceptable_lag,
-        dataset_name,
+    // A failure to start still yields the stream that reports it.
+    Some(
+        emit_overwrite_then_live(
+            dynamodb,
+            dynamodb_sys,
+            checkpoint,
+            acceptable_lag,
+            dataset_name,
+        )
+        .await
+        .unwrap_or_else(|failed| failed),
     )
-    .await
 }
 
 /// Emits a full-overwrite bootstrap through the CDC change contract, then
@@ -758,13 +762,17 @@ async fn create_bootstrap_stream(
 /// so the connector needs no runtime accelerator-write internals. Readiness
 /// continues to be driven by the live stream's watermark, preserving prior
 /// behavior.
+///
+/// When the stream cannot be set up, `Err` carries the stream to hand on instead:
+/// one that reports the failure, so the dataset shows it rather than loading
+/// forever.
 async fn emit_overwrite_then_live(
     dynamodb: Arc<DynamoDBTableProvider>,
     dynamodb_sys: Option<Arc<dyn BlobCheckpointStore>>,
     checkpoint: Checkpoint,
     acceptable_lag: Duration,
     dataset_name: TableReference,
-) -> Option<ChangesStream> {
+) -> Result<ChangesStream, ChangesStream> {
     let table_schema = dynamodb.schema();
 
     let snapshot = match Arc::clone(&dynamodb).overwrite_bootstrap_stream().await {
@@ -776,12 +784,10 @@ async fn emit_overwrite_then_live(
                 error = %e,
                 "Failed to start DynamoDB overwrite bootstrap stream"
             );
-            return Some(
-                stream::once(async move {
-                    Err(DynamoDBStreamError::FailedToStartInitialScan { source: e }.into())
-                })
-                .boxed(),
-            );
+            return Err(stream::once(async move {
+                Err(DynamoDBStreamError::FailedToStartInitialScan { source: e }.into())
+            })
+            .boxed());
         }
     };
 
@@ -793,7 +799,7 @@ async fn emit_overwrite_then_live(
             dataset = %dataset_name,
             "Failed to build DynamoDB bootstrap checkpoint barrier batch; dataset will not start streaming or commit checkpoints"
         );
-        return None;
+        return Err(stream::empty().boxed());
     };
     let checkpoint_envelope = ChangeEnvelope::from_parts(
         Box::new(DynamoDBStreamCommitter::new(
@@ -823,16 +829,14 @@ async fn emit_overwrite_then_live(
                 error = %e,
                 "Failed to start DynamoDB changes stream after initialization"
             );
-            return Some(stream_start_failed(e));
+            return Err(stream_start_failed(e));
         }
     };
 
-    Some(
-        snapshot
-            .chain(stream::once(async move { Ok(checkpoint_envelope) }))
-            .chain(live)
-            .boxed(),
-    )
+    Ok(snapshot
+        .chain(stream::once(async move { Ok(checkpoint_envelope) }))
+        .chain(live)
+        .boxed())
 }
 
 /// Resumes streaming from an existing checkpoint, handling shard expiration scenarios.
@@ -1104,14 +1108,19 @@ async fn do_rebootstrap(
         "Got new checkpoint for re-initialization of DynamoDB table"
     );
 
-    let stream = emit_overwrite_then_live(
+    let stream = match emit_overwrite_then_live(
         Arc::clone(dynamodb),
         dynamodb_sys.cloned(),
         new_checkpoint,
         acceptable_lag,
         dataset_name.clone(),
     )
-    .await?;
+    .await
+    {
+        Ok(stream) => stream,
+        // Not counted or logged as started: the stream only reports the failure.
+        Err(failed) => return Some(failed),
+    };
 
     // Count the rebootstrap once its stream is successfully set up.
     metrics_collector
