@@ -699,7 +699,7 @@ async fn handle_nsql_query(
                 Ok(r) => r,
                 Err(e) => {
                     record_nsql_error(&span, &format!("Error running NSQL model: {e}"));
-                    tracing::error!("Error running NSQL model: {e}");
+                    tracing::error!("Error running NQL model: {e}");
                     return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
                 }
             }
@@ -1831,9 +1831,9 @@ mod tests {
         );
     }
 
-    /// Collects the ERROR events recorded on each span, keyed by span name.
+    /// The ERROR events recorded on a span, as `(span name, event target, message)`.
     #[derive(Clone, Default)]
-    struct SpanErrorCapture(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+    struct SpanErrorCapture(std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>);
 
     struct MessageVisitor(String);
 
@@ -1863,27 +1863,113 @@ mod tests {
             let mut visitor = MessageVisitor(String::new());
             event.record(&mut visitor);
             if let Ok(mut errors) = self.0.lock() {
-                errors.push((span.name().to_string(), visitor.0));
+                errors.push((
+                    span.name().to_string(),
+                    event.metadata().target().to_string(),
+                    visitor.0,
+                ));
             }
         }
     }
 
-    #[test]
-    fn nsql_errors_are_recorded_on_the_nsql_span() {
-        use tracing_subscriber::layer::SubscriberExt;
+    impl SpanErrorCapture {
+        /// Installs the capture for the current thread. `#[tokio::test]` runs the handler on this
+        /// thread, so the events it emits reach the capture.
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        }
 
-        let capture = SpanErrorCapture::default();
-        let subscriber = tracing_subscriber::registry().with(capture.clone());
-        let message =
-            "invalid args: the prompt is 13858 tokens, and the model's context holds 8192";
+        /// The messages the `nsql` span recorded under the `task_history` target.
+        fn nsql_task_history_errors(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .expect("capture lock")
+                .iter()
+                .filter(|(span, target, _)| span == "nsql" && target == "task_history")
+                .map(|(_, _, message)| message.clone())
+                .collect()
+        }
+    }
 
-        tracing::subscriber::with_default(subscriber, || {
-            let span = tracing::span!(target: "task_history", tracing::Level::INFO, "nsql");
-            // The handler records the error after the span guard is gone, as it does at runtime.
-            record_nsql_error(&span, message);
+    /// A model endpoint that rejects every chat completion, as an over-context prompt is.
+    async fn serve_failing_chat_completions() -> String {
+        let router = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": {
+                        "message": "the prompt is 13858 tokens, and the model's context holds 8192",
+                        "type": "invalid_request_error",
+                        "param": null,
+                        "code": null
+                    }})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the test model endpoint");
+        let address = listener
+            .local_addr()
+            .expect("the test model endpoint has an address");
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("the test model endpoint serves");
         });
+        format!("http://{address}/v1")
+    }
 
-        let errors = capture.0.lock().expect("capture lock").clone();
-        assert_eq!(errors, vec![("nsql".to_string(), message.to_string())]);
+    /// A model that fails the request puts its error on the `nsql` task_history span.
+    #[tokio::test]
+    async fn model_error_is_recorded_on_the_nsql_span() {
+        let capture = SpanErrorCapture::default();
+        let _guard = capture.install();
+        let endpoint = serve_failing_chat_completions().await;
+
+        let (status, _) = post_nsql_to_openai_model(
+            &endpoint,
+            &[],
+            None,
+            json!({ "query": "how many rows", "model": "nsql_model" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let errors = capture.nsql_task_history_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].starts_with("Error running NSQL model: "),
+            "{errors:?}"
+        );
+        assert!(errors[0].contains("context holds 8192"), "{errors:?}");
+    }
+
+    /// Generated SQL that keeps failing past the retry limit puts its error on the `nsql` span.
+    #[tokio::test]
+    async fn exhausted_query_retries_are_recorded_on_the_nsql_span() {
+        let capture = SpanErrorCapture::default();
+        let _guard = capture.install();
+        let (endpoint, _sent) =
+            serve_scripted_chat_completions(&["SELECT no_such_column FROM no_such_table"; 12])
+                .await;
+
+        let (status, _) = post_nsql_to_openai_model(
+            &endpoint,
+            &[],
+            None,
+            json!({ "query": "how many rows", "model": "nsql_model" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let errors = capture.nsql_task_history_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].starts_with("Error executing query: "),
+            "{errors:?}"
+        );
     }
 }
