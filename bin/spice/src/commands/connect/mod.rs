@@ -24,11 +24,44 @@ mod state;
 pub(crate) mod status;
 pub(crate) mod transaction;
 
+use std::path::{Path, PathBuf};
+
 use crate::commands::add::{AddArgs, execute_add_or_connect};
 use crate::context::RuntimeContext;
 use crate::error::{Error, Result};
 use clap::Args;
 use secrecy::{ExposeSecret as _, SecretString};
+
+/// The Cloud Connect state directory inside an instance's config directory,
+/// once any state an earlier version kept in the config directory has moved
+/// into it and the directory has passed the state-directory rule.
+///
+/// Nothing moves while a runtime holds the instance directory: an older one
+/// still uses the old location, and a current one moved its state when it
+/// started.
+///
+/// # Errors
+///
+/// Returns an error when the state directory, or a config directory that
+/// still holds state to move, cannot be trusted or used.
+pub(crate) async fn local_state_dir(config_dir: &Path) -> Result<PathBuf> {
+    runtime_cloud_connect::state_dir::migrate_legacy_state_when_idle(config_dir)
+        .await
+        .map_err(|source| Error::CloudConnectIo {
+            message: source.to_string(),
+        })?;
+    let state_dir = runtime_cloud_connect::state_dir::state_dir(config_dir);
+    let checked = state_dir.clone();
+    tokio::task::spawn_blocking(move || runtime_cloud_connect::state_dir::check(&checked, false))
+        .await
+        .map_err(|source| Error::CloudConnectIo {
+            message: format!("state directory check task panicked: {source}"),
+        })?
+        .map_err(|source| Error::CloudConnectIo {
+            message: source.to_string(),
+        })?;
+    Ok(state_dir)
+}
 
 /// Arguments for the deprecated `spice connect <org>/<pod>` command.
 #[derive(Args, Debug)]

@@ -17738,6 +17738,7 @@ dependencies = [
  "runtime-checkpoint-sqlite",
  "runtime-cluster",
  "runtime-component",
+ "runtime-config",
  "runtime-datafusion",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
@@ -18054,7 +18055,6 @@ dependencies = [
  "arrow",
  "arrow-schema",
  "arrow_tools",
- "clap",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -18065,6 +18065,7 @@ dependencies = [
  "logos",
  "opentelemetry 0.32.0",
  "runtime-acceleration",
+ "runtime-config",
  "serde",
  "snafu",
  "spicepod",
@@ -18072,6 +18073,14 @@ dependencies = [
  "tracing",
  "util",
  "yaml",
+]
+
+[[package]]
+name = "runtime-config"
+version = "2.5.0-unstable"
+dependencies = [
+ "clap",
+ "spicepod",
 ]
 
 [[package]]
@@ -18159,7 +18168,6 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
- "blake3",
  "criterion 0.7.0",
  "datafusion",
  "datafusion-datasource",
@@ -18180,6 +18188,7 @@ dependencies = [
  "runtime-udfs-api",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "simsimd",
  "snafu",
  "spicepod",
@@ -20307,6 +20316,7 @@ dependencies = [
  "humantime",
  "insta",
  "keyring",
+ "libc",
  "nix 0.29.0",
  "opentelemetry 0.32.0",
  "pem",
@@ -20319,6 +20329,7 @@ dependencies = [
  "runtime-api-types",
  "runtime-cloud-connect",
  "runtime-secrets",
+ "rustix 1.1.4",
  "rustls",
  "rustyline",
  "secrecy",
@@ -20326,9 +20337,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "shell-words",
  "snafu",
  "spice-cloud-client",
  "spiceai",
+ "spiced-args",
  "spicepod",
  "system-open",
  "tar",
@@ -20533,7 +20546,9 @@ dependencies = [
  "serde_json",
  "snafu",
  "snmalloc-rs",
+ "spice",
  "spice-cloud",
+ "spiced-args",
  "telemetry",
  "tempfile",
  "test-framework",
@@ -20552,6 +20567,16 @@ dependencies = [
  "webpki-root-certs",
  "webpki-roots 1.0.11",
  "yaml",
+]
+
+[[package]]
+name = "spiced-args"
+version = "2.5.0-unstable"
+dependencies = [
+ "clap",
+ "repl",
+ "runtime-config",
+ "spicepod",
  "zeroize",
 ]
 
