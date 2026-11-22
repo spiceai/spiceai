@@ -35,6 +35,18 @@ const HORIZON: u8 = 9;
 const SHORT_HORIZON: u8 = 7;
 const VERSIONS: u8 = 6;
 
+/// A query's outcome and how the drawing marks it. The properties allow an
+/// error once the retention has passed and forbid one within it (or wrong rows),
+/// which the model records as `bad_availability` and `bad_rows`.
+fn query_outcome(result: Option<bool>, violated: bool) -> (&'static str, crate::explorer::Tone) {
+    use crate::explorer::Tone;
+    match (result, violated) {
+        (_, true) => ("FAILED within the retention", Tone::Bad),
+        (None, false) => ("running", Tone::Actor),
+        (Some(true), false) => ("rows", Tone::Actor),
+        (Some(false), false) => ("error after the retention (allowed)", Tone::Gone),
+    }
+}
 #[derive(Clone, Debug)]
 pub(crate) struct Protocol {
     mode: String,
@@ -684,17 +696,11 @@ impl Model for Protocol {
                 format!("QUERY (started {start})"),
                 vec![
                     format!("reads objects {}", needs.join(", ")),
-                    match last.result {
-                        None => "running".into(),
-                        Some(true) => "rows".into(),
-                        Some(false) => "error".into(),
-                    },
+                    query_outcome(last.result, last.bad_availability || last.bad_rows)
+                        .0
+                        .into(),
                 ],
-                if last.result == Some(false) {
-                    Tone::Bad
-                } else {
-                    Tone::Actor
-                },
+                query_outcome(last.result, last.bad_availability || last.bad_rows).1,
             ));
         }
         let (writer, head, gc, store, reader) = (0, 1, 2, 3, 4);
@@ -831,5 +837,23 @@ impl Model for Protocol {
             ));
         }
         properties
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::query_outcome;
+    use crate::explorer::Tone;
+
+    /// Only an outcome the properties forbid is drawn as a violation.
+    #[test]
+    fn only_forbidden_query_outcomes_are_violations() {
+        assert!(
+            query_outcome(Some(false), false)
+                == ("error after the retention (allowed)", Tone::Gone)
+        );
+        assert!(query_outcome(Some(false), true) == ("FAILED within the retention", Tone::Bad));
+        assert!(query_outcome(Some(true), false) == ("rows", Tone::Actor));
+        assert!(query_outcome(None, false) == ("running", Tone::Actor));
     }
 }

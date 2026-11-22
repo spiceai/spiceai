@@ -119,6 +119,15 @@ pub(crate) enum Action {
     ReplicaExpire(usize),
     ReplicaSweep(usize),
 }
+/// The replica head's references, and the ones whose objects have not reached
+/// the replica yet.
+fn replica_head_lines(refs: u8, replica: u8, n: usize) -> Vec<String> {
+    let mut lines = vec![format!("references {}", set_label(refs, n))];
+    if refs & !replica != 0 {
+        lines.push(format!("not yet copied {}", set_label(refs & !replica, n)));
+    }
+    lines
+}
 /// The members of a bit set of objects or versions.
 fn set_label(set: u8, n: usize) -> String {
     let members: Vec<String> = (0..n)
@@ -506,11 +515,14 @@ impl Model for Protocol {
             ),
             (
                 format!("REPLICA HEAD v{}", last.replica_head),
-                vec![format!("references {}", set_label(replica_refs, n))],
+                replica_head_lines(replica_refs, last.replica, n),
+                // Replication copies objects and heads in any order, so a
+                // replicated head may name objects not yet copied; the property
+                // concerns a reader adopting it, which the reader box shows.
                 if replica_refs & !last.replica == 0 {
                     Tone::Live
                 } else {
-                    Tone::Bad
+                    Tone::Staged
                 },
             ),
             (
@@ -673,7 +685,7 @@ impl Model for Protocol {
 
 #[cfg(test)]
 mod explorer_tests {
-    use super::{Protocol, set_label};
+    use super::{Protocol, replica_head_lines, set_label};
     use stateright::Model;
 
     /// A query holds its start tick and the set of objects it reads, not a
@@ -688,5 +700,22 @@ mod explorer_tests {
         let line = format!("query started {start} reads objects {}", set_label(set, 1));
         assert!(svg.contains(&line), "{line} missing");
         assert!(!svg.contains("query on v"), "{svg}");
+    }
+
+    /// A replicated head naming objects not yet copied is normal; the box says
+    /// which ones rather than flagging a violation.
+    #[test]
+    fn uncopied_objects_are_listed() {
+        assert_eq!(
+            replica_head_lines(0b11, 0b01, 2),
+            vec![
+                "references {0, 1}".to_string(),
+                "not yet copied {1}".to_string()
+            ]
+        );
+        assert_eq!(
+            replica_head_lines(0b01, 0b01, 2),
+            vec!["references {0}".to_string()]
+        );
     }
 }

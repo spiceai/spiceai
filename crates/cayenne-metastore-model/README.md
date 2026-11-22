@@ -103,7 +103,10 @@ state; the drawings live in `src/explorer.rs` and come in three kinds:
 Colors: white is committed (referenced by the authoritative head), dashed yellow
 is written but not referenced or in flight, grey is collected or superseded, red
 is missing or violated (a duplicate live key, a reference to a missing object, a
-restart that disagrees with the source), and green is an actor. `position-deletes`,
+restart that disagrees with the source) or a crash or pause in a timeline, and
+green is an actor. Red follows the properties: an outcome a property allows, such
+as a query error once its retention has passed or live rows that lag the source
+while recovery redelivers it, is not drawn red. `position-deletes`,
 `state-rules`, `read-delivery`, `predicate-progress` and `action-compatibility`
 show text only.
 
