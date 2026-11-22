@@ -755,8 +755,8 @@ mod tests {
 
     #[test]
     fn malformed_input_yields_zero_rows() {
-        assert!(json_tree("not json").is_empty());
-        assert!(json_tree("").is_empty());
+        assert_eq!(json_tree("not json"), [] as [TreeRow; 0]);
+        assert_eq!(json_tree(""), [] as [TreeRow; 0]);
     }
 
     #[test]
@@ -767,7 +767,7 @@ mod tests {
             doc = format!("[{doc}]");
         }
         let rows = json_tree(&doc);
-        assert!(!rows.is_empty());
+        assert_ne!(rows, [] as [TreeRow; 0]);
         assert!(rows.len() <= DEFAULT_MAX_DEPTH + 1);
     }
 
@@ -802,7 +802,10 @@ mod tests {
             max_bytes: 4,
             ..Default::default()
         };
-        assert!(json_tree_with_options(r#"{"a": 1}"#, &opts).is_empty());
+        assert_eq!(
+            json_tree_with_options(r#"{"a": 1}"#, &opts),
+            [] as [TreeRow; 0]
+        );
     }
 
     #[tokio::test]

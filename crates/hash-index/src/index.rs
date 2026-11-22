@@ -1171,7 +1171,7 @@ impl HashIndex {
         let mut total: usize = 0;
 
         // Sum up all shard capacities
-        for shard in self.shards.iter() {
+        for shard in &self.shards {
             total += shard.capacity() * SLOT_SIZE;
         }
 
@@ -1186,7 +1186,7 @@ impl HashIndex {
 
     /// Clears all entries.
     pub fn clear(&self) {
-        for shard in self.shards.iter() {
+        for shard in &self.shards {
             shard.clear();
         }
         self.len.store(0, Ordering::Relaxed);

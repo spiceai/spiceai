@@ -32,7 +32,10 @@ use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
     error::DataFusionError,
-    execution::SendableRecordBatchStream,
+    execution::{
+        SendableRecordBatchStream,
+        memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation},
+    },
     logical_expr::{Expr, Operator, TableProviderFilterPushDown},
     physical_plan::{ExecutionPlan, stream::RecordBatchStreamAdapter},
     scalar::ScalarValue,
@@ -1396,6 +1399,10 @@ impl GithubRestClient {
         }
     }
 
+    /// The runs of `workflow_id` as one batch. With `logs`, each run's logs
+    /// are fetched too, and every byte of them held, from the downloaded archives to the
+    /// extracted text, is charged to that pool (the pool of the query reading them) until
+    /// the batch is built.
     pub async fn fetch_workflow_runs(
         self: Arc<Self>,
         owner: Arc<str>,
@@ -1403,7 +1410,7 @@ impl GithubRestClient {
         workflow_id: Arc<str>,
         query_params: Option<HashMap<String, String>>,
         limit: Option<usize>,
-        fetch_logs: bool,
+        logs: Option<WorkflowLogs>,
     ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
         self.rate_limiter.check_rate_limit().await?;
 
@@ -1510,18 +1517,41 @@ impl GithubRestClient {
         // throughput. Per-run failures stay non-fatal: that run gets an empty logs
         // map, exactly as before, and the run_id key preserves the association
         // regardless of completion order.
-        let run_logs = if fetch_logs {
+        // Held until the batch below is built, so the logs stay charged while they are.
+        let mut logs_reservations = Vec::new();
+        let run_logs = if let Some(WorkflowLogs {
+            memory_pool,
+            dataset_name,
+        }) = &logs
+        {
+            let reservation =
+                MemoryConsumer::new(format!("GitHub workflow logs of {owner}/{repo}"))
+                    .register(memory_pool);
             let mut logs_map = std::collections::HashMap::new();
             for chunk in all_runs.chunks(NUM_FILE_CONTENT_DOWNLOAD_WORKERS) {
                 let log_futures = chunk
                     .iter()
-                    .map(|run| self.fetch_workflow_run_logs(&owner, &repo, run.id))
+                    .map(|run| {
+                        self.fetch_workflow_run_logs(
+                            &owner,
+                            &repo,
+                            run.id,
+                            reservation.new_empty(),
+                            dataset_name,
+                        )
+                    })
                     .collect::<Vec<_>>();
                 // join_all preserves input order, so zip the results back with their runs.
                 for (run, result) in chunk.iter().zip(future::join_all(log_futures).await) {
                     match result {
-                        Ok(logs) => {
+                        Ok((logs, charged)) => {
                             logs_map.insert(run.id, logs);
+                            logs_reservations.push(charged);
+                        }
+                        // Logs the query memory pool cannot hold fail the query: an empty
+                        // `logs` column would read as a run that logged nothing.
+                        Err(e) if e.downcast_ref::<DataFusionError>().is_some() => {
+                            return Err(e);
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -1672,6 +1702,8 @@ impl GithubRestClient {
 
         let record_batch = RecordBatch::try_new(Arc::clone(&schema), columns)
             .context(UnableToConstructRecordBatchSnafu)?;
+        // The logs are in the batch now; their charge ends with them.
+        drop(logs_reservations);
 
         let stream_adapter = RecordBatchStreamAdapter::new(
             Arc::clone(&schema),
@@ -1681,13 +1713,24 @@ impl GithubRestClient {
         Ok(Box::pin(stream_adapter))
     }
 
+    /// The `.txt` logs at the root of run `run_id`'s log archive, by file name, and the
+    /// reservation they are charged to.
+    ///
+    /// The archive is charged to `reservation` as it downloads and every log as it is
+    /// extracted, and the archive's charge is returned once it is released. Logs that the
+    /// query memory pool cannot hold fail with a [`DataFusionError::ResourcesExhausted`]
+    /// that names the run.
     pub async fn fetch_workflow_run_logs(
         &self,
         owner: &str,
         repo: &str,
         run_id: i64,
-    ) -> Result<std::collections::HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>>
-    {
+        reservation: MemoryReservation,
+        dataset_name: &str,
+    ) -> Result<
+        (std::collections::HashMap<String, String>, MemoryReservation),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         self.rate_limiter.check_rate_limit().await?;
 
         let endpoint =
@@ -1741,42 +1784,50 @@ impl GithubRestClient {
             }
 
             // Return empty map if logs aren't available
-            return Ok(std::collections::HashMap::new());
+            return Ok((std::collections::HashMap::new(), reservation));
         }
 
-        // Download the ZIP file
-        let zip_bytes = response.bytes().await?;
+        let memory_refusal = |source: http_body_limit::Error| {
+            Box::new(DataFusionError::ResourcesExhausted(format!(
+                "Failed to read the workflow logs of run {run_id} for GitHub repository \
+                 '{owner}/{repo}': {source}. Raise `runtime.query.memory_limit`, or select \
+                 fewer runs with a filter or LIMIT. See: https://spiceai.org/docs/reference/memory"
+            ))) as Box<dyn std::error::Error + Send + Sync>
+        };
+
+        // Download the ZIP file, charged to the query memory pool as it arrives.
+        let zip_bytes =
+            http_body_limit::read_bytes(response, http_body_limit::Limit::Reserve(&reservation))
+                .await
+                .map_err(|e| match e {
+                    source @ http_body_limit::Error::MemoryLimit { .. } => memory_refusal(source),
+                    other => Box::new(other) as Box<dyn std::error::Error + Send + Sync>,
+                })?;
 
         // Offload ZIP parsing to another thread to avoid blocking async runtime
-        let logs = tokio::task::spawn_blocking(move || {
-            // Parse the ZIP file
-            let cursor = std::io::Cursor::new(zip_bytes);
-            let mut zip = zip::ZipArchive::new(cursor)?;
-
-            let mut logs = std::collections::HashMap::new();
-
-            // Extract only .txt files from the root of the ZIP
-            for i in 0..zip.len() {
-                let mut file = zip.by_index(i)?;
-                let file_name = file.name()?.into_owned();
-
-                // Only process .txt files in the root (no directory separator)
-                if std::path::Path::new(&file_name)
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
-                    && !file_name.contains('/')
-                {
-                    let mut content = String::new();
-                    std::io::Read::read_to_string(&mut file, &mut content)?;
-                    logs.insert(file_name, content);
+        let (extracted, reservation) = tokio::task::spawn_blocking(move || {
+            let logs = extract_root_logs(zip_bytes, &reservation);
+            (logs, reservation)
+        })
+        .await?;
+        let logs = extracted.map_err(|e| match e {
+            ExtractLogsError::Memory { source } => memory_refusal(source),
+            ExtractLogsError::Bomb { job, source } => {
+                let message = format!(
+                    "Failed to read the log of workflow run {run_id}, job '{job}' for dataset \
+                     '{dataset_name}': {source} See: \
+                     https://spiceai.org/docs/components/data-connectors/github"
+                );
+                // Typed, so callers classify it as a refusal of the data, not by its text.
+                match http_body_limit::CompressionRefusal::new(message.clone(), &source) {
+                    Some(typed) => Box::new(typed) as Box<dyn std::error::Error + Send + Sync>,
+                    None => Box::new(DataFusionError::Execution(message)),
                 }
             }
+            ExtractLogsError::Other { source } => source,
+        })?;
 
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(logs)
-        })
-        .await??;
-
-        Ok(logs)
+        Ok((logs, reservation))
     }
 
     pub async fn fetch_workflows(
@@ -2120,6 +2171,247 @@ pub fn error_checker(
     }
 
     Ok(())
+}
+
+/// Where a query's workflow logs are charged, and the dataset a refused log names.
+pub struct WorkflowLogs {
+    /// The query memory pool the logs are held in.
+    pub memory_pool: Arc<dyn MemoryPool>,
+    /// The dataset's name.
+    pub dataset_name: Arc<str>,
+}
+
+/// The codec a log entry is checked as, or `None` for an entry stored uncompressed.
+fn log_codec(method: zip::CompressionMethod) -> Option<http_body_limit::Codec> {
+    match method {
+        zip::CompressionMethod::Stored => None,
+        zip::CompressionMethod::Bzip2 => Some(http_body_limit::Codec::Bzip2),
+        zip::CompressionMethod::Zstd => Some(http_body_limit::Codec::Zstd),
+        zip::CompressionMethod::Lzma | zip::CompressionMethod::Xz => {
+            Some(http_body_limit::Codec::Xz)
+        }
+        // Deflate, and anything else, holds to deflate's lower threshold.
+        _ => Some(http_body_limit::Codec::Deflate),
+    }
+}
+
+/// The job a log entry belongs to: GitHub names each root log `{index}_{job}.txt`.
+fn job_name(entry: &str) -> &str {
+    let stem = entry.strip_suffix(".txt").unwrap_or(entry);
+    match stem.split_once('_') {
+        Some((index, job)) if index.chars().all(|c| c.is_ascii_digit()) => job,
+        _ => stem,
+    }
+}
+
+/// Why the logs of one archive could not be extracted.
+enum ExtractLogsError {
+    /// The query memory pool could not hold them.
+    Memory { source: http_body_limit::Error },
+    /// A log entry expanded past what real logs compress to: a compression bomb.
+    Bomb {
+        job: String,
+        source: http_body_limit::Error,
+    },
+    Other {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl ExtractLogsError {
+    fn other(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self::Other {
+            source: source.into(),
+        }
+    }
+}
+
+/// The `.txt` logs at the root of a workflow run's log archive, by file name.
+///
+/// The archive is already charged to `reservation`; each log is charged as it
+/// decompresses, since an archive's entries can expand to far more than the archive and
+/// every byte of them is kept, and the archive's charge is returned once it is released.
+fn extract_root_logs(
+    archive: bytes::Bytes,
+    reservation: &MemoryReservation,
+) -> Result<HashMap<String, String>, ExtractLogsError> {
+    let archive_len = archive.len();
+    let mut zip =
+        zip::ZipArchive::new(std::io::Cursor::new(archive)).map_err(ExtractLogsError::other)?;
+    let mut logs = HashMap::new();
+    for i in 0..zip.len() {
+        let file = zip.by_index(i).map_err(ExtractLogsError::other)?;
+        let file_name = file.name().map_err(ExtractLogsError::other)?.into_owned();
+
+        // Only process .txt files in the root (no directory separator)
+        if std::path::Path::new(&file_name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+            && !file_name.contains('/')
+        {
+            // Each log is checked against its own compressed size, so one that expands
+            // past what real logs compress to is refused as a compression bomb. An entry
+            // that gives no compressed size is refused once it passes the floor.
+            let codec = log_codec(file.compression());
+            let compressed_size = usize::try_from(file.compressed_size()).unwrap_or(usize::MAX);
+            let job = job_name(&file_name).to_string();
+            let read = match codec {
+                Some(codec) => {
+                    let expansion =
+                        http_body_limit::Expansion::new(codec, http_body_limit::Input::Log);
+                    expansion.received(compressed_size);
+                    http_body_limit::read_to_end(
+                        expansion.check_output(file),
+                        http_body_limit::Limit::Reserve(reservation),
+                    )
+                }
+                None => {
+                    http_body_limit::read_to_end(file, http_body_limit::Limit::Reserve(reservation))
+                }
+            };
+            let content = read.map_err(|e| match e {
+                source @ http_body_limit::Error::MemoryLimit { .. } => {
+                    ExtractLogsError::Memory { source }
+                }
+                source @ http_body_limit::Error::CompressionRatio { .. } => {
+                    ExtractLogsError::Bomb { job, source }
+                }
+                other => ExtractLogsError::other(other),
+            })?;
+            logs.insert(
+                file_name,
+                String::from_utf8(content).map_err(ExtractLogsError::other)?,
+            );
+        }
+    }
+    // The logs stay charged; the archive they came from is released here.
+    drop(zip);
+    reservation.shrink(archive_len.min(reservation.size()));
+    Ok(logs)
+}
+
+/// Workflow log archives are held to the query memory pool, however far their
+/// entries expand.
+#[cfg(test)]
+mod log_archive_tests {
+    use std::io::Write;
+    use std::sync::Arc;
+
+    use datafusion::execution::memory_pool::{
+        GreedyMemoryPool, MemoryConsumer, MemoryPool, MemoryReservation, UnboundedMemoryPool,
+    };
+    use zip::write::SimpleFileOptions;
+
+    use super::{ExtractLogsError, extract_root_logs};
+
+    const MIB: usize = 1024 * 1024;
+
+    /// An archive like the one GitHub serves: a root log of `log_bytes` repeated lines,
+    /// which deflate shrinks over a hundred times, beside a step log in a directory and a
+    /// file that is not a log.
+    fn archive(log_bytes: usize) -> bytes::Bytes {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let deflated =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("0_build.txt", deflated).expect("start log");
+        let line = b"2026-01-01T00:00:00.0000000Z Waiting for a runner to pick up this job...\n";
+        let mut written = 0;
+        while written < log_bytes {
+            let n = line.len().min(log_bytes - written);
+            zip.write_all(&line[..n]).expect("write log");
+            written += n;
+        }
+        zip.start_file("build/1_step.txt", deflated)
+            .expect("start step log");
+        zip.write_all(b"step").expect("write step log");
+        zip.start_file("summary.json", deflated)
+            .expect("start json");
+        zip.write_all(b"{}").expect("write json");
+        zip.finish().expect("finish archive").into_inner().into()
+    }
+
+    fn reservation(pool_bytes: Option<usize>) -> MemoryReservation {
+        let pool: Arc<dyn MemoryPool> = match pool_bytes {
+            Some(bytes) => Arc::new(GreedyMemoryPool::new(bytes)),
+            None => Arc::new(UnboundedMemoryPool::default()),
+        };
+        MemoryConsumer::new("GitHub workflow logs").register(&pool)
+    }
+
+    #[test]
+    fn root_logs_are_extracted_and_stay_charged() {
+        let archive = archive(3 * MIB);
+        let held = reservation(None);
+        held.grow(archive.len());
+
+        let logs = extract_root_logs(archive, &held)
+            .unwrap_or_else(|_| panic!("a log the pool can hold is extracted"));
+        assert_eq!(logs.len(), 1, "only root .txt entries are logs");
+        assert_eq!(logs["0_build.txt"].len(), 3 * MIB);
+        assert_eq!(
+            held.size(),
+            3 * MIB,
+            "the log is charged; the archive is not"
+        );
+    }
+
+    #[test]
+    fn a_log_that_expands_past_deflate_s_threshold_is_refused_as_a_bomb() {
+        // One byte repeated: deflate shrinks it about 1,000 times, past real logs' reach.
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file(
+            "3_build and test.txt",
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated),
+        )
+        .expect("start log");
+        let block = vec![b'A'; MIB];
+        for _ in 0..96 {
+            zip.write_all(&block).expect("write log");
+        }
+        let archive: bytes::Bytes = zip.finish().expect("finish archive").into_inner().into();
+        let held = reservation(None);
+
+        let Err(ExtractLogsError::Bomb { job, source }) = extract_root_logs(archive, &held) else {
+            panic!("a log past deflate's threshold is refused as a compression bomb");
+        };
+        assert_eq!(job, "build and test");
+        assert!(
+            source
+                .to_string()
+                .starts_with("the deflate-compressed log expanded more than 400:1 ("),
+            "{source}"
+        );
+        assert_eq!(super::job_name("12_lint.txt"), "lint");
+        assert_eq!(super::job_name("notes.txt"), "notes");
+    }
+
+    #[test]
+    fn an_archive_that_expands_past_the_pool_is_refused() {
+        // A couple of megabytes that decompress to 256 MiB, against a 64 MiB pool.
+        let archive = archive(256 * MIB);
+        assert!(
+            archive.len() < 4 * MIB,
+            "{} bytes on the wire",
+            archive.len()
+        );
+        let held = reservation(Some(64 * MIB));
+        held.try_grow(archive.len()).expect("the archive fits");
+
+        let Err(ExtractLogsError::Memory { source }) = extract_root_logs(archive, &held) else {
+            panic!("an archive that expands past the pool is refused");
+        };
+        assert!(
+            source
+                .to_string()
+                .starts_with("holding the decoded data would pass the query memory limit"),
+            "{source}"
+        );
+        assert!(
+            held.size() < 64 * MIB,
+            "the refused log returned its charge; {} bytes held",
+            held.size()
+        );
+    }
 }
 
 #[cfg(test)]

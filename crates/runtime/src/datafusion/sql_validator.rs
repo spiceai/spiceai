@@ -815,6 +815,64 @@ mod tests {
         assert!(result.is_ok(), "Read-only subqueries should be allowed");
     }
 
+    async fn validate_sql(df: &Arc<DataFusion>, sql: &str) -> Result<(), DataFusionError> {
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+        validate_sql_query_operations(&plan, df)
+    }
+
+    /// A catalog registered again under the same name, as a Spicepod reload does, keeps
+    /// only the access its new configuration allows.
+    #[tokio::test]
+    async fn a_catalog_registered_again_keeps_only_its_new_access() {
+        use crate::component::access::AccessMode;
+
+        let df = create_test_datafusion();
+        let insert = "INSERT INTO ddl_enabled_catalog.public.t VALUES (1)";
+        let create = "CREATE TABLE ddl_enabled_catalog.public.new_table (id INT)";
+        df.ctx
+            .register_table(
+                TableReference::full("ddl_enabled_catalog", "public", "t"),
+                Arc::new(
+                    datafusion::datasource::MemTable::try_new(
+                        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)])),
+                        vec![vec![]],
+                    )
+                    .expect("table"),
+                ),
+            )
+            .expect("table should be registered");
+        let provider = df.ctx.catalog("ddl_enabled_catalog").expect("catalog");
+        validate_sql(&df, create)
+            .await
+            .expect("DDL is allowed with read_write_create");
+
+        df.register_catalog(
+            "ddl_enabled_catalog",
+            &AccessMode::ReadWrite,
+            Arc::clone(&provider),
+        )
+        .await
+        .expect("registered again");
+        validate_sql(&df, create)
+            .await
+            .expect_err("DDL access is withdrawn");
+        validate_sql(&df, insert).await.expect("write access stays");
+
+        df.register_catalog("ddl_enabled_catalog", &AccessMode::Read, provider)
+            .await
+            .expect("registered again");
+        validate_sql(&df, insert)
+            .await
+            .expect_err("write access is withdrawn");
+        assert!(!df.is_catalog_writable("ddl_enabled_catalog"));
+        assert!(!df.is_catalog_ddl_enabled("ddl_enabled_catalog"));
+    }
+
     #[tokio::test]
     async fn test_validate_insert_on_writable_catalog() {
         let df = create_test_datafusion();

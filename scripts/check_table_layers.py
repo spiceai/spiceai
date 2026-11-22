@@ -63,6 +63,7 @@ ALLOWED: dict[str, str] = {
     "SlowProvider": "test double",
     "FirstWriteHeldForBuilds": "test double",
     "WriteOrderRecordingProvider": "test double",
+    "PausingWrites": "test double",
     "DelayedNativeTableProvider": "test double",
     "CountingAccelerator": "test double",
     "GatedSource": "test double",

@@ -64,3 +64,17 @@ steps:
     expect: { rows: [['350']] }
     eventually: 60s
   - corpus: corpus/kafka.sql
+
+  # The acceleration is in memory, so a restarted spiced reads the topic again
+  # from its start. Read in small batches, it reports ready only once every
+  # message on the topic is applied, so the first count after ready is all of
+  # them.
+  - stop: {}
+  - source-exec:
+      kafka: >-
+        for g in $(seq 351 20350); do echo "{\"id\": $g, \"i\": 2, \"s\": \"backlog\", \"f\": 0.5}"; done | rpk topic produce t_${sources.kafka.namespace}
+  - source-exec:
+      ref: INSERT INTO t SELECT g, 2, 'backlog', 0.5 FROM generate_series(351, 20350) g;
+  - start: { patch: { datasets: { t: { params: { batch_max_size: '1' } } } } }
+  - query: SELECT count(*) AS n FROM t
+    expect: { rows: [['20350']] }

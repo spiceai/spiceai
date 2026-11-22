@@ -47,6 +47,7 @@ mod error;
 mod ser;
 mod value;
 
+pub use de::ValueDeserializer;
 pub use error::{Error, Location, Result};
 pub use value::{Index, Mapping, Number, Value};
 
@@ -1442,12 +1443,13 @@ empty_map: {}
 "#;
         let value: Value = from_str(yaml).expect("should parse empty values");
         assert_eq!(value.get("empty_string").and_then(|v| v.as_str()), Some(""));
-        assert!(
+        assert_eq!(
             value
                 .get("empty_array")
                 .and_then(|v| v.as_sequence())
                 .expect("empty_array should be a sequence")
-                .is_empty()
+                .as_slice(),
+            []
         );
         assert!(
             value
@@ -2460,7 +2462,7 @@ keep: |+ # keep comment
         // Bare empty collections as top-level
         let yaml = "[]";
         let result: Vec<i32> = from_str(yaml).expect("should parse bare empty sequence");
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [i32; 0]);
 
         let yaml = "{}";
         let value: Value = from_str(yaml).expect("should parse bare empty mapping");
@@ -2481,7 +2483,7 @@ tags: []
 metadata: {}
 ";
         let config: Config = from_str(yaml).expect("should parse struct with empty collections");
-        assert!(config.tags.is_empty());
+        assert_eq!(config.tags, [] as [String; 0]);
         assert!(config.metadata.is_empty());
     }
 

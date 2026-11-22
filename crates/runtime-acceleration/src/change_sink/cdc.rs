@@ -15,6 +15,10 @@ limitations under the License.
 */
 
 //! CDC operation grouping and zero-copy row selection for accelerator backends.
+//!
+//! A backend splits one CDC batch into ordered upsert, delete and truncate
+//! groups with `group_into_sub_batches`, then applies each group. The
+//! provider and Cayenne backends both use these helpers.
 
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
@@ -190,7 +194,17 @@ fn primary_key_lists_are_uniform(change_batch: &ChangeBatch) -> bool {
     let Some(names) = keys.values().as_any().downcast_ref::<StringArray>() else {
         return false;
     };
-    if keys.null_count() > 0 || names.null_count() > 0 {
+    if names.null_count() > 0 {
+        return false;
+    }
+    // A null key list is a row without keys, the same as an empty one, when it
+    // spans no names: `ChangeBatch::primary_keys` and `has_primary_keys` read it
+    // as empty. A keyless producer (a `DoExchange` subscription of a table with
+    // no primary key) sends every row that way, and treating it as nonuniform
+    // would write each row on its own.
+    if keys.null_count() > 0
+        && (0..keys.len()).any(|row| keys.is_null(row) && keys.value_length(row) != 0)
+    {
         return false;
     }
     let offsets = keys.value_offsets();
@@ -246,14 +260,18 @@ pub fn group_into_sub_batches(
             .collect();
     }
 
-    // Extract data batch and PK column indices once, instead of per-row.
-    let data_batch = change_batch.data_batch();
+    // Find the PK columns once, instead of per-row, from the data schema. The
+    // data is read as a batch only when there are keys to encode: a row
+    // without data, such as the truncate that opens a `DoExchange` snapshot,
+    // carries a null data struct, which cannot be read as a batch when a
+    // column is non-nullable, and a keyless batch never needs one.
     let pk_column_names = change_batch.primary_keys(0);
+    let data_schema = change_batch.data_schema();
     let pk_col_indices: Vec<usize> = pk_column_names
         .iter()
-        .filter_map(|name| data_batch.schema().index_of(name).ok())
+        .filter_map(|name| data_schema.index_of(name).ok())
         .collect();
-    let has_pks = !pk_col_indices.is_empty();
+    let data_batch = (!pk_col_indices.is_empty()).then(|| change_batch.data_batch());
 
     let mut upserts = OpBatchAccumulator::new();
     let mut deletes = OpBatchAccumulator::new();
@@ -276,8 +294,8 @@ pub fn group_into_sub_batches(
         // bucket (CDC rows are full-state snapshots so only the latest
         // row per PK matters) and flush only on *cross-bucket* conflicts
         // to preserve inter-operation ordering.
-        if has_pks {
-            let primary_key = encode_primary_key(&data_batch, &pk_col_indices, row_id);
+        if let Some(data_batch) = &data_batch {
+            let primary_key = encode_primary_key(data_batch, &pk_col_indices, row_id);
 
             // Cross-bucket conflict: the *other* bucket already has this
             // PK, so flush it to preserve operation ordering.

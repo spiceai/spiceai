@@ -533,6 +533,9 @@ async fn test_cayenne_catalog_persistence_impl(
 
     let connection_string = match fixture.backend_type {
         common::BackendType::Sqlite => format!("sqlite://{}", db_path.to_string_lossy()),
+        common::BackendType::ObjectNative => {
+            return Err("this test reopens a SQLite catalog file".into());
+        }
     };
 
     // Create catalog and initialize

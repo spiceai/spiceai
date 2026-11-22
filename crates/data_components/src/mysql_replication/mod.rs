@@ -604,7 +604,6 @@ pub enum ColumnTypeChanges {
 /// racing the snapshot are delivered at least once and converge via the
 /// accelerator's PK upsert — the same contract as the Postgres
 /// snapshot/WAL boundary.
-#[must_use]
 pub fn start_replication_stream(input: ReplicationStreamInput) -> ChangesStream {
     // `MySQL`'s binlog dump is server-wide with no server-side table filter, so a
     // dedicated per-dataset connection would just duplicate the whole stream for

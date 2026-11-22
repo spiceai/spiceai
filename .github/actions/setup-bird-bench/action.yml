@@ -22,21 +22,25 @@ runs:
   steps:
     - name: Configure apt mirrors (Linux)
       if: runner.os == 'Linux'
-      uses: ./.github/actions/configure-apt
+      uses: $/.github/actions/configure-apt
 
     - name: Prepare file-based data directory (Linux/macOS)
       if: runner.os != 'Windows'
       shell: bash
+      env:
+        INPUT_DATA_DIRECTORY: ${{ inputs.data_directory }}
       run: |
-        sudo rm -rf "${{ inputs.data_directory }}"
-        sudo mkdir -p "${{ inputs.data_directory }}"
-        sudo chown "$(whoami):$(id -gn)" -R "${{ inputs.data_directory }}"
+        sudo rm -rf "${INPUT_DATA_DIRECTORY}"
+        sudo mkdir -p "${INPUT_DATA_DIRECTORY}"
+        sudo chown "$(whoami):$(id -gn)" -R "${INPUT_DATA_DIRECTORY}"
 
     - name: Prepare file-based data directory (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
+      env:
+        INPUT_DATA_DIRECTORY: ${{ inputs.data_directory }}
       run: |
-        $dataDir = "${{ inputs.data_directory }}"
+        $dataDir = "${env:INPUT_DATA_DIRECTORY}"
         if (Test-Path $dataDir) { Remove-Item -Recurse -Force $dataDir }
         New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 
@@ -73,12 +77,16 @@ runs:
       id: configure_bird_bench
       if: runner.os != 'Windows'
       shell: bash
+      env:
+        INPUT_QUERYSET_NAME: ${{ inputs.queryset_name }}
+        INPUT_USE_EVIDENCE: ${{ inputs.use_evidence }}
+        INPUT_DATA_DIRECTORY: ${{ inputs.data_directory }}
       run: |
         set -euxo pipefail
 
         BIRD_BENCH_DIR="$GITHUB_WORKSPACE/bird-bench/dev_20240627"
         # Parse `bird-bench-small[<dataset>]` -> `<dataset>`
-        BIRD_BENCH_DATASET="${{ inputs.queryset_name }}"
+        BIRD_BENCH_DATASET="${INPUT_QUERYSET_NAME}"
         BIRD_BENCH_DATASET="${BIRD_BENCH_DATASET#bird-bench-small[}"
         BIRD_BENCH_DATASET="${BIRD_BENCH_DATASET%]}"
 
@@ -97,7 +105,7 @@ runs:
         sudo mkdir -p /opt/spiced/data
         sudo chown "$(whoami):$(id -gn)" /opt/spiced/data
 
-        if [ "${{ inputs.use_evidence }}" = "true" ]; then
+        if [ "${INPUT_USE_EVIDENCE}" = "true" ]; then
           jq -c --arg db "$BIRD_BENCH_DATASET" \
             '.[] | select(.db_id == $db) | { sql: .SQL, question: (.question + .evidence) }' "$BIRD_BENCH_DIR/dev.json" \
             > /opt/spiced/data/queryset.json
@@ -107,9 +115,9 @@ runs:
             > /opt/spiced/data/queryset.json
         fi
 
-        mv "$BIRD_BENCH_DIR" "${{ inputs.data_directory }}"
+        mv "$BIRD_BENCH_DIR" "${INPUT_DATA_DIRECTORY}"
 
-        DATASET_SPICEPOD="${{ inputs.data_directory }}dev_20240627/spicepods/$BIRD_BENCH_DATASET/spicepod.yaml"
+        DATASET_SPICEPOD="${INPUT_DATA_DIRECTORY}dev_20240627/spicepods/$BIRD_BENCH_DATASET/spicepod.yaml"
         if [ ! -f "$DATASET_SPICEPOD" ]; then
           echo "Error: Spicepod file not found at $DATASET_SPICEPOD"
           exit 1
@@ -131,11 +139,15 @@ runs:
       id: configure_bird_bench_windows
       if: runner.os == 'Windows'
       shell: pwsh
+      env:
+        INPUT_QUERYSET_NAME: ${{ inputs.queryset_name }}
+        INPUT_DATA_DIRECTORY: ${{ inputs.data_directory }}
+        INPUT_USE_EVIDENCE: ${{ inputs.use_evidence }}
       run: |
         $ErrorActionPreference = 'Stop'
         $birdBenchDir = "$env:GITHUB_WORKSPACE\bird-bench\dev_20240627"
         # Parse `bird-bench-small[<dataset>]` -> `<dataset>`
-        $birdBenchDataset = "${{ inputs.queryset_name }}"
+        $birdBenchDataset = "${env:INPUT_QUERYSET_NAME}"
         $birdBenchDataset = $birdBenchDataset -replace '^bird-bench-small\[', ''
         $birdBenchDataset = $birdBenchDataset -replace '\]$', ''
 
@@ -145,24 +157,24 @@ runs:
           refreshenv
         }
 
-        $dataDir = "${{ inputs.data_directory }}"
+        $dataDir = "${env:INPUT_DATA_DIRECTORY}"
         New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 
         $devJson = "$birdBenchDir\dev.json"
-        if ("${{ inputs.use_evidence }}" -eq "true") {
+        if ("${env:INPUT_USE_EVIDENCE}" -eq "true") {
           Get-Content $devJson | jq -c --arg db $birdBenchDataset '.[] | select(.db_id == $db) | { sql: .SQL, question: (.question + .evidence) }' | Set-Content -Path "$dataDir\queryset.json" -Encoding utf8
         } else {
           Get-Content $devJson | jq -c --arg db $birdBenchDataset '.[] | select(.db_id == $db) | { sql: .SQL, question: .question }' | Set-Content -Path "$dataDir\queryset.json" -Encoding utf8
         }
 
-        $destinationDir = Join-Path "${{ inputs.data_directory }}" "dev_20240627"
+        $destinationDir = Join-Path "${env:INPUT_DATA_DIRECTORY}" "dev_20240627"
         if (-not (Test-Path $destinationDir)) {
-          Move-Item -Path $birdBenchDir -Destination "${{ inputs.data_directory }}"
+          Move-Item -Path $birdBenchDir -Destination "${env:INPUT_DATA_DIRECTORY}"
         } else {
           Write-Host "Destination $destinationDir already exists. Skipping Move-Item."
         }
 
-        $datasetSpicepod = Join-Path "${{ inputs.data_directory }}" "dev_20240627\spicepods\$birdBenchDataset\spicepod.yaml"
+        $datasetSpicepod = Join-Path "${env:INPUT_DATA_DIRECTORY}" "dev_20240627\spicepods\$birdBenchDataset\spicepod.yaml"
         if (-not (Test-Path $datasetSpicepod)) {
           Write-Host "Error: Spicepod file not found at $datasetSpicepod"
           exit 1

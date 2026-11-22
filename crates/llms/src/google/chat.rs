@@ -415,6 +415,7 @@ fn convert_google_stream_response_to_openai(
             ChatChoiceStream {
                 index: idx as u32,
                 delta: ChatCompletionStreamResponseDelta {
+                    reasoning_content: None,
                     role: Some(Role::Assistant),
                     content,
                     tool_calls: tool_calls_opt,
