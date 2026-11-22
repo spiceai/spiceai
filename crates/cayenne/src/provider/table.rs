@@ -23326,10 +23326,18 @@ impl CayenneTableProvider {
     /// cannot hit this, but the method is `pub`, so the guard makes it safe by
     /// construction.
     ///
+    /// Waits for `compaction_lock` and holds it for the whole rewrite, as
+    /// [`Self::maybe_compact_small_files`] does. A background compaction
+    /// spawned by an earlier write would otherwise run alongside this rewrite,
+    /// commit first, and leave it to defer on the replaced snapshot and discard
+    /// its sorted output, so the table would keep the compaction's layout.
+    /// **Callers must not hold `compaction_lock`.**
+    ///
     /// # Errors
     ///
     /// Returns an error if reading, sorting, or rewriting fails.
     pub async fn sort_and_rewrite_data(&self, target_size_bytes: usize) -> Result<()> {
+        let _compaction_guard = self.compaction_lock.write().await;
         if self.inline_changes_unpublished() || self.has_inflight_staging_appends() {
             tracing::debug!(
                 table = %self.table_metadata.table_name,

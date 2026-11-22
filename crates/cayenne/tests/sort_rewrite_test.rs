@@ -921,3 +921,69 @@ async fn test_sort_rewrite_duplicate_values_impl(
 
     Ok(())
 }
+
+test_with_backends!(test_sort_rewrite_waits_for_a_running_compaction_impl);
+
+/// The rewrite waits for a compaction already holding the table, rather than
+/// running beside it. A compaction that committed while the rewrite sorted would
+/// replace the snapshot the rewrite read from, and the rewrite would then defer
+/// and discard its sorted output, leaving the compaction's layout in place.
+async fn test_sort_rewrite_waits_for_a_running_compaction_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+    let ctx = SessionContext::new();
+    let table = create_sorted_table(
+        &fixture,
+        "sort_waits",
+        Arc::clone(&schema),
+        vec!["id".to_string()],
+        ctx.runtime_env(),
+    )
+    .await;
+    sql_insert(&table, "sort_waits", "(3), (1), (2)").await;
+    let snapshot_before = table.current_snapshot_id();
+
+    // Stand in for a compaction pass: hold the table's compaction lock.
+    let compaction = table.hold_compaction().await;
+    let rewriting = Arc::clone(&table);
+    let mut rewrite = tokio::spawn(async move {
+        rewriting
+            .sort_and_rewrite_data(128 * 1024 * 1024)
+            .await
+            .map_err(|e| e.to_string())
+    });
+
+    // A rewrite of three rows that did not wait would finish well inside this
+    // bound; one that waits cannot finish at all while the lock is held.
+    let finished_while_held =
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut rewrite).await;
+    assert!(
+        finished_while_held.is_err(),
+        "the rewrite must wait for the compaction holding the table, but it finished \
+         with {finished_while_held:?}"
+    );
+    assert_eq!(
+        table.current_snapshot_id(),
+        snapshot_before,
+        "the rewrite must not commit while a compaction holds the table"
+    );
+
+    drop(compaction);
+    tokio::time::timeout(std::time::Duration::from_secs(60), rewrite)
+        .await
+        .expect("the rewrite finishes once the compaction releases the table")
+        .expect("rewrite task")
+        .expect("sort_and_rewrite_data");
+
+    assert_ne!(
+        table.current_snapshot_id(),
+        snapshot_before,
+        "the rewrite commits once it holds the table"
+    );
+    let results = query_all(&ctx, &table, "sort_waits").await;
+    assert_eq!(collect_i64_column(&results, "id"), vec![1, 2, 3]);
+
+    Ok(())
+}
