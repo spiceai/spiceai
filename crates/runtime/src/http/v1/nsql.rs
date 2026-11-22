@@ -711,8 +711,8 @@ async fn handle_nsql_query(
             res = chat_fut => match res {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::error!(target: "task_history", parent: &span, "Error running NQL model: {e}");
-                    tracing::error!("Error running NQL model: {e}");
+                    record_nsql_error(&span, &format!("Error running NSQL model: {e}"));
+                    tracing::error!("Error running NSQL model: {e}");
                     return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
                 }
             }
@@ -777,7 +777,10 @@ async fn handle_nsql_query(
                             }
                             Err(e) => {
                                 if num_retries >= DEFAULT_NSQL_RETRIES {
-                                    tracing::error!(target: "task_history", parent: &span, "Error collecting query results: {e}");
+                                    record_nsql_error(
+                                        &span,
+                                        &format!("Error collecting query results: {e}"),
+                                    );
                                     tracing::error!("Error collecting query results: {e}");
                                     return (StatusCode::BAD_REQUEST, headers, e.to_string());
                                 }
@@ -795,7 +798,7 @@ async fn handle_nsql_query(
                         // If query failed, retry with the updated context
 
                         if num_retries >= DEFAULT_NSQL_RETRIES {
-                            tracing::error!(target: "task_history", parent: &span, "Error executing query: {e}");
+                            record_nsql_error(&span, &format!("Error executing query: {e}"));
                             tracing::error!("Error executing query: {e}");
                             return (StatusCode::BAD_REQUEST, headers, e.to_string());
                         }
@@ -818,12 +821,18 @@ async fn handle_nsql_query(
                 );
             }
             Err(e) => {
-                tracing::error!(target: "task_history", parent: &span, "Error running NSQL model: {e}");
+                record_nsql_error(&span, &format!("Error running NSQL model: {e}"));
                 tracing::error!("Error running NSQL model: {e}");
                 return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
             }
         }
     }
+}
+
+/// Records a failure on the `nsql` task span so it reaches `runtime.task_history.error_message`.
+/// The exporter reads ERROR events attached to the span, and the handler runs outside it.
+fn record_nsql_error(span: &Span, message: &str) {
+    tracing::error!(target: "task_history", parent: span, "{message}");
 }
 
 async fn resolve_nsql_model_name(
@@ -1916,5 +1925,61 @@ mod tests {
             error,
             "No model specified and multiple compatible LLM models are configured (first_model, second_model). Include the 'model' field in the request."
         );
+    }
+
+    /// Collects the ERROR events recorded on each span, keyed by span name.
+    #[derive(Clone, Default)]
+    struct SpanErrorCapture(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+    struct MessageVisitor(String);
+
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for SpanErrorCapture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::ERROR {
+                return;
+            }
+            let Some(span) = ctx.event_span(event) else {
+                return;
+            };
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            if let Ok(mut errors) = self.0.lock() {
+                errors.push((span.name().to_string(), visitor.0));
+            }
+        }
+    }
+
+    #[test]
+    fn nsql_errors_are_recorded_on_the_nsql_span() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let capture = SpanErrorCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let message =
+            "invalid args: the prompt is 13858 tokens, and the model's context holds 8192";
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::span!(target: "task_history", tracing::Level::INFO, "nsql");
+            // The handler records the error after the span guard is gone, as it does at runtime.
+            record_nsql_error(&span, message);
+        });
+
+        let errors = capture.0.lock().expect("capture lock").clone();
+        assert_eq!(errors, vec![("nsql".to_string(), message.to_string())]);
     }
 }
