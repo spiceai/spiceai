@@ -452,8 +452,9 @@ pub fn kind(message: &str) -> String {
 }
 
 /// A failure's first line with what differs from run to run replaced: ports,
-/// paths, durations, attempt and iteration counts, timestamps, ids, file
-/// part numbers, instance namespaces and container names. JSON in the message
+/// paths, durations, attempt, iteration and unserved-partition counts,
+/// timestamps, ids, file part numbers, instance namespaces and container
+/// names. JSON in the message
 /// (a dataset status list, a schema's metadata) is written with sorted keys,
 /// since its key order varies from run to run. Unstructured detail after the
 /// failure itself is dropped: a row dump (` --- `) and a memory report. Error
@@ -490,6 +491,8 @@ fn normalized(message: &str) -> String {
             (r"PageType \d+", "PageType <n>"),
             (r"([A-Za-z])\[\d+\]", "$1[<n>]"),
             (r"\d+ of \d+ iterations", "<n> of <m> iterations"),
+            // How many partitions a lost executor held is placement.
+            (r"\b\d+ of its \d+ partitions", "<n> of its <m> partitions"),
             (r"part-\d+", "part-<n>"),
             (r"\b\d+(\.\d+)?\s?(ns|µs|us|ms|s|m|h)\b", "<duration>"),
         ]
@@ -610,6 +613,14 @@ mod tests {
                 "still failing after 61 attempts over 30s: Spice rejected the query: tcp connect error 127.0.0.1:61234 in /Users/x/work/a.log at 2026-10-19T05:05:42.001Z\nmore"
             ),
             "still failing after <n> attempts over <duration>: Spice rejected the query: tcp connect error 127.0.0.1:<port> in <path> at <time>"
+        );
+        assert_eq!(
+            signature(
+                "Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query"
+            ),
+            signature(
+                "Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query"
+            ),
         );
         assert_eq!(
             signature(

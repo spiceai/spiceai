@@ -9,28 +9,6 @@
       "group": "cluster-sql"
     }
   ],
-  "cluster-literals": [
-    {
-      "run": "cluster-literals",
-      "who": "default",
-      "key": "start: {}",
-      "kind": "status",
-      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:public.e\",\"name\":\"e\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
-      "varies": true,
-      "group": "cluster-sql",
-      "may-pass": true
-    }
-  ],
-  "cluster-nan-literal": [
-    {
-      "run": "cluster-nan-literal",
-      "who": "default",
-      "key": "start: {}",
-      "kind": "status",
-      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:public.e\",\"name\":\"e\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
-      "group": "cluster-sql"
-    }
-  ],
   "cluster-text-search": [
     {
       "run": "cluster-text-search",
