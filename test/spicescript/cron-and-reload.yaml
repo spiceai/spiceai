@@ -74,8 +74,9 @@ steps:
   - query: SELECT id, v FROM v
     oracle-sql: SELECT id, v FROM t WHERE id <= 10
     eventually: 30s
-  # The yearly schedule (midnight UTC on 1 January) has not run; an hourly one
-  # would fire during any run that crosses the top of an hour.
+  # The yearly schedule (midnight on 1 January, in the runtime's local time
+  # zone) has not run; an hourly one would fire during any run that crosses
+  # the top of an hour.
   - query: SELECT count(*) AS n FROM slow_cron
     expect: { rows: [['100']] }
     consistently: 5s
