@@ -7,7 +7,9 @@ name: Trunk tests
 # when its failures go unaddressed. Add a job here, and to `needs` of the
 # `Trunk tests` job at the end, to move a test out of the merge queue.
 #
-# Today it runs spicescript (tools/spicescript):
+# It runs the nextest tests the gate leaves to after merge (`make
+# nextest-post-merge`, NEXTEST_POST_MERGE_FILTER in the Makefile), and spicescript
+# (tools/spicescript):
 # - every script in test/spicescript, including those tagged `long`, which the
 #   merge queue skips;
 # - test/spicescript/known-failing: scripts that reproduce open bugs. Each must
@@ -394,13 +396,87 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  # The nextest tests that sign-off and the merge queue skip: the SF1
+  # result-correctness lanes, which compare Cayenne with standalone DuckDB and
+  # SQLite, and the tuning simulation's report. Built from source at the commit
+  # this run tests, as correctness_chdb.yml builds its lane, since the E2E build
+  # holds no test binaries.
+  nextest:
+    environment: ci
+    name: nextest (post-merge)
+    needs: resolve
+    runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials for the build cache
+    # The lanes took 607s one at a time on a quiet Mac, and the shared runners
+    # have been measured at up to 4.6x slower; the rest is building `cayenne`.
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Restore Cargo registry
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Set up Rust
+        uses: $/.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: $/.github/actions/setup-nextest
+
+      - name: Set up make
+        uses: $/.github/actions/setup-make
+
+      - name: Set up cc
+        uses: $/.github/actions/setup-cc
+
+      - name: Install protoc
+        uses: $/.github/actions/install-protoc
+
+      - name: Get RustFS credentials
+        id: rustfs
+        continue-on-error: true
+        uses: $/.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '7200'
+          export-env: 'false'
+
+      - name: Set up sccache
+        uses: $/.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+
+      - name: Run the post-merge nextest tests
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+        run: make nextest-post-merge
+
   # The run's one verdict, which Trunk Health reads: it succeeds only if every
   # job above succeeded or was skipped, and names the jobs that did not.
   summary:
     environment: secret-free
     name: Trunk tests
     if: ${{ !cancelled() }}
-    needs: [resolve, build, spicescript]
+    needs: [resolve, build, spicescript, nextest]
     runs-on: spiceai-dev-runners
     timeout-minutes: 5
     steps:
