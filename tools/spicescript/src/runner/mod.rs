@@ -369,7 +369,9 @@ pub struct Target {
     pub binary: PathBuf,
 }
 
+#[derive(Clone)]
 pub struct Options {
+    pub repetition: Option<u32>,
     pub targets: Vec<Target>,
     /// `--from`: the binary every instance starts on, in place of any
     /// script's `from:`; an `upgrade` step moves it to its target's.
@@ -658,8 +660,12 @@ pub async fn run_script(script: &Script, options: &Options, slots: &Slots) -> Re
             let script_busy = Arc::clone(&script_busy);
             async move {
                 let run_label = script.run_label(&combo);
+                let repetition = options
+                    .repetition
+                    .map(|index| format!("-repetition-{index}"))
+                    .unwrap_or_default();
                 let run_id = format!(
-                    "{}-{combo_index}-{}",
+                    "{}-{combo_index}{repetition}-{}",
                     sanitize(&script.name),
                     std::process::id()
                 );

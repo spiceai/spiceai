@@ -42,6 +42,7 @@ fn main() -> Result<(), String> {
                 "table-seq",
                 "delete-coverage",
                 "pk-index-checkpoint",
+                "mem-tier-seal-delete-only",
                 "seq-order-2-exhaust",
                 "seq-order-two-writers-2-exhaust",
                 "commits-retry",

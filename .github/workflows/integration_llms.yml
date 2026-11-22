@@ -395,7 +395,7 @@ jobs:
       - name: Set up the C and C++ toolchain
         uses: $/.github/actions/setup-cc
 
-      - name: Run the llama.cpp engine's model, content-part, differential, greedy-pick, Harmony, MTP, prefix-reuse, Hugging Face resolution and unsupported-architecture tests
+      - name: Run the llama.cpp engine's model, content-part, differential, greedy-pick, Harmony, Inkling, MTP, prefix-reuse, Hugging Face resolution and unsupported-architecture tests
         env:
           # Metal runners do not have `xcrun metal`
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
@@ -405,4 +405,4 @@ jobs:
         # discards every model's queued work, failing tests that did nothing wrong. Four at a
         # time still hangs the M3 Pro runners' GPU.
         run: |
-          cargo test -p llms-llamacpp --features metal --test integration -- --test-threads=1 model:: batching:: content_parts:: differential:: distributed:: greedy:: harmony:: mtp:: prefix_reuse:: sequences:: system_messages:: hf_resolution:: unsupported::
+          cargo test -p llms-llamacpp --features metal --test integration -- --test-threads=1 model:: batching:: content_parts:: differential:: distributed:: greedy:: harmony:: inkling:: mtp:: prefix_reuse:: sequences:: system_messages:: hf_resolution:: unsupported::

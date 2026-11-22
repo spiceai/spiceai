@@ -54,8 +54,6 @@ The default distribution includes the standard data and AI/ML feature set. This 
 - HTTP-backed function servers (`http-functions` feature)
 - WebAssembly user-defined functions (`wasm-functions` feature; Rust source compilation additionally requires `wasm-functions-compile`)
 
-> **Note:** The PostgreSQL data accelerator is only available in nightly builds. The PostgreSQL data connector is included in all distributions.
-
 **Installation:**
 
 ```bash

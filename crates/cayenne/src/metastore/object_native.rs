@@ -114,6 +114,12 @@ pub struct NativeCatalogConfig {
     /// The first wait between those retries, and between background reopen
     /// attempts; each later wait doubles, up to 64 times this.
     pub retry_delay: std::time::Duration,
+    /// Commit each change to a dataset's log as its own record when it is
+    /// staged, even inside a deferred scope, instead of at the scope's
+    /// acknowledgement point. Then every staging call is one record, so a test
+    /// can count how many calls an operation stages its changes in. `false` in
+    /// production: a CDC apply's changes and its source position share a record.
+    pub commit_each_change: bool,
 }
 
 impl Default for NativeCatalogConfig {
@@ -128,6 +134,7 @@ impl Default for NativeCatalogConfig {
             transaction_deadline: std::time::Duration::from_secs(60),
             publish_attempts: 8,
             retry_delay: std::time::Duration::from_millis(100),
+            commit_each_change: false,
         }
     }
 }
