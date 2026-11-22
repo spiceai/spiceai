@@ -665,15 +665,13 @@ const BATCH_ROWS: usize = 65_536;
 /// finished writing one there — the same reuse rule as the TPC-H and SSB
 /// fixtures.
 pub fn ensure_tpcds_fixture(out_dir: &Path, scale_factor: f64) {
-    let _lock = super::lock_fixture(out_dir);
     let revision = super::generator_revision(include_str!("tpcds_data.rs"));
-    if super::fixture_is_current(out_dir, &revision) {
-        return;
-    }
-    let _ = std::fs::remove_dir_all(out_dir);
-    std::fs::create_dir_all(out_dir).expect("tpcds out dir");
-    write_tpcds_parquet(out_dir, scale_factor);
-    super::mark_fixture_complete(out_dir, &revision);
+    super::ensure_fixture(out_dir, &revision, |dir| {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("tpcds out dir");
+        write_tpcds_parquet(dir, scale_factor);
+        true
+    });
 }
 
 fn write_tpcds_parquet(out_dir: &Path, scale_factor: f64) {
