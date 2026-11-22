@@ -37,7 +37,7 @@ use arrow::{
     datatypes::{DataType, Field, SchemaRef, TimeUnit},
 };
 use async_stream::try_stream;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use snafu::{OptionExt, ResultExt};
 use tokio_postgres::NoTls;
 use tokio_postgres::types::Type;
@@ -72,7 +72,7 @@ const BATCHES_PER_READER: usize = 2;
 pub fn snapshot_stream(
     input: SnapshotInput,
 ) -> Result<impl Stream<Item = std::result::Result<ChangeEnvelope, StreamError>> + Send + use<>> {
-    snapshot_stream_inner(input, PAGES_PER_READER, None)
+    Ok(snapshot_stream_inner(input, PAGES_PER_READER, None))
 }
 
 /// Internal integration-test entry point: exercise heap splitting without a
@@ -83,7 +83,11 @@ pub fn snapshot_stream_for_test(
     pages_per_reader: std::num::NonZeroU32,
     readers: Arc<std::sync::atomic::AtomicUsize>,
 ) -> Result<impl Stream<Item = std::result::Result<ChangeEnvelope, StreamError>> + Send + use<>> {
-    snapshot_stream_inner(input, pages_per_reader.get(), Some(readers))
+    Ok(snapshot_stream_inner(
+        input,
+        pages_per_reader.get(),
+        Some(readers),
+    ))
 }
 
 /// Own the connection driver as well as the client: aborting a reader or
@@ -137,9 +141,9 @@ fn snapshot_stream_inner(
     input: SnapshotInput,
     pages_per_reader: u32,
     readers_observer: Option<Arc<std::sync::atomic::AtomicUsize>>,
-) -> Result<impl Stream<Item = std::result::Result<ChangeEnvelope, StreamError>> + Send + use<>> {
+) -> impl Stream<Item = std::result::Result<ChangeEnvelope, StreamError>> + Send + use<> {
     // Keep the existing try_stream envelope/error contract at the WAL boundary.
-    Ok(try_stream! {
+    try_stream! {
         let input = Arc::new(input);
         let holder = connect(&input).await.map_err(super::err_to_stream)?;
         let relation = format!("{}.{}", quote_ident(&input.schema_name), quote_ident(&input.table_name));
@@ -226,12 +230,15 @@ fn snapshot_stream_inner(
             } else {
                 let lo = u64::from(pages) * reader as u64 / readers as u64;
                 // ONLY keeps concurrent INHERIT from changing the scanned relation set.
-                let mut sql = format!("SELECT {select_list} FROM ONLY {relation} WHERE ctid >= '({lo},0)'::tid");
-                if reader + 1 < readers {
+                // The last range is open-ended so pages added after `relpages`
+                // was sampled are still read.
+                let upper = if reader + 1 < readers {
                     let hi = u64::from(pages) * (reader + 1) as u64 / readers as u64;
-                    sql.push_str(&format!(" AND ctid < '({hi},0)'::tid"));
-                }
-                sql
+                    format!(" AND ctid < '({hi},0)'::tid")
+                } else {
+                    String::new()
+                };
+                format!("SELECT {select_list} FROM ONLY {relation} WHERE ctid >= '({lo},0)'::tid{upper}")
             };
             let holder_connection = if reader == 0 { holder.take() } else { None };
             let input = Arc::clone(&input);
@@ -316,7 +323,7 @@ fn snapshot_stream_inner(
         );
         // Readiness remains lag-based; shared.rs appends the watermark only on success.
         yield envelope_with_lsn(final_batch, confirmed_flush, 0, false, input.dataset_name.clone());
-    })
+    }
 }
 
 /// Scan one transaction using exactly the bootstrap's existing Arrow conversion
@@ -360,7 +367,6 @@ async fn scan_reader(
     // column layout.
     let mut column_map: Option<Vec<usize>> = None;
 
-    use futures::StreamExt;
     while let Some(row_result) = portal_stream.next().await {
         // Buffered rows can otherwise keep conversion running without yielding.
         tokio::task::consume_budget().await;
