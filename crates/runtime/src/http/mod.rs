@@ -374,7 +374,6 @@ pub(crate) fn test_tls_acceptor() -> TlsAcceptor {
 mod tests {
     use super::*;
     use axum::{Router, routing::get};
-    use futures::future;
     use http::StatusCode;
     use std::time::Duration;
     use tokio::{io::AsyncReadExt, net::TcpListener, sync::watch, time::timeout};
@@ -382,17 +381,6 @@ mod tests {
     // Router that immediately responds with "ok"
     fn ok_router() -> Router {
         Router::new().route("/", get(|| async { "ok" }))
-    }
-
-    // Router that never responds (simulate a hanging request)
-    fn pending_router() -> Router {
-        Router::new().route(
-            "/",
-            get(|| async {
-                future::pending::<()>().await;
-                "pending"
-            }),
-        )
     }
 
     #[tokio::test]
@@ -444,44 +432,96 @@ mod tests {
             .expect("should complete shutdown notification");
     }
 
+    /// A shutdown closes a connection that has no request in flight, and the connection's task
+    /// then drops its shutdown receiver.
     #[tokio::test]
     async fn test_process_tcp_stream_graceful_shutdown() {
-        // Bind a listener on a system assigned available port
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("to create listener");
         let addr = listener.local_addr().expect("to get local addr");
         let (shutdown_notify, shutdown_rx) = watch::channel(());
 
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("to accept connection");
-            process_tcp_stream(stream, pending_router(), shutdown_rx);
-        });
-
-        // the request handler will hang until the connection is closed
-        let request_completion_handle = tokio::spawn(async move {
-            let client = build_test_http_client();
-            client.get(format!("http://{addr}/")).send().await
-        });
-
+        let mut client = TcpStream::connect(addr).await.expect("to connect");
+        let (stream, _) = listener.accept().await.expect("to accept connection");
+        process_tcp_stream(stream, ok_router(), shutdown_rx);
         assert_eq!(
             shutdown_notify.receiver_count(),
             1,
             "Must be one active connection"
         );
-        assert!(
-            !request_completion_handle.is_finished(),
-            "Request should not be completed"
-        );
 
-        // Verify that the shutdown will close the active request and drop all receivers
         shutdown_notify.send(()).ok();
-        let _ = timeout(Duration::from_secs(5), request_completion_handle)
+        let mut byte = [0u8; 1];
+        let read = timeout(Duration::from_secs(5), client.read(&mut byte))
             .await
-            .expect("should complete request after shutdown");
+            .expect("the server should close an idle connection after shutdown")
+            .expect("to read from the connection");
+        assert_eq!(read, 0, "the server should close the connection, not write");
         timeout(Duration::from_secs(1), shutdown_notify.closed())
             .await
             .expect("should complete shutdown notification");
+    }
+
+    /// A shutdown lets a request that is already being handled finish: the client gets its
+    /// response, and then the connection closes and its task drops its shutdown receiver.
+    #[tokio::test]
+    async fn test_process_tcp_stream_graceful_shutdown_finishes_the_request_in_flight() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("to create listener");
+        let addr = listener.local_addr().expect("to get local addr");
+        let (shutdown_notify, shutdown_rx) = watch::channel(());
+
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let router = {
+            let (arrived, release) = (Arc::clone(&arrived), Arc::clone(&release));
+            Router::new().route(
+                "/",
+                get(move || async move {
+                    arrived.notify_one();
+                    release.notified().await;
+                    "finished"
+                }),
+            )
+        };
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("to accept connection");
+            process_tcp_stream(stream, router, shutdown_rx);
+        });
+        let client = build_test_http_client();
+        let request = tokio::spawn(async move {
+            client
+                .get(format!("http://{addr}/"))
+                .send()
+                .await?
+                .text()
+                .await
+        });
+        timeout(Duration::from_secs(5), arrived.notified())
+            .await
+            .expect("the request should reach its handler");
+
+        // The handler cannot finish before `release`, so when the connection's task next runs,
+        // the shutdown is the only branch of its select that is ready.
+        shutdown_notify.send(()).ok();
+        tokio::task::yield_now().await;
+        assert!(
+            !request.is_finished(),
+            "the shutdown must not end a request in flight"
+        );
+
+        release.notify_one();
+        let body = timeout(Duration::from_secs(5), request)
+            .await
+            .expect("the request should finish once its handler does")
+            .expect("the request task should not panic")
+            .expect("the request in flight should get its response");
+        assert_eq!(body, "finished");
+        timeout(Duration::from_secs(5), shutdown_notify.closed())
+            .await
+            .expect("the connection should close after its request in flight");
     }
 
     /// A small `/v1/sql` result leaves the server as several short writes (the
