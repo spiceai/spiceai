@@ -1209,7 +1209,11 @@ fn change_text(change: &Change) -> String {
 /// each delete pointing at the rows of its key at or below its sequence.
 fn draw_catalog(svg: &mut crate::explorer::Svg, y: usize, catalog: &Catalog) -> usize {
     use crate::explorer::Tone;
-    svg.heading(0, y, "DURABLE CATALOG (survives a restart)");
+    svg.heading(
+        0,
+        y,
+        "DURABLE CATALOG (survives a restart; delete arrows show sequences, AFTER A RESTART shows what is visible)",
+    );
     let y = y + 22;
     let mut lines = vec![
         format!("sequence high {}", catalog.high),
@@ -1262,10 +1266,17 @@ fn draw_catalog(svg: &mut crate::explorer::Svg, y: usize, catalog: &Catalog) -> 
         placed.push((rows, node));
     }
     for (i, v) in catalog.vectors.iter().enumerate() {
-        for (key, &(d, _)) in v.iter().enumerate() {
+        for (key, &(d, stamp)) in v.iter().enumerate() {
             if d == 0 {
                 continue;
             }
+            // The sequences only: whether the row stays visible depends on the
+            // insert stamp and the part it lives in, which "after a restart" shows.
+            let label = if stamp > 0 {
+                format!("delete <= {d}, insert stamp {stamp}")
+            } else {
+                format!("delete <= {d}")
+            };
             for (rows, node) in &placed {
                 for (j, r) in rows.iter().enumerate() {
                     if r.key == key && r.seq <= d {
@@ -1273,7 +1284,7 @@ fn draw_catalog(svg: &mut crate::explorer::Svg, y: usize, catalog: &Catalog) -> 
                             (head.right(), head.line_y(vectors_at + i)),
                             (node.x, node.line_y(j)),
                             Tone::Gone,
-                            Some("covers"),
+                            Some(&label),
                         );
                     }
                 }
@@ -1454,4 +1465,31 @@ pub(crate) fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<
         });
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::{Action, Protocol};
+    use stateright::{Model, Path};
+
+    /// After a full rewrite and a seal, the delete vector's insert stamp keeps
+    /// the current-file row visible, so the drawing states the delete and the
+    /// stamp rather than claiming the row is covered.
+    #[test]
+    fn delete_arrows_state_sequences_not_visibility() {
+        let model = Protocol::new("mem-tier-current", 3);
+        let init = model.init_states().remove(0);
+        let actions = [
+            Action::FullRewriteCapture,
+            Action::FullRewrite,
+            Action::Upsert(0, 10),
+            Action::SealCapture,
+            Action::SealStage,
+            Action::SealEnd,
+        ];
+        let path = Path::from_actions(&model, init, &actions).expect("enabled trace");
+        let svg = model.as_svg(path).expect("mem-tier draws");
+        assert!(!svg.contains(">covers<"), "{svg}");
+        assert!(svg.contains(">delete &lt;= 2, insert stamp 4<"), "{svg}");
+    }
 }
