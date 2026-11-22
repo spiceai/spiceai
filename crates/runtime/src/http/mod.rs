@@ -507,7 +507,9 @@ mod tests {
             .expect("the request should reach its handler");
 
         // The handler cannot finish before `release`, so when the connection's task next runs,
-        // the shutdown is the only branch of its select that is ready.
+        // the shutdown is the only branch of its select that is ready. On this current-thread
+        // runtime, `yield_now` runs every queued task, the connection's among them, before the
+        // test resumes, so the shutdown reaches the connection before the handler is released.
         shutdown_notify.send(()).ok();
         tokio::task::yield_now().await;
         assert!(
