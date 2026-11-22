@@ -7,7 +7,8 @@ name: Trunk tests
 # when its failures go unaddressed. Add a job here, and to `needs` of the
 # `Trunk tests` job at the end, to move a test out of the merge queue.
 #
-# Today it runs spicescript (tools/spicescript):
+# It runs the model integration tests (integration_llms.yml) and spicescript
+# (tools/spicescript):
 # - every script in test/spicescript, including those tagged `long`, which the
 #   merge queue skips;
 # - test/spicescript/known-failing: scripts that reproduce open bugs. Each must
@@ -394,13 +395,30 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  # The model integration tests (integration_llms.yml), on the commit this run
+  # tests: local models and the hosted providers. They run here and on pushes
+  # that touch the model crates, not in the merge queue.
+  models:
+    name: Model tests
+    needs: resolve
+    uses: ./.github/workflows/integration_llms.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+    # The called jobs' own permissions, which a caller must grant: the test
+    # job exchanges its OIDC token for provider access tokens.
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    secrets: inherit
+
   # The run's one verdict, which Trunk Health reads: it succeeds only if every
   # job above succeeded or was skipped, and names the jobs that did not.
   summary:
     environment: secret-free
     name: Trunk tests
     if: ${{ !cancelled() }}
-    needs: [resolve, build, spicescript]
+    needs: [resolve, build, spicescript, models]
     runs-on: spiceai-dev-runners
     timeout-minutes: 5
     steps:
