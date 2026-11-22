@@ -39,7 +39,7 @@ datasets:
     name: orders
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: snapshot
       snapshots: bootstrap_only

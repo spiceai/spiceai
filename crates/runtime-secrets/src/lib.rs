@@ -252,7 +252,7 @@ impl Secrets {
     /// end of the precedence order — i.e. consulted **last** by the
     /// `${ secrets:KEY }` walk, after every spicepod-declared store.
     ///
-    /// Does **not** survive [`Self::load_from`], which clears the registry.
+    /// Does **not** survive [`Self::load_from`], which replaces the registry.
     /// A store that must outlive a spicepod reload belongs in
     /// [`Self::register_builtin_store`].
     pub fn register_store(&mut self, name: impl Into<String>, store: Arc<dyn SecretStore>) {
@@ -261,7 +261,7 @@ impl Secrets {
 
     /// Registers a store the runtime owns: appended at the lowest precedence
     /// like [`Self::register_store`], but **re-applied after every
-    /// [`Self::load_from`]** instead of being cleared with the
+    /// [`Self::load_from`]** instead of being replaced with the
     /// spicepod-declared stores.
     ///
     /// This is how control-plane-delivered secrets participate in the default
@@ -276,15 +276,16 @@ impl Secrets {
         self.stores.insert(name, store);
     }
 
-    /// Append the built-in stores at the end of the precedence order.
+    /// Append noncolliding built-in stores at the end of `stores`.
     ///
-    /// Called at the very end of [`Self::load_from`], after the `reverse()`
-    /// that establishes spicepod precedence, so a built-in is consulted last —
-    /// a user-declared store holding the same key wins. `entry` keeps a
-    /// spicepod store of the same name authoritative over the built-in.
-    fn append_builtin_stores(&mut self) {
+    /// Called on the replacement map at the end of [`Self::load_from`], after
+    /// the `reverse()` that establishes spicepod precedence, so a built-in is
+    /// consulted last — a user-declared store holding the same key wins.
+    /// `entry` keeps a spicepod store of the same name authoritative over the
+    /// built-in.
+    fn append_builtin_stores_into(&self, stores: &mut IndexMap<String, Arc<dyn SecretStore>>) {
         for (name, store) in &self.builtin_stores {
-            self.stores
+            stores
                 .entry(name.clone())
                 .or_insert_with(|| Arc::clone(store));
         }
@@ -302,13 +303,20 @@ impl Secrets {
     /// original initialization error instead of reporting the store as
     /// undefined.
     ///
+    /// On error or cancellation before this method returns `Ok`, the previously
+    /// published store map is left intact (including any built-ins registered
+    /// through [`Self::register_builtin_store`]).
+    ///
     /// # Errors
     ///
     /// Returns an error when the `from` field references an unknown store or when a store
     /// requires (or disallows) a selector and the config is invalid.
     pub async fn load_from(&mut self, secrets: &[SpicepodSecret]) -> Result<()> {
-        self.stores.clear();
-        self.scheduler_search = None;
+        // Build the replacement registry off to the side. The live
+        // `self.stores` map (and `scheduler_search`) stay untouched until
+        // every configured provider validates, so a failed or cancelled
+        // reload cannot drop a retained built-in or leave the active map
+        // empty mid-flight.
 
         // Restore trunk's non-overwriting export of the default `.env` /
         // `.env.local` before any store initializes. AWS Secrets Manager
@@ -324,6 +332,7 @@ impl Secrets {
         // already did.
         let bootstrap_env: Arc<dyn SecretStore> = load_default_store();
 
+        let mut next_stores: IndexMap<String, Arc<dyn SecretStore>> = IndexMap::new();
         let mut any_healthy_store_loaded = false;
         for secret in secrets {
             let store_type = spicepod_secret_store_type(secret, bootstrap_env.as_ref()).await?;
@@ -350,7 +359,7 @@ impl Secrets {
                 }
             };
 
-            self.stores.insert(secret.name.clone(), secret_store);
+            next_stores.insert(secret.name.clone(), secret_store);
         }
 
         if !any_healthy_store_loaded {
@@ -361,17 +370,23 @@ impl Secrets {
             // so `${ env:KEY }` / `${ secrets:KEY }` resolve as before.
             // `or_insert_with` keeps a user-configured store named `env` (or
             // its placeholder) authoritative over the implicit default.
-            self.stores
+            next_stores
                 .entry("env".to_string())
                 .or_insert_with(load_default_store_exporting);
         }
 
         // Reverse the order of the secret stores to maintain the expected precedence order.
-        self.stores.reverse();
+        next_stores.reverse();
 
         // After the reverse, so built-ins land at the lowest precedence — a
         // user-declared store holding the same key still wins.
-        self.append_builtin_stores();
+        self.append_builtin_stores_into(&mut next_stores);
+
+        // Publish transactionally: swap the live map only after validation
+        // and built-in re-attachment succeeded. Mirror the prior success-path
+        // reset of `scheduler_search` here so a failed reload cannot clear it.
+        self.stores = next_stores;
+        self.scheduler_search = None;
 
         Ok(())
     }
@@ -520,6 +535,72 @@ impl Secrets {
         }
     }
 
+    /// Like [`Self::get_secret`], but a miss is an error when any consulted
+    /// store failed: the failed store may hold the key, so the caller must not
+    /// treat the miss as definitive.
+    ///
+    /// For the scheduler's `ExpandSecret`, so an executor's strict lookup sees
+    /// a partial outage as a (retriable) store error rather than "not found".
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no store holds the key and at least one consulted
+    /// store failed.
+    pub async fn get_secret_or_outage(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
+        if let Some(search) = &self.scheduler_search {
+            return search.get_secret(key).await;
+        }
+        self.get_secret_from_or_outage(key, |_| true).await
+    }
+
+    /// [`Self::get_secret_from_stores`] with the partial-outage semantics of
+    /// [`Self::get_secret_or_outage`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no allowed store holds the key and at least one
+    /// consulted store failed.
+    pub async fn get_secret_from_stores_or_outage(
+        &self,
+        key: &str,
+        allowed_stores: &HashSet<String>,
+    ) -> AnyErrorResult<Option<SecretString>> {
+        self.get_secret_from_or_outage(key, |store_name| allowed_stores.contains(store_name))
+            .await
+    }
+
+    async fn get_secret_from_or_outage(
+        &self,
+        key: &str,
+        allow: impl Fn(&str) -> bool,
+    ) -> AnyErrorResult<Option<SecretString>> {
+        let mut failed: Vec<String> = Vec::new();
+        for (store_name, store) in &self.stores {
+            if !allow(store_name) {
+                continue;
+            }
+            match store.get_secret(key).await {
+                Ok(Some(secret)) => return Ok(Some(secret)),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "Secret store `{store_name}` failed while looking up secret `{key}`: {e}. Trying the next store in precedence order."
+                    );
+                    failed.push(format!("`{store_name}`: {e}"));
+                }
+            }
+        }
+        if failed.is_empty() {
+            Ok(None)
+        } else {
+            Err(format!(
+                "secret `{key}` was not found, and some secret stores failed while looking it up ({})",
+                failed.join("; ")
+            )
+            .into())
+        }
+    }
+
     /// Reports whether a `${ store_name:key }` reference would resolve,
     /// without exposing the value.
     ///
@@ -597,6 +678,9 @@ impl Secrets {
     /// Internal helper for [`Self::inject_secrets`]. Returns the value
     /// wrapped in a [`SecretString`] (never a plain `String`) so the caller
     /// can splice the bytes without an intermediate non-zeroizing allocation.
+    ///
+    /// Logs the failure and returns `None` when the reference cannot be
+    /// resolved; the caller substitutes the empty string (the lenient path).
     async fn lookup_for_injection(
         &self,
         param_str: &str,
@@ -607,62 +691,221 @@ impl Secrets {
         // component layer then reports as "missing required parameter" without any
         // back-reference to the failed secret lookup. Include enough context in the
         // error branches (store, key, source of reference) that users can tie cause
-        // to effect. The store-list is allocated lazily — `inject_secrets` calls this
-        // in a tight loop for every `${...}` substitution, so we don't pay for it on
-        // the hot (success) path.
-        let configured_stores = || self.stores.keys().cloned().collect::<Vec<_>>().join(", ");
-
-        // Special case: the `secrets:` sentinel means "walk the registry in
-        // precedence order", which matches `get_secret`.
-        if store_name == SECRETS {
-            return match self.get_secret(key).await {
-                Ok(Some(secret)) => Some(secret),
-                Ok(None) => {
-                    tracing::error!(
-                        "Secret `${{ secrets:{key} }}` (referenced by `{}`) not found in any configured secret store (searched: [{}]). The parameter will be empty, which typically surfaces later as a missing/invalid parameter. Docs: https://spiceai.org/docs/components/secret-stores",
-                        param_str,
-                        configured_stores()
-                    );
-                    None
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Error looking up secret `${{ secrets:{key} }}` (referenced by `{}`): {e}",
-                        param_str
-                    );
-                    None
-                }
-            };
-        }
-
-        let Some(store) = self.stores.get(store_name) else {
-            tracing::error!(
-                "Secret reference `${{ {store_name}:{key} }}` in `{}` uses an undefined store `{store_name}`. Configured stores: [{}]. Add a `secrets:` entry in spicepod.yaml with `from: {store_name}`, or use one of the configured stores. Docs: https://spiceai.org/docs/components/secret-stores",
-                param_str,
-                configured_stores()
-            );
-            return None;
-        };
-
-        match store.get_secret(key).await {
-            Ok(Some(secret)) => Some(secret),
-            Ok(None) => {
+        // to effect.
+        match self.resolve_reference(store_name, key).await {
+            Ok(secret) => Some(secret),
+            Err(failure) => {
                 tracing::error!(
-                    "Secret `${{ {store_name}:{key} }}` (referenced by `{}`) not found in secret store `{store_name}`. The parameter will be empty. Docs: https://spiceai.org/docs/components/secret-stores",
-                    param_str
-                );
-                None
-            }
-            Err(e) => {
-                tracing::error!(
-                    "Error looking up secret `${{ {store_name}:{key} }}` (referenced by `{}`): {e}",
-                    param_str
+                    "{} (referenced by `{param_str}`). The parameter will be empty, which typically surfaces later as a missing/invalid parameter. Docs: https://spiceai.org/docs/components/secret-stores",
+                    failure.cause
                 );
                 None
             }
         }
     }
+
+    /// Resolves one `${ store_name:key }` reference.
+    ///
+    /// The `secrets:` sentinel walks the registry in precedence order (as
+    /// [`Self::get_secret`] does); any other name targets that store directly.
+    /// The failure describes the cause without any secret value. The store
+    /// list is allocated lazily, only on the failure path, because
+    /// `inject_secrets` calls this for every `${...}` substitution.
+    async fn resolve_reference(
+        &self,
+        store_name: &str,
+        key: &str,
+    ) -> std::result::Result<SecretString, UnresolvedSecretReference> {
+        let configured_stores = || self.stores.keys().cloned().collect::<Vec<_>>().join(", ");
+        let failure = |kind: UnresolvedSecretKind, cause: String| UnresolvedSecretReference {
+            reference: format!("${{ {store_name}:{key} }}"),
+            kind,
+            cause,
+        };
+
+        if store_name == SECRETS {
+            // A cluster executor resolves through the scheduler, which owns
+            // the precedence walk.
+            if let Some(search) = &self.scheduler_search {
+                return match search.get_secret(key).await {
+                    Ok(Some(secret)) => Ok(secret),
+                    Ok(None) => Err(failure(
+                        UnresolvedSecretKind::NotFound,
+                        format!("Secret `${{ secrets:{key} }}` not found by the scheduler"),
+                    )),
+                    Err(e) => Err(failure(
+                        UnresolvedSecretKind::StoreError,
+                        format!("Error looking up secret `${{ secrets:{key} }}`: {e}"),
+                    )),
+                };
+            }
+
+            // Same walk as `get_secret_from`, but remembers whether any store
+            // failed: a miss in the healthy stores plus an outage in another
+            // is not a definitive "not found", since the failed store may hold
+            // the key once it recovers.
+            let mut failed: Vec<String> = Vec::new();
+            for (name, store) in &self.stores {
+                match store.get_secret(key).await {
+                    Ok(Some(secret)) => return Ok(secret),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "Secret store `{name}` failed while looking up secret `{key}`: {e}. Trying the next store in precedence order."
+                        );
+                        failed.push(format!("`{name}`: {e}"));
+                    }
+                }
+            }
+            return Err(if failed.is_empty() {
+                failure(
+                    UnresolvedSecretKind::NotFound,
+                    format!(
+                        "Secret `${{ secrets:{key} }}` not found in any configured secret store (searched: [{}])",
+                        configured_stores()
+                    ),
+                )
+            } else {
+                failure(
+                    UnresolvedSecretKind::StoreError,
+                    format!(
+                        "Secret `${{ secrets:{key} }}` was not found, and some secret stores failed while looking it up ({}), so it may exist there (searched: [{}])",
+                        failed.join("; "),
+                        configured_stores()
+                    ),
+                )
+            });
+        }
+
+        let Some(store) = self.stores.get(store_name) else {
+            return Err(failure(
+                UnresolvedSecretKind::UndefinedStore,
+                format!(
+                    "Secret reference `${{ {store_name}:{key} }}` uses an undefined store `{store_name}`. Configured stores: [{}]. Add a `secrets:` entry in spicepod.yaml with `from: {store_name}`, or use one of the configured stores",
+                    configured_stores()
+                ),
+            ));
+        };
+
+        match store.get_secret(key).await {
+            Ok(Some(secret)) => Ok(secret),
+            Ok(None) => Err(failure(
+                UnresolvedSecretKind::NotFound,
+                format!(
+                    "Secret `${{ {store_name}:{key} }}` not found in secret store `{store_name}`"
+                ),
+            )),
+            Err(e) => Err(failure(
+                UnresolvedSecretKind::StoreError,
+                format!("Error looking up secret `${{ {store_name}:{key} }}`: {e}"),
+            )),
+        }
+    }
+
+    /// Like [`Self::inject_secrets`], but fails instead of substituting the
+    /// empty string when any `${ store:key }` reference cannot be resolved.
+    ///
+    /// A secret that resolves to the empty string (for example an env var set
+    /// to `""`) is resolved, so an intentionally optional secret can still be
+    /// expressed by defining it as empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns every reference in `param_str` that could not be resolved, in
+    /// document order. No secret values are included.
+    pub async fn try_inject_secrets(
+        &self,
+        key: &str,
+        param_str: ParamStr<'_>,
+    ) -> std::result::Result<SecretString, Vec<UnresolvedSecretReference>> {
+        tracing::trace!("Injecting secrets (strict) for: {}", key);
+        let input = param_str.0;
+        let mut result = String::with_capacity(input.len().saturating_add(256));
+        let mut last_end = 0;
+        let mut unresolved = Vec::new();
+        for secret_replacement in SecretReplacementMatcher::new(input) {
+            result.push_str(&input[last_end..secret_replacement.span.start]);
+            match self
+                .resolve_reference(&secret_replacement.store_name, &secret_replacement.key)
+                .await
+            {
+                Ok(secret) => result.push_str(secret.expose_secret()),
+                Err(failure) => unresolved.push(failure),
+            }
+            last_end = secret_replacement.span.end;
+        }
+        result.push_str(&input[last_end..]);
+        // Wrap before returning either way, so the partial buffer is zeroized
+        // on drop even on the error path.
+        let result = SecretString::from(result);
+        if unresolved.is_empty() {
+            Ok(result)
+        } else {
+            Err(unresolved)
+        }
+    }
 }
+
+/// One `${ store:key }` reference that could not be resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedSecretReference {
+    /// The reference as written, normalized to `${ store:key }`.
+    pub reference: String,
+    /// Why the reference did not resolve, for retry classification.
+    pub kind: UnresolvedSecretKind,
+    /// Why it did not resolve (not found, undefined store, store error).
+    /// Never contains a secret value.
+    pub cause: String,
+}
+
+/// Why a `${ store:key }` reference did not resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnresolvedSecretKind {
+    /// Every consulted store answered, and none holds the key.
+    NotFound,
+    /// The reference names a store that is not configured.
+    UndefinedStore,
+    /// Every consulted store failed (for example an expired token or a
+    /// network error), so the key may exist.
+    StoreError,
+}
+
+/// A component's `params:` referenced secrets that could not be resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedSecretsError {
+    /// `(parameter name, failure)` pairs, sorted by parameter name.
+    pub unresolved: Vec<(String, UnresolvedSecretReference)>,
+}
+
+impl std::fmt::Display for UnresolvedSecretsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let details = self
+            .unresolved
+            .iter()
+            .map(|(param, failure)| format!("parameter `{param}`: {}", failure.cause))
+            .collect::<Vec<_>>()
+            .join("; ");
+        write!(
+            f,
+            "Unable to resolve secret reference(s): {details}. The component was not loaded, instead of loading with an empty value. Define the secret in a configured secret store (an empty value is accepted for an intentionally optional secret), or remove the reference. Docs: https://spiceai.org/docs/components/secret-stores"
+        )
+    }
+}
+
+impl UnresolvedSecretsError {
+    /// Whether retrying the load could clear this error: true when any
+    /// reference failed because its store errored. A key that is not found,
+    /// or a store that is not configured, is a function of the spicepod and
+    /// the stores' contents, so retrying in a loop would not help.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        self.unresolved
+            .iter()
+            .any(|(_, failure)| failure.kind == UnresolvedSecretKind::StoreError)
+    }
+}
+
+impl std::error::Error for UnresolvedSecretsError {}
 
 impl Default for Secrets {
     fn default() -> Self {
@@ -946,6 +1189,52 @@ pub async fn get_params_with_secrets(
     }
 
     params_with_secrets
+}
+
+/// Like [`get_params_with_secrets`], but fails when any `${ store:key }`
+/// reference in `params` cannot be resolved instead of substituting the empty
+/// string.
+///
+/// Used for dataset and catalog connector params, where an empty substitution
+/// can change what the component reads (for example an empty `file_format`)
+/// and serve wrong results as if the component were healthy.
+///
+/// # Errors
+///
+/// Returns [`UnresolvedSecretsError`] naming every parameter and reference
+/// that did not resolve.
+#[expect(clippy::implicit_hasher)]
+pub async fn try_get_params_with_secrets(
+    secrets: Arc<RwLock<Secrets>>,
+    params: &HashMap<String, String>,
+) -> std::result::Result<HashMap<String, SecretString>, UnresolvedSecretsError> {
+    if params.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let secrets = Secrets::snapshot(&secrets).await;
+
+    let mut params_with_secrets: HashMap<String, SecretString> =
+        HashMap::with_capacity(params.len());
+    let mut unresolved = Vec::new();
+
+    for (k, v) in params {
+        match secrets.try_inject_secrets(k, ParamStr(v)).await {
+            Ok(secret) => {
+                params_with_secrets.insert(k.clone(), secret);
+            }
+            Err(failures) => {
+                unresolved.extend(failures.into_iter().map(|failure| (k.clone(), failure)));
+            }
+        }
+    }
+
+    if unresolved.is_empty() {
+        Ok(params_with_secrets)
+    } else {
+        unresolved.sort_by(|a, b| a.0.cmp(&b.0));
+        Err(UnresolvedSecretsError { unresolved })
+    }
 }
 
 /// Injects secrets from spicepod `params` templates and deserializes them
@@ -1295,7 +1584,7 @@ mod tests {
         }
     }
 
-    /// A built-in store must survive `load_from`, which clears the registry.
+    /// A built-in store must survive `load_from`, which replaces the registry.
     /// This is the bug the built-in list exists to close: a delivered store
     /// registered through `register_store` was silently dropped by the next
     /// spicepod load, failing every component that referenced it.
@@ -1307,7 +1596,7 @@ mod tests {
             std::sync::Arc::new(MapStore::new(&[("delivered_key", "from-cloud")])),
         );
 
-        // A reload with no `secrets:` section clears the registry and reloads
+        // A reload with no `secrets:` section replaces the registry and reloads
         // the default `env` store.
         secrets.load_from(&[]).await.expect("reload succeeds");
 
@@ -1334,7 +1623,7 @@ mod tests {
                 .await
                 .expect("an unregistered store is not an error, just no answer")
                 .is_none(),
-            "a non-built-in store is cleared by load_from"
+            "a non-built-in store is replaced by load_from"
         );
     }
 
@@ -1398,6 +1687,101 @@ mod tests {
             .expect("present");
         assert_eq!(value.expose_secret(), "second");
     }
+
+    /// An invalid configured provider must not wipe a retained built-in: the
+    /// replacement registry is built off to the side and only published after
+    /// every `from:` validates. (F1 / `BuiltinSurvivesReload`.)
+    #[tokio::test]
+    async fn builtin_store_survives_an_invalid_secrets_reload() {
+        let mut secrets = super::Secrets::new();
+        secrets.register_builtin_store(
+            "runtime",
+            std::sync::Arc::new(MapStore::new(&[("delivered_key", "synthetic-value")])),
+        );
+
+        let invalid = spicepod::component::secret::Secret {
+            from: "does-not-exist".into(),
+            name: "bad".into(),
+            description: None,
+            params: None,
+        };
+        assert!(
+            secrets.load_from(&[invalid]).await.is_err(),
+            "unknown provider must fail the reload"
+        );
+
+        let value = secrets
+            .get_secret_from_stores("delivered_key", &only("runtime"))
+            .await
+            .expect("lookup")
+            .expect("an invalid configured store must not drop a runtime-owned store");
+        assert_eq!(value.expose_secret(), "synthetic-value");
+    }
+
+    /// A successful reload still installs the new configured stores and keeps
+    /// noncolliding built-ins attached at lowest precedence.
+    #[tokio::test]
+    async fn successful_reload_keeps_noncolliding_builtins() {
+        let mut secrets = super::Secrets::new();
+        secrets.register_builtin_store(
+            "runtime",
+            std::sync::Arc::new(MapStore::new(&[("delivered_key", "synthetic-value")])),
+        );
+
+        secrets
+            .load_from(&[env_spicepod_secret("myenv")])
+            .await
+            .expect("reload succeeds");
+
+        assert!(
+            secrets.stores.contains_key("myenv"),
+            "configured store must be published"
+        );
+        let value = secrets
+            .get_secret_from_stores("delivered_key", &only("runtime"))
+            .await
+            .expect("lookup")
+            .expect("noncolliding built-in must survive a successful reload");
+        assert_eq!(value.expose_secret(), "synthetic-value");
+    }
+
+    /// A spicepod-configured store whose name collides with a built-in keeps
+    /// user-configured precedence (`entry` does not overwrite it).
+    #[tokio::test]
+    async fn configured_store_keeps_precedence_over_same_named_builtin() {
+        let mut secrets = super::Secrets::new();
+        secrets.register_builtin_store(
+            "myenv",
+            std::sync::Arc::new(MapStore::new(&[("delivered_key", "from-builtin")])),
+        );
+
+        secrets
+            .load_from(&[env_spicepod_secret("myenv")])
+            .await
+            .expect("reload succeeds");
+
+        // The configured `env` store occupies `myenv`; the built-in MapStore
+        // was not inserted under that name, so its key is not reachable there.
+        assert!(
+            secrets
+                .get_secret_from_stores("delivered_key", &only("myenv"))
+                .await
+                .expect("lookup")
+                .is_none(),
+            "user-configured store of the same name must win over the built-in"
+        );
+        assert!(
+            secrets.stores.contains_key("myenv"),
+            "configured store remains registered under the colliding name"
+        );
+    }
+
+    // Cancellation mid-flight is safe by construction: `load_from` never
+    // mutates `self.stores` until the replacement map is fully built, so
+    // dropping the future before it returns `Ok` leaves built-ins intact.
+    // A unit test that actually polls into a `Pending` provider init would
+    // need a hangable store hook; the invalid-provider Err path above
+    // exercises the same "exit before publish" contract.
 
     /// The registry swap on the executor bind path must not wait behind an
     /// in-flight expansion. Holding the read guard over the (network-bound)
@@ -1548,6 +1932,101 @@ mod tests {
             .await
             .expect("empty registry should not error");
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_try_get_params_with_secrets_store_outage_is_retriable() {
+        let outage = secrets_with_stores(vec![(
+            "vault",
+            std::sync::Arc::new(ErroringStore("vault is down")),
+        )]);
+        let params = std::collections::HashMap::from([(
+            "password".to_string(),
+            "${ secrets:DB_PASSWORD }".to_string(),
+        )]);
+        let err = super::try_get_params_with_secrets(
+            std::sync::Arc::new(tokio::sync::RwLock::new(outage)),
+            &params,
+        )
+        .await
+        .expect_err("a total store outage must not become an empty password");
+        assert_eq!(
+            err.unresolved[0].1.kind,
+            super::UnresolvedSecretKind::StoreError
+        );
+        assert!(err.is_retriable(), "a store outage may clear on retry");
+
+        // A miss in a healthy store plus an outage in another is retriable too:
+        // the failed store may hold the key.
+        let partial = secrets_with_stores(vec![
+            ("vault", std::sync::Arc::new(ErroringStore("vault is down"))),
+            ("env", std::sync::Arc::new(MapStore::new(&[("OTHER", "x")]))),
+        ]);
+        let err = super::try_get_params_with_secrets(
+            std::sync::Arc::new(tokio::sync::RwLock::new(partial)),
+            &params,
+        )
+        .await
+        .expect_err("a partial outage must still fail the component");
+        assert_eq!(
+            err.unresolved[0].1.kind,
+            super::UnresolvedSecretKind::StoreError
+        );
+        assert!(err.is_retriable(), "the failed store may hold the key");
+        assert!(err.to_string().contains("vault is down"), "{err}");
+
+        let missing = secrets_with_stores(vec![(
+            "env",
+            std::sync::Arc::new(MapStore::new(&[("OTHER", "x")])),
+        )]);
+        let err = super::try_get_params_with_secrets(
+            std::sync::Arc::new(tokio::sync::RwLock::new(missing)),
+            &params,
+        )
+        .await
+        .expect_err("a missing key must fail");
+        assert_eq!(
+            err.unresolved[0].1.kind,
+            super::UnresolvedSecretKind::NotFound
+        );
+        assert!(
+            !err.is_retriable(),
+            "a missing key will not appear on retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_secret_or_outage_reports_partial_outage() {
+        let partial = secrets_with_stores(vec![
+            ("vault", std::sync::Arc::new(ErroringStore("vault is down"))),
+            ("env", std::sync::Arc::new(MapStore::new(&[("FOUND", "v")]))),
+        ]);
+        // A hit still wins over an erroring store.
+        let hit = partial.get_secret_or_outage("FOUND").await.expect("hit");
+        assert_eq!(hit.expect("value").expose_secret(), "v");
+        // A miss with a failed store is an error, not a definitive miss,
+        // while the lenient lookup keeps returning `Ok(None)`.
+        let err = partial
+            .get_secret_or_outage("MISSING")
+            .await
+            .expect_err("a partial outage is not a definitive miss");
+        assert!(err.to_string().contains("vault is down"), "{err}");
+        assert!(
+            partial
+                .get_secret("MISSING")
+                .await
+                .expect("lenient")
+                .is_none()
+        );
+        // Scoped to the healthy store only, the miss is definitive.
+        let scoped = partial
+            .get_secret_from_stores_or_outage(
+                "MISSING",
+                &std::collections::HashSet::from(["env".to_string()]),
+            )
+            .await
+            .expect("only a healthy store was consulted");
+        assert!(scoped.is_none());
     }
 
     #[tokio::test]
@@ -2636,6 +3115,167 @@ params:
             )
             .await;
         assert_eq!("This is a secret: ! 🫡", result.expose_secret());
+    }
+
+    #[tokio::test]
+    async fn test_try_inject_secrets_resolves_like_inject_secrets() {
+        let _env_guard = lock_env().await;
+        let mut secrets = super::Secrets::new();
+        secrets.load_from(&[]).await.expect("to load successfully");
+
+        let key = &format!("STRICT_SECRET_KEY_{}", rand::random::<u64>());
+        unsafe { std::env::set_var(key, "csv") };
+
+        let template = format!("fmt=${{ secrets:{key} }}/${{ env:{key} }}");
+        let strict = secrets
+            .try_inject_secrets("file_format", super::ParamStr(&template))
+            .await
+            .expect("a defined secret resolves");
+        let lenient = secrets
+            .inject_secrets("file_format", super::ParamStr(&template))
+            .await;
+        assert_eq!("fmt=csv/csv", strict.expose_secret());
+        assert_eq!(lenient.expose_secret(), strict.expose_secret());
+
+        // No references at all is passed through unchanged.
+        let literal = secrets
+            .try_inject_secrets("file_format", super::ParamStr("parquet"))
+            .await
+            .expect("a literal has nothing to resolve");
+        assert_eq!("parquet", literal.expose_secret());
+
+        unsafe { std::env::remove_var(key) };
+    }
+
+    #[tokio::test]
+    async fn test_try_inject_secrets_fails_on_missing_secret() {
+        let _env_guard = lock_env().await;
+        let mut secrets = super::Secrets::new();
+        secrets.load_from(&[]).await.expect("to load successfully");
+
+        let missing = format!("STRICT_MISSING_{}", rand::random::<u64>());
+        let present = format!("STRICT_PRESENT_{}", rand::random::<u64>());
+        unsafe {
+            std::env::remove_var(&missing);
+            std::env::set_var(&present, "do-not-leak-this-value");
+        }
+
+        let template =
+            format!("${{ env:{present} }}-${{ secrets:{missing} }}-${{ nostore:{missing} }}");
+        let failures = secrets
+            .try_inject_secrets("file_format", super::ParamStr(&template))
+            .await
+            .expect_err("an unresolved reference must fail, not become empty");
+
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert_eq!(failures[0].reference, format!("${{ secrets:{missing} }}"));
+        assert_eq!(failures[0].kind, super::UnresolvedSecretKind::NotFound);
+        assert_eq!(
+            failures[1].kind,
+            super::UnresolvedSecretKind::UndefinedStore
+        );
+        assert!(
+            failures[0]
+                .cause
+                .contains("not found in any configured secret store"),
+            "{}",
+            failures[0].cause
+        );
+        assert_eq!(failures[1].reference, format!("${{ nostore:{missing} }}"));
+        assert!(
+            failures[1].cause.contains("undefined store `nostore`"),
+            "{}",
+            failures[1].cause
+        );
+        for failure in &failures {
+            assert!(!failure.cause.contains("do-not-leak-this-value"));
+        }
+
+        unsafe { std::env::remove_var(&present) };
+    }
+
+    #[tokio::test]
+    async fn test_try_inject_secrets_accepts_secret_defined_as_empty() {
+        // The opt-out for an intentionally optional secret: define it as "".
+        let _env_guard = lock_env().await;
+        let mut secrets = super::Secrets::new();
+        secrets.load_from(&[]).await.expect("to load successfully");
+
+        let key = format!("STRICT_EMPTY_{}", rand::random::<u64>());
+        unsafe { std::env::set_var(&key, "") };
+
+        let result = secrets
+            .try_inject_secrets("token", super::ParamStr(&format!("${{ secrets:{key} }}")))
+            .await
+            .expect("a secret defined as empty is resolved");
+        assert_eq!("", result.expose_secret());
+
+        unsafe { std::env::remove_var(&key) };
+    }
+
+    #[tokio::test]
+    async fn test_try_get_params_with_secrets_names_every_unresolved_param() {
+        let _env_guard = lock_env().await;
+        let mut secrets = super::Secrets::new();
+        secrets.load_from(&[]).await.expect("to load successfully");
+        let secrets = std::sync::Arc::new(tokio::sync::RwLock::new(secrets));
+
+        let fmt = format!("STRICT_FMT_{}", rand::random::<u64>());
+        let token = format!("STRICT_TOKEN_{}", rand::random::<u64>());
+        let defined = format!("STRICT_DEFINED_{}", rand::random::<u64>());
+        unsafe {
+            std::env::remove_var(&fmt);
+            std::env::remove_var(&token);
+            std::env::set_var(&defined, "do-not-leak-this-value");
+        }
+
+        let params = std::collections::HashMap::from([
+            ("file_format".to_string(), format!("${{ secrets:{fmt} }}")),
+            ("token".to_string(), format!("${{ env:{token} }}")),
+            ("user".to_string(), format!("${{ secrets:{defined} }}")),
+            ("literal".to_string(), "value".to_string()),
+        ]);
+
+        let err = super::try_get_params_with_secrets(std::sync::Arc::clone(&secrets), &params)
+            .await
+            .expect_err("unresolved references must fail the component");
+        let params_named: Vec<&str> = err.unresolved.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(params_named, vec!["file_format", "token"]);
+
+        let message = err.to_string();
+        assert!(message.contains("parameter `file_format`"), "{message}");
+        assert!(
+            message.contains(&format!("${{ secrets:{fmt} }}")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("${{ env:{token} }}")),
+            "{message}"
+        );
+        assert!(message.contains("empty value is accepted"), "{message}");
+        assert!(!message.contains("do-not-leak-this-value"), "{message}");
+
+        // Once every reference resolves, the strict and lenient paths agree.
+        unsafe {
+            std::env::set_var(&fmt, "csv");
+            std::env::set_var(&token, "t");
+        }
+        let strict = super::try_get_params_with_secrets(std::sync::Arc::clone(&secrets), &params)
+            .await
+            .expect("all references resolve");
+        let lenient =
+            super::get_params_with_secrets(std::sync::Arc::clone(&secrets), &params).await;
+        assert_eq!(strict.len(), lenient.len());
+        for (k, v) in &strict {
+            assert_eq!(v.expose_secret(), lenient[k].expose_secret(), "{k}");
+        }
+        assert_eq!(strict["file_format"].expose_secret(), "csv");
+
+        unsafe {
+            std::env::remove_var(&fmt);
+            std::env::remove_var(&token);
+            std::env::remove_var(&defined);
+        }
     }
 
     #[tokio::test]

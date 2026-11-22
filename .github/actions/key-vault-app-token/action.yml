@@ -1,0 +1,49 @@
+name: Key Vault GitHub App token
+description: >-
+  Gets a short-lived GitHub App installation token. Key Vault signs the app JWT, so the app's private
+  key never leaves the vault. The job needs `permissions: id-token: write` and an environment the
+  Entra app trusts. Pull requests from forks get no OIDC token, so this step fails there.
+
+inputs:
+  app-id:
+    description: GitHub App ID.
+    required: true
+  installation-id:
+    description: Installation of the app to get a token for.
+    required: true
+  key-id:
+    description: URL of the Key Vault key, without a version.
+    required: true
+  azure-client-id:
+    description: Entra app with Key Vault Crypto User on the key.
+    required: true
+  azure-tenant-id:
+    description: Entra tenant of that app.
+    required: true
+  repositories:
+    description: Space-separated names of the repositories the token reaches.
+    required: true
+  permissions:
+    description: JSON object of the permissions the token gets, for example '{"members":"read"}'.
+    required: true
+
+outputs:
+  token:
+    description: Installation token (masked).
+    value: ${{ steps.mint.outputs.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Sign the app JWT and request the token
+      id: mint
+      shell: bash
+      env:
+        APP_ID: ${{ inputs.app-id }}
+        INSTALLATION_ID: ${{ inputs.installation-id }}
+        KEY_ID: ${{ inputs.key-id }}
+        AZURE_CLIENT_ID: ${{ inputs.azure-client-id }}
+        AZURE_TENANT_ID: ${{ inputs.azure-tenant-id }}
+        REPOSITORIES: ${{ inputs.repositories }}
+        PERMISSIONS: ${{ inputs.permissions }}
+      run: python3 "${GITHUB_ACTION_PATH}/mint_token.py"

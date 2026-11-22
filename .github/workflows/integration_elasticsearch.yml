@@ -10,6 +10,9 @@ on:
       - 'crates/data_components/src/elasticsearch/**'
       - 'crates/data-connectors/connector-elasticsearch/**'
       - 'crates/search/src/index/elasticsearch/**'
+      - 'crates/search/tests/elasticsearch_full_refresh.rs'
+      - 'crates/search/tests/integration.rs'
+      - 'crates/search/Cargo.toml'
       - 'crates/runtime/src/embeddings/index/elasticsearch/**'
   merge_group:
     branches:
@@ -31,10 +34,15 @@ env:
   CARGO_NET_RETRY: 10
   CARGO_HTTP_TIMEOUT: 60
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   # merge_group can't path-filter, so gate the (container-spinning) test job on a
   # changed-files check instead of running Elasticsearch for every merge entry.
   changes:
+    environment: secret-free
     runs-on: ubuntu-latest
     # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
     # cold runner having to clone from scratch, not the ~1 min a warm
@@ -48,7 +56,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - id: check
-        uses: ./.github/actions/check-code-changes
+        uses: $/.github/actions/check-code-changes
         with:
           filters: |
             code_changes:
@@ -56,9 +64,13 @@ jobs:
               - 'crates/data_components/src/elasticsearch/**'
               - 'crates/data-connectors/connector-elasticsearch/**'
               - 'crates/search/src/index/elasticsearch/**'
+              - 'crates/search/tests/elasticsearch_full_refresh.rs'
+              - 'crates/search/tests/integration.rs'
+              - 'crates/search/Cargo.toml'
               - 'crates/runtime/src/embeddings/index/elasticsearch/**'
 
   test-elasticsearch:
+    environment: secret-free
     name: Elasticsearch Integration Tests
     needs: changes
     # Slowest observed success in the 2026-07-25..08-08 window: 15 min.
@@ -98,13 +110,13 @@ jobs:
           echo "Elasticsearch is ready"
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Set up make
-        uses: ./.github/actions/setup-make
+        uses: $/.github/actions/setup-make
 
       - name: Set up cc
-        uses: ./.github/actions/setup-cc
+        uses: $/.github/actions/setup-cc
 
       - name: Run elasticsearch client tests
         env:
@@ -117,3 +129,9 @@ jobs:
           ELASTICSEARCH_URL: http://localhost:9200
         run: |
           RUSTC_WRAPPER="" cargo test -p data_components --features elasticsearch --test integration -- elasticsearch_test:: --nocapture
+
+      - name: Run elasticsearch search index tests
+        env:
+          ELASTICSEARCH_URL: http://localhost:9200
+        run: |
+          RUSTC_WRAPPER="" cargo test -p search --features elasticsearch --test integration -- elasticsearch_full_refresh:: --nocapture

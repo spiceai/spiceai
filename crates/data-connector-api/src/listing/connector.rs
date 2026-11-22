@@ -19,7 +19,7 @@ use crate::parameters::ConnectorContext;
 use data_components::cdc::{AccelerationContents, ChangesStream};
 use data_components::csv_header_projection::HeaderProjectedCsvFormat;
 use data_components::file_schema_drift::{FileSchemaDriftGuard, FileSchemaDriftLayer};
-use data_components::fresh_file_listing::FreshFileListingLayer;
+use data_components::fresh_file_listing::{FreshFileListingLayer, ScanSkipsListing};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -51,7 +51,9 @@ use datafusion::execution::cache::cache_manager::{
 };
 use datafusion::execution::cache::default_cache::DefaultCache;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::object_store::ObjectStoreUrl;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
@@ -262,20 +264,27 @@ impl ListingTableTemplate {
         table: Arc<ListingTable>,
         table_path: ListingTableUrl,
     ) -> Arc<dyn TableProvider> {
-        let table: Arc<dyn TableProvider> = if has_location_metadata(table.options()) {
+        let pruning = has_location_metadata(table.options()).then(|| {
             Arc::new(LocationPruningListingTable::new(
-                table,
+                Arc::clone(&table),
                 Arc::clone(&self.object_store),
                 table_path.clone(),
                 Arc::clone(&self.schema),
                 self.extension.as_str(),
             ))
-        } else {
-            table
-        };
+        });
         // A file dataset is read as its files are at query time, not as they were
-        // listed at its first scan.
-        let table = FreshFileListingLayer::over(table, vec![table_path]);
+        // listed at its first scan. A listing with no matching data file is an
+        // error (the path is missing, or every matching file was removed) rather
+        // than an empty table, so a full refresh cannot persist a wipe. A file
+        // that still exists and holds no rows still scans as zero rows.
+        let table = reject_empty_listing(
+            table,
+            pruning,
+            table_path,
+            self.dataset_name.clone(),
+            self.extension.clone(),
+        );
         match self.schema_drift_guard() {
             Some(guard) => FileSchemaDriftLayer::over(table, guard),
             None => table,
@@ -294,6 +303,61 @@ impl ListingTableTemplate {
                 Arc::clone(&self.options.format),
             )
         })
+    }
+}
+
+/// Stacks the empty-listing guard over a single-object table that does not go
+/// through [`ListingTableTemplate::wrap`] (the S3 single-file version cache). A
+/// deleted object (`404 NoSuchKey`) lists nothing, so the scan fails rather than
+/// refreshing the acceleration to zero rows.
+fn reject_empty_single_object(
+    below: Arc<dyn TableProvider>,
+    table_path: ListingTableUrl,
+    dataset_name: String,
+    extension: String,
+) -> Arc<dyn TableProvider> {
+    FreshFileListingLayer::over_rejecting_empty(
+        below,
+        vec![table_path],
+        dataset_name,
+        move |meta: &ObjectMeta| listed_object_is_data_file(meta, &extension),
+    )
+}
+
+/// Stacks the empty-listing guard over `table`, or over `pruning` when the dataset
+/// has `_location` metadata. A scan the pruning table answers by `head()`ing the
+/// named objects skips the guard's listing, so it needs no list call (or list
+/// permission) it did not need before.
+fn reject_empty_listing(
+    table: Arc<ListingTable>,
+    pruning: Option<Arc<LocationPruningListingTable>>,
+    table_path: ListingTableUrl,
+    dataset_name: String,
+    extension: String,
+) -> Arc<dyn TableProvider> {
+    let is_data_file = move |meta: &ObjectMeta| listed_object_is_data_file(meta, &extension);
+    match pruning {
+        Some(pruning) => {
+            let skips: ScanSkipsListing = {
+                let pruning = Arc::clone(&pruning);
+                Arc::new(move |filters: &[datafusion_expr::Expr]| {
+                    pruning.answers_without_listing(filters)
+                })
+            };
+            FreshFileListingLayer::over_rejecting_empty_unless(
+                pruning,
+                vec![table_path],
+                dataset_name,
+                is_data_file,
+                Some(skips),
+            )
+        }
+        None => FreshFileListingLayer::over_rejecting_empty(
+            table,
+            vec![table_path],
+            dataset_name,
+            is_data_file,
+        ),
     }
 }
 
@@ -342,6 +406,17 @@ impl LocationPruningListingTable {
     /// through to `inner`.
     fn has_location_column(&self) -> bool {
         self.inner.schema().field_with_name("_location").is_ok()
+    }
+
+    /// Whether [`TableProvider::scan`] answers `filters` without listing the prefix:
+    /// an unsatisfiable pushed-down filter, or `_location` predicates it `head()`s.
+    fn answers_without_listing(&self, filters: &[datafusion_expr::Expr]) -> bool {
+        filters.iter().any(|filter| {
+            matches!(
+                filter,
+                datafusion_expr::Expr::Literal(ScalarValue::Boolean(None | Some(false)), _)
+            )
+        }) || (self.has_location_column() && extract_location_predicates(filters).is_some())
     }
 
     fn partition_column_types(&self) -> &[(String, datafusion::arrow::datatypes::DataType)] {
@@ -1089,6 +1164,22 @@ pub trait ListingTableConnector: DataConnector {
             detected_extension.and_then(|ext| ext.compression),
         )?;
 
+        // An explicitly empty `file_format` (for example `""`, or a secret
+        // reference that resolved to nothing) is a configuration error. It
+        // used to fall through to the unknown-format text-table path and load
+        // a CSV as a one-row document table while the dataset reported Ready.
+        if file_format_param
+            .as_deref()
+            .is_some_and(|format| format.trim().is_empty())
+        {
+            return Err(crate::DataConnectorError::InvalidConfiguration {
+                dataconnector: format!("{self}"),
+                message: empty_file_format_message(dataset, params),
+                connector_component: ConnectorComponent::from(dataset),
+                source: "Empty file format".into(),
+            });
+        }
+
         // Annotate before `?` so rustc unifies each arm as `Arc<dyn FileFormat>`
         // instead of pinning the match to the first (`CsvFormat`) arm.
         let result: DataConnectorResult<(Option<Arc<dyn FileFormat>>, ListingSuffix)> =
@@ -1465,7 +1556,11 @@ pub trait ListingTableConnector: DataConnector {
     {
         let mut format = SpiceJsonFormat::default()
             .with_format(default_format)
-            .with_file_compression_type(file_compression_type);
+            .with_file_compression_type(file_compression_type)
+            .with_source(
+                dataset.name.to_string(),
+                connector_docs_page(&format!("{self}")),
+            );
 
         if let ExposedParamLookup::Present(infer_max_rec_str) =
             params.get("schema_infer_max_records").expose()
@@ -1728,18 +1823,22 @@ pub trait ListingTableConnector: DataConnector {
         ))
     }
 
+    /// The listing table for `dataset`. Its schema is inferred from the source files under
+    /// `memory_pool`, the runtime's query memory pool, since inference can hold a file
+    /// whole (a JSON document is parsed whole).
     async fn create_listing_table(
         &self,
         dataset: &DatasetSpec,
         url: &Url,
         extension: &str,
         file_format: Arc<dyn FileFormat>,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> DataConnectorResult<Arc<dyn TableProvider>>
     where
         Self: Display,
     {
         let template = self
-            .listing_table_template(dataset, url, extension, file_format)
+            .listing_table_template(dataset, url, extension, file_format, memory_pool)
             .await?;
 
         // This shouldn't error because `listing_table_template` already parsed the same URL.
@@ -1782,7 +1881,14 @@ pub trait ListingTableConnector: DataConnector {
                 Some(guard) => cached_table.with_schema_drift_guard(guard),
                 None => cached_table,
             };
-            return Ok(Arc::new(cached_table));
+            // This table skips `template.wrap`, so it needs the same guard: a deleted
+            // object must fail the refresh, not replace the acceleration with zero rows.
+            return Ok(reject_empty_single_object(
+                Arc::new(cached_table),
+                table_path,
+                dataset.name.to_string(),
+                template.extension.clone(),
+            ));
         }
 
         Ok(template.wrap(table_arc, table_path))
@@ -1801,6 +1907,7 @@ pub trait ListingTableConnector: DataConnector {
         url: &Url,
         extension: &str,
         file_format: Arc<dyn FileFormat>,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> DataConnectorResult<ListingTableTemplate>
     where
         Self: Display,
@@ -1817,7 +1924,19 @@ pub trait ListingTableConnector: DataConnector {
 
         let object_store = self.get_object_store(dataset)?;
 
-        let ctx: SessionContext = self.get_session_context();
+        // Inference reads source files, holding a JSON document whole, so it is charged to
+        // the runtime's query memory pool rather than to an unbounded one of its own.
+        let ctx = self.get_session_context();
+        let runtime_env = RuntimeEnvBuilder::from_runtime_env(&ctx.runtime_env())
+            .with_memory_pool(Arc::clone(memory_pool))
+            .build_arc()
+            .boxed()
+            .context(crate::InternalSnafu {
+                dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
+                code: "LTC-RP-RTE".to_string(), // ListingTableConnector-ReadProvider-RuntimeEnv
+            })?;
+        let ctx = SessionContext::new_with_config_rt(ctx.copied_config(), runtime_env);
         let params = self.get_params();
         let displayed_extension = if params.secret_source("file_extension").is_some() {
             params.display_value("file_extension", extension)
@@ -2110,7 +2229,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
     async fn read_provider(
         &self,
-        _context: &dyn ConnectorContext,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         ListingTableConnector::validate_dataset(self, dataset)?;
@@ -2126,7 +2245,13 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
             }
             Some(file_format) => {
                 // Structured tabular data, use a [`ListingTable`].
-                self.create_listing_table(dataset, &url, &extension, file_format)
+                let memory_pool = Arc::clone(
+                    &context
+                        .datafusion_session_context()
+                        .runtime_env()
+                        .memory_pool,
+                );
+                self.create_listing_table(dataset, &url, &extension, file_format, &memory_pool)
                     .await
             }
         }
@@ -2584,6 +2709,20 @@ fn adjacent_transposition_match(typo: &str, valid: &[&str]) -> Option<String> {
         }
     }
     None
+}
+
+/// Error message for an explicitly empty `file_format`, naming the secret
+/// reference when the value came from one.
+fn empty_file_format_message(dataset: &DatasetSpec, params: &Parameters) -> String {
+    let valid_list = valid_listing_file_formats().join(", ");
+    let dataset_name = dataset.name.to_string();
+    let source_clause = params
+        .secret_source("file_format")
+        .map(|source| format!(" (it came from {source})"))
+        .unwrap_or_default();
+    format!(
+        "The `file_format` parameter for dataset '{dataset_name}' is empty{source_clause}. Set it to one of: {valid_list}, or remove it to infer the format from the file extension. See: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+    )
 }
 
 fn unknown_file_format_message(dataset: &DatasetSpec, params: &Parameters, format: &str) -> String {
@@ -3169,6 +3308,16 @@ fn parquet_page_index_options(app: &Arc<App>) -> ParquetPageIndexOptions {
     }
 }
 
+/// The connector's documentation page under `components/data-connectors/`, which an
+/// error about one of its files links: the connector's name, except where its page is
+/// named for the scheme users write.
+fn connector_docs_page(connector: &str) -> String {
+    match connector {
+        "http_listing" => "https".to_string(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arrow::array::{Array, RecordBatch};
@@ -3343,6 +3492,72 @@ mod tests {
                 "Cannot setup the dataset test (TestConnector) with an invalid configuration. The required 'file_format' parameter is missing. Ensure the parameter is provided, and try again."
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn test_empty_file_format_is_rejected_not_loaded_as_text() {
+        // An empty `file_format` used to fall through to the text-table path,
+        // so a CSV loaded as a one-row `location`/`content` table.
+        for format in ["", "  "] {
+            let (connector, dataset, _dir) = setup_listed_connector(&["nation.csv"], format);
+            let err = connector
+                .get_file_format_and_extension(&dataset)
+                .await
+                .expect_err("an empty file_format must fail dataset setup");
+            let message = err.to_string();
+            assert!(
+                message.contains("The `file_format` parameter for dataset 'test' is empty"),
+                "{message}"
+            );
+            assert!(
+                message.contains("csv"),
+                "must list valid formats: {message}"
+            );
+        }
+
+        // The same CSV with an explicit `csv` format is unchanged.
+        let (connector, dataset, _dir) = setup_listed_connector(&["nation.csv"], "csv");
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("csv resolves");
+        assert!(file_format.is_some(), "csv uses the structured reader");
+        assert_eq!(extension, ".csv");
+    }
+
+    #[tokio::test]
+    async fn test_empty_file_format_from_secret_names_the_reference() {
+        const REFERENCE: &str = "${ secrets:FMT }";
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("nation.csv"), "a\n1\n").expect("write csv");
+        let connector = TestConnector {
+            params: Parameters::new(
+                to_secret_map(HashMap::from([("file_format".to_string(), String::new())]))
+                    .into_iter()
+                    .collect(),
+                "test",
+                TEST_PARAMETERS,
+            )
+            .with_secret_sources(HashMap::from([(
+                "file_format".to_string(),
+                REFERENCE.to_string(),
+            )])),
+        };
+        let dataset = DatasetSpec::new(
+            format!("file://{}/nation.csv", dir.path().display()),
+            TableReference::bare("test"),
+        );
+
+        let err = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect_err("an empty secret-derived file_format must fail");
+        let message = err.to_string();
+        assert!(message.contains("is empty"), "{message}");
+        assert!(
+            message.contains(REFERENCE),
+            "must name the reference: {message}"
+        );
     }
 
     fn setup_listed_connector(
@@ -4221,7 +4436,14 @@ mod tests {
             .expect("csv plus file_extension must resolve");
         let file_format = file_format.expect("csv must use the listing-table path");
         let err = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect_err("secret-derived file_extension with no matching files must fail");
         assert_error_hides_canary(&err, "CANARYPGPW7731", REFERENCE);
@@ -4526,7 +4748,14 @@ mod tests {
         };
 
         let template = connector
-            .listing_table_template(&dataset, &url, &extension, Arc::clone(&file_format))
+            .listing_table_template(
+                &dataset,
+                &url,
+                &extension,
+                Arc::clone(&file_format),
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("template");
         assert!(
@@ -4540,7 +4769,14 @@ mod tests {
         );
 
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("listing table");
 
@@ -4623,7 +4859,14 @@ mod tests {
         };
 
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("listing table");
 
@@ -4707,7 +4950,14 @@ mod tests {
         };
 
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .unwrap_or_else(|e| panic!("{label}: listing table: {e}"));
 
@@ -4817,7 +5067,14 @@ mod tests {
         };
 
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .unwrap_or_else(|e| panic!("{label}: listing table: {e}"));
 
@@ -4910,7 +5167,14 @@ mod tests {
             panic!("expected a JSONL file format");
         };
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("listing table");
 
@@ -4951,7 +5215,14 @@ mod tests {
             panic!("expected a JSONL file format");
         };
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("listing table");
 
@@ -5006,7 +5277,14 @@ mod tests {
             "listing must enable flatten_json so user.name is a registered column"
         );
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("listing table");
         assert_eq!(
@@ -5359,7 +5637,14 @@ mod tests {
         );
 
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("create_listing_table production path");
 
@@ -5482,7 +5767,14 @@ mod tests {
         assert_eq!(extension, ".orc");
 
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("create_listing_table must not publish a schema_source_path prefix schema");
 
@@ -6028,7 +6320,14 @@ mod tests {
             panic!("expected a parquet file format");
         };
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("create_listing_table production path");
         ctx.register_table(name, provider)
@@ -6156,7 +6455,14 @@ mod tests {
             "the production listing path must wrap Parquet so float stats cannot be trusted"
         );
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("create_listing_table production path");
         let ctx = SessionContext::new();
@@ -7153,6 +7459,110 @@ mod tests {
         }
     }
 
+    /// The S3 single-object table (`S3SingleFileCached`) does not go through `wrap`,
+    /// so it gets the guard from `reject_empty_single_object`: a deleted key
+    /// (`404 NoSuchKey`, which lists nothing) fails the scan instead of answering
+    /// zero rows, and the refresh-skip check still reaches the cached table beneath.
+    #[tokio::test]
+    async fn reject_empty_single_object_errors_on_a_deleted_s3_key() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let ctx = SessionContext::new();
+        ctx.runtime_env().register_object_store(
+            &Url::parse("s3://bucket").expect("store url"),
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+        );
+        let key = Path::from("one/orders.parquet");
+        let parquet = |ids: &[i64]| {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "id",
+                arrow_schema::DataType::Int64,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(arrow::array::Int64Array::from(ids.to_vec()))],
+            )
+            .expect("batch");
+            let mut buffer = Vec::new();
+            let mut writer =
+                datafusion::parquet::arrow::ArrowWriter::try_new(&mut buffer, schema, None)
+                    .expect("parquet writer");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close parquet writer");
+            object_store::PutPayload::from(buffer)
+        };
+        let id_rows = |ctx: SessionContext| async move {
+            let batches = ctx.sql("SELECT id FROM facts").await?.collect().await?;
+            DFResult::Ok(batches.iter().map(RecordBatch::num_rows).sum::<usize>())
+        };
+        store
+            .put(&key, parquet(&[1, 2, 3]))
+            .await
+            .expect("put object");
+
+        let table_path =
+            ListingTableUrl::parse("s3://bucket/one/orders.parquet").expect("listing table url");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let listing = Arc::new(
+            ListingTable::try_new(
+                ListingTableConfig::new(table_path.clone())
+                    .with_listing_options(
+                        ListingOptions::new(Arc::new(ParquetFormat::default()))
+                            .with_file_extension(".parquet"),
+                    )
+                    .with_schema(schema),
+            )
+            .expect("create listing table"),
+        );
+        let cached = data_components::s3_single_file_cached::S3SingleFileCached::try_new(
+            listing,
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            "facts".to_string(),
+        )
+        .expect("a single object is cached");
+        let provider = reject_empty_single_object(
+            Arc::new(cached),
+            table_path,
+            "facts".to_string(),
+            ".parquet".to_string(),
+        );
+        assert!(
+            data_components::refresh_skip::should_skip_refresh_for_table_provider(
+                provider.as_ref()
+            )
+            .await
+            .expect("skip check")
+            .is_some(),
+            "the refresh-skip check must still reach the cached table under the guard"
+        );
+        ctx.register_table("facts", provider)
+            .expect("register table");
+        assert_eq!(id_rows(ctx.clone()).await.expect("initial scan"), 3);
+
+        store.delete(&key).await.expect("delete object");
+        let err: DataFusionError = id_rows(ctx.clone())
+            .await
+            .expect_err("a deleted key is an error, not zero rows");
+        let err = err.to_string();
+        assert!(
+            err.contains("No data files are yet available for dataset facts"),
+            "{err}"
+        );
+
+        store
+            .put(&key, parquet(&[1, 2, 3, 4]))
+            .await
+            .expect("restore object");
+        assert_eq!(
+            id_rows(ctx.clone()).await.expect("a restored key is read"),
+            4
+        );
+    }
+
     #[tokio::test]
     async fn test_location_pruning_skips_listing() {
         let ctx = SessionContext::new();
@@ -7186,17 +7596,27 @@ mod tests {
         )
         .expect("create listing table");
 
-        let provider = LocationPruningListingTable::new(
-            Arc::new(listing),
+        let listing = Arc::new(listing);
+        let pruning = Arc::new(LocationPruningListingTable::new(
+            Arc::clone(&listing),
             ctx.runtime_env()
                 .object_store(&table_path)
                 .expect("object store"),
             table_path.clone(),
             file_schema,
             ".parquet",
+        ));
+        // The stack `ListingTableTemplate::wrap` registers: the empty-listing guard
+        // over the pruning table must not list for a `_location`-pruned scan either.
+        let provider = reject_empty_listing(
+            listing,
+            Some(pruning),
+            table_path.clone(),
+            "test_table".to_string(),
+            ".parquet".to_string(),
         );
 
-        ctx.register_table("test_table", Arc::new(provider))
+        ctx.register_table("test_table", provider)
             .expect("register table");
 
         let df = ctx
@@ -7349,7 +7769,14 @@ mod tests {
             panic!("expected a parquet file format");
         };
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("create_listing_table production path");
 
@@ -7540,7 +7967,14 @@ mod tests {
             panic!("expected a parquet file format");
         };
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("create_listing_table production path");
 

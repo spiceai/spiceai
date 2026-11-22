@@ -22,10 +22,10 @@ limitations under the License.
 //! - **Write-through (no acceleration)**: The dataset is backed directly by Postgres
 //!   with `access: ReadWrite`. DML goes straight to Postgres.
 //!
-//! - **Write-through with `DuckDB` acceleration**: The dataset has a `DuckDB` local
+//! - **Write-through with `Cayenne` acceleration**: The dataset has a `Cayenne` local
 //!   accelerator and `write_mode: WriteThrough`. For non-Cayenne engines this falls
 //!   through to `FederatedOnly` (DML to Postgres only); an explicit refresh re-syncs
-//!   the `DuckDB` accelerator afterward.
+//!   the `Cayenne` accelerator afterward.
 //!
 //! The key regression being tested: `DataFusion`'s `PushDownFilter` optimizer moves
 //! `Filter` nodes into `TableScan.filters`. The Spice runtime's
@@ -66,14 +66,13 @@ fn write_through_dataset(port: usize, table: &str, name: &str) -> Dataset {
     ds
 }
 
-/// Build a Postgres-backed dataset with `DuckDB` acceleration, write-through mode,
+/// Build a Postgres-backed dataset with `Cayenne` acceleration, write-through mode,
 /// and upsert on the `id` primary key.
-#[cfg(feature = "duckdb")]
 fn write_through_duckdb_dataset(port: usize, table: &str, name: &str) -> Dataset {
     let mut ds = write_through_dataset(port, table, name);
     ds.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("duckdb".to_string()),
+        engine: Some("cayenne".to_string()),
         refresh_mode: Some(RefreshMode::Full),
         write_mode: WriteMode::WriteThrough,
         ..Acceleration::default()
@@ -338,17 +337,16 @@ async fn test_postgres_write_through_delete_all() -> Result<(), anyhow::Error> {
         .await
 }
 
-// ── DuckDB-accelerated write-through tests ────────────────────────────────────
+// ── Cayenne-accelerated write-through tests ────────────────────────────────────
 
-/// DELETE with WHERE on a DuckDB-accelerated dataset with write-through mode.
+/// DELETE with WHERE on a Cayenne-accelerated dataset with write-through mode.
 ///
-/// For `DuckDB` + Full refresh, `WriteThrough` falls through to `FederatedOnly`:
+/// For `Cayenne` + Full refresh, `WriteThrough` falls through to `FederatedOnly`:
 /// the DELETE is routed to Postgres only. A manual refresh is triggered to
-/// re-sync the `DuckDB` accelerator from the updated Postgres source, after
+/// re-sync the `Cayenne` accelerator from the updated Postgres source, after
 /// which queries through the runtime read the correct (post-delete) data.
-#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn test_postgres_duckdb_accel_delete_with_where() -> Result<(), anyhow::Error> {
+async fn test_postgres_cayenne_accel_delete_with_where() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -387,7 +385,7 @@ async fn test_postgres_duckdb_accel_delete_with_where() -> Result<(), anyhow::Er
                 &pg_result
             );
 
-            // Re-sync the DuckDB accelerator from the updated Postgres source
+            // Re-sync the Cayenne accelerator from the updated Postgres source
             refresh_dataset(&rt, "items").await?;
 
             // Accelerator reflects the deletion
@@ -409,13 +407,12 @@ async fn test_postgres_duckdb_accel_delete_with_where() -> Result<(), anyhow::Er
         .await
 }
 
-/// UPDATE with WHERE on a DuckDB-accelerated dataset with write-through mode.
+/// UPDATE with WHERE on a Cayenne-accelerated dataset with write-through mode.
 ///
 /// Same `FederatedOnly` routing as the delete test: UPDATE goes to Postgres, then
-/// an explicit refresh re-syncs `DuckDB`.
-#[cfg(feature = "duckdb")]
+/// an explicit refresh re-syncs `Cayenne`.
 #[tokio::test]
-async fn test_postgres_duckdb_accel_update_with_where() -> Result<(), anyhow::Error> {
+async fn test_postgres_cayenne_accel_update_with_where() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -459,7 +456,7 @@ async fn test_postgres_duckdb_accel_update_with_where() -> Result<(), anyhow::Er
                 &pg_result
             );
 
-            // Re-sync the DuckDB accelerator from the updated Postgres source
+            // Re-sync the Cayenne accelerator from the updated Postgres source
             refresh_dataset(&rt, "items").await?;
 
             // Accelerator reflects the update
@@ -485,10 +482,9 @@ async fn test_postgres_duckdb_accel_update_with_where() -> Result<(), anyhow::Er
 /// UPDATE without a WHERE clause must update all rows.
 ///
 /// Same `FederatedOnly` routing: UPDATE goes to Postgres, explicit refresh
-/// re-syncs `DuckDB`.
-#[cfg(feature = "duckdb")]
+/// re-syncs `Cayenne`.
 #[tokio::test]
-async fn test_postgres_duckdb_accel_update_all() -> Result<(), anyhow::Error> {
+async fn test_postgres_cayenne_accel_update_all() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -526,7 +522,7 @@ async fn test_postgres_duckdb_accel_update_all() -> Result<(), anyhow::Error> {
                 &pg_result
             );
 
-            // Re-sync the DuckDB accelerator from the updated Postgres source
+            // Re-sync the Cayenne accelerator from the updated Postgres source
             refresh_dataset(&rt, "items").await?;
 
             // Accelerator reflects the bulk update

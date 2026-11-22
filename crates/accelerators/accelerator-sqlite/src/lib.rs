@@ -1268,7 +1268,7 @@ mod tests {
     }
 
     /// A later batch of the same write may upsert a key the first batch
-    /// already admitted (`test_append_to_accelerator_duckdb` on `DuckDB`).
+    /// already admitted.
     #[tokio::test]
     async fn insert_upserts_a_key_repeated_across_batches() {
         let table = upsert_id_v_table("cross_batch", id_v_schema()).await;

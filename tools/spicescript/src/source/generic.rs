@@ -79,6 +79,7 @@ impl Generic {
                 },
                 healthcheck: spec.ready.as_deref().map(healthcheck),
                 network: shares_host.then(|| "host".to_string()),
+                alias: None,
             },
             if shares_host {
                 HashMap::new()
@@ -167,6 +168,6 @@ mod tests {
             .collect();
         let s = |v: &str| Some(v.to_string());
         assert_eq!(rows, vec![s("alpha  "), s(""), s(" "), s("beta")]);
-        assert!(output_lines("").rows.is_empty());
+        assert_eq!(output_lines("").rows, [] as [Vec<Option<String>>; 0]);
     }
 }

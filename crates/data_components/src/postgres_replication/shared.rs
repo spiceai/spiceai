@@ -1002,6 +1002,18 @@ struct SharedLsnCommitter {
     /// next start would then resume *past* changes the acceleration never durably
     /// received.
     watermark_notify: Arc<Notify>,
+    /// Writes this commit's position before the source is acknowledged, for an
+    /// accelerator that commits it with the data it covers. `None` in tests.
+    position: Option<PositionRecorder>,
+}
+
+/// A member's applied-position store and the source's write serialization, so a
+/// position recorded by a committer and one written by
+/// [`write_published_positions`] cannot land out of order.
+#[derive(Clone)]
+struct PositionRecorder {
+    store: Arc<dyn AppliedLsnStore>,
+    lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[async_trait]
@@ -1054,6 +1066,29 @@ impl CommitChange for SharedLsnCommitter {
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
+    }
+
+    fn record_position(
+        &self,
+    ) -> Option<futures::future::BoxFuture<'static, std::result::Result<(), CommitError>>> {
+        let recorder = self.position.clone()?;
+        let slot = Arc::clone(&self.slot);
+        let lsn = self.flush_to;
+        Some(Box::pin(async move {
+            let _serialized = recorder.lock.lock().await;
+            if lsn <= slot.recorded() {
+                return Ok(());
+            }
+            recorder
+                .store
+                .save(AppliedLsn { lsn })
+                .await
+                .map_err(|source| CommitError::UnableToCommitChange { source })?;
+            // The background writer now skips this position and anything older,
+            // so it cannot overwrite it with an earlier one.
+            slot.note_recorded(lsn);
+            Ok(())
+        }))
     }
 }
 
@@ -1203,6 +1238,7 @@ struct PendingPgEnvelope {
     dataset: String,
     /// Cloned from the member; see [`run_applied_lsn_writer`].
     watermark_notify: Arc<Notify>,
+    position: Option<PositionRecorder>,
     is_dataset_ready: bool,
     first_received_at: std::time::Instant,
 }
@@ -1238,6 +1274,7 @@ impl PendingPgEnvelope {
             // Same member (the `slot` pointer check above proves it), so both
             // sides carry the same notify; either may be kept.
             watermark_notify,
+            position,
             is_dataset_ready,
             first_received_at,
         } = other;
@@ -1250,6 +1287,7 @@ impl PendingPgEnvelope {
                 flush_to,
                 dataset,
                 watermark_notify,
+                position,
                 is_dataset_ready,
                 first_received_at,
             });
@@ -1274,6 +1312,7 @@ impl PendingPgEnvelope {
                 dataset: self.dataset,
                 source_commit_ts_ms,
                 watermark_notify: self.watermark_notify,
+                position: self.position,
             }),
             Box::new(self.rows),
             self.is_dataset_ready,
@@ -1664,14 +1703,16 @@ impl MemberMailboxReceiver {
             .fetch_sub(item.buffered_bytes(), Ordering::AcqRel);
         self.shared.capacity_notify.notify_one();
         // Echo suppression, decided here rather than in the shared pump: drop
-        // every chunk of this envelope whose xid this member's own registry
-        // recognizes as one of its own write-back deliveries. `contains` is a
+        // the changes of this envelope whose xid this member's own registry
+        // recognizes as one of its own write-back deliveries, except those to a
+        // key that changed through the stream after the delivery read it
+        // (#16505, see `PgChangeRows::drop_echoed`). `contains` is a
         // lock-free mirror read, so this never blocks; a member with no
         // registry (the overwhelming majority of datasets) skips straight past.
         if let (PendingItem::Changes(pending), Some(filter)) =
             (&mut item, self.echo_filter.as_mut())
         {
-            let scan = pending.rows.drop_echoed(&filter.registry);
+            let scan = pending.rows.drop_echoed(&filter.registry, pending.flush_to);
             // A change from a transaction this dataset did not issue means the
             // accelerator is not the only writer of this table, the one condition
             // durable write-back cannot make safe. Report it once: every later
@@ -1829,7 +1870,7 @@ struct SharedSource {
     /// Serializes [`write_published_positions`] between the writer task and the
     /// pump's final write, so a pass that read an older position cannot land after
     /// a newer one.
-    position_write_lock: tokio::sync::Mutex<()>,
+    position_write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Positions published by members that have since detached, which the writer's
     /// member sweep can no longer reach. See [`OrphanedPosition`].
     orphaned_positions: Mutex<Vec<OrphanedPosition>>,
@@ -1882,7 +1923,7 @@ impl SharedSource {
             restart_requested: AtomicBool::new(false),
             dead: AtomicBool::new(false),
             watermark_notify: Arc::new(Notify::new()),
-            position_write_lock: tokio::sync::Mutex::new(()),
+            position_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             orphaned_positions: Mutex::new(Vec::new()),
             slot_created_fresh: AtomicBool::new(false),
             slot_generation: AtomicU64::new(0),
@@ -2263,7 +2304,6 @@ fn implicitly_published_release_message(
 ///
 /// Mirrors [`super::start_replication_stream`]'s lazy contract — setup runs on
 /// first poll and setup errors surface through the stream.
-#[must_use]
 pub fn subscribe(input: ReplicationStreamInput) -> ChangesStream {
     Box::pin(
         stream::once(async move { subscribe_inner(input).await }).flat_map(|result| match result {
@@ -2604,8 +2644,13 @@ async fn attach_member(
     // replay from re-delivering commits the acceleration durably holds (see
     // `AckSlot::seat_recorded` for why re-delivery loses writes on a durable
     // write-back dataset).
+    //
+    // A rebuild whose position is still sound seats it too: the re-read already
+    // holds every change at or below it, and replaying them after the dataset is
+    // ready serves older states of the table (see
+    // `RebuildCause::keeps_recorded_position`).
     if let (Some(slot), super::RecordedPosition::At(resumed)) = (&ack_slot, &watermark)
-        && !rebuild_via_consumer
+        && rebuild_cause.is_none_or(super::RebuildCause::keeps_recorded_position)
     {
         slot.seat_recorded(resumed.lsn);
     }
@@ -3426,9 +3471,11 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
     // chunk of filtered/unrelated WAL the slot decodes), so emit at most one
     // heartbeat round per `heartbeat_every`. The per-keepalive `credit_idle`
     // ACK is unaffected. Members share the slot's connection params, so the
-    // interval is derived from the source's ready_lag.
+    // interval is derived from the source's ready_lag. Set to `None` on every
+    // successful connect, below, so a heartbeat sent on an earlier connection
+    // never throttles the next one.
     let heartbeat_every = crate::cdc::heartbeat_interval(params.ready_lag);
-    let mut last_heartbeat_at: Option<std::time::Instant> = None;
+    let mut last_heartbeat_at: Option<std::time::Instant>;
     // When the stream dropped (set as the inner loop breaks to reconnect); consumed
     // on the next successful connect to attribute the disconnected duration.
     let mut disconnect_at: Option<std::time::Instant> = None;
@@ -3546,6 +3593,12 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                 // member), so it covers every snapshot-complete member's gap:
                 // promote them to routable + creditable.
                 source.ack.promote_ready_members();
+                // A just-promoted member is ready on the next keepalive, which the
+                // client asks the server for (#15038); a heartbeat sent on the
+                // previous connection, before the member streamed, must not hold
+                // it back. Readiness follows the snapshot's publication, and the
+                // accelerator does not serve a view captured before that load.
+                last_heartbeat_at = None;
                 c
             }
             Err(e) if resilience::is_transient_pgwire(&e) => {
@@ -4645,6 +4698,10 @@ async fn deliver_commit(
             flush_to: boundary.end_lsn,
             dataset: member.dataset_name.clone(),
             watermark_notify: Arc::clone(&member.watermark_notify),
+            position: Some(PositionRecorder {
+                store: Arc::clone(&member.applied_lsn_store),
+                lock: Arc::clone(&source.position_write_lock),
+            }),
             is_dataset_ready: is_ready,
             first_received_at: std::time::Instant::now(),
         };
@@ -4743,6 +4800,7 @@ mod tests {
             ),
             slot: Arc::clone(slot),
             watermark_notify: Arc::new(Notify::new()),
+            position: None,
             flush_to,
             dataset: "ds".to_string(),
             is_dataset_ready: ready,
@@ -6384,10 +6442,9 @@ mod tests {
         let (source, _) = test_source_with_members(0);
         source.install_reservations(&shared_setup(100, true, &["t0"]));
         assert!(source.ack.slot(&key("t0")).is_none());
-        assert!(
-            source
-                .take_expired_reservations(std::time::Duration::ZERO)
-                .is_empty()
+        assert_eq!(
+            source.take_expired_reservations(std::time::Duration::ZERO),
+            [] as [(String, String); 0]
         );
     }
 
@@ -6683,6 +6740,7 @@ mod tests {
         let make = |flush_to, source_commit_ts_ms| SharedLsnCommitter {
             slot: Arc::clone(&slot),
             watermark_notify: Arc::clone(&notify),
+            position: None,
             flush_to,
             dataset: "customer".into(),
             source_commit_ts_ms,
@@ -6719,6 +6777,7 @@ mod tests {
         let make = || SharedLsnCommitter {
             slot: Arc::clone(&slot),
             watermark_notify: Arc::clone(&notify),
+            position: None,
             flush_to: 20,
             dataset: "customer".into(),
             source_commit_ts_ms: Some(2),
@@ -6751,6 +6810,7 @@ mod tests {
         let mut first = SharedLsnCommitter {
             slot: Arc::clone(&slot),
             watermark_notify: Arc::clone(&notify),
+            position: None,
             flush_to: u64::MAX - 1,
             dataset: "customer".into(),
             source_commit_ts_ms: Some(5),
@@ -6758,6 +6818,7 @@ mod tests {
         let last = SharedLsnCommitter {
             slot,
             watermark_notify: notify,
+            position: None,
             flush_to: u64::MAX,
             dataset: "customer".into(),
             source_commit_ts_ms: None,
@@ -6777,6 +6838,7 @@ mod tests {
         ack.register(&key("a"), false);
         let committer = SharedLsnCommitter {
             watermark_notify: Arc::new(Notify::new()),
+            position: None,
             slot: ack.slot(&key("a")).expect("slot registered"),
             flush_to: 42,
             dataset: "test".to_string(),
@@ -7438,6 +7500,309 @@ mod tests {
         );
     }
 
+    /// The rows a write-back member's envelope builds to, as the `id` text values.
+    fn built_ids(envelope: &ChangeEnvelope) -> Vec<i32> {
+        use arrow::array::AsArray;
+        let batch = envelope.change_batch().expect("the envelope builds");
+        let data = batch
+            .record
+            .column_by_name("data")
+            .expect("a change batch carries a data column")
+            .as_struct()
+            .clone();
+        let ids = data
+            .column_by_name("id")
+            .expect("the data struct carries id")
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .clone();
+        (0..ids.len()).map(|row| ids.value(row)).collect()
+    }
+
+    /// #16505: a write at the source reaches the stream *before* the echo of a
+    /// write-back delivery to the same key. Postgres ends with the delivered row
+    /// (its transaction committed last), but the accelerator applied the source's
+    /// write over its own copy, so it no longer holds what the delivery wrote. The
+    /// echo is then the only change that can bring it back in line with the
+    /// source, and dropping it leaves the two holding different rows for good.
+    #[tokio::test]
+    async fn echo_after_a_source_write_to_the_same_key_is_applied() {
+        let delivery_xid = 4242u32;
+        let source_xid = 7777u32;
+        let registry = registry_with_xid(delivery_xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+
+        // The direct source write to id 5 commits first ...
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            200,
+            Some(source_xid),
+        )
+        .await;
+        let foreign = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(built_ids(&foreign), vec![5], "the source write is applied");
+        foreign.commit().await.expect("commit the source write");
+
+        // ... then the write-back delivery to the same key, carrying the row
+        // Postgres now holds.
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            300,
+            Some(delivery_xid),
+        )
+        .await;
+        let echo = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(
+            built_ids(&echo),
+            vec![5],
+            "the delivery's row for the key the source wrote in between must be applied, or the accelerator keeps the source's older write"
+        );
+    }
+
+    /// The other order needs nothing: the echo of a delivery that reached the
+    /// source before any other write to its keys is dropped, and the later
+    /// source write is applied over it.
+    #[tokio::test]
+    async fn echo_before_a_source_write_is_dropped() {
+        let delivery_xid = 4242u32;
+        let source_xid = 7777u32;
+        let registry = registry_with_xid(delivery_xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            200,
+            Some(delivery_xid),
+        )
+        .await;
+        let echo = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(echo.num_rows_hint(), 0, "the echo is dropped");
+        echo.commit().await.expect("commit the ack");
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            300,
+            Some(source_xid),
+        )
+        .await;
+        let foreign = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(built_ids(&foreign), vec![5], "the source write is applied");
+    }
+
+    /// A source write to a *different* key does not make the echo of an unrelated
+    /// delivery necessary: only the keys the source wrote are re-applied.
+    #[tokio::test]
+    async fn echo_keeps_only_the_keys_the_source_wrote() {
+        let delivery_xid = 4242u32;
+        let source_xid = 7777u32;
+        let registry = registry_with_xid(delivery_xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "6")]),
+            200,
+            Some(source_xid),
+        )
+        .await;
+        let foreign = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        foreign.commit().await.expect("commit the source write");
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5"), (100, "6"), (100, "7")]),
+            300,
+            Some(delivery_xid),
+        )
+        .await;
+        let echo = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(
+            built_ids(&echo),
+            vec![6],
+            "only the key the source wrote in between is re-applied from the echo"
+        );
+    }
+
+    async fn empty_echo_registry() -> Arc<XidRegistry> {
+        XidRegistry::load(
+            Arc::new(EchoFakeStore::default()),
+            "localhost:5432/db/public.t0".to_string(),
+            "t0".to_string(),
+        )
+        .await
+        .expect("registry loads from an empty store")
+    }
+
+    /// A delivery whose accelerator read was taken after the source write was
+    /// durably applied read the source's row, so its echo carries nothing the
+    /// accelerator lacks and is dropped.
+    #[tokio::test]
+    async fn echo_is_dropped_when_the_read_observed_the_source_write() {
+        let delivery_xid = 4242u32;
+        let registry = empty_echo_registry().await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            200,
+            Some(7777),
+        )
+        .await;
+        let foreign = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        foreign.commit().await.expect("commit the source write");
+        registry.prune_acked(250).await;
+
+        let read = registry.begin_read();
+        assert_eq!(read.fence(), 250, "the read observes the applied position");
+        registry
+            .register_delivery(u64::from(delivery_xid), Some(&read))
+            .await
+            .expect("register the delivery");
+        drop(read);
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            300,
+            Some(delivery_xid),
+        )
+        .await;
+        let echo = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(echo.num_rows_hint(), 0, "the redundant echo is dropped");
+    }
+
+    /// An echo change that was kept is applied, so it is a change to its key that
+    /// a later delivery's read may not have observed either.
+    #[tokio::test]
+    async fn a_kept_echo_change_is_a_change_for_later_deliveries() {
+        let first = 4242u32;
+        let second = 4343u32;
+        let registry = empty_echo_registry().await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+
+        // The first delivery read before the source write to id 5 (fence 0).
+        let first_read = registry.begin_read();
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            200,
+            Some(7777),
+        )
+        .await;
+        receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error")
+            .commit()
+            .await
+            .expect("commit the source write");
+        registry
+            .register_delivery(u64::from(first), Some(&first_read))
+            .await
+            .expect("register the first delivery");
+        drop(first_read);
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            300,
+            Some(first),
+        )
+        .await;
+        let first_echo = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(built_ids(&first_echo), vec![5], "the first echo is applied");
+        first_echo.commit().await.expect("commit the first echo");
+
+        // The second read is fenced past the source write but before the
+        // first echo was applied.
+        registry.prune_acked(250).await;
+        let second_read = registry.begin_read();
+        registry
+            .register_delivery(u64::from(second), Some(&second_read))
+            .await
+            .expect("register the second delivery");
+        drop(second_read);
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            400,
+            Some(second),
+        )
+        .await;
+        let second_echo = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(
+            built_ids(&second_echo),
+            vec![5],
+            "the second echo is applied: its read did not observe the applied first echo"
+        );
+    }
+
     /// A transaction that is *only* the arbitrated member's echo still advances its
     /// watermark via the zero-row ack — a filtered echo is real source progress.
     #[tokio::test]
@@ -7632,7 +7997,7 @@ mod tests {
             Some(0),
         );
 
-        let scan = rows.drop_echoed(&registry);
+        let scan = rows.drop_echoed(&registry, 0);
 
         assert!(
             scan.dropped.is_empty(),

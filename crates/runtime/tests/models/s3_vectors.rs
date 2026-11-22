@@ -919,12 +919,10 @@ pub(crate) mod search {
                 "${env:AWS_S3_VECTORS_SECRET}".to_string(),
             ),
         ];
-        if std::env::var("AWS_SESSION_TOKEN").is_ok() {
-            param_map.push((
-                "s3_vectors_aws_session_token".to_string(),
-                "${env:AWS_SESSION_TOKEN}".to_string(),
-            ));
-        }
+        param_map.extend(crate::utils::aws_session_token_param(
+            "s3_vectors_aws_session_token",
+            "AWS_S3_VECTORS_SESSION_TOKEN",
+        ));
         let params = spicepod::param::Params::from_string_map(param_map.into_iter().collect());
 
         let store = VectorStore {
@@ -987,7 +985,7 @@ pub fn get_package_delivery_dataset(
     embedding_model: &str,
 ) -> Dataset {
     let mut dataset = Dataset::new(
-        format!("s3://spiceai-public-datasets/test_array_json/package-delivery/{path}"),
+        format!("s3://spice-datasets-gjezag77s0hu/test_array_json/package-delivery/{path}"),
         ds_name.to_string(),
     );
     dataset.params = Some(Params::from_string_map(
@@ -997,7 +995,7 @@ pub fn get_package_delivery_dataset(
             ("flatten_json".to_string(), "true".to_string()),
             (
                 "schema_source_path".to_string(),
-                "s3://spiceai-public-datasets/test_array_json/package-delivery/data/01.json"
+                "s3://spice-datasets-gjezag77s0hu/test_array_json/package-delivery/data/01.json"
                     .to_string(),
             ),
             ("client_timeout".to_string(), "120s".to_string()),
@@ -1048,7 +1046,7 @@ async fn delete_index(
             std::env::var("AWS_S3_VECTORS_SECRET")
                 .ok()
                 .unwrap_or_default(),
-            std::env::var("AWS_SESSION_TOKEN").ok(),
+            crate::utils::nonempty_env("AWS_S3_VECTORS_SESSION_TOKEN"),
             None,
             "S3Vectors",
         ))

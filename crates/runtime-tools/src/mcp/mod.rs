@@ -38,7 +38,12 @@ use snafu::{ResultExt, Snafu};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Invalid MCP directive 'from: mcp:{}'", id))]
+    /// A URL directive is shown without its credentials; the message is logged and kept as
+    /// the tool's status.
+    #[snafu(display(
+        "Invalid MCP directive 'from: mcp:{}'",
+        redact::redact_url_credentials(id)
+    ))]
     InvalidMCPDirective { id: String },
 
     #[snafu(display("Could not construct tool `{}`. Error: {}", name, e))]
@@ -61,6 +66,18 @@ pub enum Error {
         source
     ))]
     UnderlyingInitilizationError { source: McpError },
+}
+
+impl Error {
+    /// Returns `true` when the error is a mistake in the tool's Spicepod configuration, which
+    /// no retry can clear.
+    #[must_use]
+    pub fn is_configuration_error(&self) -> bool {
+        matches!(
+            self,
+            Error::InvalidMCPDirective { .. } | Error::InvalidMcpArgs { .. }
+        )
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -242,6 +259,18 @@ fn parse_custom_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A directive that does not parse is named without the credentials its URL carries.
+    #[test]
+    fn invalid_directive_message_leaves_out_url_credentials() {
+        let error = MCPType::from_str(r#"https://alice:pa"ss@tools.example.com/sse?token=abc123"#)
+            .err()
+            .expect("a quote does not parse");
+        assert_eq!(
+            error.to_string(),
+            "Invalid MCP directive 'from: mcp:https://tools.example.com/sse?token=***'"
+        );
+    }
 
     #[test]
     fn mcp_type_parses_stdio_command() {

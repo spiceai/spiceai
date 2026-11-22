@@ -11,10 +11,11 @@ datasets:
         AwsRegion=us-east-2;
         Schema=tpch;
         Workgroup=primary;
-        S3OutputLocation=s3://aws-athena-query-results-211125479522-us-east-2/;
+        S3OutputLocation=s3://aws-athena-query-results-165984978348-us-east-2/;
         AuthenticationType=IAM Credentials;
         UID=${ env:AWS_ACCESS_KEY_ID };
         PWD=${ env:AWS_SECRET_ACCESS_KEY };
+        SessionToken=${ env:AWS_SESSION_TOKEN };
     acceleration: &acceleration
       enabled: true
       engine: arrow

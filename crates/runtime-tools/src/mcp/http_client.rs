@@ -62,6 +62,7 @@ use rmcp::{
 };
 use snafu::Snafu;
 use sse_stream::{Sse, SseStream};
+use tokio_util::sync::CancellationToken;
 
 use super::MAX_TOOL_RESULT_SIZE;
 
@@ -107,10 +108,15 @@ pub(crate) struct BoundedHttpClient {
     inner: reqwest::Client,
     /// Spicepod name of the MCP tool catalog, for the over-limit message.
     server_name: Arc<str>,
+    /// Cancelled when the connection attempt that built this client is given up on. rmcp
+    /// sends the first request of a handshake outside its own cancellation, so without this
+    /// a handshake that timed out would keep that request, the task waiting on it, and its
+    /// connection open for as long as the server stays silent.
+    abandoned: CancellationToken,
 }
 
 impl BoundedHttpClient {
-    pub(crate) fn new(server_name: &str) -> reqwest::Result<Self> {
+    pub(crate) fn new(server_name: &str, abandoned: CancellationToken) -> reqwest::Result<Self> {
         // The same settings rmcp's default client uses: no idle pooling (a
         // pooled connection whose previous body was not fully read stalls on
         // delayed ACK), and no redirects, so custom headers such as an API key
@@ -123,6 +129,7 @@ impl BoundedHttpClient {
         Ok(Self {
             inner,
             server_name: server_name.into(),
+            abandoned,
         })
     }
 
@@ -309,38 +316,16 @@ fn legacy_discover_response(
     ))
 }
 
-impl StreamableHttpClient for BoundedHttpClient {
-    type Error = reqwest::Error;
-
-    async fn post_message(
+impl BoundedHttpClient {
+    /// Sends one POST and reads its response, never buffering more than
+    /// [`MAX_TOOL_RESULT_SIZE`] of it.
+    async fn post_bounded(
         &self,
         uri: Arc<str>,
         message: ClientJsonRpcMessage,
         session_id: Option<Arc<str>>,
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
-    ) -> HttpResult<StreamableHttpPostResponse> {
-        self.post_message_with_max_sse_event_size(
-            uri,
-            message,
-            session_id,
-            auth_header,
-            custom_headers,
-            MAX_TOOL_RESULT_SIZE,
-        )
-        .await
-    }
-
-    async fn post_message_with_max_sse_event_size(
-        &self,
-        uri: Arc<str>,
-        message: ClientJsonRpcMessage,
-        session_id: Option<Arc<str>>,
-        auth_header: Option<String>,
-        custom_headers: HashMap<HeaderName, HeaderValue>,
-        // The whole response is bounded by `MAX_TOOL_RESULT_SIZE`, which the
-        // transport config also sets as its event limit.
-        _max_sse_event_size: usize,
     ) -> HttpResult<StreamableHttpPostResponse> {
         let mut request = self
             .inner
@@ -448,7 +433,12 @@ impl StreamableHttpClient for BoundedHttpClient {
                     _ => None,
                 };
                 let bytes = BoundedByteStream {
-                    inner: response.bytes_stream().boxed(),
+                    // A handshake waits on this stream for its answer, so it ends with the
+                    // attempt like the POST does.
+                    inner: response
+                        .bytes_stream()
+                        .take_until(self.abandoned.clone().cancelled_owned())
+                        .boxed(),
                     client: self.clone(),
                     request_id,
                     received: 0,
@@ -479,6 +469,48 @@ impl StreamableHttpClient for BoundedHttpClient {
                 }
             }
             _ => Err(StreamableHttpError::UnexpectedContentType(content_type)),
+        }
+    }
+}
+
+impl StreamableHttpClient for BoundedHttpClient {
+    type Error = reqwest::Error;
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> HttpResult<StreamableHttpPostResponse> {
+        self.post_message_with_max_sse_event_size(
+            uri,
+            message,
+            session_id,
+            auth_header,
+            custom_headers,
+            MAX_TOOL_RESULT_SIZE,
+        )
+        .await
+    }
+
+    async fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        // The whole response is bounded by `MAX_TOOL_RESULT_SIZE`, which the
+        // transport config also sets as its event limit.
+        _max_sse_event_size: usize,
+    ) -> HttpResult<StreamableHttpPostResponse> {
+        tokio::select! {
+            () = self.abandoned.cancelled() => Err(StreamableHttpError::TransportChannelClosed),
+            response = self.post_bounded(uri, message, session_id, auth_header, custom_headers) => {
+                response
+            }
         }
     }
 
@@ -553,7 +585,7 @@ mod tests {
         ServerHandler,
         model::{
             CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
-            PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+            PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
         },
         service::RequestContext,
         transport::streamable_http_server::{
@@ -585,8 +617,8 @@ mod tests {
     struct SizedResultServer;
 
     impl ServerHandler for SizedResultServer {
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
         }
 
         fn list_tools(
@@ -754,12 +786,32 @@ mod tests {
         .unwrap_or_else(|e| panic!("connect to the MCP server: {e}"))
     }
 
+    /// A request made with a read-write API key: an MCP server's tools need write access, and
+    /// these tests are about the transport, not about who may call.
+    fn read_write_request() -> std::sync::Arc<runtime_request_context::RequestContext> {
+        use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
+        let context = std::sync::Arc::new(
+            runtime_request_context::RequestContext::builder(
+                runtime_request_context::Protocol::Http,
+            )
+            .build(),
+        );
+        let principal: AuthPrincipalRef = std::sync::Arc::new(
+            spicepod::component::runtime::ApiKey::parse_str("transport-test:rw"),
+        );
+        context
+            .set_auth_principal(principal)
+            .expect("a new request has no principal yet");
+        context
+    }
+
     async fn call(catalog: &McpToolCatalog, tool: &str, args: &Value) -> Result<Value, String> {
         let tool = catalog
             .get(tool)
             .await
             .unwrap_or_else(|| panic!("tool '{tool}' is listed"));
-        tokio::time::timeout(CALL_TIMEOUT, tool.call(&args.to_string()))
+        let args = args.to_string();
+        tokio::time::timeout(CALL_TIMEOUT, read_write_request().scope(tool.call(&args)))
             .await
             .expect("the tool call finishes instead of hanging")
             .map_err(|e| e.to_string())
@@ -938,8 +990,10 @@ mod tests {
             let catalog = connect(url).await;
             let tool = catalog.get("hang").await.expect("tool 'hang' is listed");
 
-            let call =
-                tokio::spawn(async move { tool.call("{}").await.map_err(|e| e.to_string()) });
+            let call = tokio::spawn(
+                read_write_request()
+                    .scope(async move { tool.call("{}").await.map_err(|e| e.to_string()) }),
+            );
             wait_until_received(&upstream.hang_received, "the tool call").await;
             tokio::time::pause();
             let result = tokio::time::timeout(2 * MCP_CALL_TOOL_TIMEOUT, call)

@@ -49,54 +49,32 @@ use spicepod::{
 use tracing::instrument;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
-#[cfg(feature = "duckdb")]
-mod duckdb;
-
-#[cfg(feature = "sqlite")]
-mod sqlite;
-
 #[tokio::test]
 async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
-    test_request_context().scope(async {
-        let running_container = prepare_test_environment()
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let running_container = Arc::new(running_container);
+    test_request_context()
+        .scope(async {
+            let running_container = prepare_test_environment()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let running_container = Arc::new(running_container);
 
-        let config = vec![
-            #[cfg(feature = "duckdb")]
-            ("duckdb", Some("spill_to_disk_duckdb.db")),
-            #[cfg(feature = "sqlite")]
-            ("sqlite", Some("spill_to_disk_sqlite.db")),
-        ];
-
-        for (idx, (engine, db_file_path)) in config.into_iter().enumerate() {
-            tracing::info!("Testing spill-to-disk and rehydration with engine: {engine}, db_file_path: {db_file_path:?}");
-
-            if idx > 0 {
-                // Ensure the container is running as the tests manipulate it
-                running_container
-                    .start()
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e))?;
-            }
             execute_spill_to_disk_and_rehydration(
                 Arc::clone(&running_container),
-                engine,
-                db_file_path,
+                "cayenne",
+                Some("spill_to_disk_cayenne"),
             )
             .await?;
-        }
 
-        running_container.cleanup().await;
+            running_container.cleanup().await;
 
-        tracing::info!("Spill-to-disk and rehydration tests passed!");
+            tracing::info!("Spill-to-disk and rehydration tests passed!");
 
-        Ok(())
-    }).await
+            Ok(())
+        })
+        .await
 }
 
 /// Validates spill-to-disk and rehydration functionality by simulating runtime restarts
@@ -133,7 +111,11 @@ async fn execute_spill_to_disk_and_rehydration(
         path_with_appended_suffix(&accelerated_db_file_path, "-shm"),
     ] {
         if std::fs::metadata(&file_path).is_ok() {
-            std::fs::remove_file(&file_path).context("should remove local database")?;
+            if file_path.is_dir() {
+                std::fs::remove_dir_all(&file_path).context("should remove local database")?;
+            } else {
+                std::fs::remove_file(&file_path).context("should remove local database")?;
+            }
         }
     }
 
@@ -189,8 +171,13 @@ async fn execute_spill_to_disk_and_rehydration(
     rt.shutdown().await;
     drop(rt);
 
-    // Restart the runtime with updated app definition that includes primary key and indexes
+    // Restart the runtime with updated app definition that includes primary key and indexes.
+    // Cayenne cannot adopt a new primary key in place, so it drops the acceleration and
+    // reloads it from the source; wait for that reload before querying.
     let rt = init_spice_app(port, engine, db_file_path, true).await?;
+    if engine == "cayenne" {
+        runtime_ready_check(&rt).await;
+    }
     let restart2_items = run_query(test_query, &rt).await?;
     let restart2_items_pretty =
         arrow::util::pretty::pretty_format_batches(&restart2_items).expect("pretty format");
@@ -199,8 +186,9 @@ async fn execute_spill_to_disk_and_rehydration(
     rt.shutdown().await;
     drop(rt);
 
-    // Simulate federated dataset access issue after the runtime is restarted, ensure query result remain consistent
-    let rt = init_spice_app(port, engine, db_file_path, false).await?;
+    // Simulate federated dataset access issue after the runtime is restarted, ensure query result remain consistent.
+    // The same app definition as the previous restart, so the acceleration is served from disk unchanged.
+    let rt = init_spice_app(port, engine, db_file_path, true).await?;
     federated_dataset_container.stop().await?;
     let restart3_items = run_query(test_query, &rt).await?;
     let restart3_items_pretty =
@@ -242,19 +230,10 @@ async fn get_locally_persisted_records(
     db_file_path: &Path,
     query: &str,
 ) -> Result<Vec<RecordBatch>, anyhow::Error> {
-    let db_file_path = db_file_path.to_string_lossy();
-    let query_result = match engine {
-        #[cfg(feature = "duckdb")]
-        "duckdb" => duckdb::query_local_db(db_file_path.as_ref(), query).await?,
-        #[cfg(feature = "sqlite")]
-        "sqlite" => sqlite::query_local_db(db_file_path.as_ref(), query).await?,
-        _ => Err(anyhow::anyhow!("Unsupported engine: {engine}"))?,
-    };
-
-    query_result
-        .try_collect::<Vec<RecordBatch>>()
-        .await
-        .map_err(|e| anyhow::anyhow!("Unable to collect query results: {e}"))
+    match engine {
+        "cayenne" => crate::acceleration::query_cayenne_file(db_file_path, "lineitem", query).await,
+        _ => Err(anyhow::anyhow!("Unsupported engine: {engine}")),
+    }
 }
 
 fn resolve_local_db_file_path(engine: &str, db_file_path: Option<&str>) -> PathBuf {
@@ -339,7 +318,11 @@ fn create_test_dataset(
     if let Some(db_file_path) = db_file_path {
         let params = SpicepodParams::from_string_map(
             vec![(
-                format!("{acceleration_engine}_file"),
+                if acceleration_engine == "cayenne" {
+                    "cayenne_file_path".to_string()
+                } else {
+                    format!("{acceleration_engine}_file")
+                },
                 db_file_path.to_string(),
             )]
             .into_iter()

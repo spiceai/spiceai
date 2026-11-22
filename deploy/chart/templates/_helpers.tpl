@@ -3,23 +3,24 @@
 Expand the name of the chart.
 */}}
 {{- define "spiceai.name" -}}
-{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- regexReplaceAll "-+$" (default .Chart.Name .Values.nameOverride | trunc 63) "" -}}
 {{- end -}}
 
 {{/*
 Create a default fully qualified app name.
 We truncate at 63 chars because some Kubernetes name fields are limited to this (by the DNS naming spec).
+A name must end in a letter or digit, so every trailing `-` the cut leaves is removed, not only the last.
 If release name contains chart name it will be used as a full name.
 */}}
 {{- define "spiceai.fullname" -}}
 {{- if .Values.fullnameOverride -}}
-{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- regexReplaceAll "-+$" (.Values.fullnameOverride | trunc 63) "" -}}
 {{- else -}}
 {{- $name := default .Chart.Name .Values.nameOverride -}}
 {{- if contains $name .Release.Name -}}
-{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- regexReplaceAll "-+$" (.Release.Name | trunc 63) "" -}}
 {{- else -}}
-{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- regexReplaceAll "-+$" (printf "%s-%s" .Release.Name $name | trunc 63) "" -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -50,7 +51,7 @@ Allow the release namespace to be overridden for multi-namespace deployments in 
 Create chart name and version as used by the chart label.
 */}}
 {{- define "spiceai.chart" -}}
-{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" -}}
+{{- regexReplaceAll "-+$" (printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63) "" -}}
 {{- end -}}
 
 {{/*
@@ -79,6 +80,157 @@ app.kubernetes.io/name: {{ include "spiceai.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 {{- end }}
+
+{{/*
+The validated `role` value: server (the default), sidecar, scheduler, or executor.
+*/}}
+{{- define "spiceai.role" -}}
+{{- $role := .Values.role | default "server" -}}
+{{- if not (has $role (list "server" "sidecar" "scheduler" "executor")) -}}
+{{- fail (printf "role '%s' is not a Spice role. Use server (the default), sidecar, scheduler, or executor." $role) -}}
+{{- end -}}
+{{- $role -}}
+{{- end -}}
+
+{{/*
+Whether the role joins a cluster: a scheduler or an executor.
+*/}}
+{{- define "spiceai.clusterNode" -}}
+{{- if has (include "spiceai.role" .) (list "scheduler" "executor") -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Cluster nodes (schedulers and executors) run as a StatefulSet behind a headless
+Service, so each pod has a stable DNS name its certificate can cover with one
+wildcard SAN (see https://spiceai.org/docs/features/distributed-query). A
+StatefulSet is also used when `stateful.enabled` requests one for any role.
+*/}}
+{{- define "spiceai.useStatefulSet" -}}
+{{- if or .Values.stateful.enabled (include "spiceai.clusterNode" .) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+The name of the Deployment or StatefulSet. A Deployment takes `<fullname>`. A StatefulSet name
+is at most 52 characters, because Kubernetes builds two values from it that must stay within 63
+characters: each pod's name, `<name>-<ordinal>`, which is also the first DNS label of the
+address a cluster node advertises; and each pod's `controller-revision-hash` label value,
+`<name>-<hash>`, whose hash is up to 10 characters.
+
+A StatefulSet takes `<fullname>` when it fits. A longer fullname is cut to 45 characters, with
+every trailing `-` the cut leaves removed, and followed by `-` and the first 6 hex characters of
+the SHA-256 of the whole fullname. Two releases whose fullnames differ only after the cut
+therefore get different names, and a release keeps its name across upgrades.
+*/}}
+{{- define "spiceai.workloadName" -}}
+{{- $fullname := include "spiceai.fullname" . -}}
+{{- if and (include "spiceai.useStatefulSet" .) (gt (len $fullname) 52) -}}
+{{- printf "%s-%s" (regexReplaceAll "-+$" ($fullname | trunc 45) "") (sha256sum $fullname | trunc 6) -}}
+{{- else -}}
+{{- $fullname -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The headless Service that gives cluster node pods their stable per-pod DNS names, and so the
+name a wildcard certificate for those pods covers. A Service name is a DNS label of at most 63
+characters. A fullname of at most 54 characters gives `<fullname>-headless`. A longer fullname is
+cut to 47 characters, with every trailing `-` the cut leaves removed, and followed by `-`, the
+first 6 hex characters of the SHA-256 of the whole fullname, and `-headless`. Two releases whose
+fullnames differ only after the cut therefore get different Services, and a release keeps its
+name across upgrades.
+
+The name must also differ from the main Service's, `<fullname>`. Only a 62- or 63-character
+fullname that ends in its own hash and `-headless` could match; it is cut to 45 characters
+instead, which gives a shorter name.
+*/}}
+{{- define "spiceai.headlessServiceName" -}}
+{{- $fullname := include "spiceai.fullname" . -}}
+{{- if le (len $fullname) 54 -}}
+{{- printf "%s-headless" $fullname -}}
+{{- else -}}
+{{- $hash := sha256sum $fullname | trunc 6 -}}
+{{- $name := printf "%s-%s-headless" (regexReplaceAll "-+$" ($fullname | trunc 47) "") $hash -}}
+{{- if eq $name $fullname -}}
+{{- $name = printf "%s-%s-headless" (regexReplaceAll "-+$" ($fullname | trunc 45) "") $hash -}}
+{{- end -}}
+{{- $name -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The address a cluster node advertises to its peers: its stable per-pod DNS name,
+`$(POD_NAME).<headless-service>.<namespace>.svc.cluster.local`, which a wildcard
+certificate `*.<headless-service>.<namespace>.svc.cluster.local` covers.
+`cluster.advertiseAddress` overrides it.
+*/}}
+{{- define "spiceai.advertiseAddress" -}}
+{{- if .Values.cluster.advertiseAddress -}}
+{{- .Values.cluster.advertiseAddress -}}
+{{- else -}}
+{{- printf "$(POD_NAME).%s.%s.svc.cluster.local" (include "spiceai.headlessServiceName" .) (include "spiceai.namespace" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The `spiced` arguments that select the role, after the command. A server takes
+none, so its pods start exactly as before the chart had a role.
+*/}}
+{{- define "spiceai.roleArgs" -}}
+{{- $role := include "spiceai.role" . -}}
+{{- if ne $role "server" }}
+- --role
+- {{ $role }}
+{{- end }}
+{{- if include "spiceai.clusterNode" . }}
+{{- $cluster := .Values.cluster }}
+{{- if eq $role "scheduler" }}
+{{- $runtime := .Values.spicepod.runtime | default dict }}
+{{- if not (or (dig "state" "location" "" $runtime) (dig "scheduler" "state_location" "" $runtime)) }}
+{{- fail "role: scheduler requires `runtime.state.location` in `spicepod`, where schedulers keep shared cluster state. See: https://spiceai.org/docs/features/distributed-query" }}
+{{- end }}
+{{- end }}
+- --node-bind-address
+- {{ printf "0.0.0.0:%v" $cluster.port | quote }}
+- --node-advertise-address
+- {{ include "spiceai.advertiseAddress" . | quote }}
+{{- if eq $role "executor" }}
+- --scheduler-address
+- {{ required "role: executor requires `cluster.schedulerAddress`, the scheduler's cluster address, e.g. https://spice-scheduler-spiceai:50052" $cluster.schedulerAddress | quote }}
+{{- end }}
+{{- if $cluster.tls.secretName }}
+- --node-mtls-ca-certificate-file
+- /etc/spice/cluster-tls/ca.crt
+- --node-mtls-certificate-file
+- /etc/spice/cluster-tls/tls.crt
+- --node-mtls-key-file
+- /etc/spice/cluster-tls/tls.key
+{{- else if $cluster.allowInsecureConnections }}
+- --allow-insecure-connections
+{{- else }}
+{{- fail (printf "role: %s requires cluster mTLS: set `cluster.tls.secretName` to a Secret holding ca.crt, tls.crt and tls.key, or set `cluster.allowInsecureConnections: true` for development and testing." $role) }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+The readiness path a role serves. An executor serves only `/health`: it has no
+`/v1/ready`, so probing that path would keep it from ever becoming ready.
+*/}}
+{{- define "spiceai.readinessPath" -}}
+{{- if eq (include "spiceai.role" .) "executor" -}}/health{{- else -}}/v1/ready{{- end -}}
+{{- end -}}
+
+{{/*
+`readinessProbe` with the default `/v1/ready` path moved to the role's own
+readiness path. Any other path is the user's choice and stays as written.
+*/}}
+{{- define "spiceai.readinessProbe" -}}
+{{- $probe := deepCopy (.Values.readinessProbe | default dict) -}}
+{{- if and $probe.httpGet (eq ($probe.httpGet.path | default "") "/v1/ready") -}}
+{{- $_ := set $probe.httpGet "path" (include "spiceai.readinessPath" .) -}}
+{{- end -}}
+{{- if $probe }}{{ toYaml $probe }}{{ end -}}
+{{- end -}}
 
 {{/*
 Render a Kubernetes probe with built-in HTTP defaults.

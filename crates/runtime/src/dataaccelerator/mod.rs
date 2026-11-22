@@ -41,6 +41,10 @@ mod test {
     use ::arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
+    // Links the `sqlite` engine's registration into this test binary, which
+    // `test_file_mode_sqlite_creation` resolves through the engine registry.
+    #[cfg(feature = "sqlite")]
+    use accelerator_sqlite as _;
     // Config types now live in `runtime-component`/`runtime-acceleration` (not re-exported
     // by the accelerator shim glob), and `Secrets` in `runtime-secrets`.
     use crate::component::dataset::acceleration::{Acceleration, Engine, IndexType, Mode};
@@ -296,43 +300,6 @@ mod test {
         };
 
         assert!(!cayenne_pk_conflict_detection_none(&acceleration_settings));
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "duckdb")]
-    async fn test_file_mode_duckdb_creation() {
-        use crate::builder::RuntimeBuilder;
-        use std::{fs, path::Path};
-
-        let path = "./abc-duckdb.db".to_string();
-        let params = HashMap::from([("duckdb_file".to_string(), path.clone())]);
-        let runtime = Arc::new(RuntimeBuilder::new().build().await);
-        let ctx = Arc::clone(&runtime.df.ctx);
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
-        let acceleration_settings = Acceleration {
-            params,
-            enabled: true,
-            mode: Mode::File,
-            engine: Engine::DuckDB,
-            ..Acceleration::default()
-        };
-        let _ = runtime
-            .accelerator_engine_registry
-            .create_accelerator_table(
-                "abc".into(),
-                schema,
-                None,
-                &acceleration_settings,
-                Arc::new(RwLock::new(Secrets::new())),
-                None,
-                ctx,
-            )
-            .await
-            .expect("accelerator table created");
-
-        let path = Path::new(&path);
-        assert!(path.is_file());
-        fs::remove_file(path).expect("file removed");
     }
 
     #[tokio::test]
@@ -792,15 +759,8 @@ mod accelerator_compat_tests {
         // Test both memory and file modes for databases
         // Format: (engine, mode, metastore_type)
         let test_configs = vec![
-            #[cfg(feature = "sqlite")]
-            (Engine::Sqlite, "memory", None),
-            #[cfg(feature = "sqlite")]
-            (Engine::Sqlite, "file", None),
-            #[cfg(feature = "duckdb")]
-            (Engine::DuckDB, "memory", None),
-            #[cfg(feature = "duckdb")]
-            (Engine::DuckDB, "file", None),
             (Engine::Arrow, "memory", None),
+            (Engine::Cayenne, "memory", None),
             (Engine::Cayenne, "file", Some("sqlite")), // Cayenne with SQLite metastore
         ];
 
@@ -869,34 +829,6 @@ mod accelerator_compat_tests {
             };
 
             let table = match engine {
-                #[cfg(feature = "sqlite")]
-                Engine::Sqlite => {
-                    use accelerator_sqlite::SqliteAccelerator;
-                    match SqliteAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new(), None)
-                        .await
-                    {
-                        Ok(table) => table,
-                        Err(e) => {
-                            println!("  Skipping SQLite - unsupported types: {}", e);
-                            continue;
-                        }
-                    }
-                }
-                #[cfg(feature = "duckdb")]
-                Engine::DuckDB => {
-                    use accelerator_duckdb::DuckDBAccelerator;
-                    match DuckDBAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new(), None)
-                        .await
-                    {
-                        Ok(table) => table,
-                        Err(e) => {
-                            println!("  Skipping DuckDB - unsupported types: {}", e);
-                            continue;
-                        }
-                    }
-                }
                 Engine::Arrow => {
                     use crate::dataaccelerator::arrow::ArrowAccelerator;
                     match ArrowAccelerator::new()
@@ -1770,26 +1702,6 @@ mod accelerator_compat_tests {
                         expected_table,
                         table_type
                     );
-                } else if matches!(engine, Engine::DuckDB) {
-                    // DuckDB normalises YearMonth/DayTime intervals to MonthDayNano
-                    // because its native INTERVAL type maps to the MonthDayNano layout.
-                    let expected_type = match original_type {
-                        DataType::Interval(
-                            arrow::datatypes::IntervalUnit::YearMonth
-                            | arrow::datatypes::IntervalUnit::DayTime,
-                        ) => &DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
-                        other => other,
-                    };
-                    assert_eq!(
-                        expected_type,
-                        table_type,
-                        "{:?}: Field {} ({}) data type mismatch. Expected {:?}, got {:?}",
-                        engine,
-                        i,
-                        original_field.name(),
-                        expected_type,
-                        table_type
-                    );
                 } else {
                     // For all other engines, types should match exactly
                     assert_eq!(
@@ -2121,22 +2033,6 @@ mod accelerator_compat_tests {
                 };
 
                 let bool_table: Arc<dyn TableProvider> = match engine {
-                    #[cfg(feature = "sqlite")]
-                    Engine::Sqlite => {
-                        use accelerator_sqlite::SqliteAccelerator;
-                        SqliteAccelerator::new()
-                            .create_external_table(external_table, None, Vec::new(), None)
-                            .await
-                            .expect("SQLite table should be created")
-                    }
-                    #[cfg(feature = "duckdb")]
-                    Engine::DuckDB => {
-                        use accelerator_duckdb::DuckDBAccelerator;
-                        DuckDBAccelerator::new()
-                            .create_external_table(external_table, None, Vec::new(), None)
-                            .await
-                            .expect("DuckDB table should be created")
-                    }
                     Engine::Arrow => {
                         use crate::dataaccelerator::arrow::ArrowAccelerator;
                         ArrowAccelerator::new()

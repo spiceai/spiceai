@@ -1,0 +1,223 @@
+---
+name: spicescript nightly
+
+# Runs the scenario scripts that are not worth their time on every merge-queue
+# run, nightly after build_nightly against the newest nightly spiced:
+#
+# - test/spicescript/long: scripts that wait on a source's own clock for many
+#   minutes (a DynamoDB Streams shard iterator expires after about five).
+# - test/spicescript/known-failing: scripts that reproduce open bugs. Each must
+#   fail exactly as its group's recordings/expected-failures.json says, so a
+#   red run means a bug was fixed (move the script up to test/spicescript/ and
+#   re-record) or now shows differently (re-record, or look for a regression).
+#
+# On demand, it runs against the Linux build of an E2E Test CI push or
+# merge_group run of trunk or a release branch, with the scripts of the commit
+# that run built. A pull request's run is refused: its author built that spiced
+# and wrote those scripts, and this job has id-token: write on the self-hosted
+# runners.
+
+on:
+  schedule:
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'An E2E Test CI run whose Linux build to test (default: the newest nightly build)'
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  spicescript:
+    environment: ci
+    name: ${{ matrix.name }}
+    runs-on: spiceai-dev-runners
+    permissions:
+      actions: read
+      contents: read
+      id-token: write  # RustFS and Docker Hub credentials
+    # The long scripts' own waits are about 15 minutes, and a known-failing
+    # share takes about 25; the rest is starting containers and building
+    # spicescript when no earlier run built it.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: 'spicescript: long', shard: long, args: test/spicescript/long }
+          # --max-wait: a known-failing script otherwise waits out every
+          # limit of the checks it is expected to fail.
+          - { name: 'spicescript: known failing (1/2)', shard: known-failing-1, args: --partition 1/2 --max-wait 30s test/spicescript/known-failing }
+          - { name: 'spicescript: known failing (2/2)', shard: known-failing-2, args: --partition 2/2 --max-wait 30s test/spicescript/known-failing }
+    steps:
+      # Before anything of the run is downloaded or checked out; see the action for the rules.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: inputs.run_id != ''
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/actions/check-trusted-run
+
+      - name: Check the run is a trusted build
+        id: trusted
+        if: inputs.run_id != ''
+        uses: $/.github/actions/check-trusted-run
+        with:
+          run-id: ${{ inputs.run_id }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Find the build
+        id: build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ inputs.run_id }}
+          TRUSTED_WORKFLOW: ${{ steps.trusted.outputs.workflow }}
+        run: |
+          set -euo pipefail
+          if [ -n "$RUN_ID" ]; then
+            # Only an E2E Test CI run holds build_linux_x86_64, which holds
+            # both spiced and the spice CLI.
+            [ "$TRUSTED_WORKFLOW" = "E2E Test CI" ] || { echo "::error::Run $RUN_ID is a $TRUSTED_WORKFLOW run, not E2E Test CI"; exit 1; }
+            run="$RUN_ID"
+            artifacts=build_linux_x86_64
+          else
+            # A nightly run with no new commits succeeds without building, so
+            # take the newest one that still holds the binaries.
+            artifacts="spiced_linux_x86_64 spice_linux_x86_64"
+            run=""
+            for id in $(gh run list -R "$GITHUB_REPOSITORY" -w build_nightly.yml -b trunk \
+                --status success -L 20 --json databaseId -q '.[].databaseId'); do
+              held=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts" \
+                -q '.artifacts[] | select(.expired | not) | .name')
+              if grep -qx spiced_linux_x86_64 <<<"$held" && grep -qx spice_linux_x86_64 <<<"$held"; then
+                run="$id"
+                break
+              fi
+            done
+            [ -n "$run" ] || { echo "No build_nightly run holds $artifacts" >&2; exit 1; }
+          fi
+          sha=$(gh run view "$run" -R "$GITHUB_REPOSITORY" --json headSha -q .headSha)
+          echo "Testing the build of run $run ($artifacts), commit $sha"
+          {
+            echo "run=$run"
+            echo "artifacts=$artifacts"
+            echo "sha=$sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.build.outputs.sha }}
+          persist-credentials: false
+
+      - name: Download spiced and spice
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_RUN: ${{ steps.build.outputs.run }}
+          BUILD_ARTIFACTS: ${{ steps.build.outputs.artifacts }}
+        run: |
+          set -euo pipefail
+          build="$RUNNER_TEMP/build"
+          for artifact in $BUILD_ARTIFACTS; do
+            gh run download "$BUILD_RUN" -R "$GITHUB_REPOSITORY" -n "$artifact" -D "$build"
+          done
+          # The nightly artifacts are tarballs; an E2E run's holds the binaries.
+          for t in "$build"/*.tar.gz; do
+            [ -e "$t" ] || continue
+            tar xzf "$t" -C "$build"
+          done
+          chmod +x "$build/spiced" "$build/spice"
+          "$build/spiced" --version
+
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: $/.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
+      - name: Install MinIO
+        uses: $/.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+
+      - name: Download testoperator
+        id: spicescript
+        uses: $/.github/actions/build-tool
+        with:
+          package: testoperator
+
+      # Sources run in containers; log in so image pulls are not rate limited. Scripts pull
+      # images as they start, so the login has to last the whole job. Docker Hub logins use
+      # the job's GitHub OIDC token (id-token: write above), as E2E Test CI's do; there are
+      # no Docker Hub password secrets.
+      - name: Login to DockerHub
+        if: github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
+        with:
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
+
+      # Object-store sources (rustfs) are managed with the aws CLI.
+      - name: Install the AWS CLI
+        run: |
+          command -v unzip >/dev/null || { sudo apt-get update && sudo apt-get install -y unzip; }
+          if ! command -v aws >/dev/null; then
+            curl -fsSL -o "$RUNNER_TEMP/awscliv2.zip" https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+            unzip -q "$RUNNER_TEMP/awscliv2.zip" -d "$RUNNER_TEMP"
+            sudo "$RUNNER_TEMP/aws/install"
+          fi
+
+      # Iceberg sources and dbgen write and read through the DuckDB CLI.
+      - name: Install DuckDB CLI
+        run: |
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 -o "$RUNNER_TEMP/duckdb.zip" \
+            https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip
+          unzip -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
+          echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
+
+      # The search and embedding scripts download a Hub model at startup.
+      - name: Authenticate the Hugging Face cache
+        uses: $/.github/actions/hf-cache-auth
+        with:
+          token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+
+      # Upgrade scripts start on the release their `from:` names; the token is
+      # for the releases API's rate limit.
+      - name: Run scripts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          "${{ steps.spicescript.outputs.path }}" script --jobs 4 \
+            --spiced "$RUNNER_TEMP/build/spiced" \
+            --spice-cli "$RUNNER_TEMP/build/spice" \
+            --work-dir "$RUNNER_TEMP/spicescript" \
+            --results "$RUNNER_TEMP/spicescript-results.json" \
+            --log-capture "$RUNNER_TEMP/spicescript-logs" \
+            ${{ matrix.args }}
+
+      - name: Upload script results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: spicescript-results-${{ matrix.shard }}
+          path: ${{ runner.temp }}/spicescript-results.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload captured logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: spicescript-logs-${{ matrix.shard }}
+          path: ${{ runner.temp }}/spicescript-logs
+          if-no-files-found: warn
+          retention-days: 7

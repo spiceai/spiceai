@@ -63,7 +63,7 @@ pub struct DispatchArgs {
     pub(crate) dry_run: bool,
 
     /// Dispatch only the test files on this schedule (a file without a `schedule` key is
-    /// `daily`). Without it, every test file is dispatched.
+    /// `daily`). Without it, every test file except the `manual` ones is dispatched.
     #[arg(long, value_enum)]
     pub(crate) schedule: Option<Schedule>,
 }
@@ -77,6 +77,9 @@ pub enum Schedule {
     /// For tests whose source is a hosted service, and for the runs of a
     /// benchmark on every supported release line of its source database.
     Weekly,
+    /// Only a dispatch that asks for it (`--schedule manual`) runs these tests: no
+    /// scheduled run does.
+    Manual,
 }
 
 impl std::fmt::Display for Schedule {
@@ -84,6 +87,7 @@ impl std::fmt::Display for Schedule {
         match self {
             Schedule::Daily => write!(f, "daily"),
             Schedule::Weekly => write!(f, "weekly"),
+            Schedule::Manual => write!(f, "manual"),
         }
     }
 }
@@ -132,10 +136,13 @@ pub struct DispatchTestFile {
 
 impl DispatchTestFile {
     /// Whether a dispatch restricted to `schedule` includes this file. An unrestricted
-    /// dispatch (`None`) includes every file.
+    /// dispatch (`None`) includes every file except the `manual` ones.
     #[must_use]
     pub fn is_on_schedule(&self, schedule: Option<Schedule>) -> bool {
-        schedule.is_none_or(|schedule| schedule == self.schedule)
+        match schedule {
+            Some(schedule) => schedule == self.schedule,
+            None => self.schedule != Schedule::Manual,
+        }
     }
 }
 
@@ -1083,6 +1090,26 @@ tests:
     }
 
     #[test]
+    fn test_manual_schedule_is_dispatched_only_when_asked_for() {
+        let yaml = "
+schedule: manual
+tests:
+  bench:
+    spicepod_path: federated/glue[parquet].yaml
+    query_set: tpch
+    runner_type: spiceai-dev-runners
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert_eq!(test_file.schedule, Schedule::Manual);
+        assert!(!test_file.is_on_schedule(None));
+        assert!(!test_file.is_on_schedule(Some(Schedule::Daily)));
+        assert!(!test_file.is_on_schedule(Some(Schedule::Weekly)));
+        assert!(test_file.is_on_schedule(Some(Schedule::Manual)));
+    }
+
+    #[test]
     fn test_unknown_schedule_is_rejected() {
         let yaml = "
 schedule: weeky
@@ -1198,7 +1225,7 @@ tests:
         let yaml = "
 tests:
   search:
-    spicepod_path: test/spicepods/search/mteb/quora/full_text_search-duckdb[file].yaml
+    spicepod_path: test/spicepods/search/mteb/quora/full_text_search-cayenne[file].yaml
     runner_type: spiceai-dev-runners
     ready_wait: 1800
 ";
@@ -1208,7 +1235,7 @@ tests:
         assert_eq!(test_file.tests.search.len(), 1);
         assert_eq!(
             test_file.tests.search[0].spicepod_path.to_string_lossy(),
-            "test/spicepods/search/mteb/quora/full_text_search-duckdb[file].yaml"
+            "test/spicepods/search/mteb/quora/full_text_search-cayenne[file].yaml"
         );
         assert!(matches!(
             test_file.tests.search[0].runner_type,
@@ -1235,7 +1262,7 @@ tests:
         let yaml = "
 tests:
   search:
-    spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-duckdb[file].yaml
+    spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-cayenne[file].yaml
     runner_type: spiceai-dev-runners
     sql_pipeline: test/spicepods/search/pipelines/text_search.sql
 ";
@@ -1259,7 +1286,7 @@ tests:
         let yaml = "
 tests:
   search:
-    spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-duckdb[file].yaml
+    spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-cayenne[file].yaml
     runner_type: spiceai-dev-runners
     sql_pipeline: |
       SELECT _id, _score FROM text_search(corpus, :query)
@@ -1280,7 +1307,7 @@ tests:
         // The spicepod names its own dataset now. A stale `benchmark_dataset` must fail here,
         // because the workflow no longer has that input and GitHub rejects unknown inputs.
         let args = "
-spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-duckdb[file].yaml
+spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-cayenne[file].yaml
 runner_type: spiceai-dev-runners
 benchmark_dataset: fiqa_retrieval
 ";

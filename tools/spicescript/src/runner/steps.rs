@@ -17,12 +17,15 @@ limitations under the License.
 //! Running one step: the dispatcher for every action, and how a step is
 //! described in reports.
 
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::Value;
 
-use crate::script::{Action, KillSignal, Script, Step};
+use crate::reap::PID_FILE;
+use crate::script::{Action, KillSignal, LoadEnd, Script, Step, Tier};
+use crate::spiced::Spiced;
 use crate::{compare, template};
 
 use super::{
@@ -74,6 +77,10 @@ pub(super) fn describe(action: &Action) -> String {
         }
         Action::StopBackground { id, .. } => format!("stop-background {id}"),
         Action::AssertFiles { .. } => "assert-files".into(),
+        Action::WipeInstanceDir { keep } if keep.is_empty() => "wipe-instance-dir".into(),
+        Action::WipeInstanceDir { keep } => {
+            format!("wipe-instance-dir (keep {})", keep.join(", "))
+        }
         Action::Tlp(t) => format!(
             "tlp {}: {} predicates (seed {})",
             t.table, t.queries, t.seed
@@ -102,9 +109,17 @@ pub(super) fn describe(action: &Action) -> String {
         Action::AssertObjects {
             source,
             prefix,
+            contains,
             min,
+            max,
             ..
-        } => format!("assert-objects {source}/{prefix} >= {min}"),
+        } => {
+            let count = max.map_or_else(|| format!(">= {min}"), |max| format!("{min}..={max}"));
+            match contains {
+                Some(contains) => format!("assert-objects {source}/{prefix}*{contains}* {count}"),
+                None => format!("assert-objects {source}/{prefix} {count}"),
+            }
+        }
         Action::Generate {
             source,
             spec,
@@ -121,9 +136,89 @@ pub(super) fn describe(action: &Action) -> String {
                 .map_or_else(String::new, |m| format!(", mirrored to {m}"))
         ),
         Action::WaitMetric(w) => format!("wait-metric {} {:?}", w.name, w.condition),
+        Action::SampleObjects(s) => format!(
+            "sample-objects {}/{}{} every {:?} for {:?}",
+            s.source,
+            s.prefix,
+            s.contains
+                .as_ref()
+                .map_or_else(String::new, |contains| format!("*{contains}*")),
+            s.every,
+            s.duration
+        ),
         Action::Slt(s) if s.setup => format!("slt-setup {} on {}", s.file, s.source),
         Action::Slt(s) => format!("slt {} over {}", s.file, s.source),
+        Action::Load(l) => format!(
+            "load: {} from {} clients, {}{}",
+            l.corpus
+                .clone()
+                .unwrap_or_else(|| format!("{} queries", l.queries.len())),
+            l.clients,
+            match l.end {
+                LoadEnd::Duration(d) => format!("for {d:?}"),
+                LoadEnd::Count(n) => format!("{n} queries in all"),
+            },
+            match l.faults.len() {
+                0 => String::new(),
+                n => format!(", {n} faults"),
+            }
+        ),
         Action::Sleep(d) => format!("sleep {d:?}"),
+    }
+}
+
+/// Files the harness itself keeps in an instance's directory, rather than
+/// `spiced`: what a lost disk would not take with it.
+const HARNESS_FILES: &[&str] = &["spicepod.yaml", "spiced.log", PID_FILE, "spiced.bin"];
+
+/// Deletes everything under `directories[0]` (the instance's directory)
+/// except each of `directories`' [`HARNESS_FILES`] (executors keep theirs in
+/// directories below it) and the `keep` paths, relative to the instance's
+/// directory. Returns how many entries it removed.
+fn wipe_instance_dir(directories: &[&Path], keep: &[String]) -> Result<usize> {
+    let Some(root) = directories.first() else {
+        return Ok(0);
+    };
+    let kept: Vec<PathBuf> = directories
+        .iter()
+        .flat_map(|dir| HARNESS_FILES.iter().map(|f| dir.join(f)))
+        .chain(keep.iter().map(|k| root.join(k)))
+        .collect();
+    let mut removed = 0;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in
+            std::fs::read_dir(&dir).with_context(|| format!("Failed to list {}", dir.display()))?
+        {
+            let path = entry?.path();
+            if kept.contains(&path) {
+                continue;
+            }
+            // A directory holding something kept is emptied rather than removed.
+            if kept.iter().any(|k| k.starts_with(&path)) {
+                pending.push(path);
+                continue;
+            }
+            let outcome = if path.is_dir() && !path.is_symlink() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            outcome.with_context(|| format!("Failed to remove {}", path.display()))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// How a step is named in reports: its action, and the `spiced` it reaches
+/// when it names one.
+pub(super) fn describe_step(step: &Step) -> String {
+    let what = describe(&step.action);
+    match step.on {
+        None => what,
+        Some(Tier::Sidecar) => format!("{what} (on sidecar)"),
+        Some(Tier::Upstream) => format!("{what} (on upstream)"),
     }
 }
 
@@ -137,6 +232,7 @@ pub(super) fn one_line(s: &str, max: usize) -> String {
 }
 
 pub(super) async fn run_source_step(action: &Action, sources: &mut Sources) -> Result<String> {
+    let started = Instant::now();
     match action {
         Action::StartSource(name) | Action::UnpauseSource(name) => {
             sources.set(name, SourceState::Running).await
@@ -149,21 +245,137 @@ pub(super) async fn run_source_step(action: &Action, sources: &mut Sources) -> R
         }
         _ => unreachable!("only source steps reach here"),
     }
-    .map(|()| String::new())
+    .map(|()| format!(" ({:.1}s)", started.elapsed().as_secs_f64()))
 }
 
+/// Runs a step on the `spiced` it reaches. Without a sidecar, that is the
+/// instance's own. With one, a lifecycle step on the upstream also starts
+/// and stops the sidecar with it (see [`run_step`]); one with `on: sidecar`
+/// acts on the sidecar alone; and any other step reaching the sidecar runs
+/// with the sidecar swapped into the instance's `spiced` place, the
+/// upstream's executors parked beside it, so that every step reaches a
+/// sidecar exactly as it reaches a lone instance.
 pub(super) async fn run_instance_step(
     script: &Script,
     instance: &mut Instance,
     step: &Step,
     sources: &Sources,
 ) -> Result<String> {
-    let ready_default = max_wait(
+    let tier = instance.tier(step);
+    if let Action::Load(load) = &step.action {
+        // A load runs its faults on the instance as it is, so it is never
+        // swapped; it reaches its tier's `spiced` by name.
+        return super::load::run_load(script, instance, load, tier, sources).await;
+    }
+    match tier {
+        Tier::Upstream => run_step(script, instance, step, sources).await,
+        Tier::Sidecar if step.action.is_lifecycle() => {
+            let started = Instant::now();
+            sidecar_lifecycle(script, instance, step).await?;
+            Ok(format!(" ({:.1}s)", started.elapsed().as_secs_f64()))
+        }
+        Tier::Sidecar => {
+            swap_sidecar(instance);
+            let outcome = run_step(script, instance, step, sources).await;
+            swap_sidecar(instance);
+            outcome
+        }
+    }
+}
+
+/// Swaps the sidecar into the instance's `spiced` place, parking the
+/// upstream's executors, or swaps them back: it undoes itself.
+fn swap_sidecar(instance: &mut Instance) {
+    if let Some(sidecar) = instance.sidecar.as_mut() {
+        std::mem::swap(&mut instance.spiced, &mut sidecar.spiced);
+        std::mem::swap(&mut instance.executors, &mut sidecar.parked_executors);
+    }
+}
+
+/// The readiness wait a start allows when it names none.
+fn ready_default(script: &Script) -> Duration {
+    max_wait(
         script
             .defaults
             .ready_timeout
             .unwrap_or(DEFAULT_READY_TIMEOUT),
-    );
+    )
+}
+
+/// Starts the sidecar unless it is running, once its upstream is up, and
+/// waits for it as the start asks.
+async fn start_sidecar(instance: &mut Instance, timeout: Duration, wait_ready: bool) -> Result<()> {
+    let Some(sidecar) = instance.sidecar.as_mut() else {
+        return Ok(());
+    };
+    if sidecar.spiced.is_running() {
+        return Ok(());
+    }
+    sidecar
+        .spiced
+        .start(&sidecar.spicepod_yaml)
+        .context("the sidecar")?;
+    if wait_ready {
+        sidecar.spiced.wait_ready(timeout).await
+    } else {
+        sidecar.spiced.wait_http(timeout).await
+    }
+    .context("the sidecar")
+}
+
+/// A lifecycle step with `on: sidecar`: it starts, stops, kills or waits on
+/// the sidecar alone, leaving the upstream as it is.
+async fn sidecar_lifecycle(script: &Script, instance: &mut Instance, step: &Step) -> Result<()> {
+    let ready_default = ready_default(script);
+    let Some(sidecar) = instance.sidecar.as_mut() else {
+        bail!("the instance has no sidecar");
+    };
+    let spiced = &mut sidecar.spiced;
+    match &step.action {
+        Action::Start {
+            ready_timeout,
+            wait_ready,
+            ..
+        } => {
+            let timeout = max_wait(ready_timeout.unwrap_or(ready_default));
+            start_sidecar(instance, timeout, *wait_ready).await?;
+        }
+        Action::Stop => spiced.stop(STOP_TIMEOUT).await.context("the sidecar")?,
+        Action::Kill { signal } => spiced
+            .kill(*signal == KillSignal::StopThenKill)
+            .await
+            .context("the sidecar")?,
+        Action::Restart {
+            kill,
+            ready_timeout,
+            wait_ready,
+            ..
+        } => {
+            match kill {
+                Some(signal) => spiced.kill(*signal == KillSignal::StopThenKill).await,
+                None => spiced.stop(STOP_TIMEOUT).await,
+            }
+            .context("the sidecar")?;
+            let timeout = max_wait(ready_timeout.unwrap_or(ready_default));
+            start_sidecar(instance, timeout, *wait_ready).await?;
+        }
+        Action::WaitReady { timeout } => {
+            spiced.wait_ready(*timeout).await.context("the sidecar")?;
+        }
+        other => bail!("`{}` acts on the upstream only", describe(other)),
+    }
+    Ok(())
+}
+
+/// Runs a step on the instance's `spiced`, which is the sidecar while
+/// [`swap_sidecar`] has it in place.
+async fn run_step(
+    script: &Script,
+    instance: &mut Instance,
+    step: &Step,
+    sources: &Sources,
+) -> Result<String> {
+    let ready_default = ready_default(script);
     let started = Instant::now();
     match &step.action {
         Action::Start {
@@ -181,8 +393,18 @@ pub(super) async fn run_instance_step(
             if *wait_ready {
                 instance.spiced.wait_ready(timeout).await?;
             }
+            // The sidecar's datasets read the upstream, so it starts last.
+            start_sidecar(instance, timeout, *wait_ready).await?;
         }
         Action::Stop => {
+            // The sidecar is the upstream's client, so it stops first.
+            if let Some(sidecar) = instance.sidecar.as_mut() {
+                sidecar
+                    .spiced
+                    .stop(STOP_TIMEOUT)
+                    .await
+                    .context("the sidecar")?;
+            }
             instance.spiced.stop(STOP_TIMEOUT).await?;
             for executor in &mut instance.executors {
                 executor.stop(STOP_TIMEOUT).await?;
@@ -227,6 +449,9 @@ pub(super) async fn run_instance_step(
             if *wait_ready {
                 instance.spiced.wait_ready(timeout).await?;
             }
+            // A running sidecar rides out the upstream's restart, as an
+            // application's would; one a `stop` stopped starts again.
+            start_sidecar(instance, timeout, *wait_ready).await?;
         }
         Action::WaitReady { timeout } => instance.spiced.wait_ready(*timeout).await?,
         Action::KillExecutor(n) => {
@@ -478,24 +703,84 @@ pub(super) async fn run_instance_step(
         Action::AssertObjects {
             source,
             prefix,
+            contains,
             min,
+            max,
             within,
         } => {
             let namespace = namespace(instance, source)?;
+            let fits = |count: usize| count >= *min && max.is_none_or(|max| count <= max);
             let deadline = Instant::now() + within.unwrap_or_default();
             let found = loop {
-                let found = sources.get(source)?.list(&namespace, prefix).await?;
-                if found.len() >= *min || Instant::now() >= deadline {
+                let mut found = sources.get(source)?.list(&namespace, prefix).await?;
+                if let Some(contains) = contains {
+                    found.retain(|key| key.contains(contains.as_str()));
+                }
+                if fits(found.len()) || Instant::now() >= deadline {
                     break found;
                 }
                 tokio::time::sleep(POLL).await;
             };
+            let matching = contains
+                .as_ref()
+                .map_or_else(String::new, |contains| format!(" containing '{contains}'"));
+            let wanted = match max {
+                Some(max) if max == min => format!("exactly {min}"),
+                Some(max) => format!("{min} to {max}"),
+                None => format!("at least {min}"),
+            };
             ensure!(
-                found.len() >= *min,
-                "expected at least {min} objects under '{prefix}' in '{source}', found {}: {found:?}",
+                fits(found.len()),
+                "expected {wanted} objects under '{prefix}'{matching} in '{source}', found {}: {found:?}",
                 found.len()
             );
             return Ok(format!(" ({} objects)", found.len()));
+        }
+        Action::SampleObjects(s) => {
+            let namespace = namespace(instance, &s.source)?;
+            let mut objects = Vec::new();
+            let mut bytes = Vec::new();
+            let mut over = Vec::new();
+            let end = Instant::now() + s.duration;
+            loop {
+                let next = Instant::now() + s.every;
+                let mut found = sources.get(&s.source)?.sizes(&namespace, &s.prefix).await?;
+                if let Some(contains) = &s.contains {
+                    found.retain(|(key, _)| key.contains(contains.as_str()));
+                }
+                let (count, size) = (found.len(), found.iter().map(|(_, size)| size).sum::<u64>());
+                if s.max_objects.is_some_and(|max| count > max)
+                    || s.max_bytes.is_some_and(|max| size > max)
+                {
+                    over.push(format!(
+                        "sample {}: {count} objects, {size} bytes",
+                        objects.len()
+                    ));
+                }
+                objects.push(count as u64);
+                bytes.push(size);
+                if next >= end {
+                    break;
+                }
+                tokio::time::sleep_until(next.into()).await;
+            }
+            let series = format!("objects {objects:?}, bytes {bytes:?}");
+            ensure!(
+                over.is_empty(),
+                "objects under '{}' in '{}' went over their bound ({}): {}; series: {series}",
+                s.prefix,
+                s.source,
+                bound_text(s.max_objects, s.max_bytes),
+                over.join(", ")
+            );
+            if let Err(trend) = flat_series(&objects).and_then(|()| flat_series(&bytes)) {
+                bail!(
+                    "objects under '{}' in '{}' trend upward: {trend}; series: {series}",
+                    s.prefix,
+                    s.source
+                );
+            }
+            return Ok(format!(" {series}"));
         }
         Action::MarkMetrics(id) => {
             let text = instance.spiced.metrics().await?;
@@ -588,10 +873,29 @@ pub(super) async fn run_instance_step(
                 started.elapsed().as_secs_f64()
             ));
         }
-        Action::AssertFiles { contains, lacks } => {
-            let shown = assert_files(&instance.spiced.dir, contains, lacks)?;
+        Action::AssertFiles {
+            contains,
+            lacks,
+            lacks_dirs,
+        } => {
+            let shown = assert_files(&instance.spiced.dir, contains, lacks, lacks_dirs)?;
             return Ok(format!(
                 " ({:.1}s) {shown}",
+                started.elapsed().as_secs_f64()
+            ));
+        }
+        Action::WipeInstanceDir { keep } => {
+            ensure!(
+                !instance.spiced.is_running()
+                    && !instance.executors.iter_mut().any(Spiced::is_running),
+                "`wipe-instance-dir` deletes the files of a stopped instance, but spiced is running; put `stop: {{}}` or `kill-spiced: {{}}` before it"
+            );
+            let directories: Vec<&Path> = std::iter::once(instance.spiced.dir.as_path())
+                .chain(instance.executors.iter().map(|e| e.dir.as_path()))
+                .collect();
+            let removed = wipe_instance_dir(&directories, keep)?;
+            return Ok(format!(
+                " ({:.1}s) removed {removed} entries",
                 started.elapsed().as_secs_f64()
             ));
         }
@@ -609,6 +913,7 @@ pub(super) async fn run_instance_step(
                 started.elapsed().as_secs_f64()
             ));
         }
+        Action::Load(_) => unreachable!("a load is run by run_instance_step"),
         Action::StartSource(_)
         | Action::StopSource(_)
         | Action::PauseSource(_)
@@ -616,4 +921,115 @@ pub(super) async fn run_instance_step(
         | Action::Sleep(_) => unreachable!("source steps run once, not per instance"),
     }
     Ok(format!(" ({:.1}s)", started.elapsed().as_secs_f64()))
+}
+
+/// The bounds of a `sample-objects` step, for its failure message.
+fn bound_text(max_objects: Option<usize>, max_bytes: Option<u64>) -> String {
+    match (max_objects, max_bytes) {
+        (Some(objects), Some(bytes)) => format!("at most {objects} objects and {bytes} bytes"),
+        (Some(objects), None) => format!("at most {objects} objects"),
+        (None, Some(bytes)) => format!("at most {bytes} bytes"),
+        (None, None) => "none".to_string(),
+    }
+}
+
+/// Whether a sampled series does not trend upward: the peak of its last third
+/// is at most a quarter (and at least one unit) above the peak of its middle
+/// third. The first third is the run warming up and is not compared.
+fn flat_series(samples: &[u64]) -> std::result::Result<(), String> {
+    if samples.len() < 6 {
+        return Err(format!("{} samples, fewer than six", samples.len()));
+    }
+    let third = samples.len() / 3;
+    let peak = |part: &[u64]| part.iter().copied().max().unwrap_or(0);
+    let middle = peak(&samples[third..2 * third]);
+    let last = peak(&samples[2 * third..]);
+    let allowed = middle.saturating_add((middle / 4).max(1));
+    if last > allowed {
+        return Err(format!(
+            "the last third peaks at {last}, above {allowed} (its middle third's peak {middle} and a quarter more)"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{flat_series, wipe_instance_dir};
+
+    #[test]
+    fn a_series_that_levels_off_is_flat_and_one_that_climbs_is_not() {
+        // Warm-up growth in the first third does not count.
+        assert_eq!(
+            flat_series(&[10, 40, 90, 100, 95, 105, 100, 98, 110]),
+            Ok(())
+        );
+        assert_eq!(
+            flat_series(&[10, 20, 30, 40, 50, 60, 70, 80, 90]),
+            Err(
+                "the last third peaks at 90, above 75 (its middle third's peak 60 and a quarter more)"
+                    .to_string()
+            )
+        );
+        // A small series may grow by one.
+        assert_eq!(flat_series(&[0, 0, 1, 1, 2, 2]), Ok(()));
+        assert_eq!(
+            flat_series(&[1, 2, 3, 4, 5]),
+            Err("5 samples, fewer than six".to_string())
+        );
+    }
+
+    #[test]
+    fn wiping_keeps_the_harness_files_and_the_kept_paths() {
+        let root = std::env::temp_dir().join(format!("spicescript-wipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let executor = root.join("executor-0");
+        for file in [
+            "spicepod.yaml",
+            "spiced.log",
+            "spiced.pid",
+            ".spice/data/t/part-0.vortex",
+            "meta/cayenne.db",
+            "s3:/bucket/state/x",
+            "state/cayenne/v1/catalog/head",
+            "executor-0/spiced.log",
+            "executor-0/.spice/data/t/part-1.vortex",
+        ] {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, "x").expect("write");
+        }
+        let removed = wipe_instance_dir(&[&root, &executor], &["state".to_string()]).expect("wipe");
+        let mut left = Vec::new();
+        let mut pending = vec![root.clone()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("list") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    left.push(
+                        path.strip_prefix(&root)
+                            .expect("under root")
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+        }
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "executor-0/spiced.log",
+                "spiced.log",
+                "spiced.pid",
+                "spicepod.yaml",
+                "state/cayenne/v1/catalog/head"
+            ]
+        );
+        // `.spice`, `meta`, `s3:` and the executor's `.spice`.
+        assert_eq!(removed, 4);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
 }

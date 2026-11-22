@@ -88,4 +88,11 @@ pub struct ModelInfo {
     /// such a cap. Absent when there is none to report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+
+    /// This node's rank in a model split across several nodes (`distributed_backend: ring`):
+    /// `0` on the node that serves the model's requests, and the node's position in the
+    /// model's `nodes` on each node that holds a share of it. Absent for a model that runs on
+    /// one node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_rank: Option<u64>,
 }

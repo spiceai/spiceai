@@ -96,7 +96,10 @@ impl DynamodbStreamProducer {
             }
         }
 
-        (combine_shard_batches(&poll_results), had_error)
+        let mut batch = combine_shard_batches(&poll_results);
+        self.state
+            .add_initializing_checkpoints(&mut batch.checkpoint);
+        (batch, had_error)
     }
 
     async fn initialize_shards_iterators(&mut self) -> bool {
@@ -317,7 +320,7 @@ mod tests {
             let results: Vec<ShardPollResult> = vec![];
             let batch = combine_shard_batches(&results);
 
-            assert!(batch.records.is_empty());
+            assert_eq!(batch.records, [] as [Record; 0]);
             assert!(batch.checkpoint.shards.is_empty());
             let lag = SystemTime::now()
                 .duration_since(batch.watermark.expect("watermark"))
@@ -355,7 +358,7 @@ mod tests {
 
             let batch = combine_shard_batches(&results);
 
-            assert!(batch.records.is_empty());
+            assert_eq!(batch.records, [] as [Record; 0]);
             assert_eq!(batch.checkpoint.shards.len(), 1);
             let lag = SystemTime::now()
                 .duration_since(batch.watermark.expect("watermark"))
@@ -374,7 +377,7 @@ mod tests {
 
             let batch = combine_shard_batches(&results);
 
-            assert!(batch.records.is_empty());
+            assert_eq!(batch.records, [] as [Record; 0]);
             assert_eq!(batch.checkpoint.shards.len(), 1);
             // Failed shards ARE eligible for watermark (they have lag)
             assert_eq!(batch.watermark, Some(system_time_from_secs(1000)));
@@ -486,7 +489,7 @@ mod tests {
 
             let batch = combine_shard_batches(&results);
 
-            assert!(!batch.records.is_empty());
+            assert_ne!(batch.records, [] as [Record; 0]);
             assert!(batch.watermark.is_none());
         }
 

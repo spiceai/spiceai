@@ -1189,6 +1189,30 @@ impl CommitChange for DynamoDBStreamCommitter {
         );
         Ok(())
     }
+
+    /// The same save as [`Self::commit`], for an accelerator that commits it with
+    /// the data it covers. Each batch's checkpoint holds every polled shard's
+    /// position, so it covers the batches before it; `commit` then saves an
+    /// unchanged checkpoint.
+    fn record_position(
+        &self,
+    ) -> Option<futures::future::BoxFuture<'static, Result<(), CommitError>>> {
+        let store = Arc::clone(self.dynamodb_sys.as_ref()?);
+        let checkpoint = self.checkpoint.clone();
+        Some(Box::pin(async move {
+            let checkpoint_json = serde_json::to_string(&checkpoint).map_err(|e| {
+                CommitError::UnableToCommitChange {
+                    source: Box::new(e),
+                }
+            })?;
+            store
+                .upsert(&checkpoint_json)
+                .await
+                .map_err(|e| CommitError::UnableToCommitChange {
+                    source: Box::new(e),
+                })
+        }))
+    }
 }
 
 #[cfg(test)]

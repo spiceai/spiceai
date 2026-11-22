@@ -27,11 +27,12 @@ outputs:
 runs:
   using: 'composite'
   steps:
-    - name: Define Shell and Commands
+    # The build and package commands read the inputs through `env` instead of
+    # being assembled into `$GITHUB_ENV` and run back as an `env` expression, so an input
+    # carrying shell metacharacters or a newline stays a value.
+    - name: Define Shell
       run: |
         echo "SHELL=bash" >> $GITHUB_ENV
-        echo "BUILD_CMD=make -C bin/spiced SPICED_NON_DEFAULT_FEATURES='cuda' RUST_PROFILE=${{ inputs.rust-profile }}" >> $GITHUB_ENV
-        echo "PACKAGE_CMD=mv target/${{ inputs.rust-profile }}/spiced spiced && chmod +x spiced && tar czf spiced_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz spiced" >> $GITHUB_ENV
       shell: bash
 
     - name: Install CUDA Toolkit (Linux)
@@ -52,15 +53,27 @@ runs:
     - name: Build spiced (models, cuda)
       env:
         CUDA_COMPUTE_CAP: ${{ inputs.cuda-compute-capability }}
-      run: ${{ env.BUILD_CMD }}
+        INPUT_RUST_PROFILE: ${{ inputs.rust-profile }}
+      # Make re-parses RUST_PROFILE, so `$(...)` in it would still run; accept only a
+      # cargo profile name.
+      run: |
+        if [[ ! "${INPUT_RUST_PROFILE}" =~ ^[A-Za-z0-9_-]*$ ]]; then
+          echo "::error::spiced-cuda-build: rust-profile must be a cargo profile name"
+          exit 1
+        fi
+        make -C bin/spiced SPICED_NON_DEFAULT_FEATURES='cuda' RUST_PROFILE="${INPUT_RUST_PROFILE}"
       shell: ${{ env.SHELL }}
 
     - name: Package binary
-      run: ${{ env.PACKAGE_CMD }}
+      env:
+        INPUT_RUST_PROFILE: ${{ inputs.rust-profile }}
+        INPUT_CUDA_COMPUTE_CAPABILITY: ${{ inputs.cuda-compute-capability }}
+        INPUT_ARTIFACT_TAG: ${{ inputs.artifact-tag }}
+      run: mv "target/${INPUT_RUST_PROFILE}/spiced" spiced && chmod +x spiced && tar czf "spiced_cuda_${INPUT_CUDA_COMPUTE_CAPABILITY}_${INPUT_ARTIFACT_TAG}.tar.gz" spiced
       shell: ${{ env.SHELL }}
 
     - name: Upload artifact
-      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: spiced_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}
         path: spiced_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz

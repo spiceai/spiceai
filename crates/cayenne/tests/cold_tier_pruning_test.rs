@@ -835,7 +835,7 @@ async fn test_cold_tier_pk_bloom_composite_key_impl(
         "SELECT id FROM bloom_comp_t WHERE id = {id} AND region = {}",
         (region + 1) % 3
     );
-    assert!(collect_ids(&ctx, &wrong).await?.is_empty());
+    assert_eq!(collect_ids(&ctx, &wrong).await?, [] as [i64; 0]);
     assert!(
         planned_distinct_files_for(&ctx, &wrong).await? <= 2,
         "a pair no file holds is rejected by the blooms"

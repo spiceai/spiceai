@@ -22,6 +22,7 @@ use data_components::iceberg::catalog::hadoop::{HadoopCatalog, HadoopCatalogBuil
 use futures::TryStreamExt;
 use iceberg::io::{
     S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
+    S3_SESSION_TOKEN,
 };
 use iceberg::{Catalog, NamespaceIdent};
 use iceberg_storage_opendal::OpenDalStorageFactory;
@@ -64,6 +65,7 @@ fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
 
     let access_key = std::env::var("MINIO_ACCESS_KEY_ID").unwrap_or("admin".to_string());
     let secret_key = std::env::var("MINIO_SECRET_ACCESS_KEY").unwrap_or("password".to_string());
+    let session_token = std::env::var("MINIO_SESSION_TOKEN").ok();
 
     let mut s3_config = opendal::services::S3Config::default();
     s3_config.bucket = "hadoop".to_string();
@@ -72,11 +74,12 @@ fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
     s3_config.region = Some("us-east-1".to_string());
     s3_config.access_key_id = Some(access_key.clone());
     s3_config.secret_access_key = Some(secret_key.clone());
+    s3_config.session_token.clone_from(&session_token);
 
     let operator =
         opendal::Operator::new(s3_config.into_builder()).expect("Should build S3 operator");
 
-    HadoopCatalogBuilder::default()
+    let builder = HadoopCatalogBuilder::default()
         .with_warehouse_root("s3a://hadoop/")
         .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
             customized_credential_load: None,
@@ -86,7 +89,11 @@ fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
         .set_property(S3_ENDPOINT, minio_endpoint)
         .set_property(S3_ACCESS_KEY_ID, access_key)
         .set_property(S3_SECRET_ACCESS_KEY, secret_key)
-        .set_property(S3_PATH_STYLE_ACCESS, "true")
+        .set_property(S3_PATH_STYLE_ACCESS, "true");
+    match session_token {
+        Some(token) => builder.set_property(S3_SESSION_TOKEN, token),
+        None => builder,
+    }
 }
 
 /// Regression test helper for scheme inference: configures the warehouse root
@@ -101,6 +108,7 @@ fn get_s3_to_s3a_inferred_hadoop_catalog() -> HadoopCatalogBuilder {
 
     let access_key = std::env::var("MINIO_ACCESS_KEY_ID").unwrap_or("admin".to_string());
     let secret_key = std::env::var("MINIO_SECRET_ACCESS_KEY").unwrap_or("password".to_string());
+    let session_token = std::env::var("MINIO_SESSION_TOKEN").ok();
 
     let mut s3_config = opendal::services::S3Config::default();
     s3_config.bucket = "hadoop".to_string();
@@ -109,11 +117,12 @@ fn get_s3_to_s3a_inferred_hadoop_catalog() -> HadoopCatalogBuilder {
     s3_config.region = Some("us-east-1".to_string());
     s3_config.access_key_id = Some(access_key.clone());
     s3_config.secret_access_key = Some(secret_key.clone());
+    s3_config.session_token.clone_from(&session_token);
 
     let operator =
         opendal::Operator::new(s3_config.into_builder()).expect("Should build S3 operator");
 
-    HadoopCatalogBuilder::default()
+    let builder = HadoopCatalogBuilder::default()
         .with_warehouse_root("s3://hadoop/")
         .with_storage_factory_builder(|_scheme| {
             Arc::new(OpenDalStorageFactory::S3 {
@@ -125,7 +134,11 @@ fn get_s3_to_s3a_inferred_hadoop_catalog() -> HadoopCatalogBuilder {
         .set_property(S3_ENDPOINT, minio_endpoint)
         .set_property(S3_ACCESS_KEY_ID, access_key)
         .set_property(S3_SECRET_ACCESS_KEY, secret_key)
-        .set_property(S3_PATH_STYLE_ACCESS, "true")
+        .set_property(S3_PATH_STYLE_ACCESS, "true");
+    match session_token {
+        Some(token) => builder.set_property(S3_SESSION_TOKEN, token),
+        None => builder,
+    }
 }
 
 #[expect(clippy::expect_used)]

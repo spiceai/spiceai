@@ -29,6 +29,7 @@ mod compare;
 mod docker;
 mod generate;
 mod json_assert;
+mod keyquota;
 mod ledger;
 mod pki;
 mod reap;
@@ -102,6 +103,10 @@ pub struct Args {
     /// printed when it finishes.
     #[arg(long, default_value_t = 1, value_name = "N")]
     jobs: usize,
+
+    /// Run each selected script this many times, with independent sources and instances.
+    #[arg(long, default_value_t = 1, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    runs_per_script: u32,
 
     /// Record each script's run time in `recordings/durations.json` beside
     /// it, the estimate `--jobs` orders scripts by; scripts without one may
@@ -198,6 +203,7 @@ pub fn exit_code(outcome: &Result<bool>) -> ExitCode {
 /// When a script or its corpus fails to parse, a `spiced` binary or a source
 /// can't be set up, or a ledger or recording can't be read or written.
 pub async fn run(cli: Args) -> Result<bool> {
+    validate_repetitions(&cli)?;
     // Retried comparisons would print every intermediate mismatch; the runner
     // reports the last one with both answers.
     result_compare::set_print_diagnostics(false);
@@ -336,6 +342,7 @@ pub async fn run(cli: Args) -> Result<bool> {
     let pki = pki::generate(&work_dir.join(format!("pki-{}", std::process::id())))?;
     let options = runner::Options {
         targets,
+        repetition: None,
         from_override: cli.from,
         releases,
         cluster: cli.cluster,
@@ -354,10 +361,10 @@ pub async fn run(cli: Args) -> Result<bool> {
     let mut expected = 0;
     let mut failures = Vec::new();
     let mut notes: Vec<String> = Vec::new();
-    let total = scripts.len();
+    let total = scripts.len() * cli.runs_per_script as usize;
     let run_started = std::time::Instant::now();
     // Each script, its time and failure count, for the summary.
-    let mut timings: Vec<(&script::Script, std::time::Duration, usize)> = Vec::new();
+    let mut timings: Vec<(&script::Script, std::time::Duration, usize, String)> = Vec::new();
     let mut done = 0;
     // Longest first, by recorded duration (a script without one counts as
     // long): each asks for slots in this order, and slots are granted in the
@@ -367,37 +374,49 @@ pub async fn run(cli: Args) -> Result<bool> {
     let slots = runner::Slots::new(cli.jobs);
     let mut running = futures::stream::FuturesUnordered::new();
     for (path, script) in order {
-        let (options, slots) = (&options, &slots);
-        running.push(async move {
-            let started = std::time::Instant::now();
-            let (report, out) = runner::run_script_buffered(script, options, slots).await;
-            (path, script, report, out, started.elapsed())
-        });
+        for repetition in 1..=cli.runs_per_script {
+            let slots = &slots;
+            let mut options = options.clone();
+            let repeated = cli.runs_per_script > 1;
+            if repeated {
+                options.repetition = Some(repetition);
+                options.log_capture = options
+                    .log_capture
+                    .map(|root| root.join(format!("repetition-{repetition}")));
+            }
+            running.push(async move {
+                let started = std::time::Instant::now();
+                let (report, out) = runner::run_script_buffered(script, &options, slots).await;
+                (
+                    path,
+                    script,
+                    repetition,
+                    options,
+                    report,
+                    out,
+                    started.elapsed(),
+                )
+            });
+        }
     }
     let mut results = results::Results {
         partition: cli.partition.map(|(i, n)| format!("{i}/{n}")),
         complete: false,
         seconds: 0.0,
         scripts: Vec::new(),
+        summaries: Vec::new(),
     };
-    while let Some((path, script, report, out, waited)) =
+    while let Some((path, script, repetition, run_options, report, out, waited)) =
         futures::StreamExt::next(&mut running).await
     {
+        let label = if cli.runs_per_script > 1 {
+            format!("{} #{repetition}/{}", script.name, cli.runs_per_script)
+        } else {
+            script.name.clone()
+        };
+        let out = annotate_output(&out, &label, cli.runs_per_script > 1);
         print!("{out}");
         let report = report?;
-        // A log that cannot be saved is a warning, as in the runner: the
-        // script's own outcome still counts, and the other scripts still run.
-        if let Some(root) = &options.log_capture
-            && !report.failures.is_empty()
-            && let Err(e) = capture_script(
-                &runner::capture_dir(root, script),
-                path,
-                &out,
-                &report.failures,
-            )
-        {
-            println!("warning: {e:#}");
-        }
         // The time it held slots, not the time it waited for them.
         let took = if report.ran.is_zero() {
             waited
@@ -414,10 +433,29 @@ pub async fn run(cli: Args) -> Result<bool> {
         } else {
             let verdict = ledger.judge(script, &report.failures);
             expected += verdict.expected;
-            notes.extend(verdict.notes.iter().cloned());
+            notes.extend(
+                verdict
+                    .notes
+                    .iter()
+                    .map(|note| annotate_output(note, &label, cli.runs_per_script > 1)),
+            );
             (verdict.problems(), Some(verdict))
         };
-        if let Some(file) = &cli.results {
+        // A log that cannot be saved is a warning, as in the runner: the
+        // script's own outcome still counts, and the other scripts still run.
+        if let Some(root) = &run_options.log_capture
+            && !report.failures.is_empty()
+            && let Err(e) = capture_script(
+                &runner::capture_dir(root, script),
+                path,
+                &out,
+                &report.failures,
+                (cli.runs_per_script > 1).then_some(label.as_str()),
+            )
+        {
+            println!("warning: {e:#}");
+        }
+        if cli.results.is_some() || cli.runs_per_script > 1 {
             results.scripts.push(results::ScriptResult::new(
                 script,
                 path,
@@ -426,8 +464,16 @@ pub async fn run(cli: Args) -> Result<bool> {
                 verdict.as_ref(),
                 &problems,
             ));
+            if cli.runs_per_script > 1 {
+                if let Some(result) = results.scripts.last_mut() {
+                    result.repetition = Some(repetition);
+                }
+                results.update_summaries();
+            }
             results.seconds = run_started.elapsed().as_secs_f64();
-            results.write(file)?;
+            if let Some(file) = &cli.results {
+                results.write(file)?;
+            }
         }
         let shown_expected = if cli.record_failures {
             0
@@ -436,15 +482,19 @@ pub async fn run(cli: Args) -> Result<bool> {
         };
         println!(
             "[{done}/{total}] done    {} in {:.1}s: {} passed, {} failed{}",
-            script.name,
+            label,
             took.as_secs_f64(),
             report.passed,
             problems.len(),
             expected_failures_note(shown_expected),
         );
-        timings.push((script, took, problems.len()));
+        timings.push((script, took, problems.len(), label.clone()));
         passed += report.passed;
-        failures.extend(problems);
+        failures.extend(
+            problems
+                .into_iter()
+                .map(|p| annotate_output(&p, &label, cli.runs_per_script > 1)),
+        );
     }
     if cli.record_failures {
         ledger.save()?;
@@ -459,7 +509,7 @@ pub async fn run(cli: Args) -> Result<bool> {
             std::path::PathBuf,
             Vec<(String, std::time::Duration)>,
         > = std::collections::BTreeMap::new();
-        for (script, took, _) in &timings {
+        for (script, took, _, _) in &timings {
             by_dir
                 .entry(script.dir.clone())
                 .or_default()
@@ -480,15 +530,20 @@ pub async fn run(cli: Args) -> Result<bool> {
     timings.sort_by_key(|t| std::cmp::Reverse(t.1));
     if timings.len() > 1 {
         println!("slowest scripts:");
-        for (script, took, failed) in timings.iter().take(10) {
+        for (_, took, failed, label) in timings.iter().take(10) {
             let note = if *failed > 0 {
                 format!("  ({failed} failed)")
             } else {
                 String::new()
             };
-            println!("  {:>8.1}s  {}{note}", took.as_secs_f64(), script.name);
+            println!("  {:>8.1}s  {}{note}", took.as_secs_f64(), label);
         }
         println!();
+    }
+    if cli.runs_per_script > 1 {
+        for summary in &results.summaries {
+            println!("{summary}");
+        }
     }
     if let Some(file) = &cli.results {
         results.complete = true;
@@ -506,6 +561,27 @@ pub async fn run(cli: Args) -> Result<bool> {
     Ok(failures.is_empty() || cli.record_failures)
 }
 
+fn validate_repetitions(cli: &Args) -> Result<()> {
+    anyhow::ensure!(
+        cli.runs_per_script == 1 || !(cli.record_durations || cli.record_failures),
+        "--runs-per-script >1 cannot be combined with --record-durations or --record-failures: repetitions would overwrite the recordings"
+    );
+    Ok(())
+}
+
+fn annotate_output(text: &str, label: &str, repeated: bool) -> String {
+    if repeated {
+        use std::fmt::Write as _;
+        text.split_inclusive('\n')
+            .fold(String::new(), |mut output, line| {
+                let _ = write!(output, "[{label}] {line}");
+                output
+            })
+    } else {
+        text.to_string()
+    }
+}
+
 /// `--log-capture`'s files for a whole script, beside its combinations'
 /// logs: the script as run, and what the run printed for it, with each
 /// failure in full.
@@ -514,6 +590,7 @@ fn capture_script(
     path: &std::path::Path,
     out: &str,
     failures: &[runner::Failure],
+    repetition_label: Option<&str>,
 ) -> Result<()> {
     use std::fmt::Write as _;
     std::fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
@@ -523,6 +600,11 @@ fn capture_script(
     // the run's summary, so it is added here as the summary prints it.
     let mut text = out.to_string();
     for failure in failures {
+        let failure = annotate_output(
+            &failure.to_string(),
+            repetition_label.unwrap_or_default(),
+            repetition_label.is_some(),
+        );
         let _ = write!(text, "\nFAILED {failure}\n");
     }
     std::fs::write(dir.join("output.txt"), text)
@@ -696,6 +778,46 @@ fn targets(specs: &[String]) -> Result<Vec<runner::Target>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repetition_output_preserves_single_run_bytes() {
+        let text = "== script\n   FAIL instance step 1\n\n";
+        assert_eq!(annotate_output(text, "script", false), text);
+        assert_eq!(
+            annotate_output("== script\nlast line", "script #2/3", true),
+            "[script #2/3] == script\n[script #2/3] last line"
+        );
+    }
+
+    /// Parses `argv` as `testoperator script` would, through a parser that
+    /// flattens [`Args`].
+    fn parse_args<'a>(argv: impl IntoIterator<Item = &'a str>) -> Result<Args, clap::Error> {
+        #[derive(clap::Parser)]
+        struct Command {
+            #[command(flatten)]
+            args: Args,
+        }
+        <Command as clap::Parser>::try_parse_from(argv).map(|command| command.args)
+    }
+
+    #[test]
+    fn repetition_flags_are_validated() {
+        assert!(parse_args(["spicescript", "--runs-per-script", "0", "s.yaml"]).is_err());
+        for flag in ["--record-durations", "--record-failures"] {
+            let cli =
+                parse_args(["spicescript", "--runs-per-script", "3", flag, "s.yaml"])
+                    .expect("valid CLI syntax");
+            assert_eq!(
+                validate_repetitions(&cli)
+                    .expect_err("recording repetitions is rejected")
+                    .to_string(),
+                "--runs-per-script >1 cannot be combined with --record-durations or --record-failures: repetitions would overwrite the recordings"
+            );
+            let cli =
+                parse_args(["spicescript", flag, "s.yaml"]).expect("default repetition");
+            validate_repetitions(&cli).expect("one run may record");
+        }
+    }
 
     #[test]
     fn partition_deals_longest_first_to_the_least_loaded_share() {

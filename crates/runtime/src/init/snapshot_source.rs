@@ -382,10 +382,9 @@ impl Runtime {
         };
         let datasets = Arc::clone(self).get_valid_datasets(&dataset.app(), LogErrors(false));
 
-        // Restoring a `DuckDB` or `SQLite` snapshot replaces the whole file, so a
+        // Restoring a `SQLite` snapshot replaces the whole file, so a
         // file two datasets share would serve whichever restored last to both.
         let param = match acceleration.engine {
-            Engine::DuckDB => "duckdb_file",
             Engine::Sqlite => "sqlite_file",
             _ => return Ok(()),
         };

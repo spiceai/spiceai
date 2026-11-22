@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn parse_s3_test_event_is_empty() {
         let events = parse_notification_body(TEST_EVENT).expect("test event is valid");
-        assert!(events.is_empty());
+        assert_eq!(events, [] as [S3ObjectEvent; 0]);
     }
 
     #[test]

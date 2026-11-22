@@ -55,6 +55,12 @@ variants:
           - { name: n, type: bigint }
           - { name: v, type: bigint }
           - { name: s, type: text }
+  # Each variant above that keeps an unpartitioned Cayenne file acceleration,
+  # with the prototype object-native Cayenne metastore.
+  kafka-object-native: {when: {src: kafka}, datasets: {t: {acceleration: {refresh_mode: append, primary_key: null}}}, spicepod: {runtime: {params: {cayenne_vnext: enabled}}}}
+  mongodb-object-native: {when: {src: mongodb}, datasets: {t: {params: {$merge: '${sources.src.params}', change_stream_batch_max_duration: 100ms, change_stream_max_await_time: 100ms}}}, spicepod: {runtime: {params: {cayenne_vnext: enabled}}}}
+  dynamodb-object-native: {when: {src: dynamodb}, spicepod: {runtime: {params: {cayenne_vnext: enabled}}}}
+  debezium-object-native: {when: {src: postgres}, datasets: {t: {from: 'cdc:t', params: null, columns: [{name: _id, type: text}, {name: n, type: bigint}, {name: v, type: bigint}, {name: s, type: text}]}}, spicepod: {runtime: {params: {cayenne_vnext: enabled}}}}
 
 defaults:
   expect: { oracle: ref }
@@ -76,7 +82,7 @@ steps:
         mkdir -p /tmp/${sources.src.namespace};
         cd /debezium;
         DEBEZIUM_SINK_TYPE=http
-        DEBEZIUM_SINK_HTTP_URL=http://${sources.dbz.host_from_container}:${instance.http_port}/v1/datasets/t/cdc
+        DEBEZIUM_SINK_HTTP_URL=http://${instance.host_from_container}:${instance.http_port}/v1/datasets/t/cdc
         DEBEZIUM_SOURCE_CONNECTOR_CLASS=io.debezium.connector.postgresql.PostgresConnector
         DEBEZIUM_SOURCE_OFFSET_STORAGE_FILE_FILENAME=/tmp/${sources.src.namespace}/offsets.dat
         DEBEZIUM_SOURCE_OFFSET_FLUSH_INTERVAL_MS=0

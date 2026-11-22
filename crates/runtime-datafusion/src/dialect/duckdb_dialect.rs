@@ -25,7 +25,7 @@ use datafusion::sql::sqlparser::ast::{self, BinaryOperator, WindowFrameBound};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::{
     CharacterLengthStyle, DateFieldExtractStyle, Dialect, DistinctFromStyle, DuckDBDialect,
-    IntervalStyle, ScalarFnToSqlHandler,
+    FloatLiteralStyle, IntervalStyle, ScalarFnToSqlHandler,
 };
 
 use super::duckdb::ordered_aggregate_to_sql;
@@ -115,6 +115,10 @@ impl Dialect for SpiceDuckDBDialect {
         self.inner.float64_ast_dtype()
     }
 
+    fn float_literal_style(&self) -> FloatLiteralStyle {
+        self.inner.float_literal_style()
+    }
+
     fn utf8_cast_dtype(&self) -> ast::DataType {
         self.inner.utf8_cast_dtype()
     }
@@ -195,6 +199,10 @@ impl Dialect for SpiceDuckDBDialect {
         self.inner.integer_division_to_sql(lhs, rhs)
     }
 
+    fn string_concat_to_sql(&self, lhs: ast::Expr, rhs: ast::Expr) -> Option<ast::Expr> {
+        self.inner.string_concat_to_sql(lhs, rhs)
+    }
+
     fn requires_explicit_comparison_coercion(&self) -> bool {
         self.inner.requires_explicit_comparison_coercion()
     }
@@ -217,6 +225,10 @@ impl Dialect for SpiceDuckDBDialect {
 
     fn derived_table_evaluates_volatile_outputs_once(&self) -> bool {
         self.inner.derived_table_evaluates_volatile_outputs_once()
+    }
+
+    fn identifier_max_length(&self) -> Option<usize> {
+        self.inner.identifier_max_length()
     }
 
     fn requires_derived_table_alias(&self) -> bool {
@@ -279,9 +291,9 @@ impl Dialect for SpiceDuckDBDialect {
         self.inner.supports_empty_select_list()
     }
 
-    /// `DuckDB` reads backslash literally in a standard string, so a value with
-    /// `\'` or `''` in it must not go through `sqlparser`'s quote escaping,
-    /// which skips both (see [`super::string_literal`]).
+    /// `DuckDB` reads backslash literally in a standard string; a value with
+    /// `\'` or `''` in it is written as quote-free pieces (see
+    /// [`super::string_literal`]).
     fn string_literal_to_sql(&self, s: &str) -> Option<ast::Expr> {
         super::string_literal::quote_safe_string_literal(s)
             .or_else(|| self.inner.string_literal_to_sql(s))

@@ -16,8 +16,10 @@ runs:
     - name: Check for the fixture
       id: fixture
       shell: bash
+      env:
+        INPUT_PREFIX: ${{ inputs.prefix }}
       run: |
-        if mc stat "spice-minio/${{ inputs.prefix }}/_SEEDED" >/dev/null 2>&1; then
+        if mc stat "spice-minio/${INPUT_PREFIX}/_SEEDED" >/dev/null 2>&1; then
           echo "present=true" >> "$GITHUB_OUTPUT"
         else
           echo "present=false" >> "$GITHUB_OUTPUT"
@@ -25,7 +27,7 @@ runs:
 
     - name: Set up Java
       if: steps.fixture.outputs.present != 'true'
-      uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+      uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
       with:
         distribution: temurin
         java-version: '17'
@@ -39,11 +41,13 @@ runs:
     - name: Generate and upload the fixture
       if: steps.fixture.outputs.present != 'true'
       shell: bash
+      env:
+        INPUT_PREFIX: ${{ inputs.prefix }}
       run: |
         python -m pip install 'pyspark==3.5.5' 'delta-spark==3.3.2'
         python test/scripts/cold_start_delta_fixture.py --out "${RUNNER_TEMP}/cold_start_fixture" \
           --rows 3000000 --commits 24 --post-optimize-commits 8
-        mc rm --recursive --force "spice-minio/${{ inputs.prefix }}/" || true
-        mc cp --recursive "${RUNNER_TEMP}/cold_start_fixture/" "spice-minio/${{ inputs.prefix }}/"
+        mc rm --recursive --force "spice-minio/${INPUT_PREFIX}/" || true
+        mc cp --recursive "${RUNNER_TEMP}/cold_start_fixture/" "spice-minio/${INPUT_PREFIX}/"
         echo "seeded by ${GITHUB_REPOSITORY}@${GITHUB_SHA} run ${GITHUB_RUN_ID}" \
-          | mc pipe "spice-minio/${{ inputs.prefix }}/_SEEDED"
+          | mc pipe "spice-minio/${INPUT_PREFIX}/_SEEDED"

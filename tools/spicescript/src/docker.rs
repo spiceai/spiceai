@@ -37,6 +37,7 @@ use bollard::{
 };
 use futures::StreamExt;
 
+#[derive(Clone)]
 pub struct ContainerSpec {
     pub name: String,
     pub image: String,
@@ -46,8 +47,20 @@ pub struct ContainerSpec {
     pub ports: Vec<u16>,
     pub healthcheck: Option<HealthConfig>,
     /// A Docker network to join (created if missing), so containers of one
-    /// source can reach each other by name.
+    /// source can reach each other by name; or `container:<name>`, to share
+    /// that container's network namespace, which takes no network from
+    /// Docker's address pools (the container then publishes no ports; the
+    /// other one publishes them).
     pub network: Option<String>,
+    /// Another name peers on `network` reach the container by. A container
+    /// name can outgrow the 63 characters a host name label may hold.
+    pub alias: Option<String>,
+}
+
+/// A network mode that names no network of the run's own: Docker's shared
+/// ones, or another container's namespace.
+fn is_shared_network(network: &str) -> bool {
+    matches!(network, "host" | "bridge" | "none") || network.starts_with("container:")
 }
 
 pub struct Container {
@@ -67,7 +80,53 @@ impl Container {
 
     /// Starts a container publishing each port in `host_ports` on the host
     /// port given there, and every other port of `spec` on a free one.
+    ///
+    /// Waits for room in the kernel key quota first, and retries a start that
+    /// runc refused because the quota filled meanwhile (see [`crate::keyquota`]).
     pub async fn start_on(spec: ContainerSpec, host_ports: HashMap<u16, u16>) -> Result<Self> {
+        let mut attempt = 1;
+        loop {
+            crate::keyquota::wait_for_room(1, &format!("container {}", spec.name)).await?;
+            match Self::start_once(spec.clone(), host_ports.clone()).await {
+                Err(e)
+                    if attempt < QUOTA_ATTEMPTS
+                        && crate::keyquota::is_quota_error(&format!("{e:#}")) =>
+                {
+                    crate::runner::emit(&format!(
+                        "   the kernel key quota was full starting {}; waiting for room and trying again ({attempt} of {QUOTA_ATTEMPTS} attempts made)",
+                        spec.name
+                    ));
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// Starts this container again after [`Self::stop`], keeping its data and
+    /// ports. Like [`Self::start_on`], it waits for room in the kernel key
+    /// quota and retries a start refused for it: a restart takes a new key.
+    pub async fn start_stopped(&self) -> Result<()> {
+        let mut attempt = 1;
+        loop {
+            crate::keyquota::wait_for_room(1, &format!("container {}", self.name)).await?;
+            match self.resume().await {
+                Err(e)
+                    if attempt < QUOTA_ATTEMPTS
+                        && crate::keyquota::is_quota_error(&format!("{e:#}")) =>
+                {
+                    crate::runner::emit(&format!(
+                        "   the kernel key quota was full restarting {}; waiting for room and trying again ({attempt} of {QUOTA_ATTEMPTS} attempts made)",
+                        self.name
+                    ));
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn start_once(spec: ContainerSpec, host_ports: HashMap<u16, u16>) -> Result<Self> {
         anyhow::ensure!(
             !crate::cleanup::shutting_down(),
             "not starting container {}: the run is shutting down",
@@ -82,27 +141,14 @@ impl Container {
             .await
             .context("Docker did not answer; start Docker (or OrbStack) and retry")?;
         pull_if_missing(&docker, &spec.image).await?;
-        if let Some(network) = &spec.network
-            && docker
-                .inspect_network::<String>(network, None)
-                .await
-                .is_err()
-        {
-            let pid = std::process::id().to_string();
-            docker
-                .create_network(bollard::network::CreateNetworkOptions {
-                    name: network.as_str(),
-                    labels: HashMap::from([(RUNNER_LABEL, pid.as_str())]),
-                    ..Default::default()
-                })
-                .await
-                .with_context(|| format!("Failed to create network {network}"))?;
-        }
 
+        let also = also_publish_on();
         let mut ports = HashMap::new();
         for port in &spec.ports {
             let host = match host_ports.get(port) {
                 Some(host) => *host,
+                // Published on `also` too, so it must be free there as well.
+                None if also.is_some() => free_port_on(std::net::Ipv4Addr::UNSPECIFIED.into())?,
                 None => free_port()?,
             };
             ports.insert(*port, host);
@@ -113,7 +159,7 @@ impl Container {
                 (
                     format!("{container}/tcp"),
                     Some(vec![PortBinding {
-                        host_ip: Some("127.0.0.1".into()),
+                        host_ip: Some(binding_address(also).into()),
                         host_port: Some(host.to_string()),
                     }]),
                 )
@@ -152,65 +198,10 @@ impl Container {
             }),
             ..Default::default()
         };
-        // A container left behind by an interrupted run would hold the name.
-        let _ = docker
-            .remove_container(
-                &spec.name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    v: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
-        let (created_id, name) = create_or_adopt(
-            CREATE_ATTEMPTS,
-            CREATE_RETRY_PAUSE,
-            &spec.name,
-            |name| {
-                let docker = &docker;
-                let mut config = config.clone();
-                // Under another name, keep the original as an alias on the
-                // container's network, so its peers still find it by it.
-                if name != spec.name
-                    && let Some(network) = spec.network.as_deref().filter(|n| *n != "host")
-                {
-                    config.networking_config = Some(NetworkingConfig {
-                        endpoints_config: HashMap::from([(
-                            network.to_string(),
-                            EndpointSettings {
-                                aliases: Some(vec![spec.name.clone()]),
-                                ..Default::default()
-                            },
-                        )]),
-                    });
-                }
-                async move {
-                    docker
-                        .create_container(
-                            Some(CreateContainerOptions {
-                                name: name.as_str(),
-                                platform: None,
-                            }),
-                            config,
-                        )
-                        .await
-                        .map(|created| created.id)
-                }
-            },
-            |holder| {
-                let docker = &docker;
-                async move {
-                    docker
-                        .inspect_container(&holder, None)
-                        .await
-                        .map(|found| found.id.unwrap_or(holder))
-                }
-            },
-        )
-        .await
-        .with_context(|| format!("Failed to create container {}", spec.name))?;
-        crate::cleanup::track_container(&created_id, &name, spec.network.as_deref());
+        let (created_id, name) = create_detached(docker.clone(), spec.clone(), config)
+            .await
+            .context("the task creating the container ended without an answer")??
+            .take();
         let container = Self {
             docker,
             id: created_id,
@@ -412,11 +403,7 @@ impl Container {
     /// Removes the network the container joined, once no container is on it.
     pub async fn remove_network(&self) -> Result<()> {
         // Docker's own networks are shared by everything on the host.
-        if let Some(network) = self
-            .network
-            .as_ref()
-            .filter(|n| !matches!(n.as_str(), "host" | "bridge" | "none"))
-        {
+        if let Some(network) = self.network.as_ref().filter(|n| !is_shared_network(n)) {
             self.docker
                 .remove_network(network)
                 .await
@@ -468,6 +455,196 @@ impl Container {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+    }
+}
+
+/// Creates `spec`'s network and container in a task of its own, which runs
+/// to its end even when the caller stops waiting (a combination whose other
+/// source failed to start drops the future that started this), so a
+/// container the daemon created is never left untracked. The container is
+/// handed over as a [`Created`], which removes it unless the caller takes it:
+/// whether the caller is gone before the hand-over or after it, before
+/// receiving it, the container is removed.
+fn create_detached(
+    docker: Docker,
+    spec: ContainerSpec,
+    config: Config<String>,
+) -> tokio::sync::oneshot::Receiver<Result<Created>> {
+    let (created_tx, created_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (docker, spec) = (&docker, &spec);
+        let created = async {
+            if let Some(network) = spec.network.as_ref().filter(|n| !is_shared_network(n))
+                && docker
+                    .inspect_network::<String>(network, None)
+                    .await
+                    .is_err()
+            {
+                let pid = std::process::id().to_string();
+                let created = docker
+                    .create_network(bollard::network::CreateNetworkOptions {
+                        name: network.as_str(),
+                        // A daemon older than API 1.44 would otherwise create a
+                        // second network of the same name for a source starting
+                        // beside this one, and the two would not reach each
+                        // other.
+                        check_duplicate: true,
+                        labels: HashMap::from([(RUNNER_LABEL, pid.as_str())]),
+                        ..Default::default()
+                    })
+                    .await;
+                match created {
+                    // Another source of the run, starting at the same time,
+                    // created it first.
+                    Ok(_)
+                    | Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 409,
+                        ..
+                    }) => {}
+                    Err(e) => {
+                        return Err(e)
+                            .with_context(|| format!("Failed to create network {network}"));
+                    }
+                }
+            }
+            // A container left behind by an interrupted run would hold the name.
+            let _ = docker
+                .remove_container(
+                    &spec.name,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        v: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            let (created_id, name) = create_or_adopt(
+                CREATE_ATTEMPTS,
+                CREATE_RETRY_PAUSE,
+                &spec.name,
+                |name| {
+                    let mut config = config.clone();
+                    // Under another name, keep the original as an alias on the
+                    // container's network, so its peers still find it by it.
+                    let aliases: Vec<String> = (name != spec.name)
+                        .then(|| spec.name.clone())
+                        .into_iter()
+                        .chain(spec.alias.clone())
+                        .collect();
+                    if !aliases.is_empty()
+                        && let Some(network) =
+                            spec.network.as_deref().filter(|n| !is_shared_network(n))
+                    {
+                        config.networking_config = Some(NetworkingConfig {
+                            endpoints_config: HashMap::from([(
+                                network.to_string(),
+                                EndpointSettings {
+                                    aliases: Some(aliases),
+                                    ..Default::default()
+                                },
+                            )]),
+                        });
+                    }
+                    async move {
+                        docker
+                            .create_container(
+                                Some(CreateContainerOptions {
+                                    name: name.as_str(),
+                                    platform: None,
+                                }),
+                                config,
+                            )
+                            .await
+                            .map(|created| created.id)
+                    }
+                },
+                |holder| async move {
+                    docker
+                        .inspect_container(&holder, None)
+                        .await
+                        .map(|found| found.id.unwrap_or(holder))
+                },
+            )
+            .await
+            .with_context(|| format!("Failed to create container {}", spec.name))?;
+            crate::cleanup::track_container(&created_id, &name, spec.network.as_deref());
+            Ok::<_, anyhow::Error>(Created {
+                docker: docker.clone(),
+                network: spec.network.clone(),
+                id: created_id,
+                name,
+                taken: false,
+            })
+        }
+        .await;
+        // A caller already gone hands the container back, and dropping it
+        // here removes it; one gone later drops it unreceived, which does too.
+        drop(created_tx.send(created));
+    });
+    created_rx
+}
+
+/// A container [`create_detached`] made and its caller has not yet taken.
+/// Dropped untaken (the caller was cancelled before it received it), it
+/// removes the container.
+struct Created {
+    docker: Docker,
+    network: Option<String>,
+    id: String,
+    name: String,
+    taken: bool,
+}
+
+impl Created {
+    /// The container's id and name, for the [`Container`] that now owns it.
+    fn take(mut self) -> (String, String) {
+        self.taken = true;
+        (std::mem::take(&mut self.id), std::mem::take(&mut self.name))
+    }
+}
+
+impl Drop for Created {
+    fn drop(&mut self) {
+        if self.taken {
+            return;
+        }
+        let (docker, network, id) = (
+            self.docker.clone(),
+            self.network.take(),
+            std::mem::take(&mut self.id),
+        );
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime
+                    .spawn(async move { remove_abandoned(&docker, network.as_deref(), &id).await });
+            }
+            // No runtime to remove it on: the synchronous `docker rm` that
+            // `Container`'s `Drop` uses.
+            Err(_) => crate::cleanup::remove_if_tracked(&id),
+        }
+    }
+}
+
+/// Removes a container its creator stopped waiting for (and its network,
+/// once empty), unless containers are kept.
+async fn remove_abandoned(docker: &Docker, network: Option<&str>, id: &str) {
+    if crate::cleanup::keeping_containers() {
+        return;
+    }
+    crate::cleanup::untrack_container(id);
+    let _ = docker
+        .remove_container(
+            id,
+            Some(RemoveContainerOptions {
+                force: true,
+                v: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    // Fails while another container is still on it; the last one removes it.
+    if let Some(network) = network.filter(|n| !is_shared_network(n)) {
+        let _ = docker.remove_network(network).await;
     }
 }
 
@@ -702,6 +879,10 @@ fn pull_error_text(err: &bollard::errors::Error) -> String {
 /// host) can take longer than the client's request timeout, and creating the
 /// container again usually succeeds.
 const CREATE_ATTEMPTS: u32 = 5;
+/// Starts of one container refused for a full kernel key quota before the
+/// failure is reported. Each waits for room first, so the quota filling again
+/// between that check and runc is what this rides out.
+const QUOTA_ATTEMPTS: u32 = 5;
 
 /// How long to wait before trying again after Docker did not answer in time,
 /// and between lookups of a container a timed-out attempt created.
@@ -821,11 +1002,102 @@ fn conflict_holder(message: &str) -> Option<String> {
 /// which the reaper reads to tell a live run's resources from a dead one's.
 pub const RUNNER_LABEL: &str = "spicescript.runner";
 
+tokio::task_local! {
+    /// An address the containers started within [`publishing_also_on`]
+    /// publish their ports on, besides loopback.
+    static ALSO_PUBLISH_ON: Option<std::net::IpAddr>;
+}
+
+/// Runs `work`, in which every container started publishes its ports where
+/// they are reached at `address` as well as on loopback, where one is given:
+/// for peers that reach this machine at that address, such as cluster
+/// executors in bridge containers behind a rootless daemon (see
+/// [`crate::spiced::ContainerRun`]).
+pub async fn publishing_also_on<F: std::future::Future>(
+    address: Option<std::net::IpAddr>,
+    work: F,
+) -> F::Output {
+    ALSO_PUBLISH_ON.scope(address, work).await
+}
+
+/// The address [`publishing_also_on`] gave the current task, if any.
+pub fn also_publish_on() -> Option<std::net::IpAddr> {
+    ALSO_PUBLISH_ON.try_with(|address| *address).ok().flatten()
+}
+
+/// The host address a container's port is published on: loopback, or, when
+/// it must also be reached at `also`, every interface. A rootless daemon
+/// cannot publish one port on two host addresses: it binds each at its own
+/// loopback inside its namespace, so the second fails with "address already
+/// in use". Every interface is loopback and `also`, the routable address.
+fn binding_address(also: Option<std::net::IpAddr>) -> &'static str {
+    if also.is_some() {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    }
+}
+
 fn runner_label() -> HashMap<&'static str, String> {
     HashMap::from([(RUNNER_LABEL, std::process::id().to_string())])
 }
 
+/// Whether the Docker daemon runs rootless. Its `host` network is then
+/// `RootlessKit`'s namespace, not this machine's: a container there still
+/// reaches other containers' published ports at 127.0.0.1, because the daemon
+/// listens for them inside that namespace too, but nothing that listens only
+/// on this machine's loopback, such as `spiced`.
+pub async fn daemon_is_rootless() -> bool {
+    static ROOTLESS: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+    *ROOTLESS
+        .get_or_init(|| async {
+            let Ok(docker) = Docker::connect_with_local_defaults() else {
+                return false;
+            };
+            docker
+                .info()
+                .await
+                .ok()
+                .and_then(|info| info.security_options)
+                .is_some_and(|options| options.iter().any(|o| o == "name=rootless"))
+        })
+        .await
+}
+
+/// This machine's address on the interface its default route leaves by. A
+/// rootless daemon's containers reach a listener on it through the daemon's
+/// outbound NAT, which never leads to this machine's loopback.
+pub fn routable_address() -> Result<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
+    // Connecting a UDP socket sends nothing; it only chooses the route.
+    // 192.0.2.1 is TEST-NET-1 (RFC 5737), so no real host is ever named.
+    socket
+        .connect(("192.0.2.1", 9))
+        .context("Failed to find this machine's routable address: no default route")?;
+    let ip = socket.local_addr()?.ip();
+    anyhow::ensure!(
+        !ip.is_unspecified() && !ip.is_loopback(),
+        "Failed to find this machine's routable address: the default route leaves from {ip}"
+    );
+    Ok(ip)
+}
+
+/// A port no listener on this machine's loopback holds; see [`free_port_on`].
 pub fn free_port() -> Result<u16> {
+    free_port_on(std::net::Ipv4Addr::LOCALHOST.into())
+}
+
+/// Whether a listener could bind `ip:port` now. Probing the wildcard address
+/// also finds a listener on any single address, such as `127.0.0.2`, that a
+/// loopback probe misses.
+fn port_is_free(ip: std::net::IpAddr, port: u16) -> bool {
+    std::net::TcpListener::bind((ip, port)).is_ok()
+}
+
+/// A port this run has not given out and that a listener could bind on `ip`.
+/// Pass the address the port will be served on: a port for a server that
+/// listens on every interface must be probed on `0.0.0.0`.
+pub fn free_port_on(ip: std::net::IpAddr) -> Result<u16> {
     const LOW: u16 = 20000;
     const HIGH: u16 = 32768;
     static GIVEN: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<u16>>> =
@@ -840,8 +1112,7 @@ pub fn free_port() -> Result<u16> {
         let offset =
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % u32::from(HIGH - LOW);
         let port = LOW + u16::try_from(offset).unwrap_or(0);
-        if GIVEN.lock().contains(&port) || std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
-        {
+        if GIVEN.lock().contains(&port) || !port_is_free(ip, port) {
             continue;
         }
         if GIVEN.lock().insert(port) {
@@ -923,6 +1194,168 @@ mod timeout_tests {
 }
 
 #[cfg(test)]
+mod detached_create_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use bollard::{API_DEFAULT_VERSION, Docker, container::Config};
+    use parking_lot::Mutex;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    /// A Docker API that records each request as `METHOD path` and answers a
+    /// create, after `create_delay`, with the id `c1`.
+    async fn recording_daemon(create_delay: Duration) -> (Docker, Arc<Mutex<Vec<String>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local address");
+        let seen = Arc::clone(&requests);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let line = String::from_utf8_lossy(&request)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    let mut parts = line.split(' ');
+                    let method = parts.next().unwrap_or_default().to_string();
+                    let path = parts.next().unwrap_or_default().to_string();
+                    seen.lock().push(format!("{method} {path}"));
+                    let response = if method == "POST" && path.contains("/containers/create") {
+                        tokio::time::sleep(create_delay).await;
+                        let body = r#"{"Id":"c1","Warnings":[]}"#;
+                        format!(
+                            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    } else {
+                        "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string()
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let docker = Docker::connect_with_http(&format!("http://{addr}"), 30, API_DEFAULT_VERSION)
+            .expect("client");
+        (docker, requests)
+    }
+
+    fn spec() -> super::ContainerSpec {
+        super::ContainerSpec {
+            name: "src".into(),
+            image: "img".into(),
+            env: Vec::new(),
+            command: None,
+            ports: Vec::new(),
+            healthcheck: None,
+            network: None,
+            alias: None,
+        }
+    }
+
+    fn removals_of_c1(requests: &Mutex<Vec<String>>) -> usize {
+        requests
+            .lock()
+            .iter()
+            .filter(|r| r.starts_with("DELETE ") && r.contains("/containers/c1"))
+            .count()
+    }
+
+    /// Waits for the daemon to see container `c1` removed, then checks it was
+    /// removed once.
+    async fn expect_c1_removed_once(requests: &Mutex<Vec<String>>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while removals_of_c1(requests) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "container c1 was never removed; the daemon saw {:?}",
+                requests.lock()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(removals_of_c1(requests), 1, "{:?}", requests.lock());
+    }
+
+    /// A container handed over and never taken, with no timing involved: the
+    /// hand-over succeeds, then the receiver goes.
+    #[tokio::test]
+    async fn an_untaken_handover_removes_its_container() {
+        let (docker, requests) = recording_daemon(Duration::ZERO).await;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let created = super::Created {
+            docker,
+            network: None,
+            id: "c1".into(),
+            name: "src".into(),
+            taken: false,
+        };
+        assert!(sender.send(created).is_ok(), "the receiver is still there");
+        drop(receiver);
+        expect_c1_removed_once(&requests).await;
+    }
+
+    /// The caller is gone before the daemon answers the create, as when a
+    /// combination drops a source start because another source failed: the
+    /// task creating the container must remove it.
+    #[tokio::test]
+    async fn a_container_created_after_its_caller_stopped_waiting_is_removed() {
+        let (docker, requests) = recording_daemon(Duration::from_millis(300)).await;
+        drop(super::create_detached(docker, spec(), Config::default()));
+        expect_c1_removed_once(&requests).await;
+    }
+
+    /// The create is answered and the container handed to the caller's
+    /// channel, but the caller is dropped before it takes it, as when another
+    /// source fails between the two: the container must still be removed.
+    #[tokio::test]
+    async fn a_container_handed_over_but_never_taken_is_removed() {
+        let (docker, requests) = recording_daemon(Duration::ZERO).await;
+        let receiver = super::create_detached(docker, spec(), Config::default());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !requests
+            .lock()
+            .iter()
+            .any(|r| r.contains("/containers/create"))
+        {
+            assert!(tokio::time::Instant::now() < deadline, "no create was sent");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Long past the daemon's answer, so the task has handed the container
+        // to the channel before the receiver goes.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(receiver);
+        expect_c1_removed_once(&requests).await;
+    }
+
+    /// While the caller waits, the container is handed over, not removed.
+    #[tokio::test]
+    async fn a_container_whose_caller_waits_is_handed_over() {
+        let (docker, requests) = recording_daemon(Duration::from_millis(300)).await;
+        let (id, name) = super::create_detached(docker, spec(), Config::default())
+            .await
+            .expect("the task answers")
+            .expect("the container is created")
+            .take();
+        crate::cleanup::untrack_container(&id);
+        assert_eq!((id.as_str(), name.as_str()), ("c1", "src"));
+        // Give a wrongly sent removal time to arrive.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(removals_of_c1(&requests), 0, "{:?}", requests.lock());
+    }
+}
+
+#[cfg(test)]
 mod port_tests {
     #[test]
     fn free_port_hands_out_distinct_ports_below_the_ephemeral_ranges() {
@@ -935,6 +1368,23 @@ mod port_tests {
             );
             assert!(seen.insert(port), "port {port} was given out twice");
         }
+    }
+
+    /// Linux routes all of 127.0.0.0/8 to loopback, so a listener on
+    /// 127.0.0.2 leaves 127.0.0.1 bindable while it blocks the wildcard.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_wildcard_probe_sees_a_listener_on_another_local_address() {
+        let held = std::net::TcpListener::bind(("127.0.0.2", 0)).expect("listen on 127.0.0.2");
+        let port = held.local_addr().expect("local addr").port();
+        assert!(super::port_is_free(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            port
+        ));
+        assert!(!super::port_is_free(
+            std::net::Ipv4Addr::UNSPECIFIED.into(),
+            port
+        ));
     }
 }
 
@@ -1113,10 +1563,18 @@ mod pull_tests {
         pull_broke_off, pull_error_text, pull_image, pull_with_retries, registry_credentials,
     };
 
-    /// `docker login` to Docker Hub as `user` with password `s3cr3t`, as the
-    /// Docker CLI stores it.
-    const HUB_LOGIN: &str =
-        r#"{"auths":{"https://index.docker.io/v1/":{"auth":"dXNlcjpzM2NyM3Q="}}}"#;
+    /// Made-up Docker Hub login used only by these tests. It is sent only to
+    /// the fake Docker daemon below on `127.0.0.1`, never to a real registry.
+    const HUB_USER: &str = "user";
+    const HUB_PASSWORD: &str = "s3cr3t";
+
+    /// The test login in a Docker CLI `config.json`, as `docker login` stores
+    /// it: `auth` is the base64 encoding of `{username}:{password}`.
+    fn hub_login_config() -> String {
+        let auth =
+            base64::engine::general_purpose::STANDARD.encode(format!("{HUB_USER}:{HUB_PASSWORD}"));
+        format!(r#"{{"auths":{{"https://index.docker.io/v1/":{{"auth":"{auth}"}}}}}}"#)
+    }
 
     /// A Docker API that answers every request with `body` after the
     /// headers of a `200 OK`, then closes the connection, and keeps each
@@ -1160,8 +1618,8 @@ mod pull_tests {
 
     fn hub_login() -> DockerCredentials {
         DockerCredentials {
-            username: Some("user".into()),
-            password: Some("s3cr3t".into()),
+            username: Some(HUB_USER.into()),
+            password: Some(HUB_PASSWORD.into()),
             serveraddress: Some("https://index.docker.io/v1/".into()),
             ..Default::default()
         }
@@ -1175,7 +1633,7 @@ mod pull_tests {
             "clickhouse/clickhouse-server:24.8",
         ] {
             assert_eq!(
-                registry_credentials(HUB_LOGIN, image),
+                registry_credentials(&hub_login_config(), image),
                 Some(hub_login()),
                 "{image}"
             );
@@ -1186,11 +1644,11 @@ mod pull_tests {
         let ghcr = r#"{"auths":{"ghcr.io":{"username":"bot","password":"token"}}}"#;
         assert_eq!(registry_credentials(ghcr, "mongo:8.0"), None);
         assert_eq!(
-            registry_credentials(HUB_LOGIN, "ghcr.io/spiceai/image:1"),
+            registry_credentials(&hub_login_config(), "ghcr.io/spiceai/image:1"),
             None
         );
         assert_eq!(
-            registry_credentials(HUB_LOGIN, "localhost:5000/image"),
+            registry_credentials(&hub_login_config(), "localhost:5000/image"),
             None
         );
         assert_eq!(
@@ -1227,8 +1685,8 @@ mod pull_tests {
                 .expect("base64"),
         )
         .expect("JSON");
-        assert_eq!(login["username"], "user");
-        assert_eq!(login["password"], "s3cr3t");
+        assert_eq!(login["username"], HUB_USER);
+        assert_eq!(login["password"], HUB_PASSWORD);
         assert_eq!(login["serveraddress"], "https://index.docker.io/v1/");
         // Without a login the header is empty: Docker pulls anonymously.
         assert!(sent[1].is_empty(), "{sent:?}");
@@ -1338,5 +1796,25 @@ mod pull_tests {
             "{got:?}"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod also_publish_tests {
+    use super::{also_publish_on, binding_address, publishing_also_on};
+
+    #[tokio::test]
+    async fn publishes_on_the_extra_address_only_within_its_scope() {
+        let address: std::net::IpAddr = std::net::Ipv4Addr::new(10, 244, 0, 183).into();
+        assert_eq!(also_publish_on(), None);
+        assert_eq!(binding_address(also_publish_on()), "127.0.0.1");
+        let inside =
+            publishing_also_on(Some(address), async { binding_address(also_publish_on()) }).await;
+        assert_eq!(inside, "0.0.0.0");
+        assert_eq!(
+            publishing_also_on(None, async { also_publish_on() }).await,
+            None
+        );
+        assert_eq!(also_publish_on(), None);
     }
 }

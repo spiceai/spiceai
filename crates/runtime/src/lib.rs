@@ -659,6 +659,14 @@ pub enum Error {
     ))]
     FullTextSearchRequiresAcceleration { dataset_name: String },
 
+    #[snafu(display(
+        "Dataset '{dataset_name}' sets `{setting}`, which keeps its data on object storage, but a sidecar serves data only from memory and local disk; the cluster it reads from serves object-storage tiers. Remove `{setting}` from the sidecar's Spicepod, or start Spice without `--role sidecar`."
+    ))]
+    SidecarColdTier {
+        dataset_name: String,
+        setting: &'static str,
+    },
+
     #[snafu(display("{reason}"))]
     StateLocationRefused { reason: String },
 
@@ -727,8 +735,6 @@ impl Default for InitialLoad {
 #[derive(Clone)]
 #[expect(clippy::struct_field_names)]
 pub struct Runtime {
-    /// Fixed at startup, including across app reloads and connector recreation.
-    mode: spicepod::component::runtime::RuntimeMode,
     app: Arc<RwLock<Option<Arc<App>>>>,
     /// Serializes [`Runtime::apply_app`] so that concurrent callers cannot
     /// interleave their diff-and-swap. `apply_app` computes diffs under a read
@@ -804,8 +810,18 @@ pub struct Runtime {
     /// The Spicepod tool loads in progress, so a Spicepod change can stop the load of a
     /// configuration it replaces or removes.
     tool_loads: Arc<init::model::LoadTasks>,
+    /// The embedding model loads in progress, kept apart from `model_loads` because a model and
+    /// an embedding model can share a name.
+    embedding_loads: Arc<init::model::LoadTasks>,
+    /// The reranker loads in progress.
+    reranker_loads: Arc<init::model::LoadTasks>,
+    /// The catalog loads in progress, so a Spicepod change can stop the load of a
+    /// configuration it replaces or removes.
+    catalog_loads: Arc<init::model::LoadTasks>,
     /// Names of the SQL functions registered for `as_sql` tools.
     tool_udfs: Arc<parking_lot::Mutex<HashSet<String>>>,
+    /// The installed app's `row_id` keys, read by `/v1/search` and `vector_search`.
+    search_primary_keys: runtime_search::search_engine::ExplicitPrimaryKeys,
     /// Startup view registrations still waiting, cancelled when a Spicepod change replaces or removes the view.
     view_loads: Arc<init::view_loads::ViewLoads>,
 
@@ -844,6 +860,12 @@ impl Runtime {
     #[must_use]
     pub fn datafusion(&self) -> Arc<DataFusion> {
         Arc::clone(&self.df)
+    }
+
+    /// The `--role` this runtime started with. A Spicepod reload cannot change it.
+    #[must_use]
+    pub fn role(&self) -> config::Role {
+        self.df.role()
     }
 
     #[must_use]
@@ -962,6 +984,12 @@ impl Runtime {
         &self,
     ) -> Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>> {
         self.llm_runtime_stores.rate_controllers()
+    }
+
+    /// This node's rank in each loaded model split across several nodes, by model name.
+    #[must_use]
+    pub fn model_node_ranks(&self) -> Arc<RwLock<HashMap<String, usize>>> {
+        self.llm_runtime_stores.node_ranks()
     }
 
     #[must_use]
@@ -1724,6 +1752,16 @@ impl Runtime {
         tls_config: Option<Arc<TlsConfig>>,
         endpoint_auth: EndpointAuth,
     ) -> Result<()> {
+        // A request with no principal may call read-write tools only when the runtime
+        // authenticates no caller, as it may then write through `/v1/sql`.
+        ::tools::set_runtime_authenticates_callers(
+            endpoint_auth.http_auth.is_some()
+                || !matches!(
+                    endpoint_auth.identity_source,
+                    runtime_auth::IdentitySource::Anonymous
+                ),
+        );
+
         // Executors: mark cluster status Initializing before any await so a
         // concurrent `load_components` cannot report ready from dataset-only
         // status while task slots are still closed (Fix B for #11758).
@@ -2560,7 +2598,12 @@ impl Runtime {
             && let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(&catalog_name)
             && let Some(tool) = catalog.get(&name).await
         {
-            return Some(tool);
+            // Under the name it is listed as, as `list_all_tools` returns it, so the tool is
+            // named the same in its errors and `task_history` whichever path called it.
+            return Some(with_name(
+                &tool,
+                encode_tool_name(&catalog_name, &name).as_str(),
+            ));
         }
         // Fall back to a direct (non-catalog) lookup — covers top-level tools
         // whose names legitimately contain the `__` catalog separator.

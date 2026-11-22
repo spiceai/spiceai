@@ -418,7 +418,11 @@ mod tests {
             None
         }
 
-        async fn call(&self, _: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Err("boom".into())
         }
     }

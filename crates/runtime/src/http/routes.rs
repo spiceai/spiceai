@@ -769,6 +769,7 @@ async fn track_metrics(
     req.extensions_mut().insert(Arc::clone(&request_context));
 
     let request_dimensions = request_context.to_dimensions();
+    let protocol_dimensions = request_context.to_protocol_dimensions();
 
     // Read before the request is handed on: whether a `/v1/sql` stream can carry
     // its `Server-Timing` total as a trailer depends on the request.
@@ -808,6 +809,7 @@ async fn track_metrics(
         .await;
 
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let unauthenticated = response.status() == http::StatusCode::UNAUTHORIZED;
     let status = http_status_label(response.status().as_u16());
 
     let mut labels = vec![
@@ -816,7 +818,14 @@ async fn track_metrics(
         KeyValue::new("status", status),
     ];
 
-    labels.extend(request_dimensions);
+    // This layer wraps the auth layer, so it also sees requests the auth layer
+    // rejected. Their client dimensions come from headers a caller chose without
+    // proving who it is, so a `401` carries only the runtime-defined labels.
+    if unauthenticated {
+        labels.extend_from_slice(protocol_dimensions);
+    } else {
+        labels.extend(request_dimensions);
+    }
 
     metrics::REQUESTS_TOTAL.add(1, &labels);
     metrics::REQUESTS.add(1, &labels);
@@ -903,9 +912,10 @@ fn mcp_origin_cors<'a>(config: &'a config::Config, app_cors: &'a CorsConfig) -> 
 /// - `"*"` or an empty CORS list expands to localhost defaults so the
 ///   rmcp allow-list is never empty (empty accepts every `Origin`).
 /// - A concrete list is the 2026-07-28 Streamable HTTP origin policy:
-///   a mismatched `Origin` is 403; a missing `Origin` still passes. rmcp
-///   matches a portless entry on any port, so [`McpTransport`] also checks
-///   the port of a concrete entry.
+///   a mismatched `Origin` is 403; a missing `Origin` still passes. The
+///   localhost defaults use rmcp's `:*` any-port suffix. [`McpTransport`]
+///   also checks the port of a concrete entry (portless user entries stay
+///   exact-port; they are not rewritten with `:*`).
 ///
 /// `legacy_session_mode` stays on so `initialize` clients still get
 /// `Mcp-Session-Id` sessions. `2026-07-28` requests are always served
@@ -1800,7 +1810,7 @@ mod mcp_origin_tests {
     use http::StatusCode;
     use rmcp::{
         ServerHandler,
-        model::{ProtocolVersion, ServerCapabilities, ServerInfo},
+        model::{ProtocolVersion, ServerCapabilities, ServerConfig},
     };
     use spicepod::component::runtime::Runtime as SpicepodRuntime;
     use std::sync::Arc;
@@ -1816,8 +1826,8 @@ mod mcp_origin_tests {
     struct OriginCheckServer;
 
     impl ServerHandler for OriginCheckServer {
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
                 .with_protocol_version(ProtocolVersion::V_2026_07_28)
         }
     }
@@ -1899,7 +1909,7 @@ mod mcp_origin_tests {
             config
                 .allowed_origins
                 .iter()
-                .any(|o| o == "http://localhost"),
+                .any(|o| o == "http://localhost:*"),
             "default CORS * must install localhost MCP origins, got {:?}",
             config.allowed_origins
         );
@@ -1916,7 +1926,7 @@ mod mcp_origin_tests {
             config
                 .allowed_origins
                 .iter()
-                .any(|o| o == "http://localhost"),
+                .any(|o| o == "http://localhost:*"),
             "wildcard CORS must install localhost MCP origins, got {:?}",
             config.allowed_origins
         );
@@ -2038,6 +2048,28 @@ mod mcp_origin_tests {
             status,
             StatusCode::FORBIDDEN,
             "localhost Origin must pass the default CORS * MCP allow-list, got {status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_cors_wildcard_accepts_localhost_non_default_port_post() {
+        let config = mcp_server_config(None, &CorsConfig::default());
+        assert!(
+            config
+                .allowed_origins
+                .iter()
+                .any(|origin| origin == "http://localhost:*"),
+            "default MCP origins must carry rmcp's `:*` suffix, got {:?}",
+            config.allowed_origins
+        );
+        let status = post_mcp_with_origin(config, Some("http://localhost:5173")).await;
+        // This helper talks to rmcp's Streamable HTTP service directly. A
+        // sessionless unknown-tool call returns 404, not 200. 403 would mean
+        // the Origin was rejected.
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "Origin http://localhost:5173 must pass the default CORS * MCP allow-list (rmcp answers this helper with 404, not 403), got {status}"
         );
     }
 

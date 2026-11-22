@@ -6,7 +6,7 @@ name: 'nsql_benchmark'
 default_acceleration: &default_acceleration
   enabled: true
   mode: file
-  engine: duckdb
+  engine: cayenne
 
 system_prompt: &system_prompt |
   Use the SQL tool when:

@@ -52,7 +52,7 @@ impl Document {
                 "ready": "rpk cluster health | grep -E 'Healthy:.+true'"
             }),
             "mongodb" => json!({
-                "kind": "docker", "image": format!("docker.io/library/mongo:{}", version.unwrap_or("8.0")), "ports": [27017],
+                "kind": "docker", "image": format!("docker.io/library/mongo:{}", version.unwrap_or("9.0")), "ports": [27017],
                 "command": ["mongod", "--replSet", "rs0", "--bind_ip_all"],
                 "ready": "mongosh --quiet --eval \"try { rs.status(); db.hello().isWritablePrimary ? 1 : 0 } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:27017'}]}); 0 }\" | grep -qx 1"
             }),

@@ -36,6 +36,7 @@ use datafusion::{
     common::Column,
     datasource::TableProvider,
     error::DataFusionError,
+    execution::memory_pool::MemoryPool,
     logical_expr::{Operator, TableProviderFilterPushDown},
     prelude::Expr,
     scalar::ScalarValue,
@@ -62,7 +63,7 @@ use stargazers::StargazersTableArgs;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration};
-use token_provider::github_app_token::GitHubAppTokenProvider;
+use token_provider::github_app_token::{AppKey, GitHubAppTokenProvider};
 use token_provider::{StaticTokenProvider, TokenProvider};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use url::Url;
@@ -76,6 +77,7 @@ use runtime_parameters::{ParameterSpec, Parameters};
 
 pub mod github;
 
+mod app_key;
 mod commits;
 mod identity;
 mod issues;
@@ -420,9 +422,11 @@ impl Github {
         }
     }
 
+    /// The GraphQL client for `tbl`, whose response bodies are charged to `memory_pool`.
     pub(crate) async fn create_graphql_client(
         &self,
         tbl: &Arc<dyn GitHubTableArgs>,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> std::result::Result<GraphQLClient, Box<dyn std::error::Error + Send + Sync>> {
         let Some(endpoint) = self.params.get("endpoint").expose().ok() else {
             return Err(
@@ -443,22 +447,22 @@ impl Github {
 
         let rate_controller = get_github_auth_rate_control(auth_context).await.controller;
 
+        // The GraphQL client decodes compressed responses itself, so one that expands past
+        // what real data compresses to is refused as a compression bomb.
         let client = reqwest::Client::builder()
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_mins(2))
-            .gzip(true)
-            .brotli(true)
-            .zstd(true)
-            .deflate(true)
             .default_headers({
                 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
                 let mut headers = HeaderMap::new();
                 headers.append(CONTENT_TYPE, HeaderValue::from_static("application/json"));
                 headers
-            })
-            .build()
-            .boxed()?;
+            });
+        let dataset_name = match tbl.get_component() {
+            ConnectorComponent::Dataset(dataset) => dataset.name.to_string(),
+            ConnectorComponent::Catalog(catalog) => catalog.name.clone(),
+        };
 
         let gql_client_params = tbl.get_graphql_values();
 
@@ -473,7 +477,8 @@ impl Github {
         .with_semaphore(Some(Arc::clone(&self.semaphore)))
         .with_rate_controller(Some(rate_controller))
         .with_nested_pager(gql_client_params.nested_pager)
-        .build(client)
+        .with_source(dataset_name, "github")
+        .build(client, Arc::clone(memory_pool))
         .boxed()
     }
 
@@ -528,8 +533,9 @@ impl Github {
         table_args: Arc<dyn GitHubTableArgs>,
         context: Option<Arc<dyn GraphQLContext>>,
         health_check_query_string: String,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        self.build_gql_table_provider(table_args, context, health_check_query_string)
+        self.build_gql_table_provider(table_args, context, health_check_query_string, memory_pool)
             .await
             .map(|provider| Arc::new(provider) as Arc<dyn TableProvider>)
     }
@@ -539,15 +545,17 @@ impl Github {
         table_args: Arc<dyn GitHubTableArgs>,
         context: Option<Arc<dyn GraphQLContext>>,
         health_check_query_string: String,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> DataConnectorResult<GraphQLTableProvider> {
         let connector_component_name = format!("{}", table_args.get_component());
         let graphql_values = table_args.get_graphql_values();
-        let client = self.create_graphql_client(&table_args).await.context(
-            data_connector_api::UnableToGetReadProviderSnafu {
+        let client = self
+            .create_graphql_client(&table_args, memory_pool)
+            .await
+            .context(data_connector_api::UnableToGetReadProviderSnafu {
                 dataconnector: "github".to_string(),
                 connector_component: table_args.get_component(),
-            },
-        )?;
+            })?;
 
         let provider_builder = GraphQLTableProviderBuilder::new(client)
             .with_schema_transform(github_gql_raw_schema_cast);
@@ -584,12 +592,13 @@ impl Github {
                 "GitHub GraphQL preflight validation failed for {connector_component_name}; continuing with the configured schema so the dataset can recover on a later refresh: {initial_build_error}"
             );
 
-            let fallback_client = self.create_graphql_client(&table_args).await.context(
-                data_connector_api::UnableToGetReadProviderSnafu {
+            let fallback_client = self
+                .create_graphql_client(&table_args, memory_pool)
+                .await
+                .context(data_connector_api::UnableToGetReadProviderSnafu {
                     dataconnector: "github".to_string(),
                     connector_component: table_args.get_component(),
-                },
-            )?;
+                })?;
 
             let fallback_builder = GraphQLTableProviderBuilder::new(fallback_client)
                 .with_schema_transform(github_gql_raw_schema_cast);
@@ -709,6 +718,7 @@ impl Github {
         repo: &str,
         requested_ref: Option<&str>,
         dataset: &DatasetSpec,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let table_args = Arc::new(CommitsTableArgs {
             owner: owner.to_string(),
@@ -725,6 +735,7 @@ impl Github {
                 Arc::clone(&gql_table_args),
                 Some(gql_context),
                 Github::get_health_check_for_owner_and_repo(owner, repo),
+                memory_pool,
             )
             .await?;
         let client = delegate_provider.client();
@@ -835,6 +846,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("private_key")
         .description("The Github App private key.")
         .secret(),
+    ParameterSpec::component("private_key_kms")
+        .description("The key that holds the GitHub App's private key, which signs the App's JWTs so the private key is never stored: an Azure Key Vault key URL (https://<vault>.vault.azure.net/keys/<name>) or an AWS KMS key or alias ARN (arn:aws:kms:<region>:<account>:alias/<name>). Use with `github_client_id` and `github_installation_id`, instead of `github_private_key`."),
     ParameterSpec::component("installation_id")
         .description("The Github App installation ID.")
         .secret(),
@@ -898,6 +911,31 @@ impl DataConnectorFactory for GithubFactory {
             .map(ToString::to_string);
 
         let connector_component = params.component.clone();
+        let github_endpoint = params
+            .parameters
+            .get("endpoint")
+            .expose()
+            .ok()
+            .unwrap_or("https://api.github.com")
+            .to_string();
+
+        let key_service_app = match app_key::resolve(&app_key::AppKeyParams {
+            private_key_kms: params.user_set("private_key_kms"),
+            private_key_set: params.user_set("private_key").is_some(),
+            token_set: params.user_set("token").is_some(),
+            client_id: client_id.as_deref(),
+            installation_id: installation_id.as_deref(),
+        }) {
+            Ok(app) => app,
+            Err(error) => {
+                let error = DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "github".to_string(),
+                    connector_component,
+                    message: error.to_string(),
+                };
+                return Box::pin(async move { Err(Box::new(error) as _) });
+            }
+        };
 
         let dataset_max_concurrent_requests = match params
             .parameters
@@ -953,28 +991,75 @@ impl DataConnectorFactory for GithubFactory {
             .unwrap_or(GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS);
 
         Box::pin(async move {
+            let unable_to_authenticate =
+                |source: token_provider::github_app_token::GitHubAppError| {
+                    DataConnectorError::UnableToConnectInternal {
+                        dataconnector: "github".to_string(),
+                        connector_component: connector_component.clone(),
+                        source: Box::new(source),
+                    }
+                };
             let (token_provider, semaphore_key): (Option<Arc<dyn TokenProvider>>, Option<String>) =
-                match (token, client_id, private_key, installation_id) {
-                    (Some(token), _, _, _) => {
-                        let key = token.expose_secret().to_string();
-                        (Some(Arc::new(StaticTokenProvider::new(token))), Some(key))
-                    }
+                if let Some(app) = key_service_app {
+                    // A key service the Spicepod names takes precedence over a token or private key
+                    // a secret store supplies unasked.
+                    let component = github_component_label(&connector_component);
+                    let (signer, load_message) = app_key::signer(app.service, &component)
+                        .await
+                        .map_err(|error| {
+                            if error.is_configuration() {
+                                DataConnectorError::InvalidConfigurationNoSource {
+                                    dataconnector: "github".to_string(),
+                                    connector_component: connector_component.clone(),
+                                    message: error.to_string(),
+                                }
+                            } else {
+                                DataConnectorError::UnableToConnectInternal {
+                                    dataconnector: "github".to_string(),
+                                    connector_component: connector_component.clone(),
+                                    source: Box::new(error),
+                                }
+                            }
+                        })?;
+                    // GitHub rate limits are per installation, so use the installation ID as the key
+                    let key = app.installation_id.clone();
+                    let provider = GitHubAppTokenProvider::try_new(
+                        component,
+                        app.client_id.into(),
+                        AppKey::Signer(signer),
+                        app.installation_id.into(),
+                        github_endpoint.into(),
+                    )
+                    .await
+                    .map_err(unable_to_authenticate)?;
+                    tracing::info!("{load_message}");
+                    (Some(Arc::new(provider)), Some(key))
+                } else {
+                    match (token, client_id, private_key, installation_id) {
+                        (Some(token), _, _, _) => {
+                            let key = token.expose_secret().to_string();
+                            (Some(Arc::new(StaticTokenProvider::new(token))), Some(key))
+                        }
 
-                    (None, Some(client_id), Some(private_key), Some(installation_id)) => {
-                        // GitHub rate limits are per installation, so use the installation ID as the key
-                        let key = installation_id.clone();
-                        let provider = Arc::new(
-                            GitHubAppTokenProvider::try_new(
-                                client_id.into(),
-                                private_key.into(),
-                                installation_id.into(),
-                            )
-                            .await?,
-                        );
-                        (Some(provider), Some(key))
-                    }
+                        (None, Some(client_id), Some(private_key), Some(installation_id)) => {
+                            // GitHub rate limits are per installation, so use the installation ID as the key
+                            let key = installation_id.clone();
+                            let provider = Arc::new(
+                                GitHubAppTokenProvider::try_new(
+                                    github_component_label(&connector_component),
+                                    client_id.into(),
+                                    AppKey::Pem(private_key.into()),
+                                    installation_id.into(),
+                                    github_endpoint.into(),
+                                )
+                                .await
+                                .map_err(unable_to_authenticate)?,
+                            );
+                            (Some(provider), Some(key))
+                        }
 
-                    _ => (None, None),
+                        _ => (None, None),
+                    }
                 };
 
             let semaphore = if let Some(key) = semaphore_key {
@@ -1026,6 +1111,14 @@ impl DataConnectorFactory for GithubFactory {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+}
+
+/// `component` as a log line names it, such as `dataset 'stars' (github)`.
+fn github_component_label(component: &ConnectorComponent) -> String {
+    match component {
+        ConnectorComponent::Dataset(dataset) => format!("dataset '{}' (github)", dataset.name),
+        ConnectorComponent::Catalog(catalog) => format!("catalog '{}' (github)", catalog.name),
     }
 }
 
@@ -1219,9 +1312,17 @@ impl DataConnector for Github {
 
     async fn read_provider(
         &self,
-        _context: &dyn ConnectorContext,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        // GraphQL response bodies are held to the runtime's query memory pool, at
+        // registration as in queries.
+        let memory_pool = Arc::clone(
+            &context
+                .datafusion_session_context()
+                .runtime_env()
+                .memory_pool,
+        );
         let path = dataset.path().to_string();
 
         // Parse owner, repo, and resource type from the path for validation
@@ -1335,7 +1436,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool
                 )
                 .await
             }
@@ -1347,6 +1448,7 @@ impl DataConnector for Github {
                     repo,
                     parsed.remaining.as_deref(),
                     dataset,
+                    &memory_pool,
                 )
                 .await
             }
@@ -1362,7 +1464,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool
                 )
                 .await
             }
@@ -1378,7 +1480,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool
                 )
                 .await
             }
@@ -1394,7 +1496,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool
                 )
                 .await
             }
@@ -1410,7 +1512,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool
                 )
                 .await
             }
@@ -1426,7 +1528,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool
                 )
                 .await
             }
@@ -1442,7 +1544,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool
                 )
                 .await
             }
@@ -1458,7 +1560,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool
                 )
                 .await
             }
@@ -1474,7 +1576,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_repository_owner(parsed.owner)
+                    Github::get_health_check_for_repository_owner(parsed.owner), &memory_pool
                 )
                 .await
             }
@@ -1489,7 +1591,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_user(parsed.owner)
+                    Github::get_health_check_for_user(parsed.owner), &memory_pool
                 )
                 .await
             }
@@ -1502,7 +1604,7 @@ impl DataConnector for Github {
                     repo: repo.to_string(),
                     component,
                 });
-                self.create_gql_table_provider(Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>, Some(table_args), Github::get_health_check_for_owner_and_repo(parsed.owner, repo)).await
+                self.create_gql_table_provider(Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>, Some(table_args), Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool).await
             }
             ("files", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "files", &component);
@@ -1597,7 +1699,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool
                 )
                 .await
             }
@@ -1612,7 +1714,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_org(parsed.owner)
+                    Github::get_health_check_for_org(parsed.owner), &memory_pool
                 )
                 .await
             }
@@ -1626,7 +1728,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_org(parsed.owner)
+                    Github::get_health_check_for_org(parsed.owner), &memory_pool
                 )
                 .await
             }
@@ -1880,6 +1982,19 @@ pub(crate) fn expr_to_match(expr: &Expr) -> Option<(Column, ScalarValue, Operato
     }
 }
 
+/// Whether GitHub search reads `value` as one plain term. A value with whitespace, a
+/// qualifier, a quote, a parenthesis, a leading `-` or a boolean operator would add
+/// terms to the query that sits beside its `repo:` qualifier.
+fn is_single_search_term(value: &str) -> bool {
+    !value.starts_with('-')
+        && !value
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, ':' | '"' | '(' | ')'))
+        && !["AND", "OR", "NOT"]
+            .iter()
+            .any(|operator| value.eq_ignore_ascii_case(operator))
+}
+
 pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
     let column_matches = expr_to_match(expr);
 
@@ -1920,6 +2035,19 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
             ScalarValue::Utf8(Some(v))
             | ScalarValue::LargeUtf8(Some(v))
             | ScalarValue::Utf8View(Some(v)) => {
+                if !is_single_search_term(v) {
+                    tracing::debug!(
+                        "Value for column {} is not a single GitHub search term",
+                        column.name
+                    );
+
+                    return FilterPushdownResult {
+                        filter_pushdown: TableProviderFilterPushDown::Unsupported,
+                        expr: expr.clone(),
+                        context: None,
+                    };
+                }
+
                 if column.name == "state" {
                     v.to_lowercase()
                 } else {

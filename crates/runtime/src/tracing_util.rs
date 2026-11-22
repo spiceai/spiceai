@@ -32,7 +32,13 @@ pub fn dataset_registered_trace(
     ds: &Dataset,
     results_cache_enabled: bool,
 ) -> String {
-    let mut info = format!("Dataset {} registered ({})", ds.name, ds.from);
+    // The source is reported as `/v1/datasets` reports it: a key or password in its URL
+    // would otherwise reach every log reader at the default level.
+    let mut info = format!(
+        "Dataset {} registered ({})",
+        ds.name,
+        crate::http::v1::redact_source_credentials(&ds.from)
+    );
     if let Some(acceleration) = &ds.acceleration
         && acceleration.enabled
     {
@@ -213,6 +219,30 @@ mod tests {
         );
     }
 
+    /// The line is written at the default level, so a key or password in the source URL
+    /// is left out, as `/v1/datasets` leaves it out.
+    #[tokio::test]
+    async fn test_dataset_registered_trace_redacts_source_credentials() {
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+        let ds = DatasetBuilder::try_new(
+            "https://alice:hunter2@api.example.com/v1/items?api_key=abc123&region=us".to_string(),
+            "items",
+        )
+        .expect("Failed to create builder")
+        .with_app(Arc::new(app))
+        .with_runtime(Arc::new(rt))
+        .build()
+        .expect("Failed to build dataset");
+
+        let test_data_connector: Arc<dyn DataConnector> = Arc::new(TestDataConnector {});
+        let info = dataset_registered_trace(test_data_connector.as_ref(), &ds, false);
+        assert_eq!(
+            info,
+            "Dataset items registered (https://api.example.com/v1/items?api_key=***&region=us)."
+        );
+    }
+
     #[tokio::test]
     async fn test_dataset_registered_trace_default_acceleration_cache() {
         let acceleration = Acceleration {
@@ -242,7 +272,7 @@ mod tests {
     async fn test_dataset_registered_trace_with_acceleration_complex() {
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::DuckDB,
+            engine: Engine::Cayenne,
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Append),
             refresh_check_interval: Some(Duration::from_secs(30)),
@@ -267,7 +297,7 @@ mod tests {
         let info = dataset_registered_trace(test_data_connector.as_ref(), &ds, false);
         assert_eq!(
             info,
-            "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (duckdb:file, append, 30s refresh, 1hr retention, fallback on source on empty result)."
+            "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (cayenne:file, append, 30s refresh, 1hr retention, fallback on source on empty result)."
         );
     }
 
@@ -297,7 +327,7 @@ mod tests {
         let table_ref = TableReference::from("taxi_trips_vw");
         let acceleration = Some(Acceleration {
             enabled: true,
-            engine: Engine::DuckDB,
+            engine: Engine::Cayenne,
             mode: Mode::File,
             refresh_check_interval: Some(Duration::from_secs(30)),
             ..Default::default()
@@ -305,7 +335,7 @@ mod tests {
         let info = view_registered_trace(&table_ref, acceleration.as_ref());
         assert_eq!(
             info,
-            "View taxi_trips_vw registered, acceleration (duckdb:file, 30s refresh)."
+            "View taxi_trips_vw registered, acceleration (cayenne:file, 30s refresh)."
         );
     }
 }

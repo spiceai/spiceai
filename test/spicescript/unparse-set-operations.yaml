@@ -1,23 +1,29 @@
 name: unparse-set-operations
 description: >
-  INTERSECT and EXCEPT answer as PostgreSQL does, NULLs included, wherever the
-  query runs.
+  INTERSECT and EXCEPT answer as the source does, NULLs included, wherever the
+  query runs. Federated, the whole query is sent to the source, PostgreSQL or
+  DuckDB (regression test for #14941).
 
 sources:
-  src: { kind: postgres }
+  src: { kind: '${matrix.src}' }
+
+matrix:
+  src: [postgres, duckdb]
 
 variants:
   federated: {}
-  duckdb: duckdb
-  arrow: arrow
+  cayenne: cayenne-file
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
+  cayenne-memory: cayenne-memory
 
 spicepod:
   version: v1
   kind: Spicepod
   name: unparse-set-operations
   datasets:
-    - { from: 'postgres:public.w', name: w, params: '${sources.src.params}' }
-    - { from: 'postgres:public.w2', name: w2, params: '${sources.src.params}' }
+    - { from: '${matrix.src}:w', name: w, params: '${sources.src.params}' }
+    - { from: '${matrix.src}:w2', name: w2, params: '${sources.src.params}' }
 
 defaults:
   expect: { oracle: src }
@@ -31,6 +37,10 @@ steps:
         CREATE TABLE w2 (id int PRIMARY KEY, a int, s text);
         INSERT INTO w2 VALUES (10, NULL, 'y'), (11, 3, NULL), (12, 7, 'z');
   - start: {}
+  - explain: SELECT a, s FROM w INTERSECT SELECT a, s FROM w2
+    contains: VirtualExecutionPlan
+    omits: [HashJoinExec, NestedLoopJoinExec]
+    only: federated
   # Control: no NULLs on either side.
   - query: SELECT a FROM w WHERE a IS NOT NULL INTERSECT SELECT a FROM w2 WHERE a IS NOT NULL
   - query: SELECT a FROM w INTERSECT SELECT a FROM w2
