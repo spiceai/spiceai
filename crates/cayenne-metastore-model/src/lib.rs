@@ -3028,17 +3028,17 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
         );
     window_required
         || (run.family == "mem-tier"
-        && run.failure.is_empty()
-        && matches!(
-            name,
-            "flush between checkpoint stage and end"
-                | "crash between checkpoint stage and publish"
-                | "bake prunes then reinsert checkpoints"
-                | "seal shadow recovered"
-                | "full rewrite committed"
-                | "full rewrite interleaves apply"
-                | "full rewrite retains later protected snapshot"
-        ))
+            && run.failure.is_empty()
+            && matches!(
+                name,
+                "flush between checkpoint stage and end"
+                    | "crash between checkpoint stage and publish"
+                    | "bake prunes then reinsert checkpoints"
+                    | "seal shadow recovered"
+                    | "full rewrite committed"
+                    | "full rewrite interleaves apply"
+                    | "full rewrite retains later protected snapshot"
+            ))
         || intent_required
         || added_required
         || standby_required
