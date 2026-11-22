@@ -11844,8 +11844,8 @@ dependencies = [
 
 [[package]]
 name = "llama-cpp-src"
-version = "1.0.0"
-source = "git+https://github.com/spiceai/llama.cpp?rev=15068ee560c2ac97b0212b14f163664907cf16cd#15068ee560c2ac97b0212b14f163664907cf16cd"
+version = "1.0.12600"
+source = "git+https://github.com/spiceai/llama.cpp?rev=71e6732c2181497d90e46ca84dff61251477f7d8#71e6732c2181497d90e46ca84dff61251477f7d8"
 
 [[package]]
 name = "llguidance"
@@ -11953,6 +11953,7 @@ dependencies = [
  "rand 0.10.1",
  "runtime-request-context",
  "runtime-resources",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
