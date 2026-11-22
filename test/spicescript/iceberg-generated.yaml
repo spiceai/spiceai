@@ -1,4 +1,5 @@
 name: iceberg-generated
+tags: [long]
 description: >
   A 500,000-row generated Iceberg table answers a pruning-sensitive corpus
   through Spice like DuckDB reading it: federated, accelerated by full refresh into Cayenne, and by append refresh on its time column into

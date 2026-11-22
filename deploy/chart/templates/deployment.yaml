@@ -1,6 +1,6 @@
 ---
 apiVersion: apps/v1
-{{- if .Values.stateful.enabled }}
+{{- if include "spiceai.useStatefulSet" . }}
 kind: StatefulSet
 {{- else }}
 kind: Deployment
@@ -9,14 +9,20 @@ metadata:
   labels:
     {{- include "spiceai.labels" . | indent 4 }}
     app: {{ .Release.Name }}
-  name: {{ template "spiceai.fullname" .  }}
+  name: {{ template "spiceai.workloadName" . }}
   namespace: {{ template "spiceai.namespace" . }}
 spec:
   {{- if .Values.replicaCount }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
-  {{- if .Values.stateful.enabled }}
+  {{- if include "spiceai.useStatefulSet" . }}
+  {{- /* Cluster nodes use the headless Service so each pod gets a stable DNS name;
+         a stateful non-cluster role keeps the main Service as before. */}}
+  {{- if include "spiceai.clusterNode" . }}
+  serviceName: {{ template "spiceai.headlessServiceName" . }}
+  {{- else }}
   serviceName: {{ template "spiceai.fullname" .  }}
+  {{- end }}
   {{- with .Values.updateStrategy }}
   updateStrategy: {{- toYaml . | nindent 4 }}
   {{- end }}
@@ -98,11 +104,17 @@ spec:
                   key: api-key
             {{- end }}
             {{- if include "spiceai.clusterNode" . }}
-            {{- /* Referenced as $(SPICE_POD_IP) by the default --node-advertise-address. */}}
+            {{- /* Available to a `cluster.advertiseAddress` override as $(SPICE_POD_IP). */}}
             - name: SPICE_POD_IP
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            {{- /* Referenced as $(POD_NAME) by the default per-pod DNS advertise
+                   address. */}}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             {{- end }}
             {{- /*
               The pod's own CPU request, so spiced sizes its thread pools and query

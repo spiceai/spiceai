@@ -1,0 +1,106 @@
+# Copyright 2026 The Spice.ai OSS Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Set up spicescript
+description: >-
+  Everything a spicescript job needs before it runs scripts: RustFS credentials
+  and the MinIO client, the spicescript binary, a Docker Hub login, the AWS and
+  DuckDB CLIs, and the Hugging Face token. The calling job needs
+  `id-token: write` (RustFS and Docker Hub use its GitHub OIDC token).
+
+inputs:
+  minio-endpoint:
+    description: 'vars.TEST_MINIO_ENDPOINT'
+    required: true
+  dockerhub-username:
+    description: 'vars.DOCKERHUB_ORGANIZATION'
+    required: true
+  dockerhub-oidc-connection-id:
+    description: 'vars.DOCKERHUB_OIDC_CONNECTIONID'
+    required: true
+  hf-token:
+    description: 'secrets.SPICE_SECRET_HF_TOKEN; may be empty'
+    required: false
+    default: ''
+
+outputs:
+  path:
+    description: 'Path to the spicescript binary'
+    value: ${{ steps.spicescript.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Get RustFS credentials
+      id: rustfs
+      uses: $/.github/actions/rustfs-credentials
+      with:
+        endpoint: ${{ inputs.minio-endpoint }}
+        duration-seconds: '3600'
+        export-env: 'false'
+
+    - name: Install MinIO
+      uses: $/.github/actions/setup-minio
+      with:
+        minio_endpoint: ${{ inputs.minio-endpoint }}
+        minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+        minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+        minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+
+    - name: Download spicescript
+      id: spicescript
+      uses: $/.github/actions/build-tool
+      with:
+        package: spicescript
+
+    # Sources run in containers; log in so image pulls are not rate limited. Scripts pull
+    # images as they start, so the login has to last the whole job. Docker Hub logins use
+    # the job's GitHub OIDC token; there are no Docker Hub password secrets.
+    - name: Login to DockerHub
+      if: github.repository == 'spiceai/spiceai'
+      uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      env:
+        DOCKERHUB_OIDC_CONNECTIONID: ${{ inputs.dockerhub-oidc-connection-id }}
+        DOCKERHUB_OIDC_EXPIREIN: '21600'
+      with:
+        username: ${{ inputs.dockerhub-username }}
+
+    # Object-store sources (rustfs) are managed with the aws CLI.
+    - name: Install the AWS CLI
+      shell: bash
+      run: |
+        command -v unzip >/dev/null || { sudo apt-get update && sudo apt-get install -y unzip; }
+        if ! command -v aws >/dev/null; then
+          curl -fsSL -o "$RUNNER_TEMP/awscliv2.zip" https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+          unzip -q "$RUNNER_TEMP/awscliv2.zip" -d "$RUNNER_TEMP"
+          sudo "$RUNNER_TEMP/aws/install"
+        fi
+
+    # Iceberg sources and dbgen write and read through the DuckDB CLI. The
+    # DuckLake source fetches the release matching spiced's embedded DuckDB.
+    - name: Install DuckDB CLI
+      shell: bash
+      run: |
+        curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 -o "$RUNNER_TEMP/duckdb.zip" \
+          https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip
+        unzip -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
+        echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
+
+    # The search and embedding scripts download a Hub model at startup. Without
+    # a token they share the pool's anonymous per-IP quota, and a rate limit fails
+    # every one of them at once as "model 'potion' … failed to load".
+    - name: Authenticate the Hugging Face cache
+      uses: $/.github/actions/hf-cache-auth
+      with:
+        token: ${{ inputs.hf-token }}

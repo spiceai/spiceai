@@ -1,0 +1,9 @@
+role: executor
+cluster:
+  schedulerAddress: https://spice-scheduler-spiceai:50052
+  advertiseAddress: executor.cluster.example.internal
+  tls:
+    secretName: spice-executor-tls
+auth:
+  apiKey:
+    existingSecret: spice-key

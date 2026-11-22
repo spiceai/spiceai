@@ -1,0 +1,8 @@
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: app
+  datasets: []
+auth:
+  apiKey:
+    existingSecret: spice-key

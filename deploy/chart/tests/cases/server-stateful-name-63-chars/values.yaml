@@ -1,0 +1,6 @@
+fullnameOverride: spice-server-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+stateful:
+  enabled: true
+auth:
+  apiKey:
+    existingSecret: spice-key

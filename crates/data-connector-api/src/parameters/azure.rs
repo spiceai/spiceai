@@ -29,7 +29,8 @@ pub enum Error {
     InvalidEndpoint { endpoint: String },
 
     #[snafu(display(
-        "The '{endpoint}' is a HTTP URL, but 'allow_http' is not enabled. Set the parameter 'allow_http: true' and retry. For details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"
+        "The '{}' is a HTTP URL, but 'allow_http' is not enabled. Set the parameter 'allow_http: true' and retry. For details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params",
+        redact::redact_url_credentials(endpoint)
     ))]
     InsecureEndpointWithoutAllowHTTP { endpoint: String },
 
@@ -62,7 +63,10 @@ impl Validator for AzureEndpointValidator {
 
             // Trim trailing slash for consistency
             if endpoint.ends_with('/') {
-                tracing::warn!("Trimming trailing '/' from Azure endpoint {endpoint}");
+                tracing::warn!(
+                    "Trimming trailing '/' from Azure endpoint {}",
+                    redact::redact_url_credentials(&endpoint)
+                );
                 params.parameters.insert(
                     "endpoint".to_string(),
                     endpoint.trim_end_matches('/').to_string().into(),
@@ -237,6 +241,18 @@ mod tests {
     use runtime_parameters::{ParameterSpec, Parameters};
     use std::collections::HashMap;
     use tokio::runtime::Handle;
+
+    /// The endpoint is named without the credentials its URL can carry.
+    #[test]
+    fn insecure_endpoint_message_leaves_out_url_credentials() {
+        let error = Error::InsecureEndpointWithoutAllowHTTP {
+            endpoint: "http://alice:hunter2@127.0.0.1:10000/".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "The 'http://127.0.0.1:10000/' is a HTTP URL, but 'allow_http' is not enabled. Set the parameter 'allow_http: true' and retry. For details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"
+        );
+    }
 
     const TEST_PARAMETERS: &[ParameterSpec] = &[
         ParameterSpec::component("account").secret(),
