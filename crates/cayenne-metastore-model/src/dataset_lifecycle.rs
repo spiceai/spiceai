@@ -911,7 +911,7 @@ impl Model for Protocol {
             Action::Buffer(t, k, false) => format!("buffer a delete of t{t}.k{k}"),
             Action::Acknowledge => "commit the buffer and acknowledge the source".into(),
             Action::Compact(mask) => format!("compact warm files (selection {mask:b})"),
-            Action::Promote => "promote every warm file to cold".into(),
+            Action::Promote => "rewrite every cold file in the cold tier".into(),
             Action::Clear => "clear delete vectors every file has applied".into(),
             Action::Checkpoint => "write a checkpoint of the current state".into(),
             Action::Floor => "move the floor to the checkpoint".into(),
@@ -1059,6 +1059,31 @@ impl Model for Protocol {
 #[cfg(test)]
 mod explorer_tests {
     use super::{Data, Op};
+
+    /// `Promote` rewrites the files already in the cold tier (warm ones are
+    /// left alone), and its label says that.
+    #[test]
+    fn promote_rewrites_cold_files_and_says_so() {
+        use super::{Action, Protocol};
+        use stateright::Model;
+        let model = Protocol::new("dataset-lifecycle", 2);
+        let init = model.init_states().remove(0);
+        let warm = |d: &Data| {
+            let mut ids: Vec<usize> = d.files.iter().filter(|f| !f.cold).map(|f| f.id).collect();
+            ids.sort_unstable();
+            ids
+        };
+        let next = model
+            .next_state(&init, Action::Promote)
+            .expect("promote is enabled");
+        assert_eq!(warm(&next.data), warm(&init.data));
+        assert!(init.data.files.iter().any(|f| f.cold));
+        assert_ne!(next.data.files, init.data.files);
+        assert_eq!(
+            model.format_action(&Action::Promote),
+            "rewrite every cold file in the cold tier"
+        );
+    }
 
     /// A prepared operation's object (`1000 + value`) is stored and can go
     /// missing; the drawing must show it like any other missing reference.
