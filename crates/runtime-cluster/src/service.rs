@@ -2345,7 +2345,7 @@ mod tests {
         ));
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let handles = registry
-            .register("exec1".to_string(), "p1", tx)
+            .register("exec1".to_string(), "p1", None, tx)
             .await
             .handles;
         let mut updates = ack_and_forward(rx, handles.pending_acks);

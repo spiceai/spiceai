@@ -39,7 +39,9 @@ use datafusion::common::TableReference;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::StreamExt;
-use runtime_acceleration::dataupdate::{DataUpdatePublisher, MAX_PUBLISHED_REFRESH_APPEND_BYTES};
+use runtime_acceleration::dataupdate::{
+    CommitGuard, DataUpdatePublisher, MAX_PUBLISHED_REFRESH_APPEND_BYTES,
+};
 
 #[derive(Debug, Default)]
 struct Kept {
@@ -119,12 +121,19 @@ impl PublishedAppend {
 /// Send a committed append to the subscribers of `publisher`'s dataset.
 pub(crate) async fn publish_committed_append(
     publisher: &DataUpdatePublisher,
+    commit_guard: CommitGuard,
     dataset_name: &TableReference,
     schema: SchemaRef,
     kept: KeptAppend,
 ) {
     match kept {
-        KeptAppend::Rows(batches) => publisher.publish_append(schema, batches).await,
+        KeptAppend::Rows(batches) => {
+            publisher
+                .publish_append(commit_guard, schema, batches)
+                .await;
+        }
+        // The guard is held until the subscriptions are ended, so no one
+        // subscribes in between and is ended for nothing.
         KeptAppend::Overflowed => {
             if publisher.close_subscribers().await {
                 tracing::warn!(
@@ -198,8 +207,10 @@ mod tests {
         let mut receiver = broadcaster.subscribe(&table).await;
         let publisher = DataUpdatePublisher::new(broadcaster, table.clone());
 
+        let guard = publisher.begin_commit().await;
         publish_committed_append(
             &publisher,
+            guard,
             &table,
             schema(),
             KeptAppend::Rows(vec![batch(vec![7, 8])]),
@@ -221,7 +232,8 @@ mod tests {
         let mut receiver = broadcaster.subscribe(&table).await;
         let publisher = DataUpdatePublisher::new(broadcaster, table.clone());
 
-        publish_committed_append(&publisher, &table, schema(), KeptAppend::Overflowed).await;
+        let guard = publisher.begin_commit().await;
+        publish_committed_append(&publisher, guard, &table, schema(), KeptAppend::Overflowed).await;
 
         assert!(matches!(
             receiver.recv().await,

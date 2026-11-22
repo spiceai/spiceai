@@ -151,7 +151,7 @@ impl AnthropicMessages {
 
     async fn json(&self, path: &str, request: MessagesRequest) -> Result<Value, MessagesError> {
         let response = self.send(path, request).await?;
-        let limit = Limit::CompressionRatioAndSize(self.max_response_bytes);
+        let limit = Limit::Size(self.max_response_bytes);
         let body = http_body_limit::read_bytes(response, limit)
             .await
             .map_err(|e| {
