@@ -1,4 +1,5 @@
 name: unparse-aggregate-scopes
+tags: [long]
 description: >
   Aggregate projection scopes preserve correlated subquery references,
   grouping sets and qualified duplicate grouping-column names. A grouping-set

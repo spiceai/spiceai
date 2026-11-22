@@ -1,4 +1,5 @@
 name: dynamodb-iterator-expiry
+tags: [long]
 description: >
   A DynamoDB Streams changes-mode acceleration keeps every change across a
   shard iterator expiry and a kill: whether the request that re-initializes
