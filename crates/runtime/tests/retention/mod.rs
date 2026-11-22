@@ -43,6 +43,7 @@ fn make_spiceai_dataset(path: &str, name: &str, engine: &str, retention_sql: &st
     ds.acceleration = Some(Acceleration {
         enabled: true,
         engine: Some(engine.to_string()),
+        mode: Mode::Memory,
         retention_sql: Some(retention_sql.to_string()),
         retention_check_enabled: true,
         retention_check_interval: Some("200ms".to_string()),
@@ -222,7 +223,7 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
                 .with_dataset(make_spiceai_dataset(
                     "spiceai/tpch/datasets/tpch.nation",
                     "nation",
-                    "arrow",
+                    "cayenne",
                     // keep only ALGERIA, ARGENTINA and CANADA
                     "DELETE FROM nation WHERE n_nationkey >= 5 OR n_name NOT LIKE '%A'",
                 ))

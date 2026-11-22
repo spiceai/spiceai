@@ -250,6 +250,9 @@ yaml = { path = "../yaml" }
 
 [dev-dependencies]
 anyhow.workspace = true
+# `TestAccelerationSource`, for unit tests that create a Cayenne table, which
+# needs a source.
+runtime-acceleration = { path = "../runtime-acceleration", features = ["test-support"] }
 runtime-drasi = { path = "../runtime-drasi", features = ["test-util"] }
 async-graphql = "7.0.17"
 async-graphql-axum = "7.0.16"
