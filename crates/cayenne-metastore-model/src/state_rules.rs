@@ -409,7 +409,7 @@ impl Model for Protocol {
             Action::UpsertKey(k) => format!("upsert key {k} (tombstone, then a new file)"),
             Action::DeleteKey(k) => format!("delete key {k} (tombstone)"),
             Action::Compact(mask) => format!("compact warm files (selection {mask:b})"),
-            Action::Promote => "promote every warm file to cold".into(),
+            Action::Promote => "rewrite every cold file in the cold tier".into(),
             Action::Clear => "clear tombstones every file has applied".into(),
             Action::Collect => "collect key records below the floor".into(),
             Action::SetKey(k, true) => format!("record key {k} present"),
