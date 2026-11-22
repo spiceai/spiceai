@@ -41,7 +41,7 @@ async fn databricks_spark_connect_integration_test_catalog() -> Result<(), anyho
     test_request_context()
         .scope(async {
             let mut db_catalog =
-                Catalog::new("databricks:spiceai_sandbox".to_string(), "db_uc".to_string());
+                Catalog::new("databricks:spiceai_ci".to_string(), "db_uc".to_string());
             db_catalog.include = vec!["tpch.*".to_string(), "tpcds.*".to_string()];
             db_catalog.params = Some(get_params());
 
@@ -144,7 +144,7 @@ async fn databricks_spark_catalog_schema_discovery_test() -> Result<(), anyhow::
         .scope(async {
             // Only include tpch — tpcds should NOT appear
             let mut db_catalog = Catalog::new(
-                "databricks:spiceai_sandbox".to_string(),
+                "databricks:spiceai_ci".to_string(),
                 "db_uc".to_string(),
             );
             db_catalog.include = vec!["tpch.*".to_string()];
