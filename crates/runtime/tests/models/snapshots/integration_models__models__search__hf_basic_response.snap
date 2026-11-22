@@ -6,35 +6,35 @@ expression: "normalize_search_response(resp, round_scores)"
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.87",
+      "_score": "0.58",
       "data": {
-        "i_color": "smoke",
-        "i_item_id": "AAAAAAAADBAAAAAA"
+        "i_color": "rosy",
+        "i_item_id": "AAAAAAAAABAAAAAA"
       },
       "dataset": "item",
       "matches": {
         "i_item_desc": [
-          "Patient"
+          "Twin, particular aspects will accept only on"
         ]
       },
       "primary_key": {
-        "i_item_sk": 19
+        "i_item_sk": 18
       }
     },
     {
-      "_score": "0.76",
+      "_score": "0.58",
       "data": {
-        "i_color": "spring",
-        "i_item_id": "AAAAAAAAHAAAAAAA"
+        "i_color": "turquoise",
+        "i_item_id": "AAAAAAAAIAAAAAAA"
       },
       "dataset": "item",
       "matches": {
         "i_item_desc": [
-          "New"
+          "F"
         ]
       },
       "primary_key": {
-        "i_item_sk": 7
+        "i_item_sk": 8
       }
     }
   ]
