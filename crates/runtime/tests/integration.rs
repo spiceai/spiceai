@@ -96,6 +96,8 @@ mod ducklake;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 mod endpoint_auth;
+#[cfg(any(feature = "postgres", feature = "adbc"))]
+mod federation_differential;
 mod file;
 mod flight;
 mod gcs;

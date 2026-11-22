@@ -74,7 +74,13 @@ impl std::fmt::Display for ConnectorComponent {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum DataConnectorError {
-    #[snafu(display("Cannot connect to the {connector_component} ({dataconnector}). {source}"))]
+    /// The connector's error can quote the URL it failed to reach, an object store's
+    /// `Error performing GET http://user:password@host/...` among them, so URL credentials
+    /// are removed from it: the message is logged and kept as the component's status.
+    #[snafu(display(
+        "Cannot connect to the {connector_component} ({dataconnector}). {}",
+        redact::redact_message_credentials(&source.to_string())
+    ))]
     UnableToConnectInternal {
         dataconnector: String,
         connector_component: ConnectorComponent,

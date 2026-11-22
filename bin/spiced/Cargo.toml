@@ -73,6 +73,7 @@ opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../../crates/otel-arrow" }
 prometheus.workspace = true
 reqwest.workspace = true
+redact = { path = "../../crates/redact" }
 runtime = { path = "../../crates/runtime" }
 runtime-auth = { path = "../../crates/runtime-auth" }
 runtime-async = { path = "../../crates/runtime-async" }
