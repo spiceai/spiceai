@@ -408,11 +408,14 @@ fn quantizations_of(listing: &[ListedFile], sidecars: bool) -> Vec<Quantization>
     // does, as `Q4_K_M` to the only quantization a cached `Q4_K_M/` folder holds; a name ending
     // in `.gguf`, as a `model.gguf/` folder's, is read as a file's path; and a name a Spicepod's
     // `files` drop, as a `Q4_K_M.bin/` folder's, never reaches resolution: each takes its next
-    // name until none holds, which its first file's path guarantees.
+    // name until none holds, which its first file's path guarantees. So does a name that starts
+    // with whitespace or `./`, which `resolve` would read as another name; its path, which
+    // `resolve` honours as written, does not.
     for (i, (q, names)) in out.iter_mut().zip(&candidates).enumerate() {
         let mut at = 0;
         while at + 1 < names.len()
             && (is_gguf(&q.name)
+                || normalized(&q.name) != q.name
                 || !ModelFile::from_path(Path::new(&q.name)).is_gguf_selector()
                 || claims
                     .iter()
@@ -556,6 +559,12 @@ fn yaml_scalar(text: &str) -> String {
     quoted
 }
 
+/// A `files` entry as `resolve` reads one the listing does not hold as written: without the
+/// whitespace around it or a leading `./`.
+fn normalized(entry: &str) -> &str {
+    entry.trim().trim_start_matches("./")
+}
+
 /// Whether the `files` entry `entry` names `quantization`: the folder that holds it, or, unless
 /// a trailing `/` makes the entry a folder, its name, its tag or its path stem.
 fn answers_to(quantization: &Quantization, entry: &str) -> bool {
@@ -598,7 +607,13 @@ pub fn resolve(
     let mut quantization = None;
     let mut named_quantization = None;
     for &entry in files {
-        let entry = entry.trim().trim_start_matches("./");
+        // An entry the listing holds as written is that file, though it starts with whitespace
+        // or `./`, which the normalization strips from any other.
+        let entry = if present.contains(entry) {
+            entry
+        } else {
+            normalized(entry)
+        };
         if is_gguf(entry) {
             if !present.contains(entry) {
                 return Err(ResolveError::MissingFile {
@@ -1222,6 +1237,49 @@ mod tests {
             .expect("the merged file stands for both layouts")
             .expect("Q4_K_M names weights");
         assert_eq!(resolved.weights, ["Model-Q4_K_M.gguf"]);
+    }
+
+    /// A repository path that starts with whitespace or `./` pins itself, from the Hub's
+    /// listing and from the cache's: the normalization a `files` entry gets would otherwise make
+    /// it name another file, so an entry the listing holds as written is that file, and a name
+    /// the normalization would change does not name a quantization.
+    #[test]
+    fn a_path_that_starts_with_whitespace_or_dot_slash_pins_itself() {
+        for odd in [
+            " gguf/Model-Q4_K_M.gguf",
+            "\u{a0}gguf/Model-Q4_K_M.gguf",
+            "./gguf/Model-Q4_K_M.gguf",
+        ] {
+            let repository = listing(&[(odd, GB), ("gguf/Model-Q4_K_M.gguf", GB)]);
+            let cache = listing(&[(odd, GB)]);
+            for (from, files) in [
+                (ListedFrom::Repository, &repository),
+                (ListedFrom::Cache, &cache),
+            ] {
+                let q = quantizations(files)
+                    .into_iter()
+                    .find(|q| q.files == [odd])
+                    .unwrap_or_else(|| panic!("{odd:?} is a quantization of {from:?}"));
+                let pin = pin_from(files, &q, from);
+                let entries: Vec<&str> = pin.iter().map(String::as_str).collect();
+                let resolved = resolve(files, &entries)
+                    .unwrap_or_else(|e| {
+                        panic!("{odd:?}: {pin:?} from {from:?} does not resolve: {e}")
+                    })
+                    .unwrap_or_else(|| panic!("{odd:?}: {pin:?} from {from:?} names no weights"));
+                assert_eq!(resolved.weights, [odd], "{pin:?} from {from:?}");
+            }
+        }
+        // a folder whose name starts with a space beside one without it
+        let folders = listing(&[(" a/Model-Q4_K_M.gguf", GB), ("a/Model-Q8_0.gguf", GB)]);
+        for q in quantizations(&folders) {
+            let pin = pin(&folders, &q);
+            let entries: Vec<&str> = pin.iter().map(String::as_str).collect();
+            let resolved = resolve(&folders, &entries)
+                .unwrap_or_else(|e| panic!("{pin:?} does not resolve: {e}"))
+                .unwrap_or_else(|| panic!("{pin:?} names no weights"));
+            assert_eq!(resolved.weights, q.files, "{pin:?}");
+        }
     }
 
     #[test]
