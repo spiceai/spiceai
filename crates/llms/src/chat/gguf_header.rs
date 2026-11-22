@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 
 use tokio::io::AsyncReadExt;
 
+use super::gguf_files;
+
 /// The architecture a draft model names; it drafts for a model, so it never decides.
 const DRAFTER: &str = "dflash";
 
@@ -173,27 +175,34 @@ where
     }
 }
 
-/// The files whose headers decide a model's architecture, in the order to read them: the
-/// `-00001-of-` shard a sharded model is opened from, else every file but an `mtp-` draft head.
+/// The files whose headers decide a model's architecture, in the order to read them: of the
+/// files that hold the model's weights by name ([`gguf_files::is_model_weights`]), or of all
+/// when none does, the `-00001-of-` shard a sharded model is opened from, else every file but
+/// an `mtp-` draft head. A projector named ahead of the weights names another architecture.
 fn candidates<P: AsRef<Path>>(weights: &[P]) -> Vec<&P> {
-    let named = |w: &&P, part: &str| {
-        w.as_ref()
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.contains(part))
+    fn name<P: AsRef<Path>>(w: &P) -> Option<&str> {
+        w.as_ref().file_name().and_then(|name| name.to_str())
+    }
+    let model: Vec<&P> = weights
+        .iter()
+        .filter(|w| name(w).is_some_and(gguf_files::is_model_weights))
+        .collect();
+    let weights: Vec<&P> = if model.is_empty() {
+        weights.iter().collect()
+    } else {
+        model
     };
-    let first: Vec<&P> = weights.iter().filter(|w| named(w, "-00001-of-")).collect();
+    let first: Vec<&P> = weights
+        .iter()
+        .copied()
+        .filter(|w| name(w).is_some_and(|name| name.contains("-00001-of-")))
+        .collect();
     if !first.is_empty() {
         return first;
     }
     weights
-        .iter()
-        .filter(|w| {
-            !w.as_ref()
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("mtp-"))
-        })
+        .into_iter()
+        .filter(|w| !name(w).is_some_and(|name| name.starts_with("mtp-")))
         .collect()
 }
 
@@ -323,6 +332,19 @@ mod tests {
         assert_eq!(
             local_architecture(&[dir.path().join("absent-00001-of-00002.gguf")]).await,
             None
+        );
+        // a projector named ahead of the weights, or named as a shard, is passed over; named
+        // alone, it is read
+        let projector = write("mmproj-F16.gguf", "clip");
+        let sharded_projector = write("model-mmproj-00001-of-00001.gguf", "clip");
+        let weights = write("model-Q4_K_M.gguf", "qwen3");
+        assert_eq!(
+            local_architecture(&[projector.clone(), sharded_projector, weights]).await,
+            Some("qwen3".to_string())
+        );
+        assert_eq!(
+            local_architecture(&[projector]).await,
+            Some("clip".to_string())
         );
     }
 }

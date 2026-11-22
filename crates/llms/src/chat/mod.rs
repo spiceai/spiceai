@@ -477,7 +477,7 @@ pub async fn create_hf_model(
     mistral::MistralLlama::from_snapshot(
         &dir,
         model_type,
-        gguf.first().map(String::as_str),
+        gguf_files::model_file(&gguf),
         chat_template_literal,
         ring_config,
         reasoning,

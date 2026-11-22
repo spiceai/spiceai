@@ -256,6 +256,17 @@ pub fn is_model_weights(path: &str) -> bool {
     !is_projector(path) && !is_sidecar(path)
 }
 
+/// The file of `files` that an engine taking one file opens the model from: the first that holds
+/// its weights by name ([`is_model_weights`]), or the first when none does.
+#[must_use]
+pub fn model_file(files: &[String]) -> Option<&str> {
+    files
+        .iter()
+        .find(|f| is_model_weights(f))
+        .or_else(|| files.first())
+        .map(String::as_str)
+}
+
 /// A file that is not the model's weights though it is a GGUF file: an importance matrix, or a
 /// `dflash-`, `eagle3-` or `dspark-` drafter, as llama.cpp's `-hf` tells them apart by name.
 /// Spice matches the names in any case, where llama.cpp matches them as written.
@@ -1288,6 +1299,29 @@ mod tests {
                 "Model-Q4_K_M-00002-of-00002.gguf"
             ]
         );
+    }
+
+    /// An engine that opens one file opens the model's weights, not a projector, importance
+    /// matrix or drafter named ahead of them; named alone, it opens that.
+    #[test]
+    fn the_model_file_is_the_first_of_the_weights() {
+        let files =
+            |names: &[&str]| -> Vec<String> { names.iter().map(ToString::to_string).collect() };
+        assert_eq!(
+            model_file(&files(&[
+                "mmproj-F16.gguf",
+                "Model-imatrix.gguf",
+                "dspark-Model-Q8_0.gguf",
+                "Model-Q4_K_M-00001-of-00002.gguf",
+                "Model-Q4_K_M-00002-of-00002.gguf",
+            ])),
+            Some("Model-Q4_K_M-00001-of-00002.gguf")
+        );
+        assert_eq!(
+            model_file(&files(&["Model-imatrix.gguf"])),
+            Some("Model-imatrix.gguf")
+        );
+        assert_eq!(model_file(&[]), None);
     }
 
     /// A name can answer to several quantizations in a listing of the cache alone and to one in
