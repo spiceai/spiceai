@@ -1023,11 +1023,19 @@ impl Https {
             .and_then(|url| url.host_str().map(redirect_host_key));
         let resolver = RedirectHostResolver::default();
         let redirect_hosts = Arc::clone(&resolver.redirect_hosts);
-        // `http_headers`, an OAuth2 token header named by `auth_header_name`, and enabled header
-        // filters (which send the headers a query names) are credentials reqwest does not remove
-        // when a redirect leaves the dataset's origin.
+        // `http_headers`, an OAuth2 token header that `auth_header_name` names other than
+        // `Authorization`, and enabled header filters (which send the headers a query names) are
+        // credentials reqwest does not remove when a redirect leaves the dataset's origin.
         let sends_custom_header = param_is_set(&self.params, "http_headers")
-            || param_is_set(&self.params, "auth_header_name")
+            || self
+                .params
+                .get("auth_header_name")
+                .expose()
+                .ok()
+                .map(str::trim)
+                .is_some_and(|name| {
+                    !name.is_empty() && !name.eq_ignore_ascii_case("authorization")
+                })
             || self
                 .params
                 .get("request_header_filters")
@@ -5185,6 +5193,10 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         for extra in [
             &[][..],
             &[("auth_token_url", "https://example.com/oauth/token")][..],
+            &[
+                ("auth_token_url", "https://example.com/oauth/token"),
+                ("auth_header_name", "authorization"),
+            ][..],
         ] {
             let (result, target_requests, _) = get_through_a_redirect_off_the_origin(extra).await;
 
