@@ -172,8 +172,9 @@ run before every merge, for what it catches there, so the merge queue skips it
 script untagged unless it is slow; tag it `long` when its CI time is high and
 its failure history low. A PR that edits a `long` script runs it in the merge
 queue too; a PR that only changes its `tags:` line does not. Write the list on
-one line (`tags: [long]`), since CI selects those scripts by that line; a block
-list, a list over several lines, and unknown or duplicate tags are rejected.
+one line with plain names (`tags: [long]`), since CI selects those scripts by
+that line; a block list, a list over several lines, a quoted or escaped name,
+and unknown or duplicate tags are rejected.
 
 ### Sources
 

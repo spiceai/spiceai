@@ -197,7 +197,11 @@ jobs:
         timeout-minutes: 150
         uses: $/.github/actions/build-spiced
         with:
-          features: 'tpc-extension,models,postgres-accel'
+          # The same features as E2E Test CI's Linux build, whose artifact this
+          # stands in for; keep the two lists equal. `http-functions` is for
+          # test/spicescript/secret-redaction.yaml, which registers remote
+          # functions.
+          features: 'tpc-extension,models,postgres-accel,http-functions'
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_linux_x86_64
