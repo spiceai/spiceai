@@ -3141,7 +3141,7 @@ jobs:
         run: |
           DATABRICKS_TOKEN="$(bash .github/scripts/databricks_oidc_token.sh)"
           export DATABRICKS_TOKEN
-          "${{ steps.spicescript.outputs.path }}" --jobs 3 \
+          "${{ steps.spicescript.outputs.path }}" script --jobs 3 \
             --spiced "$(command -v spiced)" \
             --work-dir "$RUNNER_TEMP/spicescript" \
             --results "$RUNNER_TEMP/spicescript-results.json" \
