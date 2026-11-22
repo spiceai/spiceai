@@ -1329,10 +1329,11 @@ async fn similar_to_matches_the_whole_string_with_sql_wildcards() {
     }
 
     // `ESCAPE` is refused rather than answered as if it were not there.
+    let error = answer(&ctx, "SELECT 'a%b' SIMILAR TO 'a!%b' ESCAPE '!'")
+        .await
+        .expect_err("SIMILAR TO ... ESCAPE must fail, not return a wrong answer");
     assert!(
-        answer(&ctx, "SELECT 'a%b' SIMILAR TO 'a!%b' ESCAPE '!'")
-            .await
-            .is_err(),
-        "SIMILAR TO ... ESCAPE must fail, not return a wrong answer"
+        error.contains("SIMILAR TO does not support escape_char"),
+        "{error}"
     );
 }
