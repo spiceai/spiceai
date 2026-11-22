@@ -52,6 +52,8 @@ use chrono::Timelike;
 use futures::StreamExt;
 use runtime_request_context::{Protocol, RequestContext, UserAgent};
 
+pub(crate) mod sql_clients;
+
 /// The one `MeterProvider` for the test process, installed before any instrument
 /// exists: instruments bind to the provider installed when they are first used, so
 /// force this before building a runtime whose metrics a test reads.
