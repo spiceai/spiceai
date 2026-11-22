@@ -64,7 +64,7 @@ pub struct Downloaded {
 pub struct ChosenFromCache {
     /// The quantization's name, as printable ASCII.
     pub quantization: String,
-    /// The `files` entries that load it, `{path: …}` each, comma-separated.
+    /// The `files` entries that load it, as [`gguf_files::files_entries`] prints them.
     pub pinned: String,
     /// Why only the cache was read, as a clause ([`Snapshot::cache_only_reason`]).
     pub reason: String,
@@ -282,14 +282,10 @@ fn resolve_gguf(
     Ok((gguf, chosen_from_cache))
 }
 
-/// The `files` entries that load `quantization` ([`gguf_files::pin`]), `{path: …}` each,
-/// comma-separated, as printable ASCII.
+/// The `files` entries that load `quantization` ([`gguf_files::pin`]), as a load line or an
+/// error prints them ([`gguf_files::files_entries`]).
 fn pinned(listing: &[ListedFile], quantization: &Quantization) -> String {
-    gguf_files::pin(listing, quantization)
-        .iter()
-        .map(|entry| format!("{{path: {}}}", gguf_files::printable(entry)))
-        .collect::<Vec<_>>()
-        .join(", ")
+    gguf_files::files_entries(&gguf_files::pin(listing, quantization))
 }
 
 /// The quantization a model with no `files` loads: its default, the one llama.cpp's `-hf` loads

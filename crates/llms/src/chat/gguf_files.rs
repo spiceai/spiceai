@@ -414,6 +414,61 @@ pub fn pin(listing: &[ListedFile], quantization: &Quantization) -> Vec<String> {
     entries
 }
 
+/// `entries` as a model's `files` in YAML flow style, `{path: …}` each and comma-separated, for
+/// a load line or an error to quote, so that it can be pasted into a Spicepod as it is: each path
+/// written as `yaml_scalar` writes it.
+#[must_use]
+pub fn files_entries(entries: &[String]) -> String {
+    entries
+        .iter()
+        .map(|entry| format!("{{path: {}}}", yaml_scalar(entry)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `text` as a YAML scalar that reads back as `text` within a flow collection, in printable
+/// ASCII, so that the line quoting it stays one line and shows what it holds. It is plain when it
+/// starts with an ASCII letter, holds only ASCII letters, digits, `_`, `-`, `.` and `/`, and is
+/// not a word YAML reads as a boolean or null, as a quantization's name is. Any other text is
+/// double-quoted, with `"` and `\` escaped and every character outside printable ASCII written
+/// as its `\u` or `\U` escape.
+fn yaml_scalar(text: &str) -> String {
+    // the words YAML 1.1 or 1.2 reads as a boolean or null, in any case
+    const NOT_STRINGS: [&str; 9] = ["true", "false", "yes", "no", "on", "off", "y", "n", "null"];
+    let plain = text.starts_with(|c: char| c.is_ascii_alphabetic())
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
+        && !NOT_STRINGS
+            .iter()
+            .any(|word| text.eq_ignore_ascii_case(word));
+    if plain {
+        return text.to_string();
+    }
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    for c in text.chars() {
+        match c {
+            '"' | '\\' => {
+                quoted.push('\\');
+                quoted.push(c);
+            }
+            ' '..='~' => quoted.push(c),
+            _ => {
+                let code = u32::from(c);
+                let escape = if code <= 0xFFFF {
+                    format!("\\u{code:04X}")
+                } else {
+                    format!("\\U{code:08X}")
+                };
+                quoted.push_str(&escape);
+            }
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 /// Resolves a model's `files` against the repository listing. An exact `.gguf` path is
 /// honoured, with the sibling shards of a shard, a draft head's included; any other entry names
 /// a quantization, by its name, the folder that holds only it, or its tag or path stem, which
@@ -1281,6 +1336,95 @@ mod tests {
         );
     }
 
+    /// The model a Spicepod declares with `files: [{files}]`, read as `spiced` reads a Spicepod.
+    fn declared_model(files: &str) -> spicepod::component::model::Model {
+        let text = format!(
+            "version: v1\nkind: Spicepod\nname: app\nmodels:\n  - from: huggingface:huggingface.co/org/Model-GGUF\n    name: model\n    files: [{files}]\n"
+        );
+        let value: yaml::Value =
+            yaml::from_str(&text).unwrap_or_else(|e| panic!("{text} is not YAML: {e}"));
+        let definition = spicepod::parse_definition_value(value)
+            .unwrap_or_else(|e| panic!("{text} is not a Spicepod: {e}"));
+        match definition.models.into_iter().next() {
+            Some(spicepod::component::ComponentOrReference::Component(model)) => model,
+            other => panic!("{text} declares no model: {other:?}"),
+        }
+    }
+
+    /// A `files` entry a load line or an error prints reads back, pasted into a Spicepod, as the
+    /// name it pins, whatever characters the repository gave the name, and prints as one line of
+    /// printable ASCII.
+    #[test]
+    fn a_printed_files_entry_reads_back_as_the_name_it_pins() {
+        let reads_back = |name: &str| {
+            let printed = files_entries(&[name.to_string()]);
+            assert!(
+                printed.chars().all(|c| matches!(c, ' '..='~')),
+                "{name:?} prints as {printed}"
+            );
+            let model = declared_model(&printed);
+            let paths: Vec<&str> = model.files.iter().map(|f| f.path.as_str()).collect();
+            assert_eq!(paths, [name], "{name:?} prints as {printed}");
+        };
+        for (name, printed) in [
+            ("Q4_K_M", "{path: Q4_K_M}"),
+            (
+                "UD-Q4_K_XL/GLM-4.7-Flash-UD-Q4_K_XL-00001-of-00002.gguf",
+                "{path: UD-Q4_K_XL/GLM-4.7-Flash-UD-Q4_K_XL-00001-of-00002.gguf}",
+            ),
+            ("Modèle Q8_0", r#"{path: "Mod\u00E8le Q8_0"}"#),
+            ("😀Q8_0", r#"{path: "\U0001F600Q8_0"}"#),
+            (
+                "Q4_K_M\nINFO forged line",
+                r#"{path: "Q4_K_M\u000AINFO forged line"}"#,
+            ),
+            ("say \"Q8\" \\ here", r#"{path: "say \"Q8\" \\ here"}"#),
+            ("true", r#"{path: "true"}"#),
+            ("4bit", r#"{path: "4bit"}"#),
+            ("", r#"{path: ""}"#),
+        ] {
+            reads_back(name);
+            assert_eq!(files_entries(&[name.to_string()]), printed, "{name:?}");
+        }
+        for name in [
+            "Q4_K_M\u{1b}[31m",
+            "\u{202e}M_K_4Q",
+            "Q4_K_M\u{2028}INFO forged line",
+            "Q8_0\t",
+            "Q8_0\u{7f}",
+            " Q8_0 ",
+            "True",
+            "NULL",
+            "No",
+            "on",
+            "y",
+            "1.0",
+            "0x10",
+            "1e5",
+            "-Q8_0",
+            ".inf",
+            "~",
+            "Q8_0: x",
+            "Q8 #x",
+            "Q8,Q4",
+            "[Q8]",
+            "{Q8}",
+            "*Q8",
+            "&Q8",
+            "!Q8",
+            "%Q8",
+            "@Q8",
+            "`Q8",
+            "|Q8",
+            ">Q8",
+            "'Q8'",
+            "?Q8",
+            "Q8\\",
+        ] {
+            reads_back(name);
+        }
+    }
+
     /// The `files` a load log advertises load exactly what choosing that quantization with no
     /// `files` loads, its draft head included, whatever its name is, and load it again from a
     /// cache holding those files and any part of the rest of the repository, which is what the
@@ -1314,15 +1458,9 @@ mod tests {
                 pinned_a_head |= !head.is_empty();
                 pinned_a_sharded_head |= head.len() > 1;
                 let pin = pin(&files, q);
-                // the pin as a Spicepod's `files` carries it to resolution
-                let mut model = spicepod::component::model::Model::new(
-                    "huggingface:huggingface.co/org/Model-GGUF",
-                    "model",
-                );
-                model.files = pin
-                    .iter()
-                    .map(|p| ModelFile::from_path(Path::new(p)))
-                    .collect();
+                // the pin as a load line prints it, pasted into a Spicepod, carries it to
+                // resolution
+                let model = declared_model(&files_entries(&pin));
                 assert_eq!(
                     model.gguf_selectors(),
                     pin,
