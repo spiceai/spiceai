@@ -470,11 +470,16 @@ impl Model for Protocol {
                 }
                 Action::Renew(i) => Event::on(i, "renew").to(lease),
                 Action::Takeover(i) => {
-                    let ok = after.head.generation > before.head.generation;
+                    // A takeover succeeds when the instance becomes the ingester; with
+                    // fencing by the lease object alone the head generation stays put.
+                    let ok = after.instances[i].generation != 0;
                     Event::on(
                         i,
                         if ok {
-                            format!("takeover: generation {}", after.head.generation)
+                            format!(
+                                "takeover: ingester at generation {}",
+                                after.instances[i].generation
+                            )
                         } else {
                             "takeover rejected".into()
                         },
@@ -645,5 +650,59 @@ impl Model for Protocol {
             ));
         }
         p
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::{Action, Protocol, State};
+    use stateright::{Model, Path};
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    /// With fencing by the lease object alone, a takeover succeeds without
+    /// raising the head's generation; the timeline must still call it a
+    /// takeover.
+    #[test]
+    fn lease_only_takeover_is_drawn_as_a_takeover() {
+        let model = Protocol::new("standby-no-generation");
+        let init = model.init_states().remove(0);
+        let mut parent: HashMap<State, (State, Action)> = HashMap::new();
+        let mut seen = HashSet::from([init.clone()]);
+        let mut queue = VecDeque::from([init.clone()]);
+        let mut found = None;
+        'search: while let Some(state) = queue.pop_front() {
+            let mut candidates = vec![];
+            model.actions(&state, &mut candidates);
+            for action in candidates {
+                let Some(next) = model.next_state(&state, action.clone()) else {
+                    continue;
+                };
+                if let Action::Takeover(i) = action
+                    && next.instances[i].generation != 0
+                {
+                    let mut actions = vec![action];
+                    let mut at = state;
+                    while let Some((before, a)) = parent.get(&at) {
+                        actions.push(a.clone());
+                        at = before.clone();
+                    }
+                    actions.reverse();
+                    found = Some(actions);
+                    break 'search;
+                }
+                if seen.insert(next.clone()) {
+                    parent.insert(next.clone(), (state.clone(), action));
+                    queue.push_back(next);
+                }
+            }
+        }
+        let actions = found.expect("a successful takeover");
+        let path = Path::from_actions(&model, init, &actions).expect("the path replays");
+        let svg = model.as_svg(path).expect("standby draws");
+        assert!(!svg.contains("takeover rejected"), "{actions:?}");
+        assert!(
+            svg.contains("takeover: ingester at generation"),
+            "{actions:?}"
+        );
     }
 }

@@ -794,10 +794,18 @@ impl Model for Protocol {
         }
         if s.query {
             view.snapshots.push((
-                format!(
-                    "running query (commits {}..{})",
-                    s.query_base, s.query_target
-                ),
+                if s.query_base > 0 {
+                    // `decode` starts from the checkpoint root of exactly that length.
+                    format!(
+                        "running query (commits {}..{}; reads checkpoint root [0, {}))",
+                        s.query_base, s.query_target, s.query_base
+                    )
+                } else {
+                    format!(
+                        "running query (commits {}..{})",
+                        s.query_base, s.query_target
+                    )
+                },
                 (0..s.batches.len())
                     .filter(|b| b * k < s.query_target.min(first) && (b + 1) * k > s.query_base)
                     .map(|b| (b * k, (b + 1) * k))
@@ -1011,6 +1019,21 @@ mod explorer_tests {
             }
         }
         None
+    }
+
+    /// A query from a checkpoint base decodes from that root, so its needs
+    /// name the root.
+    #[test]
+    fn query_from_a_checkpoint_names_the_root() {
+        let model = Protocol::new("storage", 2);
+        let path = crate::explorer::path_to(&model, |s| s.query && s.query_base > 0)
+            .expect("a query from a checkpoint base");
+        let base = path.last_state().query_base;
+        let svg = model.as_svg(path).expect("commits draws");
+        assert!(
+            svg.contains(&format!("reads checkpoint root [0, {base})")),
+            "{svg}"
+        );
     }
 
     #[test]

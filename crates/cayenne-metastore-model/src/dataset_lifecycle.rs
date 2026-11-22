@@ -212,7 +212,7 @@ impl Data {
                 .collect();
             let missing: Vec<String> = refs
                 .iter()
-                .filter(|id| **id < 1000 && !present.contains(id))
+                .filter(|id| !present.contains(id))
                 .map(|id| format!("#{id}"))
                 .collect();
             let ox = placed.iter().map(|(_, n)| n.right()).max().unwrap_or(col) + 40;
@@ -1053,5 +1053,34 @@ impl Model for Protocol {
                 s.log.iter().any(|r| r.deletes.len() == 2)
             }),
         ]
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::{Data, Op};
+
+    /// A prepared operation's object (`1000 + value`) is stored and can go
+    /// missing; the drawing must show it like any other missing reference.
+    #[test]
+    fn missing_prepared_object_is_drawn_missing() {
+        let data = Data {
+            high: [0, 0],
+            files: vec![],
+            deletes: vec![],
+            page: None,
+            prepared: vec![Op {
+                table: 0,
+                key: 0,
+                value: Some(5),
+                delete: 1,
+                insert: 2,
+            }],
+        };
+        let mut svg = crate::explorer::Svg::new();
+        data.draw(&mut svg, 0, 0, "T", &[], Some(&[]));
+        let svg = svg.finish();
+        assert!(svg.contains("IN HEAD, NOT STORED"), "{svg}");
+        assert!(svg.contains(">#1005<"), "{svg}");
     }
 }
