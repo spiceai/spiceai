@@ -758,8 +758,11 @@ impl Model for Protocol {
             floor: s.floor,
             first,
             window: labels(&s.window),
+            // Reads take records [floor, first) from batches, so every batch
+            // overlapping that range is referenced, including one the inline
+            // window starts inside.
             index: (0..s.batches.len())
-                .filter(|b| b * k >= s.floor && (b + 1) * k <= first)
+                .filter(|b| b * k < first && (b + 1) * k > s.floor)
                 .map(|b| (b * k, (b + 1) * k))
                 .collect(),
             batches: (0..s.batches.len())
@@ -796,7 +799,7 @@ impl Model for Protocol {
                     s.query_base, s.query_target
                 ),
                 (0..s.batches.len())
-                    .filter(|b| b * k >= s.query_base && (b + 1) * k <= s.query_target.min(first))
+                    .filter(|b| b * k < s.query_target.min(first) && (b + 1) * k > s.query_base)
                     .map(|b| (b * k, (b + 1) * k))
                     .collect(),
             ));
@@ -965,5 +968,60 @@ impl Model for Protocol {
             ]);
         }
         p
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::{Protocol, State};
+    use stateright::{Model, Path};
+    use std::collections::{HashMap, VecDeque};
+
+    /// The first state, breadth first, whose inline window starts inside a
+    /// created batch: reads still take that batch's lower records from it.
+    fn straddling(model: &Protocol) -> Option<(State, Vec<super::Action>)> {
+        let init = model.init_states().remove(0);
+        let mut parent: HashMap<State, (State, super::Action)> = HashMap::new();
+        let mut queue = VecDeque::from([init.clone()]);
+        let mut seen = std::collections::HashSet::from([init.clone()]);
+        while let Some(state) = queue.pop_front() {
+            let first = state.pos - state.window.len();
+            if first % model.k != 0
+                && first > state.floor
+                && !state.batches[first / model.k].is_empty()
+            {
+                let mut actions = vec![];
+                let mut at = state;
+                while let Some((before, action)) = parent.get(&at) {
+                    actions.push(action.clone());
+                    at = before.clone();
+                }
+                actions.reverse();
+                return Some((init, actions));
+            }
+            let mut candidates = vec![];
+            model.actions(&state, &mut candidates);
+            for action in candidates {
+                if let Some(next) = model.next_state(&state, action.clone())
+                    && seen.insert(next.clone())
+                {
+                    parent.insert(next.clone(), (state.clone(), action));
+                    queue.push_back(next);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn batch_under_a_straddling_window_is_indexed() {
+        let model = Protocol::new("storage", 2);
+        let (init, actions) = straddling(&model).expect("a window that starts inside a batch");
+        let path = Path::from_actions(&model, init, &actions).expect("the path replays");
+        let state = path.last_state().clone();
+        let start = (state.pos - state.window.len()) / model.k * model.k;
+        let svg = model.as_svg(path).expect("commits draws");
+        let entry = format!("index [{start}, {})", start + model.k);
+        assert!(svg.contains(&entry), "{actions:?}: {entry} missing");
     }
 }
