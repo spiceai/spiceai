@@ -13,6 +13,8 @@ arrow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
+# The compression ratio check and memory accounting every remote read shares.
+http-body-limit = { path = "../http-body-limit" }
 serde_json = { workspace = true, features = ["raw_value"] }
 datafusion.workspace = true
 datafusion-datasource.workspace = true

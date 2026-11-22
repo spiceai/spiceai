@@ -68,7 +68,10 @@ use crate::{
     datafusion::{
         SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA,
         request_context_extension::get_current_datafusion,
-        udf::{UserFunctionInfo, effective_user_function_volatility, user_function_infos},
+        udf::{
+            UserFunctionInfo, effective_user_function_volatility, user_function_display_from,
+            user_function_infos,
+        },
     },
     tools::{SpiceModelTool, utils::tool_call_error_response},
 };
@@ -2087,7 +2090,7 @@ pub(crate) fn user_function_context_entries(
                 syntax: Some(user_function_syntax(declaration)),
                 kind: declaration.kind.as_str().to_string(),
                 volatility: effective_user_function_volatility(declaration).to_string(),
-                from: declaration.from.clone(),
+                from: user_function_display_from(declaration),
                 description: declaration.description.clone().or(function.description),
             })
         })
