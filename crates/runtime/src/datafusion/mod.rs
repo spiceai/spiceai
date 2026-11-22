@@ -840,7 +840,7 @@ fn validate_distributed_engine(
 
 /// Converts a runtime `Engine` to a snapshot `AccelerationEngine`.
 ///
-/// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow, `PostgreSQL`).
+/// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow).
 pub(crate) fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
     match engine {
         #[cfg(feature = "sqlite")]
@@ -4442,7 +4442,7 @@ impl DataFusion {
         accelerated_table_builder.data_update_publisher(Some(
             crate::dataupdate::DataUpdatePublisher::new(
                 self.data_update_broadcaster.clone(),
-                qualify_dataset_reference(self.normalize_table_reference(dataset.name.clone())),
+                qualify_dataset_reference(dataset.name.clone()),
             ),
         ));
         accelerated_table_builder.cdc_param_overrides(
@@ -9313,27 +9313,12 @@ mod tests {
         }
 
         #[test]
-        fn postgresql_rejected_in_distributed_mode() {
-            let config = make_cluster_config(Role::Scheduler);
-            let result = validate_distributed_engine(&config, Engine::PostgreSQL, "my_dataset");
-            assert!(
-                matches!(
-                    result,
-                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
-                ),
-                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
-            );
-        }
-
-        #[test]
         fn any_engine_allowed_in_non_distributed_mode() {
             let config = make_non_distributed_config();
             validate_distributed_engine(&config, Engine::Sqlite, "ds")
                 .expect("duckdb should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Sqlite, "ds")
                 .expect("sqlite should be allowed when not in distributed mode");
-            validate_distributed_engine(&config, Engine::PostgreSQL, "ds")
-                .expect("postgresql should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Arrow, "ds")
                 .expect("arrow should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Cayenne, "ds")
@@ -9840,10 +9825,12 @@ mod tests {
 }
 
 /// The fully qualified name a dataset registers under, which is the name its
-/// `DoExchange` subscribers are keyed by. A dataset's accelerated table is
-/// built before the dataset registers, so normalizing its name then can still
-/// leave it bare. A bare or partial name registers in the default catalog and
-/// schema, the same defaults `get_table_provider` resolves with.
+/// `DoExchange` subscribers are keyed by. The name is qualified directly, not
+/// resolved against the catalog: a dataset's accelerated table is built before
+/// the dataset registers, so resolving a bare name then can leave it bare or
+/// bind it to a same-named table in another schema. A bare or partial name
+/// registers in the default catalog and schema, the same defaults
+/// `get_table_provider` resolves with.
 fn qualify_dataset_reference(table_reference: TableReference) -> TableReference {
     match table_reference {
         TableReference::Full { .. } => table_reference,

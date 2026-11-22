@@ -1936,6 +1936,15 @@ impl fmt::Display for Expr {
                         | UnaryOperator::QuestionPipe
                 ) {
                     write!(f, "{op} {expr}")
+                } else if op == &UnaryOperator::Minus {
+                    // `--` starts a comment, so a minus sign before an operand that starts with a
+                    // minus sign is followed by a space.
+                    let operand = expr.to_string();
+                    if operand.starts_with('-') {
+                        write!(f, "{op} {operand}")
+                    } else {
+                        write!(f, "{op}{operand}")
+                    }
                 } else {
                     write!(f, "{op}{expr}")
                 }

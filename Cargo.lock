@@ -82,30 +82,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "accelerator-postgres"
-version = "2.5.0-unstable"
-dependencies = [
- "async-trait",
- "data-accelerator-api",
- "data_components",
- "datafusion",
- "datafusion-table-providers",
- "linkme",
- "paste",
- "runtime-acceleration",
- "runtime-checkpoint-api",
- "runtime-checkpoint-postgres",
- "runtime-datafusion",
- "runtime-parameters",
- "runtime-secrets",
- "runtime-table-partition",
- "secrecy",
- "snafu",
- "tokio",
- "util",
-]
-
-[[package]]
 name = "accelerator-sqlite"
 version = "2.5.0-unstable"
 dependencies = [
@@ -4699,6 +4675,7 @@ dependencies = [
  "async-trait",
  "aws-kms-signer",
  "azure-key-vault-signer",
+ "bytes",
  "chrono",
  "connector-graphql",
  "data-connector-api",
@@ -4710,6 +4687,7 @@ dependencies = [
  "governor",
  "graphql-parser",
  "http 1.4.1",
+ "http-body-limit",
  "linkme",
  "reqwest 0.13.4",
  "runtime",
@@ -4755,6 +4733,7 @@ dependencies = [
  "futures",
  "graphql-parser",
  "http 1.4.1",
+ "http-body-limit",
  "linkme",
  "paste",
  "regex",
@@ -6466,6 +6445,7 @@ dependencies = [
  "datafusion-physical-expr",
  "flate2",
  "futures",
+ "http-body-limit",
  "object_store 0.13.2",
  "serde_json",
  "snafu",
@@ -10148,9 +10128,13 @@ dependencies = [
  "async-compression",
  "brotli",
  "bytes",
+ "datafusion-common",
+ "datafusion-execution",
+ "encoding_rs",
  "flate2",
  "futures",
  "http 1.4.1",
+ "mime",
  "reqwest 0.13.4",
  "snafu",
  "tokio",
@@ -11836,8 +11820,8 @@ dependencies = [
 
 [[package]]
 name = "llama-cpp-src"
-version = "1.0.0"
-source = "git+https://github.com/spiceai/llama.cpp?rev=15068ee560c2ac97b0212b14f163664907cf16cd#15068ee560c2ac97b0212b14f163664907cf16cd"
+version = "1.0.12600"
+source = "git+https://github.com/spiceai/llama.cpp?rev=71e6732c2181497d90e46ca84dff61251477f7d8#71e6732c2181497d90e46ca84dff61251477f7d8"
 
 [[package]]
 name = "llguidance"
@@ -11945,6 +11929,7 @@ dependencies = [
  "rand 0.10.1",
  "runtime-request-context",
  "runtime-resources",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -14059,6 +14044,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "futures",
  "http-body 1.0.1",
  "humantime",
  "object_store 0.13.2",
@@ -17567,7 +17553,6 @@ name = "runtime"
 version = "2.5.0-unstable"
 dependencies = [
  "accelerator-cayenne",
- "accelerator-postgres",
  "accelerator-sqlite",
  "adbc_core",
  "adbc_driver_manager",
@@ -17750,7 +17735,6 @@ dependencies = [
  "runtime-async",
  "runtime-auth",
  "runtime-checkpoint-api",
- "runtime-checkpoint-postgres",
  "runtime-checkpoint-sqlite",
  "runtime-cluster",
  "runtime-component",
@@ -17940,19 +17924,6 @@ dependencies = [
  "snafu",
  "tracing",
  "util",
-]
-
-[[package]]
-name = "runtime-checkpoint-postgres"
-version = "2.5.0-unstable"
-dependencies = [
- "arrow",
- "async-trait",
- "datafusion-table-providers",
- "runtime-acceleration",
- "runtime-checkpoint-api",
- "serde_json",
- "tokio-postgres",
 ]
 
 [[package]]
@@ -18641,6 +18612,7 @@ dependencies = [
  "datafusion-table-providers",
  "fundu",
  "futures",
+ "http-body-limit",
  "humantime",
  "insta",
  "object_store 0.13.2",
@@ -20477,7 +20449,6 @@ name = "spiced"
 version = "2.5.0-unstable"
 dependencies = [
  "accelerator-cayenne",
- "accelerator-postgres",
  "accelerator-sqlite",
  "ansi_colors",
  "app",
@@ -20624,7 +20595,6 @@ name = "spicepodschema"
 version = "2.5.0-unstable"
 dependencies = [
  "accelerator-cayenne",
- "accelerator-postgres",
  "accelerator-sqlite",
  "connector-abfs",
  "connector-clickhouse",
@@ -20692,6 +20662,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "flate2",
  "flight_client",
  "futures",
  "hex",
@@ -20713,6 +20684,7 @@ dependencies = [
  "tokio",
  "tonic",
  "yaml",
+ "zstd 0.13.5",
 ]
 
 [[package]]

@@ -1,4 +1,5 @@
 name: cluster-scheduler-failover-empty
+tags: [long]
 description: >
   A cluster scheduler killed and started again after its registration has
   expired takes back the executor that kept running: the executor's

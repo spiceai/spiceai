@@ -1,4 +1,5 @@
 name: mysql-literals
+tags: [long]
 description: >
   Every column of a MySQL table of edge values compared with each edge value
   of its type, in each comparison form (=, <, >=, <>, IN, BETWEEN), answers
