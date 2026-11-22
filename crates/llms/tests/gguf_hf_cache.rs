@@ -298,6 +298,46 @@ async fn a_drafter_told_by_its_header_can_be_named_beside_the_weights() {
     assert!(!error.is_configuration_error());
 }
 
+/// A file named beside the weights whose name says it is no weights, as a `dspark-` drafter's, is
+/// told by its header: a `dflash` one drafts, in place of the MTP head the quantization would
+/// bring, and one whose header names a model's architecture leaves the head to draft.
+#[tokio::test]
+async fn a_drafter_named_beside_the_weights_is_told_by_its_header() {
+    crate::require_process_per_test(WHY);
+    let cache = tempfile::tempdir().expect("creates a cache directory");
+    let snapshot = offline_snapshot(cache.path());
+    write_gguf(&snapshot, "Model-Q4_K_M.gguf", "qwen3");
+    write_gguf(&snapshot, "mtp-Model-Q8_0.gguf", "qwen3");
+    write_gguf(&snapshot, "dspark-Model-Q8_0.gguf", "dflash");
+    write_gguf(&snapshot, "dspark-Other-Q8_0.gguf", "qwen3");
+
+    for (files, gguf) in [
+        (
+            &["Q4_K_M", "dspark-Model-Q8_0.gguf"][..],
+            &["Model-Q4_K_M.gguf", "dspark-Model-Q8_0.gguf"][..],
+        ),
+        (
+            &["Q4_K_M", "dspark-Other-Q8_0.gguf"],
+            &[
+                "Model-Q4_K_M.gguf",
+                "dspark-Other-Q8_0.gguf",
+                "mtp-Model-Q8_0.gguf",
+            ],
+        ),
+    ] {
+        let downloaded = download_model(
+            REPO_ID,
+            files,
+            Budget::Unmeasured,
+            HubParams::default(),
+            "test",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{files:?} must load: {e}"));
+        assert_eq!(downloaded.gguf, gguf, "{files:?}");
+    }
+}
+
 /// A name several quantizations in the cache answer to says so of the cache, and to name one of
 /// them, and is retried: the Hub's listing, once read, can make the name answer to one
 /// (`gguf_files::tests::a_name_can_be_ambiguous_in_the_cache_alone`).

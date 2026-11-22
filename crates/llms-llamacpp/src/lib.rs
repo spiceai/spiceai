@@ -2757,7 +2757,10 @@ fn model_and_draft(weights: &[PathBuf]) -> (Option<PathBuf>, Option<PathBuf>) {
 fn first_shard(weights: &[PathBuf]) -> Option<PathBuf> {
     weights
         .iter()
-        .find(|w| w.to_string_lossy().contains("-00001-of-"))
+        .find(|w| {
+            w.file_name()
+                .is_some_and(|name| name.to_string_lossy().contains("-00001-of-"))
+        })
         .or_else(|| weights.first())
         .cloned()
 }
@@ -3469,6 +3472,20 @@ mod tests {
         assert_eq!(
             model_and_draft(&paths(&["Model-imatrix.gguf"])),
             (Some(PathBuf::from("Model-imatrix.gguf")), None)
+        );
+    }
+
+    /// A shard is told by its file's name, not by the folders above it, as the load line tells
+    /// it: a cache directory named like a shard does not make every file in it one.
+    #[test]
+    fn a_shard_is_told_by_its_file_name() {
+        let root = Path::new("/data/hf-00001-of-02/hub");
+        assert_eq!(
+            first_shard(&[
+                root.join("mtp-Model-Q8_0.gguf"),
+                root.join("dflash-Model-Q8_0-00001-of-00002.gguf"),
+            ]),
+            Some(root.join("dflash-Model-Q8_0-00001-of-00002.gguf"))
         );
     }
 

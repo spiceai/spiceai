@@ -261,16 +261,6 @@ pub fn is_model_weights(path: &str) -> bool {
     !is_projector(path) && !is_sidecar(path)
 }
 
-/// Whether the GGUF file at `path` is a `DFlash` or `DSpark` drafter by its name, one holding
-/// `dflash-` or `dspark-`: the drafters llama.cpp's engine drafts with beside the model.
-#[must_use]
-pub fn is_drafter_by_name(path: &str) -> bool {
-    let name = file_name(path).to_ascii_lowercase();
-    ["dflash-", "dspark-"]
-        .iter()
-        .any(|keyword| name.contains(keyword))
-}
-
 /// The file of a model's draft files the engine drafts with: the first `-00001-of-` shard, else
 /// the first, as it opens a sharded drafter from its first shard.
 #[must_use]
@@ -794,14 +784,14 @@ pub fn resolve_with_drafters(
         let (weights, opening) = sets.into_values().unzip();
         return Err(ResolveError::SeveralWeights { weights, opening });
     }
-    // A drafter the headers or its name tell drafts beside the weights, as the engine drafts with
-    // it, in place of the MTP head a named quantization would bring. Named alone, it is loaded
-    // as named.
+    // A drafter the headers tell drafts beside the weights, as the engine drafts with it, in
+    // place of the MTP head a named quantization would bring. With no weights named beside it, as
+    // a drafter named alone, what is named is loaded as named.
     let (mut weights, mut drafted): (Vec<String>, Vec<String>) = weights
         .into_iter()
-        .partition(|w| !drafters.contains(&opening(w)) && !is_drafter_by_name(w));
-    if weights.is_empty() {
-        weights = std::mem::take(&mut drafted);
+        .partition(|w| !drafters.contains(&opening(w)));
+    if !weights.iter().any(|w| is_model_weights(w)) {
+        weights.append(&mut drafted);
     }
     draft.extend(drafted);
     if weights.is_empty() && draft.is_empty() {
@@ -1378,8 +1368,9 @@ mod tests {
                 vec![
                     "llava-v1.5-7b-Q4_K_M.gguf".to_string(),
                     "llava-v1.5-7b-mmproj-model-f16.gguf".to_string(),
+                    "dspark-llava-v1.5-7b-Q8_0.gguf".to_string(),
                 ],
-                vec!["dspark-llava-v1.5-7b-Q8_0.gguf".to_string()],
+                Vec::<String>::new(),
                 Some("Q4_K_M".to_string())
             )
         );
@@ -1414,9 +1405,9 @@ mod tests {
         );
     }
 
-    /// A drafter told by its name and named beside the weights drafts, in place of the MTP head
-    /// the quantization would bring, as the engine drafts with it; named alone, it is loaded as
-    /// named.
+    /// A drafter its header tells, named beside the weights, drafts in place of the MTP head the
+    /// quantization would bring, as the engine drafts with it; named alone, it is loaded as named.
+    /// Its name alone does not make it one: the engine tells it by its header.
     #[test]
     fn a_drafter_named_beside_the_weights_drafts_in_place_of_the_head() {
         let repo = listing(&[
@@ -1424,7 +1415,21 @@ mod tests {
             ("dspark-Model-Q8_0.gguf", GB / 5),
             ("mtp-Model-Q8_0.gguf", GB / 10),
         ]);
-        let beside = resolve(&repo, &["Q4_K_M", "dspark-Model-Q8_0.gguf"])
+        let by_name = resolve(&repo, &["Q4_K_M", "dspark-Model-Q8_0.gguf"])
+            .expect("Q4_K_M resolves")
+            .expect("Q4_K_M names weights");
+        assert_eq!(
+            (by_name.weights, by_name.draft),
+            (
+                vec![
+                    "Model-Q4_K_M.gguf".to_string(),
+                    "dspark-Model-Q8_0.gguf".to_string()
+                ],
+                vec!["mtp-Model-Q8_0.gguf".to_string()]
+            )
+        );
+        let drafters = BTreeSet::from(["dspark-Model-Q8_0.gguf".to_string()]);
+        let beside = resolve_with_drafters(&repo, &["Q4_K_M", "dspark-Model-Q8_0.gguf"], &drafters)
             .expect("Q4_K_M resolves beside its drafter")
             .expect("Q4_K_M names weights");
         assert_eq!(
@@ -1435,7 +1440,7 @@ mod tests {
                 Some("Q4_K_M".to_string())
             )
         );
-        let alone = resolve(&repo, &["dspark-Model-Q8_0.gguf"])
+        let alone = resolve_with_drafters(&repo, &["dspark-Model-Q8_0.gguf"], &drafters)
             .expect("the drafter's path resolves")
             .expect("the path names a file");
         assert_eq!(

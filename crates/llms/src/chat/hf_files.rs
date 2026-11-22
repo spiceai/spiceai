@@ -235,23 +235,45 @@ async fn resolve_gguf(
     } else {
         ListedFrom::Repository
     };
-    let resolved = match gguf_files::resolve(&listing, files) {
-        // The engine tells a `DFlash` drafter by its header, so one can be named beside the
-        // weights under a name that does not say it is one: read the headers of the sets of
-        // weights before refusing them.
-        Err(gguf_files::ResolveError::SeveralWeights { opening, .. }) => {
-            let mut drafters = BTreeSet::new();
-            for file in opening {
-                if super::gguf_header::names_a_drafter(|len| snapshot.read_prefix(&file, len))
-                    .await?
-                {
-                    drafters.insert(file);
-                }
+    // The engine tells a `DFlash` drafter by its header, so one can be named beside the weights
+    // under any name: read the headers of the sets of weights before refusing them, and of the
+    // files named beside the weights that are no weights by name, and take a `dflash` one for
+    // the drafter.
+    let mut drafters = BTreeSet::new();
+    let mut resolved = gguf_files::resolve(&listing, files);
+    if let Err(gguf_files::ResolveError::SeveralWeights { opening, .. }) = &resolved {
+        for file in opening.clone() {
+            if names_a_drafter(snapshot, &file).await? {
+                drafters.insert(file);
             }
-            gguf_files::resolve_with_drafters(&listing, files, &drafters)
         }
-        resolved => resolved,
+        resolved = gguf_files::resolve_with_drafters(&listing, files, &drafters);
+    }
+    let beside: Vec<String> = match &resolved {
+        Ok(Some(named))
+            if named
+                .weights
+                .iter()
+                .any(|w| gguf_files::is_model_weights(w)) =>
+        {
+            named
+                .weights
+                .iter()
+                .filter(|w| !gguf_files::is_model_weights(w) && gguf_files::opens_a_set(w))
+                .cloned()
+                .collect()
+        }
+        _ => Vec::new(),
     };
+    let mut told = false;
+    for file in beside {
+        if names_a_drafter(snapshot, &file).await? {
+            told |= drafters.insert(file);
+        }
+    }
+    if told {
+        resolved = gguf_files::resolve_with_drafters(&listing, files, &drafters);
+    }
     if let Some(resolved) =
         resolved.map_err(|error| DownloadError::unusable(snapshot, error.clause(from)))?
     {
@@ -303,6 +325,12 @@ async fn resolve_gguf(
         offline: snapshot.is_offline(),
     });
     Ok((gguf, chosen_from_cache))
+}
+
+/// Whether the file at `path` in the snapshot is a `DFlash` drafter by its header, as the engine
+/// tells one.
+async fn names_a_drafter(snapshot: &Snapshot, path: &str) -> Result<bool, DownloadError> {
+    super::gguf_header::names_a_drafter(|len| snapshot.read_prefix(path, len)).await
 }
 
 /// The `files` entries that load `quantization` from a listing `from` holds
