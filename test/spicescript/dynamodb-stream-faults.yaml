@@ -1,4 +1,5 @@
 name: dynamodb-stream-faults
+tags: [long]
 description: >
   A DynamoDB Streams changes-mode acceleration survives faults in the stream
   itself: requests to open its shards that fail for a while (it becomes ready
