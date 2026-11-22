@@ -464,7 +464,8 @@ mod tests {
     }
 
     /// A shutdown lets a request that is already being handled finish: the client gets its
-    /// response, and then the connection closes and its task drops its shutdown receiver.
+    /// response, marked `connection: close`, and then the server closes the connection and its
+    /// task drops its shutdown receiver.
     #[tokio::test]
     async fn test_process_tcp_stream_graceful_shutdown_finishes_the_request_in_flight() {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -490,14 +491,16 @@ mod tests {
             let (stream, _) = listener.accept().await.expect("to accept connection");
             process_tcp_stream(stream, router, shutdown_rx);
         });
+        // The test holds a client of the same pool until the end, so only the server can close
+        // the connection.
         let client = build_test_http_client();
-        let request = tokio::spawn(async move {
-            client
-                .get(format!("http://{addr}/"))
-                .send()
-                .await?
-                .text()
-                .await
+        let request = tokio::spawn({
+            let client = client.clone();
+            async move {
+                let response = client.get(format!("http://{addr}/")).send().await?;
+                let connection = response.headers().get(http::header::CONNECTION).cloned();
+                Ok::<_, reqwest::Error>((connection, response.text().await?))
+            }
         });
         timeout(Duration::from_secs(5), arrived.notified())
             .await
@@ -513,15 +516,23 @@ mod tests {
         );
 
         release.notify_one();
-        let body = timeout(Duration::from_secs(5), request)
+        let (connection, body) = timeout(Duration::from_secs(5), request)
             .await
             .expect("the request should finish once its handler does")
             .expect("the request task should not panic")
             .expect("the request in flight should get its response");
         assert_eq!(body, "finished");
+        // hyper marks the response `connection: close` only when the shutdown reached the
+        // connection while its request was in flight.
+        assert_eq!(
+            connection.as_ref().map(http::HeaderValue::as_bytes),
+            Some(&b"close"[..]),
+            "the shutdown should end keep-alive on the connection whose request was in flight"
+        );
         timeout(Duration::from_secs(5), shutdown_notify.closed())
             .await
-            .expect("the connection should close after its request in flight");
+            .expect("the server should close the connection after its request in flight");
+        drop(client);
     }
 
     /// A small `/v1/sql` result leaves the server as several short writes (the
