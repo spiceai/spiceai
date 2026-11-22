@@ -5,14 +5,14 @@ description: "Query: tpcds_q5"
 +-----------------+------------------------------+-----------+---------+-----------+
 | channel         | id                           | sales     | returns | profit    |
 +-----------------+------------------------------+-----------+---------+-----------+
-| catalog channel | catalog_pageAAAAAAAAAAHBAAAA | 0.00      | 2573.86 | -2314.21  |
-| catalog channel | catalog_pageAAAAAAAAAAIBAAAA | 79271.26  | 0.00    | -15373.96 |
-| catalog channel | catalog_pageAAAAAAAAAAKBAAAA | 84480.65  | 0.00    | 6246.81   |
-| catalog channel | catalog_pageAAAAAAAAABHBAAAA | 0.00      | 778.91  | -737.66   |
-| catalog channel | catalog_pageAAAAAAAAABKBAAAA | 101276.24 | 0.00    | 10193.83  |
-| catalog channel | catalog_pageAAAAAAAAACEBAAAA | 0.00      | 147.18  | -161.10   |
-| catalog channel | catalog_pageAAAAAAAAACHBAAAA | 0.00      | 5603.78 | -3477.14  |
-| catalog channel | catalog_pageAAAAAAAAACKBAAAA | 39547.67  | 0.00    | -13233.16 |
-| catalog channel | catalog_pageAAAAAAAAADHBAAAA | 0.00      | 1291.83 | -1529.96  |
-| catalog channel | catalog_pageAAAAAAAAADIBAAAA | 0.00      | 371.25  | -135.98   |
+| catalog channel | catalog_pageAAAAAAAAAAABAAAA | 0.00      | 190.90  | -690.35   |
+| catalog channel | catalog_pageAAAAAAAAAAHBAAAA | 0.00      | 3860.38 | -1853.87  |
+| catalog channel | catalog_pageAAAAAAAAAAIBAAAA | 108220.86 | 772.05  | -9242.62  |
+| catalog channel | catalog_pageAAAAAAAAAAJBAAAA | 0.00      | 144.35  | -198.11   |
+| catalog channel | catalog_pageAAAAAAAAAAKBAAAA | 60214.11  | 0.00    | -1962.50  |
+| catalog channel | catalog_pageAAAAAAAAABHBAAAA | 0.00      | 3515.14 | -1837.73  |
+| catalog channel | catalog_pageAAAAAAAAABKBAAAA | 86753.72  | 0.00    | 5679.10   |
+| catalog channel | catalog_pageAAAAAAAAACHBAAAA | 0.00      | 8372.79 | -4683.43  |
+| catalog channel | catalog_pageAAAAAAAAACIBAAAA | 0.00      | 8.35    | -233.57   |
+| catalog channel | catalog_pageAAAAAAAAACKBAAAA | 95196.31  | 0.00    | -17410.17 |
 +-----------------+------------------------------+-----------+---------+-----------+
