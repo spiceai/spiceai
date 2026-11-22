@@ -118,6 +118,7 @@ fn function_support_for(subquery: SetComparisonSubquery) -> FunctionSupport {
         .build()
 }
 
+#[cfg(test)]
 fn supports_expression(expr: &Expr, schema: Option<&DFSchema>) -> bool {
     supports_expression_for(expr, schema, SetComparisonSubquery::Check)
 }
