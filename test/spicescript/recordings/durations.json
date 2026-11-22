@@ -42,6 +42,7 @@
   "debezium-kafka-arrow": 49,
   "debezium-offset-recovery": 103,
   "derived-table-scopes": 32,
+  "diag-16625": 1800,
   "distinct-on-scopes": 8,
   "duckdb-nested-union-all": 7,
   "duckdb-timestamp-deletes": 4,
