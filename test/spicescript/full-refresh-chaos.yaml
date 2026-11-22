@@ -1,4 +1,5 @@
 name: full-refresh-chaos
+tags: [long]
 description: >
   A Cayenne acceleration refreshed in full never serves a partial table
   through faults, whatever the source: with the source down a refresh fails

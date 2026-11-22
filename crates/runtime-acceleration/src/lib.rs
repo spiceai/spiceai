@@ -43,7 +43,7 @@ pub use snapshot::{SnapshotDownloadInfo, SnapshotPoll, SnapshotPollOutcome};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Unknown acceleration engine '{name}'. Valid engines are: arrow, sqlite, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
+        "Unknown acceleration engine '{name}'. Valid engines are: arrow, sqlite, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
     ))]
     AcceleratorEngineNotAvailable { name: String },
 
