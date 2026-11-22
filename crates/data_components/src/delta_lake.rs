@@ -111,6 +111,15 @@ pub enum Error {
         data_type: String,
     },
 
+    #[snafu(display(
+        "The Delta Lake table '{table_url}' changed column '{column}' after Spice loaded it: {change}. The query is refused because Spice planned it with the column as it was loaded. Restart Spice to load the new schema. See: https://spiceai.org/docs/components/data-connectors/delta-lake"
+    ))]
+    SchemaChanged {
+        table_url: String,
+        column: String,
+        change: &'static str,
+    },
+
     #[snafu(display("Failed to create object store for Delta Lake table {table_url}: {source}"))]
     ObjectStore {
         table_url: String,
@@ -379,7 +388,9 @@ impl DeltaTable {
         Ok(())
     }
 
-    /// Builds the logical (user-facing) Arrow schema from the snapshot's delta schema.
+    /// Builds the logical (user-facing) Arrow schema from the snapshot's delta schema. Every column
+    /// is nullable: a scan reads the latest snapshot, and Delta can drop a column's NOT NULL at any
+    /// time, after which a non-nullable field would let the planner drop `IS NULL` rows.
     fn get_logical_schema(snapshot: &Snapshot) -> Schema {
         let schema = snapshot.schema();
 
@@ -389,7 +400,7 @@ impl DeltaTable {
                 field.name(),
                 // `ColumnMappingMode::None` to always return logical names
                 map_delta_data_type_to_arrow_data_type(&field.data_type, ColumnMappingMode::None),
-                field.nullable,
+                true,
             ));
         }
 
@@ -505,7 +516,7 @@ fn build_physical_schema_mapping(
         fields.push(Field::new(
             physical_name,
             map_delta_data_type_to_arrow_data_type(field.data_type(), column_mapping_mode),
-            field.nullable,
+            true,
         ));
     }
 
@@ -1046,6 +1057,95 @@ impl PhysicalExpr for RelabelFieldsExpr {
         write!(f, "{self}")
     }
 }
+
+/// The first loaded column that the `latest` schema no longer reads the same way, and how it
+/// changed. A scan reads the latest snapshot but plans with the loaded schema, so a column that
+/// was dropped, renamed, dropped and added again (a new physical name) or given another type
+/// would read the wrong values. Columns and nested fields added after loading, and metadata other
+/// than physical names, change nothing for the loaded ones.
+fn first_changed_column(
+    loaded: &delta_kernel::schema::StructType,
+    loaded_mode: ColumnMappingMode,
+    latest: &delta_kernel::schema::StructType,
+    latest_mode: ColumnMappingMode,
+) -> Option<(String, &'static str)> {
+    loaded.fields().find_map(|field| {
+        let change = match latest.field(field.name()) {
+            None => "it was dropped or renamed",
+            Some(now) if now.physical_name(latest_mode) != field.physical_name(loaded_mode) => {
+                if loaded_mode == latest_mode {
+                    "it was dropped and added again"
+                } else {
+                    "the table's column mapping changed"
+                }
+            }
+            Some(now)
+                if !type_reads_the_same(
+                    field.data_type(),
+                    loaded_mode,
+                    now.data_type(),
+                    latest_mode,
+                ) =>
+            {
+                "its type or a field inside it changed"
+            }
+            Some(_) => return None,
+        };
+        Some((field.name().clone(), change))
+    })
+}
+
+/// Whether values of the `latest` type read into the `loaded` one: every loaded struct field is
+/// still there under the same physical name, with a type that reads the same and no NOT NULL
+/// dropped, and an array or map that had no NULL elements still has none.
+fn type_reads_the_same(
+    loaded: &delta_kernel::schema::DataType,
+    loaded_mode: ColumnMappingMode,
+    latest: &delta_kernel::schema::DataType,
+    latest_mode: ColumnMappingMode,
+) -> bool {
+    use delta_kernel::schema::DataType as D;
+    match (loaded, latest) {
+        (D::Struct(loaded), D::Struct(latest)) => loaded.fields().all(|field| {
+            latest.field(field.name()).is_some_and(|now| {
+                now.physical_name(latest_mode) == field.physical_name(loaded_mode)
+                    && (field.nullable || !now.nullable)
+                    && type_reads_the_same(
+                        field.data_type(),
+                        loaded_mode,
+                        now.data_type(),
+                        latest_mode,
+                    )
+            })
+        }),
+        (D::Array(loaded), D::Array(latest)) => {
+            (loaded.contains_null() || !latest.contains_null())
+                && type_reads_the_same(
+                    loaded.element_type(),
+                    loaded_mode,
+                    latest.element_type(),
+                    latest_mode,
+                )
+        }
+        (D::Map(loaded), D::Map(latest)) => {
+            (loaded.value_contains_null() || !latest.value_contains_null())
+                && type_reads_the_same(
+                    loaded.key_type(),
+                    loaded_mode,
+                    latest.key_type(),
+                    latest_mode,
+                )
+                && type_reads_the_same(
+                    loaded.value_type(),
+                    loaded_mode,
+                    latest.value_type(),
+                    latest_mode,
+                )
+        }
+        (loaded, latest) => loaded == latest,
+    }
+}
+
 /// Finds the first column (by dotted path) whose Delta type Spice does not map to an
 /// Arrow type yet: `void`, and the year-month and day-time interval types.
 ///
@@ -1180,12 +1280,19 @@ impl TableProvider for DeltaTable {
         let parquet_file_reader_factory = Arc::new(DefaultParquetFileReaderFactory::new(
             Arc::clone(&self.parquet_object_store),
         )) as Arc<dyn ParquetFileReaderFactory>;
-        let projected_delta_schema = project_delta_schema(
+        let loaded_schema = project_delta_schema(
             &self.arrow_schema,
             Arc::clone(&self.delta_schema),
             projection,
         )?;
         let engine = Arc::clone(&self.engine);
+        let loaded_mode = self
+            .physical_schema_mapping
+            .as_ref()
+            .map_or(ColumnMappingMode::None, |mapping| {
+                mapping.column_mapping_mode
+            });
+        let table_url = self.table_url.to_string();
 
         // Clone the filters since we need to move them into the spawn_blocking closure
         let filters_clone = filters.to_vec();
@@ -1199,12 +1306,36 @@ impl TableProvider for DeltaTable {
                 else {
                     return exec_err!("Unable to get latest Delta table snapshot");
                 };
+                let latest_schema = snapshot.schema();
+                if let Some((column, change)) = first_changed_column(
+                    &loaded_schema,
+                    loaded_mode,
+                    &latest_schema,
+                    snapshot.table_configuration().column_mapping_mode(),
+                ) {
+                    return Err(datafusion::error::DataFusionError::External(Box::new(
+                        Error::SchemaChanged {
+                            table_url,
+                            column,
+                            change,
+                        },
+                    )));
+                }
 
                 // We'll convert all filters for delta_kernel predicates since
                 // partition pruning is already handled separately later in the code
 
+                // The loaded columns read the same in the latest schema, whose fields carry the
+                // annotations its column mapping needs (a table upgraded to column mapping
+                // annotates every field).
+                let scan_schema = delta_kernel::schema::StructType::try_new(
+                    loaded_schema
+                        .fields()
+                        .filter_map(|field| latest_schema.field(field.name()).cloned()),
+                )
+                .map_err(map_delta_error_to_datafusion_err)?;
                 let mut scan_builder =
-                    ScanBuilder::new(Arc::clone(&snapshot)).with_schema(projected_delta_schema);
+                    ScanBuilder::new(Arc::clone(&snapshot)).with_schema(Arc::new(scan_schema));
 
                 // Convert and apply predicate if possible
                 if let Some(predicate) = filters_to_delta_kernel_predicate(&filters_clone) {
@@ -3041,6 +3172,206 @@ mod column_mapping_filter_tests {
 
     fn struct_of(fields: Vec<StructField>) -> StructType {
         StructType::try_new(fields).expect("a valid test struct")
+    }
+
+    #[test]
+    fn a_loaded_column_the_latest_snapshot_reads_differently_refuses_the_scan() {
+        let id = || mapped("id", "col-id", 1, DeltaType::INTEGER);
+        let amount = || mapped("amount", "col-amount", 2, DeltaType::INTEGER);
+        let status = || mapped("status", "col-status", 3, DeltaType::STRING);
+        let a = || mapped("a", "col-st-a", 5, DeltaType::INTEGER);
+        let st = |fields: Vec<StructField>| mapped("st", "col-st", 4, struct_of(fields));
+        let loaded = struct_of(vec![id(), amount(), status(), st(vec![a()])]);
+        let mode = ColumnMappingMode::Name;
+        let changed = |latest: Vec<StructField>| {
+            first_changed_column(&loaded, mode, &struct_of(latest), mode)
+        };
+        let changed_column =
+            |column: &str, change: &'static str| Some((column.to_string(), change));
+
+        let note = mapped("note", "col-note", 6, DeltaType::STRING);
+        let nested_note = mapped("note", "col-st-note", 7, DeltaType::STRING);
+        assert_eq!(
+            changed(vec![
+                id(),
+                amount(),
+                status(),
+                st(vec![a(), nested_note]),
+                note
+            ]),
+            None
+        );
+        let commented = a().add_metadata([("comment", MetadataValue::String("x".to_string()))]);
+        assert_eq!(
+            changed(vec![id(), amount(), status(), st(vec![commented])]),
+            None
+        );
+
+        let renamed = mapped("total", "col-amount", 2, DeltaType::INTEGER);
+        assert_eq!(
+            changed(vec![id(), renamed, status(), st(vec![a()])]),
+            changed_column("amount", "it was dropped or renamed")
+        );
+        let added_again = mapped("status", "col-status-2", 8, DeltaType::STRING);
+        assert_eq!(
+            changed(vec![id(), amount(), added_again, st(vec![a()])]),
+            changed_column("status", "it was dropped and added again")
+        );
+        let widened = mapped("amount", "col-amount", 2, DeltaType::LONG);
+        assert_eq!(
+            changed(vec![id(), widened, status(), st(vec![a()])]),
+            changed_column("amount", "its type or a field inside it changed")
+        );
+        let nested_renamed = mapped("b", "col-st-a", 5, DeltaType::INTEGER);
+        let nested_added_again = mapped("a", "col-st-a-2", 9, DeltaType::INTEGER);
+        let not_null = |field: StructField| StructField {
+            nullable: false,
+            ..field
+        };
+        let loaded_not_null = struct_of(vec![mapped(
+            "st",
+            "col-st",
+            4,
+            struct_of(vec![not_null(a())]),
+        )]);
+        for latest in [vec![nested_renamed], vec![nested_added_again]] {
+            assert_eq!(
+                changed(vec![id(), amount(), status(), st(latest)]),
+                changed_column("st", "its type or a field inside it changed")
+            );
+        }
+        assert_eq!(
+            first_changed_column(
+                &loaded_not_null,
+                mode,
+                &struct_of(vec![st(vec![a()])]),
+                mode
+            ),
+            changed_column("st", "its type or a field inside it changed")
+        );
+
+        let element = |fields: Vec<StructField>, contains_null: bool| {
+            mapped(
+                "l",
+                "col-l",
+                10,
+                ArrayType::new(struct_of(fields), contains_null),
+            )
+        };
+        let value = |fields: Vec<StructField>, value_contains_null: bool| {
+            let map = MapType::new(DeltaType::STRING, struct_of(fields), value_contains_null);
+            mapped("m", "col-m", 11, map)
+        };
+        let loaded_nested = struct_of(vec![element(vec![a()], false), value(vec![a()], false)]);
+        let changed_nested = |latest: Vec<StructField>| {
+            first_changed_column(&loaded_nested, mode, &struct_of(latest), mode)
+        };
+        let b = || mapped("b", "col-b", 12, DeltaType::INTEGER);
+        assert_eq!(
+            changed_nested(vec![
+                element(vec![a(), b()], false),
+                value(vec![a(), b()], false)
+            ]),
+            None
+        );
+        let in_element = changed_column("l", "its type or a field inside it changed");
+        let in_value = changed_column("m", "its type or a field inside it changed");
+        let renamed_a = || mapped("b", "col-st-a", 5, DeltaType::INTEGER);
+        assert_eq!(
+            changed_nested(vec![
+                element(vec![renamed_a()], false),
+                value(vec![a()], false)
+            ]),
+            in_element
+        );
+        assert_eq!(
+            changed_nested(vec![
+                element(vec![a()], false),
+                value(vec![renamed_a()], false)
+            ]),
+            in_value
+        );
+        assert_eq!(
+            changed_nested(vec![element(vec![a()], true), value(vec![a()], false)]),
+            in_element
+        );
+        assert_eq!(
+            changed_nested(vec![element(vec![a()], false), value(vec![a()], true)]),
+            in_value
+        );
+        // A nested field that became NOT NULL still reads into the loaded, nullable one.
+        assert_eq!(
+            changed(vec![id(), amount(), status(), st(vec![not_null(a())])]),
+            None
+        );
+
+        // Upgrading a table to column mapping keeps each name, nested ones too, as its physical name.
+        let plain = struct_of(vec![
+            StructField::new("id", DeltaType::INTEGER, true),
+            StructField::new(
+                "st",
+                struct_of(vec![StructField::new("a", DeltaType::INTEGER, true)]),
+                true,
+            ),
+        ]);
+        let upgraded = struct_of(vec![
+            mapped("id", "id", 1, DeltaType::INTEGER),
+            mapped(
+                "st",
+                "st",
+                2,
+                struct_of(vec![mapped("a", "a", 3, DeltaType::INTEGER)]),
+            ),
+        ]);
+        assert_eq!(
+            first_changed_column(&plain, ColumnMappingMode::None, &upgraded, mode),
+            None
+        );
+        assert_eq!(
+            first_changed_column(&loaded, mode, &plain, ColumnMappingMode::None),
+            changed_column("id", "the table's column mapping changed")
+        );
+        // Upgraded, then dropped and added again: a new physical name under the new mode.
+        let added_after_upgrade = struct_of(vec![mapped("id", "col-id-2", 1, DeltaType::INTEGER)]);
+        assert_eq!(
+            first_changed_column(&plain, ColumnMappingMode::None, &added_after_upgrade, mode),
+            changed_column("id", "the table's column mapping changed")
+        );
+        let nested_added_after_upgrade = struct_of(vec![
+            mapped("id", "id", 1, DeltaType::INTEGER),
+            mapped(
+                "st",
+                "st",
+                2,
+                struct_of(vec![mapped("a", "col-st-a-2", 3, DeltaType::INTEGER)]),
+            ),
+        ]);
+        assert_eq!(
+            first_changed_column(
+                &plain,
+                ColumnMappingMode::None,
+                &nested_added_after_upgrade,
+                mode
+            ),
+            changed_column("st", "its type or a field inside it changed")
+        );
+        let keyed = |key: DeltaType| {
+            struct_of(vec![mapped(
+                "k",
+                "col-k",
+                13,
+                MapType::new(key, DeltaType::STRING, true),
+            )])
+        };
+        assert_eq!(
+            first_changed_column(
+                &keyed(DeltaType::INTEGER),
+                mode,
+                &keyed(DeltaType::LONG),
+                mode
+            ),
+            changed_column("k", "its type or a field inside it changed")
+        );
     }
 
     /// `id INT`, `st STRUCT<a INT, label STRING>` where `label` was renamed from `b`,
