@@ -399,10 +399,11 @@ pub enum Error {
     #[snafu(display("Table {table_name} is not accelerated"))]
     NotAcceleratedTable { table_name: String },
 
-    /// A deferred dataset whose source has not been reached yet: it is initialized by the
-    /// first query that references it, and a refresh has nothing to refresh before then.
+    /// A deferred dataset that no query has initialized: none has referenced it yet, or its
+    /// initialization failed, and a refresh has nothing to refresh before it initializes.
+    /// The message names no cause and promises no retry, because it covers all of these.
     #[snafu(display(
-        "Dataset {table_name} is not initialized yet: it initializes when a query first references it, and its source was unavailable at the last attempt. Query it to retry, then refresh."
+        "Dataset {table_name} is not initialized yet: it is initialized by a query that references it, and no query has initialized it. Query the dataset to initialize it, or to see the error that prevents it, then refresh. See: https://spiceai.org/docs/components/data-accelerators/data-refresh#ready-state"
     ))]
     DatasetNotInitialized { table_name: String },
 
