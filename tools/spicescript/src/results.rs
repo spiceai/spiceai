@@ -86,6 +86,23 @@ pub struct FailureResult {
     pub message: String,
 }
 
+impl FailureResult {
+    /// The failure's first line as the run prints it (`runner::Failure`'s
+    /// `Display`), which also starts every ledger problem about this check.
+    fn header(&self) -> String {
+        let who = if self.who.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", self.who)
+        };
+        let query = self
+            .query
+            .map(|q| format!(" query {q}"))
+            .unwrap_or_default();
+        format!("{}{who} step {} {}{query}", self.run, self.step, self.what)
+    }
+}
+
 /// How a failure stands against the expected-failure ledger.
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "kebab-case")]
@@ -249,19 +266,25 @@ impl Results {
                     &failure.message,
                 );
             }
-            // Ledger-only problems (for example a required failure that passed)
-            // have no failed step, but must still explain a failed repetition.
-            if result.failures.is_empty() {
-                for problem in &result.problems {
-                    summary.add_failure(
-                        repetition,
-                        &result.name,
-                        "ledger",
-                        0,
-                        problem.lines().next().unwrap_or_default(),
-                        problem.lines().nth(1).unwrap_or_default(),
-                    );
+            // A problem about a failed check starts with that check's first
+            // line and is already grouped above. The rest come from the ledger
+            // alone (for example a required failure that passed) and must still
+            // explain a failed repetition, whether or not another check failed.
+            let failed_checks: std::collections::HashSet<String> =
+                result.failures.iter().map(FailureResult::header).collect();
+            for problem in &result.problems {
+                let first_line = problem.lines().next().unwrap_or_default();
+                if failed_checks.contains(first_line) {
+                    continue;
                 }
+                summary.add_failure(
+                    repetition,
+                    &result.name,
+                    "ledger",
+                    0,
+                    first_line,
+                    problem.lines().nth(1).unwrap_or_default(),
+                );
             }
         }
         self.summaries = summaries.into_values().collect();
@@ -342,6 +365,53 @@ mod tests {
             "other",
         );
         assert_eq!(summary.failure_groups.len(), 5);
+    }
+
+    /// A repetition whose failed check is expected but whose other expected
+    /// failure passed fails on the ledger alone: its summary lists both, and
+    /// the failed check once.
+    #[test]
+    fn summaries_list_ledger_problems_beside_failed_checks() {
+        let script =
+            Script::parse("name: s\nspicepod: {}\nsteps: [{start: {}}]").expect("script parses");
+        let failed = crate::runner::Failure {
+            run: "s".into(),
+            who: "default".into(),
+            step: 2,
+            key: "query".into(),
+            what: "query: SELECT 1".into(),
+            query: None,
+            labels: Vec::new(),
+            message: "wrong answer".into(),
+        };
+        let gone = "s default step 4 query: SELECT 2\nThis expected failure (g) no longer fails: if it is fixed, move it out of the ledger with --record-failures (and its script out of known-failing/).".to_string();
+        let report = Report {
+            passed: 1,
+            failures: vec![failed],
+            ran: std::time::Duration::ZERO,
+        };
+        let problems = vec![report.failures[0].to_string(), gone];
+        let mut result = ScriptResult::new(
+            &script,
+            Path::new("s.yaml"),
+            &report,
+            std::time::Duration::ZERO,
+            None,
+            &problems,
+        );
+        result.repetition = Some(1);
+        let mut results = Results {
+            partition: None,
+            complete: false,
+            seconds: 0.0,
+            scripts: vec![result],
+            summaries: Vec::new(),
+        };
+        results.update_summaries();
+        assert_eq!(
+            results.summaries[0].to_string(),
+            "s: 0/1 passed (100.0% failed)\n  1x s default step 2 query: SELECT 1  (#1)\n     wrong answer\n  1x s ledger step 0 s default step 4 query: SELECT 2  (#1)\n     This expected failure (g) no longer fails: if it is fixed, move it out of the ledger with --record-failures (and its script out of known-failing/)."
+        );
     }
 
     #[test]
