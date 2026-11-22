@@ -217,19 +217,6 @@ fn choose_quantization<'q>(
     name: &str,
     repo: &str,
 ) -> Result<&'q Quantization, DownloadError> {
-    let names = || {
-        quantizations
-            .iter()
-            .map(|q| {
-                format!(
-                    "{} ({})",
-                    gguf_files::printable(&q.name),
-                    gigabytes(q.bytes)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
     let pin = |q: &Quantization| {
         gguf_files::pin(listing, q)
             .iter()
@@ -251,7 +238,7 @@ fn choose_quantization<'q>(
                 describe_sized(default),
                 default_reason(quantizations, default),
                 quantizations.len(),
-                names()
+                listed(quantizations)
             );
             return Ok(default);
         }
@@ -279,7 +266,7 @@ fn choose_quantization<'q>(
                     gguf_files::printable(&q.name),
                     gigabytes(q.bytes)
                 )),
-                names()
+                listed(quantizations)
             ),
         )),
     }
@@ -300,6 +287,32 @@ fn default_reason(quantizations: &[Quantization], default: &Quantization) -> Str
         format!(
             "its first by path, as llama.cpp loads it when a repository has neither {q4} nor {q8}"
         )
+    }
+}
+
+/// How many quantizations a load line or an error names. The repository decides how many it
+/// offers, so the list is bounded; repositories offer a few dozen at most.
+const LISTED_QUANTIZATIONS: usize = 40;
+
+/// `BF16 (1.2 GB), Q8_0 (0.6 GB), ...`: the quantizations a model's `files` can name, largest
+/// first, as a load line or an error lists them. Past [`LISTED_QUANTIZATIONS`], the rest are
+/// counted: `..., and 3 more`.
+fn listed(quantizations: &[Quantization]) -> String {
+    let named = quantizations
+        .iter()
+        .take(LISTED_QUANTIZATIONS)
+        .map(|q| {
+            format!(
+                "{} ({})",
+                gguf_files::printable(&q.name),
+                gigabytes(q.bytes)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    match quantizations.len().saturating_sub(LISTED_QUANTIZATIONS) {
+        0 => named,
+        more => format!("{named}, and {more} more"),
     }
 }
 
@@ -543,6 +556,40 @@ mod tests {
         // A local directory is read by its top-level names: weights in a folder are not
         // the model's.
         assert_eq!(files(&["onnx/model.safetensors", "config.json"]), None);
+    }
+
+    /// The repository decides how many quantizations it offers, so a load line or an error
+    /// names the first 40, largest first, and counts the rest.
+    #[test]
+    fn a_list_of_quantizations_names_forty_and_counts_the_rest() {
+        let quantizations = |count: u64| -> Vec<Quantization> {
+            (1..=count)
+                .rev()
+                .map(|i| Quantization {
+                    name: format!("Q{i}"),
+                    files: vec![format!("model-Q{i}.gguf")],
+                    bytes: i * 100_000_000,
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            listed(&quantizations(3)),
+            "Q3 (0.3 GB), Q2 (0.2 GB), Q1 (0.1 GB)"
+        );
+
+        let forty = listed(&quantizations(40));
+        assert_eq!(forty.matches(" GB)").count(), 40);
+        assert!(forty.starts_with("Q40 (4.0 GB), Q39 (3.9 GB), "), "{forty}");
+        assert!(forty.ends_with(", Q2 (0.2 GB), Q1 (0.1 GB)"), "{forty}");
+
+        let many = listed(&quantizations(43));
+        assert_eq!(many.matches(" GB)").count(), 40);
+        assert!(many.starts_with("Q43 (4.3 GB), Q42 (4.2 GB), "), "{many}");
+        assert!(
+            many.ends_with(", Q5 (0.5 GB), Q4 (0.4 GB), and 3 more"),
+            "{many}"
+        );
     }
 
     #[test]
