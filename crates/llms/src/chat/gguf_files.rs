@@ -32,23 +32,7 @@ use regex::Regex;
 use snafu::Snafu;
 use spicepod::component::model::ModelFile;
 
-/// `text` as a message prints a name that comes from a repository's file paths: printable ASCII
-/// as it is, and every other character, a backslash included, escaped as Rust escapes it (`\n`,
-/// `\\`, `\u{202e}`), so a repository's owner cannot break the message's line, colour it, or
-/// hide or reorder its characters. ASCII punctuation prints as it is, so a name can still read
-/// like the text around it.
-#[must_use]
-pub fn printable(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        if c != '\\' && (c.is_ascii_graphic() || c == ' ') {
-            out.push(c);
-        } else {
-            out.extend(c.escape_default());
-        }
-    }
-    out
-}
+pub use huggingface_hub::printable;
 
 /// How many names a load line or an error lists. The repository decides how many quantizations
 /// and shards it offers, so a list of them is bounded; repositories offer a few dozen at most.

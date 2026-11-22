@@ -1196,6 +1196,38 @@ async fn an_unusable_listing_read_from_the_cache_says_so_and_is_retried() {
     assert!(!error.is_configuration_error());
 }
 
+/// What a response the client cannot read held prints as printable ASCII wherever the failure
+/// is quoted, so the endpoint cannot break a line: here a listing whose entry type carries a
+/// newline and an escape sequence, which the JSON error quotes as it came.
+#[tokio::test]
+async fn a_listing_that_cannot_be_read_is_quoted_as_printable_ascii() {
+    const QUOTED: &str = "the Hugging Face Hub could not be reached (the Hugging Face Hub returned an unexpected response for model 'o/m': a page of the file listing could not be read (unknown variant `file\\nnext line\\u{1b}[2K`, expected `file` or `directory` at line 1 column 35))";
+    let fixture = Fixture::new().await;
+    fixture.mock.commit(MODEL, C1, model_files());
+    fixture.mock.branch(MODEL, "main", C1);
+    fixture
+        .open(None, &[])
+        .await
+        .download(&["config.json"])
+        .await
+        .expect("the config downloads");
+
+    fixture.mock.faults(|faults| {
+        faults.revision_files = RevisionFiles::Omitted;
+        faults.tree_body =
+            Some(r#"[{"type":"file\nnext line\u001b[2K","path":"a.gguf","size":1}]"#.to_string());
+    });
+    let snapshot = fixture.open(None, &[]).await;
+    assert_eq!(snapshot.cache_only_reason().as_deref(), Some(QUOTED));
+    let error = huggingface_hub::DownloadError::unusable(&snapshot, "x");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): {QUOTED}, so Spice read only the Hugging Face cache, where x. Spice retries the download; check the network connection. See: https://spiceai.org/docs/components/models/huggingface"
+        )
+    );
+}
+
 #[tokio::test]
 async fn a_connection_failure_keeps_its_kind_through_the_revision_cache() {
     // A port nothing listens on.
