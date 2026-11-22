@@ -25,7 +25,7 @@ datasets:
       delta_lake_aws_region: us-west-2
 
   # Databricks Delta Lake
-  - from: databricks:spiceai_sandbox.tpch.region
+  - from: databricks:spiceai_ci.tpch.region
     name: region_databricks_delta
     params:
       mode: delta_lake
