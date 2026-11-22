@@ -30,7 +30,11 @@ limitations under the License.
 //! must read nothing but `SQLite`. The Cayenne sides read the rows
 //! back through Cayenne's own scan, with filters and projections pushed into
 //! it, so a value Cayenne stores, encodes, or prunes wrongly shows up as a row
-//! that differs from `PostgreSQL`'s. The fixture holds the values
+//! that differs from `PostgreSQL`'s. Every side answers each query three
+//! ways a user can send it: in-process, over HTTP `/v1/sql`, and over Flight
+//! SQL, so a value the JSON or Flight encoder changes on its way out differs
+//! from `PostgreSQL`'s too, and each way's `EXPLAIN` must show the path its
+//! side claims to read. The fixture holds the values
 //! a translation gets wrong: NULLs in every column, `bigint` and `numeric`
 //! boundaries, `LIKE` wildcards as literal characters, non-ASCII and padded
 //! text, fractional-second timestamps, and duplicate join keys.
@@ -66,11 +70,14 @@ use crate::{
     configure_test_datafusion,
     federation_differential::{
         Case, PlanCheck, Row, agreement, check_cayenne_sources, check_federated, check_sources,
-        empty, operators, ordered, physical_plan, rows, spice_rows,
+        empty, operators, ordered, physical_plan, render, rows, spice_rows,
     },
     init_tracing,
     postgres::common::{self, get_pg_params},
-    utils::{register_test_connectors, runtime_ready_check, test_request_context},
+    utils::{
+        register_test_connectors, run_query, runtime_ready_check, sql_clients::SqlClients,
+        test_request_context,
+    },
 };
 
 /// The rows of the fixture table, so a load that dropped some fails up front.
@@ -427,6 +434,49 @@ const SUBJECTS: &[Subject] = &[
     },
 ];
 
+/// A way a user sends SQL to the runtime.
+#[derive(Clone, Copy)]
+enum Surface {
+    InProcess,
+    Http,
+    FlightSql,
+}
+
+const SURFACES: [Surface; 3] = [Surface::InProcess, Surface::Http, Surface::FlightSql];
+
+impl Surface {
+    fn label(self) -> &'static str {
+        match self {
+            Surface::InProcess => "in-process",
+            Surface::Http => "http",
+            Surface::FlightSql => "flight-sql",
+        }
+    }
+
+    /// Spice's answer to `sql` sent this way, rendered cell by cell.
+    async fn rows(
+        self,
+        rt: &Arc<Runtime>,
+        clients: &SqlClients,
+        sql: &str,
+    ) -> Result<Vec<Row>, String> {
+        let batches = match self {
+            Surface::InProcess => run_query(rt, sql).await.map_err(|e| e.to_string())?,
+            Surface::Http => clients.over_http(sql).await?,
+            Surface::FlightSql => clients.over_flight_sql(sql).await?,
+        };
+        render(&batches)
+    }
+}
+
+/// What one case compared: the cells (a side, a surface) whose rows were
+/// compared with `PostgreSQL`'s, and whether every federated plan sent the
+/// whole query to `PostgreSQL`.
+struct Compared {
+    cells: usize,
+    all_remote: bool,
+}
+
 /// Checks that every source of the physical plan in `plan` is SQL sent to the
 /// `SQLite` acceleration, so a `SQLite` side answers from `SQLite`.
 #[cfg(feature = "sqlite")]
@@ -440,10 +490,11 @@ fn check_sqlite_sources(plan: &[Row]) -> Result<(), String> {
 
 async fn compare_case(
     rt: &Arc<Runtime>,
+    clients: &SqlClients,
     client: &tokio_postgres::Client,
     case: &Case,
     failures: &mut Vec<String>,
-) -> Result<bool, anyhow::Error> {
+) -> Result<Compared, anyhow::Error> {
     let oracle_sql = case.oracle_sql("diff_items", "diff_regions");
     let oracle = postgres_rows(client, &oracle_sql)
         .await
@@ -456,20 +507,12 @@ async fn compare_case(
         ));
     }
 
-    let mut all_remote = true;
+    let mut compared = Compared {
+        cells: 0,
+        all_remote: true,
+    };
     for subject in SUBJECTS {
-        let name = subject.name;
         let sql = Case::bind(case.sql, subject.items, subject.regions);
-        match spice_rows(rt, &sql).await {
-            Ok(spice) => {
-                if let Err(reason) = agreement(&spice, &oracle, case.ordered) {
-                    failures.push(format!(
-                        "{name}: {sql}\n    {reason}\n    spice:      {spice:?}\n    postgres:   {oracle:?}"
-                    ));
-                }
-            }
-            Err(e) => failures.push(format!("{name}: {sql}\n    failed: {e}")),
-        }
         // The federated side must send the whole query to PostgreSQL, or it is
         // DataFusion over a wider scan and compares nothing the accelerated side
         // does not. A Cayenne side must read only Cayenne, or its agreement says
@@ -485,17 +528,34 @@ async fn compare_case(
             #[cfg(feature = "sqlite")]
             Kind::SqliteMemory | Kind::SqliteFile => Some(&check_sqlite_sources),
         };
-        if let Some(check) = check {
-            let plan = spice_rows(rt, &format!("EXPLAIN {sql}"))
-                .await
-                .map_err(|e| anyhow::anyhow!("EXPLAIN {sql}: {e}"))?;
-            if let Err(reason) = check(&plan) {
-                failures.push(format!("{name}: {sql}\n    {reason}"));
-                all_remote &= subject.kind != Kind::Federated;
+        for surface in SURFACES {
+            let name = format!("{} over {}", subject.name, surface.label());
+            match surface.rows(rt, clients, &sql).await {
+                Ok(spice) => {
+                    compared.cells += 1;
+                    if let Err(reason) = agreement(&spice, &oracle, case.ordered) {
+                        failures.push(format!(
+                            "{name}: {sql}\n    {reason}\n    spice:      {spice:?}\n    postgres:   {oracle:?}"
+                        ));
+                    }
+                }
+                Err(e) => failures.push(format!("{name}: {sql}\n    failed: {e}")),
+            }
+            // Each surface plans the query itself, so each one's plan must show
+            // the path its side claims to read.
+            if let Some(check) = check {
+                let plan = surface
+                    .rows(rt, clients, &format!("EXPLAIN {sql}"))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{name}: EXPLAIN {sql}: {e}"))?;
+                if let Err(reason) = check(&plan) {
+                    failures.push(format!("{name}: {sql}\n    {reason}"));
+                    compared.all_remote &= subject.kind != Kind::Federated;
+                }
             }
         }
     }
-    Ok(all_remote)
+    Ok(compared)
 }
 
 #[tokio::test]
@@ -528,6 +588,7 @@ async fn federated_and_accelerated_postgres_answers_match_postgres() -> Result<(
                 () = Arc::clone(&rt).load_components() => {}
             }
             runtime_ready_check(&rt).await;
+            let clients = SqlClients::start(&rt).await.map_err(|e| anyhow::anyhow!(e))?;
 
             // Each side must hold the whole fixture before any answer counts.
             let expected = vec![vec![Some(ITEM_ROWS.to_string())]];
@@ -538,14 +599,18 @@ async fn federated_and_accelerated_postgres_answers_match_postgres() -> Result<(
                 expected
             );
             for subject in SUBJECTS {
-                assert_eq!(
-                    spice_rows(&rt, &format!("SELECT count(*) FROM {}", subject.items))
-                        .await
-                        .map_err(|e| anyhow::anyhow!(e))?,
-                    expected,
-                    "{} must hold every fixture row",
-                    subject.items
-                );
+                for surface in SURFACES {
+                    assert_eq!(
+                        surface
+                            .rows(&rt, &clients, &format!("SELECT count(*) FROM {}", subject.items))
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                        expected,
+                        "{} over {} must hold every fixture row",
+                        subject.items,
+                        surface.label()
+                    );
+                }
             }
             // The Vortex side must serve its rows from Vortex files on disk,
             // not from rows inlined in its metastore.
@@ -579,15 +644,19 @@ async fn federated_and_accelerated_postgres_answers_match_postgres() -> Result<(
             let cases = cases();
             let mut failures = Vec::new();
             let mut all_remote = 0_usize;
+            let mut cells = 0_usize;
             for case in &cases {
-                if compare_case(&rt, &client, case, &mut failures).await? {
+                let compared = compare_case(&rt, &clients, &client, case, &mut failures).await?;
+                cells += compared.cells;
+                if compared.all_remote {
                     all_remote += 1;
                 }
             }
             eprintln!(
-                "postgres federation differential: {} cases, {} federated plans sent the whole query to PostgreSQL, {} failures",
+                "postgres federation differential: {} cases x {} sides x {} surfaces, {cells} cells compared, {all_remote} cases whose federated plans sent the whole query to PostgreSQL on every surface, {} failures",
                 cases.len(),
-                all_remote,
+                SUBJECTS.len(),
+                SURFACES.len(),
                 failures.len()
             );
 
