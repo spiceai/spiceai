@@ -35,18 +35,6 @@ const HORIZON: u8 = 9;
 const SHORT_HORIZON: u8 = 7;
 const VERSIONS: u8 = 6;
 
-/// A query's outcome and how the drawing marks it. The properties allow an
-/// error once the retention has passed and forbid one within it (or wrong rows),
-/// which the model records as `bad_availability` and `bad_rows`.
-fn query_outcome(result: Option<bool>, violated: bool) -> (&'static str, crate::explorer::Tone) {
-    use crate::explorer::Tone;
-    match (result, violated) {
-        (_, true) => ("FAILED within the retention", Tone::Bad),
-        (None, false) => ("running", Tone::Actor),
-        (Some(true), false) => ("rows", Tone::Actor),
-        (Some(false), false) => ("error after the retention (allowed)", Tone::Gone),
-    }
-}
 #[derive(Clone, Debug)]
 pub(crate) struct Protocol {
     mode: String,
@@ -696,11 +684,15 @@ impl Model for Protocol {
                 format!("QUERY (started {start})"),
                 vec![
                     format!("reads objects {}", needs.join(", ")),
-                    query_outcome(last.result, last.bad_availability || last.bad_rows)
-                        .0
-                        .into(),
+                    crate::explorer::query_outcome(
+                        last.result,
+                        last.bad_availability,
+                        last.bad_rows,
+                    )
+                    .0
+                    .into(),
                 ],
-                query_outcome(last.result, last.bad_availability || last.bad_rows).1,
+                crate::explorer::query_outcome(last.result, last.bad_availability, last.bad_rows).1,
             ));
         }
         let (writer, head, gc, store, reader) = (0, 1, 2, 3, 4);
@@ -756,22 +748,13 @@ impl Model for Protocol {
                 Action::Respond => Event::on(head, label).to(reader),
                 Action::Start => Event::on(reader, label).tone(Tone::Actor),
                 Action::Get(o) => {
-                    let ok = before.present[o];
-                    // A miss is a violation only when this read raises a property's
-                    // flag; past the retention an error is an allowed outcome.
-                    let violated = (after.bad_availability && !before.bad_availability)
-                        || (after.bad_rows && !before.bad_rows);
-                    let (text, tone) = match (ok, violated) {
-                        (true, false) => (label, Tone::Actor),
-                        (_, true) => (
-                            format!("object {o} is MISSING within the retention"),
-                            Tone::Bad,
-                        ),
-                        (false, false) => (
-                            format!("object {o} is gone after the retention (allowed)"),
-                            Tone::Gone,
-                        ),
-                    };
+                    let (text, tone) = crate::explorer::fetch_event(
+                        o,
+                        before.present[o],
+                        after.bad_availability && !before.bad_availability,
+                        after.bad_rows && !before.bad_rows,
+                        label,
+                    );
                     Event::on(reader, text).to(store).tone(tone)
                 }
             });
@@ -848,8 +831,7 @@ impl Model for Protocol {
 
 #[cfg(test)]
 mod explorer_tests {
-    use super::query_outcome;
-    use crate::explorer::Tone;
+    use crate::explorer::{Tone, fetch_event, query_outcome};
 
     /// A read that finds its object deleted after the retention has passed is
     /// an allowed error, so the timeline draws it grey, as the query box does.
@@ -878,21 +860,49 @@ mod explorer_tests {
         assert!(!path.last_state().bad_availability);
         let svg = model.as_svg(path).expect("retention draws");
         assert!(
-            svg.contains("object 0 is gone after the retention (allowed)"),
+            svg.contains("object 0 is gone after the window (allowed)"),
             "{svg}"
         );
         assert!(!svg.contains("is MISSING"), "{svg}");
     }
 
-    /// Only an outcome the properties forbid is drawn as a violation.
+    /// Only an outcome the properties forbid is drawn as a violation, and the
+    /// two violations are named apart: a missing object read as empty returns
+    /// wrong rows even after the window, which is not a failure within it.
     #[test]
     fn only_forbidden_query_outcomes_are_violations() {
-        assert!(
-            query_outcome(Some(false), false)
-                == ("error after the retention (allowed)", Tone::Gone)
+        let cases = [
+            (
+                (Some(false), false, false),
+                ("error after the window (allowed)", Tone::Gone),
+            ),
+            (
+                (Some(false), true, false),
+                ("FAILED within the window", Tone::Bad),
+            ),
+            (
+                (Some(true), false, true),
+                ("WRONG ROWS (a missing object read as empty)", Tone::Bad),
+            ),
+            (
+                (Some(true), true, true),
+                (
+                    "FAILED within the window and returned WRONG ROWS",
+                    Tone::Bad,
+                ),
+            ),
+            ((Some(true), false, false), ("rows", Tone::Actor)),
+            ((None, false, false), ("running", Tone::Actor)),
+        ];
+        for ((result, unavailable, wrong_rows), expected) in cases {
+            assert_eq!(query_outcome(result, unavailable, wrong_rows), expected);
+        }
+        assert_eq!(
+            fetch_event(0, false, false, true, String::new()),
+            (
+                "object 0 missing, read as empty: WRONG ROWS".to_string(),
+                Tone::Bad
+            )
         );
-        assert!(query_outcome(Some(false), true) == ("FAILED within the retention", Tone::Bad));
-        assert!(query_outcome(Some(true), false) == ("rows", Tone::Actor));
-        assert!(query_outcome(None, false) == ("running", Tone::Actor));
     }
 }

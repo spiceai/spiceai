@@ -15,7 +15,7 @@ const PAD: usize = 6;
 const GAP: usize = 40;
 
 /// How a box or arrow is drawn.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Tone {
     /// Committed: referenced by the authoritative head.
     Live,
@@ -724,4 +724,52 @@ where
         }
     }
     None
+}
+
+/// How a reader's fetch of object `o` is drawn: red only for a violation the
+/// fetch itself raised, and named by which one. `unavailable` is a failure
+/// within the protection window; `wrong_rows` is a missing object read as
+/// empty. Otherwise a miss is an allowed error once the window has passed.
+pub(crate) fn fetch_event(
+    o: usize,
+    found: bool,
+    unavailable: bool,
+    wrong_rows: bool,
+    label: String,
+) -> (String, Tone) {
+    match (found, unavailable, wrong_rows) {
+        (_, true, true) => (
+            format!("object {o} MISSING within the window, read as empty: WRONG ROWS"),
+            Tone::Bad,
+        ),
+        (_, true, false) => (format!("object {o} MISSING within the window"), Tone::Bad),
+        (_, false, true) => (
+            format!("object {o} missing, read as empty: WRONG ROWS"),
+            Tone::Bad,
+        ),
+        (true, false, false) => (label, Tone::Actor),
+        (false, false, false) => (
+            format!("object {o} is gone after the window (allowed)"),
+            Tone::Gone,
+        ),
+    }
+}
+
+/// A finished or running query's outcome, named by which violation, if any.
+pub(crate) fn query_outcome(
+    result: Option<bool>,
+    unavailable: bool,
+    wrong_rows: bool,
+) -> (&'static str, Tone) {
+    match (result, unavailable, wrong_rows) {
+        (_, true, true) => (
+            "FAILED within the window and returned WRONG ROWS",
+            Tone::Bad,
+        ),
+        (_, true, false) => ("FAILED within the window", Tone::Bad),
+        (_, false, true) => ("WRONG ROWS (a missing object read as empty)", Tone::Bad),
+        (None, false, false) => ("running", Tone::Actor),
+        (Some(true), false, false) => ("rows", Tone::Actor),
+        (Some(false), false, false) => ("error after the window (allowed)", Tone::Gone),
+    }
 }
