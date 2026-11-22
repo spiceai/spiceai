@@ -2333,6 +2333,26 @@ fn is_refusal_code(code: Option<&str>) -> bool {
     })
 }
 
+/// Whether a GraphQL `errors` entry is a failure no retry clears, as
+/// `handle_graphql_query_error` classifies it: a problem with the query, an
+/// explicit credential refusal named by `extensions.code` or by the top-level
+/// `type`, or a `NOT_FOUND` type.
+fn is_permanent_entry(entry: &Value) -> bool {
+    let has_location = entry
+        .get("locations")
+        .and_then(|l| l.as_array())
+        .is_some_and(|l| !l.is_empty());
+    let code = entry
+        .get("extensions")
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_str());
+    let error_type = entry.get("type").and_then(|t| t.as_str());
+    is_query_error(has_location, code)
+        || is_refusal_code(code)
+        || is_refusal_code(error_type)
+        || error_type.is_some_and(|t| t.eq_ignore_ascii_case("not_found"))
+}
+
 fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
     // Check if there are any errors in the response
     if let Some(errors) = response.get("errors") {
@@ -2370,25 +2390,14 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
     }
 
     // Safely access the first error with bounds checking
-    // Prefer the first entry that is definitely permanent (a query problem or an
-    // explicit credential refusal) over an earlier bare message, so one
-    // transient-looking entry cannot hide a validation failure.
+    // Prefer the first entry that is definitely permanent over an earlier bare
+    // message, so one transient-looking entry cannot hide a failure no retry clears.
     let graphql_error = response
         .get("errors")
         .and_then(|e| e.as_array())
         .and_then(|arr| {
             arr.iter()
-                .find(|entry| {
-                    let has_location = entry
-                        .get("locations")
-                        .and_then(|l| l.as_array())
-                        .is_some_and(|l| !l.is_empty());
-                    let code = entry
-                        .get("extensions")
-                        .and_then(|e| e.get("code"))
-                        .and_then(|c| c.as_str());
-                    is_query_error(has_location, code) || is_refusal_code(code)
-                })
+                .find(|entry| is_permanent_entry(entry))
                 .or_else(|| arr.first())
         })
         .unwrap_or(&Value::Null);
@@ -5319,6 +5328,35 @@ mod graphql_errors_classification_tests {
         }));
         assert!(matches!(err, Error::InvalidGraphQLQuery { .. }), "{err:?}");
         assert!(err.to_string().contains("bad field"));
+    }
+
+    #[test]
+    fn later_type_refusal_is_not_hidden_by_a_bare_first_entry() {
+        let err = classify(&json!({
+            "errors": [
+                {"message": "upstream timeout"},
+                {"message": "access denied", "type": "FORBIDDEN"}
+            ]
+        }));
+        assert!(
+            matches!(err, Error::InvalidCredentialsOrPermissions { .. }),
+            "{err:?}"
+        );
+        assert!(!is_retriable_error(&err));
+        assert!(err.to_string().contains("access denied"));
+    }
+
+    #[test]
+    fn later_not_found_type_is_not_hidden_by_a_bare_first_entry() {
+        let err = classify(&json!({
+            "errors": [
+                {"message": "upstream timeout"},
+                {"message": "no such repository", "type": "NOT_FOUND"}
+            ]
+        }));
+        assert!(matches!(err, Error::ResourceNotFound { .. }), "{err:?}");
+        assert!(!is_retriable_error(&err));
+        assert!(err.to_string().contains("no such repository"));
     }
 
     #[test]
