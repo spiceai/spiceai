@@ -99,6 +99,7 @@ fn date(name: &str) -> Field {
 /// finished writing one there. Same reuse rule as the SSB fixture: a leftover
 /// tree from an older generator is regenerated rather than trusted.
 pub fn ensure_tpch_fixture(out_dir: &Path, scale_factor: f64) {
+    let _lock = super::lock_fixture(out_dir);
     let revision = super::generator_revision(include_str!("tpch_data.rs"));
     if super::fixture_is_current(out_dir, &revision) {
         return;

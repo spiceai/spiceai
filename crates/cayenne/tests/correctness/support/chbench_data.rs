@@ -50,6 +50,7 @@ pub const CHBENCH_TABLES: &[&str] = &[
 /// already finished writing one there — the reuse rule of the TPC-H, TPC-DS and
 /// SSB fixtures.
 pub fn ensure_chbench_fixture(out_dir: &Path, warehouses: i64) {
+    let _lock = super::lock_fixture(out_dir);
     let revision = super::generator_revision(include_str!("chbench_data.rs"));
     if super::fixture_is_current(out_dir, &revision) {
         return;

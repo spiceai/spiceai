@@ -546,8 +546,10 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
     // other twenty-two, so a directory left behind by an interrupted dsdgen was
     // read as complete and its missing tables became `Excluded` — a pass.
     let tpcds_revision = tpcds_fixture_revision();
+    let tpcds_lock = support::lock_fixture(&tpcds_dir);
     let tpcds_fixture_missing = !support::fixture_is_current(&tpcds_dir, &tpcds_revision)
         && generate_tpcds_parquet(&tpcds_dir, sf, &tpcds_revision).is_none();
+    drop(tpcds_lock);
 
     // Discover exported tables.
     let exported: Vec<String> = std::fs::read_dir(&tpcds_dir)

@@ -39,6 +39,7 @@ pub const SSB_TABLES: &[&str] = &["lineorder", "customer", "supplier", "part", "
 /// older generator wrote, and this one's rows are what the ORDER BY checks are
 /// calibrated against.
 pub fn ensure_ssb_fixture(out_dir: &Path, scale: i64) {
+    let _lock = super::lock_fixture(out_dir);
     let revision = super::generator_revision(include_str!("ssb_data.rs"));
     if super::fixture_is_current(out_dir, &revision) {
         return;
