@@ -75,7 +75,8 @@ use crate::{
     init_tracing,
     postgres::common::{self, get_pg_params},
     utils::{
-        register_test_connectors, run_query, runtime_ready_check, sql_clients::SqlClients,
+        register_test_connectors, runtime_ready_check,
+        sql_clients::{SURFACES, SqlClients, Surface},
         test_request_context,
     },
 };
@@ -434,39 +435,13 @@ const SUBJECTS: &[Subject] = &[
     },
 ];
 
-/// A way a user sends SQL to the runtime.
-#[derive(Clone, Copy)]
-enum Surface {
-    InProcess,
-    Http,
-    FlightSql,
-}
-
-const SURFACES: [Surface; 3] = [Surface::InProcess, Surface::Http, Surface::FlightSql];
-
-impl Surface {
-    fn label(self) -> &'static str {
-        match self {
-            Surface::InProcess => "in-process",
-            Surface::Http => "http",
-            Surface::FlightSql => "flight-sql",
-        }
-    }
-
-    /// Spice's answer to `sql` sent this way, rendered cell by cell.
-    async fn rows(
-        self,
-        rt: &Arc<Runtime>,
-        clients: &SqlClients,
-        sql: &str,
-    ) -> Result<Vec<Row>, String> {
-        let batches = match self {
-            Surface::InProcess => run_query(rt, sql).await.map_err(|e| e.to_string())?,
-            Surface::Http => clients.over_http(sql).await?,
-            Surface::FlightSql => clients.over_flight_sql(sql).await?,
-        };
-        render(&batches)
-    }
+/// Spice's answer to `sql` sent the `surface` way, rendered cell by cell.
+async fn surface_rows(
+    clients: &SqlClients,
+    surface: Surface,
+    sql: &str,
+) -> Result<Vec<Row>, String> {
+    render(&clients.query(surface, sql).await?)
 }
 
 /// What one case compared: the cells (a side, a surface) whose rows were
@@ -489,7 +464,6 @@ fn check_sqlite_sources(plan: &[Row]) -> Result<(), String> {
 }
 
 async fn compare_case(
-    rt: &Arc<Runtime>,
     clients: &SqlClients,
     client: &tokio_postgres::Client,
     case: &Case,
@@ -530,7 +504,7 @@ async fn compare_case(
         };
         for surface in SURFACES {
             let name = format!("{} over {}", subject.name, surface.label());
-            match surface.rows(rt, clients, &sql).await {
+            match surface_rows(clients, surface, &sql).await {
                 Ok(spice) => {
                     compared.cells += 1;
                     if let Err(reason) = agreement(&spice, &oracle, case.ordered) {
@@ -544,8 +518,7 @@ async fn compare_case(
             // Each surface plans the query itself, so each one's plan must show
             // the path its side claims to read.
             if let Some(check) = check {
-                let plan = surface
-                    .rows(rt, clients, &format!("EXPLAIN {sql}"))
+                let plan = surface_rows(clients, surface, &format!("EXPLAIN {sql}"))
                     .await
                     .map_err(|e| anyhow::anyhow!("{name}: EXPLAIN {sql}: {e}"))?;
                 if let Err(reason) = check(&plan) {
@@ -601,8 +574,7 @@ async fn federated_and_accelerated_postgres_answers_match_postgres() -> Result<(
             for subject in SUBJECTS {
                 for surface in SURFACES {
                     assert_eq!(
-                        surface
-                            .rows(&rt, &clients, &format!("SELECT count(*) FROM {}", subject.items))
+                        surface_rows(&clients, surface, &format!("SELECT count(*) FROM {}", subject.items))
                             .await
                             .map_err(|e| anyhow::anyhow!(e))?,
                         expected,
@@ -646,7 +618,7 @@ async fn federated_and_accelerated_postgres_answers_match_postgres() -> Result<(
             let mut all_remote = 0_usize;
             let mut cells = 0_usize;
             for case in &cases {
-                let compared = compare_case(&rt, &clients, &client, case, &mut failures).await?;
+                let compared = compare_case(&clients, &client, case, &mut failures).await?;
                 cells += compared.cells;
                 if compared.all_remote {
                     all_remote += 1;

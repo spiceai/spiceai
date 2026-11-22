@@ -37,7 +37,8 @@ use super::{
 };
 use crate::configure_test_datafusion;
 use crate::utils::{
-    register_test_connectors, run_query, runtime_ready_check, sql_clients::SqlClients,
+    register_test_connectors, run_query, runtime_ready_check,
+    sql_clients::{SURFACES, SqlClients},
     test_request_context,
 };
 
@@ -161,14 +162,10 @@ async fn surfaces_match_standalone_oracles(engine: &str, storage: Storage) {
                 q.name
             );
         }
-        let surfaces = [
-            (
-                "in-process",
-                run_query(&rt, &q.sql).await.map_err(|e| e.to_string()),
-            ),
-            ("http", clients.over_http(&q.sql).await),
-            ("flight-sql", clients.over_flight_sql(&q.sql).await),
-        ];
+        let mut surfaces = Vec::with_capacity(SURFACES.len());
+        for surface in SURFACES {
+            surfaces.push((surface.label(), clients.query(surface, &q.sql).await));
+        }
         for (surface, spice) in &surfaces {
             let spice = match spice {
                 Ok(batches) if row_count(batches) > 0 => batches,

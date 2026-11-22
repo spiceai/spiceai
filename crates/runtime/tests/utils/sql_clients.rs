@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! The clients a user sends SQL to a runtime with, other than in-process: HTTP
-//! `/v1/sql` and Flight SQL. A test starts a runtime's servers with
-//! [`SqlClients::start`] and sends the same SQL over each, so an answer that a
-//! wire encoder changes shows up as rows that differ from the in-process ones.
+//! The ways a user sends SQL to a runtime: in-process, HTTP `/v1/sql`, and
+//! Flight SQL. A test starts a runtime's servers with [`SqlClients::start`] and
+//! sends the same SQL each [`Surface`] way, so an answer that a wire encoder
+//! changes shows up as rows that differ from the in-process ones.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -30,12 +30,34 @@ use futures::TryStreamExt;
 use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use tonic::transport::Channel;
 
-use super::{free_ports, wait_until_true};
+use super::{free_ports, run_query, wait_until_true};
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
-/// An HTTP client and a Flight SQL channel connected to one runtime's servers.
+/// A way a user sends SQL to the runtime.
+#[derive(Clone, Copy)]
+pub(crate) enum Surface {
+    InProcess,
+    Http,
+    FlightSql,
+}
+
+pub(crate) const SURFACES: [Surface; 3] = [Surface::InProcess, Surface::Http, Surface::FlightSql];
+
+impl Surface {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Surface::InProcess => "in-process",
+            Surface::Http => "http",
+            Surface::FlightSql => "flight-sql",
+        }
+    }
+}
+
+/// One runtime, with an HTTP client and a Flight SQL channel connected to its
+/// servers.
 pub(crate) struct SqlClients {
+    rt: Arc<Runtime>,
     http: reqwest::Client,
     http_port: u16,
     flight: Channel,
@@ -73,16 +95,30 @@ impl SqlClients {
         }
         let flight = endpoint.connect().await.map_err(|e| e.to_string())?;
         Ok(Self {
+            rt: Arc::clone(rt),
             http,
             http_port,
             flight,
         })
     }
 
+    /// The runtime's answer to `sql` sent the `surface` way.
+    pub(crate) async fn query(
+        &self,
+        surface: Surface,
+        sql: &str,
+    ) -> Result<Vec<RecordBatch>, String> {
+        match surface {
+            Surface::InProcess => run_query(&self.rt, sql).await.map_err(|e| e.to_string()),
+            Surface::Http => self.over_http(sql).await,
+            Surface::FlightSql => self.over_flight_sql(sql).await,
+        }
+    }
+
     /// `sql` over HTTP `/v1/sql`, its `application/vnd.spiceai.sql.v1+json`
     /// answer decoded with the Arrow schema the response carries, so a
     /// comparison sees the types the server reported.
-    pub(crate) async fn over_http(&self, sql: &str) -> Result<Vec<RecordBatch>, String> {
+    async fn over_http(&self, sql: &str) -> Result<Vec<RecordBatch>, String> {
         let response = self
             .http
             .post(format!("http://{LOCALHOST}:{}/v1/sql", self.http_port))
@@ -126,7 +162,7 @@ impl SqlClients {
 
     /// `sql` over Flight SQL: `CommandStatementQuery`, then a `DoGet` for each
     /// endpoint it returns.
-    pub(crate) async fn over_flight_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, String> {
+    async fn over_flight_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, String> {
         let mut client = FlightSqlServiceClient::new(self.flight.clone());
         let info = client
             .execute(sql.to_string(), None)
