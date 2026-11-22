@@ -834,10 +834,10 @@ impl Model for Protocol {
 mod explorer_tests {
     use crate::explorer::{Tone, fetch_event, query_outcome};
 
-    /// A read that finds its object deleted after the retention has passed is
-    /// an allowed error, so the timeline draws it grey, as the query box does.
+    /// A read that finds its object deleted after the retention has passed
+    /// breaks no property, so the timeline draws a plain grey miss.
     #[test]
-    fn allowed_late_miss_is_grey_in_the_timeline() {
+    fn late_miss_is_not_drawn_as_a_violation() {
         use super::{Action, Protocol};
         use stateright::{Model, Path};
         let model = Protocol::new("retention-readers");
@@ -860,10 +860,8 @@ mod explorer_tests {
         let path = Path::from_actions(&model, init, &actions).expect("enabled trace");
         assert!(!path.last_state().bad_availability);
         let svg = model.as_svg(path).expect("retention draws");
-        assert!(
-            svg.contains("object 0 is gone after the window (allowed)"),
-            "{svg}"
-        );
+        assert!(svg.contains("object 0 is missing"), "{svg}");
+        assert!(!svg.contains("BREAKS"), "{svg}");
         assert!(!svg.contains("is MISSING"), "{svg}");
     }
 

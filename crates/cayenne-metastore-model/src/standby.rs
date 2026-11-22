@@ -408,6 +408,11 @@ impl Model for Protocol {
             Action::Tick => "the clock ticks".into(),
             Action::Acquire(i) => format!("instance {i} acquires the expired lease"),
             Action::Renew(i) => format!("instance {i} renews its lease"),
+            Action::Takeover(i) if self.has("no-generation") => {
+                format!(
+                    "instance {i} takes over (lease object only; the head generation is not raised)"
+                )
+            }
             Action::Takeover(i) => {
                 format!("instance {i} takes over the head (raises its generation)")
             }
@@ -658,6 +663,20 @@ mod explorer_tests {
     use super::{Action, Protocol, State};
     use stateright::{Model, Path};
     use std::collections::{HashMap, HashSet, VecDeque};
+
+    /// The takeover label follows the mode: only with head fencing does it
+    /// raise the generation.
+    #[test]
+    fn takeover_label_follows_the_mode() {
+        assert_eq!(
+            Protocol::new("standby").format_action(&Action::Takeover(1)),
+            "instance 1 takes over the head (raises its generation)"
+        );
+        assert_eq!(
+            Protocol::new("standby-no-generation").format_action(&Action::Takeover(1)),
+            "instance 1 takes over (lease object only; the head generation is not raised)"
+        );
+    }
 
     /// With fencing by the lease object alone, a takeover succeeds without
     /// raising the head's generation; the timeline must still call it a
