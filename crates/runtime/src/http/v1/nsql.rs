@@ -1932,7 +1932,6 @@ mod tests {
         let (status, _) = post_nsql_to_openai_model(
             &endpoint,
             &[],
-            None,
             json!({ "query": "how many rows", "model": "nsql_model" }),
         )
         .await;
@@ -1959,7 +1958,6 @@ mod tests {
         let (status, _) = post_nsql_to_openai_model(
             &endpoint,
             &[],
-            None,
             json!({ "query": "how many rows", "model": "nsql_model" }),
         )
         .await;
