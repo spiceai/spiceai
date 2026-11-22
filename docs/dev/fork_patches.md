@@ -610,6 +610,23 @@ upstream would still be silent, so its guard stays:
 |---|---|---|---|
 | Arrow requirement narrowed to the one major the workspace builds against, `>=59.0.0, <60` (fork PR #4 set it to 58; moved to 59 in the merge of ADBC 24; upstream's own range is `>=58, <61` since ADBC 25) | A range spanning more than one major lets a workspace that also carries an older arrow subtree — a geospatial stack on an older `DataFusion`, say — resolve the ADBC crates onto it while the rest of the workspace runs on 59. Two copies of `arrow-schema` then exist and a `Schema` does not match across the ADBC boundary; the enterprise runtime does not compile | build | `cargo check -p connector-adbc` in the enterprise runtime, which fails with `expected arrow_schema::Schema, found arrow_schema::schema::Schema` when the requirement is widened |
 
+## ADBC BigQuery driver
+
+Upstream [adbc-drivers/bigquery](https://github.com/adbc-drivers/bigquery), fork
+[spiceai/bigquery](https://github.com/spiceai/bigquery), branch `spiceai`: upstream tag
+`go/v1.15.0` plus the patches below. The ADBC catalog requires this build for
+BigQuery. It is not a cargo dependency, so the pin table
+above does not list it: `.github/actions/setup-adbc-bigquery` builds
+`libadbc_driver_bigquery.so` from the commit in its `adbc_bigquery_commit` input, and
+checks that each patch below is present before it builds. Both patches are merged
+upstream (adbc-drivers/bigquery#381) but are in no release yet; the fork carries them
+until the pin moves to a release that has them.
+
+| Patch | What breaks if it is lost | Loss | Guard |
+|---|---|---|---|
+| `bigquery.skip_query_result_tables` and `bigquery.skip_hidden_datasets` options: `get_objects` drops the `anon…` tables of cached query results, in datasets named `_` and 40 hex digits, before fetching any table metadata (spiceai/bigquery#10, spiceai/bigquery#12) | The driver rejects the option, and every BigQuery ADBC catalog fails to load with "the BigQuery driver does not support the `bigquery.skip_query_result_tables` option" | silent (catalog fails to load) | `.github/actions/setup-adbc-bigquery` fails the driver build; the rejection is `crates/data_components/src/adbc_helpers.rs::bigquery_query_result_table_skip_tests::a_driver_without_the_option_rejects_it` |
+| `get_objects` fetches table metadata concurrently, bounded per connection, and skips a table only on a 403 `accessDenied` or a 404 (spiceai/bigquery#10) | Listing a hidden dataset fetches each table's metadata in turn, about 100 ms each; a quota 403 drops a readable table from the listing | silent (slow discovery, missing tables) | `.github/actions/setup-adbc-bigquery` fails the driver build |
+
 ## iceberg-rust
 
 Upstream [apache/iceberg-rust](https://github.com/apache/iceberg-rust), branch

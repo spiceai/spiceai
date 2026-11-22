@@ -23,11 +23,16 @@ url.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+futures.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+
+[[bench]]
+harness = false
+name = "response_read"
 
 [lints]
 workspace = true

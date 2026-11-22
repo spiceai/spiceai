@@ -11,6 +11,7 @@ version.workspace = true
 
 [dependencies]
 globset = { workspace = true }
+redact = { path = "../redact" }
 runtime-component = { path = "../runtime-component" }
 snafu.workspace = true
 

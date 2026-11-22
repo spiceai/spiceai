@@ -72,7 +72,7 @@ async fn runtime_shutdown_timeout_force() -> Result<(), anyhow::Error> {
 
             let app = AppBuilder::new("lineitem")
                 .with_dataset(get_s3_dataset(
-                    "s3://spiceai-public-datasets/tpch_sf100/lineitem.parquet",
+                    "s3://spice-datasets-gjezag77s0hu/tpch_sf100/lineitem.parquet",
                     "lineitem",
                 ))
                 .with_shutdown_timeout("5s")
@@ -161,7 +161,7 @@ async fn runtime_shutdown_timeout_grace() -> Result<(), anyhow::Error> {
 
             let app = AppBuilder::new("lineitem")
                 .with_dataset(get_s3_dataset(
-                    "s3://spiceai-public-datasets/tpch_sf100/lineitem.parquet",
+                    "s3://spice-datasets-gjezag77s0hu/tpch_sf100/lineitem.parquet",
                     "lineitem",
                 ))
                 .with_shutdown_timeout("20s")

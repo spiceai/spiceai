@@ -3890,6 +3890,7 @@ dependencies = [
  "async-trait",
  "futures",
  "rand 0.10.1",
+ "redact",
  "serde",
  "serde_json",
  "snafu",
@@ -4698,6 +4699,7 @@ dependencies = [
  "async-trait",
  "aws-kms-signer",
  "azure-key-vault-signer",
+ "bytes",
  "chrono",
  "connector-graphql",
  "data-connector-api",
@@ -4709,6 +4711,7 @@ dependencies = [
  "governor",
  "graphql-parser",
  "http 1.4.1",
+ "http-body-limit",
  "linkme",
  "reqwest 0.13.4",
  "runtime",
@@ -4754,6 +4757,7 @@ dependencies = [
  "futures",
  "graphql-parser",
  "http 1.4.1",
+ "http-body-limit",
  "linkme",
  "paste",
  "regex",
@@ -6276,6 +6280,7 @@ dependencies = [
  "object_store 0.13.2",
  "orc-rust",
  "paste",
+ "redact",
  "reqwest 0.13.4",
  "runtime-checkpoint-api",
  "runtime-component",
@@ -6300,6 +6305,7 @@ name = "data-connector-types"
 version = "2.5.0-unstable"
 dependencies = [
  "globset",
+ "redact",
  "runtime-component",
  "snafu",
 ]
@@ -6413,6 +6419,7 @@ dependencies = [
  "prost 0.14.3",
  "rand 0.10.1",
  "rdkafka",
+ "redact",
  "regex",
  "reqwest 0.13.4",
  "runtime-checkpoint-api",
@@ -6462,6 +6469,7 @@ dependencies = [
  "datafusion-physical-expr",
  "flate2",
  "futures",
+ "http-body-limit",
  "object_store 0.13.2",
  "serde_json",
  "snafu",
@@ -8105,6 +8113,7 @@ dependencies = [
  "async-trait",
  "cache",
  "chunking",
+ "redact",
  "runtime-rate-control",
  "snafu",
  "tokio",
@@ -10143,9 +10152,13 @@ dependencies = [
  "async-compression",
  "brotli",
  "bytes",
+ "datafusion-common",
+ "datafusion-execution",
+ "encoding_rs",
  "flate2",
  "futures",
  "http 1.4.1",
+ "mime",
  "reqwest 0.13.4",
  "snafu",
  "tokio",
@@ -11894,6 +11907,7 @@ dependencies = [
  "parking_lot",
  "paste",
  "rand 0.10.1",
+ "redact",
  "regex",
  "reqwest 0.13.4",
  "reqwest-eventsource",
@@ -14053,6 +14067,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "futures",
  "http-body 1.0.1",
  "humantime",
  "object_store 0.13.2",
@@ -16785,6 +16800,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
 
 [[package]]
+name = "redact"
+version = "2.5.0-unstable"
+dependencies = [
+ "percent-encoding",
+]
+
+[[package]]
 name = "redis"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17725,6 +17747,7 @@ dependencies = [
  "rayon",
  "rcgen",
  "rdkafka",
+ "redact",
  "regex",
  "repl",
  "reqwest 0.13.4",
@@ -18036,6 +18059,7 @@ dependencies = [
  "parking_lot",
  "prometheus",
  "prost 0.14.3",
+ "rcgen",
  "runtime-datafusion",
  "runtime-metrics",
  "runtime-proto",
@@ -18051,6 +18075,7 @@ dependencies = [
  "telemetry",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "tonic",
@@ -18328,6 +18353,7 @@ dependencies = [
  "opentelemetry-proto 0.32.0",
  "opentelemetry_sdk 0.32.1",
  "parking_lot",
+ "redact",
  "reqwest 0.13.4",
  "snafu",
  "spicepod",
@@ -18624,6 +18650,7 @@ dependencies = [
  "datafusion-table-providers",
  "fundu",
  "futures",
+ "http-body-limit",
  "humantime",
  "insta",
  "object_store 0.13.2",
@@ -18735,6 +18762,7 @@ dependencies = [
  "http-body-util",
  "itertools 0.14.0",
  "jsonschema",
+ "redact",
  "reqwest 0.13.4",
  "rmcp",
  "runtime-auth",
@@ -20527,6 +20555,7 @@ dependencies = [
  "prometheus",
  "prost 0.14.3",
  "rcgen",
+ "redact",
  "repl",
  "reqwest 0.13.4",
  "runtime",
@@ -20673,6 +20702,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "flate2",
  "flight_client",
  "futures",
  "hex",
@@ -20694,6 +20724,7 @@ dependencies = [
  "tokio",
  "tonic",
  "yaml",
+ "zstd 0.13.5",
 ]
 
 [[package]]
