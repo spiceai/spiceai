@@ -2742,7 +2742,11 @@ fn model_and_draft(weights: &[PathBuf]) -> (Option<PathBuf>, Option<PathBuf>) {
     // when nothing else is.
     let model: Vec<PathBuf> = trunk
         .iter()
-        .filter(|w| w.to_str().is_some_and(gguf_files::is_model_weights))
+        .filter(|w| {
+            w.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(gguf_files::is_model_weights)
+        })
         .cloned()
         .collect();
     let model = if model.is_empty() { trunk } else { model };
@@ -3465,6 +3469,20 @@ mod tests {
         assert_eq!(
             model_and_draft(&paths(&["Model-imatrix.gguf"])),
             (Some(PathBuf::from("Model-imatrix.gguf")), None)
+        );
+    }
+
+    /// A cache root whose path is not UTF-8 changes nothing: the file's own name decides
+    /// whether it is the model's weights.
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_root_that_is_not_utf8_still_opens_the_model_from_its_weights() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = Path::new(std::ffi::OsStr::from_bytes(b"/home/op\xff/hub"));
+        let weights = vec![root.join("mmproj-F16.gguf"), root.join("Model-Q4_K_M.gguf")];
+        assert_eq!(
+            model_and_draft(&weights),
+            (Some(root.join("Model-Q4_K_M.gguf")), None)
         );
     }
 
