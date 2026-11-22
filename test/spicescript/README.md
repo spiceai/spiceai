@@ -10,7 +10,9 @@ target/debug/spicescript --jobs 8 --spiced trunk=target/release/spiced test/spic
 ```
 
 The merge queue runs every script here except those tagged `tags: [long]`
-(`--exclude-tag long`), plus any script the PR adds or changes.
+(`--exclude-tag long`), plus any `long` or known-failing script the PR adds
+or changes. An edit to a script's `tags:` line alone does not count: it moves
+the script between runs without changing what it does.
 `trunk_tests.yml` runs every script after merge, on trunk. Use
 `--exclude-tag long` for a quick local run.
 
