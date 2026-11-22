@@ -726,7 +726,10 @@ pub fn resolve_with_drafters(
                 }
             };
             weights.extend(q.files.iter().cloned());
-            named_quantization = Some(q);
+            // A quantization the headers show to be a drafter loads beside the model, not as it.
+            if !q.files.first().is_some_and(|f| drafters.contains(f)) {
+                named_quantization = Some(q);
+            }
         }
     }
     // Each entry naming a shard expands to its whole series, so naming two shards repeats it.
@@ -1376,6 +1379,35 @@ mod tests {
                 "Model-Q4_K_M-00002-of-00002.gguf"
             ]
         );
+    }
+
+    /// A quantization named in `files` that the headers show to be a drafter is not the one the
+    /// model loads: the load names the weights' quantization, and takes their draft head.
+    #[test]
+    fn a_drafter_named_as_a_quantization_is_not_the_one_loaded() {
+        let repo = listing(&[
+            ("Model-Q4_K_M.gguf", GB),
+            ("Model-Q8_0.gguf", GB),
+            ("mtp-Model-Q4_K_M.gguf", GB / 10),
+        ]);
+        let drafters = BTreeSet::from(["Model-Q8_0.gguf".to_string()]);
+        for files in [&["Q4_K_M", "Q8_0"][..], &["Q8_0", "Q4_K_M"]] {
+            let resolved = resolve_with_drafters(&repo, files, &drafters)
+                .expect("Q4_K_M resolves beside its drafter")
+                .expect("Q4_K_M names weights");
+            assert_eq!(
+                (resolved.weights, resolved.draft, resolved.quantization),
+                (
+                    vec![
+                        "Model-Q4_K_M.gguf".to_string(),
+                        "Model-Q8_0.gguf".to_string()
+                    ],
+                    vec!["mtp-Model-Q4_K_M.gguf".to_string()],
+                    Some("Q4_K_M".to_string())
+                ),
+                "files {files:?}"
+            );
+        }
     }
 
     /// An engine that opens one file opens the model's weights, not a projector, importance

@@ -188,8 +188,8 @@ where
 /// The files whose headers decide a model's architecture, in the order to read them. An MTP
 /// draft head is set aside, as the engine sets it aside to draft with. Of the rest, the files
 /// that hold the model's weights by name ([`gguf_files::is_model_weights`]), or all of the rest
-/// when none does: the `-00001-of-` shard a sharded model is opened from, else every one. A
-/// projector named ahead of the weights names another architecture.
+/// when none does: the `-00001-of-` shards a sharded model is opened from first, then the others.
+/// A projector named ahead of the weights names another architecture.
 fn candidates<P: AsRef<Path>>(weights: &[P]) -> Vec<&P> {
     fn name<P: AsRef<Path>>(w: &P) -> Option<&str> {
         w.as_ref().file_name().and_then(|name| name.to_str())
@@ -204,12 +204,13 @@ fn candidates<P: AsRef<Path>>(weights: &[P]) -> Vec<&P> {
         .filter(|w| name(w).is_some_and(gguf_files::is_model_weights))
         .collect();
     let weights: Vec<&P> = if model.is_empty() { trunk } else { model };
-    let first: Vec<&P> = weights
-        .iter()
-        .copied()
-        .filter(|w| name(w).is_some_and(|name| name.contains("-00001-of-")))
-        .collect();
-    if first.is_empty() { weights } else { first }
+    // The engine opens a model from its first `-00001-of-` shard, else from its first file, and
+    // sets aside a drafter it tells by its header: read in that order, so that when the first
+    // file is a drafter's, passed over for its header, the weights' is read next.
+    let (first, rest): (Vec<&P>, Vec<&P>) = weights
+        .into_iter()
+        .partition(|w| name(w).is_some_and(|name| name.contains("-00001-of-")));
+    first.into_iter().chain(rest).collect()
 }
 
 /// The architecture a model of GGUF `weights` names in its first shard's header, read by
@@ -351,6 +352,16 @@ mod tests {
         assert_eq!(
             local_architecture(&[projector]).await,
             Some("clip".to_string())
+        );
+        // lone weights beside a sharded drafter: each set's opening file is read in turn, and
+        // the drafter's is passed over
+        let lone_weights = write("model-IQ4_XS.gguf", "qwen3");
+        let drafter_first = write("helper-Q8_0-00001-of-00002.gguf", "dflash");
+        let drafter_second = dir.path().join("helper-Q8_0-00002-of-00002.gguf");
+        std::fs::write(&drafter_second, b"no header").expect("the second shard is written");
+        assert_eq!(
+            local_architecture(&[lone_weights, drafter_first, drafter_second]).await,
+            Some("qwen3".to_string())
         );
         // an MTP head is set aside before the weights are looked for, sharded or not
         let imatrix_named = write("model-Q4_K_M-imatrix.gguf", "qwen3");
