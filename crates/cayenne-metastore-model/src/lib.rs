@@ -2735,14 +2735,14 @@ fn check_with_symmetry<M>(
     run: Run,
     representative: Option<Representative<M::State>>,
     explore: Option<&str>,
-) -> bool
+) -> Result<bool, String>
 where
     M: Model + Clone + Send + Sync + 'static,
     M::State: Clone + std::fmt::Debug + Send + Sync + std::hash::Hash + PartialEq,
     M::Action: Clone + PartialEq + std::fmt::Debug + Send + Sync,
 {
     if let Ok(spec) = std::env::var("WALK") {
-        return walk(&model, &run, &spec);
+        return Ok(walk(&model, &run, &spec));
     }
     println!("START {}", run.name);
     let _simulating = Simulating::start(run.seed.is_some());
@@ -2831,13 +2831,20 @@ where
     drop(finished);
     let joined = watchdog.join().is_ok();
     if let (Some(address), Some(model)) = (explore, explorer_model) {
+        // The check can run for minutes after `serve` first tried the address,
+        // so try it again just before serving. Stateright binds the address
+        // itself and panics if that fails; this leaves only the instant between
+        // the two binds for another process to take it.
+        if let Err(error) = std::net::TcpListener::bind(address) {
+            return Err(format!("Cannot serve the Explorer on {address}: {error}"));
+        }
         println!(
             "EXPLORER {} serving http://{address}/ (Ctrl-C to stop)",
             run.name
         );
         model.checker().threads(threads).serve(address);
     }
-    result && joined
+    Ok(result && joined)
 }
 /// Whether a run must reach the `sometimes` property `name`.
 fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
@@ -3227,7 +3234,14 @@ fn run_checks(name: &str, explore: Option<&str>) -> Result<(), String> {
     {
         return Err("Controls require EXHAUST=1".into());
     }
-    let good = dispatch(r, &mut CheckRun { explore }).unwrap_or(false);
+    let mut checker = CheckRun {
+        explore,
+        serve_error: None,
+    };
+    let good = dispatch(r, &mut checker).unwrap_or(false);
+    if let Some(error) = checker.serve_error {
+        return Err(error);
+    }
     if good {
         Ok(())
     } else {
@@ -3319,6 +3333,8 @@ trait Visitor {
 /// Checks a run, then serves it in the Explorer when `explore` names an address.
 struct CheckRun<'a> {
     explore: Option<&'a str>,
+    /// Why serving the Explorer failed after the check, if it did.
+    serve_error: Option<String>,
 }
 impl Visitor for CheckRun<'_> {
     fn visit<M>(
@@ -3332,7 +3348,10 @@ impl Visitor for CheckRun<'_> {
         M::State: Clone + std::fmt::Debug + Send + Sync + std::hash::Hash + PartialEq,
         M::Action: Clone + PartialEq + std::fmt::Debug + Send + Sync,
     {
-        check_with_symmetry(model, run, representative, self.explore)
+        check_with_symmetry(model, run, representative, self.explore).unwrap_or_else(|error| {
+            self.serve_error = Some(error);
+            false
+        })
     }
 }
 
