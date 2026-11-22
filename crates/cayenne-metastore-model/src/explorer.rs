@@ -684,3 +684,44 @@ pub(crate) fn steps<S: Clone, A>(path: stateright::Path<S, A>) -> Vec<(S, A, S)>
     }
     out
 }
+
+/// Breadth first, the actions from the first initial state to the first
+/// reachable state satisfying `wanted`, for tests that need a particular state.
+#[cfg(test)]
+pub(crate) fn path_to<M: stateright::Model>(
+    model: &M,
+    wanted: impl Fn(&M::State) -> bool,
+) -> Option<stateright::Path<M::State, M::Action>>
+where
+    M::State: Clone + Eq + std::hash::Hash,
+    M::Action: Clone + PartialEq,
+{
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let init = model.init_states().into_iter().next()?;
+    let mut parent: HashMap<M::State, (M::State, M::Action)> = HashMap::new();
+    let mut seen = HashSet::from([init.clone()]);
+    let mut queue = VecDeque::from([init.clone()]);
+    while let Some(state) = queue.pop_front() {
+        if wanted(&state) {
+            let mut actions = vec![];
+            let mut at = state;
+            while let Some((before, action)) = parent.get(&at) {
+                actions.push(action.clone());
+                at = before.clone();
+            }
+            actions.reverse();
+            return stateright::Path::from_actions(model, init, &actions);
+        }
+        let mut candidates = vec![];
+        model.actions(&state, &mut candidates);
+        for action in candidates {
+            if let Some(next) = model.next_state(&state, action.clone())
+                && seen.insert(next.clone())
+            {
+                parent.insert(next.clone(), (state.clone(), action));
+                queue.push_back(next);
+            }
+        }
+    }
+    None
+}

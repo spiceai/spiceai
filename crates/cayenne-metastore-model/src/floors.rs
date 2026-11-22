@@ -223,7 +223,18 @@ impl Model for Protocol {
             &state.store,
             crate::explorer::record_id,
         );
-        view.pin("reader's polled head", state.captured.as_ref());
+        // The reader rereads the live head once its floor has moved past the
+        // polled one (`Read`), so the polled head then needs nothing of its own.
+        match state.captured.as_ref() {
+            Some(polled) if polled.floor < state.store.floor => view.snapshots.push((
+                format!(
+                    "reader's polled head (floor {} < live floor {}): reads the live head",
+                    polled.floor, state.store.floor
+                ),
+                vec![],
+            )),
+            polled => view.pin("reader's polled head", polled),
+        }
         view.pin("running query", state.query.as_ref());
         Some(crate::explorer::stacked(&[view]))
     }
@@ -273,5 +284,24 @@ impl Model for Protocol {
                 state.store.revived
             }),
         ]
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::Protocol;
+    use stateright::Model;
+
+    /// Once the live floor passes the reader's polled floor, the reader reads
+    /// the live head, so the drawing says so instead of pinning old batches.
+    #[test]
+    fn superseded_poll_is_drawn_as_reading_the_live_head() {
+        let model = Protocol::new("floor-aligned", 6);
+        let path = crate::explorer::path_to(&model, |s| {
+            s.captured.as_ref().is_some_and(|p| p.floor < s.store.floor)
+        })
+        .expect("a poll the floor has moved past");
+        let svg = model.as_svg(path).expect("floors draws");
+        assert!(svg.contains("reads the live head"), "{svg}");
     }
 }
