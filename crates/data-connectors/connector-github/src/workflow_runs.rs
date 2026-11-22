@@ -198,6 +198,8 @@ pub struct WorkflowRunsTableProvider {
     workflow_id: Arc<str>,
     schema: SchemaRef,
     fetch_logs: bool,
+    /// The dataset's name, which a refused log names.
+    dataset_name: Arc<str>,
 }
 
 impl WorkflowRunsTableProvider {
@@ -263,7 +265,7 @@ impl WorkflowRunsTableProvider {
                 workflow_id.into(),
                 None,
                 Some(1),
-                false,
+                None,
             )
             .await
         {
@@ -298,6 +300,7 @@ impl WorkflowRunsTableProvider {
             workflow_id: workflow_id.into(),
             schema,
             fetch_logs,
+            dataset_name: Arc::from(dataset.name.to_string()),
         })
     }
 }
@@ -368,6 +371,7 @@ impl TableProvider for WorkflowRunsTableProvider {
             },
             limit,
             fetch_logs: self.fetch_logs,
+            dataset_name: Arc::clone(&self.dataset_name),
             schema: Arc::clone(&self.schema),
             client: Arc::clone(&self.client),
             properties: Arc::new(PlanProperties::new(
@@ -405,6 +409,7 @@ struct WorkflowRunsExecutionPlan {
     query_params: Option<HashMap<String, String>>,
     limit: Option<usize>,
     fetch_logs: bool,
+    dataset_name: Arc<str>,
     schema: SchemaRef,
     client: Arc<GithubRestClient>,
     properties: Arc<PlanProperties>,
@@ -541,20 +546,27 @@ impl ExecutionPlan for WorkflowRunsExecutionPlan {
     fn execute(
         &self,
         _partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
         let owner = Arc::clone(&self.owner);
         let repo = Arc::clone(&self.repo);
         let workflow_id = Arc::clone(&self.workflow_id);
         let query_params = self.query_params.clone();
         let limit = self.limit;
-        let fetch_logs = self.fetch_logs;
+        // Logs are charged to this query's memory pool while they are held.
+        let logs = self.fetch_logs.then(|| crate::github::WorkflowLogs {
+            memory_pool: Arc::clone(context.memory_pool()),
+            dataset_name: Arc::clone(&self.dataset_name),
+        });
         let client = Arc::clone(&self.client);
 
         let stream = futures::stream::once(
             client
-                .fetch_workflow_runs(owner, repo, workflow_id, query_params, limit, fetch_logs)
-                .map_err(DataFusionError::External),
+                .fetch_workflow_runs(owner, repo, workflow_id, query_params, limit, logs)
+                .map_err(|e| match e.downcast::<DataFusionError>() {
+                    Ok(error) => *error,
+                    Err(e) => DataFusionError::External(e),
+                }),
         )
         .try_flatten();
 
