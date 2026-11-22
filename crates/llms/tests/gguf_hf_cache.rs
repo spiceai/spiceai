@@ -20,10 +20,12 @@ limitations under the License.
 //! Selected in the `nextest` gate (see `NEXTEST_FILTER` in the Makefile), like the other
 //! credential-free `llms` integration tests.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use llms::chat::gguf_files::{self, ListedFile};
-use llms::chat::hf_files::{Budget, download_model};
+use llms::chat::hf_files::{Budget, download_model, model_architecture};
 use llms::hf::HubParams;
 
 const REPO_ID: &str = "spiceai-test/gguf-not-on-the-hub";
@@ -238,6 +240,88 @@ async fn a_model_with_no_files_loads_the_default_of_what_the_cache_holds() {
         .await
         .unwrap_or_else(|e| panic!("the cached Q8_0 loads: {e}"));
     assert_eq!(downloaded.gguf, ["Model-Q8_0.gguf"]);
+}
+
+/// A model split across nodes, with the Hub out of reach, resolves its files from each node's
+/// own cache. The node that loads the weights logs what the model loads. A node that reads only
+/// their architecture, as a rank other than 0 does, logs what it resolved at debug, never as
+/// what the model loads: the head sends it its share of the head's weights, which here are
+/// `Q4_K_M` while this node's cache holds only `Q8_0`.
+#[tokio::test]
+async fn only_the_node_that_loads_the_weights_says_what_the_model_loads() {
+    crate::require_process_per_test(WHY);
+    let cache = tempfile::tempdir().expect("creates a cache directory");
+    let snapshot = offline_snapshot(cache.path());
+    write_file(&snapshot, "Model-Q8_0.gguf");
+    let line = "llms::chat::hf_files: Model 'test' loads quantization Q8_0 (1 file, 0.0 GB) from Hugging Face repo 'spiceai-test/gguf-not-on-the-hub', the quantization a model with no `files` loads: its Q8_0, as llama.cpp loads it when a repository has no Q4_K_M. `HF_HUB_OFFLINE` is set, so Spice chose among what the Hugging Face cache holds, and a load that reads the Hub may choose another. The cache holds no other complete GGUF quantization of the repo.";
+
+    let (downloaded, log) = logged(download_model(
+        REPO_ID,
+        &[],
+        Budget::Split,
+        HubParams::default(),
+        "test",
+    ))
+    .await;
+    assert_eq!(
+        downloaded.expect("the cached Q8_0 loads").gguf,
+        ["Model-Q8_0.gguf"]
+    );
+    assert_eq!(resolution_lines(&log), [format!(" INFO {line}")], "{log}");
+
+    let (resolved, log) = logged(model_architecture(
+        REPO_ID,
+        &[],
+        Budget::Split,
+        HubParams::default(),
+        "test",
+    ))
+    .await;
+    assert_eq!(
+        resolved.expect("the cached Q8_0 is read").gguf,
+        ["Model-Q8_0.gguf"]
+    );
+    assert_eq!(resolution_lines(&log), [format!("DEBUG {line}")], "{log}");
+}
+
+/// `future`'s output, and what it logged at debug and above, without times or colours.
+async fn logged<T>(future: impl Future<Output = T>) -> (T, String) {
+    let log = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let writer = Arc::clone(&log);
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || Capture(Arc::clone(&writer)))
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let output = {
+        let _capture = tracing::subscriber::set_default(subscriber);
+        future.await
+    };
+    let log = String::from_utf8_lossy(&log.lock().expect("the log")).into_owned();
+    (output, log)
+}
+
+/// The lines of `log` the resolver wrote.
+fn resolution_lines(log: &str) -> Vec<String> {
+    log.lines()
+        .filter(|line| line.contains("llms::chat::hf_files:"))
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// A `tracing` writer into a shared buffer.
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("the log").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn listing(files: &[(&str, u64)]) -> Vec<ListedFile> {

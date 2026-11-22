@@ -84,7 +84,14 @@ pub async fn download_model(
     name: &str,
 ) -> Result<Downloaded, DownloadError> {
     let snapshot = open(model_id, hub, name).await?;
-    let gguf = resolve_gguf(&snapshot, files, budget, name, repo_of(model_id))?;
+    let gguf = resolve_gguf(
+        &snapshot,
+        files,
+        budget,
+        name,
+        repo_of(model_id),
+        Purpose::Load,
+    )?;
     let paths: Vec<&str> = gguf.iter().map(String::as_str).collect();
     let dir = download(&snapshot, &paths).await?;
     Ok(Downloaded { dir, gguf })
@@ -104,7 +111,9 @@ pub struct Resolved {
 /// `budget` as [`download_model`] resolves them, and the architecture their first shard's
 /// header names, both read from the Hub without downloading the weights. A node that holds a
 /// share of a model split across nodes decides from them which engine serves the model, as the
-/// node that downloads the weights does.
+/// node that downloads the weights does. It logs what it resolves at debug, not as what the
+/// model loads: the head loads the weights and says what they are, and with the Hub out of
+/// reach, each node resolving from its own cache, they need not be what this node resolved.
 ///
 /// # Errors
 ///
@@ -118,7 +127,14 @@ pub async fn model_architecture(
     name: &str,
 ) -> Result<Resolved, DownloadError> {
     let snapshot = open(model_id, hub, name).await?;
-    let gguf = resolve_gguf(&snapshot, files, budget, name, repo_of(model_id))?;
+    let gguf = resolve_gguf(
+        &snapshot,
+        files,
+        budget,
+        name,
+        repo_of(model_id),
+        Purpose::ReadArchitecture,
+    )?;
     let paths: Vec<&str> = gguf.iter().map(String::as_str).collect();
     let architecture = super::gguf_header::model_architecture(&paths, |file: &&str, len| {
         let file = (*file).to_string();
@@ -149,6 +165,24 @@ async fn open(model_id: &str, hub: HubParams<'_>, name: &str) -> Result<Snapshot
     crate::hf::open_model(requester, repo, revision, hub).await
 }
 
+/// What a node resolves a model's files for, which decides how it logs what it resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    /// To download and load them: the line says what the model loads.
+    Load,
+    /// To read their architecture only, as a node that holds a share of a model split across
+    /// nodes does: the line is logged at debug ([`model_architecture`]).
+    ReadArchitecture,
+}
+
+/// Logs `line`, which says what a model loads, as `purpose` decides.
+fn log_resolved(purpose: Purpose, line: &str) {
+    match purpose {
+        Purpose::Load => tracing::info!("{line}"),
+        Purpose::ReadArchitecture => tracing::debug!("{line}"),
+    }
+}
+
 /// The GGUF files a model loads from `snapshot`: those `files` resolve to, or with none named,
 /// the quantization `budget` chooses ([`choose_quantization`]), and its draft head. Empty for
 /// a repository that offers no GGUF quantization or that mistral.rs loads from safetensors.
@@ -158,6 +192,7 @@ fn resolve_gguf(
     budget: Budget,
     name: &str,
     repo: &str,
+    purpose: Purpose,
 ) -> Result<Vec<String>, DownloadError> {
     let listing: Vec<ListedFile> = snapshot
         .files()
@@ -170,7 +205,7 @@ fn resolve_gguf(
         .map_err(|error| DownloadError::unusable(snapshot, error.to_string()))?
     {
         if files.iter().any(|file| !is_gguf_path(file)) {
-            tracing::info!(
+            let line = format!(
                 "Model '{name}' loads {} from Hugging Face repo '{repo}'{}.",
                 describe(
                     resolved
@@ -188,6 +223,7 @@ fn resolve_gguf(
                         gguf_files::printable(draft)
                     ))
             );
+            log_resolved(purpose, &line);
         }
         return Ok(resolved
             .files()
@@ -200,7 +236,15 @@ fn resolve_gguf(
     if quantizations.is_empty() || weights(&names).is_some() {
         return Ok(Vec::new());
     }
-    let chosen = choose_quantization(snapshot, &listing, &quantizations, budget, name, repo)?;
+    let chosen = choose_quantization(
+        snapshot,
+        &listing,
+        &quantizations,
+        budget,
+        name,
+        repo,
+        purpose,
+    )?;
     let mut gguf = chosen.files.clone();
     gguf.extend(gguf_files::draft_head(&listing, chosen));
     Ok(gguf)
@@ -209,7 +253,8 @@ fn resolve_gguf(
 /// The quantization a model with no `files` loads: its default, the one llama.cpp's `-hf` loads
 /// ([`gguf_files::default_quantization`]), or, when the engine measures the memory and the
 /// default's weights do not fit it with room for the context, the largest that does. A split
-/// model and a build that cannot measure the memory take the default as it is.
+/// model and a build that cannot measure the memory take the default as it is. The line that
+/// says which is logged as `purpose` decides ([`log_resolved`]).
 fn choose_quantization<'q>(
     snapshot: &Snapshot,
     listing: &[ListedFile],
@@ -217,6 +262,7 @@ fn choose_quantization<'q>(
     budget: Budget,
     name: &str,
     repo: &str,
+    purpose: Purpose,
 ) -> Result<&'q Quantization, DownloadError> {
     let pin = |q: &Quantization| {
         gguf_files::pin(listing, q)
@@ -240,15 +286,15 @@ fn choose_quantization<'q>(
     let memory = match budget {
         Budget::Free(memory) if default.bytes > gguf_files::weights_budget(memory) => memory,
         Budget::Free(_) | Budget::Unmeasured | Budget::Split => {
-            tracing::info!("{}", line.default(default, quantizations));
+            log_resolved(purpose, &line.default(default, quantizations));
             return Ok(default);
         }
     };
     match gguf_files::choose(quantizations, gguf_files::weights_budget(memory)) {
         Ok(chosen) => {
-            tracing::info!(
-                "{}",
-                line.step_down(chosen, default, quantizations.len(), memory, &pin(chosen))
+            log_resolved(
+                purpose,
+                &line.step_down(chosen, default, quantizations.len(), memory, &pin(chosen)),
             );
             Ok(chosen)
         }
