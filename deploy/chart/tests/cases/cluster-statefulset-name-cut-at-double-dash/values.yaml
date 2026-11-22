@@ -1,0 +1,6 @@
+role: executor
+fullnameOverride: spice-executor-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx--y
+cluster:
+  schedulerAddress: https://spice-scheduler-spiceai:50052
+  tls:
+    secretName: spice-executor-tls

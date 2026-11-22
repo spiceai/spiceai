@@ -1,4 +1,5 @@
 name: results-cache
+tags: [long]
 description: >
   The SQL results cache answers a repeated query from the cache (case and
   whitespace aside), empty answers included but not statements about the

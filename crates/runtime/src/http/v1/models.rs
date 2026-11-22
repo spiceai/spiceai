@@ -208,13 +208,15 @@ pub(crate) async fn get(
                         None
                     }
                 });
+                // Reported as `/v1/datasets` reports a dataset's: without the credentials a URL
+                // in the model's `from` can carry.
                 let error_message = status
                     .as_ref()
-                    .and_then(|s| s.error_message().map(String::from));
+                    .and_then(|s| s.error_message().map(super::redact_message_credentials));
                 OpenAIModel {
                     id: m.name.clone(),
                     object: "model".to_string(),
-                    owned_by: m.from.clone(),
+                    owned_by: super::redact_source_credentials(&m.from),
                     datasets: d,
                     status,
                     error,
