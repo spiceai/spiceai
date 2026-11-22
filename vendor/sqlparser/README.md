@@ -34,7 +34,7 @@ The two source hunks of #2436, unchanged:
   the right operand short of `->` in the generic and MySQL dialects. `PostgreSqlDialect` has its
   own table and already ranked these operators above `IS`; Spice parses with that dialect.
 
-Two Spice changes that are not upstream:
+Three Spice changes that are not upstream:
 
 - `src/ast/mod.rs`, `impl Display for Ident`: a quoted identifier writes every quote character in
   its name twice. Upstream (0.62.0 and 0.63.0) skips a quote character that follows a backslash or
@@ -50,17 +50,24 @@ Two Spice changes that are not upstream:
   queries send client filter values to the source this way. An engine that reads a backslash as an
   escape needs its dialect to write the backslash as well.
 
+- `src/ast/mod.rs`, `impl Display for Expr`, `Expr::UnaryOp`: a minus sign before an operand that
+  starts with a minus sign, such as DataFusion's `-(-x)`, is written as `- -x`. Upstream (0.62.0
+  and 0.63.0) writes `--x`, which most engines read as a comment to the end of the line, so the
+  engine fails to parse the query or runs a different one. Federated queries send client filters
+  to the source this way.
+
 The rest of the crate is byte-for-byte the published 0.62.0 (`src/`, `Cargo.toml` apart from a
 header comment, `LICENSE.TXT`).
 
 To re-sync with a newer upstream release, drop this directory and the `[patch.crates-io]` entry
 once DataFusion depends on a sqlparser release that contains #2436 (0.63.0 or later) and writes
-every quote character of a quoted identifier and of a string literal twice. These tests fail if a
-fix is lost:
+every quote character of a quoted identifier and of a string literal twice and a space between
+two minus signs. These tests fail if a fix is lost:
 `crates/runtime-datafusion/tests/is_distinct_from_precedence.rs`, the spicescript
 `test/spicescript/sql-is-distinct-from-precedence.yaml`,
 `crates/runtime-datafusion/tests/quoted_identifier_escaping.rs`,
-`crates/runtime-datafusion/tests/string_literal_escaping.rs` and the string values of
+`crates/runtime-datafusion/tests/string_literal_escaping.rs`,
+`crates/runtime-datafusion/tests/unary_minus_spacing.rs` and the string values of
 `test/spicescript/postgres-literals.yaml`.
 
 [`sqlparser`]: https://crates.io/crates/sqlparser

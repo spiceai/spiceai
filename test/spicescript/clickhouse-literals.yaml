@@ -1,4 +1,5 @@
 name: clickhouse-literals
+tags: [long]
 description: >
   Every column of a ClickHouse table of edge values compared with each edge
   value of its type, in each comparison form (=, <, >=, <>, IN, BETWEEN),

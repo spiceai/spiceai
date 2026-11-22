@@ -66,7 +66,8 @@ pub enum Error {
     InvalidEndpoint { endpoint: String },
 
     #[snafu(display(
-        "Insecure HTTP endpoint '{endpoint}' requires 'allow_http: true' in the dataset parameters."
+        "Insecure HTTP endpoint '{}' requires 'allow_http: true' in the dataset parameters.",
+        redact::redact_url_credentials(endpoint)
     ))]
     InsecureEndpointWithoutAllowHTTP { endpoint: String },
 
@@ -361,4 +362,21 @@ pub async fn initiate_config_with_auth_method(
             });
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    /// The endpoint is named without the credentials its URL can carry.
+    #[test]
+    fn insecure_endpoint_message_leaves_out_url_credentials() {
+        let error = Error::InsecureEndpointWithoutAllowHTTP {
+            endpoint: "http://alice:hunter2@127.0.0.1:9000".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "Insecure HTTP endpoint 'http://127.0.0.1:9000' requires 'allow_http: true' in the dataset parameters."
+        );
+    }
 }

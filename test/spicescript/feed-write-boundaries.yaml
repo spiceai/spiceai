@@ -1,4 +1,5 @@
 name: feed-write-boundaries
+tags: [long]
 description: >
   PostgreSQL RETURNING row images preserve unsigned integer boundaries,
   exact decimals, NULL, empty strings and booleans through MongoDB and

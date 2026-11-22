@@ -59,6 +59,21 @@ pub enum Error {
     ))]
     ReqwestInternal { source: reqwest::Error },
 
+    /// The response body could not be read: refused as a compression bomb, or because the
+    /// query memory pool could not hold it, or it could not be read as sent.
+    #[snafu(display(
+        "Failed to read the GraphQL response from {endpoint} for {dataset}: {source}{}",
+        response_body_remedy(source, connector)
+    ))]
+    ResponseBody {
+        endpoint: String,
+        /// `dataset 'name'`, or `this dataset` when the client has no dataset name.
+        dataset: String,
+        /// The connector whose documentation page the error links.
+        connector: &'static str,
+        source: http_body_limit::Error,
+    },
+
     #[snafu(display("HTTP {status}: {message}"))]
     InvalidReqwestStatus {
         status: reqwest::StatusCode,
@@ -200,6 +215,12 @@ pub fn is_retriable_error(error: &Error) -> bool {
         Error::UnexpectedResponse { status, format, .. } => {
             response::is_retryable_unexpected_response(*status, *format)
         }
+        // A body that could not be read may have been cut short in transit, as a failed
+        // read is; one the query memory pool could not hold is not asked for again.
+        Error::ResponseBody { source, .. } => matches!(
+            source,
+            http_body_limit::Error::Decode { .. } | http_body_limit::Error::Io { .. }
+        ),
         Error::ReqwestInternal { source } => {
             // Check for transient network/connection errors:
             // - is_timeout(): Connection or request timeouts
@@ -219,6 +240,22 @@ pub fn is_retriable_error(error: &Error) -> bool {
                 })
         }
         _ => false,
+    }
+}
+
+/// What to do about a GraphQL response body that was refused, as the end of the
+/// sentence that names it. A compression bomb's cause already names its fix.
+fn response_body_remedy(source: &http_body_limit::Error, connector: &str) -> String {
+    match source {
+        http_body_limit::Error::MemoryLimit { .. } => {
+            ". Raise `runtime.query.memory_limit`, or request fewer rows per page. \
+             See: https://spiceai.org/docs/reference/memory"
+                .to_string()
+        }
+        http_body_limit::Error::CompressionRatio { .. } => {
+            format!(" See: https://spiceai.org/docs/components/data-connectors/{connector}")
+        }
+        _ => String::new(),
     }
 }
 

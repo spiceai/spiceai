@@ -246,7 +246,10 @@ impl DataConnectorFactory for S3Factory {
         if let Some(endpoint) = params.parameters.get("endpoint").expose().ok()
             && endpoint.ends_with('/')
         {
-            tracing::warn!("Trimming trailing '/' from S3 endpoint {endpoint}");
+            tracing::warn!(
+                "Trimming trailing '/' from S3 endpoint {}",
+                redact::redact_url_credentials(endpoint)
+            );
             params.parameters.insert(
                 "endpoint".to_string(),
                 endpoint.trim_end_matches('/').to_string().into(),
