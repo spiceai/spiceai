@@ -288,6 +288,22 @@ class CachedFetchTest(unittest.TestCase):
         self.assertEqual(self.source.count(SOURCE_PATH), 1)
         self.assertEqual(self.source.count(MIRROR_PATH), 1)
 
+    def test_a_retry_asks_only_the_source_urls_that_failed_transiently(self):
+        self.source.script[SOURCE_PATH] = [404]
+        self.source.script[MIRROR_PATH] = [503, CONTENT]
+        sources = [f"{self.source.url}{SOURCE_PATH}", f"{self.source.url}{MIRROR_PATH}"]
+        self.assert_fetched(self.run_fetch(cache=False, sources=sources))
+        self.assertEqual(self.source.requests, [SOURCE_PATH, MIRROR_PATH, MIRROR_PATH])
+
+    def test_a_source_url_without_the_file_is_asked_only_once(self):
+        self.source.script[SOURCE_PATH] = [404]
+        self.source.script[MIRROR_PATH] = [503]
+        sources = [f"{self.source.url}{SOURCE_PATH}", f"{self.source.url}{MIRROR_PATH}"]
+        proc = self.run_fetch(cache=False, sources=sources)
+        self.assert_failed(proc)
+        self.assertEqual(self.source.requests, [SOURCE_PATH] + [MIRROR_PATH] * 4)
+        self.assertIn("after 4 attempts", proc.stdout)
+
     # --- the host's cache directory ----------------------------------------------------
 
     def test_cache_dir_hit_makes_no_request(self):

@@ -161,7 +161,10 @@ runs:
         # against the manifest pinned in .github/ci-cache/pins.json; rustup checks the
         # component hashes again. RUSTUP_DIST_SERVER points at the mirror for this install
         # only, so a later `rustup target add` still reaches static.rust-lang.org. If any
-        # of it fails, the install below runs from static.rust-lang.org as before.
+        # of it fails, the install below runs from static.rust-lang.org as before. Only a
+        # toolchain without rustc or cargo is installed this way, since it replaces the
+        # whole toolchain directory: one that lacks only rustfmt or clippy keeps its
+        # targets and components, and `rustup component add` below adds the two.
         if [ -n "${CI_CACHE_URL:-}" ]; then
           case "$(uname -s)-$(uname -m)" in
             Linux-x86_64) cache_host=x86_64-unknown-linux-gnu ;;
@@ -171,8 +174,7 @@ runs:
             *) cache_host='' ;;
           esac
           cache_tool_dir="$rustup_home/toolchains/${toolchain}-${cache_host}"
-          if [ -n "$cache_host" ] && ! { [ -x "$cache_tool_dir/bin/rustc" ] && [ -x "$cache_tool_dir/bin/cargo" ] &&
-            [ -x "$cache_tool_dir/bin/rustfmt" ] && [ -x "$cache_tool_dir/bin/cargo-clippy" ]; }; then
+          if [ -n "$cache_host" ] && ! { [ -x "$cache_tool_dir/bin/rustc" ] && [ -x "$cache_tool_dir/bin/cargo" ]; }; then
             mirror="${RUNNER_TEMP:-/tmp}/rust-dist-${toolchain}"
             rm -rf "$mirror"
             status=0

@@ -10,9 +10,10 @@
 #   2. CI_CACHE_URL, the `ci-cache` bucket of the CI object store, read anonymously over
 #      HTTP as <CI_CACHE_URL>/sha256/<sha256>. CI_CACHE_ATTEMPTS tries (default 2, one
 #      retry), and a 404 is a miss, not retried.
-#   3. The source URLs, tried in order on every attempt. CI_SOURCE_ATTEMPTS tries (default
-#      4, three retries), retrying only a failure of the network or the server (408, 429,
-#      5xx): any other error, such as a 404, cannot succeed on a retry.
+#   3. The source URLs, tried in order. CI_SOURCE_ATTEMPTS tries (default 4, three
+#      retries), retrying only the URLs that failed with an error of the network or the
+#      server (408, 429, 5xx): any other error, such as a 404, cannot succeed on a retry,
+#      so that URL is not asked again.
 #
 # Every copy is checked against the pinned SHA-256 before it is used. A cached copy that
 # does not match is a miss, so a wrong or tampered entry costs a download from the source
@@ -182,7 +183,7 @@ write_back() {
 # 3. The source.
 delay="$source_delay"
 for ((attempt = 1; ; attempt++)); do
-  retry=false
+  retry_urls=()
   for url in "${sources[@]}"; do
     fetch "$url" 30 1800
     if [ "$status" -eq 0 ]; then
@@ -196,13 +197,13 @@ for ((attempt = 1; ; attempt++)); do
       exit 1
     fi
     if transient "$status" "$code"; then
-      retry=true
+      retry_urls+=("$url")
       echo "::warning::Downloading $name from $url failed with a network or server error (curl exit $status, HTTP $code, attempt $attempt of $source_attempts)."
     else
       echo "::warning::Downloading $name from $url failed (curl exit $status, HTTP $code), which a retry cannot fix."
     fi
   done
-  if [ "$retry" != true ]; then
+  if [ "${#retry_urls[@]}" -eq 0 ]; then
     echo "::error::Could not download $name: no source URL answered with the file, and none failed in a way a retry could fix."
     exit 1
   fi
@@ -213,4 +214,5 @@ for ((attempt = 1; ; attempt++)); do
   echo "Retrying the download of $name in ${delay}s."
   sleep "$delay"
   delay=$((delay * 2))
+  sources=("${retry_urls[@]}")
 done
