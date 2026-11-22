@@ -667,6 +667,9 @@ impl Model for Protocol {
     }
     fn format_action(&self, action: &Action) -> String {
         match action {
+            Action::Ingest(w) if self.has("no-intent") => {
+                format!("writer {w} sends A: actions + source position, with no intent for B")
+            }
             Action::Ingest(w) => {
                 format!("writer {w} sends A: actions + source position + intent for B")
             }
@@ -823,9 +826,16 @@ impl Model for Protocol {
                     .unwrap_or(0)
             };
             let event = match action {
-                Action::Ingest(w) => Event::on(w, "send Txn + intent")
-                    .to(lane_a)
-                    .tone(Tone::Staged),
+                Action::Ingest(w) => Event::on(
+                    w,
+                    if self.has("no-intent") {
+                        "send Txn (no intent)"
+                    } else {
+                        "send Txn + intent"
+                    },
+                )
+                .to(lane_a)
+                .tone(Tone::Staged),
                 Action::IssueApply(w) => Event::on(w, "send Apply").to(lane_b).tone(Tone::Staged),
                 Action::IssueDone(w) => Event::on(w, "send Done").to(lane_a).tone(Tone::Staged),
                 Action::SkipDone(w) => Event::on(w, "skip Done"),
@@ -980,5 +990,24 @@ impl Model for Protocol {
                 },
             ),
         ]
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::{Action, Protocol};
+    use stateright::Model;
+
+    /// Without the intent, the ingest label says the A record carries none.
+    #[test]
+    fn ingest_label_follows_the_intent_mode() {
+        assert_eq!(
+            Protocol::new("intent", 1).format_action(&Action::Ingest(0)),
+            "writer 0 sends A: actions + source position + intent for B"
+        );
+        assert_eq!(
+            Protocol::new("intent-no-intent", 1).format_action(&Action::Ingest(0)),
+            "writer 0 sends A: actions + source position, with no intent for B"
+        );
     }
 }
