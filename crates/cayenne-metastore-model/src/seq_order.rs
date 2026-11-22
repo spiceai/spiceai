@@ -513,7 +513,7 @@ impl Model for Protocol {
         let mut events = vec![];
         for (before, action, after) in steps(path) {
             let label = self.format_action(&action);
-            events.push(match action {
+            let event = match action {
                 Action::Buffer(i, ..) | Action::Seal(i) => Event::on(i, label).tone(Tone::Staged),
                 Action::Commit(i) | Action::Retry(i) => {
                     let ok = after.log.len() > before.log.len();
@@ -547,7 +547,8 @@ impl Model for Protocol {
                     .to(head)
                     .tone(if ok { Tone::Live } else { Tone::Gone })
                 }
-            });
+            };
+            events.push(event.breaking(&crate::explorer::broken(self, &before, &after)));
         }
         Some(state_and_trace(&boxes, &Timeline { lanes, events }))
     }

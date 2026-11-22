@@ -558,7 +558,7 @@ impl Model for Protocol {
         let mut events = vec![];
         for (before, action, after) in steps(path) {
             let label = self.format_action(&action);
-            events.push(match action {
+            let event = match action {
                 Action::Tick => {
                     Event::on(source, format!("clock -> {}", after.now)).tone(Tone::Gone)
                 }
@@ -600,7 +600,8 @@ impl Model for Protocol {
                 Action::ReplicaRead | Action::ReplicaExpire(_) | Action::ReplicaSweep(_) => {
                     Event::on(gc, label).to(replica)
                 }
-            });
+            };
+            events.push(event.breaking(&crate::explorer::broken(self, &before, &after)));
         }
         Some(state_and_trace(&boxes, &Timeline { lanes, events }))
     }

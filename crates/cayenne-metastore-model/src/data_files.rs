@@ -1705,7 +1705,7 @@ impl Model for Protocol {
         let mut events = vec![];
         for (before, action, after) in steps(path) {
             let label = self.format_action(&action);
-            events.push(match action {
+            let event = match action {
                 Action::StartUpload(w) => Event::on(w, label).to(lane_store).tone(Tone::Staged),
                 Action::FinishUpload(i) => {
                     let w = before.puts.get(i).map_or(0, |(w, _)| *w);
@@ -1756,7 +1756,8 @@ impl Model for Protocol {
                 Action::Tick => {
                     Event::on(lane_readers, format!("clock -> {}", after.now)).tone(Tone::Gone)
                 }
-            });
+            };
+            events.push(event.breaking(&crate::explorer::broken(self, &before, &after)));
         }
         Timeline {
             lanes: lane_names,

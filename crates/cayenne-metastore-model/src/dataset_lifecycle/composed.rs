@@ -766,7 +766,10 @@ impl Model for Protocol {
             // "snapshot rows or error" allows an error (a missing delayed object
             // erroring is a witness), so an error is drawn as an outcome, not a
             // violation; wrong rows show in the summary against the source.
-            let tone = if s.result == Some(Err(())) {
+            let wrong = !crate::explorer::holds(self, s, "snapshot rows or error");
+            let tone = if wrong {
+                Tone::Bad
+            } else if s.result == Some(Err(())) {
                 Tone::Gone
             } else {
                 Tone::Actor
@@ -776,7 +779,11 @@ impl Model for Protocol {
                     0,
                     bottom + 20,
                     0,
-                    &format!("QUERY on commit {v} (retained until clock {})", s.expires),
+                    &format!(
+                        "QUERY on commit {v} (retained until clock {}){}",
+                        s.expires,
+                        if wrong { " - WRONG ROWS" } else { "" }
+                    ),
                     &files,
                     tone,
                 )

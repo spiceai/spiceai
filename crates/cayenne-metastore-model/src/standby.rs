@@ -510,7 +510,7 @@ impl Model for Protocol {
                     .to(i)
                     .tone(Tone::Actor),
             };
-            events.push(ev);
+            events.push(ev.breaking(&crate::explorer::broken(self, &before, &after)));
         }
         let mut boxes: Vec<(String, Vec<String>, Tone)> = last
             .instances

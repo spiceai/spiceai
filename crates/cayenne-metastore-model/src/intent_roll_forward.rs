@@ -822,7 +822,7 @@ impl Model for Protocol {
                     .position(|w| w.epoch == epoch)
                     .unwrap_or(0)
             };
-            events.push(match action {
+            let event = match action {
                 Action::Ingest(w) => Event::on(w, "send Txn + intent")
                     .to(lane_a)
                     .tone(Tone::Staged),
@@ -874,7 +874,8 @@ impl Model for Protocol {
                     lane_b
                 }),
                 Action::OtherWrite => Event::on(lane_m, "second writer's keyed write").to(lane_b),
-            });
+            };
+            events.push(event.breaking(&crate::explorer::broken(self, &before, &after)));
         }
         Timeline {
             lanes: lane_names,
