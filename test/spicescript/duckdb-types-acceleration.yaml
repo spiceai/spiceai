@@ -161,7 +161,9 @@ steps:
 
   # 3,000 rows of decimals, past Cayenne's inline limit, each written out
   # digit by digit so no value passes through a float: every third row is
-  # negative and every eleventh NULL.
+  # negative and every eleventh NULL. Rows 3001 and 3002 fill every digit of
+  # each precision, one positive and one negative, in different groups, so the
+  # grouped and filtered sums reach 38 digits without overflowing.
   - source-exec:
       src: |
         CREATE TABLE dec AS
@@ -171,6 +173,9 @@ steps:
           CAST(printf('%s%d.%010d', sg, (g * 15485863) % 1000000000000000000, (g * 7907) % 10000000000) AS DECIMAL(38, 10)) AS d38
         FROM (SELECT g, CASE WHEN g % 3 = 0 THEN '-' ELSE '' END AS sg FROM range(1, 3001) r(g));
         UPDATE dec SET d10 = NULL, d20 = NULL, d38 = NULL WHERE id % 11 = 0;
+        INSERT INTO dec VALUES
+          (3001, 99999999.99, 9999999999999999.9999, 9999989999999999999999999999.9999999999),
+          (3002, -99999999.99, -9999999999999999.9999, -9999989999999999999999999999.9999999999);
 
   - start: {}
 
