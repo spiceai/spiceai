@@ -231,7 +231,7 @@ async fn what_the_cache_lacks_is_retried_and_says_how_to_fill_it() {
         (
             &[],
             Budget::Free(1),
-            "none of its GGUF quantizations fits the 0.0 GiB of memory free for the model with room for the context; the smallest, Q4_K_M, is 0.0 GB. Name one in the model's `files` to load it anyway, across machines with `nodes` if one cannot hold it: Q4_K_M (0.0 GB)",
+            "none of its GGUF quantizations fits the 0.0 GiB of memory free for the model with room for the context; the smallest, Model-Q4_K_M.gguf, is 0.0 GB. Name one in the model's `files` to load it anyway, across machines with `nodes` if one cannot hold it: Model-Q4_K_M.gguf (0.0 GB)",
         ),
     ] {
         let error = download_model(REPO_ID, files, budget, HubParams::default(), "test")
@@ -244,6 +244,58 @@ async fn what_the_cache_lacks_is_retried_and_says_how_to_fill_it() {
         );
         assert!(!error.is_configuration_error(), "{files:?}");
     }
+}
+
+/// A `DFlash` drafter, which the engine tells by its header, can be named beside the model's
+/// weights under a name that does not say it is one: its header is read before two sets of
+/// weights are refused, and it goes after the weights, which a model opens from. Two sets of
+/// weights the headers do not tell apart are refused.
+#[tokio::test]
+async fn a_drafter_told_by_its_header_can_be_named_beside_the_weights() {
+    crate::require_process_per_test(WHY);
+    let cache = tempfile::tempdir().expect("creates a cache directory");
+    let snapshot = offline_snapshot(cache.path());
+    write_gguf(&snapshot, "Model-Q4_K_M.gguf", "qwen3");
+    write_gguf(&snapshot, "Model-Q8_0.gguf", "qwen3");
+    write_gguf(&snapshot, "assistant.gguf", "dflash");
+
+    for files in [
+        &["Q4_K_M", "assistant.gguf"][..],
+        &["assistant.gguf", "Q4_K_M"],
+    ] {
+        let downloaded = download_model(
+            REPO_ID,
+            files,
+            Budget::Unmeasured,
+            HubParams::default(),
+            "test",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{files:?} must load the weights and the drafter: {e}"));
+        assert_eq!(
+            downloaded.gguf,
+            ["Model-Q4_K_M.gguf", "assistant.gguf"],
+            "{files:?}"
+        );
+    }
+
+    let error = download_model(
+        REPO_ID,
+        &["Q4_K_M", "Model-Q8_0.gguf"],
+        Budget::Unmeasured,
+        HubParams::default(),
+        "test",
+    )
+    .await
+    .expect_err("two sets of weights");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Failed to download model 'test' from Hugging Face repo '{REPO_ID}' (revision 'main'): `HF_HUB_OFFLINE` is set, so Spice read only the Hugging Face cache at '{}', where `files` names 2 sets of model weights there, Q4_K_M, Q8_0, and a model loads one; name one of them. Run `hf download {REPO_ID} --revision main` while online, or unset `HF_HUB_OFFLINE`. See: https://spiceai.org/docs/components/models/huggingface",
+            cache.path().display()
+        )
+    );
+    assert!(!error.is_configuration_error());
 }
 
 /// A name several quantizations in the cache answer to says so of the cache, and to name one of
@@ -489,6 +541,27 @@ fn write_file(snapshot: &Path, path: &str) {
         std::fs::create_dir_all(dir).expect("creates the file's folder");
     }
     std::fs::write(&file, b"GGUF").expect("writes the cached file");
+}
+
+/// Writes a GGUF for `path` in the snapshot whose header names `architecture`, as a drafter's
+/// (`dflash`) or a model's, and holds nothing else.
+fn write_gguf(snapshot: &Path, path: &str, architecture: &str) {
+    let string = |bytes: &mut Vec<u8>, text: &str| {
+        bytes.extend_from_slice(&(text.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(text.as_bytes());
+    };
+    let mut bytes = b"GGUF".to_vec();
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    string(&mut bytes, "general.architecture");
+    bytes.extend_from_slice(&8u32.to_le_bytes());
+    string(&mut bytes, architecture);
+    let file = snapshot.join(path);
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir).expect("creates the file's folder");
+    }
+    std::fs::write(&file, bytes).expect("writes the cached GGUF");
 }
 
 /// Lays out an empty snapshot of [`REPO_ID`] at `main` in the Hugging Face cache `cache`,

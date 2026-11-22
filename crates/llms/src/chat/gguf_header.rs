@@ -151,6 +151,16 @@ fn scan(reader: &mut Reader<'_>) -> Result<Header, Short> {
     Ok(Header::Unknown)
 }
 
+/// Whether the GGUF whose first `len` bytes `read` returns is a `DFlash` drafter by its header,
+/// as the engine tells one apart from the model's weights.
+pub(crate) async fn names_a_drafter<F, Fut, E>(read: F) -> Result<bool, E>
+where
+    F: Fn(u64) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, E>>,
+{
+    Ok(read_architecture(read).await?.as_deref() == Some(DRAFTER))
+}
+
 /// The architecture in the header of a GGUF whose first `len` bytes `read` returns, reading
 /// more until the key is found or [`MAX_READ`] bytes were read.
 async fn read_architecture<F, Fut, E>(read: F) -> Result<Option<String>, E>

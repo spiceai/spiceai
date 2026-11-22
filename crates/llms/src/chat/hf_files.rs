@@ -32,6 +32,7 @@ limitations under the License.
 //! the engine reports less memory than its weights need, the largest complete quantization that
 //! fits.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -68,7 +69,8 @@ pub struct ChosenFromCache {
     pub pinned: String,
     /// Why only the cache was read, as a clause ([`Snapshot::cache_only_reason`]).
     pub reason: String,
-    /// Whether `HF_HUB_OFFLINE` is set ([`Snapshot::is_offline`]), which only a restart without
+    /// Whether `HF_HUB_OFFLINE` or `TRANSFORMERS_OFFLINE` is set ([`Snapshot::is_offline`]),
+    /// which only a restart without
     /// it clears; with the Hub out of reach instead, a later load can read the Hub's listing.
     pub offline: bool,
 }
@@ -110,7 +112,8 @@ pub async fn download_model(
         name,
         repo_of(model_id),
         Purpose::Load,
-    )?;
+    )
+    .await?;
     let paths: Vec<&str> = gguf.iter().map(String::as_str).collect();
     let dir = download(&snapshot, &paths).await?;
     Ok(Downloaded {
@@ -157,7 +160,8 @@ pub async fn model_architecture(
         name,
         repo_of(model_id),
         Purpose::ReadArchitecture,
-    )?;
+    )
+    .await?;
     let paths: Vec<&str> = gguf.iter().map(String::as_str).collect();
     let architecture = super::gguf_header::model_architecture(&paths, |file: &&str, len| {
         let file = (*file).to_string();
@@ -211,7 +215,7 @@ fn log_resolved(purpose: Purpose, line: &str) {
 /// a repository that offers no GGUF quantization or that mistral.rs loads from safetensors.
 /// With the quantization chosen from a listing of the cache alone, also what was chosen
 /// ([`ChosenFromCache`]).
-fn resolve_gguf(
+async fn resolve_gguf(
     snapshot: &Snapshot,
     files: &[&str],
     budget: Budget,
@@ -231,8 +235,25 @@ fn resolve_gguf(
     } else {
         ListedFrom::Repository
     };
-    if let Some(resolved) = gguf_files::resolve(&listing, files)
-        .map_err(|error| DownloadError::unusable(snapshot, error.clause(from)))?
+    let resolved = match gguf_files::resolve(&listing, files) {
+        // The engine tells a `DFlash` drafter by its header, so one can be named beside the
+        // weights under a name that does not say it is one: read the headers of the sets of
+        // weights before refusing them.
+        Err(gguf_files::ResolveError::SeveralWeights { opening, .. }) => {
+            let mut drafters = BTreeSet::new();
+            for file in opening {
+                if super::gguf_header::names_a_drafter(|len| snapshot.read_prefix(&file, len))
+                    .await?
+                {
+                    drafters.insert(file);
+                }
+            }
+            gguf_files::resolve_with_drafters(&listing, files, &drafters)
+        }
+        resolved => resolved,
+    };
+    if let Some(resolved) =
+        resolved.map_err(|error| DownloadError::unusable(snapshot, error.clause(from)))?
     {
         if files.iter().any(|file| !is_gguf_path(file)) {
             let line = format!(
@@ -308,7 +329,7 @@ fn choose_quantization<'q>(
     repo: &str,
     purpose: Purpose,
 ) -> Result<&'q Quantization, DownloadError> {
-    let Some(default) = gguf_files::default_quantization(quantizations) else {
+    let Some(default) = gguf_files::default_quantization(listing, quantizations) else {
         return Err(DownloadError::unusable(
             snapshot,
             "it offers no complete GGUF quantization".to_string(),
@@ -336,15 +357,7 @@ fn choose_quantization<'q>(
                     default,
                     quantizations.len(),
                     memory,
-                    &pinned(
-                        listing,
-                        chosen,
-                        if cache_only.is_some() {
-                            ListedFrom::Cache
-                        } else {
-                            ListedFrom::Repository
-                        },
-                    ),
+                    &pinned(listing, chosen, line.from()),
                 ),
             );
             Ok(chosen)
@@ -356,10 +369,10 @@ fn choose_quantization<'q>(
                 gibibytes(memory),
                 smallest.map_or_else(String::new, |q| format!(
                     "; the smallest, {}, is {}",
-                    gguf_files::printable(&q.name),
+                    gguf_files::printable(name_in(q, line.from())),
                     gigabytes(q.bytes)
                 )),
-                listed(quantizations)
+                listed(quantizations, line.from())
             ),
         )),
     }
@@ -376,6 +389,15 @@ struct LoadLine<'a> {
 }
 
 impl LoadLine<'_> {
+    /// Where the listing the line names quantizations from came from.
+    fn from(&self) -> ListedFrom {
+        if self.cache_only.is_some() {
+            ListedFrom::Cache
+        } else {
+            ListedFrom::Repository
+        }
+    }
+
     /// The line for `default`, the quantization a model with no `files` loads, of
     /// `quantizations`, the complete GGUF quantizations listed.
     fn default(&self, default: &Quantization, quantizations: &[Quantization]) -> String {
@@ -387,7 +409,7 @@ impl LoadLine<'_> {
             count => format!(
                 " To load another of {}, name it in the model's `files`: {}.",
                 offered(count, self.cache_only.is_some()),
-                listed(quantizations)
+                listed(quantizations, self.from())
             ),
         };
         format!(
@@ -469,14 +491,28 @@ fn default_reason(quantizations: &[Quantization], default: &Quantization) -> Str
 }
 
 /// `BF16 (1.2 GB), Q8_0 (0.6 GB), ...`: the quantizations a model's `files` can name, largest
-/// first, as a load line or an error lists them. Past [`gguf_files::LISTED`], the rest are
-/// counted: `..., and 3 more`.
-fn listed(quantizations: &[Quantization]) -> String {
+/// first, as a load line or an error lists them, each as [`name_in`] names it. Past
+/// [`gguf_files::LISTED`], the rest are counted: `..., and 3 more`.
+fn listed(quantizations: &[Quantization], from: ListedFrom) -> String {
     gguf_files::listed(
         quantizations
             .iter()
-            .map(|q| format!("{} ({})", q.name, gigabytes(q.bytes))),
+            .map(|q| format!("{} ({})", name_in(q, from), gigabytes(q.bytes))),
     )
+}
+
+/// What a model's `files` names `quantization` by, as a load line or an error advises it: its
+/// name, or, from a listing of the cache alone, its first file's path. A name read from one
+/// cache can name another quantization, or several, once the Hub's listing is read, as a folder
+/// that holds one quantization in the cache and two in the repository; a path names one file.
+fn name_in(quantization: &Quantization, from: ListedFrom) -> &str {
+    match from {
+        ListedFrom::Repository => &quantization.name,
+        ListedFrom::Cache => quantization
+            .files
+            .first()
+            .map_or(quantization.name.as_str(), String::as_str),
+    }
 }
 
 /// `quantization Q4_K_M (1 file, 18.3 GB)`: a quantization Spice chose, with its size.
@@ -737,16 +773,16 @@ mod tests {
         };
 
         assert_eq!(
-            listed(&quantizations(3)),
+            listed(&quantizations(3), ListedFrom::Repository),
             "Q3 (0.3 GB), Q2 (0.2 GB), Q1 (0.1 GB)"
         );
 
-        let forty = listed(&quantizations(40));
+        let forty = listed(&quantizations(40), ListedFrom::Repository);
         assert_eq!(forty.matches(" GB)").count(), 40);
         assert!(forty.starts_with("Q40 (4.0 GB), Q39 (3.9 GB), "), "{forty}");
         assert!(forty.ends_with(", Q2 (0.2 GB), Q1 (0.1 GB)"), "{forty}");
 
-        let many = listed(&quantizations(43));
+        let many = listed(&quantizations(43), ListedFrom::Repository);
         assert_eq!(many.matches(" GB)").count(), 40);
         assert!(many.starts_with("Q43 (4.3 GB), Q42 (4.2 GB), "), "{many}");
         assert!(
@@ -756,9 +792,9 @@ mod tests {
     }
 
     /// The load line of a model with no `files` names what it loads, from what, and how to
-    /// load another: of the repository's quantizations, or, with the Hub not read, of the
-    /// cache's, which a load that reads the Hub may choose otherwise from; and says when there
-    /// is no other.
+    /// load another: of the repository's quantizations, by name, or, with the Hub not read, of
+    /// the cache's, by path, which a load that reads the Hub may choose otherwise from; and says
+    /// when there is no other.
     #[test]
     fn a_load_line_says_what_it_chose_among() {
         let quantization = |name: &str, bytes: u64| Quantization {
@@ -793,7 +829,7 @@ mod tests {
         assert_eq!(
             line(offline).default(&q8, &[q8.clone(), q2.clone()]),
             format!(
-                "{start} Q8_0 (1 file, 0.6 GB) from Hugging Face repo 'o/m', the quantization a model with no `files` loads: its Q8_0, as llama.cpp loads it when a repository has no Q4_K_M. `HF_HUB_OFFLINE` is set, so Spice chose among what the Hugging Face cache holds, and a load that reads the Hub may choose another. To load another of the 2 complete GGUF quantizations in the cache, name it in the model's `files`: Q8_0 (0.6 GB), Q2_K (0.3 GB)."
+                "{start} Q8_0 (1 file, 0.6 GB) from Hugging Face repo 'o/m', the quantization a model with no `files` loads: its Q8_0, as llama.cpp loads it when a repository has no Q4_K_M. `HF_HUB_OFFLINE` is set, so Spice chose among what the Hugging Face cache holds, and a load that reads the Hub may choose another. To load another of the 2 complete GGUF quantizations in the cache, name it in the model's `files`: Model-Q8_0.gguf (0.6 GB), Model-Q2_K.gguf (0.3 GB)."
             )
         );
         assert_eq!(

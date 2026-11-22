@@ -157,7 +157,11 @@ pub enum ResolveError {
         weights.len(),
         listed(weights)
     ))]
-    SeveralWeights { weights: Vec<String> },
+    SeveralWeights {
+        weights: Vec<String>,
+        /// The file each set opens from, in the same order: its first shard, or itself.
+        opening: Vec<String>,
+    },
 }
 
 /// What a listing holds: the repository's files, as the Hub lists them, or only those the
@@ -200,7 +204,7 @@ impl ResolveError {
                 printable(name),
                 listed(available)
             ),
-            (Self::SeveralWeights { weights }, ListedFrom::Cache) => format!(
+            (Self::SeveralWeights { weights, .. }, ListedFrom::Cache) => format!(
                 "`files` names {} sets of model weights there, {}, and a model loads one; name one of them",
                 weights.len(),
                 listed(weights)
@@ -640,6 +644,21 @@ pub fn resolve(
     listing: &[ListedFile],
     files: &[&str],
 ) -> std::result::Result<Option<Resolved>, ResolveError> {
+    resolve_with_drafters(listing, files, &BTreeSet::new())
+}
+
+/// [`resolve`], with the sets of weights that open from a file in `drafters` taken for drafters,
+/// as the engine tells a `DFlash` drafter by its header: they are not counted as a second set of
+/// weights, and they go after the weights, which a model opens from.
+///
+/// # Errors
+///
+/// As [`resolve`].
+pub fn resolve_with_drafters(
+    listing: &[ListedFile],
+    files: &[&str],
+    drafters: &BTreeSet<String>,
+) -> std::result::Result<Option<Resolved>, ResolveError> {
     if files.is_empty() {
         return Ok(None);
     }
@@ -723,20 +742,32 @@ pub fn resolve(
         .iter()
         .flat_map(|q| q.files.iter().map(|f| (f.as_str(), q.name.as_str())))
         .collect();
-    let mut sets: BTreeMap<(String, Option<u32>), String> = BTreeMap::new();
-    for w in weights.iter().filter(|w| is_model_weights(w)) {
+    // The file a set opens from: its first shard, or itself.
+    let opening =
+        |w: &str| shard(w).map_or_else(|| w.to_string(), |(stem, _, n)| shard_path(&stem, 1, n));
+    let mut sets: BTreeMap<(String, Option<u32>), (String, String)> = BTreeMap::new();
+    for w in weights
+        .iter()
+        .filter(|w| is_model_weights(w) && !drafters.contains(&opening(w)))
+    {
         let key = shard(w).map_or_else(|| (w.clone(), None), |(stem, _, n)| (stem, Some(n)));
         sets.entry(key).or_insert_with(|| {
-            names
+            let name = names
                 .get(w.as_str())
-                .map_or_else(|| w.clone(), |n| (*n).to_string())
+                .map_or_else(|| w.clone(), |n| (*n).to_string());
+            (name, opening(w))
         });
     }
     if sets.len() > 1 {
-        return Err(ResolveError::SeveralWeights {
-            weights: sets.into_values().collect(),
-        });
+        let (weights, opening) = sets.into_values().unzip();
+        return Err(ResolveError::SeveralWeights { weights, opening });
     }
+    // A drafter goes after the weights, so that an engine that opens the first file opens them.
+    let (mut weights, drafted): (Vec<String>, Vec<String>) = weights
+        .into_iter()
+        .partition(|w| !drafters.contains(&opening(w)));
+    let model_weights = weights.clone();
+    weights.extend(drafted);
     if weights.is_empty() && draft.is_empty() {
         return Ok(None);
     }
@@ -745,7 +776,7 @@ pub fn resolve(
             draft = draft_head(listing, q);
         }
         quantization = Some(q.name.clone());
-    } else if let Some(q) = quantizations.iter().find(|q| q.files == weights) {
+    } else if let Some(q) = quantizations.iter().find(|q| q.files == model_weights) {
         quantization = Some(q.name.clone());
     }
     Ok(Some(Resolved {
@@ -773,11 +804,37 @@ pub const DEFAULT_TAGS: [&str; 2] = ["Q4_K_M", "Q8_0"];
 /// path. A path carries a tag where the tag follows the path's start, `-`,
 /// `.` or `/` and comes before `.` or `-`, in any case, so `Model-UD-Q4_K_M.gguf` carries
 /// `Q4_K_M`, `Q4_K_M/model.gguf` does not (only its folder bears the tag), and `BF16` does not
-/// carry `F16`. `None` when there is none.
+/// carry `F16`. A merged file stands for the shards beside it (`M-Q4_K_M.gguf` and
+/// `M-Q4_K_M-00001-of-00002.gguf` …), so it goes by the earlier of its path and its first
+/// shard's in `listing`, where llama.cpp meets the quantization first. `None` when there is none.
 #[must_use]
-pub fn default_quantization(quantizations: &[Quantization]) -> Option<&Quantization> {
+pub fn default_quantization<'q>(
+    listing: &[ListedFile],
+    quantizations: &'q [Quantization],
+) -> Option<&'q Quantization> {
+    // Where llama.cpp meets `q` in the listing: its first file's path, or, for a merged file,
+    // the earlier of that and its first shard's.
+    fn at<'a>(q: &'a Quantization, first_shards: &BTreeMap<String, &'a str>) -> &'a str {
+        let first = q.files.first().map_or("", String::as_str);
+        let shards = shard(first)
+            .is_none()
+            .then(|| first.strip_suffix(".gguf"))
+            .flatten()
+            .and_then(|stem| first_shards.get(stem).copied());
+        shards.map_or(first, |shards| shards.min(first))
+    }
+    // The first shard of each series, by its stem, for a merged file that stands for one.
+    let mut first_shards: BTreeMap<String, &str> = BTreeMap::new();
+    for file in listing {
+        if let Some((stem, 1, _)) = shard(&file.path) {
+            first_shards
+                .entry(stem)
+                .and_modify(|first| *first = (*first).min(file.path.as_str()))
+                .or_insert(file.path.as_str());
+        }
+    }
     let mut by_path: Vec<&Quantization> = quantizations.iter().collect();
-    by_path.sort_by(|a, b| a.files.first().cmp(&b.files.first()));
+    by_path.sort_by(|a, b| at(a, &first_shards).cmp(at(b, &first_shards)));
     DEFAULT_TAGS
         .iter()
         .find_map(|tag| by_path.iter().copied().find(|q| carries(q, tag)))
@@ -1083,8 +1140,26 @@ mod tests {
         ])
     }
 
+    /// llama.cpp meets a quantization offered both merged and split at its first shard, which
+    /// sorts before the merged file's path, so the merged file that stands for it goes by the
+    /// earlier of the two, and an `-alt` file between them is not the default.
+    #[test]
+    fn a_merged_file_goes_by_its_first_shard_for_the_default() {
+        let merged = listing(&[
+            ("M-Q4_K_M-00001-of-00002.gguf", GB),
+            ("M-Q4_K_M-00002-of-00002.gguf", GB),
+            ("M-Q4_K_M-alt.gguf", 2 * GB),
+            ("M-Q4_K_M.gguf", 2 * GB),
+        ]);
+        let quantizations = quantizations(&merged);
+        assert_eq!(
+            default_quantization(&merged, &quantizations).map(|q| q.files.clone()),
+            Some(vec!["M-Q4_K_M.gguf".to_string()])
+        );
+    }
+
     fn default_name(listing: &[ListedFile]) -> Option<String> {
-        default_quantization(&quantizations(listing)).map(|q| q.name.clone())
+        default_quantization(listing, &quantizations(listing)).map(|q| q.name.clone())
     }
 
     #[test]
@@ -1098,7 +1173,7 @@ mod tests {
         // Else the first by path: Qwen3.8's UD-Q2_K_XL/ before UD-Q3_K_XL/. Its MTP heads carry
         // Q4_K_M and Q8_0 but are not quantizations of the model.
         assert_eq!(default_name(&qwen38()).as_deref(), Some("UD-Q2_K_XL"));
-        assert_eq!(default_quantization(&[]), None);
+        assert_eq!(default_quantization(&[], &[]), None);
     }
 
     #[test]
