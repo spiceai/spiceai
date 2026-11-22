@@ -92,7 +92,13 @@ large runs prefer the printed links.
 facts its drawing leaves out: the serial history or source, what a reader sees
 next to what the source says, and the witness and violation flags that are set.
 "Complete State?" still shows the raw `Debug` state. Most models also draw their
-state; the drawings live in `src/explorer.rs` and come in three kinds:
+state; the drawings live in `src/explorer.rs` and come in three kinds: Action labels describe the protocol's own step. Where a control changes what a
+step visibly publishes (a split staging call, a late stamp, a takeover without a
+head generation, an A record with no intent, data and position in two commits),
+the label says so; where a control only removes a guard inside the step, the label
+is the protocol's, and the control's run and its row in the controls tables below
+say what it removes. Red never depends on a label: it comes from the model's own
+properties.
 
 | Drawing | What it shows | Families |
 |---|---|---|
