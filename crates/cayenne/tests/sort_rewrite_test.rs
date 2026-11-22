@@ -57,11 +57,27 @@ async fn create_sorted_table(
     sort_columns: Vec<String>,
     runtime_env: Arc<RuntimeEnv>,
 ) -> Arc<CayenneTableProvider> {
-    let vortex_config = VortexConfig {
-        sort_columns,
-        ..VortexConfig::default()
-    };
+    create_table_with_config(
+        fixture,
+        table_name,
+        schema,
+        VortexConfig {
+            sort_columns,
+            ..VortexConfig::default()
+        },
+        runtime_env,
+    )
+    .await
+}
 
+/// [`create_sorted_table`] with a caller-chosen `VortexConfig`.
+async fn create_table_with_config(
+    fixture: &common::TestFixture,
+    table_name: &str,
+    schema: Arc<Schema>,
+    vortex_config: VortexConfig,
+    runtime_env: Arc<RuntimeEnv>,
+) -> Arc<CayenneTableProvider> {
     let context = CayenneContext::new(
         &vortex_config,
         Arc::clone(&runtime_env),
@@ -574,48 +590,96 @@ async fn test_sort_rewrite_then_insert_impl(
 test_with_backends!(test_sort_rewrite_orders_nulls_and_duplicates_across_files_impl);
 
 /// The full compaction sorts each scan partition on its own and merges them.
-/// With a nullable, heavily duplicated key spread over several input files, the
-/// written order must still be one ascending, NULLs-last sequence holding every
-/// input row exactly once. (Order across several output files is checked by
-/// `layout_pruning_ab_test`.)
+/// With a nullable, heavily duplicated key spread over several input files and
+/// a 1 MB target file size (so the output rolls over into several files), the
+/// written order must be one ascending, NULLs-last sequence across every file
+/// boundary, holding every input row exactly once.
 async fn test_sort_rewrite_orders_nulls_and_duplicates_across_files_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use arrow::array::BinaryArray;
+    use common::lookup_index::SplitMix64;
+
+    /// Bytes of seeded random padding per row: incompressible, so a 1 MB file
+    /// holds about 5,000 rows and the 30,000 rows below span several files.
+    const PAD_BYTES: usize = 200;
+    const INSERTS: i64 = 6;
+    const ROWS_PER_INSERT: i64 = 5_000;
+
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("k", DataType::Int64, true),
+        Field::new("pad", DataType::Binary, false),
     ]));
     let setup_ctx = SessionContext::new();
-    let table = create_sorted_table(
+    let table = create_table_with_config(
         &fixture,
         "sort_nulls_files",
         Arc::clone(&schema),
-        vec!["k".to_string()],
+        VortexConfig {
+            sort_columns: vec!["k".to_string()],
+            target_vortex_file_size_mb: 1,
+            ..VortexConfig::default()
+        },
         setup_ctx.runtime_env(),
     )
     .await;
 
-    // 6 inserts (6 files) of 2,000 rows; every insert spans the whole key range.
+    // 6 inserts (6 input files); every insert spans the whole key range.
     let key = |id: i64| (id % 37 != 0).then(|| (id * 7_919) % 500);
+    let mut rng = SplitMix64(0x5EED_F11E_5000);
     let mut expected: Vec<(Option<i64>, i64)> = Vec::new();
-    for file in 0..6_i64 {
-        let values: Vec<String> = (0..2_000_i64)
-            .map(|i| {
-                let id = i * 6 + file;
-                expected.push((key(id), id));
-                match key(id) {
-                    Some(k) => format!("({id}, {k})"),
-                    None => format!("({id}, NULL)"),
-                }
+    for file in 0..INSERTS {
+        let ids: Vec<i64> = (0..ROWS_PER_INSERT).map(|i| i * INSERTS + file).collect();
+        let keys: Vec<Option<i64>> = ids.iter().map(|&id| key(id)).collect();
+        let pads: Vec<Vec<u8>> = ids
+            .iter()
+            .map(|_| {
+                (0..PAD_BYTES / 8)
+                    .flat_map(|_| rng.next_u64().to_le_bytes())
+                    .collect()
             })
             .collect();
-        sql_insert(&table, "sort_nulls_files", &values.join(", ")).await;
+        expected.extend(keys.iter().copied().zip(ids.iter().copied()));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int64Array::from(keys)),
+                Arc::new(BinaryArray::from_iter_values(pads.iter())),
+            ],
+        )?;
+        common::insert_batch(&table, batch).await?;
     }
 
     // The second pass reads the snapshot the first attested as sorted; it must
     // write the same single order again.
-    assert!(table.force_full_compaction().await?, "first pass commits");
-    assert!(table.force_full_compaction().await?, "second pass commits");
+    for pass in ["first", "second"] {
+        assert!(table.force_full_compaction().await?, "{pass} pass commits");
+        let files = file_key_ranges(&fixture, &table).await;
+        assert!(
+            files.len() >= 3,
+            "the {pass} pass must roll over into several files, so the order is \
+             checked across file boundaries: {files:?}"
+        );
+        for pair in files.windows(2) {
+            let (prev, next) = (&pair[0], &pair[1]);
+            assert!(
+                prev.nulls == 0 || next.min.is_none(),
+                "NULLs sort last, so only files after one holding NULLs may hold them, \
+                 and those hold nothing else: {files:?}"
+            );
+            if let (Some(prev_max), Some(next_min)) = (prev.max, next.min) {
+                assert!(
+                    prev_max <= next_min,
+                    "{} (max {prev_max}) must end at or before {} (min {next_min}) begins: \
+                     {files:?}",
+                    prev.name,
+                    next.name
+                );
+            }
+        }
+    }
 
     // One partition reads the snapshot's files in order as a single stream, so
     // this is the physical order the rewrite wrote.
@@ -1025,4 +1089,70 @@ async fn test_sort_rewrite_waits_for_a_running_compaction_impl(
     assert_eq!(collect_i64_column(&results, "id"), vec![1, 2, 3]);
 
     Ok(())
+}
+
+/// The footer statistics of `k` in one data file of a table's current snapshot.
+#[derive(Debug)]
+struct FileKeyRange {
+    name: String,
+    /// `None` when the file holds no non-NULL `k`.
+    min: Option<i64>,
+    max: Option<i64>,
+    nulls: u64,
+}
+
+/// [`FileKeyRange`] of every data file in `table`'s current snapshot, in file
+/// name order, which is the order the rewrite's single writer emitted them.
+async fn file_key_ranges(
+    fixture: &common::TestFixture,
+    table: &Arc<CayenneTableProvider>,
+) -> Vec<FileKeyRange> {
+    use vortex::VortexSessionDefault;
+    use vortex::expr::stats::Stat;
+    use vortex::file::OpenOptionsSessionExt;
+    use vortex_session::VortexSession;
+
+    let dir = fixture
+        .data_path
+        .join(table.table_id())
+        .join(table.current_snapshot_id());
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .expect("read snapshot dir")
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "vortex"))
+        .collect();
+    paths.sort();
+    let column = table.schema().index_of("k").expect("k in schema");
+    let mut ranges = Vec::with_capacity(paths.len());
+    for path in paths {
+        let session = VortexSession::default();
+        let file = session
+            .open_options()
+            .open_path(&path)
+            .await
+            .expect("open data file");
+        let stats = file.file_stats().expect("data file has footer statistics");
+        let (set, dtype) = stats.get(column);
+        let nulls = set
+            .get_as::<u64>(
+                Stat::NullCount,
+                &vortex::dtype::DType::Primitive(
+                    vortex::dtype::PType::U64,
+                    vortex::dtype::Nullability::NonNullable,
+                ),
+            )
+            .into_inner()
+            .expect("footer null count of k");
+        ranges.push(FileKeyRange {
+            name: path
+                .file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .into_owned(),
+            min: set.get_as::<i64>(Stat::Min, dtype).into_inner(),
+            max: set.get_as::<i64>(Stat::Max, dtype).into_inner(),
+            nulls,
+        });
+    }
+    ranges
 }
