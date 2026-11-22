@@ -722,6 +722,168 @@ mod tests {
         }
     }
 
+    /// The scan keys floats by their bits, so `0.0` and `-0.0`, and two NaNs
+    /// with different payloads, are distinct keys. The hash maps `-0.0` to
+    /// `0.0`, so a signed-zero pair collides and falls back to the scan; NaN
+    /// payloads hash apart, so a NaN pair takes the fast path. Either way the
+    /// grouping is the scan's.
+    #[test]
+    fn float_keys_equal_as_numbers_group_as_the_scan_does() {
+        let nan = |payload: u64| f64::from_bits(0x7ff8_0000_0000_0000 | (payload << 40));
+        for (values, fast_path) in [(vec![0.0, -0.0], false), (vec![nan(1), nan(2)], true)] {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "the NaN payloads sit in bits an f32 keeps"
+            )]
+            let columns: [ArrayRef; 2] = [
+                Arc::new(arrow::array::Float64Array::from(values.clone())),
+                Arc::new(arrow::array::Float32Array::from(
+                    values.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+                )),
+            ];
+            for column in columns {
+                let case = format!("{} {values:?}", column.data_type());
+                let batch = change_batch(&["c"; 2], &vec![vec!["key0"]; 2], vec![column]);
+                assert_eq!(distinct_upserts(&batch), fast_path, "{case}: fast path");
+                let expected = vec![(ChangeOperationType::Upsert, vec![0, 1])];
+                assert_eq!(group_by_scan(&batch), expected, "{case}: scan");
+                assert_eq!(group_into_sub_batches(&batch), expected, "{case}");
+            }
+        }
+    }
+
+    /// One per key type the fast path accepts, so the differential below
+    /// checks every hash implementation against the scan's byte encoding.
+    const KEY_TYPE_COUNT: usize = 22;
+
+    /// Builds a key column of type `kind` from small integers. Narrow types
+    /// wrap, which adds duplicate keys. Floats map 0 to `0.0`, 1 to `-0.0`
+    /// (when `negative_zero`), and 7 and 8 to NaNs with different payloads, so
+    /// one batch of distinct keys can hold values that compare equal as numbers
+    /// but differ in bits.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "wrapping into narrow key types creates the duplicate keys the sweep needs"
+    )]
+    fn key_column(kind: usize, values: &[Option<i32>], negative_zero: bool) -> ArrayRef {
+        use arrow::array::{
+            BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array, Float64Array,
+            Int8Array, Int16Array, LargeStringArray, Time32MillisecondArray, Time32SecondArray,
+            Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+            TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+            UInt16Array, UInt64Array,
+        };
+        // The NaN payloads sit in high mantissa bits so they survive the cast
+        // to `f32`.
+        let float = |v: i32| -> f64 {
+            match v {
+                1 if negative_zero => -0.0,
+                7 => f64::from_bits(0x7ff8_0100_0000_0000),
+                8 => f64::from_bits(0x7ff8_0200_0000_0000),
+                _ => f64::from(v) / 4.0,
+            }
+        };
+        let map = |f: &dyn Fn(i32) -> i64| -> Vec<Option<i64>> {
+            values.iter().map(|v| v.map(f)).collect()
+        };
+        let ints = map(&|v| i64::from(v));
+        match kind {
+            0 => Arc::new(Int32Array::from(values.to_vec())),
+            1 => Arc::new(Int64Array::from(ints)),
+            2 => Arc::new(StringArray::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| format!("κ\0/{v}")))
+                    .collect::<Vec<_>>(),
+            )),
+            3 => Arc::new(LargeStringArray::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| format!("κ\0/{v}")))
+                    .collect::<Vec<_>>(),
+            )),
+            4 => Arc::new(BooleanArray::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| v % 2 == 0))
+                    .collect::<Vec<_>>(),
+            )),
+            5 => Arc::new(Int8Array::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| v as i8))
+                    .collect::<Vec<_>>(),
+            )),
+            6 => Arc::new(Int16Array::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| v as i16))
+                    .collect::<Vec<_>>(),
+            )),
+            7 => Arc::new(UInt8Array::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| v as u8))
+                    .collect::<Vec<_>>(),
+            )),
+            8 => Arc::new(UInt16Array::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| v as u16))
+                    .collect::<Vec<_>>(),
+            )),
+            9 => Arc::new(UInt32Array::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| v as u32))
+                    .collect::<Vec<_>>(),
+            )),
+            10 => Arc::new(UInt64Array::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| v as u64))
+                    .collect::<Vec<_>>(),
+            )),
+            11 => Arc::new(Float32Array::from(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| float(v) as f32))
+                    .collect::<Vec<_>>(),
+            )),
+            12 => Arc::new(Float64Array::from(
+                values.iter().map(|v| v.map(float)).collect::<Vec<_>>(),
+            )),
+            13 => Arc::new(Date32Array::from(values.to_vec())),
+            14 => Arc::new(Date64Array::from(map(&|v| i64::from(v) * 86_400_000))),
+            15 => Arc::new(Time32SecondArray::from(values.to_vec())),
+            16 => Arc::new(Time32MillisecondArray::from(values.to_vec())),
+            17 => Arc::new(Time64MicrosecondArray::from(map(&|v| i64::from(v)))),
+            18 => Arc::new(Time64NanosecondArray::from(map(&|v| i64::from(v)))),
+            19 => match values.len() % 4 {
+                0 => Arc::new(TimestampSecondArray::from(map(&|v| i64::from(v)))),
+                1 => Arc::new(TimestampMillisecondArray::from(map(&|v| i64::from(v)))),
+                2 => Arc::new(
+                    TimestampMicrosecondArray::from(map(&|v| i64::from(v))).with_timezone("+05:30"),
+                ),
+                _ => Arc::new(TimestampNanosecondArray::from(map(&|v| i64::from(v)))),
+            },
+            20 => Arc::new(
+                Decimal128Array::from(
+                    values
+                        .iter()
+                        .map(|v| v.map(|v| i128::from(v) * 10_i128.pow(30)))
+                        .collect::<Vec<_>>(),
+                )
+                .with_precision_and_scale(38, 4)
+                .expect("valid decimal precision"),
+            ),
+            _ => Arc::new(Decimal128Array::from(
+                values.iter().map(|v| v.map(i128::from)).collect::<Vec<_>>(),
+            )),
+        }
+    }
+
     #[test]
     fn grouping_matches_scan_for_seeded_batches() {
         const SEED: u64 = 0x1a9e_427b_d530_6fc1;
@@ -729,7 +891,8 @@ mod tests {
         let mut random = Random(SEED);
         let mut eligible = 0;
         let key_names = ["key0", "key1", "key2"];
-        for iteration in 0..720 {
+        let mut eligible_kinds = [false; KEY_TYPE_COUNT];
+        for iteration in 0..2400 {
             let rows = if iteration == 0 { 0 } else { random.below(301) };
             let key_count = 1 + random.below(3);
             let scenario = iteration % 12;
@@ -745,6 +908,7 @@ mod tests {
                 }
             }
             let mut columns = Vec::new();
+            let mut kinds = Vec::new();
             for _ in 0..key_count {
                 let values = ids
                     .iter()
@@ -757,22 +921,10 @@ mod tests {
                         }
                     })
                     .collect::<Vec<_>>();
-                let column: ArrayRef = match random.below(3) {
-                    0 => Arc::new(Int32Array::from(values)),
-                    1 => Arc::new(Int64Array::from(
-                        values
-                            .into_iter()
-                            .map(|v| v.map(i64::from))
-                            .collect::<Vec<_>>(),
-                    )),
-                    _ => Arc::new(StringArray::from(
-                        values
-                            .into_iter()
-                            .map(|v| v.map(|v| format!("κ\0/{v}")))
-                            .collect::<Vec<_>>(),
-                    )),
-                };
-                columns.push(column);
+                let kind = random.below(KEY_TYPE_COUNT);
+                kinds.push(kind);
+                let sign = random.below(2) == 0;
+                columns.push(key_column(kind, &values, sign));
             }
             let mut ops = (0..rows)
                 .map(|_| ["c", "u", "r"][random.below(3)])
@@ -801,7 +953,12 @@ mod tests {
                 _ => {}
             }
             let batch = change_batch(&ops, &keys, columns);
-            eligible += usize::from(distinct_upserts(&batch));
+            if distinct_upserts(&batch) {
+                eligible += 1;
+                for &kind in &kinds {
+                    eligible_kinds[kind] = true;
+                }
+            }
             assert_eq!(
                 group_into_sub_batches(&batch),
                 group_by_scan(&batch),
@@ -811,6 +968,10 @@ mod tests {
         assert!(
             eligible > 0,
             "seed={SEED:#x}: no batch exercised the fast path"
+        );
+        assert_eq!(
+            eligible_kinds, [true; KEY_TYPE_COUNT],
+            "seed={SEED:#x}: a key type never reached the fast path"
         );
     }
 }
