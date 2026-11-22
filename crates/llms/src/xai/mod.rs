@@ -47,6 +47,7 @@ use crate::chat::{
     ApiErrorKind, Chat, Error,
     nsql::{SqlGeneration, json::JsonSchemaSqlGeneration},
 };
+use crate::model_http::{BoundedService, Limits};
 use crate::openai::default_rate_controller;
 
 static DEFAULT_ENDPOINT: &str = "https://api.x.ai/v1";
@@ -72,11 +73,11 @@ impl Xai {
             .with_api_base(endpoint)
             .with_api_key(api_key);
 
-        // No retries, as `crate::provider::client_without_retry`. The service also reads xAI's
-        // error bodies, which `async-openai` cannot.
-        let http_client = reqwest::Client::new();
-        let client = Client::build(http_client.clone(), cfg)
-            .with_http_service(error::XaiErrorService::new(http_client));
+        // The same retry policy and bounds as `crate::provider::client_without_retry`. The service
+        // also reads xAI's error bodies, which `async-openai` cannot.
+        let service = BoundedService::new(Limits::default());
+        let client = Client::build(service.http_client().clone(), cfg)
+            .with_http_service(error::XaiErrorService::new(service));
 
         Self {
             model: model.unwrap_or(DEFAULT_MODEL).to_string(),

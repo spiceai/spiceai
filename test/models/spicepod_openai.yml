@@ -33,7 +33,7 @@ datasets:
           overlap_size: 128
           trim_whitespace: false
 
-  - from: s3://spiceai-public-datasets/tpcds/catalog_page/
+  - from: s3://spice-datasets-gjezag77s0hu/tpcds/catalog_page/
     name: catalog_page
     description: Represents an e-commerce platform's catalog page metadata
     params:

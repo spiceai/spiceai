@@ -1,4 +1,5 @@
 name: feed-generate
+tags: [long]
 description: >
   The built-in feed sources generate the same typed rows as PostgreSQL,
   accept source-neutral inserts, updates and deletes, and keep NULL distinct

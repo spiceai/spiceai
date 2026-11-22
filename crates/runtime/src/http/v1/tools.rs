@@ -25,7 +25,7 @@ use axum::{
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tools::SpiceModelTool;
+use tools::{SpiceModelTool, ToolCallDenied};
 
 use crate::{
     Runtime,
@@ -188,6 +188,12 @@ pub(crate) async fn search(
             example = json!({"message": "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured."})
         ),
         (
+            status = 403,
+            description = "The tool can change data or act outside Spice, and the credentials on the request do not allow write access",
+            body = serde_json::Value,
+            example = json!({"message": "Failed to call tool 'store_memory': the tool can change data or act outside Spice, and the credentials on this request do not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth"})
+        ),
+        (
             status = 404,
             description = "Tool not found",
             body = serde_json::Value,
@@ -221,11 +227,22 @@ pub(crate) async fn post(
 
     match tool.call(body.as_str()).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"message": format!("Error calling tool {tool_name}: {e}")})),
-        )
-            .into_response(),
+        Err(e) => {
+            // The caller may not call the tool (or a tool `tool_invoke` resolved): a read-write
+            // tool needs a principal with write access.
+            if let Some(denied) = ToolCallDenied::find(e.as_ref()) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"message": denied.to_string()})),
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"message": format!("Error calling tool {tool_name}: {e}")})),
+            )
+                .into_response()
+        }
     }
 }
 

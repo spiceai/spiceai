@@ -207,9 +207,12 @@ pub fn cases() -> Vec<Case> {
                 Some(Expectation::NoulBelow(0.5)),
             )],
         ),
+        // Not "the same charge twice": a duplicate charge also reads as a defect, so a
+        // hosted model sometimes sent it to "technical" (bugs). A request for an invoice
+        // copy fits only "billing".
         case(
             "choice",
-            "My invoice shows the same charge twice.",
+            "Please send me a copy of last month's invoice for my expense report.",
             vec![(
                 "team",
                 choice(TEAM_QUESTION, &TEAMS),

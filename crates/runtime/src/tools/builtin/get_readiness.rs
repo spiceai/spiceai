@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use runtime_status as status;
 use serde_json::Value;
 use snafu::ResultExt;
-use tools::SpiceModelTool;
+use tools::{SpiceModelTool, ToolAccess};
 
 pub struct GetReadinessTool {
     name: String,
@@ -55,7 +55,12 @@ impl SpiceModelTool for GetReadinessTool {
         None
     }
 
-    async fn call(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    /// Reads the readiness of the runtime's components.
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadOnly
+    }
+
+    async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::get_readiness", tool = self.name().to_string());
 
         let statuses = self.status.get_all_statuses();

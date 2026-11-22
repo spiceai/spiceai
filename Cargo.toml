@@ -37,11 +37,13 @@ members = [
     "crates/duckdb-oracle",
     "crates/duration-parse",
     "crates/http-body-limit",
+    "crates/http-retry",
     "crates/dynamodb-streams",
     "crates/event_stream",
     "crates/flight_client",
     "crates/repl",
     "crates/result-compare",
+    "crates/redact",
     "crates/google-genai",
     "crates/hash-index",
     "crates/huggingface-hub",
@@ -78,7 +80,6 @@ members = [
     "crates/runtime-api-types",
     "crates/runtime-checkpoint-api",
     "crates/runtime-checkpoint-sqlite",
-    "crates/runtime-checkpoint-postgres",
     "crates/runtime-auth",
     "crates/runtime-metrics",
     "crates/runtime-async",
@@ -519,7 +520,7 @@ uuid = "1"
 # verifier and `vstd` ship together, so this moves with `VERUS_VSTD_VERSION` in
 # `.github/workflows/verus_verify.yml`.
 vstd = "=0.0.0-2026-11-01-0251"
-wasmtime = { version = "48.0.8", default-features = false, features = ["cranelift", "runtime", "std"] }
+wasmtime = { version = "48.0.9", default-features = false, features = ["cranelift", "runtime", "std"] }
 wat = "1.248.0"
 
 flatbuffers = "25.2.10"
@@ -597,41 +598,41 @@ lto = "off"
 adbc_core = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "7caad4ccc7050b0721778a426eef38f0f151fef9" } # branch: spiceai-25 (ADBC 25)
 adbc_driver_manager = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "7caad4ccc7050b0721778a426eef38f0f151fef9" }
 adbc_ffi = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "7caad4ccc7050b0721778a426eef38f0f151fef9" }
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" } # branch: spiceai-55 (DataFusion 55.3.0, SQL semantics fixes for #15538, spiceai/datafusion#275, spiceai/datafusion#277, spiceai/datafusion#280, spiceai/datafusion#281, spiceai/datafusion#282, spiceai/datafusion#276, spiceai/datafusion#285, spiceai/datafusion#283, spiceai/datafusion#287, spiceai/datafusion#286, spiceai/datafusion#288, spiceai/datafusion#274, spiceai/datafusion#295, spiceai/datafusion#296, spiceai/datafusion#300)
-datafusion-catalog = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-catalog-listing = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-common-runtime = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-datasource-arrow = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-datasource-csv = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-datasource-json = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-datasource-parquet = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-doc = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-functions = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-functions-aggregate = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-functions-aggregate-common = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-functions-nested = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-functions-table = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-functions-window = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-functions-window-common = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-macros = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-optimizer = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-physical-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-physical-expr-adapter = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-physical-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-physical-optimizer = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-physical-plan = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-proto = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-proto-common = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-spark = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
-datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev = "e6d76c543c870e1da23d4daa6195731f08ff3f50" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" } # branch: spiceai-55 (DataFusion 55.3.0, SQL semantics fixes for #15538, spiceai/datafusion#275, spiceai/datafusion#277, spiceai/datafusion#280, spiceai/datafusion#281, spiceai/datafusion#282, spiceai/datafusion#276, spiceai/datafusion#285, spiceai/datafusion#283, spiceai/datafusion#287, spiceai/datafusion#286, spiceai/datafusion#288, spiceai/datafusion#274, spiceai/datafusion#295, spiceai/datafusion#296, spiceai/datafusion#300, spiceai/datafusion#301)
+datafusion-catalog = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-catalog-listing = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-common-runtime = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-datasource-arrow = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-datasource-csv = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-datasource-json = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-datasource-parquet = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-doc = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-functions = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-functions-aggregate = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-functions-aggregate-common = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-functions-nested = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-functions-table = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-functions-window = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-functions-window-common = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-macros = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-optimizer = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-physical-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-physical-expr-adapter = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-physical-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-physical-optimizer = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-physical-plan = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-proto = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-proto-common = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-spark = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
+datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev = "59d7744e63e188b7bc577eba7f450cf73859a467" }
 
 # Local vendored fork of `mysql-common-derive` (path: vendor/mysql-common-derive)
 # that drops the unmaintained `proc-macro-error2` dependency (RUSTSEC-2026-0173).
@@ -650,8 +651,10 @@ tantivy-query-grammar = { path = "vendor/tantivy-query-grammar" }
 # apache/datafusion-sqlparser-rs#2436 backported: the right operand of
 # `IS [NOT] DISTINCT FROM` swallowed a following `AND`/`OR`, so
 # `a IS DISTINCT FROM b OR c` parsed as `a IS DISTINCT FROM (b OR c)` and
-# returned wrong rows. Drop this when DataFusion moves to sqlparser >= 0.63.
-# See vendor/sqlparser/README.md.
+# returned wrong rows. It also writes every quote character in a quoted
+# identifier and in a string literal twice and a space between two minus
+# signs, which upstream does not. See vendor/sqlparser/README.md before
+# dropping it.
 sqlparser = { path = "vendor/sqlparser" }
 
 # Dependencies on crates.io `backoff` 0.4 resolve to the workspace crate.

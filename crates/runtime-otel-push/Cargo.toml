@@ -13,6 +13,7 @@ version.workspace = true
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
+redact = { path = "../redact" }
 parking_lot.workspace = true
 reqwest.workspace = true
 snafu.workspace = true
