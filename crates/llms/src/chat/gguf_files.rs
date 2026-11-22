@@ -242,9 +242,18 @@ pub fn is_draft_head(path: &str) -> bool {
 }
 
 /// A vision projector, which a text model does not load: a file whose name holds `mmproj`, as
-/// llama.cpp's `-hf` tells them apart.
+/// llama.cpp's `-hf` tells them apart. Spice matches it in any case, where llama.cpp matches it
+/// as written.
 fn is_projector(path: &str) -> bool {
     file_name(path).to_ascii_lowercase().contains("mmproj")
+}
+
+/// Whether the GGUF file at `path` holds a model's weights, by its name: not a vision projector,
+/// an importance matrix or a drafter, which are named beside a model's weights, so that the model
+/// opens from the weights and not from whichever of them comes first.
+#[must_use]
+pub fn is_model_weights(path: &str) -> bool {
+    !is_projector(path) && !is_sidecar(path)
 }
 
 /// A file that is not the model's weights though it is a GGUF file: an importance matrix, or a
@@ -427,16 +436,24 @@ fn quantizations_of(listing: &[ListedFile], sidecars: bool) -> Vec<Quantization>
     // name until none holds, which its first file's path guarantees. So does a name that starts
     // with whitespace, as a folder's deeper in the path, which `resolve` would read as another
     // name; its path, which no quantization's starts with, does not.
+    // How many quantizations claim each name, so that whether another claims one is a lookup
+    // and not a scan of every other quantization's claims.
+    let mut claimants: BTreeMap<&str, usize> = BTreeMap::new();
+    for claim in claims.iter().flatten() {
+        *claimants.entry(claim.as_str()).or_default() += 1;
+    }
+    let claimed_by_another = |i: usize, name: &str| {
+        let name = name.to_ascii_lowercase();
+        let own = usize::from(claims[i].contains(&name));
+        claimants.get(name.as_str()).copied().unwrap_or(0) > own
+    };
     for (i, (q, names)) in out.iter_mut().zip(&candidates).enumerate() {
         let mut at = 0;
         while at + 1 < names.len()
             && (is_gguf(&q.name)
                 || normalized(&q.name) != q.name
                 || !ModelFile::from_path(Path::new(&q.name)).is_gguf_selector()
-                || claims
-                    .iter()
-                    .enumerate()
-                    .any(|(j, claim)| j != i && claim.contains(&q.name.to_ascii_lowercase())))
+                || claimed_by_another(i, &q.name))
         {
             at += 1;
             q.name.clone_from(&names[at]);
@@ -688,16 +705,13 @@ pub fn resolve(
     // with the second's head, while the load says the second is loaded. Each lone file and each
     // shard series is one set, whatever the listing names it, so the merged file and the shards
     // of one quantization are two. A projector, an importance matrix or a drafter named beside
-    // the weights is none: the engine loads a drafter beside the model.
+    // the weights is none, and the engine does not open the model from it.
     let names: BTreeMap<&str, &str> = quantizations
         .iter()
         .flat_map(|q| q.files.iter().map(|f| (f.as_str(), q.name.as_str())))
         .collect();
     let mut sets: BTreeMap<(String, Option<u32>), String> = BTreeMap::new();
-    for w in weights
-        .iter()
-        .filter(|w| !is_projector(w) && !is_sidecar(w))
-    {
+    for w in weights.iter().filter(|w| is_model_weights(w)) {
         let key = shard(w).map_or_else(|| (w.clone(), None), |(stem, _, n)| (stem, Some(n)));
         sets.entry(key).or_insert_with(|| {
             names

@@ -2737,7 +2737,16 @@ fn model_and_draft(weights: &[PathBuf]) -> (Option<PathBuf>, Option<PathBuf>) {
             .is_some_and(gguf_files::is_draft_head)
             || DraftKind::dflash_of(w).is_some()
     });
-    (first_shard(&trunk), first_shard(&drafts))
+    // A projector, an importance matrix or a drafter named beside the model's weights is not the
+    // model, wherever `files` lists it: the model opens from the weights, or from what is named
+    // when nothing else is.
+    let model: Vec<PathBuf> = trunk
+        .iter()
+        .filter(|w| w.to_str().is_some_and(gguf_files::is_model_weights))
+        .cloned()
+        .collect();
+    let model = if model.is_empty() { trunk } else { model };
+    (first_shard(&model), first_shard(&drafts))
 }
 
 /// The GGUF a sharded model is opened from: the `-00001-of-` file, or the only file.
@@ -3416,6 +3425,46 @@ mod tests {
                 Some(PathBuf::from("Model-Q4_K_M.gguf")),
                 Some(PathBuf::from("MTP/MTP-Model-Q8_0-00001-of-00002.gguf"))
             )
+        );
+    }
+
+    /// A projector, an importance matrix or a drafter named beside the model's weights is never
+    /// opened as the model, before or after them in `files`, sharded or not; named alone, it is.
+    #[test]
+    fn a_file_named_beside_the_weights_is_not_opened_as_the_model() {
+        let paths = |names: &[&str]| -> Vec<PathBuf> { names.iter().map(PathBuf::from).collect() };
+        for beside in [
+            "mmproj-F16.gguf",
+            "Model-mmproj-Q6_K.gguf",
+            "Model-Q5_K_M-mmproj-00001-of-00001.gguf",
+            "Model-imatrix.gguf",
+            "eagle3-Model-Q8_0-00001-of-00001.gguf",
+        ] {
+            for weights in [
+                paths(&[beside, "Model-Q4_K_M.gguf"]),
+                paths(&["Model-Q4_K_M.gguf", beside]),
+            ] {
+                assert_eq!(
+                    model_and_draft(&weights),
+                    (Some(PathBuf::from("Model-Q4_K_M.gguf")), None),
+                    "weights {weights:?}"
+                );
+            }
+        }
+        assert_eq!(
+            model_and_draft(&paths(&[
+                "Q4_K_M/Model-Q4_K_M-00002-of-00002.gguf",
+                "mmproj-F16.gguf",
+                "Q4_K_M/Model-Q4_K_M-00001-of-00002.gguf",
+            ])),
+            (
+                Some(PathBuf::from("Q4_K_M/Model-Q4_K_M-00001-of-00002.gguf")),
+                None
+            )
+        );
+        assert_eq!(
+            model_and_draft(&paths(&["Model-imatrix.gguf"])),
+            (Some(PathBuf::from("Model-imatrix.gguf")), None)
         );
     }
 
