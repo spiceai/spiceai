@@ -3149,6 +3149,7 @@ jobs:
           path: |
             ${{ runner.temp }}/spicescript-logs
             ${{ runner.temp }}/spicescript/harness-checks/*.log
+            ${{ runner.temp }}/spicescript/**/spiced.log
           if-no-files-found: warn
           retention-days: 7
 
