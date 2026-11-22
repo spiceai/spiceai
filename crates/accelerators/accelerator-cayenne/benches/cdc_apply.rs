@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Measures change-sink CDC apply of a bootstrap-shaped keyed batch stream into Cayenne.
+//! Compares change-sink CDC apply with a first-load append of the same keyed rows into Cayenne.
 
 #![expect(
     clippy::expect_used,
@@ -40,7 +40,11 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use data_accelerator_api::DataAccelerator;
 use data_components::cdc::{ChangeBatch as CdcBatch, changes_schema};
 use datafusion::{
-    common::TableReference, datasource::TableProvider, execution::context::SessionContext,
+    common::TableReference,
+    datasource::{TableProvider, memory::MemorySourceConfig},
+    execution::context::SessionContext,
+    logical_expr::dml::InsertOp,
+    physical_plan::collect,
 };
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
@@ -148,7 +152,7 @@ fn order_line_schema() -> SchemaRef {
     ]))
 }
 
-fn change_batches(schema: &SchemaRef) -> Vec<CdcBatch> {
+fn order_line_batches(schema: &SchemaRef) -> Vec<RecordBatch> {
     (0..BATCH_COUNT)
         .map(|batch_index| {
             let start = i64::try_from(batch_index * BATCH_ROWS).expect("batch start fits i64");
@@ -156,7 +160,7 @@ fn change_batches(schema: &SchemaRef) -> Vec<CdcBatch> {
             let rows = start..end;
             // Ten lines per order, 3000 orders per district, ten districts per
             // warehouse. The composite key stays distinct across all batches.
-            let data = RecordBatch::try_new(
+            RecordBatch::try_new(
                 Arc::clone(schema),
                 vec![
                     Arc::new(Int64Array::from_iter_values(
@@ -179,7 +183,15 @@ fn change_batches(schema: &SchemaRef) -> Vec<CdcBatch> {
                     ])),
                 ],
             )
-            .expect("order_line rows");
+            .expect("order_line rows")
+        })
+        .collect()
+}
+
+fn change_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> Vec<CdcBatch> {
+    batches
+        .iter()
+        .map(|data| {
             let keys = ListArray::try_new(
                 Arc::new(Field::new("item", DataType::Utf8, false)),
                 OffsetBuffer::from_lengths(std::iter::repeat_n(PRIMARY_KEYS.len(), BATCH_ROWS)),
@@ -196,7 +208,7 @@ fn change_batches(schema: &SchemaRef) -> Vec<CdcBatch> {
                 vec![
                     Arc::new(StringArray::from(vec!["c"; BATCH_ROWS])),
                     Arc::new(keys),
-                    Arc::new(StructArray::from(data)),
+                    Arc::new(StructArray::from(data.clone())),
                 ],
             )
             .expect("CDC record");
@@ -212,7 +224,8 @@ fn bench_cdc_apply(c: &mut Criterion) {
         .build()
         .expect("benchmark runtime");
     let schema = order_line_schema();
-    let batches = change_batches(&schema);
+    let rows = order_line_batches(&schema);
+    let batches = change_batches(&schema, &rows);
     let total_rows = u64::try_from(BATCH_COUNT * BATCH_ROWS).expect("row count fits u64");
     let mut group = c.benchmark_group("cdc_apply");
     group.sample_size(10);
@@ -265,6 +278,85 @@ fn bench_cdc_apply(c: &mut Criterion) {
                             .await
                             .expect("visible row count"),
                         BATCH_COUNT * BATCH_ROWS
+                    );
+                    fixture.sink.begin_close().wait().await.expect("drain sink");
+                    drop(fixture);
+                }
+                elapsed
+            }
+        });
+    });
+    group.bench_function("order_line_bootstrap_first_load", |b| {
+        b.to_async(&runtime).iter_custom(|iterations| {
+            let schema = &schema;
+            let batches = &rows;
+            async move {
+                let mut elapsed = Duration::ZERO;
+                for _ in 0..iterations {
+                    let fixture = Fixture::new(schema).await;
+                    let state = fixture.ctx.state();
+                    // Without this permission, CDC memory durability does not
+                    // divert a plain append to write_cdc_append_stream.
+                    assert!(
+                        state
+                            .config()
+                            .get_extension::<cayenne::RebuildableWrite>()
+                            .is_none(),
+                        "first-load benchmark requires an unmarked write session"
+                    );
+                    assert!(
+                        fixture.table.takes_versioned_append().await,
+                        "first-load benchmark requires an eligible empty file-backed table"
+                    );
+                    // One partition feeds all 64 batches through a single append.
+                    let input = MemorySourceConfig::try_new_exec(
+                        &[batches.clone()],
+                        Arc::clone(schema),
+                        None,
+                    )
+                    .expect("first-load input");
+                    let task_ctx = fixture.ctx.task_ctx();
+                    let start = Instant::now();
+                    let plan = fixture
+                        .table
+                        .insert_into(&state, input, InsertOp::Append)
+                        .await
+                        .expect("first-load insert plan");
+                    collect(plan, task_ctx).await.expect("first-load append");
+                    elapsed += start.elapsed();
+
+                    assert_eq!(
+                        fixture
+                            .ctx
+                            .read_table(Arc::clone(&fixture.table) as Arc<dyn TableProvider>)
+                            .expect("scan order_line")
+                            .count()
+                            .await
+                            .expect("visible row count"),
+                        BATCH_COUNT * BATCH_ROWS
+                    );
+                    fixture
+                        .ctx
+                        .register_table(
+                            "order_line",
+                            Arc::clone(&fixture.table) as Arc<dyn TableProvider>,
+                        )
+                        .expect("register order_line");
+                    let duplicates = fixture
+                        .ctx
+                        .sql(
+                            "SELECT ol_w_id, ol_d_id, ol_o_id, ol_number FROM order_line \
+                             GROUP BY ol_w_id, ol_d_id, ol_o_id, ol_number HAVING count(*) > 1",
+                        )
+                        .await
+                        .expect("duplicate-key query")
+                        .collect()
+                        .await
+                        .expect("duplicate-key rows");
+                    assert_eq!(
+                        duplicates.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                        0,
+                        "first load must not duplicate any composite primary key"
                     );
                     fixture.sink.begin_close().wait().await.expect("drain sink");
                     drop(fixture);
