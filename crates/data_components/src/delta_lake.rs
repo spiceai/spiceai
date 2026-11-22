@@ -388,9 +388,7 @@ impl DeltaTable {
         Ok(())
     }
 
-    /// Builds the logical (user-facing) Arrow schema from the snapshot's delta schema. Every column
-    /// is nullable: a scan reads the latest snapshot, and Delta can drop a column's NOT NULL at any
-    /// time, after which a non-nullable field would let the planner drop `IS NULL` rows.
+    /// Builds the logical (user-facing) Arrow schema from the snapshot's delta schema.
     fn get_logical_schema(snapshot: &Snapshot) -> Schema {
         let schema = snapshot.schema();
 
@@ -400,7 +398,7 @@ impl DeltaTable {
                 field.name(),
                 // `ColumnMappingMode::None` to always return logical names
                 map_delta_data_type_to_arrow_data_type(&field.data_type, ColumnMappingMode::None),
-                true,
+                field.nullable,
             ));
         }
 
@@ -516,7 +514,7 @@ fn build_physical_schema_mapping(
         fields.push(Field::new(
             physical_name,
             map_delta_data_type_to_arrow_data_type(field.data_type(), column_mapping_mode),
-            true,
+            field.nullable,
         ));
     }
 
@@ -1062,7 +1060,8 @@ impl PhysicalExpr for RelabelFieldsExpr {
 /// changed. A scan reads the latest snapshot but plans with the loaded schema, so a column that
 /// was dropped, renamed, dropped and added again (a new physical name) or given another type
 /// would read the wrong values. Columns and nested fields added after loading, and metadata other
-/// than physical names, change nothing for the loaded ones.
+/// than physical names, change nothing for the loaded ones. A dropped top-level NOT NULL is
+/// checked by [`first_dropped_not_null`].
 fn first_changed_column(
     loaded: &delta_kernel::schema::StructType,
     loaded_mode: ColumnMappingMode,
@@ -1093,6 +1092,42 @@ fn first_changed_column(
         };
         Some((field.name().clone(), change))
     })
+}
+
+/// The first loaded column, or field reached through NOT NULL structs, that was NOT NULL and is
+/// nullable in the `latest` schema, as a dotted path. The planner turns a NULL test on a
+/// non-nullable value into a constant and drops the column from the scan, so this is checked on
+/// every loaded column, not only the ones a scan reads. A field under a nullable struct reads as
+/// nullable already, so it is not checked.
+fn first_dropped_not_null(
+    loaded: &delta_kernel::schema::StructType,
+    latest: &delta_kernel::schema::StructType,
+) -> Option<String> {
+    loaded.fields().find_map(|field| {
+        latest
+            .field(field.name())
+            .and_then(|now| dropped_not_null_path(field, now))
+    })
+}
+
+fn dropped_not_null_path(
+    loaded: &delta_kernel::schema::StructField,
+    latest: &delta_kernel::schema::StructField,
+) -> Option<String> {
+    use delta_kernel::schema::DataType as D;
+    if loaded.nullable {
+        return None;
+    }
+    if latest.nullable {
+        return Some(loaded.name().clone());
+    }
+    match (loaded.data_type(), latest.data_type()) {
+        (D::Struct(loaded_fields), D::Struct(latest_fields)) => {
+            first_dropped_not_null(loaded_fields, latest_fields)
+                .map(|path| format!("{}.{path}", loaded.name()))
+        }
+        _ => None,
+    }
 }
 
 /// Whether values of the `latest` type read into the `loaded` one: every loaded struct field is
@@ -1286,6 +1321,7 @@ impl TableProvider for DeltaTable {
             projection,
         )?;
         let engine = Arc::clone(&self.engine);
+        let loaded_table_schema = Arc::clone(&self.delta_schema);
         let loaded_mode = self
             .physical_schema_mapping
             .as_ref()
@@ -1312,7 +1348,11 @@ impl TableProvider for DeltaTable {
                     loaded_mode,
                     &latest_schema,
                     snapshot.table_configuration().column_mapping_mode(),
-                ) {
+                )
+                .or_else(|| {
+                    first_dropped_not_null(&loaded_table_schema, &latest_schema)
+                        .map(|column| (column, "its NOT NULL was dropped"))
+                }) {
                     return Err(datafusion::error::DataFusionError::External(Box::new(
                         Error::SchemaChanged {
                             table_url,
@@ -3249,6 +3289,32 @@ mod column_mapping_filter_tests {
             ),
             changed_column("st", "its type or a field inside it changed")
         );
+        let loaded_required = struct_of(vec![id(), not_null(amount())]);
+        let relaxed = struct_of(vec![id(), amount()]);
+        assert_eq!(
+            first_dropped_not_null(&loaded_required, &relaxed),
+            Some("amount".to_string())
+        );
+        assert_eq!(first_dropped_not_null(&relaxed, &loaded_required), None);
+        assert_eq!(
+            first_dropped_not_null(&loaded_required, &struct_of(vec![id()])),
+            None
+        );
+        let required_st = |a: StructField| not_null(st(vec![a]));
+        assert_eq!(
+            first_dropped_not_null(
+                &struct_of(vec![id(), required_st(not_null(a()))]),
+                &struct_of(vec![id(), required_st(a())])
+            ),
+            Some("st.a".to_string())
+        );
+        assert_eq!(
+            first_dropped_not_null(
+                &struct_of(vec![id(), st(vec![not_null(a())])]),
+                &struct_of(vec![id(), st(vec![a()])])
+            ),
+            None
+        );
 
         let element = |fields: Vec<StructField>, contains_null: bool| {
             mapped(
@@ -3680,6 +3746,118 @@ mod table_read_tests {
         std::fs::write(log.join("00000000000000000000.json"), commit).expect("write commit");
     }
 
+    /// Writes an `INT32` Parquet file whose columns carry the given (physical) names.
+    fn write_i32_file(file: &Path, columns: &[(&str, Vec<Option<i32>>)]) -> u64 {
+        use datafusion::arrow::array::{ArrayRef, Int32Array};
+        use parquet::arrow::ArrowWriter;
+        let schema = Arc::new(Schema::new(
+            columns
+                .iter()
+                .map(|(name, _)| Field::new(*name, DataType::Int32, true))
+                .collect::<Vec<_>>(),
+        ));
+        let arrays = columns
+            .iter()
+            .map(|(_, values)| Arc::new(Int32Array::from(values.clone())) as ArrayRef)
+            .collect();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).expect("batch");
+        let out = std::fs::File::create(file).expect("create parquet file");
+        let mut writer = ArrowWriter::try_new(out, schema, None).expect("parquet writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close parquet file");
+        std::fs::metadata(file).expect("parquet file").len()
+    }
+
+    /// An `integer` column, with a physical name and id when the table uses column mapping.
+    fn int_column(name: &str, mapping: Option<(&str, i64)>, nullable: bool) -> serde_json::Value {
+        let metadata = mapping.map_or_else(
+            || serde_json::json!({}),
+            |(physical, id)| {
+                serde_json::json!({
+                    "delta.columnMapping.id": id,
+                    "delta.columnMapping.physicalName": physical
+                })
+            },
+        );
+        serde_json::json!({"name": name, "type": "integer", "nullable": nullable, "metadata": metadata})
+    }
+
+    fn table_metadata(columns: &[serde_json::Value], column_mapping: bool) -> serde_json::Value {
+        let schema = serde_json::json!({"type": "struct", "fields": columns}).to_string();
+        let configuration = if column_mapping {
+            serde_json::json!({"delta.columnMapping.mode": "name", "delta.columnMapping.maxColumnId": "9"})
+        } else {
+            serde_json::json!({})
+        };
+        serde_json::json!({"metaData": {
+            "id": "00000000-0000-0000-0000-000000000000",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": schema,
+            "partitionColumns": [],
+            "configuration": configuration,
+            "createdTime": 0
+        }})
+    }
+
+    fn protocol(reader: u32, writer: u32) -> serde_json::Value {
+        serde_json::json!({"protocol": {"minReaderVersion": reader, "minWriterVersion": writer}})
+    }
+
+    fn add_file(path: &str, size: u64) -> serde_json::Value {
+        serde_json::json!({"add": {
+            "path": path,
+            "partitionValues": {},
+            "size": size,
+            "modificationTime": 0,
+            "dataChange": true
+        }})
+    }
+
+    /// Writes commit `version` of the table's Delta log.
+    fn write_commit(table: &Path, version: u64, actions: &[serde_json::Value]) {
+        let log = table.join("_delta_log");
+        std::fs::create_dir_all(&log).expect("create _delta_log");
+        let commit = actions
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(log.join(format!("{version:020}.json")), commit).expect("write commit");
+    }
+
+    /// Registers the table once, the way a dataset keeps its provider while the table changes.
+    fn registered(table: &Path) -> SessionContext {
+        let provider = DeltaTable::from(
+            table.to_str().expect("utf-8 path").to_string(),
+            HashMap::new(),
+            &Handle::current(),
+        )
+        .expect("open Delta table");
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider))
+            .expect("register table");
+        ctx
+    }
+
+    async fn rows(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
+        ctx.sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("execute")
+    }
+
+    async fn refusal(ctx: &SessionContext, sql: &str) -> String {
+        ctx.sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("the scan is refused")
+            .to_string()
+    }
+
     async fn query(table: &Path, sql: &str) -> Vec<RecordBatch> {
         let provider = DeltaTable::from(
             table.to_str().expect("utf-8 path").to_string(),
@@ -3784,5 +3962,194 @@ mod table_read_tests {
         location("/tables/source/part-0.parquet").expect_err("path from the bucket root");
         location("s3://other-bucket/tables/source/part-0.parquet").expect_err("other bucket");
         location("gs://bucket/tables/source/part-0.parquet").expect_err("other store");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scan_after_a_schema_change_refuses_the_changed_columns_and_reads_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = dir.path();
+        let size = write_i32_file(
+            &table.join("part-0.parquet"),
+            &[
+                ("col-id", vec![Some(1), Some(2)]),
+                ("col-status", vec![Some(10), Some(20)]),
+                ("col-c", vec![Some(5), Some(6)]),
+            ],
+        );
+        let loaded = [
+            int_column("id", Some(("col-id", 1)), true),
+            int_column("status", Some(("col-status", 2)), true),
+            int_column("c", Some(("col-c", 3)), false),
+        ];
+        write_commit(
+            table,
+            0,
+            &[
+                protocol(2, 5),
+                table_metadata(&loaded, true),
+                add_file("part-0.parquet", size),
+            ],
+        );
+        let ctx = registered(table);
+        assert_batches_eq!(
+            [
+                "+----+--------+---+",
+                "| id | status | c |",
+                "+----+--------+---+",
+                "| 1  | 10     | 5 |",
+                "| 2  | 20     | 6 |",
+                "+----+--------+---+",
+            ],
+            &rows(&ctx, "SELECT id, status, c FROM t ORDER BY id").await
+        );
+
+        // `status` is dropped and added again, and a row is written under the new schema while the
+        // table stays registered.
+        let size = write_i32_file(
+            &table.join("part-1.parquet"),
+            &[
+                ("col-id", vec![Some(3)]),
+                ("col-c", vec![Some(7)]),
+                ("col-status-2", vec![Some(30)]),
+            ],
+        );
+        let latest = [
+            int_column("id", Some(("col-id", 1)), true),
+            int_column("c", Some(("col-c", 3)), false),
+            int_column("status", Some(("col-status-2", 4)), true),
+        ];
+        write_commit(
+            table,
+            1,
+            &[
+                table_metadata(&latest, true),
+                add_file("part-1.parquet", size),
+            ],
+        );
+
+        let error = refusal(&ctx, "SELECT id, status FROM t").await;
+        assert!(
+            error.contains(
+                "changed column 'status' after Spice loaded it: it was dropped and added again"
+            ),
+            "{error}"
+        );
+        assert_batches_eq!(
+            [
+                "+----+", "| id |", "+----+", "| 1  |", "| 2  |", "| 3  |", "+----+"
+            ],
+            &rows(&ctx, "SELECT id FROM t ORDER BY id").await
+        );
+
+        // `c` loses its NOT NULL. The planner reads `c IS NOT NULL` as `true` and leaves `c` out of
+        // the scan, so even a query that does not read `c` is refused.
+        let size = write_i32_file(
+            &table.join("part-2.parquet"),
+            &[
+                ("col-id", vec![Some(4)]),
+                ("col-c", vec![None]),
+                ("col-status-2", vec![Some(40)]),
+            ],
+        );
+        let relaxed = [
+            int_column("id", Some(("col-id", 1)), true),
+            int_column("c", Some(("col-c", 3)), true),
+            int_column("status", Some(("col-status-2", 4)), true),
+        ];
+        write_commit(
+            table,
+            2,
+            &[
+                table_metadata(&relaxed, true),
+                add_file("part-2.parquet", size),
+            ],
+        );
+        for sql in [
+            "SELECT id FROM t",
+            "SELECT count(*) FROM t WHERE c IS NOT NULL",
+        ] {
+            let error = refusal(&ctx, sql).await;
+            assert!(
+                error
+                    .contains("changed column 'c' after Spice loaded it: its NOT NULL was dropped"),
+                "{sql}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_table_upgraded_to_column_mapping_keeps_reading() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = dir.path();
+        let size = write_i32_file(
+            &table.join("part-0.parquet"),
+            &[("id", vec![Some(1)]), ("v", vec![Some(10)])],
+        );
+        let plain = [int_column("id", None, true), int_column("v", None, true)];
+        write_commit(
+            table,
+            0,
+            &[
+                protocol(1, 2),
+                table_metadata(&plain, false),
+                add_file("part-0.parquet", size),
+            ],
+        );
+        let ctx = registered(table);
+
+        // The upgrade keeps each name as its physical name, so the old files still read.
+        let size = write_i32_file(
+            &table.join("part-1.parquet"),
+            &[("id", vec![Some(2)]), ("v", vec![Some(20)])],
+        );
+        let upgraded = [
+            int_column("id", Some(("id", 1)), true),
+            int_column("v", Some(("v", 2)), true),
+        ];
+        write_commit(
+            table,
+            1,
+            &[
+                protocol(2, 5),
+                table_metadata(&upgraded, true),
+                add_file("part-1.parquet", size),
+            ],
+        );
+        assert_batches_eq!(
+            [
+                "+----+----+",
+                "| id | v  |",
+                "+----+----+",
+                "| 1  | 10 |",
+                "| 2  | 20 |",
+                "+----+----+",
+            ],
+            &rows(&ctx, "SELECT id, v FROM t ORDER BY id").await
+        );
+
+        // `v` is then dropped and added again under the new mode, with a new physical name.
+        let size = write_i32_file(
+            &table.join("part-2.parquet"),
+            &[("id", vec![Some(3)]), ("col-v-2", vec![Some(30)])],
+        );
+        let added_again = [
+            int_column("id", Some(("id", 1)), true),
+            int_column("v", Some(("col-v-2", 3)), true),
+        ];
+        write_commit(
+            table,
+            2,
+            &[
+                table_metadata(&added_again, true),
+                add_file("part-2.parquet", size),
+            ],
+        );
+        let error = refusal(&ctx, "SELECT id, v FROM t").await;
+        assert!(
+            error.contains(
+                "changed column 'v' after Spice loaded it: the table's column mapping changed"
+            ),
+            "{error}"
+        );
     }
 }
