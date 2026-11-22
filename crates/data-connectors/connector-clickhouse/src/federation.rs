@@ -291,7 +291,10 @@ fn supports_expression_for(
     }
     match expr {
         // ClickHouse 24.8 does not accept SQL truth-value tests. Its IN list
-        // semantics ignore a NULL item rather than yielding UNKNOWN.
+        // semantics ignore a NULL item rather than yielding UNKNOWN. `ROLLUP`
+        // and `CUBE` over no rows give no total row on `ClickHouse`, and a key
+        // that a grouping set leaves out holds its type's default value (`0`,
+        // `''`), not NULL.
         Expr::IsTrue(_)
         | Expr::IsNotTrue(_)
         | Expr::IsFalse(_)
@@ -302,7 +305,8 @@ fn supports_expression_for(
         | Expr::InSubquery(_)
         | Expr::ScalarSubquery(_)
         | Expr::OuterReferenceColumn(_, _)
-        | Expr::TryCast(_) => false,
+        | Expr::TryCast(_)
+        | Expr::GroupingSet(_) => false,
         // `ClickHouse` reads `\` as an escape character inside a quoted name,
         // and the unparser writes a name with only its quote doubled.
         Expr::Column(column) => {
@@ -1030,6 +1034,21 @@ mod tests {
             None,
             NullEquality::NullEqualsNull
         )?));
+        Ok(())
+    }
+
+    #[test]
+    fn a_grouping_set_stays_local() -> Result<()> {
+        use datafusion::logical_expr::{cube, grouping_set, rollup};
+
+        let scope = DFSchema::try_from(Schema::new(vec![Field::new("i", DataType::Int64, true)]))?;
+        for set in [
+            rollup(vec![col("i")]),
+            cube(vec![col("i")]),
+            grouping_set(vec![vec![col("i")], vec![]]),
+        ] {
+            assert!(!supports_expression(&set, Some(&scope)), "{set}");
+        }
         Ok(())
     }
 
