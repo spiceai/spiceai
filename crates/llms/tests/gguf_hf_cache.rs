@@ -181,6 +181,65 @@ async fn a_model_with_no_files_keeps_its_safetensors_offline() {
     );
 }
 
+/// With the Hub out of reach, what the cache lacks is a gap in the cache, not a mistake in the
+/// Spicepod: the error says only the cache was read and how to fill it, and Spice retries the
+/// load. A file `files` names that the cache lacks, and, for a model with no `files`, a cache
+/// whose quantizations none fit the memory, where the Hub may offer a smaller one.
+#[tokio::test]
+async fn what_the_cache_lacks_is_retried_and_says_how_to_fill_it() {
+    crate::require_process_per_test(WHY);
+    let cache = tempfile::tempdir().expect("creates a cache directory");
+    let snapshot = offline_snapshot(cache.path());
+    write_file(&snapshot, "Model-Q4_K_M.gguf");
+    let fill = format!(
+        "Run `hf download {REPO_ID} --revision main` while online, or unset `HF_HUB_OFFLINE`. See: https://spiceai.org/docs/components/models/huggingface"
+    );
+    let read = format!(
+        "Failed to download model 'test' from Hugging Face repo '{REPO_ID}' (revision 'main'): `HF_HUB_OFFLINE` is set, so Spice read only the Hugging Face cache at '{}', where",
+        cache.path().display()
+    );
+
+    for (files, budget, why) in [
+        (
+            &["Model-Q8_0.gguf"][..],
+            Budget::Unmeasured,
+            "the repository has no file 'Model-Q8_0.gguf'",
+        ),
+        (
+            &[],
+            Budget::Free(1),
+            "none of its GGUF quantizations fits the 0.0 GiB of memory free for the model with room for the context; the smallest, Q4_K_M, is 0.0 GB. Name one in the model's `files` to load it anyway, across machines with `nodes` if one cannot hold it: Q4_K_M (0.0 GB)",
+        ),
+    ] {
+        let error = download_model(REPO_ID, files, budget, HubParams::default(), "test")
+            .await
+            .expect_err("the cache holds no file the model can load");
+        assert_eq!(
+            error.to_string(),
+            format!("{read} {why}. {fill}"),
+            "{files:?}"
+        );
+        assert!(!error.is_configuration_error(), "{files:?}");
+    }
+}
+
+/// A split model with no `files` loads, with the Hub out of reach, the default of what the
+/// cache holds, which need not be the repository's: here its `Q8_0`, the cache holding no
+/// `Q4_K_M`.
+#[tokio::test]
+async fn a_model_with_no_files_loads_the_default_of_what_the_cache_holds() {
+    crate::require_process_per_test(WHY);
+    let cache = tempfile::tempdir().expect("creates a cache directory");
+    let snapshot = offline_snapshot(cache.path());
+    write_file(&snapshot, "Model-Q8_0.gguf");
+    write_file(&snapshot, "Model-Q2_K.gguf");
+
+    let downloaded = download_model(REPO_ID, &[], Budget::Split, HubParams::default(), "test")
+        .await
+        .unwrap_or_else(|e| panic!("the cached Q8_0 loads: {e}"));
+    assert_eq!(downloaded.gguf, ["Model-Q8_0.gguf"]);
+}
+
 fn listing(files: &[(&str, u64)]) -> Vec<ListedFile> {
     files
         .iter()

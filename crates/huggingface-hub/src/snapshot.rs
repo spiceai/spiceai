@@ -114,6 +114,20 @@ pub(crate) enum Source {
     CacheInOutage { reason: String },
 }
 
+impl Source {
+    /// Why only the cache was read, as a clause: "`HF_HUB_OFFLINE` is set", "the Hugging Face
+    /// Hub could not be reached (HTTP 503)". `None` for the Hub's listing.
+    pub(crate) fn cache_only_reason(&self) -> Option<String> {
+        match self {
+            Source::Hub => None,
+            Source::OfflineCache => Some("`HF_HUB_OFFLINE` is set".to_string()),
+            Source::CacheInOutage { reason } => Some(format!(
+                "the Hugging Face Hub could not be reached ({reason})"
+            )),
+        }
+    }
+}
+
 /// A repository at one commit.
 pub struct Snapshot {
     requester: Requester,
@@ -360,6 +374,15 @@ impl Snapshot {
     /// Where the snapshot's files came from.
     pub(crate) fn source(&self) -> &Source {
         &self.source
+    }
+
+    /// Why the snapshot lists only the files the cache holds, as a clause: "`HF_HUB_OFFLINE`
+    /// is set", "the Hugging Face Hub could not be reached (HTTP 503)". `None` when it lists the
+    /// repository's files, from the Hub. A component that chooses among the listed files names
+    /// it, since a load that reads the Hub may choose otherwise.
+    #[must_use]
+    pub fn cache_only_reason(&self) -> Option<String> {
+        self.source.cache_only_reason()
     }
 
     /// The component the snapshot is for.

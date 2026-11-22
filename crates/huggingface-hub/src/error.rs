@@ -99,9 +99,10 @@ pub(crate) enum Cause {
         what: String,
         source: Source,
     },
-    /// The repository's files cannot be used: `message` says why.
+    /// The repository's files, as listed from `source`, cannot be used: `message` says why.
     Unusable {
         message: String,
+        source: Source,
     },
     /// The repository id is not one the Hub allows.
     InvalidRepo,
@@ -173,14 +174,16 @@ impl DownloadError {
         )
     }
 
-    /// The repository's files cannot be used; `message` says why, as the clause after a
-    /// colon.
+    /// The repository's files, as the snapshot lists them, cannot be used; `message` says why,
+    /// as the clause after a colon. When the snapshot lists only the cache, the error says so
+    /// and how to fill it.
     #[must_use]
     pub fn unusable(snapshot: &crate::snapshot::Snapshot, message: impl Into<String>) -> Self {
         snapshot.error(
             None,
             Cause::Unusable {
                 message: message.into(),
+                source: snapshot.source().clone(),
             },
         )
     }
@@ -189,15 +192,15 @@ impl DownloadError {
     /// valid, or a repository that does not hold what the component loads. A refusal from the
     /// Hub is not one: a missing or private repository, a rejected token and a gated
     /// repository can all be fixed on the Hub's side, and a network failure, a full disk or a
-    /// cache `hf download` can fill can clear while Spice runs.
+    /// cache `hf download` can fill can clear while Spice runs. Nor is what a listing of the
+    /// cache alone lacks, which the cache, not the repository, is missing.
     #[must_use]
     pub fn is_configuration_error(&self) -> bool {
         match self.cause.as_ref() {
-            Cause::Settings(_)
-            | Cause::Unusable { .. }
-            | Cause::InvalidPath
-            | Cause::InvalidRepo => true,
-            Cause::Missing { source, .. } => matches!(source, Source::Hub),
+            Cause::Settings(_) | Cause::InvalidPath | Cause::InvalidRepo => true,
+            Cause::Missing { source, .. } | Cause::Unusable { source, .. } => {
+                matches!(source, Source::Hub)
+            }
             Cause::Hub(error) | Cause::Fetch(FetchError::Hub { source: error }) => matches!(
                 error,
                 client::Error::InvalidEndpoint { .. } | client::Error::InvalidToken { .. }
@@ -303,7 +306,29 @@ impl DownloadError {
                 ),
                 Some(unreachable_fix(retried)),
             ),
-            Cause::Unusable { message } => (message.clone(), None),
+            Cause::Unusable {
+                message,
+                source: Source::Hub,
+            } => (message.clone(), None),
+            Cause::Unusable {
+                message,
+                source: Source::OfflineCache,
+            } => (
+                format!(
+                    "`HF_HUB_OFFLINE` is set, so Spice read only the Hugging Face cache at '{}', where {message}",
+                    display_path(&context.cache_dir)
+                ),
+                Some(offline_fix(context)),
+            ),
+            Cause::Unusable {
+                message,
+                source: Source::CacheInOutage { reason },
+            } => (
+                format!(
+                    "the Hugging Face Hub could not be reached ({reason}), so Spice read only the Hugging Face cache, where {message}"
+                ),
+                Some(unreachable_fix(retried)),
+            ),
             Cause::InvalidRepo => (
                 "it is not a Hugging Face repo id: use '<owner>/<name>', each 1 to 96 letters, digits, '-', '_' or '.', starting and ending with a letter or digit, without '--' or '..'"
                     .to_string(),

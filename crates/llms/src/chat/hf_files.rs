@@ -231,29 +231,24 @@ fn choose_quantization<'q>(
             "it offers no complete GGUF quantization".to_string(),
         ));
     };
+    let cache_only = snapshot.cache_only_reason();
+    let line = LoadLine {
+        model: name,
+        repo,
+        cache_only: cache_only.as_deref(),
+    };
     let memory = match budget {
         Budget::Free(memory) if default.bytes > gguf_files::weights_budget(memory) => memory,
         Budget::Free(_) | Budget::Unmeasured | Budget::Split => {
-            tracing::info!(
-                "Model '{name}' loads {} from Hugging Face repo '{repo}', the quantization a model with no `files` loads: {}. To load another of its {} complete GGUF quantizations, name it in the model's `files`: {}.",
-                describe_sized(default),
-                default_reason(quantizations, default),
-                quantizations.len(),
-                listed(quantizations)
-            );
+            tracing::info!("{}", line.default(default, quantizations));
             return Ok(default);
         }
     };
     match gguf_files::choose(quantizations, gguf_files::weights_budget(memory)) {
         Ok(chosen) => {
             tracing::info!(
-                "Model '{name}' loads {} from Hugging Face repo '{repo}', the largest of its {} complete GGUF quantizations whose weights fit the {} of memory free for it with room for the context; {} ({}), which a model with no `files` loads, does not. Pin it with `files: [{}]`.",
-                describe_sized(chosen),
-                quantizations.len(),
-                gibibytes(memory),
-                gguf_files::printable(&default.name),
-                gigabytes(default.bytes),
-                pin(chosen)
+                "{}",
+                line.step_down(chosen, default, quantizations.len(), memory, &pin(chosen))
             );
             Ok(chosen)
         }
@@ -271,6 +266,91 @@ fn choose_quantization<'q>(
             ),
         )),
     }
+}
+
+/// The log line of a model with no `files` that names the quantization it loads: `model` is
+/// the model's name, `repo` its repository, and `cache_only` why the listing it chose from is
+/// the cache's alone ([`Snapshot::cache_only_reason`]), so the line says the choice was made
+/// among what the cache holds.
+struct LoadLine<'a> {
+    model: &'a str,
+    repo: &'a str,
+    cache_only: Option<&'a str>,
+}
+
+impl LoadLine<'_> {
+    /// The line for `default`, the quantization a model with no `files` loads, of
+    /// `quantizations`, the complete GGUF quantizations listed.
+    fn default(&self, default: &Quantization, quantizations: &[Quantization]) -> String {
+        let others = match quantizations.len() {
+            1 if self.cache_only.is_some() => {
+                " The cache holds no other complete GGUF quantization of the repo.".to_string()
+            }
+            1 => " It is the only complete GGUF quantization the repo offers.".to_string(),
+            count => format!(
+                " To load another of {}, name it in the model's `files`: {}.",
+                offered(count, self.cache_only.is_some()),
+                listed(quantizations)
+            ),
+        };
+        format!(
+            "Model '{}' loads {} from Hugging Face repo '{}', the quantization a model with no `files` loads: {}.{}{others}",
+            self.model,
+            describe_sized(default),
+            self.repo,
+            default_reason(quantizations, default),
+            chosen_from(self.cache_only)
+        )
+    }
+
+    /// The line for `chosen`, the largest of `count` complete GGUF quantizations whose weights
+    /// fit `memory` when `default`'s do not, which `files` pins as `pinned`.
+    fn step_down(
+        &self,
+        chosen: &Quantization,
+        default: &Quantization,
+        count: usize,
+        memory: u64,
+        pinned: &str,
+    ) -> String {
+        format!(
+            "Model '{}' loads {} from Hugging Face repo '{}', the largest of {} whose weights fit the {} of memory free for it with room for the context; {} ({}), which a model with no `files` loads, does not.{} Pin it with `files: [{pinned}]`.",
+            self.model,
+            describe_sized(chosen),
+            self.repo,
+            offered(count, self.cache_only.is_some()),
+            gibibytes(memory),
+            gguf_files::printable(&default.name),
+            gigabytes(default.bytes),
+            chosen_from(self.cache_only)
+        )
+    }
+}
+
+/// `its 26 complete GGUF quantizations`, or with a listing of the cache alone, `the 3 complete
+/// GGUF quantizations in the cache`. `count` is at least 2.
+fn offered(count: usize, cache_only: bool) -> String {
+    if cache_only {
+        format!("the {count} complete GGUF quantizations in the cache")
+    } else {
+        format!("its {count} complete GGUF quantizations")
+    }
+}
+
+/// The sentence a load line adds when the listing is the cache's alone, `cache_only` saying
+/// why, as in "The Hugging Face Hub could not be reached (HTTP 503), so Spice chose among
+/// what the Hugging Face cache holds, and a load that reads the Hub may choose another." Empty
+/// for the Hub's listing.
+fn chosen_from(cache_only: Option<&str>) -> String {
+    cache_only.map_or_else(String::new, |reason| {
+        let mut chars = reason.chars();
+        let reason = chars.next().map_or_else(String::new, |first| {
+            first.to_uppercase().chain(chars).collect::<String>()
+        });
+        format!(
+            " {reason}, so Spice chose among what the Hugging Face cache holds, and a load that reads the Hub may choose another."
+        )
+    })
 }
 
 /// Why `default` is the quantization a model with no `files` loads, for the log line that
@@ -575,6 +655,67 @@ mod tests {
         assert!(
             many.ends_with(", Q5 (0.5 GB), Q4 (0.4 GB), and 3 more"),
             "{many}"
+        );
+    }
+
+    /// The load line of a model with no `files` names what it loads, from what, and how to
+    /// load another: of the repository's quantizations, or, with the Hub not read, of the
+    /// cache's, which a load that reads the Hub may choose otherwise from; and says when there
+    /// is no other.
+    #[test]
+    fn a_load_line_says_what_it_chose_among() {
+        let quantization = |name: &str, bytes: u64| Quantization {
+            name: name.to_string(),
+            files: vec![format!("Model-{name}.gguf")],
+            bytes,
+        };
+        let q8 = quantization("Q8_0", 600_000_000);
+        let q4 = quantization("Q4_K_M", 400_000_000);
+        let q2 = quantization("Q2_K", 300_000_000);
+        let line = |cache_only| LoadLine {
+            model: "qwen3",
+            repo: "o/m",
+            cache_only,
+        };
+        let offline = Some("`HF_HUB_OFFLINE` is set");
+        let outage = Some("the Hugging Face Hub could not be reached (connection failed)");
+        let start = "Model 'qwen3' loads quantization";
+
+        assert_eq!(
+            line(None).default(&q4, &[q8.clone(), q4.clone(), q2.clone()]),
+            format!(
+                "{start} Q4_K_M (1 file, 0.4 GB) from Hugging Face repo 'o/m', the quantization a model with no `files` loads: its Q4_K_M, as llama.cpp loads it. To load another of its 3 complete GGUF quantizations, name it in the model's `files`: Q8_0 (0.6 GB), Q4_K_M (0.4 GB), Q2_K (0.3 GB)."
+            )
+        );
+        assert_eq!(
+            line(None).default(&q8, std::slice::from_ref(&q8)),
+            format!(
+                "{start} Q8_0 (1 file, 0.6 GB) from Hugging Face repo 'o/m', the quantization a model with no `files` loads: its Q8_0, as llama.cpp loads it when a repository has no Q4_K_M. It is the only complete GGUF quantization the repo offers."
+            )
+        );
+        assert_eq!(
+            line(offline).default(&q8, &[q8.clone(), q2.clone()]),
+            format!(
+                "{start} Q8_0 (1 file, 0.6 GB) from Hugging Face repo 'o/m', the quantization a model with no `files` loads: its Q8_0, as llama.cpp loads it when a repository has no Q4_K_M. `HF_HUB_OFFLINE` is set, so Spice chose among what the Hugging Face cache holds, and a load that reads the Hub may choose another. To load another of the 2 complete GGUF quantizations in the cache, name it in the model's `files`: Q8_0 (0.6 GB), Q2_K (0.3 GB)."
+            )
+        );
+        assert_eq!(
+            line(outage).default(&q4, std::slice::from_ref(&q4)),
+            format!(
+                "{start} Q4_K_M (1 file, 0.4 GB) from Hugging Face repo 'o/m', the quantization a model with no `files` loads: its Q4_K_M, as llama.cpp loads it. The Hugging Face Hub could not be reached (connection failed), so Spice chose among what the Hugging Face cache holds, and a load that reads the Hub may choose another. The cache holds no other complete GGUF quantization of the repo."
+            )
+        );
+        assert_eq!(
+            line(None).step_down(&q2, &q4, 3, 1 << 30, "{path: Q2_K}"),
+            format!(
+                "{start} Q2_K (1 file, 0.3 GB) from Hugging Face repo 'o/m', the largest of its 3 complete GGUF quantizations whose weights fit the 1.0 GiB of memory free for it with room for the context; Q4_K_M (0.4 GB), which a model with no `files` loads, does not. Pin it with `files: [{{path: Q2_K}}]`."
+            )
+        );
+        assert_eq!(
+            line(offline).step_down(&q2, &q4, 3, 1 << 30, "{path: Q2_K}"),
+            format!(
+                "{start} Q2_K (1 file, 0.3 GB) from Hugging Face repo 'o/m', the largest of the 3 complete GGUF quantizations in the cache whose weights fit the 1.0 GiB of memory free for it with room for the context; Q4_K_M (0.4 GB), which a model with no `files` loads, does not. `HF_HUB_OFFLINE` is set, so Spice chose among what the Hugging Face cache holds, and a load that reads the Hub may choose another. Pin it with `files: [{{path: Q2_K}}]`."
+            )
         );
     }
 
