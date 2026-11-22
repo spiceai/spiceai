@@ -872,7 +872,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        acceleration: [{}, { engine: arrow, mode: memory }]
+        acceleration: [{}, { engine: cayenne, mode: memory }]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
@@ -1054,7 +1054,7 @@ jobs:
         acceleration:
           [
             {},
-            { engine: arrow, mode: memory },
+            { engine: cayenne, mode: memory },
             { engine: cayenne, mode: file },
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
@@ -1214,7 +1214,7 @@ jobs:
         acceleration:
           [
             {},
-            { engine: arrow, mode: memory },
+            { engine: cayenne, mode: memory },
             { engine: cayenne, mode: file },
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
@@ -1331,12 +1331,10 @@ jobs:
             if [[ -n "$MODE" ]]; then
               echo "      mode: $MODE" >> spicepod.yaml
             fi
-            if [[ "$ENGINE" != 'arrow' ]]; then
-              echo "      primary_key: ID" >> spicepod.yaml
-              echo "      indexes:" >> spicepod.yaml
-              echo "        col_Timestamp: enabled" >> spicepod.yaml
-              echo "        '(col_Timestamp, col_String)': unique" >> spicepod.yaml
-            fi
+            echo "      primary_key: ID" >> spicepod.yaml
+            echo "      indexes:" >> spicepod.yaml
+            echo "        col_Timestamp: enabled" >> spicepod.yaml
+            echo "        '(col_Timestamp, col_String)': unique" >> spicepod.yaml
           fi
 
           # add params if present
@@ -1646,7 +1644,6 @@ jobs:
       fail-fast: false
       matrix:
         acceleration: [
-            { engine: arrow, mode: memory },
             { engine: cayenne, mode: memory },
             { engine: cayenne, mode: file },
           ]
@@ -2186,7 +2183,7 @@ jobs:
       - name: Configure live GitHub smoke test
         run: |
           mkdir -p test_app
-          cp test/github/github-arrow-smoke.yaml test_app/spicepod.yaml
+          cp test/github/github-cayenne-smoke.yaml test_app/spicepod.yaml
 
       - name: Allocate runtime ports
         uses: $/.github/actions/allocate-spice-ports
