@@ -330,10 +330,6 @@ fn encode_blocks<const SIZE: usize>(out: &mut [u8], val: &[u8]) -> usize {
     // The output stride is one continuation byte wider than `SIZE`.
     // `as_chunks_mut::<{ SIZE + 1 }>()` is rejected: a const generic cannot
     // be used in a const operation.
-    #[expect(
-        clippy::chunks_exact_to_as_chunks,
-        reason = "output stride is SIZE + 1, which cannot be a const-generic argument"
-    )]
     let outputs = to_write.chunks_exact_mut(SIZE + 1);
     for (input, output) in chunks.iter().zip(outputs) {
         output[..SIZE].copy_from_slice(input);

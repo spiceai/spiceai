@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: '37 2 * * *'
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   stale:
     environment: secret-free

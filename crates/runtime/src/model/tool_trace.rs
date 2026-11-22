@@ -989,4 +989,30 @@ mod tests {
             })))
         );
     }
+
+    /// A worker's scheduled prompt runs as the runtime itself, whose tool steps are restored only
+    /// for it: an anonymous request that replays the same conversation is a different caller.
+    #[test]
+    fn scheduled_work_is_not_an_anonymous_caller() {
+        use runtime_auth::{AuthPrincipalRef, SystemPrincipal};
+        use runtime_request_context::Protocol;
+
+        let scheduled = RequestContext::builder(Protocol::Internal).build();
+        let principal: AuthPrincipalRef = Arc::new(SystemPrincipal);
+        scheduled
+            .set_auth_principal(principal)
+            .expect("a new context has no principal yet");
+        let anonymous = RequestContext::builder(Protocol::Http).build();
+
+        assert_eq!(
+            CallerScope::of(&scheduled),
+            CallerScope::Principal("system:spice".to_string())
+        );
+        assert_eq!(CallerScope::of(&anonymous), CallerScope::Anonymous);
+        let conversation = [user("Remember the alert state."), assistant("done")];
+        assert_ne!(
+            key(&CallerScope::of(&scheduled), &conversation),
+            anonymous_key(&conversation)
+        );
+    }
 }

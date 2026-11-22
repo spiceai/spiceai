@@ -322,7 +322,7 @@ async fn test_streaming_response_structure() {
 
     // Check that all responses have consistent structure
     for response in &responses {
-        assert!(!response.id.is_empty());
+        assert_ne!(response.id, "");
         assert_eq!(response.model, "test-structure");
         assert_eq!(response.object, "chat.completion.chunk");
         assert!(response.created > 0);

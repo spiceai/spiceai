@@ -5,7 +5,8 @@ name: Attestation Script Tests
 # inside pr.yml, and a required check has no test coverage of its own: a PR that
 # breaks it either wrongly blocks every branch or wrongly passes an unsigned one.
 # These tests lift those blocks out of the workflow and run them against a stub
-# GitHub API.
+# GitHub API. The same job tests the modules Attestation and Trunk Health import
+# from .github/scripts.
 on:
   pull_request:
     branches:
@@ -17,6 +18,12 @@ on:
       - '.github/workflows/pr.yml'
       - '.github/workflows/attestation_script_test.yml'
       - '.github/scripts/test_pr_attestation_signoff.mjs'
+      - '.github/workflows/trunk_health.yml'
+      - '.github/scripts/pure_revert.mjs'
+      - '.github/scripts/trunk_health.mjs'
+      - '.github/scripts/fake_github.mjs'
+      - '.github/scripts/test_pure_revert.mjs'
+      - '.github/scripts/test_trunk_health.mjs'
   push:
     branches:
       - trunk
@@ -24,11 +31,20 @@ on:
       - '.github/workflows/pr.yml'
       - '.github/workflows/attestation_script_test.yml'
       - '.github/scripts/test_pr_attestation_signoff.mjs'
+      - '.github/workflows/trunk_health.yml'
+      - '.github/scripts/pure_revert.mjs'
+      - '.github/scripts/trunk_health.mjs'
+      - '.github/scripts/fake_github.mjs'
+      - '.github/scripts/test_pure_revert.mjs'
+      - '.github/scripts/test_trunk_health.mjs'
   workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}
   cancel-in-progress: true
+
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
 
 jobs:
   test-attestation-signoff:
@@ -50,3 +66,11 @@ jobs:
 
       - name: Run tests
         run: node .github/scripts/test_pr_attestation_signoff.mjs
+
+      # The pure-revert rule Attestation and Trunk Health share, and the Trunk
+      # Health gate, against the same kind of stub API.
+      - name: Run pure-revert tests
+        run: node .github/scripts/test_pure_revert.mjs
+
+      - name: Run Trunk Health tests
+        run: node .github/scripts/test_trunk_health.mjs

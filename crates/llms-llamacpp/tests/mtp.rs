@@ -252,7 +252,9 @@ fn generate(spec: &mut Mtp<'_>, prompt: &[Token], steps: usize) -> (Vec<Vec<Toke
     spec.begin(0, prompt).expect("drafting begins");
     let mut sampler = Sampler::greedy();
     let mut history = prompt.to_vec();
-    let mut id = sampler.sample(spec.target(), batch.n_tokens() - 1);
+    let mut id = sampler
+        .sample(spec.target(), batch.n_tokens() - 1)
+        .expect("a decoded row samples");
     let mut drafts = Vec::new();
     let mut reply = Vec::new();
     for _ in 0..steps {
@@ -279,7 +281,9 @@ fn generate(spec: &mut Mtp<'_>, prompt: &[Token], steps: usize) -> (Vec<Vec<Toke
         reply.push(id);
         let mut accepted = 0;
         let next = loop {
-            let token = sampler.sample(spec.target(), position(accepted));
+            let token = sampler
+                .sample(spec.target(), position(accepted))
+                .expect("a decoded row samples");
             if accepted < draft.len() && token == draft[accepted] {
                 history.push(token);
                 reply.push(token);
@@ -427,7 +431,9 @@ fn generate_after_read(
     let mut sampler = Sampler::greedy();
     let mut history = prompt.to_vec();
     // the last read batch's last row is the prompt's last token
-    let mut id = sampler.sample(spec.target(), -1);
+    let mut id = sampler
+        .sample(spec.target(), -1)
+        .expect("a decoded row samples");
     let mut batch = Batch::new(512);
     let mut drafts = Vec::new();
     let mut reply = Vec::new();
@@ -454,7 +460,9 @@ fn generate_after_read(
         reply.push(id);
         let mut accepted = 0;
         let next = loop {
-            let token = sampler.sample(spec.target(), position(accepted));
+            let token = sampler
+                .sample(spec.target(), position(accepted))
+                .expect("a decoded row samples");
             if accepted < draft.len() && token == draft[accepted] {
                 history.push(token);
                 reply.push(token);

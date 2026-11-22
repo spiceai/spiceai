@@ -634,7 +634,7 @@ mod tests {
         let schema = id_schema();
         let source = ChunkedSource::new(Arc::clone(&schema), source_stream(&schema, vec![]));
         let got = drain_ids(source.next_chunk(ChunkCap::Rows(100))).await;
-        assert!(got.is_empty());
+        assert_eq!(got, [] as [i64; 0]);
         assert!(source.is_exhausted());
     }
 
@@ -813,7 +813,7 @@ mod tests {
             1024,
         );
         let got = drain_ids(sorted).await;
-        assert!(got.is_empty());
+        assert_eq!(got, [] as [i64; 0]);
     }
 
     /// Empty sort columns: passthrough, batches unchanged and in order.

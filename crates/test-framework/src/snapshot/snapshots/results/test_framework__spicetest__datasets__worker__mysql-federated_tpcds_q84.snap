@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q84"
 ---
-+------------------+--------------+
-| customer_id      | customername |
-+------------------+--------------+
-| AAAAAAAAAENGBAAA | 0            |
-| AAAAAAAAEFEBBAAA | 0            |
-| AAAAAAAAEGPDAAAA | 0            |
-| AAAAAAAAHJHBAAAA | 0            |
-| AAAAAAAAHNFDAAAA | 0            |
-| AAAAAAAAIIHCAAAA | 0            |
-| AAAAAAAAIJMGAAAA | 0            |
-| AAAAAAAAJHACAAAA | 0            |
-| AAAAAAAAJNHAAAAA | 0            |
-| AAAAAAAAKBGDAAAA | 0            |
-+------------------+--------------+
++------------------+--------------------+
+| customer_id      | customername       |
++------------------+--------------------+
+| AAAAAAAAAENGBAAA | Chavez, Allyson    |
+| AAAAAAAABLEPAAAA | Morris, Lorraine   |
+| AAAAAAAADLECBAAA | Duffy, Meredith    |
+| AAAAAAAAEFEBBAAA | Shepherd, Linda    |
+| AAAAAAAAEFPDBAAA | Keeler, George     |
+| AAAAAAAAEGPDAAAA | Garcia, Rose       |
+| AAAAAAAAFFOGBAAA | Nadeau, Kristi     |
+| AAAAAAAAGLFBAAAA | Hernandez, Darlene |
+| AAAAAAAAIEPNAAAA | Wilder, Williams   |
+| AAAAAAAAIGBPAAAA | Phillips, Sharon   |
++------------------+--------------------+

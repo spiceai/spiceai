@@ -97,10 +97,10 @@ env:
   # verification inherits (checked below), and VERUS_SHA256 pins the exact
   # bytes of the archive: a release tag names an asset, it does not fix its
   # contents, and this job executes what it downloads.
-  VERUS_RELEASE: release/0.2026.09.27.3cf1832
-  VERUS_ASSET: verus-0.2026.09.27.3cf1832-x86-linux.zip
-  VERUS_SHA256: 43814031e10df043221d83c7fa842e3ebd662cb7b0090fc1eb4d7a8673226978
-  VERUS_VSTD_VERSION: 0.0.0-2026-09-20-0158
+  VERUS_RELEASE: release/0.2026.11.02.8bf68ee
+  VERUS_ASSET: verus-0.2026.11.02.8bf68ee-x86-linux.zip
+  VERUS_SHA256: f3a0119292df8855e4435da8130bee1873b0e6a60c306accf81a08ea687bba3c
+  VERUS_VSTD_VERSION: 0.0.0-2026-11-01-0251
 
 jobs:
   verus-verify:
@@ -144,7 +144,7 @@ jobs:
       # this job runs on `merge_group`, where a textual lockfile merge is what
       # that guard exists to name before any cargo work.
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       # The crates that opted into verification, from the manifests themselves,
       # so the path filter, the pin check and the verify loop below cannot drift
@@ -219,7 +219,7 @@ jobs:
       # reports the required context green with the verifier never invoked.
       - name: Check for changes this gate covers
         id: changes
-        uses: ./.github/actions/check-code-changes
+        uses: $/.github/actions/check-code-changes
         with:
           filters: ${{ steps.crates.outputs.filters }}
 
@@ -250,7 +250,7 @@ jobs:
       # rather than rely on the image, as `object_store_wal.yml` does.
       - name: Set up the C toolchain
         if: steps.gate.outputs.verify == 'true'
-        uses: ./.github/actions/setup-cc
+        uses: $/.github/actions/setup-cc
 
       # The tools the steps below call, checked up front so a runner image that
       # lacks one fails here by name instead of as exit 127 mid-step. `gh`

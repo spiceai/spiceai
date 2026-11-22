@@ -45,8 +45,11 @@ pub use llms::rerank::RerankerModelStore;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
+    /// `from` is shown without the credentials a URL in it can carry; the message is logged
+    /// and kept as the reranker's status.
     #[snafu(display(
-        "Unknown reranker source in `from: {from}`. Supported prefixes: cohere:, voyage:, jina:, http://, https://."
+        "Unknown reranker source in `from: {}`. Supported prefixes: cohere:, voyage:, jina:, http://, https://.",
+        crate::http::v1::redact_source_credentials(from)
     ))]
     UnknownSource { from: String },
 
@@ -55,7 +58,12 @@ pub enum Error {
     ))]
     MissingParam { name: String, param_key: String },
 
-    #[snafu(display("Reranker '{name}' failed health check: {source}"))]
+    /// The provider's error can quote the request URL, which for an HTTP reranker is its
+    /// `from`, so URL credentials are removed from it.
+    #[snafu(display(
+        "Reranker '{name}' failed health check: {}",
+        redact::redact_message_credentials(&source.to_string())
+    ))]
     HealthFailed {
         name: String,
         source: llms::rerank::Error,
@@ -78,6 +86,21 @@ pub enum Error {
         "Reranker '{name}' uses a local model source (`{from}`), but this build was compiled without the `models` feature. Rebuild with `models` enabled or use a remote reranker (cohere:, voyage:, jina:, http://)."
     ))]
     LocalRerankerNotEnabled { name: String, from: String },
+}
+
+impl Error {
+    /// Returns `true` when the error is a mistake in the reranker's Spicepod configuration, which
+    /// no retry can clear. A refusal or failure of the provider is not one.
+    #[must_use]
+    pub fn is_configuration_error(&self) -> bool {
+        matches!(
+            self,
+            Self::UnknownSource { .. }
+                | Self::MissingParam { .. }
+                | Self::InvalidParam { .. }
+                | Self::LocalRerankerNotEnabled { .. }
+        )
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -305,4 +328,36 @@ pub async fn try_to_rerank_model(
     };
 
     Ok(reranker)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    /// A reranker's `from`, and a provider error quoting its URL, are shown without the
+    /// credentials the URL carries.
+    #[test]
+    fn messages_leave_out_url_credentials() {
+        let unknown = Error::UnknownSource {
+            from: "rerankhub:https://alice:hunter2@rerank.example.com/v1?api_key=abc123"
+                .to_string(),
+        };
+        assert_eq!(
+            unknown.to_string(),
+            "Unknown reranker source in `from: rerankhub:https://rerank.example.com/v1?api_key=***`. Supported prefixes: cohere:, voyage:, jina:, http://, https://."
+        );
+
+        let health = Error::HealthFailed {
+            name: "r".to_string(),
+            source: llms::rerank::Error::ModelCallFailed {
+                model: "r".to_string(),
+                source: "error sending request for url (http://127.0.0.1:1/rerank?api_key=abc123)"
+                    .into(),
+            },
+        };
+        assert_eq!(
+            health.to_string(),
+            "Reranker 'r' failed health check: Reranker model 'r' failed: error sending request for url (http://127.0.0.1:1/rerank?api_key=***)"
+        );
+    }
 }

@@ -56,6 +56,13 @@ pub fn state_as_record(s: &TableState, table_id: &str) -> Record {
         table_id: t(),
         files: s.delete_files.values().cloned().collect(),
     })));
+    // After every entry that makes a file live: a retired key is live nowhere.
+    if !s.retired.is_empty() {
+        actions.push(Action::new(Kind::RetireFiles(p::FileKeys {
+            table_id: t(),
+            keys: s.retired.iter().cloned().collect(),
+        })));
+    }
     if let Some(stat) = &s.stats {
         actions.push(Action::new(Kind::SetTableStats(p::SetTableStats {
             table_id: t(),
@@ -258,6 +265,7 @@ mod tests {
                 published: true,
             },
         );
+        s.retired.insert("merged/file".into());
         s.insert_records.insert(vec![1], 12);
         s.pending_write_back.insert(vec![2], 13);
         s.partitions.insert(

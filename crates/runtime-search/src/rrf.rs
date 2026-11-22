@@ -1485,7 +1485,6 @@ mod tests {
         ))
     }
 
-    #[expect(clippy::float_cmp)]
     #[test]
     fn test_parse_argument_exprs() {
         // Empty call
@@ -1850,7 +1849,6 @@ mod tests {
         );
     }
 
-    #[expect(clippy::float_cmp)]
     #[tokio::test]
     async fn linear_recency_decay_uses_second_window() {
         let ctx = SessionContext::new();

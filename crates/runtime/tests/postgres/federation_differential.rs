@@ -16,11 +16,21 @@ limitations under the License.
 
 //! Differential test of `PostgreSQL` federation against `PostgreSQL` itself.
 //!
-//! Each query runs three ways over the same committed rows: sent straight to
+//! Each query runs over the same committed rows: sent straight to
 //! `PostgreSQL` (the oracle, which shares no code with Spice), against the
-//! federated datasets, whose plans Spice rewrites and sends to `PostgreSQL`, and
-//! against an Arrow acceleration of the same tables, which `DataFusion`
-//! evaluates after the connector converts the rows. The fixture holds the values
+//! federated datasets, whose plans Spice rewrites and sends to `PostgreSQL`,
+//! and against accelerations of the same tables, loaded with
+//! `refresh_mode: full` after the connector converts the rows: Arrow, Arrow
+//! partitioned by `grp`, Cayenne `mode: memory`, Cayenne `mode: file` with its
+//! defaults, which keeps a load this small as rows inlined in its metastore,
+//! Cayenne `mode: file` with inlining turned off, which writes and reads Vortex
+//! files, and, with the `sqlite` feature, `SQLite` `mode: memory` and
+//! `mode: file`. Spice sends each query over a `SQLite` acceleration to `SQLite`
+//! as SQL in `SQLite`'s dialect, so those sides check that translation, and
+//! must read nothing but `SQLite`. The Cayenne sides read the rows
+//! back through Cayenne's own scan, with filters and projections pushed into
+//! it, so a value Cayenne stores, encodes, or prunes wrongly shows up as a row
+//! that differs from `PostgreSQL`'s. The fixture holds the values
 //! a translation gets wrong: NULLs in every column, `bigint` and `numeric`
 //! boundaries, `LIKE` wildcards as literal characters, non-ASCII and padded
 //! text, fractional-second timestamps, and duplicate join keys.
@@ -33,24 +43,34 @@ limitations under the License.
 //! integers, text, and `numeric` and `date` cast to `VARCHAR`, whose text forms
 //! the two engines share.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use app::AppBuilder;
-use arrow::array::RecordBatch;
-use arrow::util::display::{ArrayFormatter, FormatOptions};
 use runtime::Runtime;
 use secrecy::ExposeSecret;
 use spicepod::{
-    acceleration::{Acceleration, RefreshMode},
+    acceleration::{Acceleration, Mode, RefreshMode},
     component::dataset::Dataset,
     param::Params,
+    partitioning::PartitionedBy,
 };
 use tokio_postgres::SimpleQueryMessage;
 
 use crate::{
-    configure_test_datafusion, init_tracing,
+    acceleration::has_vortex_file,
+    configure_test_datafusion,
+    federation_differential::{
+        Case, PlanCheck, Row, agreement, check_cayenne_sources, check_federated, check_sources,
+        empty, operators, ordered, physical_plan, rows, spice_rows,
+    },
+    init_tracing,
     postgres::common::{self, get_pg_params},
-    utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 
 /// The rows of the fixture table, so a load that dropped some fails up front.
@@ -85,83 +105,8 @@ const SEED: &[&str] = &[
        (NULL, 'nowhere'), (7, 'unused')",
 ];
 
-/// One query, with `{items}` and `{regions}` standing for the tables.
-struct Case {
-    sql: &'static str,
-    /// Whether the rows' order is part of the answer: the query's top-level
-    /// `ORDER BY` covers a unique key, so the order is fixed.
-    ordered: bool,
-    /// Whether no row is the right answer. Every other case must return rows,
-    /// so two empty answers cannot pass for agreement.
-    empty: bool,
-}
-
-const fn rows(sql: &'static str) -> Case {
-    Case {
-        sql,
-        ordered: false,
-        empty: false,
-    }
-}
-
-const fn ordered(sql: &'static str) -> Case {
-    Case {
-        sql,
-        ordered: true,
-        empty: false,
-    }
-}
-
-const fn empty(sql: &'static str) -> Case {
-    Case {
-        sql,
-        ordered: false,
-        empty: true,
-    }
-}
-
-/// The operators a federated plan may run in Spice: wrappers that pass rows
-/// through, and the scan that sends SQL to `PostgreSQL`. Both tables come from
-/// one `PostgreSQL` database, so federation sends the whole query there. Any
-/// other operator means Spice evaluated part of the query itself, over a wider
-/// scan: a filter, an aggregate, a join, a sort, a window, or a computed
-/// column. The answer can still match, but then it compares `DataFusion` with
-/// `PostgreSQL`, which the accelerated side already does, and not the
-/// translation this test exists to check.
-const PASS_THROUGH: [&str; 3] = [
-    "SchemaCastScanExec",
-    "CooperativeExec",
-    "BytesProcessedExec",
-];
+/// The scans that send SQL to `PostgreSQL`, or to a `SQLite` acceleration.
 const REMOTE_SCANS: [&str; 2] = ["VirtualExecutionPlan", "SqlExec"];
-
-/// Checks that the physical plan in `plan`, an `EXPLAIN` answer, runs nothing
-/// in Spice but [`PASS_THROUGH`] operators over one of [`REMOTE_SCANS`].
-fn check_nothing_local(plan: &[Row]) -> Result<(), String> {
-    let physical = plan
-        .iter()
-        .find(|row| row.first().and_then(Option::as_deref) == Some("physical_plan"))
-        .and_then(|row| row.get(1).cloned().flatten())
-        .ok_or_else(|| format!("the plan has no physical plan: {plan:?}"))?;
-    let operators: Vec<&str> = physical
-        .lines()
-        .filter_map(|line| line.split([':', ' ']).find(|token| !token.is_empty()))
-        .collect();
-    let local: Vec<&str> = operators
-        .iter()
-        .copied()
-        .filter(|op| !PASS_THROUGH.contains(op) && !REMOTE_SCANS.contains(op))
-        .collect();
-    if !local.is_empty() {
-        return Err(format!(
-            "Spice evaluates {local:?} itself instead of sending it to PostgreSQL:\n{physical}"
-        ));
-    }
-    if !operators.iter().any(|op| REMOTE_SCANS.contains(op)) {
-        return Err(format!("the plan sends no SQL to PostgreSQL:\n{physical}"));
-    }
-    Ok(())
-}
 
 fn cases() -> Vec<Case> {
     vec![
@@ -294,10 +239,43 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-/// A row as its cells, each rendered, or `None` for NULL.
-type Row = Vec<Option<String>>;
+/// How a dataset reads `PostgreSQL`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// No acceleration: Spice sends each query to `PostgreSQL`.
+    Federated,
+    /// An Arrow acceleration loaded once with `refresh_mode: full`.
+    Accelerated,
+    /// A Cayenne acceleration held in memory, loaded once with
+    /// `refresh_mode: full`.
+    CayenneMemory,
+    /// A Cayenne acceleration with a metastore on disk, loaded once with
+    /// `refresh_mode: full`, with its default inlining: a load under
+    /// `inline_max_rows` is kept as rows in the metastore, not a Vortex file.
+    CayenneFile,
+    /// [`Kind::CayenneFile`] with `inline_max_rows: 0`, so the load is written
+    /// to Vortex files and every scan reads them.
+    CayenneVortex,
+    /// An Arrow acceleration with `partition_by: grp`, loaded once with
+    /// `refresh_mode: full`: one in-memory table per `grp` value, NULL included.
+    PartitionedArrow,
+    /// A `SQLite` acceleration held in memory, loaded once with
+    /// `refresh_mode: full`. Spice sends each query over it to `SQLite` as SQL.
+    #[cfg(feature = "sqlite")]
+    SqliteMemory,
+    /// [`Kind::SqliteMemory`] in a database file on disk.
+    #[cfg(feature = "sqlite")]
+    SqliteFile,
+}
 
-fn dataset(port: usize, table: &str, name: &str, accelerated: bool) -> Dataset {
+/// Where a `mode: file` acceleration of dataset `name` keeps its data.
+fn data_dir(dir: &Path, name: &str) -> PathBuf {
+    dir.join(name).join("data")
+}
+
+/// `dir` holds a `mode: file` acceleration's data and metastore, one
+/// directory per dataset `name`.
+fn dataset(port: usize, table: &str, name: &str, kind: Kind, dir: &Path) -> Dataset {
     let mut ds = Dataset::new(format!("postgres:{table}"), name.to_string());
     ds.params = Some(Params::from_string_map(
         get_pg_params(port)
@@ -305,46 +283,69 @@ fn dataset(port: usize, table: &str, name: &str, accelerated: bool) -> Dataset {
             .map(|(k, v)| (k, v.expose_secret().to_string()))
             .collect::<HashMap<String, String>>(),
     ));
-    if accelerated {
-        ds.acceleration = Some(Acceleration {
-            enabled: true,
+    let full = Acceleration {
+        enabled: true,
+        refresh_mode: Some(RefreshMode::Full),
+        ..Acceleration::default()
+    };
+    ds.acceleration = match kind {
+        Kind::Federated => None,
+        Kind::Accelerated => Some(Acceleration {
             engine: Some("arrow".to_string()),
-            refresh_mode: Some(RefreshMode::Full),
-            ..Acceleration::default()
-        });
-    }
-    ds
-}
-
-fn render(batches: &[RecordBatch]) -> Result<Vec<Row>, String> {
-    let options = FormatOptions::default();
-    let mut rendered = Vec::new();
-    for batch in batches {
-        let formatters = batch
-            .columns()
-            .iter()
-            .map(|column| ArrayFormatter::try_new(column.as_ref(), &options))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        for row in 0..batch.num_rows() {
-            rendered.push(
-                batch
-                    .columns()
-                    .iter()
-                    .zip(&formatters)
-                    .map(|(column, formatter)| {
-                        (!column.is_null(row)).then(|| formatter.value(row).to_string())
-                    })
-                    .collect(),
-            );
+            ..full
+        }),
+        Kind::CayenneMemory => Some(Acceleration {
+            engine: Some("cayenne".to_string()),
+            mode: Mode::Memory,
+            ..full
+        }),
+        Kind::CayenneFile | Kind::CayenneVortex => {
+            let mut params = HashMap::from([
+                (
+                    "cayenne_file_path".to_string(),
+                    data_dir(dir, name).display().to_string(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    dir.join(name).join("metadata").display().to_string(),
+                ),
+            ]);
+            if kind == Kind::CayenneVortex {
+                params.insert("cayenne_inline_max_rows".to_string(), "0".to_string());
+            }
+            Some(Acceleration {
+                engine: Some("cayenne".to_string()),
+                mode: Mode::File,
+                params: Some(Params::from_string_map(params)),
+                ..full
+            })
         }
-    }
-    Ok(rendered)
-}
-
-async fn spice_rows(rt: &Arc<Runtime>, sql: &str) -> Result<Vec<Row>, String> {
-    let batches = run_query(rt, sql).await.map_err(|e| e.to_string())?;
-    render(&batches)
+        Kind::PartitionedArrow => Some(Acceleration {
+            engine: Some("arrow".to_string()),
+            partition_by: vec![PartitionedBy {
+                name: "grp".to_string(),
+                expression: "grp".to_string(),
+            }],
+            ..full
+        }),
+        #[cfg(feature = "sqlite")]
+        Kind::SqliteMemory => Some(Acceleration {
+            engine: Some("sqlite".to_string()),
+            mode: Mode::Memory,
+            ..full
+        }),
+        #[cfg(feature = "sqlite")]
+        Kind::SqliteFile => Some(Acceleration {
+            engine: Some("sqlite".to_string()),
+            mode: Mode::File,
+            params: Some(Params::from_string_map(HashMap::from([(
+                "sqlite_file".to_string(),
+                dir.join(format!("{name}.db")).display().to_string(),
+            )]))),
+            ..full
+        }),
+    };
+    ds
 }
 
 /// The oracle: `sql` sent to `PostgreSQL` over the simple query protocol, which
@@ -364,41 +365,78 @@ async fn postgres_rows(client: &tokio_postgres::Client, sql: &str) -> Result<Vec
         .collect())
 }
 
-fn agreement(subject: &[Row], oracle: &[Row], ordered: bool) -> Result<(), &'static str> {
-    if ordered {
-        return (subject == oracle)
-            .then_some(())
-            .ok_or("rows or their order differ");
-    }
-    let (mut subject, mut oracle) = (subject.to_vec(), oracle.to_vec());
-    subject.sort();
-    oracle.sort();
-    (subject == oracle).then_some(()).ok_or("rows differ")
-}
-
-/// One Spice side of the comparison: the datasets it reads, and whether its
-/// plan must send the whole query to `PostgreSQL`.
+/// One Spice side of the comparison: the datasets it reads, and how they read
+/// `PostgreSQL`, which decides what its plan must show.
 struct Subject {
     name: &'static str,
     items: &'static str,
     regions: &'static str,
-    federated: bool,
+    kind: Kind,
 }
 
-const SUBJECTS: [Subject; 2] = [
+const SUBJECTS: &[Subject] = &[
     Subject {
         name: "federated",
         items: "fed_items",
         regions: "fed_regions",
-        federated: true,
+        kind: Kind::Federated,
     },
     Subject {
         name: "accelerated",
         items: "acc_items",
         regions: "acc_regions",
-        federated: false,
+        kind: Kind::Accelerated,
+    },
+    Subject {
+        name: "cayenne memory",
+        items: "cmem_items",
+        regions: "cmem_regions",
+        kind: Kind::CayenneMemory,
+    },
+    Subject {
+        name: "cayenne file",
+        items: "cfile_items",
+        regions: "cfile_regions",
+        kind: Kind::CayenneFile,
+    },
+    Subject {
+        name: "cayenne vortex",
+        items: "cvortex_items",
+        regions: "cvortex_regions",
+        kind: Kind::CayenneVortex,
+    },
+    Subject {
+        name: "partitioned arrow",
+        items: "parrow_items",
+        regions: "parrow_regions",
+        kind: Kind::PartitionedArrow,
+    },
+    #[cfg(feature = "sqlite")]
+    Subject {
+        name: "sqlite memory",
+        items: "smem_items",
+        regions: "smem_regions",
+        kind: Kind::SqliteMemory,
+    },
+    #[cfg(feature = "sqlite")]
+    Subject {
+        name: "sqlite file",
+        items: "sfile_items",
+        regions: "sfile_regions",
+        kind: Kind::SqliteFile,
     },
 ];
+
+/// Checks that every source of the physical plan in `plan` is SQL sent to the
+/// `SQLite` acceleration, so a `SQLite` side answers from `SQLite`.
+#[cfg(feature = "sqlite")]
+fn check_sqlite_sources(plan: &[Row]) -> Result<(), String> {
+    check_sources(
+        plan,
+        |leaf, _| REMOTE_SCANS.contains(&leaf.name) && leaf.line.contains("name=sqlite"),
+        "the SQLite acceleration",
+    )
+}
 
 async fn compare_case(
     rt: &Arc<Runtime>,
@@ -406,10 +444,7 @@ async fn compare_case(
     case: &Case,
     failures: &mut Vec<String>,
 ) -> Result<bool, anyhow::Error> {
-    let oracle_sql = case
-        .sql
-        .replace("{items}", "diff_items")
-        .replace("{regions}", "diff_regions");
+    let oracle_sql = case.oracle_sql("diff_items", "diff_regions");
     let oracle = postgres_rows(client, &oracle_sql)
         .await
         .map_err(|e| anyhow::anyhow!("PostgreSQL rejected `{oracle_sql}`: {e}"))?;
@@ -422,12 +457,9 @@ async fn compare_case(
     }
 
     let mut all_remote = true;
-    for subject in &SUBJECTS {
+    for subject in SUBJECTS {
         let name = subject.name;
-        let sql = case
-            .sql
-            .replace("{items}", subject.items)
-            .replace("{regions}", subject.regions);
+        let sql = Case::bind(case.sql, subject.items, subject.regions);
         match spice_rows(rt, &sql).await {
             Ok(spice) => {
                 if let Err(reason) = agreement(&spice, &oracle, case.ordered) {
@@ -438,16 +470,28 @@ async fn compare_case(
             }
             Err(e) => failures.push(format!("{name}: {sql}\n    failed: {e}")),
         }
-        if subject.federated {
-            // The federated side must send the whole query to PostgreSQL, or
-            // it is DataFusion over a wider scan and compares nothing the
-            // accelerated side does not.
+        // The federated side must send the whole query to PostgreSQL, or it is
+        // DataFusion over a wider scan and compares nothing the accelerated side
+        // does not. A Cayenne side must read only Cayenne, or its agreement says
+        // nothing about what Cayenne stored.
+        let check: Option<PlanCheck> = match subject.kind {
+            Kind::Federated => {
+                Some(&|plan| check_federated(plan, &REMOTE_SCANS, "PostgreSQL", case.kept_local))
+            }
+            Kind::CayenneMemory | Kind::CayenneFile | Kind::CayenneVortex => {
+                Some(&check_cayenne_sources)
+            }
+            Kind::Accelerated | Kind::PartitionedArrow => None,
+            #[cfg(feature = "sqlite")]
+            Kind::SqliteMemory | Kind::SqliteFile => Some(&check_sqlite_sources),
+        };
+        if let Some(check) = check {
             let plan = spice_rows(rt, &format!("EXPLAIN {sql}"))
                 .await
                 .map_err(|e| anyhow::anyhow!("EXPLAIN {sql}: {e}"))?;
-            if let Err(reason) = check_nothing_local(&plan) {
+            if let Err(reason) = check(&plan) {
                 failures.push(format!("{name}: {sql}\n    {reason}"));
-                all_remote = false;
+                all_remote &= subject.kind != Kind::Federated;
             }
         }
     }
@@ -461,18 +505,20 @@ async fn federated_and_accelerated_postgres_answers_match_postgres() -> Result<(
     test_request_context()
         .scope(async {
             let (port, container) = common::test_database().await?;
+            let dir = tempfile::tempdir()?;
             let client = common::connect(u16::try_from(port)?).await?;
             for statement in SEED {
                 client.batch_execute(statement).await?;
             }
 
             register_test_connectors().await;
-            let app = AppBuilder::new("postgres_federation_differential")
-                .with_dataset(dataset(port, "diff_items", "fed_items", false))
-                .with_dataset(dataset(port, "diff_regions", "fed_regions", false))
-                .with_dataset(dataset(port, "diff_items", "acc_items", true))
-                .with_dataset(dataset(port, "diff_regions", "acc_regions", true))
-                .build();
+            let mut app = AppBuilder::new("postgres_federation_differential");
+            for subject in SUBJECTS {
+                app = app
+                    .with_dataset(dataset(port, "diff_items", subject.items, subject.kind, dir.path()))
+                    .with_dataset(dataset(port, "diff_regions", subject.regions, subject.kind, dir.path()));
+            }
+            let app = app.build();
             configure_test_datafusion();
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
             tokio::select! {
@@ -491,13 +537,42 @@ async fn federated_and_accelerated_postgres_answers_match_postgres() -> Result<(
                     .map_err(|e| anyhow::anyhow!(e))?,
                 expected
             );
-            for table in ["fed_items", "acc_items"] {
+            for subject in SUBJECTS {
                 assert_eq!(
-                    spice_rows(&rt, &format!("SELECT count(*) FROM {table}"))
+                    spice_rows(&rt, &format!("SELECT count(*) FROM {}", subject.items))
                         .await
                         .map_err(|e| anyhow::anyhow!(e))?,
                     expected,
-                    "{table} must hold every fixture row"
+                    "{} must hold every fixture row",
+                    subject.items
+                );
+            }
+            // The Vortex side must serve its rows from Vortex files on disk,
+            // not from rows inlined in its metastore.
+            for subject in SUBJECTS.iter().filter(|s| s.kind == Kind::CayenneVortex) {
+                for table in [subject.items, subject.regions] {
+                    let data = data_dir(dir.path(), table);
+                    anyhow::ensure!(
+                        has_vortex_file(&data),
+                        "{table} turns inlining off but wrote no Vortex file under {}",
+                        data.display()
+                    );
+                }
+            }
+
+            // The partitioned Arrow side must scan one table per `grp` value,
+            // or it is the plain Arrow side under another name.
+            for subject in SUBJECTS.iter().filter(|s| s.kind == Kind::PartitionedArrow) {
+                let plan = spice_rows(&rt, &format!("EXPLAIN SELECT id FROM {}", subject.items))
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                let physical = physical_plan(&plan).map_err(|e| anyhow::anyhow!(e))?;
+                anyhow::ensure!(
+                    operators(&physical)
+                        .iter()
+                        .any(|op| op.name == "PartitionedUnionExec"),
+                    "{} sets `partition_by` but its scan reads no partitions:\n{physical}",
+                    subject.items
                 );
             }
 

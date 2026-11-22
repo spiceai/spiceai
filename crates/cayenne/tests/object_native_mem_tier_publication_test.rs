@@ -64,7 +64,7 @@ use prost::Message;
 
 use crate::common;
 
-const PREFIX: &str = "catalog";
+const PREFIX: &str = crate::common::LOCATION_CATALOG;
 const TABLE: &str = "orders";
 
 /// One step of the scenario.
@@ -138,7 +138,54 @@ fn schema() -> Arc<Schema> {
     ]))
 }
 
-fn options(data: &std::path::Path, shards: usize) -> CreateTableOptions {
+/// Where a table's data files go.
+#[derive(Clone)]
+enum Data {
+    /// A local directory, for the SQLite metastore.
+    Local(std::path::PathBuf),
+    /// The object-native location of a catalog, on a store of its own, so a
+    /// crash point counts only the metastore's writes.
+    Location {
+        url: String,
+        store: Arc<dyn ObjectStore>,
+    },
+}
+
+impl Data {
+    fn location(catalog: &ObjectNativeCatalog) -> Self {
+        Self::Location {
+            url: crate::common::location_data_url(catalog, TABLE),
+            store: Arc::new(InMemory::new()),
+        }
+    }
+
+    fn base_path(&self) -> String {
+        match self {
+            Self::Local(path) => path.to_string_lossy().into_owned(),
+            Self::Location { url, .. } => url.clone(),
+        }
+    }
+
+    fn builder(
+        &self,
+        catalog: Arc<dyn MetadataCatalog>,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> CayenneTableProviderBuilder {
+        match self {
+            Self::Local(_) => CayenneTableProviderBuilder::new(catalog, runtime_env),
+            Self::Location { url, store } => crate::common::table_builder_on_store(
+                catalog,
+                runtime_env,
+                cayenne::metadata::ObjectStoreConfig {
+                    url: url::Url::parse(url).expect("data url"),
+                    store: Arc::clone(store),
+                },
+            ),
+        }
+    }
+}
+
+fn options(data: &Data, shards: usize) -> CreateTableOptions {
     CreateTableOptions {
         table_name: TABLE.to_string(),
         schema: schema(),
@@ -146,7 +193,7 @@ fn options(data: &std::path::Path, shards: usize) -> CreateTableOptions {
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: data.to_string_lossy().into_owned(),
+        base_path: data.base_path(),
         partition_column: None,
         vortex_config: VortexConfig {
             cdc_durability: CdcDurability::Memory,
@@ -176,17 +223,18 @@ impl SlotAdvancer for NoopSlotAdvancer {
 
 async fn open_table(
     catalog: Arc<dyn MetadataCatalog>,
-    data: &std::path::Path,
+    data: &Data,
     shards: usize,
     create: bool,
 ) -> Arc<CayenneTableProvider> {
     let runtime_env = SessionContext::new().runtime_env();
     let table = if create {
-        CayenneTableProvider::create_table(catalog, options(data, shards), runtime_env)
+        data.builder(catalog, runtime_env)
+            .create(options(data, shards))
             .await
             .expect("create the table")
     } else {
-        CayenneTableProviderBuilder::new(catalog, runtime_env)
+        data.builder(catalog, runtime_env)
             .open(TABLE)
             .await
             .expect("reopen the table")
@@ -346,21 +394,20 @@ async fn each_seal_and_checkpoint_publishes_one_record() {
 
 async fn one_record_per_step(commit_each_change: bool) {
     let mut per_step = Vec::new();
-    let tmp = tempfile::tempdir().expect("tempdir");
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let catalog: Arc<dyn MetadataCatalog> = Arc::new(
-        ObjectNativeCatalog::create_with_config(
-            Arc::clone(&store),
-            Path::from(PREFIX),
-            NativeCatalogConfig {
-                commit_each_change,
-                ..config()
-            },
-        )
-        .await
-        .expect("create the catalog"),
-    );
-    let table = open_table(catalog, tmp.path(), 1, true).await;
+    let native = ObjectNativeCatalog::create_with_config(
+        Arc::clone(&store),
+        Path::from(PREFIX),
+        NativeCatalogConfig {
+            commit_each_change,
+            ..config()
+        },
+    )
+    .await
+    .expect("create the catalog");
+    let data = Data::location(&native);
+    let catalog: Arc<dyn MetadataCatalog> = Arc::new(native);
+    let table = open_table(catalog, &data, 1, true).await;
     for (index, &step) in SCENARIO.iter().enumerate() {
         let before = records(&store).await.len();
         run_step(&table, step).await;
@@ -409,7 +456,6 @@ async fn crash_at(
     shards: usize,
     concurrent_flushes: bool,
 ) -> Option<(Outcome, Vec<Rows>)> {
-    let tmp = tempfile::tempdir().expect("tempdir");
     let storage: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let crash = Arc::new(CrashStore::new(Arc::clone(&storage)));
     let store: Arc<dyn ObjectStore> = Arc::clone(&crash) as Arc<dyn ObjectStore>;
@@ -418,9 +464,10 @@ async fn crash_at(
             .await
             .expect("create the catalog"),
     );
+    let data = Data::location(&catalog);
     let table = open_table(
         Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
-        tmp.path(),
+        &data,
         shards,
         true,
     )
@@ -485,7 +532,7 @@ async fn crash_at(
             .await
             .expect("reopen the catalog after the crash"),
     );
-    let table = open_table(reopened, tmp.path(), shards, false).await;
+    let table = open_table(reopened, &data, shards, false).await;
     let rows = served(&table).await;
     let count = counted(&table).await;
 
@@ -606,12 +653,18 @@ async fn seal_over_current_snapshot_then_restart(native: bool) -> Vec<(i64, i64)
             Arc::new(catalog) as Arc<dyn MetadataCatalog>
         }
     };
-    let mut table_options = options(&tmp.path().join("data"), 1);
+    let first = catalog().await;
+    let data = match first.as_any().downcast_ref::<ObjectNativeCatalog>() {
+        Some(native) => Data::location(native),
+        None => Data::Local(tmp.path().join("data")),
+    };
+    let mut table_options = options(&data, 1);
     // Durable writes land in Vortex files of the current snapshot.
     table_options.vortex_config.inline_max_rows = 0;
     let runtime_env = SessionContext::new().runtime_env();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog().await, table_options, runtime_env)
+        data.builder(first, runtime_env)
+            .create(table_options)
             .await
             .expect("create"),
     );
@@ -669,7 +722,7 @@ async fn seal_over_current_snapshot_then_restart(native: bool) -> Vec<(i64, i64)
     );
     drop(table);
     let reopened_catalog = catalog().await;
-    let reopened = open_table(reopened_catalog, tmp.path(), 1, false).await;
+    let reopened = open_table(reopened_catalog, &data, 1, false).await;
     served(&reopened).await
 }
 

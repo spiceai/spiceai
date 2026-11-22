@@ -1394,7 +1394,7 @@ mod tests {
                 .with_remove_duplicates(true)
                 .with_last_write_wins(true),
         ] {
-            let table = builder(Engine::Sqlite)
+            let table = builder(Engine::Cayenne)
                 .upsert_options(options.clone())
                 .build()
                 .expect("build succeeds");
@@ -1415,7 +1415,7 @@ mod tests {
     /// on the same "no deduplication" answer.
     #[test]
     fn no_upsert_options_means_no_keys_written_and_none_read_back() {
-        let table = builder(Engine::Sqlite).build().expect("build succeeds");
+        let table = builder(Engine::Cayenne).build().expect("build succeeds");
 
         assert!(!table.options.contains_key("upsert_remove_duplicates"));
         assert!(!table.options.contains_key("upsert_last_write_wins"));
@@ -1429,7 +1429,7 @@ mod tests {
     /// upserts on. Dropping them turns every upsert into a blind append.
     #[test]
     fn constraints_reach_the_created_table() {
-        let table = builder(Engine::Sqlite)
+        let table = builder(Engine::Cayenne)
             .constraints(pk(vec![0, 1]))
             .build()
             .expect("build succeeds");
@@ -1439,13 +1439,13 @@ mod tests {
 
     #[test]
     fn a_table_built_without_constraints_has_none_rather_than_a_stale_key() {
-        let table = builder(Engine::Sqlite).build().expect("build succeeds");
+        let table = builder(Engine::Cayenne).build().expect("build succeeds");
         assert!(table.constraints.is_empty());
     }
 
     #[test]
     fn the_on_conflict_behavior_reaches_the_created_table() {
-        let table = builder(Engine::Sqlite)
+        let table = builder(Engine::Cayenne)
             .on_conflict(OnConflict::Upsert(
                 datafusion_table_providers::util::column_reference::ColumnReference::try_from("id")
                     .expect("column reference"),
@@ -1461,7 +1461,7 @@ mod tests {
 
     #[test]
     fn the_write_mode_reaches_the_created_table() {
-        let table = builder(Engine::Sqlite)
+        let table = builder(Engine::Cayenne)
             .mode(Mode::File)
             .build()
             .expect("build succeeds");
@@ -1500,12 +1500,18 @@ mod tests {
     #[test]
     fn unique_constraints_are_not_reported_as_primary_keys() {
         let constraints = Constraints::new_unverified(vec![Constraint::Unique(vec![2])]);
-        assert!(get_primary_keys_from_constraints(&constraints, &schema()).is_empty());
+        assert_eq!(
+            get_primary_keys_from_constraints(&constraints, &schema()),
+            [] as [String; 0]
+        );
     }
 
     #[test]
     fn no_constraints_yields_no_primary_keys() {
-        assert!(get_primary_keys_from_constraints(&Constraints::default(), &schema()).is_empty());
+        assert_eq!(
+            get_primary_keys_from_constraints(&Constraints::default(), &schema()),
+            [] as [String; 0]
+        );
     }
 
     /// Turning primary-key conflict detection off is a Cayenne-only escape
