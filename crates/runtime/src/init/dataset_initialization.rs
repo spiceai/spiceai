@@ -699,12 +699,11 @@ mod tests {
         let (runtime, dataset) = ready_deferred_dataset().await;
         let (builder, calls) = failing_then_serving(1, || "no data files yet".into());
 
-        let failure = match plan(&runtime, &dataset, builder)
+        let Err(failure) = plan(&runtime, &dataset, builder)
             .initialize_retriable()
             .await
-        {
-            Ok(_) => panic!("the first attempt must fail"),
-            Err(failure) => failure,
+        else {
+            panic!("the first attempt must fail");
         };
         let retry = failure.retry.expect("an unavailable source can be retried");
         assert!(
@@ -738,12 +737,11 @@ mod tests {
             })
         });
 
-        let failure = match plan(&runtime, &dataset, builder)
+        let Err(failure) = plan(&runtime, &dataset, builder)
             .initialize_retriable()
             .await
-        {
-            Ok(_) => panic!("the attempt must fail"),
-            Err(failure) => failure,
+        else {
+            panic!("the attempt must fail");
         };
         assert!(
             failure.retry.is_none(),
@@ -767,12 +765,11 @@ mod tests {
             })
         });
 
-        let failure = match plan(&runtime, &dataset, builder)
+        let Err(failure) = plan(&runtime, &dataset, builder)
             .initialize_retriable()
             .await
-        {
-            Ok(_) => panic!("the attempt must fail"),
-            Err(failure) => failure,
+        else {
+            panic!("the attempt must fail");
         };
         assert!(
             failure.retry.is_none(),
