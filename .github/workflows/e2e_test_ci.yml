@@ -230,14 +230,16 @@ jobs:
         with:
           # `http-functions` for test/spicescript/secret-redaction.yaml, which registers
           # remote functions.
-          features: 'tpc-extension,models,postgres-accel,http-functions'
+          features: 'tpc-extension,models,http-functions'
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          # The binaries only hand off to this run's test jobs, so they need not
-          # outlive it; at the repository's 30-day default each run kept its
-          # two builds (~600 MiB) stored for a month.
-          artifact_retention_days: '1'
+          # This run's test jobs use the binaries, and so does trunk_tests.yml,
+          # which runs every 12 hours and tests the merge queue's build of trunk
+          # HEAD rather than building it again. Three days covers a missed or
+          # late run; at the repository's 30-day default each run kept its two
+          # builds (~600 MiB) stored for a month.
+          artifact_retention_days: '3'
 
       - name: Build spiced and spice CLI (macOS)
         if: matrix.target.target_os == 'darwin'
@@ -249,7 +251,7 @@ jobs:
         timeout-minutes: 180
         uses: $/.github/actions/build-spiced
         with:
-          features: 'tpc-extension,models,postgres-accel,http-functions,metal'
+          features: 'tpc-extension,models,http-functions,metal'
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -2966,7 +2968,10 @@ jobs:
         with:
           package: spicescript
 
-  # Runs the scenario scripts against this run's spiced and spice CLI.
+  # Runs the scenario scripts not tagged `long` against this run's spiced and
+  # spice CLI, plus every script this run adds or changes. Every script, the
+  # known-failing ledger, the older DuckDB releases and the live providers run
+  # after merge, on trunk, in trunk_tests.yml.
   test_spicescript:
     name: ${{ matrix.name }}
     needs: [build, build_spicescript]
@@ -2974,107 +2979,99 @@ jobs:
     environment: ci
     permissions:
       contents: read
-      id-token: write  # RustFS credentials, and the tokens of the live scripts
+      id-token: write  # RustFS and Docker Hub credentials
     timeout-minutes: 60
-    env:
-      HAS_OPENAI_WIF: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID != '' }}
-      HAS_ANTHROPIC_WIF: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID != '' }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Scripts that pass: any failure fails the job. Each shard runs
-          # its share of the scripts (--partition), balanced by their
+          # Scripts without `tags: [long]`: any failure fails the job. Each
+          # shard runs its share of them (--partition), balanced by their
           # recorded durations.
-          - { name: 'spicescript: scripts (1/4)', partition: 1/4, args: test/spicescript }
-          - { name: 'spicescript: scripts (2/4)', partition: 2/4, args: test/spicescript }
-          - { name: 'spicescript: scripts (3/4)', partition: 3/4, args: test/spicescript }
-          - { name: 'spicescript: scripts (4/4)', partition: 4/4, args: test/spicescript }
-          # Scripts that reproduce open bugs (test/spicescript/known-failing)
-          # run nightly in spicescript_nightly.yml, not here.
-          # The shards above read DuckDB and DuckLake sources with the newest
-          # release test/duckdb_versions.json lists; this one runs the scripts
-          # with DuckDB sources again on each older listed release.
-          - { name: 'spicescript: older DuckDB releases', partition: 1/1, older_duckdb: true }
-          # test/spicescript/live: real providers through static credential params, with
-          # tokens minted from this job's GitHub OIDC token just before the run.
-          - { name: 'spicescript: live', live: true }
+          - { name: 'spicescript: scripts (1/2)', partition: 1/2 }
+          - { name: 'spicescript: scripts (2/2)', partition: 2/2 }
+          # The `long` and known-failing scripts this run adds or changes (the
+          # others already run in the shards above): a new regression script
+          # runs before it merges, and a fix whose known-failing script now
+          # passes learns it here rather than from the next trunk tests run.
+          - { name: 'spicescript: changed scripts', changed: true }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # What changed against the base of the merge group, or the previous trunk
+      # commit on a push. Scripts are the *.yaml files directly in
+      # test/spicescript and in test/spicescript/known-failing/<group>/; the
+      # other directories under it are not run by CI (see its README), and the
+      # live scripts need the provider tokens only trunk_tests.yml mints. A
+      # changed known-failing ledger (a re-record) runs its whole group against
+      # the new ledger. An edit to a script's `tags:` line alone changes which
+      # run it belongs to, not what it does, so it selects nothing here.
+      - name: Find changed scripts
+        id: changed
+        if: ${{ matrix.changed }}
+        env:
+          BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = 0000000000000000000000000000000000000000 ]; then
+            echo "No base commit to compare with; no changed scripts to run."
+            exit 0
+          fi
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          # Scripts without `tags: [long]` run in the script shards from this
+          # same commit, so only the changed `long` ones run again here.
+          passing=$(git diff --name-only --diff-filter=AMR -I'^tags:' "$BASE_SHA" HEAD -- \
+            ':(glob)test/spicescript/*.yaml' ':(exclude)test/spicescript/variants.yaml' |
+            while read -r script; do
+              if grep -qE '^tags:.*[^a-z_-]long([^a-z_-]|$)' "$script"; then echo "$script"; fi
+            done | xargs)
+          groups=$(git diff --name-only --diff-filter=AMRD "$BASE_SHA" HEAD -- \
+            ':(glob)test/spicescript/known-failing/*/recordings/expected-failures.json' \
+            | sed 's#/recordings/expected-failures.json$##' | while read -r dir; do
+              # A group a fix emptied is gone; under pipefail a bare test would
+              # end the loop with status 1 and abort this step.
+              if [ -d "$dir" ]; then echo "$dir"; fi
+            done | sort -u)
+          known=$( {
+            echo "$groups"
+            git diff --name-only --diff-filter=AMR -I'^tags:' "$BASE_SHA" HEAD -- \
+              ':(glob)test/spicescript/known-failing/*/*.yaml' | while read -r script; do
+                # A script whose whole group already runs is not listed again.
+                grep -qx "$(dirname "$script")" <<<"$groups" || echo "$script"
+              done
+          } | sed '/^$/d' | xargs)
+          echo "Changed scripts: ${passing:-none}"
+          echo "Changed known-failing scripts: ${known:-none}"
+          {
+            echo "passing=$passing"
+            echo "known=$known"
+          } >> "$GITHUB_OUTPUT"
+
       - name: download artifacts - build_linux_x86_64
+        if: ${{ !matrix.changed || steps.changed.outputs.passing != '' || steps.changed.outputs.known != '' }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_linux_x86_64
           path: ./build
 
       - name: Install spice
+        if: ${{ !matrix.changed || steps.changed.outputs.passing != '' || steps.changed.outputs.known != '' }}
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
-      - name: Get RustFS credentials
-        id: rustfs
-        uses: $/.github/actions/rustfs-credentials
-        with:
-          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
-          duration-seconds: '3600'
-          export-env: 'false'
-
-      - name: Install MinIO
-        uses: $/.github/actions/setup-minio
-        with:
-          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
-          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
-          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
-
-      - name: Download spicescript
+      - name: Set up spicescript
         id: spicescript
-        uses: $/.github/actions/build-tool
+        if: ${{ !matrix.changed || steps.changed.outputs.passing != '' || steps.changed.outputs.known != '' }}
+        uses: $/.github/actions/setup-spicescript
         with:
-          package: spicescript
-
-      # Sources run in containers; log in so image pulls are not rate limited. Scripts pull
-      # images as they start, so the login has to last the whole job.
-      - name: Login to DockerHub
-        if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
-        env:
-          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
-          DOCKERHUB_OIDC_EXPIREIN: '21600'
-        with:
-          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
-
-      # Object-store sources (rustfs) are managed with the aws CLI.
-      - name: Install the AWS CLI
-        run: |
-          command -v unzip >/dev/null || { sudo apt-get update && sudo apt-get install -y unzip; }
-          if ! command -v aws >/dev/null; then
-            curl -fsSL -o "$RUNNER_TEMP/awscliv2.zip" https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
-            unzip -q "$RUNNER_TEMP/awscliv2.zip" -d "$RUNNER_TEMP"
-            sudo "$RUNNER_TEMP/aws/install"
-          fi
-
-      # Iceberg sources and dbgen write and read through the DuckDB CLI. The
-      # DuckLake source fetches the release matching spiced's embedded DuckDB.
-      - name: Install DuckDB CLI
-        run: |
-          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 -o "$RUNNER_TEMP/duckdb.zip" \
-            https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip
-          unzip -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
-          echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
-
-      # The search and embedding scripts download a Hub model at startup. Without
-      # a token they share the pool's anonymous per-IP quota, and a rate limit fails
-      # every one of them at once as "model 'potion' … failed to load".
-      - name: Authenticate the Hugging Face cache
-        uses: $/.github/actions/hf-cache-auth
-        with:
-          token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+          minio-endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          dockerhub-username: ${{ vars.DOCKERHUB_ORGANIZATION }}
+          dockerhub-oidc-connection-id: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          hf-token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
 
       - name: Check harness rejects incorrect answers
-        if: ${{ matrix.partition == '1/4' }}
+        if: ${{ matrix.partition == '1/2' }}
         run: |
           python3 test/spicescript/check_harness.py \
             --runner "${{ steps.spicescript.outputs.path }}" \
@@ -3086,97 +3083,53 @@ jobs:
       # and downloads each release it needs into ~/.cache/spicescript, so no
       # `--from` is passed here. The token is for the releases API's rate limit.
       - name: Run scenario scripts
-        if: ${{ !matrix.older_duckdb && !matrix.live }}
+        if: ${{ !matrix.changed }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           "${{ steps.spicescript.outputs.path }}" --jobs 4 \
+            --exclude-tag long \
             --partition ${{ matrix.partition }} \
             --spiced "$(command -v spiced)" \
             --spice-cli "$(command -v spice)" \
             --work-dir "$RUNNER_TEMP/spicescript" \
             --results "$RUNNER_TEMP/spicescript-results.json" \
             --log-capture "$RUNNER_TEMP/spicescript-logs" \
-            ${{ matrix.args }}
+            test/spicescript
 
-      # Each minted token expires about 5 minutes later, so all are minted right before the
-      # one run, which runs the scripts side by side.
-      - name: Mint an OpenAI access token
-        if: ${{ matrix.live && env.HAS_OPENAI_WIF == 'true' }}
-        uses: $/.github/actions/openai-token
-        with:
-          identity-provider-id: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
-          service-account-id: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
-          audience: ${{ secrets.OPENAI_WIF_AUDIENCE }}
-
-      - name: Mint an Anthropic access token
-        if: ${{ matrix.live && env.HAS_ANTHROPIC_WIF == 'true' }}
-        uses: $/.github/actions/anthropic-token
-        with:
-          federation-rule-id: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
-          organization-id: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
-          service-account-id: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
-          workspace-id: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
-
-      - name: Assume the Databricks Delta role
-        id: aws-databricks-delta
-        if: ${{ matrix.live }}
-        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
-          role-session-name: gha-databricks-delta-${{ github.run_id }}
-          aws-region: us-east-1
-          output-env-credentials: false
-          output-credentials: true
-
-      - name: Run live scripts
-        if: ${{ !cancelled() && matrix.live }}
+      - name: Run changed scripts
+        if: ${{ matrix.changed && steps.changed.outputs.passing != '' }}
         env:
-          DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
-          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
-          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta.outputs.aws-access-key-id }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta.outputs.aws-secret-access-key }}
-          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta.outputs.aws-session-token }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SCRIPTS: ${{ steps.changed.outputs.passing }}
         run: |
-          DATABRICKS_TOKEN="$(bash .github/scripts/databricks_oidc_token.sh)"
-          export DATABRICKS_TOKEN
-          "${{ steps.spicescript.outputs.path }}" --jobs 3 \
+          # shellcheck disable=SC2086 # SCRIPTS holds several paths
+          "${{ steps.spicescript.outputs.path }}" --jobs 4 \
             --spiced "$(command -v spiced)" \
+            --spice-cli "$(command -v spice)" \
             --work-dir "$RUNNER_TEMP/spicescript" \
             --results "$RUNNER_TEMP/spicescript-results.json" \
             --log-capture "$RUNNER_TEMP/spicescript-logs" \
-            test/spicescript/live
+            $SCRIPTS
 
-      # The combinations whose source is DuckDB or DuckLake (matrix keys
-      # backend, src and source), then the DuckDB and DuckLake scripts without
-      # such a key, on each older listed release.
-      - name: Run DuckDB scripts on older DuckDB releases
-        if: ${{ matrix.older_duckdb }}
+      # Each must fail exactly as its group's recordings/expected-failures.json
+      # says, so a fix (or a change in how a bug shows) fails this job.
+      # --max-wait: a known-failing script otherwise waits out every limit of
+      # the checks it is expected to fail.
+      - name: Run changed known-failing scripts
+        if: ${{ !cancelled() && matrix.changed && steps.changed.outputs.known != '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SCRIPTS: ${{ steps.changed.outputs.known }}
         run: |
-          status=0
-          for version in $(jq -r '.versions[:-1][].version' test/duckdb_versions.json); do
-            for args in "--matrix backend=duckdb test/spicescript" \
-              "--matrix src=duckdb test/spicescript" \
-              "--matrix source=duckdb test/spicescript" \
-              "--matrix backend=ducklake test/spicescript" \
-              "--matrix src=ducklake test/spicescript" \
-              "--matrix source=ducklake test/spicescript" \
-              "test/spicescript/adbc-duckdb-catalog.yaml test/spicescript/ducklake-coverage.yaml test/spicescript/ducklake-refresh.yaml"; do
-              # shellcheck disable=SC2086 # args holds several words
-              "${{ steps.spicescript.outputs.path }}" --jobs 4 \
-                --duckdb-version "$version" \
-                --spiced "$(command -v spiced)" \
-                --spice-cli "$(command -v spice)" \
-                --work-dir "$RUNNER_TEMP/spicescript" \
-                --results "$RUNNER_TEMP/spicescript-results-duckdb-$version-$((++run)).json" \
-                --log-capture "$RUNNER_TEMP/spicescript-logs" \
-                $args || status=1
-            done
-          done
-          exit $status
+          # shellcheck disable=SC2086 # SCRIPTS holds several paths
+          "${{ steps.spicescript.outputs.path }}" --jobs 4 --max-wait 30s \
+            --spiced "$(command -v spiced)" \
+            --spice-cli "$(command -v spice)" \
+            --work-dir "$RUNNER_TEMP/spicescript" \
+            --results "$RUNNER_TEMP/spicescript-results-known-failing.json" \
+            --log-capture "$RUNNER_TEMP/spicescript-logs" \
+            $SCRIPTS
 
       # Every script's outcome, passes included, from every run: a script's
       # failure rate across runs is read off these rather than off job logs.
@@ -3186,7 +3139,7 @@ jobs:
         with:
           name: spicescript-results-${{ strategy.job-index }}
           path: ${{ runner.temp }}/spicescript-results*.json
-          if-no-files-found: warn
+          if-no-files-found: ignore
           retention-days: 30
 
       # A directory per script with a failure: the script, what the run
@@ -3242,9 +3195,8 @@ jobs:
       - graceful_shutdown_test_full
       - test_cold_start_unkeyed_append
       - build_spicescript
-      # Every spicescript job gates: the passing scripts, the older DuckDB
-      # releases and the live providers. A failing shard names its failing scripts in
-      # its own log.
+      # Every spicescript job gates: the script shards and the changed scripts.
+      # A failing shard names its failing scripts in its own log.
       - test_spicescript
     steps:
       - name: Verify all E2E jobs succeeded
