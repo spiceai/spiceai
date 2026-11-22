@@ -1,4 +1,5 @@
 name: mysql-unsigned-negation
+tags: [long]
 description: >
   Native MySQL unsigned columns negate to signed results and reject overflow,
   including comparisons and IN predicates.

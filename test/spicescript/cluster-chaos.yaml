@@ -1,4 +1,5 @@
 name: cluster-chaos
+tags: [long]
 description: >
   On a cluster of Cayenne accelerations, readers running throughout get the
   right answer or an error, never a wrong one, while the cluster changes

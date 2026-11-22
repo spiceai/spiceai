@@ -7,7 +7,7 @@
 the times the scripts take on the CI runners, at the `--jobs` CI uses, not on a
 developer's machine. This reads the `spicescript-results-*` artifacts of the
 given runs (by default the newest successful E2E Test CI merge-queue runs and
-spicescript nightly runs), takes each script's median, and writes it beside the
+trunk tests runs), takes each script's median, and writes it beside the
 script. A script no run reached keeps its recorded duration.
 
     python3 test/spicescript/update_durations.py            # newest runs
@@ -27,7 +27,7 @@ import tempfile
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DURATIONS_FILE = Path("recordings/durations.json")
 # The workflows whose runs carry spicescript results, and the event of the runs to read.
-SOURCES = [("e2e_test_ci.yml", "merge_group"), ("spicescript_nightly.yml", "schedule")]
+SOURCES = [("e2e_test_ci.yml", "merge_group"), ("trunk_tests.yml", "schedule")]
 
 
 def gh(*args):

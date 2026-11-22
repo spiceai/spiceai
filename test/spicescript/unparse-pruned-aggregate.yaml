@@ -1,4 +1,5 @@
 name: unparse-pruned-aggregate
+tags: [long]
 description: >
   Aggregates keep their rows when an outer query reads none of their output
   columns: one row for a global aggregate, including over empty input, and one
