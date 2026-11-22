@@ -4,7 +4,9 @@ description: >
   refresh, an append and an accelerated view each follow the source with no
   manual refresh. With the spicepod watched, edits take effect without a
   restart: a slower cron made faster, a dataset added and one removed, and a
-  view's SQL changed.
+  view's SQL changed. A dataset and a view added by an edit with the removed
+  `postgres` acceleration engine each fail to load with the removal error,
+  while the dataset added beside them loads.
 
 sources:
   src: { kind: postgres }
@@ -89,9 +91,13 @@ steps:
         datasets:
           - { from: 'postgres:public.t', name: full_cron, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_cron: '*/2 * * * * *' } }
           - { from: 'postgres:public.events', name: added_later, params: '${sources.src.params}' }
+          - { from: 'postgres:public.t', name: postgres_engine_later, params: '${sources.src.params}', acceleration: { enabled: true, engine: postgres } }
         views:
           - name: v
             sql: SELECT id, v FROM full_cron WHERE id > 80
+          - name: postgres_view_later
+            sql: SELECT id, v FROM full_cron
+            acceleration: { enabled: true, engine: postgres }
   - query: SELECT id, at FROM added_later
     oracle-sql: SELECT id, at FROM events
     eventually: 60s
@@ -101,3 +107,16 @@ steps:
   - query: SELECT id, v FROM v
     oracle-sql: SELECT id, v FROM t WHERE id > 80
     eventually: 60s
+  # The `postgres` engine is removed: a dataset and a view the edit adds with it
+  # each fail to load with the removal error, and are never switched to Cayenne.
+  - query: SELECT * FROM postgres_engine_later
+    expect-error: postgres_engine_later
+    eventually: 60s
+  - query: SELECT * FROM postgres_view_later
+    expect-error: postgres_view_later
+    eventually: 60s
+  - assert-log:
+      count:
+        "ERROR .*Failed to load dataset 'postgres_engine_later': the acceleration engine `postgres` is no longer supported as of v2\\.5 and cannot be used\\. Set `acceleration\\.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots\\. See: https://spiceai\\.org/docs/components/data-accelerators/cayenne/migration dataset=\"postgres_engine_later\"$": 1
+        "ERROR .*Failed to load view 'postgres_view_later': the acceleration engine `postgres` is no longer supported as of v2\\.5 and cannot be used\\. Set `acceleration\\.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots\\. See: https://spiceai\\.org/docs/components/data-accelerators/cayenne/migration view=\"postgres_view_later\"$": 1
+      lacks: ["deprecated .*postgres_(engine|view)_later", "Unknown acceleration engine 'postgres"]
