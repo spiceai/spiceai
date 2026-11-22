@@ -530,6 +530,41 @@ pub fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + 
     }
 }
 
+/// Whether `driver_name` names the `BigQuery` ADBC driver.
+#[must_use]
+pub fn is_bigquery_driver(driver_name: &str) -> bool {
+    driver_name.eq_ignore_ascii_case("bigquery")
+}
+
+/// Whether `dataset` is a `BigQuery` hidden dataset: one whose name starts with
+/// `_`. `BigQuery` rejects a query against a hidden dataset's
+/// `INFORMATION_SCHEMA` ("Cannot use `INFORMATION_SCHEMA` with a hidden
+/// dataset").
+#[must_use]
+pub fn is_bigquery_hidden_dataset(dataset: &str) -> bool {
+    dataset.starts_with('_')
+}
+
+/// The `BigQuery` ADBC driver option that leaves the tables of cached query
+/// results out of `get_objects`, before the driver fetches any table's metadata.
+/// Tables in a user's own hidden datasets are still listed. Only the
+/// `spiceai/bigquery` build of the driver has it.
+pub const BIGQUERY_SKIP_QUERY_RESULT_TABLES: &str = "bigquery.skip_query_result_tables";
+
+/// Turns on [`BIGQUERY_SKIP_QUERY_RESULT_TABLES`] for a `BigQuery` database.
+///
+/// # Errors
+///
+/// When the driver rejects the option, as a driver build without it does.
+pub fn skip_bigquery_query_result_tables(
+    database: &mut impl adbc_core::Optionable<Option = OptionDatabase>,
+) -> adbc_core::error::Result<()> {
+    database.set_option(
+        OptionDatabase::Other(BIGQUERY_SKIP_QUERY_RESULT_TABLES.to_string()),
+        "true".into(),
+    )
+}
+
 /// Enriches a table provider with BigQuery-specific schema metadata (descriptions,
 /// source types, partition flags, clustering ordinals) queried from the
 /// `INFORMATION_SCHEMA` views. For non-BigQuery drivers this is a no-op.
@@ -539,7 +574,15 @@ pub async fn enrich_with_bigquery_metadata(
     table_reference: &TableReference,
     provider: Arc<dyn TableProvider>,
 ) -> Arc<dyn TableProvider> {
-    if !driver_name.eq_ignore_ascii_case("bigquery") {
+    if !is_bigquery_driver(driver_name) {
+        return provider;
+    }
+    // The metadata comes from `INFORMATION_SCHEMA`, which `BigQuery` rejects for
+    // a hidden dataset, so a table in one has none to read.
+    if table_reference
+        .schema()
+        .is_some_and(is_bigquery_hidden_dataset)
+    {
         return provider;
     }
 
@@ -1089,5 +1132,78 @@ mod scrub_tests {
             scrub_connection_secrets("Cannot open file \"/data/sales.db\"", &secrets),
             "Cannot open file \"***\""
         );
+    }
+}
+
+#[cfg(test)]
+mod bigquery_query_result_table_skip_tests {
+    use super::*;
+    use adbc_core::error::{Error as AdbcError, Result as AdbcResult, Status};
+    use adbc_core::options::OptionValue;
+
+    /// A database that records the options set on it, and rejects them the way
+    /// a driver build without the option does when `known` is false.
+    struct Database {
+        known: bool,
+        set: Vec<(String, String)>,
+    }
+
+    impl adbc_core::Optionable for Database {
+        type Option = OptionDatabase;
+
+        fn set_option(&mut self, key: OptionDatabase, value: OptionValue) -> AdbcResult<()> {
+            if !self.known {
+                return Err(AdbcError::with_message_and_status(
+                    format!("Unknown database option '{}'", key.as_ref()),
+                    Status::NotImplemented,
+                ));
+            }
+            let OptionValue::String(value) = value else {
+                panic!("expected a string option value");
+            };
+            self.set.push((key.as_ref().to_string(), value));
+            Ok(())
+        }
+
+        fn get_option_string(&self, _: OptionDatabase) -> AdbcResult<String> {
+            unimplemented!()
+        }
+        fn get_option_bytes(&self, _: OptionDatabase) -> AdbcResult<Vec<u8>> {
+            unimplemented!()
+        }
+        fn get_option_int(&self, _: OptionDatabase) -> AdbcResult<i64> {
+            unimplemented!()
+        }
+        fn get_option_double(&self, _: OptionDatabase) -> AdbcResult<f64> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn a_driver_with_the_option_skips_query_result_tables() {
+        let mut database = Database {
+            known: true,
+            set: Vec::new(),
+        };
+        skip_bigquery_query_result_tables(&mut database).expect("the option is applied");
+        assert_eq!(
+            database.set,
+            vec![(
+                "bigquery.skip_query_result_tables".to_string(),
+                "true".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_driver_without_the_option_rejects_it() {
+        let mut database = Database {
+            known: false,
+            set: Vec::new(),
+        };
+        let error = skip_bigquery_query_result_tables(&mut database)
+            .expect_err("a driver without the option rejects it");
+        assert_eq!(error.status, Status::NotImplemented);
+        assert_eq!(database.set, Vec::<(String, String)>::new());
     }
 }

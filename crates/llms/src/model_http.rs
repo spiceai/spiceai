@@ -162,7 +162,7 @@ fn asks_for_stream(request: &reqwest::Request) -> bool {
 
 /// `response` with its body read whole, up to `max_bytes` once decoded.
 async fn read_whole(response: Response, max_bytes: usize) -> Result<Response, OpenAIError> {
-    http_body_limit::buffer(response, Limit::CompressionRatioAndSize(max_bytes))
+    http_body_limit::buffer(response, Limit::Size(max_bytes))
         .await
         .map_err(|error| match error {
             http_body_limit::Error::Read { source } => OpenAIError::Reqwest(source),

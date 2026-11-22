@@ -44,6 +44,7 @@ members = [
     "crates/flight_client",
     "crates/repl",
     "crates/result-compare",
+    "crates/redact",
     "crates/google-genai",
     "crates/hash-index",
     "crates/huggingface-hub",
@@ -80,7 +81,6 @@ members = [
     "crates/runtime-api-types",
     "crates/runtime-checkpoint-api",
     "crates/runtime-checkpoint-sqlite",
-    "crates/runtime-checkpoint-postgres",
     "crates/runtime-auth",
     "crates/runtime-metrics",
     "crates/runtime-async",
@@ -653,8 +653,9 @@ tantivy-query-grammar = { path = "vendor/tantivy-query-grammar" }
 # `IS [NOT] DISTINCT FROM` swallowed a following `AND`/`OR`, so
 # `a IS DISTINCT FROM b OR c` parsed as `a IS DISTINCT FROM (b OR c)` and
 # returned wrong rows. It also writes every quote character in a quoted
-# identifier twice, which upstream does not. See vendor/sqlparser/README.md
-# before dropping it.
+# identifier and in a string literal twice and a space between two minus
+# signs, which upstream does not. See vendor/sqlparser/README.md before
+# dropping it.
 sqlparser = { path = "vendor/sqlparser" }
 
 # Dependencies on crates.io `backoff` 0.4 resolve to the workspace crate.

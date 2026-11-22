@@ -77,21 +77,22 @@ const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_CLIENT_TIMEOUT: Duration = Duration::from_secs(DEFAULT_CLIENT_TIMEOUT_SECS);
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
-fn parse_pagination_max_pages(value: &str) -> Option<usize> {
+/// `pagination_max_pages`: a positive number of pages, or `nolimit` (`Ok(None)`). Any
+/// other value is an error, so a limit the operator set is never silently dropped.
+fn parse_pagination_max_pages(value: &str) -> Result<Option<usize>, ()> {
     let trimmed = value.trim();
     if trimmed.eq_ignore_ascii_case("nolimit") {
-        return None;
+        return Ok(None);
     }
+    match trimmed.parse::<usize>() {
+        Ok(max_pages) if max_pages > 0 => Ok(Some(max_pages)),
+        _ => Err(()),
+    }
+}
 
-    if let Ok(max_pages) = trimmed.parse::<usize>() {
-        Some(max_pages)
-    } else {
-        tracing::warn!(
-            "Invalid pagination_max_pages value '{}': expected a positive integer or 'nolimit'. The parameter will be ignored.",
-            value
-        );
-        Some(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES)
-    }
+/// `max_request_partitions`: a positive number of requests. Any other value is an error.
+fn parse_max_request_partitions(value: &str) -> Option<usize> {
+    value.trim().parse::<usize>().ok().filter(|max| *max > 0)
 }
 
 /// Redirects the JSON API client follows before a request fails.
@@ -317,7 +318,7 @@ struct HttpProviderParams {
     allowed_paths: Vec<String>,
     request_filters: RequestFilterParams,
     rate_control: HttpRateControlConfig,
-    max_request_partitions: Option<usize>,
+    max_request_partitions: usize,
     cache_max_size_bytes: usize,
     cache_fallback_ttl: Option<Duration>,
     health_probe: Option<String>,
@@ -495,13 +496,26 @@ impl Https {
             None => None,
         };
 
-        let max_request_partitions = self
+        // One request per combination of request filter values, so the bound always
+        // applies; a value that is not a positive integer is refused rather than dropped.
+        let max_request_partitions = match self
             .params
             .get("max_request_partitions")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|value| *value > 0);
+        {
+            Some(value) => parse_max_request_partitions(value).ok_or_else(|| {
+                DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: format!(
+                        "`max_request_partitions` must be a positive integer, got '{value}'. Set it to the most requests one query may send, or remove it to use the default of {}. See: https://spiceai.org/docs/components/data-connectors/https",
+                        data_components::http::provider::DEFAULT_MAX_REQUEST_PARTITIONS
+                    ),
+                }
+            })?,
+            None => data_components::http::provider::DEFAULT_MAX_REQUEST_PARTITIONS,
+        };
 
         let health_probe = self
             .params
@@ -548,15 +562,19 @@ impl Https {
                 .ok()
                 .map(std::string::ToString::to_string);
 
-            let max_pages = self
-                .params
-                .get("pagination_max_pages")
-                .expose()
-                .ok()
-                .map_or(
-                    Some(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES),
-                    parse_pagination_max_pages,
-                );
+            let max_pages = match self.params.get("pagination_max_pages").expose().ok() {
+                Some(value) => parse_pagination_max_pages(value).map_err(|()| {
+                    DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "https".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        message: format!(
+                            "`pagination_max_pages` must be a positive integer or 'nolimit', got '{value}'. Set it to the most pages one request may fetch, or remove it to use the default of {}. See: https://spiceai.org/docs/components/data-connectors/https",
+                            data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES
+                        ),
+                    }
+                })?,
+                None => Some(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES),
+            };
 
             let data_map_to_array = self
                 .params
@@ -2018,7 +2036,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("max_request_headers_length")
             .description("Maximum size (in bytes) for request_headers filter values. Default: 16384 (16KiB)."),
         ParameterSpec::runtime("max_request_partitions")
-            .description("Maximum number of HTTP request partitions that can be created from request_path, request_query, request_body, and request_headers filters. If unset, the number of request partitions is not capped."),
+            .description("Maximum number of distinct requests one query may send to this dataset, one for each combination of request_path, request_query, request_body and request_headers values. Each request may fetch up to `pagination_max_pages` pages. Default: 1000."),
         ParameterSpec::runtime("response_cache_max_size_bytes")
             .description("Byte budget for the responses this dataset caches, counting response bodies and the request keys they are held under. Once reached, entries are evicted to stay inside it. Set '0' to disable the response cache. Default: 67108864 (64 MiB), applied per dataset, so raise it only where a dataset earns it. Applies to dynamic JSON API endpoints only; structured HTTP file datasets do not use this cache."),
         ParameterSpec::runtime("response_cache_fallback_ttl")
@@ -2038,7 +2056,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("pagination_data_pointer")
             .description("JSON pointer (RFC 6901) to the data array in each page's response (e.g., '/data', '/results', '/items'). When set, only the array at this path is returned as data rows."),
         ParameterSpec::runtime("pagination_max_pages")
-            .description("Maximum number of pages to fetch for pagination. Default: 100. Set to 'nolimit' to disable the limit."),
+            .description("Maximum number of pages one request may fetch with pagination: a positive integer, or 'nolimit' to disable the limit. Default: 100."),
         ParameterSpec::runtime("pagination_data_map_to_array")
             .description("When 'enabled', if the data at pagination_data_pointer (or the top-level response) is a JSON object/map, extract its values as rows instead of treating it as a single row. Default: 'disabled'.")
             .one_of(&["enabled", "disabled"]),
@@ -3791,7 +3809,45 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             vec!["x-sandbox-id", "x-region"]
         );
         assert_eq!(params.request_filters.max_headers_length, 2048);
-        assert_eq!(params.max_request_partitions, Some(7000));
+        assert_eq!(params.max_request_partitions, 7000);
+    }
+
+    #[tokio::test]
+    async fn request_and_page_limits_default_and_refuse_values_they_cannot_use() {
+        let connector = test_connector_with(&[]).await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        let params = connector
+            .resolve_http_provider_params(&dataset)
+            .expect("defaults resolve");
+        assert_eq!(params.max_request_partitions, 1000);
+
+        for (value, shown) in [("0", "'0'"), ("1k", "'1k'"), ("-5", "'-5'")] {
+            let connector = test_connector_with(&[("max_request_partitions", value)]).await;
+            let Err(error) = connector.resolve_http_provider_params(&dataset) else {
+                panic!("max_request_partitions {value} is refused");
+            };
+            assert!(
+                error.to_string().contains(&format!(
+                    "`max_request_partitions` must be a positive integer, got {shown}. Set it to the most requests one query may send, or remove it to use the default of 1000. See: https://spiceai.org/docs/components/data-connectors/https"
+                )),
+                "{error}"
+            );
+        }
+
+        for value in ["1k", "0"] {
+            let connector =
+                test_connector_with(&[("pagination", "enabled"), ("pagination_max_pages", value)])
+                    .await;
+            let Err(error) = connector.resolve_http_provider_params(&dataset) else {
+                panic!("pagination_max_pages {value} is refused");
+            };
+            assert!(
+                error.to_string().contains(&format!(
+                    "`pagination_max_pages` must be a positive integer or 'nolimit', got '{value}'. Set it to the most pages one request may fetch, or remove it to use the default of 100. See: https://spiceai.org/docs/components/data-connectors/https"
+                )),
+                "{error}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4698,12 +4754,12 @@ uGgYIHbi/F+GaiUPzDyqe5p9
     }
 
     #[tokio::test]
-    async fn compression_bomb_is_refused_just_past_the_floor_without_retrying() {
+    async fn compression_bomb_is_refused_without_retrying() {
         let len = http_body_limit::RATIO_CHECK_FLOOR_BYTES + 64 * MIB;
         let body = gzip_json(len, |_| b'A');
         assert!(
-            body.len() * http_body_limit::MAX_COMPRESSION_RATIO < len,
-            "the response expands past the ratio: {} bytes on the wire",
+            body.len() * http_body_limit::Codec::Gzip.max_ratio() < len,
+            "the response expands past gzip's ratio: {} bytes on the wire",
             body.len()
         );
         let (origin, requests) = serve_gzip(body).await;
@@ -4717,40 +4773,21 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             ),
         };
         let (prefix, rest) = message
-            .split_once(" decoded (")
-            .unwrap_or_else(|| panic!("no byte counts in {message}"));
-        let (counts, suffix) = rest
             .split_once(" received)")
-            .unwrap_or_else(|| panic!("no byte counts in {message}"));
+            .unwrap_or_else(|| panic!("no sizes in {message}"));
         assert!(
-            prefix.ends_with(&format!(
+            prefix.contains(&format!(
                 "Failed to read the response from {origin} for dataset 'http_test': the \
-                 gzip-compressed response body expanded more than 100:1 when"
+                 gzip-compressed response expanded more than 400:1 (64."
             )),
             "{message}"
         );
         assert_eq!(
-            suffix,
-            ", which is refused once a body passes 64 MiB decoded. Ask the endpoint for an \
-             uncompressed response by adding `Accept-Encoding: identity` to `http_headers`, \
-             or request less data per call. \
-             See: https://spiceai.org/docs/components/data-connectors/https"
+            rest,
+            ", far past what real data compresses to, so it was refused as a compression \
+             bomb. If the data is genuine, have the origin serve it uncompressed or at a lower \
+             compression level. See: https://spiceai.org/docs/components/data-connectors/https"
         );
-
-        // Refused as soon as it passed the floor: never more than one decode block past it.
-        let (decoded, received) = counts
-            .split_once(" bytes from ")
-            .unwrap_or_else(|| panic!("malformed byte counts in {message}"));
-        let decoded: usize = decoded.parse().expect("decoded byte count");
-        let received: usize = received.parse().expect("received byte count");
-        assert!(
-            decoded > http_body_limit::RATIO_CHECK_FLOOR_BYTES
-                && decoded
-                    <= http_body_limit::RATIO_CHECK_FLOOR_BYTES
-                        + http_body_limit::DECODE_BLOCK_BYTES,
-            "refused at {decoded} decoded bytes"
-        );
-        assert!(decoded > received * http_body_limit::MAX_COMPRESSION_RATIO);
 
         // The refusal is permanent: the origin is asked once, not once per retry.
         assert_eq!(made, 1);
@@ -4762,7 +4799,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let body = gzip_json(len, ids);
         let ratio = len / body.len();
         assert!(
-            (2..http_body_limit::MAX_COMPRESSION_RATIO).contains(&ratio),
+            (2..http_body_limit::Codec::Gzip.max_ratio()).contains(&ratio),
             "the response compresses {ratio}:1"
         );
         let (origin, requests) = serve_gzip(body).await;

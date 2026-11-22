@@ -233,8 +233,9 @@ impl ListingCache {
             };
             if let Some(cause) = unreachable {
                 tracing::warn!(
-                    "Failed to read the token limits of model '{model}' from '{}', so /v1/models reports none for it, or for other models on that endpoint, until the endpoint answers; coding agents started meanwhile use their own defaults. Retrying in the background. Cause: {cause}",
-                    request.url
+                    "Failed to read the token limits of model '{model}' from '{}', so /v1/models reports none for it, or for other models on that endpoint, until the endpoint answers; coding agents started meanwhile use their own defaults. Retrying in the background. Cause: {}",
+                    redact::redact_url_credentials(&request.url),
+                    redact::redact_message_credentials(cause)
                 );
                 self.spawn_refresh(key, request, self.timings.retry_first);
             }

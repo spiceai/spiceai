@@ -1,0 +1,40 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Refusals a query can fail with that callers classify by type, not by message: how
+//! `/v1/sql` and Flight answer them, and whether a refresh asks again.
+
+/// Whether `error`, or any error in its chain of sources, is data a connector refused as
+/// a compression bomb. The answer is the same however many layers wrapped it.
+pub use http_body_limit::is_compression_refusal;
+
+/// Whether `error`, or any error in its chain of sources, is a query an HTTP dataset
+/// refused because its request filters, or a subquery's values, combine into more
+/// requests than `max_request_partitions` allows.
+#[must_use]
+pub fn is_request_bound_refusal(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if matches!(
+            error.downcast_ref::<crate::http::provider::Error>(),
+            Some(crate::http::provider::Error::TooManyRequests { .. })
+        ) {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}

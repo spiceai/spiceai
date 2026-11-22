@@ -31,7 +31,13 @@ limitations under the License.
 //! body: '[{"id": 1}]'
 //! delay-ms: 0
 //! times: 1                 # answers this many requests, then the next route
+//! repeat: 1                # the body is `body` this many times over, `{i}` its index
+//! encoding: gzip           # sent gzip-compressed (best level) or zstd (level 3), with `Content-Encoding`
 //! ```
+//!
+//! `repeat` and `encoding` serve a body far larger than a script would spell out: `repeat`
+//! for a large response, and both together for one small on the wire that decodes to many
+//! times its size.
 //!
 //! Later routes for a path come first, so a script changes an answer by adding
 //! a route; `reset` removes every route. `source-query` reads the requests:
@@ -75,6 +81,88 @@ struct Route {
     delay_ms: u64,
     #[serde(default)]
     times: Option<u64>,
+    #[serde(default = "once")]
+    repeat: u64,
+    #[serde(default)]
+    encoding: Option<Encoding>,
+    /// The body as sent, built from the fields above when the route is added.
+    #[serde(skip)]
+    payload: Bytes,
+}
+
+/// How a route's body is encoded on the wire.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum Encoding {
+    Gzip,
+    Zstd,
+}
+
+fn once() -> u64 {
+    1
+}
+
+impl Route {
+    /// The body as it is sent: `body` repeated `repeat` times, with `{i}` in it replaced by
+    /// each repetition's index, compressed as it is built when the route has an
+    /// `encoding`, so a body that decodes to gigabytes is never held decoded.
+    fn build_payload(&self) -> Result<Bytes> {
+        use std::io::Write;
+        let mut sink = Collect::default();
+        {
+            let shared = sink.clone();
+            let mut out: Box<dyn Write> = match self.encoding {
+                None => Box::new(shared),
+                // The best level, as a body built to expand would use.
+                Some(Encoding::Gzip) => Box::new(flate2::write::GzEncoder::new(
+                    shared,
+                    flate2::Compression::best(),
+                )),
+                // zstd's default level, as an origin compressing on the fly uses.
+                Some(Encoding::Zstd) => Box::new(zstd::Encoder::new(shared, 3)?.auto_finish()),
+            };
+            if self.body.contains("{i}") {
+                for i in 0..self.repeat {
+                    out.write_all(self.body.replace("{i}", &i.to_string()).as_bytes())?;
+                }
+            } else {
+                // Written a block of whole bodies at a time rather than one body at a time.
+                let per_block = u64::try_from((64 * 1024 / self.body.len().max(1)).max(1))?;
+                let block = self.body.repeat(usize::try_from(per_block)?);
+                for _ in 0..self.repeat / per_block {
+                    out.write_all(block.as_bytes())?;
+                }
+                for _ in 0..self.repeat % per_block {
+                    out.write_all(self.body.as_bytes())?;
+                }
+            }
+            out.flush()?;
+            // Dropping the encoder writes its trailer into `sink`.
+        }
+        Ok(sink.take())
+    }
+}
+
+/// A writer that collects into a buffer it shares with its clones, so an encoder can
+/// write into it and the bytes be taken once the encoder has finished.
+#[derive(Clone, Default)]
+struct Collect(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+impl Collect {
+    fn take(&mut self) -> Bytes {
+        std::mem::take(&mut *self.0.lock()).into()
+    }
+}
+
+impl std::io::Write for Collect {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn ok() -> u16 {
@@ -187,9 +275,18 @@ async fn answer(
     }
     let mut response = (
         StatusCode::from_u16(route.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        route.body,
+        route.payload,
     )
         .into_response();
+    if let Some(encoding) = route.encoding {
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_ENCODING,
+            HeaderValue::from_static(match encoding {
+                Encoding::Gzip => "gzip",
+                Encoding::Zstd => "zstd",
+            }),
+        );
+    }
     for (name, value) in &route.headers {
         if let (Ok(name), Ok(value)) = (
             HeaderName::try_from(name.as_str()),
@@ -243,6 +340,7 @@ impl Source for MockHttp {
             bail!("a mock route path starts with '/': {}", route.path);
         }
         route.path = format!("{prefix}{}", route.path);
+        route.payload = route.build_payload()?;
         self.state.lock().routes.push((route, 0));
         Ok(())
     }

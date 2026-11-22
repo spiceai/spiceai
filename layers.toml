@@ -339,6 +339,8 @@ telemetry = "foundation"
 token_provider = "foundation"
 write-retry = "foundation"
 util = "foundation"
+# Removes credentials from URLs before they are reported; depends on nothing in the workspace.
+redact = "foundation"
 vortex-datafusion = "foundation"
 yaml = "foundation"
 

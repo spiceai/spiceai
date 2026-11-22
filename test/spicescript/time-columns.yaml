@@ -1,4 +1,5 @@
 name: time-columns
+tags: [long]
 description: >
   Every `time_format` against append refresh and `refresh_data_window` on
   Cayenne: append adds exactly the newer rows, and the window loads exactly
