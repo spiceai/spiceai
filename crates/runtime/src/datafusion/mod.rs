@@ -8755,7 +8755,8 @@ mod tests {
         /// The Cayenne snapshot engine production passes as the override; without it a
         /// Cayenne archive would be unrestorable and no config is built at all (see
         /// `cayenne_does_not_publish_without_its_snapshot_engine`).
-        fn test_snapshot_engine() -> Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine> {
+        fn test_snapshot_engine() -> Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>
+        {
             Arc::new(runtime_acceleration::snapshot::engine::DefaultSnapshotEngine)
         }
 
