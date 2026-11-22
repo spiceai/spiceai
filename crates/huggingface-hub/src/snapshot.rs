@@ -110,20 +110,20 @@ pub(crate) enum Source {
     Hub,
     /// The cache, read alone because `HF_HUB_OFFLINE` is set.
     OfflineCache,
-    /// The cache, read alone because the Hub failed (`reason`).
-    CacheInOutage { reason: String },
+    /// The cache, read alone because the Hub's listing failed with `error`: the Hub could not
+    /// be reached, or it refused the request.
+    CacheInOutage { error: Arc<client::Error> },
 }
 
 impl Source {
     /// Why only the cache was read, as a clause: "`HF_HUB_OFFLINE` is set", "the Hugging Face
-    /// Hub could not be reached (HTTP 503)". `None` for the Hub's listing.
+    /// Hub could not be reached (HTTP 503)", "the Hugging Face Hub refused the request (token
+    /// rejected, HTTP 401)". `None` for the Hub's listing.
     pub(crate) fn cache_only_reason(&self) -> Option<String> {
         match self {
             Source::Hub => None,
             Source::OfflineCache => Some("`HF_HUB_OFFLINE` is set".to_string()),
-            Source::CacheInOutage { reason } => Some(format!(
-                "the Hugging Face Hub could not be reached ({reason})"
-            )),
+            Source::CacheInOutage { error } => Some(crate::error::fallback_clause(error)),
         }
     }
 }
@@ -228,13 +228,23 @@ impl Snapshot {
                     let Some((commit, files)) = from_cache(&cache, &repo, &revision).await else {
                         return Err(context.error(None, Cause::Hub(error)));
                     };
-                    let reason = crate::error::unreachable_reason(&error);
                     tracing::warn!(
-                        "{} could not reach the Hugging Face Hub ({reason}), so it loads revision '{revision}' of '{repo}' from the cache at commit {}. Changes to '{revision}' are not seen until the Hub is reachable.",
-                        requester.capitalized(),
-                        short(&commit)
+                        "{}",
+                        crate::error::fallback_warning(
+                            &requester.capitalized(),
+                            &error,
+                            &revision,
+                            &repo,
+                            short(&commit)
+                        )
                     );
-                    (commit, files, Source::CacheInOutage { reason })
+                    (
+                        commit,
+                        files,
+                        Source::CacheInOutage {
+                            error: Arc::new(error),
+                        },
+                    )
                 }
                 Err(error) => return Err(context.error(None, Cause::Hub(error))),
             }

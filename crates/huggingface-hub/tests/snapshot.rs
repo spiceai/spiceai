@@ -1048,6 +1048,52 @@ async fn a_rejected_token_is_named_by_its_source() {
         .expect("the token file's token is accepted");
 }
 
+/// A rejected token falls back to the cache, as every failure but a missing repository,
+/// revision or file does, and what the cache then lacks is reported as the token's fault, with
+/// its fix, not as a network failure.
+#[tokio::test]
+async fn a_rejected_token_with_a_cached_snapshot_says_to_fix_the_token() {
+    let fixture = Fixture::new().await;
+    fixture.mock.commit(MODEL, C1, model_files());
+    fixture.mock.branch(MODEL, "main", C1);
+    fixture
+        .open(None, &[])
+        .await
+        .download(&["config.json"])
+        .await
+        .expect("the config downloads");
+
+    fixture.mock.require_token("hf_right");
+    let snapshot = fixture.open(None, &[("HF_TOKEN", "hf_wrong")]).await;
+    assert_eq!(snapshot.commit(), C1);
+    assert_eq!(
+        snapshot.cache_only_reason().as_deref(),
+        Some("the Hugging Face Hub refused the request (token rejected, HTTP 401)")
+    );
+    snapshot
+        .download(&["config.json"])
+        .await
+        .expect("the cached config loads");
+
+    let error = snapshot
+        .download(&["tokenizer.json"])
+        .await
+        .expect_err("the tokenizer was never downloaded");
+    assert_eq!(
+        error.to_string(),
+        "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): the Hub rejected the token from `HF_TOKEN` (HTTP 401), so Spice read only the Hugging Face cache, which does not hold 'tokenizer.json'. Set `HF_TOKEN` to a token with access to this repo, or set `hf_token`. See: https://spiceai.org/docs/components/models/huggingface"
+    );
+    assert!(!error.is_configuration_error());
+
+    let error =
+        huggingface_hub::DownloadError::unusable(&snapshot, "there is no file 'model.gguf'");
+    assert_eq!(
+        error.to_string(),
+        "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): the Hub rejected the token from `HF_TOKEN` (HTTP 401), so Spice read only the Hugging Face cache, where there is no file 'model.gguf'. Set `HF_TOKEN` to a token with access to this repo, or set `hf_token`. See: https://spiceai.org/docs/components/models/huggingface"
+    );
+    assert!(!error.is_configuration_error());
+}
+
 #[tokio::test]
 async fn a_path_that_leaves_the_snapshot_is_refused() {
     let fixture = Fixture::new().await;

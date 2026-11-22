@@ -300,10 +300,24 @@ impl DownloadError {
             ),
             Cause::Missing {
                 what,
-                source: Source::CacheInOutage { reason },
+                source: Source::CacheInOutage { error },
+            } if refused(error) => {
+                let (cause, fix) =
+                    hub_cause_and_fix(error, token, no_token_fix, &context.revision, retried);
+                (
+                    format!(
+                        "{cause}, so Spice read only the Hugging Face cache, which does not hold {what}"
+                    ),
+                    fix,
+                )
+            }
+            Cause::Missing {
+                what,
+                source: Source::CacheInOutage { error },
             } => (
                 format!(
-                    "the Hugging Face Hub could not be reached ({reason}), and the Hugging Face cache does not hold {what}"
+                    "the Hugging Face Hub could not be reached ({}), and the Hugging Face cache does not hold {what}",
+                    unreachable_reason(error)
                 ),
                 Some(unreachable_fix(retried)),
             ),
@@ -323,10 +337,22 @@ impl DownloadError {
             ),
             Cause::Unusable {
                 message,
-                source: Source::CacheInOutage { reason },
+                source: Source::CacheInOutage { error },
+            } if refused(error) => {
+                let (cause, fix) =
+                    hub_cause_and_fix(error, token, no_token_fix, &context.revision, retried);
+                (
+                    format!("{cause}, so Spice read only the Hugging Face cache, where {message}"),
+                    fix,
+                )
+            }
+            Cause::Unusable {
+                message,
+                source: Source::CacheInOutage { error },
             } => (
                 format!(
-                    "the Hugging Face Hub could not be reached ({reason}), so Spice read only the Hugging Face cache, where {message}"
+                    "the Hugging Face Hub could not be reached ({}), so Spice read only the Hugging Face cache, where {message}",
+                    unreachable_reason(error)
                 ),
                 Some(unreachable_fix(retried)),
             ),
@@ -447,6 +473,49 @@ fn unreachable_fix(retried: bool) -> String {
         "Spice retries the download; check the network connection".to_string()
     } else {
         "Check the network connection, then restart Spice".to_string()
+    }
+}
+
+/// Whether the Hub answered and refused the request, so that a token, the repository's access
+/// conditions or the end of a rate limit, not the network, decides whether the files load.
+pub(crate) fn refused(error: &client::Error) -> bool {
+    matches!(
+        error,
+        client::Error::TokenRejected { .. }
+            | client::Error::Gated { .. }
+            | client::Error::RateLimited { .. }
+    )
+}
+
+/// Why a load read only the cache, as a clause: "the Hugging Face Hub could not be reached
+/// (HTTP 503)", "the Hugging Face Hub refused the request (token rejected, HTTP 401)".
+pub(crate) fn fallback_clause(error: &client::Error) -> String {
+    let reason = unreachable_reason(error);
+    if refused(error) {
+        format!("the Hugging Face Hub refused the request ({reason})")
+    } else {
+        format!("the Hugging Face Hub could not be reached ({reason})")
+    }
+}
+
+/// The warning a load that falls back to the cache logs: `subject` loads revision `revision` of
+/// `repo` from the cache at `commit`, because the Hub could not be reached or refused it.
+pub(crate) fn fallback_warning(
+    subject: &str,
+    error: &client::Error,
+    revision: &str,
+    repo: &RepoId,
+    commit: &str,
+) -> String {
+    let reason = unreachable_reason(error);
+    if refused(error) {
+        format!(
+            "{subject} was refused by the Hugging Face Hub ({reason}), so it loads revision '{revision}' of '{repo}' from the cache at commit {commit}. Changes to '{revision}' are not seen until the Hub accepts its requests."
+        )
+    } else {
+        format!(
+            "{subject} could not reach the Hugging Face Hub ({reason}), so it loads revision '{revision}' of '{repo}' from the cache at commit {commit}. Changes to '{revision}' are not seen until the Hub is reachable."
+        )
     }
 }
 
@@ -580,6 +649,32 @@ mod tests {
         );
     }
 
+    /// A load that falls back to the cache says whether the Hub could not be reached or
+    /// refused it, so a rejected token is not taken for a network failure.
+    #[test]
+    fn the_fallback_warning_says_whether_the_hub_refused_the_request() {
+        let unavailable = client::Error::Status {
+            repo: repo(),
+            status: 503,
+            attempts: 5,
+            message: String::new(),
+        };
+        assert_eq!(
+            fallback_warning("Model 'test'", &unavailable, "main", &repo(), "abc1234"),
+            "Model 'test' could not reach the Hugging Face Hub (HTTP 503), so it loads revision 'main' of 'o/m' from the cache at commit abc1234. Changes to 'main' are not seen until the Hub is reachable."
+        );
+        let rejected = client::Error::TokenRejected {
+            repo: repo(),
+            status: 401,
+            token: Some(TokenSource::Env("HF_TOKEN")),
+            token_scope: TokenScope::Any,
+        };
+        assert_eq!(
+            fallback_warning("Model 'test'", &rejected, "main", &repo(), "abc1234"),
+            "Model 'test' was refused by the Hugging Face Hub (token rejected, HTTP 401), so it loads revision 'main' of 'o/m' from the cache at commit abc1234. Changes to 'main' are not seen until the Hub accepts its requests."
+        );
+    }
+
     /// Each piece of advice that depends on whether Spice loads the component again after a
     /// failed download.
     #[test]
@@ -609,12 +704,50 @@ mod tests {
         let outage_without_file = || Cause::Missing {
             what: "'tokenizer.json'".to_string(),
             source: Source::CacheInOutage {
-                reason: "HTTP 503".to_string(),
+                error: std::sync::Arc::new(client::Error::Status {
+                    repo: repo(),
+                    status: 503,
+                    attempts: 5,
+                    message: ": The Hub is down.".to_string(),
+                }),
+            },
+        };
+        let env_token = || Some(TokenSource::Env("HF_TOKEN"));
+        let rejected_without_file = || Cause::Missing {
+            what: "'tokenizer.json'".to_string(),
+            source: Source::CacheInOutage {
+                error: std::sync::Arc::new(client::Error::TokenRejected {
+                    repo: repo(),
+                    status: 401,
+                    token: env_token(),
+                    token_scope: TokenScope::Any,
+                }),
+            },
+        };
+        let gated_without_file = || Cause::Missing {
+            what: "'tokenizer.json'".to_string(),
+            source: Source::CacheInOutage {
+                error: std::sync::Arc::new(client::Error::Gated {
+                    repo: repo(),
+                    repo_url: "https://huggingface.co/o/m".to_string(),
+                    token: env_token(),
+                    token_scope: TokenScope::Any,
+                }),
+            },
+        };
+        let rate_limited_without_file = || Cause::Missing {
+            what: "'tokenizer.json'".to_string(),
+            source: Source::CacheInOutage {
+                error: std::sync::Arc::new(client::Error::RateLimited {
+                    repo: repo(),
+                    reset_hint: String::new(),
+                    token: None,
+                    token_scope: TokenScope::Any,
+                }),
             },
         };
         let prefix = "Failed to download embedding model 'e5' from Hugging Face repo 'o/m' (revision 'main'):";
         let docs = "See: https://spiceai.org/docs/components/embeddings/huggingface";
-        let env_token = || Some(TokenSource::Env("HF_TOKEN"));
         let cases = [
             (
                 error(true, None, unavailable()),
@@ -659,6 +792,22 @@ mod tests {
             (
                 error(false, None, outage_without_file()),
                 "the Hugging Face Hub could not be reached (HTTP 503), and the Hugging Face cache does not hold 'tokenizer.json'. Check the network connection, then restart Spice.",
+            ),
+            (
+                error(true, env_token(), rejected_without_file()),
+                "the Hub rejected the token from `HF_TOKEN` (HTTP 401), so Spice read only the Hugging Face cache, which does not hold 'tokenizer.json'. Set `HF_TOKEN` to a token with access to this repo, or set `hf_token`.",
+            ),
+            (
+                error(true, env_token(), gated_without_file()),
+                "the repo is gated, so Spice read only the Hugging Face cache, which does not hold 'tokenizer.json'. Accept its access conditions at https://huggingface.co/o/m with the account the token from `HF_TOKEN` belongs to.",
+            ),
+            (
+                error(true, None, rate_limited_without_file()),
+                "the Hub kept rate-limiting requests, so Spice read only the Hugging Face cache, which does not hold 'tokenizer.json'. Spice retries the download; to raise the limit, set `hf_token`, set `HF_TOKEN`, or run `hf auth login`.",
+            ),
+            (
+                error(false, None, rate_limited_without_file()),
+                "the Hub kept rate-limiting requests, so Spice read only the Hugging Face cache, which does not hold 'tokenizer.json'. Restart Spice once the limit resets; to raise the limit, set `hf_token`, set `HF_TOKEN`, or run `hf auth login`.",
             ),
         ];
         for (actual, expected) in cases {
