@@ -724,9 +724,9 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
     log.push('\n');
     std::fs::write(&log_path, &log).expect("write tpcds/clickbench log");
 
-    let coverage_path = scratch.join("parity_coverage.md");
-    // Merge micro + tpch outcomes if present from prior tests in same process? No —
-    // write what we have plus inventory dump.
+    // Each lane writes its own coverage report: lanes run concurrently and share
+    // the scratch tree, so a shared report file would be overwritten mid-write.
+    let coverage_path = scratch.join("parity_coverage_tpcds_clickbench.md");
     write_coverage_report(&coverage_path, &results).expect("coverage report");
     eprintln!("{}", summary_line(&results));
     eprintln!("coverage report: {}", coverage_path.display());
@@ -1065,7 +1065,7 @@ async fn sqllancer_corpus_parity_vs_duckdb() {
     log.push_str(&summary_line(&results));
     log.push('\n');
     std::fs::write(&log_path, &log).expect("write sqllancer log");
-    write_coverage_report(&scratch.join("parity_coverage.md"), &results).ok();
+    write_coverage_report(&scratch.join("parity_coverage_sqllancer.md"), &results).ok();
     eprintln!("{}", summary_line(&results));
 
     let fails = support::report::unexplained(&results, &build_inventory(), &[]);

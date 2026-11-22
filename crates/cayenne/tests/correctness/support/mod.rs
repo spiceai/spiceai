@@ -110,7 +110,10 @@ pub fn fixture_is_current(dir: &Path, revision: &str) -> bool {
 /// find it current, rather than all of them writing the same files at once.
 #[must_use]
 pub fn lock_fixture(dir: &Path) -> std::fs::File {
-    let mut name = dir.file_name().expect("fixture dir has a name").to_os_string();
+    let mut name = dir
+        .file_name()
+        .expect("fixture dir has a name")
+        .to_os_string();
     name.push(".lock");
     let path = dir.with_file_name(name);
     if let Some(parent) = path.parent() {
@@ -1073,4 +1076,72 @@ pub fn suite_queries() -> Vec<(String, Query)> {
 #[must_use]
 pub fn sql_has_order_by(sql: &str) -> bool {
     row_order_from_sql(sql) == RowOrder::Preserved
+}
+
+#[cfg(test)]
+mod fixture_lock_tests {
+    use std::time::{Duration, Instant};
+
+    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    use super::chbench_data::{chbench_batches, ensure_chbench_fixture};
+    use super::{fixture_is_current, generator_revision, lock_fixture};
+
+    /// Lanes that share a fixture run in separate nextest processes, and each
+    /// holds the fixture's lock while it checks and generates. A second holder
+    /// must not start generating while the first holds the lock, and once the
+    /// lock is free it must leave a complete, current fixture. Each holder here
+    /// opens the lock file itself, as two processes would: `File::lock` locks
+    /// are held per open file, so two opens contend within one process too.
+    #[test]
+    fn a_fixture_is_generated_only_while_its_lock_is_free() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let dir = scratch.path().join("chbench_sf1");
+        let held = lock_fixture(&dir);
+
+        let worker = std::thread::spawn({
+            let dir = dir.clone();
+            move || ensure_chbench_fixture(&dir, 1)
+        });
+
+        // Generation writes the fixture directory and a dozen parquet files,
+        // which takes well under a second unlocked. Watching for it over two
+        // seconds is a window in which a helper that ignored the lock would
+        // have started, so this wait is the property under test, not a
+        // readiness guess.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            assert!(
+                !dir.exists(),
+                "the fixture was written while another holder had its lock: {:?}",
+                std::fs::read_dir(&dir).map(Iterator::count)
+            );
+            assert!(
+                !worker.is_finished(),
+                "ensure_chbench_fixture returned while the lock was held"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        drop(held);
+        worker
+            .join()
+            .expect("ensure_chbench_fixture after the lock was released");
+
+        let revision = generator_revision(include_str!("chbench_data.rs"));
+        assert!(
+            fixture_is_current(&dir, &revision),
+            "the fixture is stamped with the current generator"
+        );
+        for (name, expected) in chbench_batches(1) {
+            let file = std::fs::File::open(dir.join(format!("{name}.parquet")))
+                .unwrap_or_else(|e| panic!("open {name}.parquet: {e}"));
+            let rows: usize = ParquetRecordBatchReaderBuilder::try_new(file)
+                .and_then(ParquetRecordBatchReaderBuilder::build)
+                .unwrap_or_else(|e| panic!("read {name}.parquet: {e}"))
+                .map(|batch| batch.expect("parquet batch").num_rows())
+                .sum();
+            assert_eq!(rows, expected.num_rows(), "rows of {name}.parquet");
+        }
+    }
 }
