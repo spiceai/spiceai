@@ -33750,16 +33750,17 @@ impl CayenneTableProvider {
         if self.cached_inlined_row_count() > 0 {
             let guard = self.write_lock.lock().await;
             let checkpoint_guard = self.mem_checkpoint_lock_for_writer().lock_owned().await;
-            // Defer while a staged inline-conflict tombstone is unpublished (Option D)
-            // or a staged append is mid-finalization, exactly as
-            // `checkpoint_inlined_data_if_memtable_pressure_exceeded` does. The
+            // Defer while a staged inline-conflict tombstone is unpublished (Option D),
+            // as `checkpoint_inlined_data_if_memtable_pressure_exceeded` does. The
             // checkpoint below flushes inline rows to a file WITHOUT applying an inert
             // (`published = false`) tombstone and then clears every tombstone, so
             // running it inside that window writes the old row to a file AND drops the
             // tombstone — resurfacing that row as a duplicate once the replacement
-            // publishes. Those two guard the same counter because they can reach a table
-            // holding one; retention can now too, since the pipelined CDC path inlines
-            // without consulting `InlineMutationPolicy`. A mem-tier seal shadow is
+            // publishes. The pressure checkpoint guards that counter because it can
+            // reach a table holding one; retention can now too, since the pipelined
+            // CDC path inlines without consulting `InlineMutationPolicy`. Retention
+            // also defers while a staged append is mid-finalization, which the
+            // pressure checkpoint does not check. A mem-tier seal shadow is
             // refused for a different reason — it is a durable inline row deliberately
             // held above the watermark while its rows are still live in RAM, so
             // materializing it would serve them twice, which is why
