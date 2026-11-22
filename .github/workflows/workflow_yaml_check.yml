@@ -25,6 +25,7 @@ on:
       - '.github/scripts/cached_fetch.sh'
       - '.github/scripts/test_cached_fetch.py'
       - '.github/scripts/check_ci_cache_pins.py'
+      - '.github/scripts/test_check_ci_cache_pins.py'
       - '.github/ci-cache/**'
       - 'rust-toolchain.toml'
       - '.github/scripts/mssql_tpch_restore.sh'
@@ -48,6 +49,7 @@ on:
       - '.github/scripts/cached_fetch.sh'
       - '.github/scripts/test_cached_fetch.py'
       - '.github/scripts/check_ci_cache_pins.py'
+      - '.github/scripts/test_check_ci_cache_pins.py'
       - '.github/ci-cache/**'
       - 'rust-toolchain.toml'
       - '.github/scripts/mssql_tpch_restore.sh'
@@ -98,6 +100,7 @@ jobs:
           python .github/scripts/test_docker_pull.py -v
           python .github/scripts/test_mc_cp.py -v
           python .github/scripts/test_cached_fetch.py -v
+          python .github/scripts/test_check_ci_cache_pins.py -v
           python .github/scripts/test_mssql_tpch_restore.py -v
           python .github/scripts/test_extract_snapshot_archives.py -v
 

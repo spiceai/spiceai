@@ -13,7 +13,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 PINS_PATH = ROOT / ".github" / "ci-cache" / "pins.json"
+INSTALL_CARGO_DENY = ROOT / ".github" / "actions" / "install-cargo-deny" / "action.yml"
 SHA256 = re.compile(r"[0-9a-f]{64}")
+# The arms of install-cargo-deny's `case "$(uname -s)-$(uname -m)"`, such as
+# `Darwin-arm64) target=aarch64-apple-darwin ;;`: the targets it can ask pins.json for.
+ACTION_TARGET = re.compile(r"^\s*[A-Za-z]+-[A-Za-z0-9_]+\)\s*target=([A-Za-z0-9_.-]+)\s*;;", re.M)
 
 
 def main() -> int:
@@ -48,6 +52,19 @@ def main() -> int:
     for target, sha256 in deny["sha256"].items():
         if not SHA256.fullmatch(sha256):
             errors.append(f"cargo-deny.sha256.{target} is not a lowercase hex SHA-256.")
+    action_targets = ACTION_TARGET.findall(INSTALL_CARGO_DENY.read_text())
+    if not action_targets:
+        errors.append(
+            f"Found no `<os>-<arch>) target=<target> ;;` arm in {INSTALL_CARGO_DENY.relative_to(ROOT)}, "
+            "so the cargo-deny targets to require cannot be read; update this check with the action."
+        )
+    for target in action_targets:
+        if target not in deny["sha256"]:
+            errors.append(
+                f"cargo-deny.sha256 has no pin for {target}, which {INSTALL_CARGO_DENY.relative_to(ROOT)} "
+                f"installs on that platform, so cargo-deny would fail to install there. Add the SHA-256 of "
+                f"cargo-deny-{deny['version']}-{target}.tar.gz from the release."
+            )
 
     for error in errors:
         print(f"::error file={PINS_PATH.relative_to(ROOT)}::{error}")
