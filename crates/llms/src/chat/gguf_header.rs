@@ -175,35 +175,31 @@ where
     }
 }
 
-/// The files whose headers decide a model's architecture, in the order to read them: of the
-/// files that hold the model's weights by name ([`gguf_files::is_model_weights`]), or of all
-/// when none does, the `-00001-of-` shard a sharded model is opened from, else every file but
-/// an `mtp-` draft head. A projector named ahead of the weights names another architecture.
+/// The files whose headers decide a model's architecture, in the order to read them. An MTP
+/// draft head is set aside, as the engine sets it aside to draft with. Of the rest, the files
+/// that hold the model's weights by name ([`gguf_files::is_model_weights`]), or all of the rest
+/// when none does: the `-00001-of-` shard a sharded model is opened from, else every one. A
+/// projector named ahead of the weights names another architecture.
 fn candidates<P: AsRef<Path>>(weights: &[P]) -> Vec<&P> {
     fn name<P: AsRef<Path>>(w: &P) -> Option<&str> {
         w.as_ref().file_name().and_then(|name| name.to_str())
     }
-    let model: Vec<&P> = weights
+    let trunk: Vec<&P> = weights
         .iter()
+        .filter(|w| !name(w).is_some_and(gguf_files::is_draft_head))
+        .collect();
+    let model: Vec<&P> = trunk
+        .iter()
+        .copied()
         .filter(|w| name(w).is_some_and(gguf_files::is_model_weights))
         .collect();
-    let weights: Vec<&P> = if model.is_empty() {
-        weights.iter().collect()
-    } else {
-        model
-    };
+    let weights: Vec<&P> = if model.is_empty() { trunk } else { model };
     let first: Vec<&P> = weights
         .iter()
         .copied()
         .filter(|w| name(w).is_some_and(|name| name.contains("-00001-of-")))
         .collect();
-    if !first.is_empty() {
-        return first;
-    }
-    weights
-        .into_iter()
-        .filter(|w| !name(w).is_some_and(|name| name.starts_with("mtp-")))
-        .collect()
+    if first.is_empty() { weights } else { first }
 }
 
 /// The architecture a model of GGUF `weights` names in its first shard's header, read by
@@ -345,6 +341,19 @@ mod tests {
         assert_eq!(
             local_architecture(&[projector]).await,
             Some("clip".to_string())
+        );
+        // an MTP head is set aside before the weights are looked for, sharded or not
+        let imatrix_named = write("model-Q4_K_M-imatrix.gguf", "qwen3");
+        let head = write("mtp-model-Q8_0.gguf", "qwen3-mtp");
+        assert_eq!(
+            local_architecture(&[imatrix_named, head]).await,
+            Some("qwen3".to_string())
+        );
+        let sharded_head = write("mtp-model-Q8_0-00001-of-00001.gguf", "qwen3-mtp");
+        let lone = write("model-Q8_0.gguf", "qwen3");
+        assert_eq!(
+            local_architecture(&[sharded_head, lone]).await,
+            Some("qwen3".to_string())
         );
     }
 }

@@ -256,13 +256,15 @@ pub fn is_model_weights(path: &str) -> bool {
     !is_projector(path) && !is_sidecar(path)
 }
 
-/// The file of `files` that an engine taking one file opens the model from: the first that holds
-/// its weights by name ([`is_model_weights`]), or the first when none does.
+/// The file of `files` that an engine taking one file opens the model from. An MTP draft head
+/// is set aside first, as the engine sets it aside to draft with; of the rest, the first that
+/// holds the weights by name ([`is_model_weights`]), else the first of the rest, else the first.
 #[must_use]
 pub fn model_file(files: &[String]) -> Option<&str> {
-    files
-        .iter()
+    let trunk = || files.iter().filter(|f| !is_draft_head(f));
+    trunk()
         .find(|f| is_model_weights(f))
+        .or_else(|| trunk().next())
         .or_else(|| files.first())
         .map(String::as_str)
 }
@@ -1320,6 +1322,18 @@ mod tests {
         assert_eq!(
             model_file(&files(&["Model-imatrix.gguf"])),
             Some("Model-imatrix.gguf")
+        );
+        // an MTP head drafts for the model, so it is set aside before the weights are looked for
+        assert_eq!(
+            model_file(&files(&[
+                "Model-Q4_K_M-imatrix.gguf",
+                "mtp-Model-Q8_0.gguf"
+            ])),
+            Some("Model-Q4_K_M-imatrix.gguf")
+        );
+        assert_eq!(
+            model_file(&files(&["mtp-Model-Q8_0.gguf", "Model-Q4_K_M.gguf"])),
+            Some("Model-Q4_K_M.gguf")
         );
         assert_eq!(model_file(&[]), None);
     }
