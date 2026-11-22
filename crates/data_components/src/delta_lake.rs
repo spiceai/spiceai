@@ -733,6 +733,16 @@ fn as_one_line(text: &str) -> String {
     rendered
 }
 
+/// The refusal for a scan whose loaded `column` reads differently in the latest snapshot. The
+/// name comes out of the table, so it is rendered through [`as_one_line`].
+fn schema_changed(table_url: String, column: &str, change: &'static str) -> DataFusionError {
+    DataFusionError::External(Box::new(Error::SchemaChanged {
+        table_url,
+        column: as_one_line(column),
+        change,
+    }))
+}
+
 /// The refusal [`logical_target_in_source_order`] returns, in the shape this connector's other
 /// messages take: the table and column that cannot be read, the disagreement, what it costs, and
 /// the one action that re-reads the schema. `disagreement` completes "column '<name>' ...".
@@ -1353,13 +1363,7 @@ impl TableProvider for DeltaTable {
                     first_dropped_not_null(&loaded_table_schema, &latest_schema)
                         .map(|column| (column, "its NOT NULL was dropped"))
                 }) {
-                    return Err(datafusion::error::DataFusionError::External(Box::new(
-                        Error::SchemaChanged {
-                            table_url,
-                            column,
-                            change,
-                        },
-                    )));
+                    return Err(schema_changed(table_url, &column, change));
                 }
 
                 // We'll convert all filters for delta_kernel predicates since
@@ -2563,6 +2567,18 @@ mod tests {
             message.contains("https://spiceai.org/docs/components/data-connectors/delta-lake"),
             "the refusal must carry the docs link: {message}"
         );
+    }
+
+    #[test]
+    fn a_changed_column_name_cannot_split_the_refusal() {
+        let message = schema_changed(
+            "file:///t/".to_string(),
+            "two\nlines",
+            "it was dropped or renamed",
+        )
+        .to_string();
+        assert!(!message.contains('\n'), "{message:?}");
+        assert!(message.contains("changed column 'two"), "{message}");
     }
 
     /// The names in a refusal come out of the table, so the one-line guarantee above has to hold
