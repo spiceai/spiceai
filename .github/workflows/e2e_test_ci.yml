@@ -230,7 +230,7 @@ jobs:
         with:
           # `http-functions` for test/spicescript/secret-redaction.yaml, which registers
           # remote functions.
-          features: 'tpc-extension,models,postgres-accel,http-functions'
+          features: 'tpc-extension,models,http-functions'
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -249,7 +249,7 @@ jobs:
         timeout-minutes: 180
         uses: $/.github/actions/build-spiced
         with:
-          features: 'tpc-extension,models,postgres-accel,http-functions,metal'
+          features: 'tpc-extension,models,http-functions,metal'
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
