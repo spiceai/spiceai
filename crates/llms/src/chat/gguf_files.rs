@@ -261,6 +261,27 @@ pub fn is_model_weights(path: &str) -> bool {
     !is_projector(path) && !is_sidecar(path)
 }
 
+/// Whether the GGUF file at `path` is a `DFlash` or `DSpark` drafter by its name, one holding
+/// `dflash-` or `dspark-`: the drafters llama.cpp's engine drafts with beside the model.
+#[must_use]
+pub fn is_drafter_by_name(path: &str) -> bool {
+    let name = file_name(path).to_ascii_lowercase();
+    ["dflash-", "dspark-"]
+        .iter()
+        .any(|keyword| name.contains(keyword))
+}
+
+/// The file of a model's draft files the engine drafts with: the first `-00001-of-` shard, else
+/// the first, as it opens a sharded drafter from its first shard.
+#[must_use]
+pub fn drafting_file(draft: &[String]) -> Option<&str> {
+    draft
+        .iter()
+        .find(|d| d.contains("-00001-of-"))
+        .or_else(|| draft.first())
+        .map(String::as_str)
+}
+
 /// Whether the GGUF file at `path` is the one its set of weights opens from: a lone file, or the
 /// first shard of a series.
 #[must_use]
@@ -773,11 +794,15 @@ pub fn resolve_with_drafters(
         let (weights, opening) = sets.into_values().unzip();
         return Err(ResolveError::SeveralWeights { weights, opening });
     }
-    // A drafter the headers tell drafts beside the weights, as the engine drafts with it, in
-    // place of the MTP head a named quantization would bring.
-    let (weights, drafted): (Vec<String>, Vec<String>) = weights
+    // A drafter the headers or its name tell drafts beside the weights, as the engine drafts with
+    // it, in place of the MTP head a named quantization would bring. Named alone, it is loaded
+    // as named.
+    let (mut weights, mut drafted): (Vec<String>, Vec<String>) = weights
         .into_iter()
-        .partition(|w| !drafters.contains(&opening(w)));
+        .partition(|w| !drafters.contains(&opening(w)) && !is_drafter_by_name(w));
+    if weights.is_empty() {
+        weights = std::mem::take(&mut drafted);
+    }
     draft.extend(drafted);
     if weights.is_empty() && draft.is_empty() {
         return Ok(None);
@@ -1348,13 +1373,13 @@ mod tests {
         .expect("Q4_K_M resolves")
         .expect("Q4_K_M names weights");
         assert_eq!(
-            (beside.weights, beside.quantization),
+            (beside.weights, beside.draft, beside.quantization),
             (
                 vec![
                     "llava-v1.5-7b-Q4_K_M.gguf".to_string(),
                     "llava-v1.5-7b-mmproj-model-f16.gguf".to_string(),
-                    "dspark-llava-v1.5-7b-Q8_0.gguf".to_string(),
                 ],
+                vec!["dspark-llava-v1.5-7b-Q8_0.gguf".to_string()],
                 Some("Q4_K_M".to_string())
             )
         );
@@ -1387,6 +1412,60 @@ mod tests {
                 "Model-Q4_K_M-00002-of-00002.gguf"
             ]
         );
+    }
+
+    /// A drafter told by its name and named beside the weights drafts, in place of the MTP head
+    /// the quantization would bring, as the engine drafts with it; named alone, it is loaded as
+    /// named.
+    #[test]
+    fn a_drafter_named_beside_the_weights_drafts_in_place_of_the_head() {
+        let repo = listing(&[
+            ("Model-Q4_K_M.gguf", GB),
+            ("dspark-Model-Q8_0.gguf", GB / 5),
+            ("mtp-Model-Q8_0.gguf", GB / 10),
+        ]);
+        let beside = resolve(&repo, &["Q4_K_M", "dspark-Model-Q8_0.gguf"])
+            .expect("Q4_K_M resolves beside its drafter")
+            .expect("Q4_K_M names weights");
+        assert_eq!(
+            (beside.weights, beside.draft, beside.quantization),
+            (
+                vec!["Model-Q4_K_M.gguf".to_string()],
+                vec!["dspark-Model-Q8_0.gguf".to_string()],
+                Some("Q4_K_M".to_string())
+            )
+        );
+        let alone = resolve(&repo, &["dspark-Model-Q8_0.gguf"])
+            .expect("the drafter's path resolves")
+            .expect("the path names a file");
+        assert_eq!(
+            (alone.weights, alone.draft),
+            (
+                vec!["dspark-Model-Q8_0.gguf".to_string()],
+                Vec::<String>::new()
+            )
+        );
+    }
+
+    /// The draft file a load names is the one the engine drafts with: the first shard 1 among
+    /// them, else the first.
+    #[test]
+    fn the_drafting_file_is_the_one_the_engine_opens() {
+        let files =
+            |names: &[&str]| -> Vec<String> { names.iter().map(ToString::to_string).collect() };
+        assert_eq!(
+            drafting_file(&files(&[
+                "mtp-Model-Q4_K_M.gguf",
+                "Helper-Q8_0-00001-of-00002.gguf",
+                "Helper-Q8_0-00002-of-00002.gguf",
+            ])),
+            Some("Helper-Q8_0-00001-of-00002.gguf")
+        );
+        assert_eq!(
+            drafting_file(&files(&["mtp-A-Q8_0.gguf", "mtp-B-Q8_0.gguf"])),
+            Some("mtp-A-Q8_0.gguf")
+        );
+        assert_eq!(drafting_file(&[]), None);
     }
 
     /// A quantization named in `files` that the headers show to be a drafter is not the one the

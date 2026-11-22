@@ -266,13 +266,10 @@ async fn resolve_gguf(
                         .as_deref(),
                     resolved.weights.len()
                 ),
-                resolved
-                    .draft
-                    .first()
-                    .map_or_else(String::new, |draft| format!(
-                        ", drafting with '{}'",
-                        gguf_files::printable(draft)
-                    ))
+                gguf_files::drafting_file(&resolved.draft).map_or_else(
+                    String::new,
+                    |draft| format!(", drafting with '{}'", gguf_files::printable(draft))
+                )
             );
             log_resolved(purpose, &line);
         }
