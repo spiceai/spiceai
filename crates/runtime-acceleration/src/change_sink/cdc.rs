@@ -31,6 +31,7 @@ use arrow::array::{
 use arrow::datatypes::{ArrowNativeType, DataType};
 use data_components::cdc::{ChangeBatch, ChangeOperation};
 use datafusion::common::TableReference;
+use datafusion::common::hash_utils::{RandomState, create_hashes};
 use datafusion::error::Result;
 use opentelemetry::KeyValue;
 use runtime_metrics::acceleration as metrics;
@@ -243,6 +244,99 @@ fn primary_key_lists_are_uniform(change_batch: &ChangeBatch) -> bool {
 pub fn group_into_sub_batches(
     change_batch: &ChangeBatch,
 ) -> Vec<(ChangeOperationType, Vec<usize>)> {
+    if distinct_upserts(change_batch) {
+        // Distinct keys only append to the upsert bucket, never replace a slot
+        // or set needs_sort. With no deletes or barriers, its final flush emits
+        // every row in input order.
+        return vec![(
+            ChangeOperationType::Upsert,
+            (0..change_batch.record.num_rows()).collect(),
+        )];
+    }
+    group_by_scan(change_batch)
+}
+
+/// Proves that the scan would emit all rows as a single ordered upsert group.
+/// Hash collisions reject the optimization; they never decide key equality.
+fn distinct_upserts(change_batch: &ChangeBatch) -> bool {
+    let num_rows = change_batch.record.num_rows();
+    if num_rows == 0 || !primary_key_lists_are_uniform(change_batch) {
+        return false;
+    }
+
+    let Some(ops) = change_batch
+        .record
+        .column_by_name("op")
+        .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+    else {
+        return false;
+    };
+    // Read value(row), just as ChangeBatch::op does, including at null slots.
+    if !(0..num_rows).all(|row| matches!(ops.value(row), "c" | "u" | "r")) {
+        return false;
+    }
+
+    let pk_column_names = change_batch.primary_keys(0);
+    let data_schema = change_batch.data_schema();
+    let pk_col_indices: Vec<usize> = pk_column_names
+        .iter()
+        .filter_map(|name| data_schema.index_of(name).ok())
+        .collect();
+    if pk_col_indices.is_empty() || pk_col_indices.len() != pk_column_names.len() {
+        return false;
+    }
+    let data_batch = change_batch.data_batch();
+    if pk_col_indices.iter().any(|&index| {
+        let column = data_batch.column(index);
+        // The encoder writes a null marker independent of the underlying value.
+        // Keep nulls on the exact scan rather than depend on hash null semantics.
+        // Only byte-encoded types qualify: display-based encoding can equate
+        // values that Arrow hashes differently (for example nested values).
+        column.null_count() != 0
+            || !matches!(
+                column.data_type(),
+                DataType::Boolean
+                    | DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Date32
+                    | DataType::Date64
+                    | DataType::Time32(_)
+                    | DataType::Time64(_)
+                    | DataType::Timestamp(_, _)
+                    | DataType::Decimal128(_, _)
+            )
+    }) {
+        return false;
+    }
+
+    let mut hashes = vec![0; num_rows];
+    if create_hashes(
+        pk_col_indices.iter().map(|&index| data_batch.column(index)),
+        &RandomState::with_seed(0),
+        &mut hashes,
+    )
+    .is_err()
+    {
+        // An unavailable hash implementation must preserve the scan's behavior.
+        return false;
+    }
+    // Sort in place: contiguous u64 comparisons avoid a second hash-table
+    // allocation and per-row probing. No copy or collision resolution is needed.
+    hashes.sort_unstable();
+    hashes.windows(2).all(|pair| pair[0] != pair[1])
+}
+
+fn group_by_scan(change_batch: &ChangeBatch) -> Vec<(ChangeOperationType, Vec<usize>)> {
     let num_rows = change_batch.record.num_rows();
     if num_rows == 0 {
         return vec![];
@@ -527,5 +621,196 @@ impl ChangeOperationType {
             ChangeOperation::Truncate => Self::Truncate,
             ChangeOperation::Unknown(_) => Self::Unknown,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::StructArray;
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::{Field, Schema};
+    use data_components::cdc::changes_schema;
+
+    fn change_batch(ops: &[&str], keys: &[Vec<&str>], columns: Vec<ArrayRef>) -> ChangeBatch {
+        let schema = Arc::new(Schema::new(
+            columns
+                .iter()
+                .enumerate()
+                .map(|(index, column)| {
+                    Field::new(format!("key{index}"), column.data_type().clone(), true)
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let names = keys.iter().flatten().copied().collect::<Vec<_>>();
+        let keys = ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, false)),
+            OffsetBuffer::from_lengths(keys.iter().map(Vec::len)),
+            Arc::new(StringArray::from(names)),
+            None,
+        );
+        let data = StructArray::new(schema.fields().clone(), columns, None);
+        ChangeBatch::try_new(
+            RecordBatch::try_new(
+                Arc::new(changes_schema(&schema)),
+                vec![
+                    Arc::new(StringArray::from(ops.to_vec())),
+                    Arc::new(keys),
+                    Arc::new(data),
+                ],
+            )
+            .expect("CDC record batch"),
+        )
+        .expect("valid CDC batch")
+    }
+
+    #[test]
+    fn distinct_upserts_preserve_input_order() {
+        let batch = change_batch(
+            &["c", "u", "r", "c"],
+            &vec![vec!["key0"]; 4],
+            vec![Arc::new(Int64Array::from(vec![30, 10, 40, 20]))],
+        );
+        assert!(distinct_upserts(&batch));
+        let expected = vec![(ChangeOperationType::Upsert, vec![0, 1, 2, 3])];
+        assert_eq!(group_into_sub_batches(&batch), expected);
+        assert_eq!(group_by_scan(&batch), expected);
+    }
+
+    #[test]
+    fn duplicate_upserts_use_last_write_in_row_order() {
+        let batch = change_batch(
+            &["c", "u", "r", "c"],
+            &vec![vec!["key0"]; 4],
+            vec![Arc::new(Int64Array::from(vec![30, 10, 40, 30]))],
+        );
+        assert!(!distinct_upserts(&batch));
+        let expected = vec![(ChangeOperationType::Upsert, vec![1, 2, 3])];
+        assert_eq!(group_into_sub_batches(&batch), expected);
+        assert_eq!(group_into_sub_batches(&batch), group_by_scan(&batch));
+    }
+
+    #[test]
+    fn one_delete_uses_scan_buckets() {
+        let batch = change_batch(
+            &["c", "d", "r", "c"],
+            &vec![vec!["key0"]; 4],
+            vec![Arc::new(Int64Array::from(vec![30, 10, 40, 20]))],
+        );
+        assert!(!distinct_upserts(&batch));
+        assert_eq!(
+            group_into_sub_batches(&batch),
+            vec![
+                (ChangeOperationType::Upsert, vec![0, 2, 3]),
+                (ChangeOperationType::Delete, vec![1]),
+            ]
+        );
+        assert_eq!(group_into_sub_batches(&batch), group_by_scan(&batch));
+    }
+
+    /// A seeded xorshift generator keeps this pure-function sweep reproducible
+    /// without adding a test dependency. The seed is printed before generation.
+    struct Random(u64);
+
+    impl Random {
+        fn below(&mut self, limit: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            usize::try_from(self.0 % u64::try_from(limit).expect("small limit"))
+                .expect("value is below a usize limit")
+        }
+    }
+
+    #[test]
+    fn grouping_matches_scan_for_seeded_batches() {
+        const SEED: u64 = 0x1a9e_427b_d530_6fc1;
+        eprintln!("grouping differential seed: {SEED:#x}");
+        let mut random = Random(SEED);
+        let mut eligible = 0;
+        let key_names = ["key0", "key1", "key2"];
+        for iteration in 0..720 {
+            let rows = if iteration == 0 { 0 } else { random.below(301) };
+            let key_count = 1 + random.below(3);
+            let scenario = iteration % 12;
+            let mut ids = (0..rows).collect::<Vec<_>>();
+            for row in (1..rows).rev() {
+                ids.swap(row, random.below(row + 1));
+            }
+            if scenario == 3 && rows > 1 {
+                ids[rows - 1] = ids[0];
+            } else if scenario >= 5 {
+                for id in &mut ids {
+                    *id = random.below(20);
+                }
+            }
+            let mut columns = Vec::new();
+            for _ in 0..key_count {
+                let values = ids
+                    .iter()
+                    .enumerate()
+                    .map(|(row, &id)| {
+                        if scenario == 4 && (row == 0 || random.below(5) == 0) {
+                            None
+                        } else {
+                            Some(i32::try_from(id).expect("at most 300 rows") - 150)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let column: ArrayRef = match random.below(3) {
+                    0 => Arc::new(Int32Array::from(values)),
+                    1 => Arc::new(Int64Array::from(
+                        values
+                            .into_iter()
+                            .map(|v| v.map(i64::from))
+                            .collect::<Vec<_>>(),
+                    )),
+                    _ => Arc::new(StringArray::from(
+                        values
+                            .into_iter()
+                            .map(|v| v.map(|v| format!("κ\0/{v}")))
+                            .collect::<Vec<_>>(),
+                    )),
+                };
+                columns.push(column);
+            }
+            let mut ops = (0..rows)
+                .map(|_| ["c", "u", "r"][random.below(3)])
+                .collect::<Vec<_>>();
+            if scenario == 5 {
+                for op in &mut ops {
+                    *op = ["c", "u", "r", "d", "t", "unknown"][random.below(6)];
+                }
+            } else if rows > 0 {
+                match scenario {
+                    6 => ops[random.below(rows)] = "d",
+                    7 => ops[random.below(rows)] = "t",
+                    8 => ops[random.below(rows)] = "unknown",
+                    _ => {}
+                }
+            }
+            let mut keys = vec![key_names[..key_count].to_vec(); rows];
+            match scenario {
+                9 => {
+                    for row in (1..rows).step_by(2) {
+                        keys[row] = vec!["key0", "missing"];
+                    }
+                }
+                10 => keys.fill(vec![]),
+                11 => keys.fill(vec!["key0", "missing"]),
+                _ => {}
+            }
+            let batch = change_batch(&ops, &keys, columns);
+            eligible += usize::from(distinct_upserts(&batch));
+            assert_eq!(
+                group_into_sub_batches(&batch),
+                group_by_scan(&batch),
+                "seed={SEED:#x}, iteration={iteration}, scenario={scenario}, rows={rows}"
+            );
+        }
+        assert!(
+            eligible > 0,
+            "seed={SEED:#x}: no batch exercised the fast path"
+        );
     }
 }
