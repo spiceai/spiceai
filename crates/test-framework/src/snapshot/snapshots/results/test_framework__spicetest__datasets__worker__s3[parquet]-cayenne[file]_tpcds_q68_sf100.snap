@@ -5,14 +5,14 @@ description: "Query: tpcds_q68"
 +-------------+--------------+-------------+-------------+------------------+----------------+--------------+------------+
 | c_last_name | c_first_name | ca_city     | bought_city | ss_ticket_number | extended_price | extended_tax | list_price |
 +-------------+--------------+-------------+-------------+------------------+----------------+--------------+------------+
-| Aaron       | Georgia      | Fairfield   | Centerville | 18440065         | 30530.71       | 1272.93      | 66885.42   |
-| Aaron       | Agnes        | Oakwood     | Five Points | 22001953         | 15702.12       | 371.94       | 41514.48   |
-| Abbott      | Erika        | Watkins     | Oak Hill    | 143191           | 32271.03       | 898.50       | 47388.67   |
-| Abbott      | Diane        | Belmont     | Hurricane   | 950650           | 11756.04       | 667.28       | 39584.57   |
-| Abbott      | Lenora       | Brownsville | Pine Grove  | 7879652          | 16706.42       | 396.49       | 29105.17   |
-| Abbott      | Lionel       | Wilton      | Plainview   | 8790557          | 18128.67       | 137.88       | 36534.73   |
-| Abbott      | Sophie       | Brownsville | Hamilton    | 8828429          | 32637.52       | 2202.22      | 63974.33   |
-| Abbott      | Michael      | Macedonia   | Salem       | 9186320          | 11808.51       | 452.58       | 27950.57   |
-| Abbott      | Robert       | Snug Harbor | Enterprise  | 11917253         | 14552.21       | 599.94       | 40487.38   |
-| Abbott      | Jeremy       | Glenwood    | Riverview   | 12104933         | 16636.19       | 295.34       | 36649.17   |
+| Aaron       | Georgia      | Fairfield   | Centerville | 18440065         | 48116.99       | 2542.66      | 68714.54   |
+| Aaron       | Agnes        | Oakwood     | Five Points | 22001953         | 24565.92       | 1485.56      | 48419.74   |
+| Abbott      | Erika        | Watkins     | Oak Hill    | 143191           | 22323.23       | 1411.24      | 45537.99   |
+| Abbott      | Diane        | Belmont     | Hurricane   | 950650           | 16105.85       | 599.42       | 47699.75   |
+| Abbott      | Lenora       | Brownsville | Pine Grove  | 7879652          | 13762.08       | 668.68       | 29381.15   |
+| Abbott      | Lionel       | Wilton      | Plainview   | 8790557          | 30781.76       | 1432.45      | 51491.57   |
+| Abbott      | Sophie       | Brownsville | Hamilton    | 8828429          | 21534.66       | 1318.54      | 46315.23   |
+| Abbott      | Michael      | Macedonia   | Salem       | 9186320          | 18121.36       | 454.39       | 29413.58   |
+| Abbott      | Robert       | Snug Harbor | Enterprise  | 11917253         | 17471.17       | 677.61       | 45821.08   |
+| Abbott      | Jeremy       | Glenwood    | Riverview   | 12104933         | 7403.84        | 314.49       | 18945.28   |
 +-------------+--------------+-------------+-------------+------------------+----------------+--------------+------------+
