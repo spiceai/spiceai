@@ -27,7 +27,7 @@ use spicepod::{acceleration::Acceleration, component::dataset::Dataset, param::P
 
 use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
 
-const S3_BASE: &str = "s3://spiceai-public-datasets/test_different_formats/json_format";
+const S3_BASE: &str = "s3://spice-datasets-gjezag77s0hu/test_different_formats/json_format";
 
 fn json_dataset(s3_path: &str, name: &str, json_format: &str, accelerated: bool) -> Dataset {
     json_dataset_with_params(s3_path, name, json_format, accelerated, &[])

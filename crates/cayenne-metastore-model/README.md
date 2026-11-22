@@ -30,11 +30,40 @@ links to a section that does.
 cargo run --release -p cayenne-metastore-model -- cite-check docs/design/object-native-metastore.md docs/design/object-native-metastore-technical.md
 ```
 
+Retirement graphs have a 30-minute watchdog for the combined scan, restore-point
+and retention-clock interleavings; other graphs keep the 9-minute watchdog.
+A watchdog timeout is incomplete, never an exhaustive safety result.
+
 Checkers use 6 threads by default; set `MODEL_THREADS` to change it. Results do not depend on the thread count, and the binary uses mimalloc, because cloning states dominates checking. Models list candidate actions and reject disabled ones in `next_state`, so each successor is computed once; simulation runs, whose checker cannot replay a rejected pick, list only enabled actions. Controls require `EXHAUST=1`. A control stops once it has found its expected failure and every witness it must reach; its other safety properties print `NOT_FOUND`, not `HOLDS`, because the rest of its graph is not explored. A wrong outcome, missing
 required control failure, invalid witness, or checker timeout makes the command fail.
 A sampled run reports `NOT_FOUND`, which does not establish exhaustive safety.
 New exhaustive safe graphs require their essential reachability witnesses; missing
 one fails the run.
+
+## Traces for replay
+
+`TRACE_JSON=<file>` appends one JSON line per witness or counterexample a run
+reports (run, family, mode, property, status and the minimized actions);
+`WALK=<seed>:<count>:<max_steps>` replaces the check with seeded random walks,
+one JSON line each with the safety properties that failed along it. A replay
+harness maps a trace's actions to real operations through `transaction_steps`
+(`transactions` runs) or `data_file_steps` (`data-files` runs), which return
+`None` for an action the run does not enable where it occurs. The `data-files`
+traces in `crates/cayenne/tests/traces/` were generated serially from the
+repository root:
+
+```sh
+cargo build --release -p cayenne-metastore-model
+TRACE_JSON=crates/cayenne/tests/traces/data-files.jsonl target/release/cayenne-metastore-model run data-files
+WALK=42:20:40 TRACE_JSON=crates/cayenne/tests/traces/data-files-walk.jsonl target/release/cayenne-metastore-model run data-files
+```
+
+Delete both files first: `TRACE_JSON` appends. The retirement traces in
+`crates/object_store_occ/tests/traces/` are generated the same way; see that
+directory's README. `data_file_replay.rs` replays them with per-file records
+(`AddFiles`, `RemoveFiles`, `ReplaceFiles` with carried files,
+`ForgetRetired{files}`), the retired set as files with the record that removed
+each, the local `EndScan` action, and the `Tick` and `Remote*` actions.
 
 ## Compositions and bounds
 
@@ -68,6 +97,12 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 | `standby` / `standby-three` | Two or three instances of one Spicepod on one location: a lease object with an expiry on a discrete clock, renewal by the holder, crash, restart, pause and resume, acquisition only after expiry, and takeover by a head commit that raises the generation; only the generation in the head fences writers; the ingester commits source changes by exact-head CAS and then acknowledges them; standbys serve head reads. No change applied twice or acknowledged without commit, no stale-generation commit accepted, one committing instance per head generation, lease exclusivity, no lease loss by a healthy holder, and an ingester again within the lease duration of a holder failure | Exhaustive: lease duration 3 ticks, 2 source changes, 1 crash, 1 pause, at most 4 lease epochs; a running holder renews and a running standby acquires or takes over before the next tick |
 | `standby-early-safety` | The standby graph with acquisition allowed before expiry; checks only the safety properties, which do not depend on lease timing | Same bounds |
 | `object-names` | Immutable object names when several leased units create objects: the writer `w0` and maintenance units, each with its own lease generation raised by a head commit when a node takes it; create-if-absent under `<kind><unit>.<generation>-<counter>`, identical retries of a lost upload, references committed under a guard on the unit's generation, and maintenance units retired and created with ids never reused. No name created with different bytes, and every referenced object reads back with its digest; witnesses include two units at one generation, successive holders of one unit, a unit created after another retired, and a fenced holder | Exhaustive: 2 nodes, 3 lease takeovers, 2 objects per holding, 1 unit created, 1 retry |
+| `data-files` / `data-files-3` | Data files uploaded to fresh final keys `<generation>-<id>` under the dataset prefix before the commit that names them: a commit is an exact-base conditional head publication guarded by the lease generation and names only files whose upload returned; readers read the head's committed file set and fetch each file, never listing; a lost response leaves an unknown outcome, resent identically and resolved from the head alone (committed when the head names the files, aborted once the head moved past the request's base); a takeover is a head commit that fences the previous holder, whose uploads still land; a crash forgets the writer's state while its sends still land; an unnamed file of a fenced generation is swept. Committed files exist, a reader sees only files committed at its head version, an aborted or abandoned upload is never visible, and an unknown outcome resolves all-or-nothing; witnesses include an accepted commit, an orphan after an aborted commit, a fenced commit refused, a fenced writer's upload landing after a takeover, unknown outcomes resolved both ways, a reader fetch and an orphan reclaimed | Exhaustive: 2 writers, 2 uploads (`-3`: 3), 3 commit attempts, 2 takeovers, 1 crash, 1 identical resend, 2 head reads |
+| `data-files-intent` | The `data-files` graph with the sweep run by the lease holder and no generation in its rule: a writer records each key before it uploads it and holds it until its commit's outcome resolves, in its own process (a crash or takeover loses the record); the sweep deletes an unnamed file only when the holder's record does not hold it. Same properties and witnesses as `data-files` | As `data-files` |
+| `data-files-retire` / `data-files-retire-3` | Per-file retirement of committed data files (I15), carried files, retention T, local scan with S = 0, restore-point holds, late/failed deletes and `ForgetRetired`. Local scans never hold back the sweep; every fetch within T succeeds, and later fetches may fail but cannot return another file’s rows. See [reader protection](#data-file-retirement-and-reader-protection). | 2 uploads, 1 takeover, 1 scan, 1 failed delete, 1 restore point, 3 ticks; `-3`: 3 uploads, no restore point, 2 ticks |
+| `data-files-retire-remote` / `data-files-retire-remote-3` | The `data-files-retire` graph with a logical clock and a reader on another instance instead of local scans and restore points: the sweep starts an in-memory timer when it first observes a retired file (a crash or takeover loses it, and the next holder restarts it) and deletes the file once T has passed on it; the remote reader confirms the head with a GET, starts its query within S of the GET, and fetches its files, late ones included. Adds: a data file is deleted no earlier than T after the record that removed it, and the remote reader finds every file it fetches within T − S of its start; witnesses add the remote reader reading a file removed after its confirmation, and a fetch past T − S finding its file deleted (the bound is reached) | Exhaustive: T = 2 and S = 1 ticks, one remote query; the clock advances only while a holder timer or the query runs; 2 uploads and 3 ticks (`-3`: 3 uploads, 2 ticks, no crash) |
+| `data-files-retire-prepared` / `data-files-retire-prepared-lean-3` | The `data-files-retire` graph where a commit can record a prepared transaction (a compaction of every live file, applied when a later resolve commits it and retiring those files then, or discarded); while it is unresolved the table refuses other changes and both sweeps decline. Witnesses add a transaction committed and aborted. Prepared graphs omit restore points; the base `data-files-retire` graph and `data-files-retire-ignores-restore-hold` control cover the deletion hold. `lean` also omits scans | Exhaustive: 2 uploads; `lean-3`: 3 uploads |
+| `data-files-retire-prepared-lean-3-retire-ignores-reservation` | Not a control: the `lean-3` graph with the retirement sweep running while a transaction is prepared (reached); every property still holds, so in this graph the retirement sweep's reservation check is not what keeps data safe (the orphan sweep's is, and the reserved table's refusal of the forget record) | As `lean-3` |
 | `reads-linearizable` / `reads-bounded` | Read freshness against real time: a writer completes commits on a discrete clock; a reader caches the head with the time its GET was sent, answers queries from it while it is fresh for the staleness bound S and otherwise waits for a newer GET; queries share GETs, a GET observes the head when sent, and responses arrive late and out of order. With S = 0, events within a tick are ordered, so a commit that completes earlier in a query's tick counts as before it; with S > 0, times compare by tick. A query includes every commit completed more than S before it started; with S = 0 that is linearizability for one dataset's committed state, and a query also includes the client's own acknowledged write. Witnesses: a query waits for a GET, two queries share one, a late response is ignored, a commit completes while a GET is in flight, a query is served while a newer commit exists, and (S > 0) a query is answered from the cache | Exhaustive: 2 commits, 3 GETs, 2 queries, 4 clock ticks; S = 0 and S = 1 |
 | `commits-etag` | Explicit store-version CAS and delayed retry across head changes; I1–I3, I5 | Exhaustive/control 1; one writer, one original/retry pair |
 | `commits-storage` | Checkpoint parts/root before head publication, delayed GC, a query kept by retention, lagging reopen, late seal; I4, I7, I8 | Bound 2; samples 4 |
@@ -248,6 +283,19 @@ as a separate maintenance process does.
 | `object-names-generation-only` | Name objects by generation and counter only: two units at one generation create one name with different bytes |
 | `object-names-no-generation` | Name objects by unit and counter only: successive holders of one unit create one name with different bytes |
 | `object-names-reuse-unit-id` | Give a retired unit's id to a new unit, whose generation restarts: the new unit creates a name the retired one already holds |
+| `data-files-no-upload-before-commit` | A commit names files whose upload has not returned: the head names a file the store does not hold; committed files exist |
+| `data-files-no-committed-read` | The reader lists the store instead of reading the head: it fetches an uploaded, uncommitted file; reader sees only committed files |
+| `data-files-no-resolve-by-head` | An unknown outcome resolves as aborted when the head lacks its files, without waiting for the head to move past the request's base: the request lands afterwards; unknown outcome resolves all-or-nothing |
+| `data-files-intent-sweep-ignores-intent` | The lease holder's sweep deletes an unnamed file its own write still holds: the write's commit then names a file the store no longer holds; committed files exist |
+| `data-files-intent-adopt-by-listing` | A commit names every unnamed file the store lists, as a maintenance pass that derives its file set from a listing would: it publishes an upload a crashed writer abandoned, and the reader fetches it; aborted or abandoned upload never visible to a reader |
+| `data-files-retire-whole-snapshot` | Retiring a still-live carried file starts its timer before its actual removal; a later removal can therefore delete it within T of a local scan’s start |
+| `data-files-retire-3-retires-carried` | A compaction also retires the file it carries in place: the sweep deletes a file the live set still names; carried or shared file never deleted while live (committed files exist and the I15 timing check also fail) |
+| `data-files-retire-local-ignores-retention` | The sweep ignores T for a local scan: its next fetch within T finds the file gone; local scan within T finds every file (the I15 timing check also fails) |
+| `data-files-retire-remote-ignores-retention` | The sweep deletes a retired file as soon as it observes the removal: a remote reader confirms a head naming the file, the removal commits, the sweep deletes it, and the reader's first fetch, within T − S of its start, finds it gone; remote reader within T − S finds every file (the I15 timing check also fails) |
+| `data-files-retire-forget-early` | The sweep commits `ForgetRetired` before its deletes return: a file the forget took out of the retired set is still stored, and nothing will delete it if the delete then fails; forgotten file leaves nothing behind |
+| `data-files-retire-ignores-restore-hold` | The sweep runs while a restore point copies: it deletes a file the restore point has yet to copy; restore point copies every file |
+| `data-files-retire-sweep-uncommitted` | The sweep plans from its process's view with its own removal in flight applied, as if the record had committed: the removal has not landed, and the deleted file is still live; committed files exist |
+| `data-files-retire-prepared-orphan-ignores-reservation` | The orphan sweep runs while a prepared transaction reserves the table: after the Prepare's response clears the writer's intent, the transaction's upload is named only by the prepared record, and the sweep deletes it; committed files exist |
 | `reads-token-wait` | Answer a query from any cached head at or past the client's commit number: read-your-writes holds, but a commit that completed before the query started is missing |
 | `reads-response-time` | Count freshness from the GET response's arrival: a late response to an old GET looks fresh and misses a completed commit |
 | `reads-tick-only` | Compare freshness by tick alone with S = 0: a head fetched earlier in the query's tick answers it and misses a commit that completed before the query started |
@@ -401,6 +449,66 @@ and so is not checked. The head is already superseded at the source, so it can n
 be confirmed and no query reads it: the checked guarantee is that a head confirmed
 current references only replica objects. HEADing every referenced object at adoption
 would restore the stronger property at one request per object.
+
+## Data-file retirement and reader protection
+
+The `data-files-retire*` runs check per-file retirement of committed data
+files (I15). Data files sit flat per table, and a record changes the live set
+by name: `RemoveFiles` and `ReplaceFiles` remove files, and a compaction names
+the files it carries in place, so several commits can name one file. The
+record that removes a file retires it, in the same record; a carried file is
+never removed, so it is never retired, and shared files need no rule of their
+own. Only the lease holder sweeps, and only from committed state: it declines
+while its own commit is outstanding (its view would include a change that may
+not land), while a prepared transaction reserves the table, and while a
+restore point holds deletions. It deletes a retired file by name, never by
+listing, once T has passed on the timer it
+started when it first observed the removal; it commits `ForgetRetired` for
+those files only after every delete it sent has returned. Deletes of a sweep
+that crashed, was taken over or had a delete fail can land later; the files
+stay retired, and a later pass deletes again (a missing key is a no-op) and
+forgets them. A local scan captures the head in one step (S = 0) and is
+protected only by T, like the remote reader’s T − S window. Later reads may
+fail; any bytes returned must still match the captured committed file. The orphan sweep (the `data-files-intent` rule) treats a retired
+file as named until its forget, and declines while a transaction is prepared.
+
+The properties, per file:
+
+| Property | Checked as |
+|---|---|
+| A data file is deleted only after the record that removed it, and not before T has passed since then | When a delete or orphan sweep removes a committed file from the store, the record that retired it exists, the file had left the live set, and the clock is at least T past the tick it left (a ghost kept apart from the sweep's own timers) |
+| A carried or shared file is never deleted while live | No delete lands on a file the live set names |
+| A local scan within T finds every file | Every fetch before T after local head capture returns its file; later fetches may fail |
+| A remote reader within T − S finds every file | Every fetch of the remote query less than T − S after it started returns its file; later fetches may fail |
+| A restore point copies every file | Every copy returns its file |
+| A forgotten file leaves nothing behind | No file whose `ForgetRetired` committed is still stored |
+| Retired files reclaimed at quiescence once T has passed | Bounded, not a liveness proof under fairness: when a lease holder runs with no commit outstanding, no local scan, restore point, remote query or prepared transaction, and only new work, faults or the clock remain enabled, every retired file is waiting out T on the holder's timer. It assumes an unknown commit outcome is eventually resolved; a holder whose outcome stays unknown never sweeps |
+
+All retirement graphs have retention T and a logical clock. The local graphs
+(`data-files-retire`, `-3`, `-prepared*`) capture a scan with S = 0 and include
+restore points; `remote` graphs instead include a reader on another instance
+with staleness S. The clock advances while a holder timer or either query runs.
+At three uploads the restore point is omitted; the remote graph also omits
+crashes. The two-upload graphs cover both.
+
+Findings and limits:
+
+- Retiring whole snapshots (`data-files-retire-whole-snapshot`) can start a
+  carried file’s timer while it is still live. A later removal can then delete
+  it within T of a local scan’s capture. Per-file retirement starts the timer
+  only after the sweep observes the actual removal.
+- With the retirement sweep running while a transaction is prepared
+  (`data-files-retire-prepared-lean-3-retire-ignores-reservation`), every
+  property still holds: a prepared record applies nothing to the retired set
+  until its resolve, and no prepared action makes a retired file live again.
+  The reservation matters for the orphan sweep and for the forget record,
+  which a reserved table refuses.
+- One process sweeps at a time; local scans, restore points and the sweep
+  share a process. A reader on another instance is modeled only through T and
+  S; holds of another instance (a standby's restore point) are not. Files are
+  never made live again once removed. Local head capture is one step; file reads
+  may happen later and are guaranteed only within T. The orphan sweep has no age floor here. Deletes go one
+  key per request; batching and forgetting per batch are not modeled.
 
 ## Composition boundaries and liveness
 
@@ -770,6 +878,9 @@ declarations.
 | `position-delete` | 1 | 62 / 53 | 0.000 |
 | `remote-maintenance-clear-retry` | 4 | 3,492 / 2,637 | 0.012 |
 
+The exhaustive `data-files*` set runs in CI's nightly model job, which records
+each declaration's state count and time.
+
 The longest completed checker on 2026-10-31 was
 `dataset-prepare-query-expiry-byte-window` at 268.241 s. All exhaustive declarations completed below the 540-second watchdog.
 The original four-selection statement, three-selection delivery and two-selection
@@ -828,3 +939,203 @@ operation then completes as a no-op. Missing/expired mappings
 are not modeled and cannot be treated as proof of deletion. Retain mapping evidence
 until outstanding operations can resolve or re-plan. The graph covers one rewrite,
 not chains, multiple output files, keyed replacements or mapping reclamation.
+
+## Mem-tier seal, checkpoint, full rewrite, and recovery
+
+The initial durable write is ONE protected snapshot at S=1, containing keys 0
+and 1 (values 1 and 2), with an empty current snapshot and durable high-water 1.
+`mem-tier-current-3-exhaust` documents the current seal's known duplicate-key
+failure: `failure = "recovered reads match the source"`. It requires `EXHAUST=1`.
+`mem-tier-seal-delete-only` is the candidate positive, expecting `holds`, and is
+included in `quick`. Its seal writes only pure delete vectors, because its shadow
+rows live inline and their visibility ignores insert sequences. Checkpoints still
+write their usual reinsert vector stamps and precomputed insert records.
+`mem-tier-seal-delete-only-sqlite` uses the same protocol with immediate
+publication of every staged catalog call. Its `Flush` is idempotent and has no
+durability effect; the object-native run also accepts an empty `Flush`.
+
+All four negative controls are based on `mem-tier-seal-delete-only`. They keep
+requiring their named downstream failure even if exhaustive exploration finds
+none; a missing failure is reported rather than relabeled safe or hidden. Bounds
+are three source applies, one seal, two explicit checkpoints, one bake attempt,
+one full-rewrite attempt and one crash/recovery, with budgets retained across
+restart. Six threads and the shared 540-second watchdog apply.
+
+```sh
+nice -n 10 cargo build --release -p cayenne-metastore-model
+EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-current-3-exhaust
+nice -n 10 target/release/cayenne-metastore-model run mem-tier-seal-delete-only
+EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-no-one-call
+EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-no-insert-records
+EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-no-capture-reservation
+EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-late-stamp
+nice -n 10 cargo clippy -p cayenne-metastore-model --release --tests --no-deps -- -D warnings
+nice -n 10 cargo test -p cayenne-metastore-model --release --test mem_tier_steps -- --nocapture
+```
+
+The logical oracle replays source key/value assignments without physical
+sequences. State identity includes the live catalog, a separately materialized
+durable catalog, the pending actions and all protocol/visibility/witness state.
+Historical record grouping is audit-only: histories with identical state in all
+those fields have identical successors and property verdicts, so their old record
+boundaries are excluded from equality/hashing. The trace API keeps the actual
+path's records and folds them independently to check the materialized durable
+catalog on every replayed step. Every scan keeps physical multiplicity, including identical copies.
+The safety properties are unchanged: live rows equal the source outside recovery;
+crash/recover/replay equals the complete source at every state; acknowledged keys
+without a later source mutation are durable, including their absence/multiplicity.
+The last predicate permits newer durable writes to supersede older acknowledged
+values. Recovery rebuilds only committed actions and redelivers the unacknowledged
+source suffix through ordinary applies before permitting new source operations.
+The committed source position also bounds redelivery.
+
+`FullRewriteCapture` pins the current and protected rows with their deletion view,
+records their exact folded set and the allocator high-water cutoff, and releases
+the capture lock. `FullRewrite` commits the output as current and atomically
+publishes its RAM view. Applies and seal/checkpoint steps can interleave between
+these actions; later protected snapshots remain registered. This matters because
+post-capture mutations must survive the cutoff prune and a concurrent seal can
+become durable before the rewrite removes the last protected snapshot. Bake and
+another full rewrite are serialized by the maintenance path.
+
+The engine first drains the mem tier and published inline corpus before capturing
+a full rewrite. The model requires an empty tier, empty published inline corpus,
+and no seal shadow at `FullRewriteCapture`; explicit checkpoints supply that
+prerequisite within their two-checkpoint budget. This omits the engine's implicit
+drain scheduling, not its data effects. Empty rewrite output models the reclaim
+arm; ordinary compaction with zero output returns without publication. No cold
+tier, replacement writer or append-to-current writer is modeled, so the cold cap,
+current-directory generation guard and replacement CAS cannot change in flight.
+
+The full rewrite scan skips query-only tombstone pushdown. Its durable fenced
+commit removes delete-vector catalog entries with DELETE sequence <= cutoff
+(including each removed vector's reinsert stamp), removes standalone insert
+records with INSERT sequence <= cutoff, unregisters exactly the folded protected
+snapshots and switches the current snapshot. RAM prunes the two index sides
+independently when the index has a delete side, and removes exactly that folded
+set. `prune_deletion_index_at_or_below` returns early for an insert-only index
+(`table.rs:31338`); the model preserves that detail even though insert-only entries
+do not hide rows. Vectors and standalone insert
+records are stored separately in the symbolic catalog so this distinction also
+holds during recovery. Unreferenced physical file reclamation is not modeled.
+
+The bake merges all protected snapshots using partial deletion filters, tags the
+output with the capped delete fence, and prunes only the RAM index at that fence.
+It retains durable vectors and insert records. The replay configures the
+existing `compaction_trigger_protected_snapshots` threshold to 2, so the engine
+keeps zero recent snapshots. The model enables `Bake` only with at least two
+eligible inputs and a clean physical current-file prefix. The all-protected
+scope still excludes partial-prefix and pass-budget selection. Current files start empty, making prune/reinsert schedules
+reachable; a later full rewrite can leave physical old ranges that block baking.
+Snapshot file minimum sequences are modeled separately from their read cutoffs.
+
+`mem_tier_steps` / `MemTierStep` accept the shared Debug/JSON action grammar,
+including both full-rewrite actions. They expose live rows, availability, logical
+reference, acknowledgement, committed action lists, hypothetical recovery/replay
+rows, and the durable current/protected rows, vectors and standalone insert
+records. `pending_changes` exposes the staged changes; `durable` and
+`durable_plus_pending` expose modeled data-content projections (physical
+current/protected/inline row multisets, vector entries, and standalone insert
+stamps), with a recovery result for each. The replay compares one coherent
+projection and recovery result, never independent per-field alternatives. An
+observed whole-buffer early flush becomes a `Flush` in subsequent model prefixes,
+so its durability survives a later crash. Parsing and enablement follow
+`transaction_steps`. The shared
+`TRACE_JSON`/`WALK` driver remains usable. Trace API tests run finite schedules,
+not exhaustive checks during `cargo test`.
+
+Mandatory positive witnesses cover checkpoint stage/flush, stage/crash before
+publish, recovered seal shadow, bake/prune/reinsert/checkpoint, full rewrite,
+an apply overlapping rewrite, and a later protected snapshot retained by rewrite.
+The optional `protected survivor excluded by pushdown` diagnostic is hypothesis B.
+
+| Control | Mutation | Required failure |
+|---|---|---|
+| `mem-tier-no-one-call` | Stage seal shadow before pure vectors; stage checkpoint insert records after snapshot/vectors/clear, allowing flush/crash between | `recovered reads match the source` |
+| `mem-tier-no-insert-records` | Omit checkpoint insert records and hidden-key RAM upgrade, retaining checkpoint vector stamps | `recovered reads match the source` |
+| `mem-tier-no-capture-reservation` | Reserve the pure-delete seal's shadow sequence after releasing capture | `recovered reads match the source` |
+| `mem-tier-late-stamp` | Reserve a fresh insert-record stamp at checkpoint staging after a post-capture apply | `recovered reads match the source` |
+
+Control names retain their original API; their modes have the
+`mem-tier-seal-delete-only-no-` prefix (`no-early-stamp` for late stamping).
+A failure must actually exercise the mutation to establish necessity. In
+particular, split staging needs a flush/crash between stages, and late reservation
+needs an intervening apply. Source replay remains enabled in all controls: an
+unacknowledged partial publication may be repaired by redelivery. Trace tests
+compare the known-defect and candidate seal schedule, check fenced durable cleanup
+and later-write retention, exercise every mutation, and compare the candidate and
+no-insert-records prune/reinsert/checkpoint schedule. Run results and counterexample
+artifacts belong in the report/PR, not the repository.
+
+The replay models the reserve-ahead allocator's logical handouts without forcing
+an unrelated pending catalog buffer to flush at each apply. Physical allocator
+gaps are normalized by the replay from observed reservation boundaries, rather
+than equating a persisted block high-water with the model's next logical sequence.
+The PK existence cache is separate from visible rows: it filters durable inputs
+by the file deletion view, includes all tier keys, retains keys across absorbed
+deletes and bake, and is discarded by full rewrite and recovery. A retained key
+can produce a redundant supersede tombstone. The logical source oracle remains
+independent of these physical bookkeeping rules.
+
+Split staging and omitted insert records are checked as catalog-content
+properties in replay even when reinsert vectors or source redelivery preserve the
+logical rows. A trace that preserves rows is not a data-loss reproduction. The
+control runs retain their original required row-failure predicates; missing
+failures must be reported, never relabeled or hidden. Historical control JSONL
+schedules remain useful for driving partial-publication interleavings, but their
+old FAIL labels are not a verdict of a revised model.
+
+Rules checked against the source at `43bee9dd8bb653926ce8bc836cb48a7d3cb6ba35`
+plus the existing worktree changes (locations relative to `crates/cayenne/src/`):
+
+| Modeled rule | Code |
+|---|---|
+| One allocator; reserve before handing out; pairs for applies | `provider/table.rs:1413` (`reserve_sequences_in`), `:13114`, `:35480`, `:35537`, `:36027` |
+| Upsert existing-key or delete-side probe; delete always; tier has no inserts | `provider/table.rs:16901`, `:17147`, `:35344`, `:35537`, `:36027` |
+| Independent delete/insert max, delete-side-only tombstone probe | `provider/deletion_index.rs:253` (`merged_entry`), `:1528`; `provider/delete/filter_exec.rs:193` |
+| Main applies reinserts only without protected plans; protected cutoff ignores reinserts | `provider/table.rs:43328`, `:41553`; `provider/delete/filter_exec.rs:156` |
+| Sequence-blind pushdown shared by file scans, separate memory filters | `provider/table.rs:42327`, `:43025`; `provider/file_pruning.rs:128`; `provider/table.rs:33630`, `:34869`, `:34935` |
+| Merge tier tombstones by delete max into file-side scan index | `provider/table.rs:33868` (`merged_deletions_for_build`) |
+| Seal capture/reservation, shadow and grouped vectors, mark/ack | `provider/table.rs:37249`–`:37434`; `metastore/object_native.rs:1891` |
+| Checkpoint capture, empty/data arms, precomputed insert records, atomic visibility publish | `provider/table.rs:36381`, `:36481`, `:36682`, `:36923`, `:37001`; `:18294` and `:18348` |
+| Buffered catalog-live state, table flush, position commit before ack | `metastore/object_native.rs:595`, `:642`, `:712`; `provider/table.rs:37878` |
+| Bake fence, clean-prefix gate, partial-filter scan without query pushdown, per-side RAM prune | `provider/table.rs:30780`, `:28799`, `:29210`, `:29430`, `:31338`; `provider/deletion_index.rs:843` |
+| Recovery merges vector and record inserts; inline watermark; protected reload | `provider/table.rs:39454`, `:39571`, `:39709`; `provider/delete/vector_io.rs:657`; `provider/table.rs:33190` |
+| Full rewrite capture, drain and fenced publication | `provider/table.rs:25608`, `:25912`, `:25950`, `:26325`, `:26401` |
+| Rewrite scan skips tombstone pushdown | `provider/table.rs:26546`, `:26561` |
+| Fenced catalog commit removes vectors/records by separate cutoffs and only folded snapshots | `provider/table.rs:6795`, `:6832`; `metastore/object_native.rs:1433`; `../cayenne-metastore-actions/src/state.rs:478`, `:615` |
+| RAM full-rewrite prune and folded-set removal | `provider/table.rs:30962`, `:31338`; `provider/deletion_index.rs:843` |
+
+The allocator reserves ahead in physical blocks. Logical handouts from an
+already claimed block do not call the metastore and therefore do not publish an
+unrelated checkpoint buffer. The model records logical high-water with the next
+publication; reopening resumes from that logical committed high-water. Replay
+maps actual handout boundaries to logical sequences, preserving their order while
+abstracting unused physical block tails. `CatalogView` is the modeled data-content
+projection: it excludes allocator block high-water, source-position records,
+manifest min/max ranges and optimizer statistics. Acknowledgement and recovered
+rows are checked separately. The bake scope requires all protected inputs eligible;
+partial-prefix bakes retaining an above-fence suffix are outside this model.
+The requested protected S=1 genesis supersedes the original brief's current-file
+genesis. Bake scans and rewrite scans skip query-only tombstone pushdown; using the
+query visibility helper for either would misrepresent their materialized rows.
+The engine's full rewrite drains memory before capture, and its fenced catalog
+commit does remove old durable vectors and insert records; bake retains them.
+Source acknowledgement also includes a committed source-position action in the
+existing object-native worktree implementation, rather than only an external ack.
+
+Other abstractions: files are symbolic immutable rows; successful per-table
+publication is atomic. No torn object I/O, uncertain CAS, source transport failure,
+multishard torn capture, NULL/schema changes, overflow, cold storage, statistics
+correctness or resource accounting is modeled. Statistics/file-stat cleanup do
+not affect row visibility and are omitted. Inline tombstone state is empty here:
+seals append unpublished shadow rows, and checkpoints clear all inline state.
+Protected rows use only their registered read cutoff; seal shadows receive their
+seal sequence. Insert records use maxima, as the original brief permits. Source
+position stage/flush/ack is one end action, with earlier flush/crash opportunities.
+The full rewrite's current-pointer/catalog commit and RAM swap form one action;
+crash between them has the same durable recovery state as crash just after it.
+The mem-tier family uses DFS, including controls, so a control with no failure can
+exhaust without retaining a breadth-first frontier. All safety predicates remain
+unchanged. These are bounded symbolic protocol checks, not additional engine
+reproductions.

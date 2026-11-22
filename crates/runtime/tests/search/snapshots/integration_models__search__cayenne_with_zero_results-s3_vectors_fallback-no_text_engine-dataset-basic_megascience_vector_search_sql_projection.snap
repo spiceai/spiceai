@@ -8,7 +8,7 @@ description: "SELECT id, answer, question, subject, trunc(_score, 3) as _score F
     "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples.",
     "question": "How many multiples of 4 are there between 1 and 30? List them and count the total.",
     "subject": "math",
-    "_score": 0.541
+    "_score": 0.539
   },
   {
     "id": 1277,
@@ -29,6 +29,6 @@ description: "SELECT id, answer, question, subject, trunc(_score, 3) as _score F
     "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "question": "What is the fifth root of 32?",
     "subject": "math",
-    "_score": 0.53
+    "_score": 0.529
   }
 ]

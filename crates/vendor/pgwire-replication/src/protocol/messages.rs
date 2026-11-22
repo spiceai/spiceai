@@ -215,7 +215,7 @@ mod tests {
         let payload = [0, 0, 0, 0]; // auth type 0 = OK
         let (code, rest) = parse_auth_request(&payload).expect("should succeed");
         assert_eq!(code, auth::OK);
-        assert!(rest.is_empty());
+        assert_eq!(rest, []);
     }
 
     #[test]

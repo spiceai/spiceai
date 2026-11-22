@@ -31,6 +31,7 @@ arrow.workspace = true
 arrow-schema.workspace = true
 arrow_tools = { path = "../../arrow_tools" }
 async-trait.workspace = true
+bytes.workspace = true
 chrono.workspace = true
 connector-graphql = { path = "../connector-graphql" }
 data_components = { path = "../../data_components" }
@@ -43,6 +44,7 @@ globset.workspace = true
 governor.workspace = true
 graphql-parser.workspace = true
 http.workspace = true
+http-body-limit = { path = "../../http-body-limit" }
 reqwest.workspace = true
 runtime-component = { path = "../../runtime-component" }
 runtime-datafusion = { path = "../../runtime-datafusion" }

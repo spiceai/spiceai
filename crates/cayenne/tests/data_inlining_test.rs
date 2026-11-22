@@ -160,7 +160,7 @@ async fn test_inlined_data_crud(
             created_at: String::new(),
         })
         .await?;
-    assert!(!id.is_empty());
+    assert_ne!(id, "");
 
     // Verify count
     assert_eq!(catalog.get_inlined_data_count(&table_id).await?, 3);

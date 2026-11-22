@@ -1,0 +1,42 @@
+[package]
+name = "chrono-tz"
+# Must stay semver-compatible with 0.10: the root `[patch.crates-io]` entry only
+# applies to dependents whose `chrono-tz` requirement this version satisfies.
+# `compat/` serves the 0.8 and 0.9 requirements from this crate.
+version = "0.10.4"
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+# The code is chrono-tz's: the upstream URL keeps chrono-tz in acknowledgements.md,
+# whose generator (`make display-deps`) leaves out github.com/spiceai crates.
+repository = "https://github.com/chronotope/chrono-tz"
+description = "IANA time zones for chrono, from the part of chrono-tz 0.10.4 that Spice.ai uses"
+autotests = false
+
+[dependencies]
+chrono.workspace = true
+phf = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+# Reads the system tz database for the comparison in `src/system_tzdb.rs`.
+jiff = "0.2.28"
+
+[build-dependencies]
+# 0.4.1 generated chrono-tz 0.10.4's tables, and `build.rs` reproduces them with
+# it. 0.5 writes different tables: it names numeric-offset spans (`+0230`) that
+# 0.4 leaves unnamed.
+parse-zoneinfo = "0.4.1"
+phf_codegen = "0.13"
+
+[features]
+# Dependents still request these crates.io `chrono-tz` 0.10 features. The
+# standard library is always used, so both are no-ops.
+default = []
+std = []
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[lints]
+workspace = true

@@ -766,7 +766,7 @@ async fn scans_read_one_commit_and_follow_the_branch() {
     let dataset = DatasetSpec::new("hf://datasets/o/branch/data/", TableReference::bare("t"));
     mock.clear_seen();
     let table = connector
-        .table(&dataset)
+        .table(&dataset, &unbounded_pool())
         .await
         .expect("the dataset registers");
     let registered = table.schema();
@@ -844,7 +844,7 @@ async fn api_responses_cut_off_part_way_are_requested_again() {
     let connector = connector(&mock, None, &[]);
     let dataset = DatasetSpec::new("hf://datasets/o/flaky/data/", TableReference::bare("t"));
     let table = connector
-        .table(&dataset)
+        .table(&dataset, &unbounded_pool())
         .await
         .expect("the dataset registers");
     let ctx = session();
@@ -929,7 +929,10 @@ async fn a_single_file_and_a_glob_select_their_files() {
     );
     ctx.register_table(
         "test",
-        connector.table(&file).await.expect("a file registers"),
+        connector
+            .table(&file, &unbounded_pool())
+            .await
+            .expect("a file registers"),
     )
     .expect("registered");
     let glob = DatasetSpec::new(
@@ -938,7 +941,10 @@ async fn a_single_file_and_a_glob_select_their_files() {
     );
     ctx.register_table(
         "train",
-        connector.table(&glob).await.expect("a glob registers"),
+        connector
+            .table(&glob, &unbounded_pool())
+            .await
+            .expect("a glob registers"),
     )
     .expect("registered");
 
@@ -973,7 +979,10 @@ async fn a_glob_infers_its_schema_from_the_files_it_selects() {
         "hf://datasets/o/globschema/data/train-*.csv",
         TableReference::bare("t"),
     );
-    let table = connector.table(&dataset).await.expect("registers");
+    let table = connector
+        .table(&dataset, &unbounded_pool())
+        .await
+        .expect("registers");
     let names: Vec<_> = table
         .schema()
         .fields()
@@ -1006,8 +1015,14 @@ async fn a_csv_commit_with_reordered_columns_fails_instead_of_misreading() {
     let connector = connector(&mock, None, &[]);
     let dataset = DatasetSpec::new("hf://datasets/o/csvmove/data/", TableReference::bare("t"));
     let ctx = session();
-    ctx.register_table("t", connector.table(&dataset).await.expect("registers"))
-        .expect("registered");
+    ctx.register_table(
+        "t",
+        connector
+            .table(&dataset, &unbounded_pool())
+            .await
+            .expect("registers"),
+    )
+    .expect("registered");
     let sql = "SELECT id, name, city FROM t ORDER BY id";
     let printed = |batches: &[RecordBatch]| {
         arrow::util::pretty::pretty_format_batches(batches)
@@ -1074,7 +1089,7 @@ async fn csv_files_whose_columns_disagree_fail_registration() {
     let connector = connector(&mock, None, &[]);
     let dataset = DatasetSpec::new("hf://datasets/o/csvmixed/data/", TableReference::bare("t"));
     let message = connector
-        .table(&dataset)
+        .table(&dataset, &unbounded_pool())
         .await
         .expect_err("a file's columns differ")
         .to_string();
@@ -1103,8 +1118,14 @@ async fn csv_files_whose_columns_disagree_fail_registration() {
     mock.branch("o/csvmixed", "main", C2);
     connector.store.hub().forget_revisions();
     let ctx = session();
-    ctx.register_table("t", connector.table(&dataset).await.expect("registers"))
-        .expect("registered");
+    ctx.register_table(
+        "t",
+        connector
+            .table(&dataset, &unbounded_pool())
+            .await
+            .expect("registers"),
+    )
+    .expect("registered");
     let batches = query(&ctx, "SELECT id, name, city FROM t ORDER BY id").await;
     assert_eq!(
         arrow::util::pretty::pretty_format_batches(&batches)
@@ -1128,7 +1149,7 @@ async fn a_quoted_multiline_column_name_is_one_column() {
     let connector = connector(&mock, None, &[]);
     let dataset = DatasetSpec::new("hf://datasets/o/csvquoted/data/", TableReference::bare("t"));
     let table = connector
-        .table(&dataset)
+        .table(&dataset, &unbounded_pool())
         .await
         .expect("the header check passes");
     let names: Vec<_> = table
@@ -1183,10 +1204,20 @@ async fn each_token_reads_through_its_own_store() {
         TableReference::bare("t"),
     );
     let ctx = session();
-    ctx.register_table("one", one.table(&dataset).await.expect("registers"))
-        .expect("registered");
-    ctx.register_table("two", two.table(&dataset).await.expect("registers"))
-        .expect("registered");
+    ctx.register_table(
+        "one",
+        one.table(&dataset, &unbounded_pool())
+            .await
+            .expect("registers"),
+    )
+    .expect("registered");
+    ctx.register_table(
+        "two",
+        two.table(&dataset, &unbounded_pool())
+            .await
+            .expect("registers"),
+    )
+    .expect("registered");
     for (table, token) in [("one", "hf_one"), ("two", "hf_two"), ("one", "hf_one")] {
         one.store.hub().forget_revisions();
         two.store.hub().forget_revisions();
@@ -1244,7 +1275,7 @@ async fn dots_in_a_revision_or_name_are_not_file_extensions() {
         ctx.register_table(
             name,
             connector
-                .table(&dataset)
+                .table(&dataset, &unbounded_pool())
                 .await
                 .unwrap_or_else(|e| panic!("{from}: {e}")),
         )
@@ -1258,8 +1289,13 @@ async fn dots_in_a_revision_or_name_are_not_file_extensions() {
     // A tag that looks like a compression suffix does not make plain CSV read as gzip.
     let csv = connector(&mock, None, &[("file_format", "csv")]);
     let dataset = DatasetSpec::new("hf://datasets/o/csvtag@v1.gz", TableReference::bare("c"));
-    ctx.register_table("c", csv.table(&dataset).await.expect("registers"))
-        .expect("registered");
+    ctx.register_table(
+        "c",
+        csv.table(&dataset, &unbounded_pool())
+            .await
+            .expect("registers"),
+    )
+    .expect("registered");
     let batches = query(&ctx, "SELECT id, name FROM c").await;
     assert_eq!(
         arrow::util::pretty::pretty_format_batches(&batches)
@@ -1291,8 +1327,14 @@ async fn csv_and_jsonl_files_are_read_through_the_hub_cache() {
         ("j", "hf://datasets/o/text/jsonl/"),
     ] {
         let dataset = DatasetSpec::new(from, TableReference::bare(name));
-        ctx.register_table(name, connector.table(&dataset).await.expect("registers"))
-            .expect("registered");
+        ctx.register_table(
+            name,
+            connector
+                .table(&dataset, &unbounded_pool())
+                .await
+                .expect("registers"),
+        )
+        .expect("registered");
     }
     let csv = query(&ctx, "SELECT id, name FROM c ORDER BY id").await;
     assert_eq!(
@@ -1328,14 +1370,20 @@ async fn a_folder_of_mixed_formats_asks_for_a_narrower_location() {
     let connector = connector(&mock, None, &[]);
 
     let mixed = DatasetSpec::new("hf://datasets/o/mixed/data/", TableReference::bare("t"));
-    let error = connector.table(&mixed).await.expect_err("two formats");
+    let error = connector
+        .table(&mixed, &unbounded_pool())
+        .await
+        .expect_err("two formats");
     assert_eq!(
         error.to_string(),
         "Cannot setup the dataset t (hf) with an invalid configuration. 'data' in dataset 'o/mixed' holds files of more than one format (.csv, .parquet). Narrow `from` to one format's files, for example with a glob such as '*.parquet', or set `file_format`. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
     );
 
     let docs = DatasetSpec::new("hf://datasets/o/mixed/docs/", TableReference::bare("t"));
-    let error = connector.table(&docs).await.expect_err("no data files");
+    let error = connector
+        .table(&docs, &unbounded_pool())
+        .await
+        .expect_err("no data files");
     assert_eq!(
         error.to_string(),
         "Cannot setup the dataset t (hf) with an invalid configuration. No Parquet, CSV, TSV, JSON or ORC files were found under 'docs' in dataset 'o/mixed' (found .md). Point `from` at the dataset's data files, or read the Hub's Parquet conversion of it with '@~parquet'. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
@@ -1349,7 +1397,7 @@ async fn a_folder_of_mixed_formats_asks_for_a_narrower_location() {
     );
     assert_eq!(
         connector
-            .table(&raw)
+            .table(&raw, &unbounded_pool())
             .await
             .expect_err("no extension")
             .to_string(),
@@ -1361,7 +1409,7 @@ async fn a_folder_of_mixed_formats_asks_for_a_narrower_location() {
     );
     assert_eq!(
         connector
-            .table(&folder)
+            .table(&folder, &unbounded_pool())
             .await
             .expect_err("no data files")
             .to_string(),
@@ -1371,8 +1419,14 @@ async fn a_folder_of_mixed_formats_asks_for_a_narrower_location() {
     // `file_format` settles it.
     let connector = self::connector(&mock, None, &[("file_format", "csv")]);
     let ctx = session();
-    ctx.register_table("t", connector.table(&mixed).await.expect("csv registers"))
-        .expect("registered");
+    ctx.register_table(
+        "t",
+        connector
+            .table(&mixed, &unbounded_pool())
+            .await
+            .expect("csv registers"),
+    )
+    .expect("registered");
     let batches = query(&ctx, "SELECT count(*) AS n FROM t").await;
     assert_eq!(
         arrow::util::pretty::pretty_format_batches(&batches)
@@ -1384,7 +1438,11 @@ async fn a_folder_of_mixed_formats_asks_for_a_narrower_location() {
 
 async fn registration_error(connector: &HuggingFace, from: &str) -> String {
     let dataset = DatasetSpec::new(from, TableReference::bare("t"));
-    connector.table(&dataset).await.expect_err(from).to_string()
+    connector
+        .table(&dataset, &unbounded_pool())
+        .await
+        .expect_err(from)
+        .to_string()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1617,7 +1675,10 @@ async fn unsupported_file_format_error_never_echoes_a_secret_value() {
         ),
         ("untracked", &untracked, unsupported("")),
     ] {
-        let error = connector.table(&dataset).await.expect_err(case);
+        let error = connector
+            .table(&dataset, &unbounded_pool())
+            .await
+            .expect_err(case);
         let display = error.to_string();
         let debug = format!("{error:?}");
         assert_eq!(display, expected, "{case}");
@@ -1640,7 +1701,7 @@ async fn the_token_is_sent_to_the_hub_and_never_to_the_cdn() {
     );
     assert_eq!(
         anonymous
-            .table(&dataset)
+            .table(&dataset, &unbounded_pool())
             .await
             .expect_err("no token")
             .to_string(),
@@ -1650,7 +1711,7 @@ async fn the_token_is_sent_to_the_hub_and_never_to_the_cdn() {
     let wrong = connector(&mock, Some("hf_wrong"), &[]);
     assert_eq!(
         wrong
-            .table(&dataset)
+            .table(&dataset, &unbounded_pool())
             .await
             .expect_err("a wrong token")
             .to_string(),
@@ -1660,8 +1721,14 @@ async fn the_token_is_sent_to_the_hub_and_never_to_the_cdn() {
     let authorized = connector(&mock, Some(TOKEN), &[]);
     mock.clear_seen();
     let ctx = session();
-    ctx.register_table("t", authorized.table(&dataset).await.expect("registers"))
-        .expect("registered");
+    ctx.register_table(
+        "t",
+        authorized
+            .table(&dataset, &unbounded_pool())
+            .await
+            .expect("registers"),
+    )
+    .expect("registered");
     assert_rows(
         &query(&ctx, "SELECT * FROM t ORDER BY id").await,
         &rows(0..50),
@@ -2404,4 +2471,9 @@ async fn endpoints_must_be_https_unless_loopback() {
             "`HF_ENDPOINT` \"http://hf.example\" is not a valid Hugging Face Hub endpoint: use an https:// URL such as 'https://huggingface.co' (http:// is accepted only for a loopback address). See: {DOCS}"
         )
     );
+}
+
+/// A memory pool with no limit, for tests whose tables are not about memory.
+fn unbounded_pool() -> Arc<dyn datafusion::execution::memory_pool::MemoryPool> {
+    Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
 }

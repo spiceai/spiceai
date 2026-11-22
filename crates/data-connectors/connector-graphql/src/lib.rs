@@ -28,13 +28,14 @@ use data_connector_api::ConnectorContext;
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DEFAULT_SPICE_CLIENT_TIMEOUT, DataConnector,
     DataConnectorError, DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
-    default_spice_client,
+    RedirectScope, default_spice_client_builder,
 };
 use data_http_rate_control as http_rate_control;
 use data_http_rate_control::{
     HttpRateControlMetricSource, HttpRateControlMetrics, HttpRateControlMetricsProvider,
 };
 use datafusion::datasource::TableProvider;
+use datafusion::execution::memory_pool::MemoryPool;
 use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::MetricsProvider;
 use runtime_parameters::{ParameterSpec, Parameters};
@@ -165,9 +166,11 @@ impl DataConnectorFactory for GraphQLFactory {
 }
 
 impl GraphQL {
+    /// The client for `dataset`, whose response bodies are charged to `memory_pool`.
     async fn get_client(
         &self,
         dataset: &DatasetSpec,
+        memory_pool: Arc<dyn MemoryPool>,
     ) -> DataConnectorResult<(
         GraphQLClient,
         http_rate_control::SharedRateControllerReservation,
@@ -241,13 +244,14 @@ impl GraphQL {
             });
         }
 
-        let client = default_spice_client("application/json")
-            .boxed()
-            .map_err(|source| DataConnectorError::InternalWithSource {
-                dataconnector: "graphql".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                source,
-            })?;
+        // A token sent in a custom header is a credential reqwest does not remove when a redirect
+        // leaves the endpoint's origin.
+        let redirects = if auth_header.is_some() && token.is_some() {
+            RedirectScope::RequestOrigin
+        } else {
+            RedirectScope::PublicHosts
+        };
+        let client = default_spice_client_builder("application/json", redirects);
 
         let mut rate_control = http_rate_control::resolve_config_for_component(
             &self.params,
@@ -255,7 +259,7 @@ impl GraphQL {
             &ConnectorComponent::from(dataset),
             "graphql",
         )?;
-        // The GraphQL client is `default_spice_client`, so its request timeout
+        // The GraphQL client is `default_spice_client_builder`'s, so its request timeout
         // is the `client_timeout` equivalent the acquire bound defaults to.
         rate_control.apply_default_acquire_timeout(DEFAULT_SPICE_CLIENT_TIMEOUT);
         let rate_limiter = self
@@ -288,7 +292,8 @@ impl GraphQL {
         .with_rate_limiter(Some(rate_limiter))
         .with_rate_controller(rate_controller.shared().controller.clone())
         .with_auth_header(auth_header)
-        .build(client)
+        .with_source(dataset.name.to_string(), "graphql")
+        .build(client, memory_pool)
         .boxed();
 
         match client_result {
@@ -313,7 +318,7 @@ impl DataConnector for GraphQL {
 
     async fn read_provider(
         &self,
-        _context: &dyn ConnectorContext,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let query = self.params.get("query").expose().ok_or_else(|p| {
@@ -324,7 +329,15 @@ impl DataConnector for GraphQL {
             }
         })?;
 
-        let (client, rate_controller) = self.get_client(dataset).await?;
+        // Response bodies are held to the runtime's query memory pool, at registration as
+        // in queries.
+        let memory_pool = Arc::clone(
+            &context
+                .datafusion_session_context()
+                .runtime_env()
+                .memory_pool,
+        );
+        let (client, rate_controller) = self.get_client(dataset, memory_pool).await?;
 
         match GraphQLTableProviderBuilder::new(client).build(query).await {
             Ok(provider) => {
@@ -462,7 +475,10 @@ mod tests {
         let dataset = test_dataset("https://graphql-dataset-params.example.com/graphql").await;
 
         let (_, reservation) = graphql
-            .get_client(&dataset)
+            .get_client(
+                &dataset,
+                Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+            )
             .await
             .expect("GraphQL client should build with rate-control params");
         reservation.commit().await;
@@ -494,7 +510,10 @@ mod tests {
         let dataset = test_dataset("https://graphql-runtime-defaults.example.com/graphql").await;
 
         let (_, reservation) = graphql
-            .get_client(&dataset)
+            .get_client(
+                &dataset,
+                Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+            )
             .await
             .expect("GraphQL client should build with runtime rate-control defaults");
         reservation.commit().await;
@@ -516,7 +535,13 @@ mod tests {
         };
         let dataset = test_dataset("https://graphql-invalid-limit.example.com/graphql").await;
 
-        let Err(error) = graphql.get_client(&dataset).await else {
+        let Err(error) = graphql
+            .get_client(
+                &dataset,
+                Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+            )
+            .await
+        else {
             panic!("zero GraphQL rate-control limit should be rejected");
         };
 
@@ -544,6 +569,150 @@ mod tests {
         };
 
         assert!(DataConnector::metrics_provider(&graphql).is_none());
+    }
+
+    const CUSTOM_HEADER_AUTH: [(&str, &str); 3] = [
+        ("graphql_auth_header", "x-api-key"),
+        ("graphql_auth_token", "test-token"),
+        ("json_pointer", "/data/users"),
+    ];
+
+    fn users_response() -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200)
+            .set_body_raw(r#"{"data": {"users": [{"id": "1"}]}}"#, "application/json")
+    }
+
+    fn redirect_response(location: &str) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(307).insert_header("location", location)
+    }
+
+    /// Queries `endpoint` with the client a dataset with `params` gets.
+    async fn query_users(
+        params: &[(&str, &str)],
+        endpoint: &str,
+    ) -> graphql::Result<graphql::client::GraphQLQueryResult> {
+        let connector = GraphQL {
+            app_name: std::sync::Arc::from("test_app"),
+            params: test_params(params).await,
+            runtime_rate_control_params: None,
+            rate_control_registry: http_rate_control::global_registry(),
+            metrics: Arc::new(HttpRateControlMetrics::default()),
+            emit_rate_control_metrics: true,
+            rate_control_metric_source: None,
+        };
+        let dataset = test_dataset(endpoint).await;
+        let (client, reservation) = connector
+            .get_client(
+                &dataset,
+                Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+            )
+            .await
+            .expect("the GraphQL client builds");
+        reservation.commit().await;
+        let query =
+            graphql::client::GraphQLQuery::try_from(Arc::<str>::from("query { users { id } }"))
+                .expect("the query parses");
+        client.execute(&query, None, None, None, None, None).await
+    }
+
+    #[tokio::test]
+    async fn a_custom_auth_header_is_not_sent_on_a_redirect_off_the_endpoint_origin() {
+        let target = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(users_response())
+            .mount(&target)
+            .await;
+        let target_url = format!("{}/graphql", target.uri());
+        let endpoint = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(redirect_response(&target_url))
+            .mount(&endpoint)
+            .await;
+
+        let Err(error) =
+            query_users(&CUSTOM_HEADER_AUTH, &format!("{}/graphql", endpoint.uri())).await
+        else {
+            panic!("a redirect to another port must be refused");
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("Refused to follow the redirect to {target_url}")),
+            "unexpected error: {error}"
+        );
+        let target_requests = target
+            .received_requests()
+            .await
+            .expect("requests are recorded");
+        assert!(
+            target_requests.is_empty(),
+            "the redirect target must receive no request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_custom_auth_header_follows_a_redirect_within_the_endpoint_origin() {
+        let endpoint = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/graphql"))
+            .respond_with(redirect_response("/graphql/v2"))
+            .mount(&endpoint)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::path("/graphql/v2"))
+            .and(wiremock::matchers::header("x-api-key", "test-token"))
+            .respond_with(users_response())
+            .mount(&endpoint)
+            .await;
+
+        let result = query_users(&CUSTOM_HEADER_AUTH, &format!("{}/graphql", endpoint.uri()))
+            .await
+            .expect("the redirect is followed with the header");
+
+        let rows: usize = result
+            .records
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn a_dataset_without_a_custom_header_token_follows_a_redirect_to_another_port() {
+        for params in [
+            &[
+                ("graphql_auth_token", "test-token"),
+                ("json_pointer", "/data/users"),
+            ][..],
+            &[
+                ("graphql_auth_header", "x-api-key"),
+                ("graphql_auth_user", "user"),
+                ("json_pointer", "/data/users"),
+            ][..],
+        ] {
+            let target = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::any())
+                .respond_with(users_response())
+                .mount(&target)
+                .await;
+            let endpoint = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::any())
+                .respond_with(redirect_response(&format!("{}/graphql", target.uri())))
+                .mount(&endpoint)
+                .await;
+
+            let result = query_users(params, &format!("{}/graphql", endpoint.uri()))
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("the redirect is followed with {params:?}: {error}")
+                });
+
+            let rows: usize = result
+                .records
+                .iter()
+                .map(arrow::array::RecordBatch::num_rows)
+                .sum();
+            assert_eq!(rows, 1);
+        }
     }
 }
 

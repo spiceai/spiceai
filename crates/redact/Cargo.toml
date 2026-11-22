@@ -1,0 +1,15 @@
+[package]
+description = "Removes credentials from URLs, and from messages that embed them, before they are reported"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "redact"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+percent-encoding.workspace = true
+
+[lints]
+workspace = true

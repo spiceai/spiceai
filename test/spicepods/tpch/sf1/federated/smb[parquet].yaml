@@ -7,7 +7,7 @@ datasets:
     params: &smb_params
       file_format: parquet
       smb_user: runner
-      smb_pass: ${secrets:UNAS_SMB_PASS}
+      smb_pass: ${secrets:SMB_PASSWORD}
   - from: smb://192.168.3.148/ai_platform_dev/data/benchmarks/tpch/sf1/lineitem.parquet
     name: lineitem
     params: *smb_params

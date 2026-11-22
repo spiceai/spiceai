@@ -101,6 +101,8 @@ mod ducklake;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 mod endpoint_auth;
+#[cfg(any(feature = "postgres", feature = "adbc"))]
+mod federation_differential;
 mod file;
 mod flight;
 mod gcs;
@@ -152,7 +154,6 @@ mod refresh_retry;
 mod refresh_sql;
 mod refresh_worker_panic;
 mod reload_start_time_only;
-#[cfg(feature = "sqlite")]
 mod result_correctness;
 mod results_cache;
 mod results_cache_warmup;

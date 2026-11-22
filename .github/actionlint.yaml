@@ -46,7 +46,19 @@ self-hosted-runner:
 # a listed workflow is the other half of that: the old key goes inert *and* the
 # deferred finding reappears under the new name, so CI goes red until the key is
 # renamed with it.
+#
+# The one glob entry, first below, is not a deferred finding. actionlint 1.7.12,
+# the latest release, does not know the `uses: $/…` form. That form runs a
+# same-repository action at the workflow's own commit, so `actions.lock` can cover
+# the action's remote dependencies, and actionlint reports every such call as a
+# missing ref. The pattern matches only a `$/` call, so a malformed `owner/repo`
+# ref still fails anywhere. actionlint stops checking a step it cannot parse, so
+# `workflow_yaml_check.yml` also lints a copy of the tree with `$/` read as `./`.
+# That run keeps checking each call's `with:` against the action's inputs.
 paths:
+  .github/workflows/**/*.{yml,yaml}:
+    ignore:
+      - 'specifying action "\$/[^"]+" in invalid format because ref is missing'
   .github/workflows/e2e_test_ci.yml:
     ignore:
       # `concurrency` accepts only `group` and `cancel-in-progress`. Three

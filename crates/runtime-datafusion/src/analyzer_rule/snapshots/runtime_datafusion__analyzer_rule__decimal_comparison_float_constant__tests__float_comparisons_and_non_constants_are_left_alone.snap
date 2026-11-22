@@ -1,0 +1,5 @@
+---
+source: crates/runtime-datafusion/src/analyzer_rule/decimal_comparison_float_constant.rs
+expression: mysql
+---
+SELECT * FROM `m` WHERE (((`m`.`f` < 7E-2) AND (`m`.`disc` < (`m`.`f` * 5E-1))) AND (`m`.`disc` < 1E300))

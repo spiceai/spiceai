@@ -364,7 +364,7 @@ fn normalize(key: u128, lo: u128, hi: u128) -> u64 {
     // When it does not, drop the low bits of `x` and `span` together: they sit
     // below the resolution a CURVE_BITS-wide coordinate can represent anyway, and
     // shifting both preserves the ratio.
-    let shift = (u128::BITS - span.leading_zeros()).saturating_sub(CURVE_BITS);
+    let shift = span.bit_width().saturating_sub(CURVE_BITS);
     let (x, span) = (x >> shift, span >> shift);
     u64::try_from(x * u128::from(MAX_CODE) / span).unwrap_or(MAX_CODE)
 }

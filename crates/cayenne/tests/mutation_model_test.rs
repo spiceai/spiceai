@@ -45,10 +45,7 @@ use std::sync::Arc;
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use cayenne::{
-    CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog,
-    metadata::CreateTableOptions,
-};
+use cayenne::{CayenneTableProvider, MetadataCatalog, metadata::CreateTableOptions};
 use common::TestFixture;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
@@ -118,7 +115,7 @@ async fn setup_int64_upsert_table(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -127,7 +124,10 @@ async fn setup_int64_upsert_table(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
@@ -147,7 +147,7 @@ async fn setup_composite_upsert_table(
             "region".to_string(),
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -156,7 +156,10 @@ async fn setup_composite_upsert_table(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
@@ -260,8 +263,9 @@ async fn reopen_and_read_int64_rows(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-        .open(table_name)
+    let provider = fixture
+        .data_store
+        .open(catalog, ctx.runtime_env(), table_name)
         .await?;
     ctx.register_table(table_name, Arc::new(provider) as Arc<dyn TableProvider>)?;
     read_int64_rows(&ctx, table_name).await
@@ -274,8 +278,9 @@ async fn reopen_and_read_composite_rows(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-        .open(table_name)
+    let provider = fixture
+        .data_store
+        .open(catalog, ctx.runtime_env(), table_name)
         .await?;
     ctx.register_table(table_name, Arc::new(provider) as Arc<dyn TableProvider>)?;
     read_composite_rows(&ctx, table_name).await
@@ -594,7 +599,7 @@ async fn test_exhaustive_int64_single_row_sequences_impl(fixture: TestFixture) -
     Ok(())
 }
 
-test_with_backends!(test_exhaustive_int64_single_row_sequences_impl);
+test_on_data_store!(test_exhaustive_int64_single_row_sequences_impl);
 
 async fn test_exhaustive_int64_batch_sequences_impl(fixture: TestFixture) -> TestResult<()> {
     let sequences = enumerate_sequences(&int64_batch_ops(), 3);
@@ -616,7 +621,7 @@ async fn test_exhaustive_int64_batch_sequences_impl(fixture: TestFixture) -> Tes
     Ok(())
 }
 
-test_with_backends!(test_exhaustive_int64_batch_sequences_impl);
+test_on_data_store!(test_exhaustive_int64_batch_sequences_impl);
 
 async fn test_exhaustive_composite_single_row_sequences_impl(
     fixture: TestFixture,
@@ -640,7 +645,7 @@ async fn test_exhaustive_composite_single_row_sequences_impl(
     Ok(())
 }
 
-test_with_backends!(test_exhaustive_composite_single_row_sequences_impl);
+test_on_data_store!(test_exhaustive_composite_single_row_sequences_impl);
 
 async fn test_sequence_reservation_guard_impl(fixture: TestFixture) -> TestResult<()> {
     let (table, ctx, schema) = setup_int64_upsert_table(&fixture, "reservation_guard").await?;
@@ -675,7 +680,7 @@ async fn test_sequence_reservation_guard_impl(fixture: TestFixture) -> TestResul
     );
     Ok(())
 }
-test_with_backends!(test_sequence_reservation_guard_impl);
+test_on_data_store!(test_sequence_reservation_guard_impl);
 
 async fn test_publication_tombstone_replay_impl(fixture: TestFixture) -> TestResult<()> {
     use cayenne::{catalog::CatalogPublication, metadata::InlinedDelete};
@@ -700,6 +705,7 @@ async fn test_publication_tombstone_replay_impl(fixture: TestFixture) -> TestRes
         inline_tombstone: Some(&tombstone),
         pending_durable_flips: &[],
         dirty_pk_bytes: std::borrow::Cow::Borrowed(&[]),
+        files: &[],
     };
     fixture
         .catalog
@@ -724,7 +730,7 @@ async fn test_publication_tombstone_replay_impl(fixture: TestFixture) -> TestRes
     assert_eq!(after[0].delete_ipc, vec![1, 2, 3]);
     Ok(())
 }
-test_with_backends!(test_publication_tombstone_replay_impl);
+test_on_data_store!(test_publication_tombstone_replay_impl);
 
 async fn test_delete_file_replacement_same_path_impl(fixture: TestFixture) -> TestResult<()> {
     use cayenne::metadata::{DeleteFile, DeletionType};
@@ -769,6 +775,7 @@ async fn test_delete_file_replacement_same_path_impl(fixture: TestFixture) -> Te
     assert_eq!(stored[0].delete_count, 1);
     Ok(())
 }
+// Hand-made deletion vectors at a local path: SQLite with local data files in every mode.
 test_with_backends!(test_delete_file_replacement_same_path_impl);
 
 async fn test_publication_without_reinsert_sequence_impl(fixture: TestFixture) -> TestResult<()> {
@@ -806,6 +813,7 @@ async fn test_publication_without_reinsert_sequence_impl(fixture: TestFixture) -
         inline_tombstone: None,
         pending_durable_flips: &[],
         dirty_pk_bytes: std::borrow::Cow::Borrowed(&[]),
+        files: &[],
     };
     fixture.catalog.commit_publications(&[publication]).await?;
     let files = fixture
@@ -816,4 +824,5 @@ async fn test_publication_without_reinsert_sequence_impl(fixture: TestFixture) -
     assert_eq!(files[0].reinsert_sequence, None);
     Ok(())
 }
+// Hand-made deletion vectors at a local path: SQLite with local data files in every mode.
 test_with_backends!(test_publication_without_reinsert_sequence_impl);

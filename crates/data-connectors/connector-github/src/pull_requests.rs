@@ -1094,7 +1094,7 @@ mod tests {
                 fn respond(&self, _request: &Request) -> ResponseTemplate {
                     if self
                         .remaining_empty
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                             left.checked_sub(1)
                         })
                         .is_ok()
@@ -1139,16 +1139,19 @@ mod tests {
                 .brotli(true)
                 .zstd(true)
                 .deflate(true)
-                .default_headers(default_headers)
-                .build()
-                .expect("GitHub-style HTTP client to build");
+                .default_headers(default_headers);
             let client = GraphQLClientBuilder::new(
                 Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
                 params.unnest_behavior,
             )
             .with_json_pointer(params.json_pointer)
             .with_schema(params.schema)
-            .build(http_client)
+            .build(
+                http_client,
+                std::sync::Arc::new(
+                    datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                ),
+            )
             .expect("GitHub-style GraphQL client to build");
 
             let provider = GraphQLTableProviderBuilder::new(client)
