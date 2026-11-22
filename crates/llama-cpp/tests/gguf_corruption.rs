@@ -261,6 +261,50 @@ fn a_tensor_written_as_the_old_type_43_fails_the_load_instead_of_reading_as_f8_e
     );
 }
 
+/// A `DSpark` drafter (a `DFlash` model with a Markov head, `markov_w1.weight`) chains its drafts
+/// over the trained block, which also sizes its mask embeddings (`block_size - 1` of them). The
+/// fork checks the block size while loading the hyperparameters, so a GGUF that gives 0 fails its
+/// load there with the reason, rather than reaching the tensors or a graph build.
+#[test]
+fn a_dspark_drafter_without_a_block_size_fails_its_load() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let path = dir.path().join("dspark-block0.gguf");
+    let pairs: &[(&str, Kv)] = &[
+        ("general.architecture", Kv::Str("dflash")),
+        ("tokenizer.ggml.model", Kv::Str("none")),
+        ("dflash.context_length", Kv::U32(64)),
+        ("dflash.embedding_length", Kv::U32(8)),
+        ("dflash.block_count", Kv::U32(1)),
+        ("dflash.attention.head_count", Kv::U32(2)),
+        ("dflash.attention.layer_norm_rms_epsilon", Kv::F32(1e-6)),
+        ("dflash.block_size", Kv::U32(0)),
+        ("general.alignment", Kv::U32(32)),
+    ];
+    // the header with one tensor, the Markov head's first matrix: F32 [8, 4], 128 bytes
+    let mut bytes = gguf_header(pairs);
+    bytes[8..16].copy_from_slice(&1u64.to_le_bytes());
+    put_string(&mut bytes, "markov_w1.weight");
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    bytes.extend_from_slice(&8u64.to_le_bytes());
+    bytes.extend_from_slice(&4u64.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    while !bytes.len().is_multiple_of(32) {
+        bytes.push(0);
+    }
+    bytes.extend(std::iter::repeat_n(0u8, 8 * 4 * 4));
+    std::fs::write(&path, bytes).expect("the file is written");
+
+    let refused = refusal(&path).expect("the file does not load");
+
+    assert_eq!(
+        reason(&refused),
+        "llama_model_load: error loading model: error loading model hyperparameters: \
+         DSpark draft requires 'dflash.block_size' of at least 1 in GGUF metadata",
+        "the zero block size is the reason: {refused}"
+    );
+}
+
 /// One mutation of `bytes`: a flipped byte, a truncation, a run of 0xFF that turns a count or
 /// length into a huge one, or a run of random bytes.
 fn mutate(bytes: &mut Vec<u8>, rng: &mut XorShift) {

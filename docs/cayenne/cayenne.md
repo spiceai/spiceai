@@ -779,6 +779,8 @@ Reads are unchanged — a scan still unions the whole RAM tier; the split is inv
 
 The contract: the slot stays tied to the **persisted** tier (it never advances before durability) but is untied from reads (it advances after the rows are scannable, without waiting for a publish). A crash before a seal re-streams only the un-acked tail — PK-idempotent, exactly-once, now a ~2-second window instead of a checkpoint-cadence one. Setting `cayenne_cdc_mem_tier_seal_age_ms: 0` disables sealing and reverts the slot ack to the checkpoint cadence; the value should sit at or below the age cap, since a seal older than the checkpoint window is superseded by the checkpoint's own slot advance. Like the checkpoint interval, this is a fixed time-domain durability-policy bound, not an adaptive-controller actuator.
 
+**Each seal and each checkpoint is one metastore commit** (`MetadataCatalog::commit_mem_tier_durable`): a seal's shadow rows and its delete-only tombstones; a checkpoint's tombstones, protected-snapshot registration and inline clear, and — for a data-bearing checkpoint — the per-key insert records that keep re-inserted `Int64` keys visible after a restart, the table statistics that count its rows, and the removal of other snapshots' per-file statistics. SQLite applies them in one transaction. The object-native metastore stages them in one call, so a concurrent commit of the table's pending changes (a CDC apply's acknowledgement point) publishes all of them or none. Committed in parts, a crash between two of them leaves a state no version of the table had — new row versions without the tombstones that hide the old ones serve duplicate keys after the restart (#16147).
+
 ### Why the mem-tier is safe to lose
 
 For replayable CDC, the crash model is:

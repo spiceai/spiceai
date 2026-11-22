@@ -881,6 +881,21 @@ async fn a_reply_under_a_gpu_fault() {
             message.contains("failed computing"),
             "the error does not say a backend failed: {message}"
         );
+        // llama.cpp logs the cause only in the call that first finds the failure, whichever
+        // one that is, and later calls fail without it. Here the failure is the one
+        // `GGML_BACKEND_FAULT_TEST` makes, which llama.cpp finds where it waits for the graph
+        // (`check_backends`) or where it queues the next one (`graph_compute`), and either way
+        // logs the line that fails the context, ending as below
+        let cause = message
+            .split_once(". llama.cpp reported: ")
+            .map(|(_, cause)| cause);
+        assert!(
+            cause.is_some_and(|cause| cause.contains(
+                " outputs and state are not the computation's and every later decode fails; \
+                 free the context and create another"
+            )),
+            "the error does not carry the cause llama.cpp logged: {message}"
+        );
     };
     // the failed graph may be one the model's load computes
     let model = match llms::chat::create_local_model(

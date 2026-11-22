@@ -774,7 +774,8 @@ pub(super) fn physical_expr_to_sql(
     }
     if let Some(neg) = any.downcast_ref::<NegativeExpr>() {
         let inner = physical_expr_to_sql(neg.arg(), column_substitutions, spice_sql)?;
-        return Some(format!("(-{inner})"));
+        // The space keeps a negative operand from forming `--`, which starts a comment.
+        return Some(format!("(- {inner})"));
     }
     None
 }
@@ -852,6 +853,22 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::{Float64Array, Int64Array};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn a_negated_negative_number_is_not_a_comment() {
+        use datafusion::physical_expr::expressions::{Literal, NegativeExpr};
+        use datafusion::scalar::ScalarValue;
+
+        for (value, sql) in [(-5_i64, "(- -5)"), (i64::MIN, "(- -9223372036854775808)")] {
+            let expr: Arc<dyn PhysicalExpr> = Arc::new(NegativeExpr::new(Arc::new(Literal::new(
+                ScalarValue::Int64(Some(value)),
+            ))));
+            assert_eq!(
+                physical_expr_to_sql(&expr, &[], false).as_deref(),
+                Some(sql)
+            );
+        }
+    }
 
     /// Identity mapping: same types, same column order.
     #[test]

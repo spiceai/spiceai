@@ -103,8 +103,20 @@ steps:
         UPDATE tb SET v = 'purged-gap' WHERE id <= 10;
         DELETE FROM tc WHERE id > 150;
         INSERT INTO tc VALUES (500, 'after purge');
+        CREATE TABLE purge_mark (g TEXT);
+        INSERT INTO purge_mark SELECT @@GLOBAL.gtid_executed;
         FLUSH BINARY LOGS;
+  # MySQL keeps a binlog file while a binlog dump thread still reads it, and the
+  # stopped spiced's dump thread can outlive it by a moment, until it next writes
+  # to its closed connection. A single PURGE then removes nothing, and spiced
+  # resumes as though nothing had been purged. Purge until every transaction up to
+  # `purge_mark` (the writes above, taken before the flush) is gone.
+  - source-query:
+      src: |
         PURGE BINARY LOGS BEFORE NOW() + INTERVAL 1 SECOND;
+        SELECT GTID_SUBSET(g, @@GLOBAL.gtid_purged) FROM purge_mark;
+    expect: { rows: [['1']] }
+    eventually: 30s
   - start: { ready: false }
   - assert-status: { dataset: a, status: Error, message-contains: mysql_replication_invalid_checkpoint_behavior }
     eventually: 60s
