@@ -1,0 +1,19 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q6"
+---
++---------------+---------------------------------------------------------------------------------+
+| plan_type     | plan                                                                            |
++---------------+---------------------------------------------------------------------------------+
+| logical_plan  | SubqueryAlias: c                                                                |
+|               |   Projection: __spice_checked_add(orders.o_orderkey, Int64(1)) AS key           |
+|               |     Limit: skip=0, fetch=10                                                     |
+|               |       TableScan: orders projection=[o_orderkey], fetch=10                       |
+| physical_plan | ProjectionExec: expr=[__spice_checked_add(o_orderkey@0, 1) as key]              |
+|               |   SchemaCastScanExec                                                            |
+|               |     CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>           |
+|               |       CoalescePartitionsExec: fetch=10                                          |
+|               |         BytesProcessedExec                                                      |
+|               |           DataSourceExec: partitions=16, partition_sizes=[<redacted>], fetch=10 |
+|               |                                                                                 |
++---------------+---------------------------------------------------------------------------------+
