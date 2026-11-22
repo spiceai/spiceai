@@ -25,4 +25,7 @@ steps:
       path: /v1/chat/completions
       headers: { content-type: application/json }
       body: '{"model": "qwen3", "messages": [{"role": "user", "content": "What is 12 times 12? Reply with only the number."}], "temperature": 0, "reasoning_effort": "none", "max_tokens": 16}'
-    expect: { status: 200, body-contains: '144' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /choices/0/message/content, equals: '144' }
