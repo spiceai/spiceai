@@ -1,4 +1,5 @@
 name: query-protocols
+tags: [long]
 description: >
   Documented SQL functions and syntax, plus seeded random queries, return the
   same rows over Flight, Flight SQL and HTTP JSON.

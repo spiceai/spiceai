@@ -45,16 +45,46 @@ jobs:
     runs-on: spiceai-dev-runners
     timeout-minutes: 10
     steps:
-      - name: Checkout
+      # The files under check. Steps only read these files; none runs one.
+      - name: Check out the Dockerfiles and DuckDB versions to check
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          path: checked
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /Dockerfile*
+            /test/duckdb_versions.json
+
+      # The scripts that run. This runner is reused across jobs, so a pull
+      # request from a fork runs the base branch's copies, never its own. The
+      # push run on trunk tests a fork's changes to these scripts once it merges.
+      - name: Check out the check scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: checker
+          sparse-checkout: scripts
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && github.event.pull_request.base.sha || '' }}
+
+      # A symlink would make the check read, and print, a file elsewhere on
+      # this runner.
+      - name: Refuse symlinks in the files under check
+        run: |
+          set -euo pipefail
+          links="$(find checked -path checked/.git -prune -o -type l -print)"
+          if [ -n "$links" ]; then
+            printf '::error::Symlinks are not allowed in the files this workflow checks:\n%s\n' "$links"
+            exit 1
+          fi
 
       # Its parser is exercised first: a regex that stopped matching any ARG
       # would report every Dockerfile as missing libduckdb, but one that
       # matched the wrong text could pass a drifted image.
       - name: Run tests
+        working-directory: checker
         run: python3 scripts/test_check_duckdb_image_versions.py -v
 
       - name: Check the DuckDB version every image ships
-        run: python3 scripts/check_duckdb_image_versions.py
+        working-directory: checker
+        run: python3 scripts/check_duckdb_image_versions.py "$GITHUB_WORKSPACE/checked"

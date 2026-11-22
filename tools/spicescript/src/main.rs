@@ -105,6 +105,10 @@ struct Cli {
     #[arg(long, default_value_t = 1, value_name = "N")]
     jobs: usize,
 
+    /// Run each selected script this many times, with independent sources and instances.
+    #[arg(long, default_value_t = 1, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    runs_per_script: u32,
+
     /// Record each script's run time in `recordings/durations.json` beside
     /// it, the estimate `--jobs` orders scripts by; scripts without one may
     /// run. Times from a `--jobs 1` run are the least disturbed by neighbours.
@@ -123,6 +127,14 @@ struct Cli {
     /// share with the least work so far, so the N shares take about as long.
     #[arg(long, value_name = "I/N", value_parser = parse_partition)]
     partition: Option<(usize, usize)>,
+
+    /// Select scripts with any of these tags. Repeat for several tags.
+    #[arg(long, value_enum, value_name = "TAG")]
+    only_tag: Vec<script::Tag>,
+
+    /// Exclude scripts with any of these tags, even when --only-tag matches.
+    #[arg(long, value_enum, value_name = "TAG")]
+    exclude_tag: Vec<script::Tag>,
 
     /// Cap every wait for a condition (`eventually`, readiness, a refresh)
     /// at this long, such as `20s`: for scripts expected to fail, which
@@ -189,6 +201,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<bool> {
+    validate_repetitions(&cli)?;
     // Retried comparisons would print every intermediate mismatch; the runner
     // reports the last one with both answers.
     result_compare::set_print_diagnostics(false);
@@ -235,15 +248,21 @@ async fn run(cli: Cli) -> Result<bool> {
             );
         }
     }
-    if let Some((index, count)) = cli.partition {
-        let share = partition(&scripts, count);
-        (paths, scripts) = paths
-            .into_iter()
-            .zip(scripts)
-            .zip(share)
-            .filter_map(|(pair, share)| (share == index - 1).then_some(pair))
-            .unzip();
+    let selection = select_scripts(&scripts, &cli.only_tag, &cli.exclude_tag, cli.partition);
+    if !cli.only_tag.is_empty() || !cli.exclude_tag.is_empty() {
+        let selected = selection.as_ref().map_or(0, |(_, count)| *count);
+        eprintln!(
+            "Tag filter selected {selected} of {} scripts",
+            scripts.len()
+        );
     }
+    let (indices, _) = selection?;
+    (paths, scripts) = paths
+        .into_iter()
+        .zip(scripts)
+        .enumerate()
+        .filter_map(|(i, pair)| indices.contains(&i).then_some(pair))
+        .unzip();
     if cli.check {
         return check(&paths, &scripts);
     }
@@ -327,6 +346,7 @@ async fn run(cli: Cli) -> Result<bool> {
     let pki = pki::generate(&work_dir.join(format!("pki-{}", std::process::id())))?;
     let options = runner::Options {
         targets,
+        repetition: None,
         from_override: cli.from,
         releases,
         cluster: cli.cluster,
@@ -345,10 +365,10 @@ async fn run(cli: Cli) -> Result<bool> {
     let mut expected = 0;
     let mut failures = Vec::new();
     let mut notes: Vec<String> = Vec::new();
-    let total = scripts.len();
+    let total = scripts.len() * cli.runs_per_script as usize;
     let run_started = std::time::Instant::now();
     // Each script, its time and failure count, for the summary.
-    let mut timings: Vec<(&script::Script, std::time::Duration, usize)> = Vec::new();
+    let mut timings: Vec<(&script::Script, std::time::Duration, usize, String)> = Vec::new();
     let mut done = 0;
     // Longest first, by recorded duration (a script without one counts as
     // long): each asks for slots in this order, and slots are granted in the
@@ -358,37 +378,49 @@ async fn run(cli: Cli) -> Result<bool> {
     let slots = runner::Slots::new(cli.jobs);
     let mut running = futures::stream::FuturesUnordered::new();
     for (path, script) in order {
-        let (options, slots) = (&options, &slots);
-        running.push(async move {
-            let started = std::time::Instant::now();
-            let (report, out) = runner::run_script_buffered(script, options, slots).await;
-            (path, script, report, out, started.elapsed())
-        });
+        for repetition in 1..=cli.runs_per_script {
+            let slots = &slots;
+            let mut options = options.clone();
+            let repeated = cli.runs_per_script > 1;
+            if repeated {
+                options.repetition = Some(repetition);
+                options.log_capture = options
+                    .log_capture
+                    .map(|root| root.join(format!("repetition-{repetition}")));
+            }
+            running.push(async move {
+                let started = std::time::Instant::now();
+                let (report, out) = runner::run_script_buffered(script, &options, slots).await;
+                (
+                    path,
+                    script,
+                    repetition,
+                    options,
+                    report,
+                    out,
+                    started.elapsed(),
+                )
+            });
+        }
     }
     let mut results = results::Results {
         partition: cli.partition.map(|(i, n)| format!("{i}/{n}")),
         complete: false,
         seconds: 0.0,
         scripts: Vec::new(),
+        summaries: Vec::new(),
     };
-    while let Some((path, script, report, out, waited)) =
+    while let Some((path, script, repetition, run_options, report, out, waited)) =
         futures::StreamExt::next(&mut running).await
     {
+        let label = if cli.runs_per_script > 1 {
+            format!("{} #{repetition}/{}", script.name, cli.runs_per_script)
+        } else {
+            script.name.clone()
+        };
+        let out = annotate_output(&out, &label, cli.runs_per_script > 1);
         print!("{out}");
         let report = report?;
-        // A log that cannot be saved is a warning, as in the runner: the
-        // script's own outcome still counts, and the other scripts still run.
-        if let Some(root) = &options.log_capture
-            && !report.failures.is_empty()
-            && let Err(e) = capture_script(
-                &runner::capture_dir(root, script),
-                path,
-                &out,
-                &report.failures,
-            )
-        {
-            println!("warning: {e:#}");
-        }
         // The time it held slots, not the time it waited for them.
         let took = if report.ran.is_zero() {
             waited
@@ -405,10 +437,29 @@ async fn run(cli: Cli) -> Result<bool> {
         } else {
             let verdict = ledger.judge(script, &report.failures);
             expected += verdict.expected;
-            notes.extend(verdict.notes.iter().cloned());
+            notes.extend(
+                verdict
+                    .notes
+                    .iter()
+                    .map(|note| annotate_output(note, &label, cli.runs_per_script > 1)),
+            );
             (verdict.problems(), Some(verdict))
         };
-        if let Some(file) = &cli.results {
+        // A log that cannot be saved is a warning, as in the runner: the
+        // script's own outcome still counts, and the other scripts still run.
+        if let Some(root) = &run_options.log_capture
+            && !report.failures.is_empty()
+            && let Err(e) = capture_script(
+                &runner::capture_dir(root, script),
+                path,
+                &out,
+                &report.failures,
+                (cli.runs_per_script > 1).then_some(label.as_str()),
+            )
+        {
+            println!("warning: {e:#}");
+        }
+        if cli.results.is_some() || cli.runs_per_script > 1 {
             results.scripts.push(results::ScriptResult::new(
                 script,
                 path,
@@ -417,8 +468,16 @@ async fn run(cli: Cli) -> Result<bool> {
                 verdict.as_ref(),
                 &problems,
             ));
+            if cli.runs_per_script > 1 {
+                if let Some(result) = results.scripts.last_mut() {
+                    result.repetition = Some(repetition);
+                }
+                results.update_summaries();
+            }
             results.seconds = run_started.elapsed().as_secs_f64();
-            results.write(file)?;
+            if let Some(file) = &cli.results {
+                results.write(file)?;
+            }
         }
         let shown_expected = if cli.record_failures {
             0
@@ -427,15 +486,19 @@ async fn run(cli: Cli) -> Result<bool> {
         };
         println!(
             "[{done}/{total}] done    {} in {:.1}s: {} passed, {} failed{}",
-            script.name,
+            label,
             took.as_secs_f64(),
             report.passed,
             problems.len(),
             expected_failures_note(shown_expected),
         );
-        timings.push((script, took, problems.len()));
+        timings.push((script, took, problems.len(), label.clone()));
         passed += report.passed;
-        failures.extend(problems);
+        failures.extend(
+            problems
+                .into_iter()
+                .map(|p| annotate_output(&p, &label, cli.runs_per_script > 1)),
+        );
     }
     if cli.record_failures {
         ledger.save()?;
@@ -450,7 +513,7 @@ async fn run(cli: Cli) -> Result<bool> {
             std::path::PathBuf,
             Vec<(String, std::time::Duration)>,
         > = std::collections::BTreeMap::new();
-        for (script, took, _) in &timings {
+        for (script, took, _, _) in &timings {
             by_dir
                 .entry(script.dir.clone())
                 .or_default()
@@ -471,15 +534,20 @@ async fn run(cli: Cli) -> Result<bool> {
     timings.sort_by_key(|t| std::cmp::Reverse(t.1));
     if timings.len() > 1 {
         println!("slowest scripts:");
-        for (script, took, failed) in timings.iter().take(10) {
+        for (_, took, failed, label) in timings.iter().take(10) {
             let note = if *failed > 0 {
                 format!("  ({failed} failed)")
             } else {
                 String::new()
             };
-            println!("  {:>8.1}s  {}{note}", took.as_secs_f64(), script.name);
+            println!("  {:>8.1}s  {}{note}", took.as_secs_f64(), label);
         }
         println!();
+    }
+    if cli.runs_per_script > 1 {
+        for summary in &results.summaries {
+            println!("{summary}");
+        }
     }
     if let Some(file) = &cli.results {
         results.complete = true;
@@ -497,6 +565,27 @@ async fn run(cli: Cli) -> Result<bool> {
     Ok(failures.is_empty() || cli.record_failures)
 }
 
+fn validate_repetitions(cli: &Cli) -> Result<()> {
+    anyhow::ensure!(
+        cli.runs_per_script == 1 || !(cli.record_durations || cli.record_failures),
+        "--runs-per-script >1 cannot be combined with --record-durations or --record-failures: repetitions would overwrite the recordings"
+    );
+    Ok(())
+}
+
+fn annotate_output(text: &str, label: &str, repeated: bool) -> String {
+    if repeated {
+        use std::fmt::Write as _;
+        text.split_inclusive('\n')
+            .fold(String::new(), |mut output, line| {
+                let _ = write!(output, "[{label}] {line}");
+                output
+            })
+    } else {
+        text.to_string()
+    }
+}
+
 /// `--log-capture`'s files for a whole script, beside its combinations'
 /// logs: the script as run, and what the run printed for it, with each
 /// failure in full.
@@ -505,6 +594,7 @@ fn capture_script(
     path: &std::path::Path,
     out: &str,
     failures: &[runner::Failure],
+    repetition_label: Option<&str>,
 ) -> Result<()> {
     use std::fmt::Write as _;
     std::fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
@@ -514,6 +604,11 @@ fn capture_script(
     // the run's summary, so it is added here as the summary prints it.
     let mut text = out.to_string();
     for failure in failures {
+        let failure = annotate_output(
+            &failure.to_string(),
+            repetition_label.unwrap_or_default(),
+            repetition_label.is_some(),
+        );
         let _ = write!(text, "\nFAILED {failure}\n");
     }
     std::fs::write(dir.join("output.txt"), text)
@@ -621,25 +716,68 @@ fn parse_partition(text: &str) -> Result<(usize, usize), String> {
     }
 }
 
+/// Select by tags before balancing partitions. Return original indices and the
+/// total selected before partitioning, including when a share is empty.
+fn select_scripts(
+    scripts: &[script::Script],
+    only: &[script::Tag],
+    exclude: &[script::Tag],
+    partition_share: Option<(usize, usize)>,
+) -> Result<(Vec<usize>, usize)> {
+    let selected: Vec<usize> = scripts
+        .iter()
+        .enumerate()
+        .filter(|(_, script)| {
+            (only.is_empty() || only.iter().any(|tag| script.tags.contains(tag)))
+                && !exclude.iter().any(|tag| script.tags.contains(tag))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let count = selected.len();
+    anyhow::ensure!(
+        (only.is_empty() && exclude.is_empty()) || count > 0,
+        "--only-tag/--exclude-tag selected none of the {} scripts given; check the tags in the scripts and on the command line",
+        scripts.len()
+    );
+    let Some((index, shares)) = partition_share else {
+        return Ok((selected, count));
+    };
+    let selected_scripts: Vec<_> = selected.iter().map(|&i| &scripts[i]).collect();
+    let assignments = partition(&selected_scripts, shares);
+    Ok((
+        selected
+            .into_iter()
+            .zip(assignments)
+            .filter_map(|(i, share)| (share == index - 1).then_some(i))
+            .collect(),
+        count,
+    ))
+}
+
 /// Which of `count` shares each script falls in: longest first (a script
 /// without a recorded duration counts as an hour), each to the share with
 /// the least recorded time so far, ties to the lower share. Depends only on
 /// the scripts and their recorded durations, so every job computes the same
 /// split.
-fn partition(scripts: &[script::Script], count: usize) -> Vec<usize> {
+fn partition(scripts: &[impl std::borrow::Borrow<script::Script>], count: usize) -> Vec<usize> {
     let cost = |s: &script::Script| s.duration.unwrap_or(std::time::Duration::from_secs(3600));
     let mut order: Vec<usize> = (0..scripts.len()).collect();
     order.sort_by(|&a, &b| {
-        cost(&scripts[b])
-            .cmp(&cost(&scripts[a]))
-            .then_with(|| scripts[a].dir.cmp(&scripts[b].dir))
-            .then_with(|| scripts[a].file_stem.cmp(&scripts[b].file_stem))
+        cost(scripts[b].borrow())
+            .cmp(&cost(scripts[a].borrow()))
+            .then_with(|| scripts[a].borrow().dir.cmp(&scripts[b].borrow().dir))
+            .then_with(|| {
+                scripts[a]
+                    .borrow()
+                    .file_stem
+                    .cmp(&scripts[b].borrow().file_stem)
+            })
     });
     let mut load = vec![std::time::Duration::ZERO; count];
     let mut share = vec![0; scripts.len()];
     for i in order {
         let least = (0..count).min_by_key(|&k| (load[k], k)).unwrap_or(0);
-        load[least] += cost(&scripts[i]);
+        load[least] += cost(scripts[i].borrow());
         share[i] = least;
     }
     share
@@ -687,6 +825,121 @@ fn targets(specs: &[String]) -> Result<Vec<runner::Target>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tagged_scripts() -> Vec<script::Script> {
+        ["[]", "[long]", "[]"]
+            .into_iter()
+            .map(|tags| {
+                script::Script::parse(&format!(
+                    "name: s\ntags: {tags}\nspicepod: {{}}\nsteps: [{{start: {{}}}}]"
+                ))
+                .expect("tagged script parses")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_tag_selects_the_tagged_scripts() {
+        assert_eq!(
+            select_scripts(&tagged_scripts(), &[script::Tag::Long], &[], None).expect("selection"),
+            (vec![1], 1)
+        );
+    }
+
+    #[test]
+    fn exclude_tag_drops_the_tagged_scripts() {
+        assert_eq!(
+            select_scripts(&tagged_scripts(), &[], &[script::Tag::Long], None).expect("selection"),
+            (vec![0, 2], 2)
+        );
+    }
+
+    #[test]
+    fn no_tag_flags_select_all() {
+        assert_eq!(
+            select_scripts(&tagged_scripts(), &[], &[], None).expect("selection"),
+            (vec![0, 1, 2], 3)
+        );
+    }
+
+    #[test]
+    fn tags_filter_before_partition() {
+        // untagged 100s, long 95s, untagged 10s, untagged 5s. Over the three
+        // untagged scripts, share 2/2 gets 10s and 5s (both behind 100s).
+        // Dealing all four first would put 95s in share 2, the 10s with it and
+        // the 5s in share 1, so filtering afterwards would leave share 2 with
+        // only 10s.
+        let scripts: Vec<script::Script> = [("[]", 100), ("[long]", 95), ("[]", 10), ("[]", 5)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (tags, secs))| {
+                let mut s = script::Script::parse(&format!(
+                    "name: s{i}\ntags: {tags}\nspicepod: {{}}\nsteps: [{{start: {{}}}}]"
+                ))
+                .expect("tagged script parses");
+                s.file_stem = format!("s{i}");
+                s.duration = Some(std::time::Duration::from_secs(secs));
+                s
+            })
+            .collect();
+        let long = [script::Tag::Long];
+        assert_eq!(
+            select_scripts(&scripts, &[], &long, Some((2, 2))).expect("selection"),
+            (vec![2, 3], 3)
+        );
+        assert_eq!(
+            select_scripts(&scripts, &[], &long, Some((1, 2))).expect("selection"),
+            (vec![0], 3)
+        );
+        assert_eq!(
+            select_scripts(&scripts, &[], &long, Some((4, 4))).expect("empty share is allowed"),
+            (vec![], 3)
+        );
+    }
+
+    #[test]
+    fn zero_tag_selection_is_an_error() {
+        assert_eq!(
+            select_scripts(
+                &tagged_scripts(),
+                &[script::Tag::Long],
+                &[script::Tag::Long],
+                None
+            )
+            .expect_err("empty selection")
+            .to_string(),
+            "--only-tag/--exclude-tag selected none of the 3 scripts given; check the tags in the scripts and on the command line"
+        );
+    }
+
+    #[test]
+    fn repetition_output_preserves_single_run_bytes() {
+        let text = "== script\n   FAIL instance step 1\n\n";
+        assert_eq!(annotate_output(text, "script", false), text);
+        assert_eq!(
+            annotate_output("== script\nlast line", "script #2/3", true),
+            "[script #2/3] == script\n[script #2/3] last line"
+        );
+    }
+
+    #[test]
+    fn repetition_flags_are_validated() {
+        assert!(Cli::try_parse_from(["spicescript", "--runs-per-script", "0", "s.yaml"]).is_err());
+        for flag in ["--record-durations", "--record-failures"] {
+            let cli =
+                Cli::try_parse_from(["spicescript", "--runs-per-script", "3", flag, "s.yaml"])
+                    .expect("valid CLI syntax");
+            assert_eq!(
+                validate_repetitions(&cli)
+                    .expect_err("recording repetitions is rejected")
+                    .to_string(),
+                "--runs-per-script >1 cannot be combined with --record-durations or --record-failures: repetitions would overwrite the recordings"
+            );
+            let cli =
+                Cli::try_parse_from(["spicescript", flag, "s.yaml"]).expect("default repetition");
+            validate_repetitions(&cli).expect("one run may record");
+        }
+    }
 
     #[test]
     fn partition_deals_longest_first_to_the_least_loaded_share() {

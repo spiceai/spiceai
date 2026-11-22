@@ -24,11 +24,11 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
+use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::sql::unparser::dialect::{Dialect, IntervalStyle, PostgreSqlDialect};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use flight_client::Credentials;
@@ -54,10 +54,8 @@ use super::{
     ParameterSpec,
 };
 use crate::component::dataset::DatasetSpec;
-use arrow_tools::map_entries::StreamNormalizer;
 use data_components::cdc::{
-    self, AccelerationContents, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange,
-    CommitError,
+    self, AccelerationContents, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
 };
 use data_components::flight::{FlightFactory, FlightTable};
 use data_components::{Read, ReadWrite};
@@ -182,6 +180,13 @@ fn resolve_client_identity_params(
 #[derive(Clone, Debug)]
 pub struct SpiceAI {
     flight_factory: FlightFactory,
+    /// The runtime's query memory pool, which a reload of the append stream
+    /// stages its snapshot in.
+    reload_memory_pool: Arc<dyn MemoryPool>,
+    /// The local dataset this connector serves, when it serves one. Its append
+    /// stream tracks staleness, labels metrics and logs under this name, so two
+    /// local datasets reading the same upstream table are reported apart.
+    local_dataset: Option<String>,
 }
 
 impl SpiceAI {
@@ -462,7 +467,18 @@ impl DataConnectorFactory for SpiceAIFactory {
                 Arc::new(SpiceCloudPlatformDialect {}),
             )
             .with_substrait(context.role() == Role::Sidecar);
-            Ok(Arc::new(SpiceAI { flight_factory }) as Arc<dyn DataConnector>)
+            let reload_memory_pool = Arc::clone(
+                &context
+                    .datafusion_session_context()
+                    .runtime_env()
+                    .memory_pool,
+            );
+            let local_dataset = local_dataset_name(&params.component);
+            Ok(Arc::new(SpiceAI {
+                flight_factory,
+                reload_memory_pool,
+                local_dataset,
+            }) as Arc<dyn DataConnector>)
         })
     }
 
@@ -579,17 +595,30 @@ impl DataConnector for SpiceAI {
         &self,
         _context: &dyn ConnectorContext,
         federated_table: Arc<dyn FederatedTableProvider>,
-        _dataset: &DatasetSpec,
+        dataset: &DatasetSpec,
         _acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
-        self.append_stream(federated_table)
+        Some(self.append_stream_for(federated_table, Some(dataset.name.to_string())))
     }
 
     fn append_stream(
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
     ) -> Option<ChangesStream> {
-        Some(Box::pin(stream! {
+        Some(self.append_stream_for(federated_table, self.local_dataset.clone()))
+    }
+}
+
+impl SpiceAI {
+    /// The append stream of `federated_table`, tracked under `local_dataset`
+    /// or, when the connector serves no single dataset, the upstream name.
+    fn append_stream_for(
+        &self,
+        federated_table: Arc<dyn FederatedTableProvider>,
+        local_dataset: Option<String>,
+    ) -> ChangesStream {
+        let reload_memory_pool = Arc::clone(&self.reload_memory_pool);
+        Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
             let Some(federated_table_provider_adaptor) = table_provider
             .downcast_ref::<FederatedTableProviderAdaptor>() else {
@@ -603,15 +632,19 @@ impl DataConnector for SpiceAI {
                 return;
             };
 
+            let table_reference = flight_table.get_table_reference();
+            let dataset = local_dataset.unwrap_or_else(|| dataset_label(&table_reference));
             let mut stream = Box::pin(subscribe_to_append_stream(
                 flight_table.get_flight_client(),
-                flight_table.get_table_reference(),
+                table_reference,
+                dataset,
+                reload_memory_pool,
             ));
 
             while let Some(item) = stream.next().await {
                 yield item;
             }
-        }))
+        })
     }
 }
 
@@ -660,96 +693,46 @@ impl SpiceAI {
     }
 }
 
-/// Most times an append stream resubscribes in a row, each after the upstream
-/// ended the subscription with `DATA_LOSS`, before it gives up.
-const MAX_APPEND_STREAM_RESUBSCRIBES: u32 = 5;
+mod append_stream;
 
-/// A subscription that lasted this long counts as healthy, so the next
-/// `DATA_LOSS` starts the resubscribe budget again.
-const APPEND_STREAM_HEALTHY_SUBSCRIPTION: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Whether the upstream ended a subscription because the subscriber missed
-/// updates. A new subscription starts with a truncate and a full snapshot, so
-/// resubscribing reconciles the acceleration.
-fn is_resubscribable(error: &arrow_flight::error::FlightError) -> bool {
-    matches!(error, arrow_flight::error::FlightError::Tonic(status) if status.code() == tonic::Code::DataLoss)
+/// Reads the append stream (`DoExchange`) of the upstream dataset
+/// `table_reference` into change envelopes for the local dataset `dataset`. A
+/// reload of the dataset stages its snapshot in memory reserved from
+/// `memory_pool`, and is refused (and retried later) when the pool cannot hold
+/// it.
+///
+/// `table_reference` is only what the upstream is asked for; staleness
+/// tracking, metric labels and logs use `dataset`, the plain local name, so
+/// two local datasets reading one upstream table are reported apart.
+pub fn subscribe_to_append_stream(
+    client: FlightClient,
+    table_reference: String,
+    dataset: String,
+    memory_pool: Arc<dyn MemoryPool>,
+) -> impl Stream<Item = Result<ChangeEnvelope, cdc::StreamError>> {
+    let subscribe_to = table_reference;
+    append_stream::append_stream(
+        move || {
+            let mut client = client.clone();
+            let table_reference = subscribe_to.clone();
+            async move { client.subscribe(&table_reference).await }
+        },
+        dataset,
+        append_stream::ReloadBudget::new(memory_pool),
+    )
 }
 
-pub fn subscribe_to_append_stream(
-    mut client: FlightClient,
-    table_reference: String,
-) -> impl Stream<Item = Result<ChangeEnvelope, cdc::StreamError>> {
-    stream! {
-        let mut resubscribes = 0_u32;
-        'subscription: loop {
-            // The subscription carries one schema per stream, so the normalizer is resolved from the
-            // first batch and reused for the rest. Without it an accelerated dataset that started on
-            // the conformed scan schema would ingest the producer's non-conforming MAP declaration.
-            let mut normalizer = StreamNormalizer::new();
-            let subscribed_at = std::time::Instant::now();
-            let mut stream = match client.subscribe(&table_reference).await {
-                Ok(stream) => stream,
-                Err(e) => {
-                    yield Err(cdc::StreamError::Flight(e.to_string()));
-                    break 'subscription;
-                }
-            };
-            while let Some(decoded_data) = stream.next().await {
-                match decoded_data {
-                    Ok(decoded_data) => match decoded_data.payload {
-                        DecodedPayload::None | DecodedPayload::Schema(_) => {},
-                        DecodedPayload::RecordBatch(batch) => {
-                            let batch = match normalizer.normalize(batch) {
-                                Ok(batch) => batch,
-                                Err(source) => {
-                                    yield Err(cdc::StreamError::Arrow(format!(
-                                        "Failed to read the change stream from Arrow Flight for dataset '{table_reference}' ({source}), so the dataset stops receiving updates. Remove the null map entries at the source, or expose the column as a string with `to_json(<column>)`. See: https://spiceai.org/docs/components/data-connectors"
-                                    )));
-                                    // End the subscription rather than resuming it. The CDC
-                                    // apply loop keeps running after a fatal stream error, so
-                                    // a resumed subscription would apply every later envelope
-                                    // on top of the change this one dropped and leave the
-                                    // acceleration permanently diverged from its source.
-                                    break 'subscription;
-                                }
-                            };
-                            match ChangeBatch::try_new(batch).map(|rb| {
-                                ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb, true)
-                            }) {
-                                Ok(change_batch) => yield Ok(change_batch),
-                                Err(e) => {
-                                    yield Err(cdc::StreamError::SerdeJsonError(e.to_string()))
-                                }
-                            }
-                        }
-                    },
-                    Err(e) if is_resubscribable(&e) => {
-                        if subscribed_at.elapsed() >= APPEND_STREAM_HEALTHY_SUBSCRIPTION {
-                            resubscribes = 0;
-                        }
-                        if resubscribes >= MAX_APPEND_STREAM_RESUBSCRIBES {
-                            yield Err(cdc::StreamError::Flight(e.to_string()));
-                            break 'subscription;
-                        }
-                        resubscribes += 1;
-                        // A new subscription opens with a truncate and the full snapshot,
-                        // so applying it reconciles whatever this one missed.
-                        tracing::warn!(
-                            "The append stream for dataset '{table_reference}' missed updates from its source ({e}), so it is resubscribing to reload the dataset from a fresh snapshot (attempt {resubscribes} of {MAX_APPEND_STREAM_RESUBSCRIBES})."
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            250 * u64::from(resubscribes),
-                        ))
-                        .await;
-                        continue 'subscription;
-                    }
-                    Err(e) => {
-                        yield Err(cdc::StreamError::Flight(e.to_string()));
-                    }
-                }
-            }
-            break 'subscription;
-        }
+/// The plain name of the upstream dataset `table_reference` refers to, as other
+/// dataset metrics and logs show it (`events`, not `"events"`).
+fn dataset_label(table_reference: &str) -> String {
+    TableReference::parse_str(table_reference).to_string()
+}
+
+/// The plain name of the local dataset `component` is, if it is one.
+fn local_dataset_name(component: &ConnectorComponent) -> Option<String> {
+    match component {
+        ConnectorComponent::Dataset(dataset) => Some(dataset.name.to_string()),
+        ConnectorComponent::Catalog(_) => None,
     }
 }
 
@@ -812,20 +795,53 @@ mod tests {
         }
     }
 
-    /// Only an upstream's `DATA_LOSS` (the subscriber missed updates) sends
-    /// the append stream back for a fresh snapshot; any other error ends it.
+    /// Logs and metric labels name an upstream dataset by its unquoted name.
+    #[test]
+    fn an_append_stream_reports_its_dataset_by_its_unquoted_name() {
+        assert_eq!(
+            dataset_label(&TableReference::bare("events").to_quoted_string()),
+            "events"
+        );
+        assert_eq!(
+            dataset_label(&TableReference::partial("audit", "events").to_quoted_string()),
+            "audit.events"
+        );
+    }
+
+    /// Two local datasets reading one upstream table track their append
+    /// streams under their own names, not the shared upstream one.
+    #[tokio::test]
+    async fn an_append_stream_is_tracked_under_its_local_dataset_name() {
+        let app = Arc::new(app::AppBuilder::new("test").build());
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let name_of = |local: &str| {
+            let dataset = DatasetBuilder::try_new("spice.ai/test.table".to_string(), local)
+                .expect("failed to create builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&runtime))
+                .build()
+                .expect("failed to build dataset");
+            local_dataset_name(&ConnectorComponent::from(&dataset))
+        };
+        assert_eq!(name_of("east").as_deref(), Some("east"));
+        assert_eq!(name_of("west").as_deref(), Some("west"));
+    }
+
+    /// From a producer that does not mark its stream, only `DATA_LOSS` (the
+    /// subscriber missed updates) sends the append stream back for a fresh
+    /// snapshot; any other error is reported.
     #[test]
     fn only_data_loss_resubscribes_an_append_stream() {
         use arrow_flight::error::FlightError;
-        assert!(is_resubscribable(&FlightError::Tonic(Box::new(
-            tonic::Status::data_loss("missed updates")
-        ))));
-        assert!(!is_resubscribable(&FlightError::Tonic(Box::new(
-            tonic::Status::unavailable("upstream down")
-        ))));
-        assert!(!is_resubscribable(&FlightError::ProtocolError(
-            "bad message".to_string()
+        assert!(append_stream::is_resubscribable(&FlightError::Tonic(
+            Box::new(tonic::Status::data_loss("missed updates"))
         )));
+        assert!(!append_stream::is_resubscribable(&FlightError::Tonic(
+            Box::new(tonic::Status::unavailable("upstream down"))
+        )));
+        assert!(!append_stream::is_resubscribable(
+            &FlightError::ProtocolError("bad message".to_string())
+        ));
     }
 
     #[tokio::test]
