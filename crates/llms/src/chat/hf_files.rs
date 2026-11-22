@@ -280,17 +280,18 @@ fn resolve_gguf(
     gguf.extend(gguf_files::draft_head(&listing, chosen));
     let chosen_from_cache = snapshot.cache_only_reason().map(|reason| ChosenFromCache {
         quantization: gguf_files::printable(&chosen.name),
-        pinned: pinned(&listing, chosen),
+        pinned: pinned(&listing, chosen, ListedFrom::Cache),
         reason,
         offline: snapshot.is_offline(),
     });
     Ok((gguf, chosen_from_cache))
 }
 
-/// The `files` entries that load `quantization` ([`gguf_files::pin`]), as a load line or an
-/// error prints them ([`gguf_files::files_entries`]).
-fn pinned(listing: &[ListedFile], quantization: &Quantization) -> String {
-    gguf_files::files_entries(&gguf_files::pin(listing, quantization))
+/// The `files` entries that load `quantization` from a listing `from` holds
+/// ([`gguf_files::pin_from`]), as a load line or an error prints them
+/// ([`gguf_files::files_entries`]).
+fn pinned(listing: &[ListedFile], quantization: &Quantization, from: ListedFrom) -> String {
+    gguf_files::files_entries(&gguf_files::pin_from(listing, quantization, from))
 }
 
 /// The quantization a model with no `files` loads: its default, the one llama.cpp's `-hf` loads
@@ -335,7 +336,15 @@ fn choose_quantization<'q>(
                     default,
                     quantizations.len(),
                     memory,
-                    &pinned(listing, chosen),
+                    &pinned(
+                        listing,
+                        chosen,
+                        if cache_only.is_some() {
+                            ListedFrom::Cache
+                        } else {
+                            ListedFrom::Repository
+                        },
+                    ),
                 ),
             );
             Ok(chosen)

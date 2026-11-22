@@ -477,6 +477,30 @@ pub fn pin(listing: &[ListedFile], quantization: &Quantization) -> Vec<String> {
     entries
 }
 
+/// The `files` entries that load what choosing `quantization` with no `files` loads, from a
+/// listing `from` holds. From the repository's, its name ([`pin`]). From the cache's alone, the
+/// path of its first file and of its draft head's: a name read from one cache, such as that of
+/// a folder that holds one quantization there, can name another quantization in another node's
+/// cache, where a path names the same file or nothing.
+#[must_use]
+pub fn pin_from(
+    listing: &[ListedFile],
+    quantization: &Quantization,
+    from: ListedFrom,
+) -> Vec<String> {
+    match from {
+        ListedFrom::Repository => pin(listing, quantization),
+        ListedFrom::Cache => quantization
+            .files
+            .first()
+            .into_iter()
+            .cloned()
+            // a shard of a series names its whole series
+            .chain(draft_head(listing, quantization).into_iter().next())
+            .collect(),
+    }
+}
+
 /// `entries` as a model's `files` in YAML flow style, `{path: …}` each and comma-separated, for
 /// a load line or an error to quote, so that it can be pasted into a Spicepod as it is: each path
 /// written as `yaml_scalar` writes it.
@@ -1111,6 +1135,93 @@ mod tests {
                     .to_string()
             )
         );
+    }
+
+    /// The `files` entries a node advertises from a listing of its cache alone name, in any
+    /// other node's cache of the repository, the quantization it chose or nothing there: never
+    /// another. A folder that holds one quantization in this node's cache can hold another in
+    /// the next node's, so a folder's name there would load the other.
+    #[test]
+    fn a_pin_from_one_cache_never_loads_another_quantization_from_another() {
+        let mut checked = 0;
+        for (fixture, files) in [
+            ("one_folder", one_folder()),
+            ("tags_in_one_folder", tags_in_one_folder()),
+            ("tag_meets_folder", tag_meets_folder()),
+            ("merged_and_split", merged_and_split()),
+            ("sharded_head", sharded_head()),
+            ("bare_tags", bare_tags()),
+            ("qwen38", qwen38()),
+            ("glm", glm()),
+        ] {
+            let all = quantizations(&files);
+            for q in &all {
+                let head = draft_head(&files, q);
+                // this node's cache holds the quantization and its draft head
+                let mine: Vec<ListedFile> = files
+                    .iter()
+                    .filter(|f| q.files.contains(&f.path) || head.contains(&f.path))
+                    .cloned()
+                    .collect();
+                let chosen = quantizations(&mine)
+                    .into_iter()
+                    .find(|m| m.files == q.files)
+                    .unwrap_or_else(|| panic!("{fixture}: the cache holds {:?}", q.files));
+                let pin = pin_from(&mine, &chosen, ListedFrom::Cache);
+                let entries: Vec<&str> = pin.iter().map(String::as_str).collect();
+                let here = resolve(&mine, &entries)
+                    .unwrap_or_else(|e| panic!("{fixture}: {pin:?} does not resolve: {e}"))
+                    .unwrap_or_else(|| panic!("{fixture}: {pin:?} names no weights"));
+                assert_eq!(here.weights, q.files, "{fixture}: {pin:?}");
+                // the next node's cache holds another quantization alone
+                for other in all.iter().filter(|r| r.files != q.files) {
+                    let theirs: Vec<ListedFile> = files
+                        .iter()
+                        .filter(|f| other.files.contains(&f.path))
+                        .cloned()
+                        .collect();
+                    if let Ok(Some(there)) = resolve(&theirs, &entries) {
+                        panic!(
+                            "{fixture}: {pin:?}, advertised from a cache of {}, loads {:?} from a cache of {}",
+                            q.name, there.weights, other.name
+                        );
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "no two quantizations of a fixture were compared"
+        );
+    }
+
+    /// A cache can make a name ambiguous that a file it gains makes plain: two shard layouts of
+    /// one quantization are two quantizations until the merged file stands for both, so an
+    /// ambiguity read from the cache is retried.
+    #[test]
+    fn a_name_ambiguous_in_the_cache_is_plain_once_it_holds_the_merged_file() {
+        let mut cache = listing(&[
+            ("Model-Q4_K_M-00001-of-00002.gguf", 2 * GB),
+            ("Model-Q4_K_M-00002-of-00002.gguf", 2 * GB),
+            ("Model-Q4_K_M-00001-of-00003.gguf", GB),
+            ("Model-Q4_K_M-00002-of-00003.gguf", GB),
+            ("Model-Q4_K_M-00003-of-00003.gguf", 2 * GB),
+        ]);
+        assert!(
+            matches!(
+                resolve(&cache, &["Q4_K_M"]),
+                Err(ResolveError::AmbiguousQuantization { ref quantizations, .. })
+                    if quantizations.len() == 2
+            ),
+            "{:?}",
+            resolve(&cache, &["Q4_K_M"])
+        );
+        cache.extend(listing(&[("Model-Q4_K_M.gguf", 4 * GB)]));
+        let resolved = resolve(&cache, &["Q4_K_M"])
+            .expect("the merged file stands for both layouts")
+            .expect("Q4_K_M names weights");
+        assert_eq!(resolved.weights, ["Model-Q4_K_M.gguf"]);
     }
 
     #[test]
