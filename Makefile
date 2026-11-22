@@ -265,7 +265,9 @@ NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtim
 # `cayenne` would hit. The names are module-qualified and unique in the
 # workspace. They are exact, so a renamed test leaves this filter and runs in the
 # gate again; `nextest-post-merge` fails when the filter selects fewer tests
-# than it names.
+# than it names. `nextest-packages`, sign-off's targeted pre-check, leaves them
+# out too: `sim_regret_report` is a `cayenne` unit test, which it would
+# otherwise run whenever a branch touches `cayenne`.
 NEXTEST_POST_MERGE_FILTER := test(=result_correctness_vs_duckdb_test::chbench_sf1_load_mode_matrix_vs_duckdb) | test(=result_correctness_vs_duckdb_test::tpcds_and_clickbench_parity_vs_duckdb) | test(=result_correctness_vs_duckdb_test::spicebench_sf1_tpch_scenario_parity_vs_duckdb) | test(=result_correctness_vs_duckdb_test::tpch_full_result_parity_vs_duckdb) | test(=result_correctness_vs_sqlite_test::tpcds_full_result_parity_vs_sqlite) | test(=result_correctness_vs_sqlite_test::tpch_full_result_parity_vs_sqlite) | test(=result_correctness_vs_sqlite_test::chbench_full_result_parity_vs_sqlite) | test(=provider::tuning_sim::sim_regret_report)
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
@@ -357,7 +359,7 @@ verify-cli:
 nextest-packages:
 	@test -n "$(strip $(PACKAGES))" || { echo 'nextest-packages requires PACKAGES="crate1 crate2"' >&2; exit 1; }
 	@$(_WITH_LIBDUCKDB) \
-	cargo nextest run --no-tests=pass $(_LINT_PKG_FLAGS) --lib $(_FEATURES_FLAGS) $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
+	cargo nextest run --no-tests=pass $(_LINT_PKG_FLAGS) --lib $(_FEATURES_FLAGS) $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E 'not ($(NEXTEST_POST_MERGE_FILTER))'
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
