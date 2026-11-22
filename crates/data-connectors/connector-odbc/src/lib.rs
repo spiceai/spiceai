@@ -131,7 +131,7 @@ impl From<&str> for ODBCProfile {
     fn from(val: &str) -> Self {
         // match a profile name to a dialect
         match val {
-            _ if val.contains("mysql") => ODBCProfile::MySql,
+            _ if val.contains("mysql") || val.contains("mariadb") => ODBCProfile::MySql,
             _ if val.contains("postgres") => ODBCProfile::PostgreSql,
             _ if val.contains("sqlite") => ODBCProfile::Sqlite,
             _ if val.contains("databricks") => ODBCProfile::Databricks,
@@ -443,6 +443,40 @@ mod test {
             "postgresql",
             "the sql_dialect parameter is the engine name the gate keys on"
         );
+    }
+
+    /// A `MariaDB` driver (`MariaDB`, `MariaDB Unicode`) gets the `MySQL`
+    /// profile, so a string with a backslash, which `MariaDB` reads as an
+    /// escape, stays local.
+    #[test]
+    fn a_mariadb_driver_gets_the_mysql_profile() {
+        use datafusion::logical_expr::LogicalPlanBuilder;
+        use datafusion::prelude::lit;
+        use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
+
+        for driver in [
+            "driver={mariadb}",
+            "driver={mariadb unicode}",
+            "driver=mysql",
+        ] {
+            let profile = ODBCProfile::from(driver);
+            assert!(
+                matches!(profile, ODBCProfile::MySql),
+                "{driver}: {profile:?}"
+            );
+            let plan = LogicalPlanBuilder::values(vec![vec![lit("a\\'b")]])
+                .expect("values")
+                .build()
+                .expect("build plan");
+            assert!(
+                contains_unsupported_functions(
+                    &plan,
+                    &function_support_for_engine(profile.engine())
+                )
+                .expect("the support check must not error"),
+                "{driver}: a string with a backslash must stay local"
+            );
+        }
     }
 
     /// Regression test for #14753 and #14754 on the ODBC route: `SQLite` has
