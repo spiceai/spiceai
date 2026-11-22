@@ -43,11 +43,18 @@ runs:
         method: 'network'
         use-github-cache: false
         non-cuda-sub-packages: '["libcurand-dev", "libcublas","libcublas-dev"]'
-        sub-packages: '["nvcc","compiler","libraries","libraries-dev","cudart","cudart-dev"]'
+        # nvml-dev: llama.cpp's CUDA backend includes <nvml.h> (it loads
+        # libnvidia-ml at run time, so only the header is needed to build).
+        sub-packages: '["nvcc","compiler","libraries","libraries-dev","cudart","cudart-dev","nvml-dev"]'
 
     - name: Verify CUDA prerequisites
       run: |
         nvcc --version
+        # Fail here, not two hours into the llama.cpp CUDA compile.
+        if [[ ! -f "${CUDA_PATH}/include/nvml.h" ]]; then
+          echo "::error::spiced-cuda-build: ${CUDA_PATH}/include/nvml.h is missing; llama.cpp's CUDA backend needs the NVML header (the cuda-nvml-dev package)"
+          exit 1
+        fi
       shell: ${{ env.SHELL }}
 
     - name: Build spiced (models, cuda)
