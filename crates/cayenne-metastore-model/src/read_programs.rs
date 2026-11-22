@@ -91,8 +91,9 @@ fn program_text(p: &Program) -> String {
             predicate.text()
         ),
         Program::Aggregate { table, target, cap } => format!(
-            "SET t{}.k{} = COUNT(t{table}) (cap {cap})",
-            target.0, target.1
+            "INSERT t{t}.k{k} = [1, 0] IF t{t}.k{k} IS ABSENT AND SUM(t{table}.c0) + 1 <= {cap}",
+            t = target.0,
+            k = target.1
         ),
         Program::Absent { lookup, target } => format!(
             "IF NOT EXISTS t{}.k{} INSERT t{}.k{}",
@@ -1440,5 +1441,25 @@ impl Model for PredicateProgress {
                 }
             }),
         ]
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::{Program, program_text};
+
+    /// The label describes what the model executes: a fixed insert gated on
+    /// the target being absent and `SUM(c0) + 1` staying within the cap.
+    #[test]
+    fn aggregate_label_names_the_sum_gate_and_the_insert() {
+        let text = program_text(&Program::Aggregate {
+            table: 0,
+            target: (1, 2),
+            cap: 2,
+        });
+        assert_eq!(
+            text,
+            "INSERT t1.k2 = [1, 0] IF t1.k2 IS ABSENT AND SUM(t0.c0) + 1 <= 2"
+        );
     }
 }

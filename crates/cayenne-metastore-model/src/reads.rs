@@ -375,7 +375,11 @@ impl Model for Protocol {
                 }
                 Action::Deliver(i) => {
                     let (c, _) = before.gets[i];
-                    if after.cache == before.cache {
+                    // The rule `next_state` applies: a response older than the
+                    // cache is ignored. Comparing whole caches misreads an accepted
+                    // response for the cached commit, since `canonical` renumbers
+                    // the times it would change.
+                    if c < before.cache.commit {
                         Event::on(
                             head,
                             format!("response (commit {c}) ignored: older than cache"),
@@ -456,5 +460,25 @@ impl Model for Protocol {
             ));
         }
         p
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::{Action, Protocol};
+    use stateright::{Model, Path};
+
+    /// An accepted response for the commit the cache already holds leaves the
+    /// cache's canonical state unchanged; the timeline must still call it
+    /// accepted, as `next_state` does.
+    #[test]
+    fn same_commit_response_is_drawn_as_accepted() {
+        let model = Protocol::new("reads", 1);
+        let init = model.init_states().remove(0);
+        let actions = [Action::Send, Action::Start(0), Action::Deliver(0)];
+        let path = Path::from_actions(&model, init, &actions).expect("enabled trace");
+        let svg = model.as_svg(path).expect("reads draws");
+        assert!(svg.contains("response: cache now commit 0"), "{svg}");
+        assert!(!svg.contains("ignored"), "{svg}");
     }
 }
