@@ -1353,6 +1353,7 @@ fn listing_rebuild_envelope(
         batch,
         false,
         true,
+        false,
     ))
 }
 

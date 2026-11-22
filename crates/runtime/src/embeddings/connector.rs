@@ -222,7 +222,7 @@ impl EmbeddingConnector {
         // this wrapper sits between a (possibly multiplexed) source and the
         // accelerator, so it must build the deferred rows before augmenting them.
         // Offload the synchronous build so a large burst can't stall this worker.
-        let (change_committer, batch, is_dataset_ready, history_unavailable) =
+        let (change_committer, batch, is_dataset_ready, history_unavailable, snapshot_rows) =
             envelope.into_parts_offloaded().await?;
         let data_batch = batch.data_batch();
 
@@ -258,6 +258,7 @@ impl EmbeddingConnector {
             new_change_batch,
             is_dataset_ready,
             history_unavailable,
+            snapshot_rows,
         ))
     }
 }
