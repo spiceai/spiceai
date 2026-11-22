@@ -433,6 +433,7 @@ impl RefreshTask {
                     let timestamp = (!envelope.is_heartbeat())
                         .then(|| envelope.source_commit_ts_ms())
                         .flatten();
+                    self.diag16625_envelope(&envelope);
                     let (committer, rows, ready, _) = envelope.into_lazy_parts();
                     let options = WriteOptions {
                         recovery: if committer.supports_deferral() {
@@ -577,6 +578,73 @@ impl RefreshTask {
         Ok(())
     }
 
+    /// TEMPORARY diagnostics for #16625. Never merge.
+    fn diag16625_envelope(&self, envelope: &cdc::ChangeEnvelope) {
+        use std::collections::BTreeMap;
+        let Ok(batch) = envelope.change_batch() else {
+            return;
+        };
+        let data = batch.data_batch();
+        let o_id = data
+            .column_by_name("o_id")
+            .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>().cloned());
+        let mut ops: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for row in 0..batch.record.num_rows() {
+            let entry = ops.entry(match batch.op(row) {
+                data_components::cdc::ChangeOperation::Create => "create".to_string(),
+                data_components::cdc::ChangeOperation::Update => "update".to_string(),
+                data_components::cdc::ChangeOperation::Delete => "delete".to_string(),
+                data_components::cdc::ChangeOperation::Read => "read".to_string(),
+                data_components::cdc::ChangeOperation::Truncate => "truncate".to_string(),
+                data_components::cdc::ChangeOperation::Unknown(op) => format!("unknown:{op}"),
+            }).or_default();
+            entry.0 += 1;
+            if let Some(ids) = &o_id
+                && row < ids.len()
+                && arrow::array::Array::is_valid(ids, row)
+                && ids.value(row) % 55 == 0
+            {
+                entry.1 += 1;
+            }
+        }
+        tracing::warn!(
+            target: "diag16625",
+            "DIAG16625 admit dataset={} heartbeat={} ts={:?} ops(rows,o_id%55==0)={ops:?}",
+            self.dataset_name,
+            envelope.is_heartbeat(),
+            envelope.source_commit_ts_ms()
+        );
+    }
+
+    async fn diag16625_count(&self, tag: &str) {
+        if self.dataset_name.table() != "orders" {
+            return;
+        }
+        let ctx = datafusion::execution::context::SessionContext::new();
+        if ctx
+            .register_table("diag_t", Arc::clone(&self.accelerator))
+            .is_err()
+        {
+            return;
+        }
+        let sql = "SELECT count(*), count(*) FILTER (WHERE o_id % 55 = 0), count(*) FILTER (WHERE o_id % 11 = 0), count(*) FILTER (WHERE o_id % 5 = 0) FROM diag_t";
+        let result = match ctx.sql(sql).await {
+            Ok(df) => df.collect().await,
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(rows) => tracing::warn!(
+                target: "diag16625",
+                "DIAG16625 count {tag} dataset={} {}",
+                self.dataset_name,
+                arrow::util::pretty::pretty_format_batches(&rows)
+                    .map(|t| t.to_string().replace('\n', " "))
+                    .unwrap_or_default()
+            ),
+            Err(e) => tracing::warn!(target: "diag16625", "DIAG16625 count {tag} failed: {e}"),
+        }
+    }
+
     async fn source_error(&self, context: &ApplyContext<'_>, error: &DataFusionError) {
         self.set_refresh_status(
             context.refresh_sql,
@@ -645,6 +713,7 @@ impl RefreshTask {
             let mut callback = callback.lock().await;
             callback().await;
         }
+        self.diag16625_count("after_apply").await;
         if group.ready {
             self.signal_dataset_ready(context).await;
         }
@@ -709,6 +778,7 @@ impl RefreshTask {
             if !self.rebuild_from_batches(context, rows, schema).await {
                 return false;
             }
+            self.diag16625_count("after_rebuild_from_batches").await;
             return self
                 .run_finalize_side_effects(
                     context,
@@ -721,6 +791,7 @@ impl RefreshTask {
         if !self.rebuild_from_source(context).await {
             return false;
         }
+        self.diag16625_count("after_rebuild_from_source").await;
         if no_op {
             if ready {
                 self.signal_dataset_ready(context).await;

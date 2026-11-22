@@ -846,10 +846,17 @@ impl AckTable {
     /// members — they have no route yet, so "no in-flight envelopes" says
     /// nothing about what they've missed.
     fn credit_idle(&self, upto: u64) {
-        for slot in read_lock(&self.members).values() {
+        for (diag_key, slot) in read_lock(&self.members).iter() {
             let s = slot.state.load(Ordering::Acquire);
             if s & (LIVE | STREAMING) == (LIVE | STREAMING) && slot.delivered() == slot.committed()
             {
+                if upto > slot.committed() {
+                    tracing::warn!(
+                        target: "diag16625",
+                        "DIAG16625 credit_idle member={:?} committed={:X} -> upto={:X} recorded={:X}",
+                        diag_key, slot.committed(), upto, slot.recorded()
+                    );
+                }
                 // Advance `committed` BEFORE `delivered` (both Release): a torn
                 // observation must never show `delivered > committed`. Writing
                 // committed first means a concurrent sweep/credit can only
@@ -925,10 +932,23 @@ impl AckTable {
             .values()
             .map(|slot| slot.committed())
             .min();
+        let before = self.shared_flush.load(Ordering::Acquire);
         if let Some(floor) = floor {
             advance_monotonic(&self.shared_flush, floor);
         }
-        self.shared_flush.load(Ordering::Acquire)
+        let after = self.shared_flush.load(Ordering::Acquire);
+        if after != before {
+            let floors: Vec<String> = read_lock(&self.members)
+                .iter()
+                .map(|(k, v)| format!("{k:?}=c{:X}/d{:X}/r{:X}", v.committed(), v.delivered(), v.recorded()))
+                .collect();
+            tracing::warn!(
+                target: "diag16625",
+                "DIAG16625 slot_ack advanced {before:X} -> {after:X} members=[{}]",
+                floors.join(", ")
+            );
+        }
+        after
     }
 
     /// Whether `key`'s member has been promoted to the streaming phase (past its
@@ -2629,6 +2649,11 @@ async fn attach_member(
         contents_implying_gap,
     );
     let rebuild_via_consumer = rebuild_cause.is_some();
+    tracing::warn!(
+        target: "diag16625",
+        "DIAG16625 attach dataset={} watermark={:?} slot_restart_lsn={:?} consistent_lsn={:X} seated_floor={:X} rebuild_cause={:?}",
+        dataset_name, watermark, setup.slot_restart_lsn, setup.slot.consistent_lsn, seated_floor, rebuild_cause
+    );
     // Recorded, not exported: the operator is told which cause fired by the
     // warning below, and this is the same fact in the form an integration test
     // can assert (see `ReplicationMetricsCollector::rebuild_cause`). Set
@@ -3302,6 +3327,11 @@ async fn write_one(
     }
     match store.save(AppliedLsn { lsn: pending }).await {
         Ok(()) => {
+            tracing::warn!(
+                target: "diag16625",
+                "DIAG16625 position_recorded dataset={dataset} lsn={pending:X} committed={:X}",
+                slot.committed()
+            );
             slot.note_recorded(pending);
             // The durable applied floor for this member has advanced to `pending`.
             // Any registered write-back whose echo committed at or below it is now
@@ -4631,6 +4661,12 @@ async fn deliver_commit(
         if !slot.has(STREAMING) {
             continue;
         }
+        tracing::warn!(
+            target: "diag16625",
+            "DIAG16625 deliver_commit dataset={} end_lsn={:X} committed={:X} delivered={:X} recorded={:X} skip_already_committed={} raw_len={}",
+            member.dataset_name, boundary.end_lsn, slot.committed(), slot.delivered(), slot.recorded(),
+            slot.already_committed(boundary.end_lsn), raw.len()
+        );
         if slot.already_committed(boundary.end_lsn) {
             // Reconnect replay of a commit this member already durably
             // applied (replays start at the minimum floor across members).
