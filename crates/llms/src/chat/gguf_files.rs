@@ -150,6 +150,13 @@ pub enum ResolveError {
         listed(files)
     ))]
     NamedSidecar { name: String, files: Vec<String> },
+    /// `files` that name several quantizations, by name or by path, of which a model loads one.
+    #[snafu(display(
+        "`files` names {} quantizations, {}, and a model loads one; name one of them",
+        quantizations.len(),
+        listed(quantizations)
+    ))]
+    SeveralQuantizations { quantizations: Vec<String> },
 }
 
 /// What a listing holds: the repository's files, as the Hub lists them, or only those the
@@ -191,6 +198,11 @@ impl ResolveError {
                 "there is no file or quantization '{}'; the quantizations there are {}",
                 printable(name),
                 listed(available)
+            ),
+            (Self::SeveralQuantizations { quantizations }, ListedFrom::Cache) => format!(
+                "`files` names {} quantizations there, {}, and a model loads one; name one of them",
+                quantizations.len(),
+                listed(quantizations)
             ),
             _ => self.to_string(),
         }
@@ -589,8 +601,8 @@ fn answers_to(quantization: &Quantization, entry: &str) -> bool {
 /// # Errors
 ///
 /// Returns an error when a named file is missing, a shard series is incomplete, a name matches
-/// several quantizations, a name only importance matrices or drafters answer to, or a name is
-/// neither a file nor a quantization of the repository.
+/// several quantizations, a name only importance matrices or drafters answer to, a name is
+/// neither a file nor a quantization of the repository, or `files` name several quantizations.
 pub fn resolve(
     listing: &[ListedFile],
     files: &[&str],
@@ -669,6 +681,17 @@ pub fn resolve(
     let mut seen = BTreeSet::new();
     weights.retain(|w| seen.insert(w.clone()));
     draft.retain(|d| seen.insert(d.clone()));
+    // A model loads one quantization: with the weights of two, the engine would open the first's
+    // and take the second's draft head, while the load says the second is loaded.
+    let loaded: Vec<&Quantization> = quantizations
+        .iter()
+        .filter(|q| q.files.iter().any(|f| weights.contains(f)))
+        .collect();
+    if let [_, _, ..] = loaded.as_slice() {
+        return Err(ResolveError::SeveralQuantizations {
+            quantizations: loaded.iter().map(|q| q.name.clone()).collect(),
+        });
+    }
     if weights.is_empty() && draft.is_empty() {
         return Ok(None);
     }
@@ -1115,6 +1138,59 @@ mod tests {
             .expect("Q8_0 resolves")
             .expect("Q8_0 names weights");
         assert_eq!(q8.weights, ["Model-Q8_0.gguf"]);
+    }
+
+    /// A model loads one quantization, so `files` that name two, by name or by path, fail
+    /// rather than load the first's weights as the second's with the second's draft head.
+    #[test]
+    fn files_that_name_two_quantizations_are_refused() {
+        let two = listing(&[
+            ("Model-Q4_K_M.gguf", GB),
+            ("Model-Q8_0.gguf", GB),
+            ("mtp-Model-Q8_0.gguf", GB / 10),
+            ("mmproj-F16.gguf", GB / 2),
+        ]);
+        let refused = Err(
+            "`files` names 2 quantizations, Q4_K_M, Q8_0, and a model loads one; name one of them"
+                .to_string(),
+        );
+        for files in [
+            &["Q4_K_M", "Q8_0"][..],
+            &["Model-Q4_K_M.gguf", "Q8_0"],
+            &["Q8_0", "Model-Q4_K_M.gguf"],
+            &["Model-Q4_K_M.gguf", "Model-Q8_0.gguf"],
+        ] {
+            assert_eq!(
+                resolve(&two, files).map_err(|e| e.to_string()),
+                refused,
+                "files {files:?}"
+            );
+        }
+        // one quantization named twice, or beside a file that is no quantization, still loads
+        let once = resolve(&two, &["Q8_0", "Model-Q8_0.gguf"])
+            .expect("Q8_0 resolves")
+            .expect("Q8_0 names weights");
+        assert_eq!(
+            (once.weights, once.draft, once.quantization),
+            (
+                vec!["Model-Q8_0.gguf".to_string()],
+                vec!["mtp-Model-Q8_0.gguf".to_string()],
+                Some("Q8_0".to_string())
+            )
+        );
+        let projector = resolve(&two, &["Q4_K_M", "mmproj-F16.gguf"])
+            .expect("Q4_K_M resolves")
+            .expect("Q4_K_M names weights");
+        assert_eq!(
+            (projector.weights, projector.quantization),
+            (
+                vec![
+                    "Model-Q4_K_M.gguf".to_string(),
+                    "mmproj-F16.gguf".to_string()
+                ],
+                Some("Q4_K_M".to_string())
+            )
+        );
     }
 
     /// A name can answer to several quantizations in a listing of the cache alone and to one in
