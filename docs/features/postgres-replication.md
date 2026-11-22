@@ -2,7 +2,7 @@
 
 Stream every `INSERT`, `UPDATE`, and `DELETE` from a PostgreSQL table directly into a Spice-accelerated dataset over Postgres' native logical replication protocol — no Debezium, no Kafka, no external services.
 
-This is the recommended way to keep a Spice accelerator (Cayenne, SQLite, Postgres, Arrow) continuously in sync with a Postgres source.
+This is the recommended way to keep a Spice accelerator (Cayenne, SQLite, Arrow) continuously in sync with a Postgres source.
 
 ## How it works
 
@@ -175,11 +175,10 @@ Note: `prefer` behaves as plaintext here because the replication transport does 
 | Engine     | `INSERT` |          `UPDATE`           | `DELETE` | Notes                                                                                                                                                                                                 |
 | ---------- | :------: | :-------------------------: | :------: | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `sqlite`   |    ✅     |         ✅ (upsert)          |    ✅     | Great for small/medium datasets.                                                                                                                                                                      |
-| `postgres` |    ✅     |         ✅ (upsert)          |    ✅     | Use when the accelerator is another Postgres.                                                                                                                                                         |
 | `cayenne`  |    ✅     |         ✅ (upsert)          |    ✅     | The default. Recommended for most workloads.                                                                                                                                                          |
 | `arrow`    |    ✅     | ✅ (upsert with primary key) |    ✅     | Arrow's in-memory engine uses a hash index for primary-key upserts. Without a primary key, updates are appended as new rows. `DELETE` and `TRUNCATE` are applied via Arrow's `DeletionTableProvider`. |
 
-For Arrow workloads that need true upsert semantics (so `UPDATE`s replace existing rows instead of duplicating them), configure a primary key. Cayenne, SQLite, and Postgres also support upsert behavior.
+For Arrow workloads that need true upsert semantics (so `UPDATE`s replace existing rows instead of duplicating them), configure a primary key. Cayenne and SQLite also support upsert behavior.
 
 ## Sharing one slot across multiple datasets
 

@@ -700,7 +700,7 @@ mod tests {
             })
         });
         DatasetResponseItem {
-            from: "s3://spiceai-public-datasets/trips.parquet".to_string(),
+            from: "s3://spice-datasets-gjezag77s0hu/trips.parquet".to_string(),
             name: name.to_string(),
             replication_enabled: false,
             acceleration_enabled: true,
@@ -730,7 +730,7 @@ mod tests {
         assert_eq!(
             csv,
             "from,name,replication_enabled,acceleration_enabled,status,error,error_message,last_refresh,next_refresh,properties.search,properties.vector_search\n\
-             s3://spiceai-public-datasets/trips.parquet,trips,false,true,,,,,,supported,unsupported\n"
+             s3://spice-datasets-gjezag77s0hu/trips.parquet,trips,false,true,,,,,,supported,unsupported\n"
         );
     }
 
@@ -750,8 +750,8 @@ mod tests {
         assert_eq!(
             csv,
             "from,name,replication_enabled,acceleration_enabled,status,error,error_message,last_refresh,next_refresh,properties.search,properties.vector_search\n\
-             s3://spiceai-public-datasets/trips.parquet,ready_trips,false,true,Ready,,,,,supported,unsupported\n\
-             s3://spiceai-public-datasets/trips.parquet,broken_trips,false,true,Error,dataset.auth,UnableToConnectInvalidUsernameOrPassword,,,supported,unsupported\n"
+             s3://spice-datasets-gjezag77s0hu/trips.parquet,ready_trips,false,true,Ready,,,,,supported,unsupported\n\
+             s3://spice-datasets-gjezag77s0hu/trips.parquet,broken_trips,false,true,Error,dataset.auth,UnableToConnectInvalidUsernameOrPassword,,,supported,unsupported\n"
         );
         let broken = csv
             .lines()

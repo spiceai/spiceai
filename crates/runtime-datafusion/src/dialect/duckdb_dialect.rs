@@ -291,9 +291,9 @@ impl Dialect for SpiceDuckDBDialect {
         self.inner.supports_empty_select_list()
     }
 
-    /// `DuckDB` reads backslash literally in a standard string, so a value with
-    /// `\'` or `''` in it must not go through `sqlparser`'s quote escaping,
-    /// which skips both (see [`super::string_literal`]).
+    /// `DuckDB` reads backslash literally in a standard string; a value with
+    /// `\'` or `''` in it is written as quote-free pieces (see
+    /// [`super::string_literal`]).
     fn string_literal_to_sql(&self, s: &str) -> Option<ast::Expr> {
         super::string_literal::quote_safe_string_literal(s)
             .or_else(|| self.inner.string_literal_to_sql(s))

@@ -1,4 +1,5 @@
 name: conflict-batches
+tags: [long]
 description: >
   Cayenne keeps one row per primary key, the version that arrived last, for a
   key repeated in one refresh or statement, across record batches and within
