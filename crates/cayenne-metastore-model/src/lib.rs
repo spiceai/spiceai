@@ -93,12 +93,26 @@ const RULE_NOT_REQUIRED: [&str; 10] = [
 const CURRENT_DEFECTS: [&str; 1] = ["mem-tier-current-3-exhaust"];
 
 /// Runs whose traces are replayed against the implementation: the trace files
-/// under `crates/cayenne/tests/traces` and `crates/object_store_occ/tests/traces`,
+/// under `crates/cayenne/tests/traces` and `crates/object_store_occ/tests/traces`
+/// (including the data-file replay),
 /// and the runs `crates/cayenne`'s mem-tier replay names directly. A test keeps
 /// this list equal to the runs those files name.
-const REPLAYED_AGAINST_CODE: [&str; 20] = [
+const REPLAYED_AGAINST_CODE: [&str; 33] = [
     "commits-restart-no-persist-before-send",
     "commits-restart-turnover",
+    "data-files",
+    "data-files-retire",
+    "data-files-retire-3",
+    "data-files-retire-3-retires-carried",
+    "data-files-retire-forget-early",
+    "data-files-retire-ignores-restore-hold",
+    "data-files-retire-local-ignores-retention",
+    "data-files-retire-prepared",
+    "data-files-retire-prepared-orphan-ignores-reservation",
+    "data-files-retire-remote",
+    "data-files-retire-remote-ignores-retention",
+    "data-files-retire-sweep-uncommitted",
+    "data-files-retire-whole-snapshot",
     "mem-tier-current-3-exhaust",
     "mem-tier-no-one-call",
     "mem-tier-seal-delete-only",
