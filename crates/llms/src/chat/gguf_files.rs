@@ -49,6 +49,33 @@ pub fn printable(text: &str) -> String {
     out
 }
 
+/// How many names a load line or an error lists. The repository decides how many quantizations
+/// and shards it offers, so a list of them is bounded; repositories offer a few dozen at most.
+pub const LISTED: usize = 40;
+
+/// `items` joined with `, ` for a load line or an error, each [`printable`]. Past [`LISTED`]
+/// items, the rest are counted: `a, b, c, and 3 more`.
+#[must_use]
+pub fn listed<I>(items: I) -> String
+where
+    I: IntoIterator,
+    I::IntoIter: ExactSizeIterator,
+    I::Item: AsRef<str>,
+{
+    let items = items.into_iter();
+    let more = items.len().saturating_sub(LISTED);
+    let named = items
+        .take(LISTED)
+        .map(|item| printable(item.as_ref()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if more == 0 {
+        named
+    } else {
+        format!("{named}, and {more} more")
+    }
+}
+
 /// A file of the repository: its path in the repository and its size in bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedFile {
@@ -105,7 +132,7 @@ pub enum ResolveError {
     #[snafu(display(
         "'{}' is a shard of a series the repository lacks part of: {}",
         printable(path),
-        printable(&missing.join(", "))
+        listed(missing)
     ))]
     IncompleteShards { path: String, missing: Vec<String> },
     /// A name several quantizations answer to: a folder that holds several, or a tag one has
@@ -114,7 +141,7 @@ pub enum ResolveError {
         "'{}' matches {} quantizations of the repository, {}; name one of them",
         printable(name),
         quantizations.len(),
-        printable(&quantizations.join(", "))
+        listed(quantizations)
     ))]
     AmbiguousQuantization {
         name: String,
@@ -124,7 +151,7 @@ pub enum ResolveError {
     #[snafu(display(
         "the repository has no file or quantization '{}'; its quantizations are {}",
         printable(name),
-        printable(&available.join(", "))
+        listed(available)
     ))]
     UnknownQuantization {
         name: String,
@@ -906,6 +933,44 @@ mod tests {
         let listing = listing(&[("Q4_K_M\nINFO forged.gguf", GB)]);
         let error = resolve(&listing, &["Q9_K"]).expect_err("no such quantization");
         assert!(!error.to_string().contains('\n'), "{error}");
+    }
+
+    /// The repository decides how many quantizations and shards it offers, so an error names
+    /// the first 40 and counts the rest.
+    #[test]
+    fn an_error_names_forty_and_counts_the_rest() {
+        let names =
+            |count: usize| -> Vec<String> { (1..=count).map(|i| format!("Q{i}")).collect() };
+        let first_forty = names(40).join(", ");
+
+        assert_eq!(
+            ResolveError::UnknownQuantization {
+                name: "Q99".to_string(),
+                available: names(43),
+            }
+            .to_string(),
+            format!(
+                "the repository has no file or quantization 'Q99'; its quantizations are {first_forty}, and 3 more"
+            )
+        );
+        assert_eq!(
+            ResolveError::AmbiguousQuantization {
+                name: "Q".to_string(),
+                quantizations: names(41),
+            }
+            .to_string(),
+            format!(
+                "'Q' matches 41 quantizations of the repository, {first_forty}, and 1 more; name one of them"
+            )
+        );
+        assert_eq!(
+            ResolveError::IncompleteShards {
+                path: "Q1".to_string(),
+                missing: names(40),
+            }
+            .to_string(),
+            format!("'Q1' is a shard of a series the repository lacks part of: {first_forty}")
+        );
     }
 
     #[test]

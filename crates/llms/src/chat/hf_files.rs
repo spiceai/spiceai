@@ -290,30 +290,15 @@ fn default_reason(quantizations: &[Quantization], default: &Quantization) -> Str
     }
 }
 
-/// How many quantizations a load line or an error names. The repository decides how many it
-/// offers, so the list is bounded; repositories offer a few dozen at most.
-const LISTED_QUANTIZATIONS: usize = 40;
-
 /// `BF16 (1.2 GB), Q8_0 (0.6 GB), ...`: the quantizations a model's `files` can name, largest
-/// first, as a load line or an error lists them. Past [`LISTED_QUANTIZATIONS`], the rest are
+/// first, as a load line or an error lists them. Past [`gguf_files::LISTED`], the rest are
 /// counted: `..., and 3 more`.
 fn listed(quantizations: &[Quantization]) -> String {
-    let named = quantizations
-        .iter()
-        .take(LISTED_QUANTIZATIONS)
-        .map(|q| {
-            format!(
-                "{} ({})",
-                gguf_files::printable(&q.name),
-                gigabytes(q.bytes)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    match quantizations.len().saturating_sub(LISTED_QUANTIZATIONS) {
-        0 => named,
-        more => format!("{named}, and {more} more"),
-    }
+    gguf_files::listed(
+        quantizations
+            .iter()
+            .map(|q| format!("{} ({})", q.name, gigabytes(q.bytes))),
+    )
 }
 
 /// `quantization Q4_K_M (1 file, 18.3 GB)`: a quantization Spice chose, with its size.
