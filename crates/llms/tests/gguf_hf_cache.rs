@@ -303,7 +303,7 @@ async fn a_split_model_whose_nodes_each_load_the_weights_does_not_choose_from_a_
         .expect("a quantization chosen from the cache is refused");
     assert_eq!(
         error.to_string(),
-        "Model 'test' is split across nodes by mistral.rs, which has each node load the weights itself, and `HF_HUB_OFFLINE` is set, so this node chose quantization Q8_0 among what its Hugging Face cache holds, and another node's cache need not hold the same. Name the quantization in the model's `files`, so that every node loads the same weights: `files: [{path: Q8_0}]`. See: https://spiceai.org/docs/components/models/huggingface"
+        "Model 'test' is split across nodes by mistral.rs, which has each node load the weights itself, and `HF_HUB_OFFLINE` is set, so this node chose quantization Q8_0 among what its Hugging Face cache holds, and another node's cache need not hold the same. Name the quantization in the model's `files`, so that every node loads the same quantization: `files: [{path: Q8_0}]`. See: https://spiceai.org/docs/components/models/huggingface"
     );
     assert!(
         error.is_configuration_error(),
@@ -347,7 +347,7 @@ async fn a_split_model_that_chose_from_the_cache_in_an_outage_is_retried() {
         "{message}"
     );
     assert!(
-        message.ends_with("), so this node chose quantization Q8_0 among what its Hugging Face cache holds, and another node's cache need not hold the same. Name the quantization in the model's `files`, so that every node loads the same weights: `files: [{path: Q8_0}]`. See: https://spiceai.org/docs/components/models/huggingface"),
+        message.ends_with("), so this node chose quantization Q8_0 among what its Hugging Face cache holds, and another node's cache need not hold the same. Name the quantization in the model's `files`, so that every node loads the same quantization: `files: [{path: Q8_0}]`. See: https://spiceai.org/docs/components/models/huggingface"),
         "{message}"
     );
     assert!(

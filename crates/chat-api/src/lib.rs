@@ -211,7 +211,7 @@ pub enum Error {
     /// `reason` says why only the cache was read, as a clause, and `pinned` is the `files`
     /// entries that load `quantization`.
     #[snafu(display(
-        "Model '{model}' is split across nodes by mistral.rs, which has each node load the weights itself, and {reason}, so this node chose quantization {quantization} among what its Hugging Face cache holds, and another node's cache need not hold the same. Name the quantization in the model's `files`, so that every node loads the same weights: `files: [{pinned}]`. See: https://spiceai.org/docs/components/models/huggingface"
+        "Model '{model}' is split across nodes by mistral.rs, which has each node load the weights itself, and {reason}, so this node chose quantization {quantization} among what its Hugging Face cache holds, and another node's cache need not hold the same. Name the quantization in the model's `files`, so that every node loads the same quantization: `files: [{pinned}]`. See: https://spiceai.org/docs/components/models/huggingface"
     ))]
     SplitModelChoseFromCache {
         model: String,
