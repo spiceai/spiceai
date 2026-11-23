@@ -308,7 +308,7 @@ jobs:
         id: aws-iceberg
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_ICEBERG_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_ICEBERG_ROLE_ARN }}
           role-session-name: gha-iceberg-${{ github.run_id }}
           role-duration-seconds: 36000
           aws-region: us-east-1
@@ -332,7 +332,7 @@ jobs:
           # Defaults to the dedicated spicehq nodegroup; without it the app lands on
           # the shared default nodegroup.
           SPIDAPTER_ORGANIZATION_TAG: ${{ env.CB_ORGANIZATION_TAG }}
-          SCHEDULER_STATE_LOCATION: 's3://spiceai-testing-cluster-state/testoperator-cluster-bench-${{ github.run_id }}/'
+          SCHEDULER_STATE_LOCATION: 's3://spiceai-ci-testing-cluster-state/testoperator-cluster-bench-${{ github.run_id }}/'
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           EXECUTOR_REPLICAS: ${{ env.CB_EXECUTOR_REPLICAS }}
           CHANNEL: ${{ env.CB_CHANNEL }}

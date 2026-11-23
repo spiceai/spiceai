@@ -740,16 +740,16 @@ mod tests {
     #[test]
     fn test_ensure_s3_trailing_slash() {
         assert_eq!(
-            ensure_s3_trailing_slash("s3://spiceai-public-datasets/tpch/customer"),
-            "s3://spiceai-public-datasets/tpch/customer/"
+            ensure_s3_trailing_slash("s3://spice-datasets-gjezag77s0hu/tpch/customer"),
+            "s3://spice-datasets-gjezag77s0hu/tpch/customer/"
         );
         assert_eq!(
-            ensure_s3_trailing_slash("s3://spiceai-public-datasets/tpch/customer/"),
-            "s3://spiceai-public-datasets/tpch/customer/"
+            ensure_s3_trailing_slash("s3://spice-datasets-gjezag77s0hu/tpch/customer/"),
+            "s3://spice-datasets-gjezag77s0hu/tpch/customer/"
         );
         assert_eq!(
-            ensure_s3_trailing_slash("s3://spiceai-public-datasets/tpch/customer/customer.csv"),
-            "s3://spiceai-public-datasets/tpch/customer/customer.csv"
+            ensure_s3_trailing_slash("s3://spice-datasets-gjezag77s0hu/tpch/customer/customer.csv"),
+            "s3://spice-datasets-gjezag77s0hu/tpch/customer/customer.csv"
         );
         assert_eq!(ensure_s3_trailing_slash(""), "");
         assert_eq!(ensure_s3_trailing_slash("/local/path"), "/local/path");
