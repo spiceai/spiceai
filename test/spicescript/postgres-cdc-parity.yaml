@@ -299,7 +299,7 @@ steps:
   # Expected failures (ledger): a `refresh_mode: changes` dataset is not
   # registered while its source cannot be reached, so its copy in the location
   # is not served until the source is back ("table … not found" on every
-  # object-native-data variant).
+  # object-native-data variant; #14611).
   - query: SELECT * FROM orders
     id: orders-before-wipe
     only: *object-native-data
