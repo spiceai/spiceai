@@ -1287,7 +1287,7 @@ fn config_endpoint_refused_message(
     let param_hint = if key == REST_CATALOG_PROP_OAUTH2_SERVER_URI {
         "set the `iceberg_oauth2_server_url` parameter to its full token endpoint URL"
     } else {
-        "use its full URL as the catalog URL in the Spicepod"
+        "make its full URL the part before `/v1/` in the Spicepod's catalog URL"
     };
     format!(
         "The Iceberg catalog for {component} answered `GET /v1/config` with `{key}` set to an endpoint on {:?}, but {reason}, so no catalog request or credential is sent to it and the catalog cannot be read. If this endpoint is trusted, {param_hint}, or set `{}=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
@@ -1847,7 +1847,7 @@ mod tests {
 
         fn refusal(key: &str, origin: &str, reason: &str) -> String {
             let hint = if key == "uri" {
-                "use its full URL as the catalog URL in the Spicepod"
+                "make its full URL the part before `/v1/` in the Spicepod's catalog URL"
             } else {
                 "set the `iceberg_oauth2_server_url` parameter to its full token endpoint URL"
             };
