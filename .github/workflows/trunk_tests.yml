@@ -509,10 +509,19 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
+      # A dispatch can test an older trunk or release commit, from before these
+      # tests left the merge gate. That commit has no `nextest-post-merge`, and
+      # its own merge gate already ran the tests, so there is nothing to run.
       - name: Run the post-merge nextest tests
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-        run: make nextest-post-merge
+        run: |
+          set -euo pipefail
+          if ! grep -q '^nextest-post-merge:' Makefile; then
+            echo "::notice::This commit predates make nextest-post-merge; its merge gate ran these tests, so there is nothing to run here."
+            exit 0
+          fi
+          make nextest-post-merge
 
   # The run's one verdict, which Trunk Health reads: it succeeds only if every
   # job above succeeded or was skipped, and names the jobs that did not.
