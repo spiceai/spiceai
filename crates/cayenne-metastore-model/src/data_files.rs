@@ -389,6 +389,45 @@ pub(crate) enum Action {
     RemoteFetch,
 }
 
+fn key_label(key: Key) -> String {
+    format!("g{}-{}", key.generation, key.id)
+}
+fn files_label(files: &[File]) -> String {
+    if files.is_empty() {
+        return "-".into();
+    }
+    files
+        .iter()
+        .map(|(k, _)| key_label(*k))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+fn kind_label(kind: CommitKind) -> &'static str {
+    match kind {
+        CommitKind::Append => "AddFiles",
+        CommitKind::Compact => "ReplaceFiles",
+        CommitKind::CompactCarry => "ReplaceFiles carrying the oldest",
+        CommitKind::Remove => "RemoveFiles",
+        CommitKind::Prepare => "prepared compaction",
+    }
+}
+fn request_label(r: &Request) -> String {
+    let mut parts = vec![format!(
+        "attempt {} {} on head v{} gen {}: add {}",
+        r.attempt,
+        kind_label(r.kind),
+        r.base,
+        r.generation,
+        files_label(&r.files)
+    )];
+    if !r.remove.is_empty() {
+        parts.push(format!("remove {}", files_label(&r.remove)));
+    }
+    if !r.carry.is_empty() {
+        parts.push(format!("carry {}", files_label(&r.carry)));
+    }
+    parts.join(", ")
+}
 fn keys(files: &[File]) -> impl Iterator<Item = Key> + '_ {
     files.iter().map(|(k, _)| *k)
 }
@@ -1354,6 +1393,379 @@ impl Model for Protocol {
         }
         (next != *s).then_some(next)
     }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::StartUpload(w) => format!("writer {w} starts uploading a file to a fresh key"),
+            Action::FinishUpload(i) => format!("upload {i} lands in the store"),
+            Action::Commit(w) => format!("writer {w} sends AddFiles naming its uploads"),
+            Action::Compact(w) => format!("writer {w} sends a compaction (ReplaceFiles)"),
+            Action::CompactCarry(w) => {
+                format!("writer {w} sends a compaction carrying the oldest file")
+            }
+            Action::Remove(w) => format!("writer {w} sends RemoveFiles for the oldest live file"),
+            Action::Prepare(w) => format!("writer {w} sends a prepared compaction"),
+            Action::CommitTx(w) => format!("writer {w} commits the prepared transaction"),
+            Action::AbortTx(w) => format!("writer {w} aborts the prepared transaction"),
+            Action::Deliver(i) => {
+                format!("commit request {i} reaches the head (conditional publication)")
+            }
+            Action::Drop(i) => format!("commit request {i} is lost"),
+            Action::Timeout(w) => format!("writer {w}'s commit response is lost (outcome unknown)"),
+            Action::Retry(w) => format!("writer {w} resends its identical commit request"),
+            Action::Resolve(w) => format!("writer {w} resolves its unknown outcome from the head"),
+            Action::Takeover(w) => format!("writer {w} takes over the lease (head commit)"),
+            Action::Crash(w) => format!("writer {w} crashes"),
+            Action::Read => "a local scan reads the head".into(),
+            Action::Fetch => "the local scan fetches its next file".into(),
+            Action::EndScan => "the local scan ends".into(),
+            Action::Sweep(i) => format!("the orphan sweep deletes stored file {i}"),
+            Action::Plan => "the retirement sweep plans: starts timers, sends due deletes".into(),
+            Action::DeleteLand(i) => format!("delete {i} lands"),
+            Action::DeleteFail(i) => format!("delete {i} fails"),
+            Action::Forget => "the sweep commits ForgetRetired for its deleted files".into(),
+            Action::RestoreStart => "a restore point starts (holds deletions)".into(),
+            Action::RestoreCopy => "the restore point copies its next file".into(),
+            Action::RestoreEnd => "the restore point ends".into(),
+            Action::Tick => "the clock ticks".into(),
+            Action::RemoteConfirm => "a remote reader confirms the head with a GET".into(),
+            Action::RemoteStart => "the remote reader starts its query".into(),
+            Action::RemoteFetch => "the remote reader fetches its next file".into(),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        let observed: Vec<String> = s
+            .observed
+            .iter()
+            .map(|(v, k, b)| {
+                format!(
+                    "v{v}:{}={}",
+                    key_label(*k),
+                    b.map_or("MISSING".into(), |b| format!("w{b}"))
+                )
+            })
+            .collect();
+        Some(crate::explorer::summary(&[
+            format!(
+                "head v{} lease gen {}; clock {} (retention {} ticks, remote staleness {})",
+                s.version, s.lease, s.now, RETENTION, STALENESS
+            ),
+            format!(
+                "reads observed: {}",
+                if observed.is_empty() {
+                    "-".into()
+                } else {
+                    observed.join(" ")
+                }
+            ),
+            format!(
+                "forgotten: {}",
+                files_label(&s.forgotten.iter().map(|(f, _)| *f).collect::<Vec<_>>())
+            ),
+            crate::explorer::flags(&[
+                ("accepted", s.accepted),
+                ("fenced commit refused", s.fenced_refused),
+                ("fenced upload landed", s.fenced_landed),
+                ("delete landed after takeover", s.landed_after_takeover),
+                ("orphan reclaimed", s.reclaimed),
+                ("prepared committed", s.tx_committed),
+                ("prepared aborted", s.tx_aborted),
+                ("BAD early delete", s.early_delete),
+                ("BAD deleted a live file", s.deleted_live),
+                ("BAD remote query missed a file", s.remote_missed),
+                ("BAD local scan missed a file", s.local_missed),
+            ]),
+        ]))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{Event, Svg, Timeline, Tone, row, steps};
+        let state = path.last_state().clone();
+        let mut svg = Svg::new();
+        svg.heading(0, 0, "HEAD -> DATA FILES IN THE STORE");
+        let mut lines = vec![format!(
+            "version {} lease gen {}",
+            state.version, state.lease
+        )];
+        let live_at = lines.len();
+        lines.extend(
+            state
+                .head
+                .iter()
+                .map(|(k, _)| format!("live {}", key_label(*k))),
+        );
+        let retired_at = lines.len();
+        lines.extend(
+            state
+                .retired
+                .iter()
+                .map(|((k, _), r)| format!("retired {} at v{}", key_label(*k), r.version)),
+        );
+        let prepared_at = lines.len();
+        if let Some(tx) = &state.prepared {
+            lines.push(format!(
+                "prepared tx {}: add {} remove {}",
+                tx.id,
+                files_label(&tx.files),
+                files_label(&tx.remove)
+            ));
+        }
+        let head = svg.node(0, 22, 0, "HEAD", &lines, Tone::Live);
+        let col = head.right() + 90;
+        let mut store_y = 22;
+        let mut all: Vec<File> = state.store.clone();
+        let prepared_files: Vec<File> = state
+            .prepared
+            .as_ref()
+            .map_or_else(Vec::new, |tx| tx.files.clone());
+        for f in state
+            .head
+            .iter()
+            .chain(state.retired.iter().map(|(f, _)| f))
+            .chain(prepared_files.iter())
+        {
+            if !all.contains(f) {
+                all.push(*f);
+            }
+        }
+        all.sort_unstable();
+        let mut placed = vec![];
+        for f in &all {
+            let stored = state.store.contains(f);
+            let live = state.head.contains(f);
+            let retired = state.retired.iter().any(|(r, _)| r == f);
+            let deleting = state.deletes.iter().any(|(d, _, _)| d == f);
+            let prepared = prepared_files.contains(f);
+            let (tone, note) = match (stored, live, retired) {
+                (false, true, _) => (Tone::Bad, "MISSING (head names it)"),
+                (false, _, true) => (Tone::Gone, "deleted, retirement not yet forgotten"),
+                (false, false, false) if prepared => {
+                    (Tone::Bad, "MISSING (prepared transaction names it)")
+                }
+                (true, true, _) => (Tone::Live, "live"),
+                (true, false, true) => (Tone::Gone, "retired, awaiting retention"),
+                (true, false, false) if prepared => {
+                    (Tone::Staged, "named by the prepared transaction")
+                }
+                _ => (Tone::Staged, "orphan: no committed head names it"),
+            };
+            let mut text = vec![format!("{note}; uploaded by writer {}", f.1)];
+            if deleting {
+                text.push("delete in flight".into());
+            }
+            let file_node = svg.node(col, store_y, 0, &key_label(f.0), &text, tone);
+            store_y = file_node.bottom() + 8;
+            placed.push((*f, file_node));
+        }
+        for (i, f) in state.head.iter().enumerate() {
+            if let Some((_, node)) = placed.iter().find(|(p, _)| p == f) {
+                let tone = if state.store.contains(f) {
+                    Tone::Live
+                } else {
+                    Tone::Bad
+                };
+                svg.arrow(
+                    (head.right(), head.line_y(live_at + i)),
+                    (node.x, node.mid_y()),
+                    tone,
+                    None,
+                );
+            }
+        }
+        for f in &prepared_files {
+            if let Some((_, node)) = placed.iter().find(|(p, _)| p == f) {
+                let tone = if state.store.contains(f) {
+                    Tone::Staged
+                } else {
+                    Tone::Bad
+                };
+                svg.arrow(
+                    (head.right(), head.line_y(prepared_at)),
+                    (node.x, node.mid_y() + 2),
+                    tone,
+                    None,
+                );
+            }
+        }
+        for (i, (f, _)) in state.retired.iter().enumerate() {
+            if let Some((_, node)) = placed.iter().find(|(p, _)| p == f) {
+                svg.arrow(
+                    (head.right(), head.line_y(retired_at + i)),
+                    (node.x, node.mid_y() + 4),
+                    Tone::Gone,
+                    None,
+                );
+            }
+        }
+        let mut boxes: Vec<(String, Vec<String>, Tone)> = state
+            .writers
+            .iter()
+            .enumerate()
+            .map(|(w, wr)| {
+                let mut lines = vec![match wr.generation {
+                    Some(g) if g == state.lease => format!("holds the lease (gen {g})"),
+                    Some(g) => format!("believes gen {g}; FENCED by gen {}", state.lease),
+                    None => "holds no lease".into(),
+                }];
+                lines.push(format!(
+                    "uploading {}; uploaded, unnamed {}",
+                    files_label(&wr.started),
+                    files_label(&wr.finished)
+                ));
+                if let Some((r, unknown)) = &wr.pending {
+                    lines.push(format!(
+                        "{}{}",
+                        request_label(r),
+                        if *unknown { " - OUTCOME UNKNOWN" } else { "" }
+                    ));
+                }
+                let tone = if wr.generation == Some(state.lease) {
+                    Tone::Actor
+                } else {
+                    Tone::Gone
+                };
+                (format!("WRITER {w}"), lines, tone)
+            })
+            .collect();
+        if !state.net.is_empty() {
+            boxes.push((
+                "COMMIT REQUESTS IN FLIGHT".into(),
+                state.net.iter().map(request_label).collect(),
+                Tone::Staged,
+            ));
+        }
+        if let Some(sweep) = &state.sweep {
+            boxes.push((
+                format!("SWEEP (writer {}, gen {})", sweep.writer, sweep.generation),
+                vec![
+                    format!("will forget {}", files_label(&sweep.files)),
+                    if sweep.failed {
+                        "a delete FAILED".into()
+                    } else {
+                        "deletes pending".into()
+                    },
+                ],
+                Tone::Actor,
+            ));
+        }
+        if let Some((v, keys)) = &state.snapshot {
+            boxes.push((
+                format!("LOCAL SCAN of v{v}"),
+                vec![format!(
+                    "files {}; fetched {}",
+                    keys.iter()
+                        .map(|k| key_label(*k))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    state.fetched
+                )],
+                Tone::Actor,
+            ));
+        }
+        if let Some((v, keys, next)) = &state.restore {
+            boxes.push((
+                format!("RESTORE POINT of v{v} (holds deletions)"),
+                vec![format!(
+                    "copies {}; copied {next}",
+                    keys.iter()
+                        .map(|k| key_label(*k))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )],
+                Tone::Actor,
+            ));
+        }
+        if let Some(r) = &state.remote {
+            boxes.push((
+                format!("REMOTE READER of v{}", r.version),
+                vec![
+                    format!(
+                        "confirmed at {}, started {:?}; files {}",
+                        r.confirmed,
+                        r.started,
+                        r.keys
+                            .iter()
+                            .map(|k| key_label(*k))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ),
+                    format!("fetched {}", r.next),
+                ],
+                if state.remote_missed {
+                    Tone::Bad
+                } else {
+                    Tone::Actor
+                },
+            ));
+        }
+        let trace_y = row(&mut svg, head.bottom().max(store_y) + 24, &boxes) + 24;
+        let n = state.writers.len();
+        let (lane_head, lane_store, lane_readers) = (n, n + 1, n + 2);
+        let mut lane_names: Vec<String> = (0..n).map(|w| format!("writer {w}")).collect();
+        lane_names.extend(["head", "object store", "readers / sweep"].map(String::from));
+        let mut events = vec![];
+        for (before, action, after) in steps(path) {
+            let label = self.format_action(&action);
+            let event = match action {
+                Action::StartUpload(w) => Event::on(w, label).to(lane_store).tone(Tone::Staged),
+                Action::FinishUpload(i) => {
+                    let w = before.puts.get(i).map_or(0, |(w, _)| *w);
+                    Event::on(lane_store, label).to(w)
+                }
+                Action::Commit(w)
+                | Action::Compact(w)
+                | Action::CompactCarry(w)
+                | Action::Remove(w)
+                | Action::Prepare(w)
+                | Action::Retry(w) => Event::on(w, label).to(lane_head).tone(Tone::Staged),
+                Action::CommitTx(w) | Action::AbortTx(w) | Action::Takeover(w) => {
+                    Event::on(w, label).to(lane_head)
+                }
+                Action::Deliver(i) => {
+                    let w = before.net.get(i).map_or(0, |r| r.writer);
+                    let ok = after.version > before.version;
+                    Event::on(
+                        w,
+                        if ok {
+                            "commit lands".to_string()
+                        } else {
+                            "commit refused (base or lease moved)".into()
+                        },
+                    )
+                    .to(lane_head)
+                    .tone(if ok { Tone::Live } else { Tone::Gone })
+                }
+                Action::Drop(_) => Event::on(lane_head, label).tone(Tone::Gone),
+                Action::Timeout(w) | Action::Resolve(w) => Event::on(w, label).tone(Tone::Actor),
+                Action::Crash(w) => Event::on(w, "CRASH").tone(Tone::Bad),
+                Action::Read | Action::RemoteConfirm => Event::on(lane_readers, label)
+                    .to(lane_head)
+                    .tone(Tone::Actor),
+                Action::Fetch | Action::RestoreCopy | Action::RemoteFetch => {
+                    Event::on(lane_readers, label)
+                        .to(lane_store)
+                        .tone(Tone::Actor)
+                }
+                Action::Sweep(_) | Action::DeleteLand(_) | Action::DeleteFail(_) => {
+                    Event::on(lane_readers, label).to(lane_store)
+                }
+                Action::Plan | Action::Forget => Event::on(lane_readers, label).to(lane_head),
+                Action::EndScan
+                | Action::RestoreStart
+                | Action::RestoreEnd
+                | Action::RemoteStart => Event::on(lane_readers, label).tone(Tone::Actor),
+                Action::Tick => {
+                    Event::on(lane_readers, format!("clock -> {}", after.now)).tone(Tone::Gone)
+                }
+            };
+            events.push(event.breaking(&crate::explorer::broken(self, &before, &after)));
+        }
+        Timeline {
+            lanes: lane_names,
+            events,
+        }
+        .draw(&mut svg, 0, trace_y);
+        Some(svg.finish())
+    }
     #[expect(clippy::too_many_lines, reason = "one entry per property")]
     fn properties(&self) -> Vec<Property<Self>> {
         let mut properties = vec![
@@ -1939,4 +2351,41 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
         state = next;
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::Protocol;
+    use stateright::Model;
+
+    /// Files a prepared transaction names are not orphans: the drawing says so,
+    /// and shows one the store lacks as missing.
+    #[test]
+    fn prepared_files_are_named_and_missing_ones_shown() {
+        let model = Protocol::new("data-files-intent-retire-prepared", 2);
+        let path = crate::explorer::path_to(&model, |s| {
+            s.prepared
+                .as_ref()
+                .is_some_and(|t| t.files.iter().any(|f| s.store.contains(f)))
+        })
+        .expect("a stored prepared file");
+        let svg = model.as_svg(path).expect("data-files draws");
+        assert!(svg.contains("named by the prepared transaction"), "{svg}");
+
+        let model = Protocol::new(
+            "data-files-intent-retire-prepared-orphan-ignores-reservation",
+            2,
+        );
+        let path = crate::explorer::path_to(&model, |s| {
+            s.prepared
+                .as_ref()
+                .is_some_and(|t| t.files.iter().any(|f| !s.store.contains(f)))
+        })
+        .expect("a missing prepared file");
+        let svg = model.as_svg(path).expect("data-files draws");
+        assert!(
+            svg.contains("MISSING (prepared transaction names it)"),
+            "{svg}"
+        );
+    }
 }
