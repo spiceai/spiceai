@@ -93,7 +93,9 @@ jobs:
           ref: ${{ github.event.ref || 'refs/heads/trunk' }}
 
       - name: Display spiced commit
-        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+        env:
+          SETUP_SPICED_SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+        run: echo "SPICED_COMMIT=${SETUP_SPICED_SPICED_COMMIT}"
 
       - name: Build Testoperator
         uses: $/.github/actions/build-testoperator
@@ -129,8 +131,10 @@ jobs:
       # feeds them one at a time with --max-concurrent.
       - name: Resolve scale factor
         id: resolve
+        env:
+          INPUT_SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
         run: |
-          SF="${{ github.event.inputs.scale_factor }}"
+          SF="${INPUT_SCALE_FACTOR}"
           if [ -z "$SF" ]; then
             case "${{ github.event.schedule }}" in
               # The 0000 firing (a delayed one still starts before 0800) adds the vnext arm.

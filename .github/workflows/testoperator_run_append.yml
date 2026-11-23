@@ -102,19 +102,24 @@ jobs:
 
       - name: Set spicepod path
         id: set_spicepod_path
+        env:
+          INPUT_QUERY_SET: ${{ github.event.inputs.query_set }}
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
         run: |
-          query_set="${{ github.event.inputs.query_set }}"
+          query_set="${INPUT_QUERY_SET}"
           query_set="${query_set%%\[*\]*}"
-          SPICEPOD_PATH="./test/spicepods/${query_set}/sf1/${{ github.event.inputs.spicepod_path }}"
+          SPICEPOD_PATH="./test/spicepods/${query_set}/sf1/${INPUT_SPICEPOD_PATH}"
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
 
       - name: Validate spicepod file exists
+        env:
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
         run: |
-          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
-            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          if [ ! -f "${SPICEPOD_PATH}" ]; then
+            echo "Error: Spicepod file not found at ${SPICEPOD_PATH}"
             exit 1
           fi
-          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          echo "Spicepod file found at ${SPICEPOD_PATH}"
 
       - name: Get RustFS credentials
         id: rustfs
@@ -141,8 +146,10 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate spicepod
+        env:
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
         run: |
-          spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          spicepod-validator "${SPICEPOD_PATH}"
 
       - name: Setup spiced
         uses: $/.github/actions/setup-spiced
@@ -171,23 +178,33 @@ jobs:
           rm -rf .spice/data
           testoperator run append \
             -s /usr/local/bin/spiced \
-            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
+            -p "${SPICEPOD_PATH}" \
             -d /opt/spiced/data \
-            --query-set ${{ github.event.inputs.query_set }} \
+            --query-set "${INPUT_QUERY_SET}" \
             --ready-wait 300 \
             --disable-progress-bars \
             --metrics \
-            --duration ${{ github.event.inputs.duration }} \
-            --concurrency ${{ github.event.inputs.concurrency }} \
-            --load-interval ${{ github.event.inputs.load_interval }} \
-            --load-steps ${{ github.event.inputs.load_steps }} \
-            ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
-            ${{ github.event.inputs.with_conflict_data == 'true' && '--with-conflict-data' || '' }} \
-            ${{ github.event.inputs.with_retention_data == 'true' && '--with-retention-data' || '' }} \
-            --validate=${{ github.event.inputs.validate_results }}
+            --duration "${INPUT_DURATION}" \
+            --concurrency "${INPUT_CONCURRENCY}" \
+            --load-interval "${INPUT_LOAD_INTERVAL}" \
+            --load-steps "${INPUT_LOAD_STEPS}" \
+            ${INPUT_QUERY_OVERRIDES:+--query-overrides "${INPUT_QUERY_OVERRIDES}"} \
+            ${ARG_WITH_CONFLICT_DATA:+"${ARG_WITH_CONFLICT_DATA}"} \
+            ${ARG_WITH_RETENTION_DATA:+"${ARG_WITH_RETENTION_DATA}"} \
+            --validate="${INPUT_VALIDATE_RESULTS}"
         env:
           S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
           S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
           S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+          INPUT_QUERY_SET: ${{ github.event.inputs.query_set }}
+          INPUT_DURATION: ${{ github.event.inputs.duration }}
+          INPUT_CONCURRENCY: ${{ github.event.inputs.concurrency }}
+          INPUT_LOAD_INTERVAL: ${{ github.event.inputs.load_interval }}
+          INPUT_LOAD_STEPS: ${{ github.event.inputs.load_steps }}
+          INPUT_QUERY_OVERRIDES: ${{ github.event.inputs.query_overrides }}
+          ARG_WITH_CONFLICT_DATA: ${{ github.event.inputs.with_conflict_data == 'true' && '--with-conflict-data' || '' }}
+          ARG_WITH_RETENTION_DATA: ${{ github.event.inputs.with_retention_data == 'true' && '--with-retention-data' || '' }}
+          INPUT_VALIDATE_RESULTS: ${{ github.event.inputs.validate_results }}

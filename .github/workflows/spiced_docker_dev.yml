@@ -94,9 +94,11 @@ jobs:
 
       - name: Set image metadata
         id: set_image_metadata
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          echo "image=ghcr.io/spiceai/spiceai-dev:${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/spiceai/spiceai-dev:${INPUT_TAG}" >> "$GITHUB_OUTPUT"
+          echo "tag=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Set version
         id: set_version
@@ -136,10 +138,12 @@ jobs:
 
       - name: Set target architectures
         id: set_targets
+        env:
+          INPUT_TARGET: ${{ inputs.target }}
         run: |
           # When invoked via workflow_call, `inputs.target` is unset and we
           # always build amd64 only — cluster-bench callers don't need arm.
-          target="${{ inputs.target }}"
+          target="${INPUT_TARGET}"
           if [ -z "$target" ]; then
             target="amd64"
           fi

@@ -156,7 +156,9 @@ jobs:
           ref: refs/heads/${{ matrix.branch }}
 
       - name: Display spiced commit
-        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+        env:
+          SETUP_SPICED_SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+        run: echo "SPICED_COMMIT=${SETUP_SPICED_SPICED_COMMIT}"
 
       # A release branch dispatches its suite once per spiced build. setup-spiced selects the newest
       # commit on the branch that has a built spiced, which is older than the branch head when the
@@ -607,7 +609,9 @@ jobs:
           ref: ${{ github.event.ref }}
 
       - name: Display spiced commit
-        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+        env:
+          SETUP_SPICED_SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+        run: echo "SPICED_COMMIT=${SETUP_SPICED_SPICED_COMMIT}"
 
       - name: Build Testoperator
         uses: $/.github/actions/build-testoperator
@@ -676,80 +680,96 @@ jobs:
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - SF1
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 \
-            --workflow ${{ github.event.inputs.workflow_type }} \
-            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+            --workflow "${INPUT_WORKFLOW_TYPE}" \
+            --update-snapshots "${INPUT_UPDATE_SNAPSHOTS}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
+          INPUT_WORKFLOW_TYPE: ${{ github.event.inputs.workflow_type }}
+          INPUT_UPDATE_SNAPSHOTS: ${{ github.event.inputs.update_snapshots }}
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCDS
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf1 \
-            --workflow ${{ github.event.inputs.workflow_type }} \
-            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+            --workflow "${INPUT_WORKFLOW_TYPE}" \
+            --update-snapshots "${INPUT_UPDATE_SNAPSHOTS}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
+          INPUT_WORKFLOW_TYPE: ${{ github.event.inputs.workflow_type }}
+          INPUT_UPDATE_SNAPSHOTS: ${{ github.event.inputs.update_snapshots }}
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - ClickBench
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/clickbench/sf1 \
-            --workflow ${{ github.event.inputs.workflow_type }} \
-            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+            --workflow "${INPUT_WORKFLOW_TYPE}" \
+            --update-snapshots "${INPUT_UPDATE_SNAPSHOTS}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
+          INPUT_WORKFLOW_TYPE: ${{ github.event.inputs.workflow_type }}
+          INPUT_UPDATE_SNAPSHOTS: ${{ github.event.inputs.update_snapshots }}
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - SF10 memory mode
         run: |
           testoperator dispatch "./tools/testoperator/dispatch/tpch/sf10/accelerated/s3[parquet]-cayenne[memory].yaml" \
-            --workflow ${{ github.event.inputs.workflow_type }} \
-            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+            --workflow "${INPUT_WORKFLOW_TYPE}" \
+            --update-snapshots "${INPUT_UPDATE_SNAPSHOTS}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
+          INPUT_WORKFLOW_TYPE: ${{ github.event.inputs.workflow_type }}
+          INPUT_UPDATE_SNAPSHOTS: ${{ github.event.inputs.update_snapshots }}
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - SF100
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf100 \
-            --workflow ${{ github.event.inputs.workflow_type }} \
-            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+            --workflow "${INPUT_WORKFLOW_TYPE}" \
+            --update-snapshots "${INPUT_UPDATE_SNAPSHOTS}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
+          INPUT_WORKFLOW_TYPE: ${{ github.event.inputs.workflow_type }}
+          INPUT_UPDATE_SNAPSHOTS: ${{ github.event.inputs.update_snapshots }}
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCDS - SF100
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf100 \
-            --workflow ${{ github.event.inputs.workflow_type }} \
-            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+            --workflow "${INPUT_WORKFLOW_TYPE}" \
+            --update-snapshots "${INPUT_UPDATE_SNAPSHOTS}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
+          INPUT_WORKFLOW_TYPE: ${{ github.event.inputs.workflow_type }}
+          INPUT_UPDATE_SNAPSHOTS: ${{ github.event.inputs.update_snapshots }}
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - Text to SQL
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/text_to_sql \
-            --workflow ${{ github.event.inputs.workflow_type }} \
-            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+            --workflow "${INPUT_WORKFLOW_TYPE}" \
+            --update-snapshots "${INPUT_UPDATE_SNAPSHOTS}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
+          INPUT_WORKFLOW_TYPE: ${{ github.event.inputs.workflow_type }}
+          INPUT_UPDATE_SNAPSHOTS: ${{ github.event.inputs.update_snapshots }}
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - Streaming
         if: false
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/streaming \
-            --workflow ${{ github.event.inputs.workflow_type }} \
-            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+            --workflow "${INPUT_WORKFLOW_TYPE}" \
+            --update-snapshots "${INPUT_UPDATE_SNAPSHOTS}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
+          INPUT_WORKFLOW_TYPE: ${{ github.event.inputs.workflow_type }}
+          INPUT_UPDATE_SNAPSHOTS: ${{ github.event.inputs.update_snapshots }}

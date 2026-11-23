@@ -133,19 +133,25 @@ jobs:
 
       - name: Set spicepod path
         id: set_spicepod_path
+        env:
+          INPUT_QUERY_SET: ${{ github.event.inputs.query_set }}
+          INPUT_SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
         run: |
-          query_set="${{ github.event.inputs.query_set }}"
+          query_set="${INPUT_QUERY_SET}"
           query_set="${query_set%%\[*\]*}"
-          SPICEPOD_PATH="./test/spicepods/${query_set}/sf${{ github.event.inputs.scale_factor }}/${{ github.event.inputs.spicepod_path }}"
+          SPICEPOD_PATH="./test/spicepods/${query_set}/sf${INPUT_SCALE_FACTOR}/${INPUT_SPICEPOD_PATH}"
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
 
       - name: Validate spicepod file exists
+        env:
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
         run: |
-          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
-            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          if [ ! -f "${SPICEPOD_PATH}" ]; then
+            echo "Error: Spicepod file not found at ${SPICEPOD_PATH}"
             exit 1
           fi
-          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          echo "Spicepod file found at ${SPICEPOD_PATH}"
 
       - name: Get RustFS credentials
         id: rustfs
@@ -172,8 +178,10 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate spicepod
+        env:
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
         run: |
-          spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          spicepod-validator "${SPICEPOD_PATH}"
 
       - name: Setup spiced
         uses: $/.github/actions/setup-spiced
@@ -194,10 +202,12 @@ jobs:
           query_set: ${{ github.event.inputs.query_set }}
 
       - name: Setup MySQL
+        env:
+          INPUT_QUERY_SET: ${{ github.event.inputs.query_set }}
         run: |
-          if [[ ${{ github.event.inputs.query_set }} == "tpcds" ]]; then
+          if [[ "${INPUT_QUERY_SET}" == "tpcds" ]]; then
             echo "MYSQL_DB=tpcds_sf1" >> $GITHUB_ENV
-          elif [[ ${{ github.event.inputs.query_set }} == "tpch" ]]; then
+          elif [[ "${INPUT_QUERY_SET}" == "tpch" ]]; then
             echo "MYSQL_DB=tpch_sf1" >> $GITHUB_ENV
           fi
 
@@ -207,11 +217,13 @@ jobs:
         env:
           PGHOST: ${{ (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10') && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
           PGPASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+          INPUT_QUERY_SET: ${{ github.event.inputs.query_set }}
+          INPUT_SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
         run: |
           set -e
-          QUERY_SET="${{ github.event.inputs.query_set }}"
+          QUERY_SET="${INPUT_QUERY_SET}"
           QUERY_SET="${QUERY_SET%%\[*\]*}"
-          SCALE_FACTOR="${{ github.event.inputs.scale_factor }}"
+          SCALE_FACTOR="${INPUT_SCALE_FACTOR}"
           DB_NAME="${QUERY_SET}_sf${SCALE_FACTOR}"
 
           sudo apt-get update -y
@@ -354,13 +366,13 @@ jobs:
           rm -rf .spice/data
           testoperator run throughput \
             -s /usr/local/bin/spiced \
-            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
+            -p "${SPICEPOD_PATH}" \
             -d /opt/spiced/data \
-            --query-set ${{ github.event.inputs.query_set }} \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --query-set "${INPUT_QUERY_SET}" \
+            --ready-wait "${INPUT_READY_WAIT}" \
             --disable-progress-bars \
-            ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
-            --concurrency ${{ github.event.inputs.concurrency_count }}
+            ${INPUT_QUERY_OVERRIDES:+--query-overrides "${INPUT_QUERY_OVERRIDES}"} \
+            --concurrency "${INPUT_CONCURRENCY_COUNT}"
         env:
           S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
@@ -408,3 +420,8 @@ jobs:
           SCYLLADB_HOST: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '127.0.0.1' || '' }}
           SCYLLADB_PORT: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '9042' || '' }}
           SCYLLADB_KEYSPACE: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && 'tpch_sf1' || '' }}
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+          INPUT_QUERY_SET: ${{ github.event.inputs.query_set }}
+          INPUT_READY_WAIT: ${{ github.event.inputs.ready_wait }}
+          INPUT_QUERY_OVERRIDES: ${{ github.event.inputs.query_overrides }}
+          INPUT_CONCURRENCY_COUNT: ${{ github.event.inputs.concurrency_count }}

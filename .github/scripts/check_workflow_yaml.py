@@ -27,10 +27,16 @@
 # runtime's S3 traffic to the cache and reports as a dataset that never loads
 # (#12624).
 #
-# Finally, it requires a nightly's later test suites to survive an earlier one's
+# It requires a nightly's later test suites to survive an earlier one's
 # failure. A step's default condition is `success()`, so in a job that runs its
 # suites as a sequence of steps the first red suite skips every suite behind it:
 # their state stops being reported and nobody is told it stopped (#12625).
+#
+# Finally, in a workflow that holds `id-token: write`, it rejects a script that
+# expands a value its dispatcher or a branch name chooses in place: GitHub pastes
+# `${{ }}` into the script before the shell parses it, so `$(…)` in a dispatch
+# input runs as code, with the token the job can trade for the store's
+# credentials.
 """Validate the repository's GitHub Actions workflow and composite action YAML."""
 
 from __future__ import annotations
@@ -149,6 +155,16 @@ SNAPSHOT_ACTION = "push-snap-changes"
 # better default — a cancelled run should stop.
 SURVIVES_FAILURE = re.compile(r"(?:!\s*cancelled|always)\s*\(\s*\)")
 
+# Values whoever starts the run chooses: dispatch and call inputs, the branch name,
+# and an event's free text. Inside `${{ }}` in a script they become code; through a
+# step's `env:` they stay values.
+UNTRUSTED_CONTEXT = re.compile(
+    r"(?<![\w.-])(?:inputs\.|github\.event\.inputs\b|github\.head_ref\b|github\.ref_name\b"
+    r"|github\.event\.(?:pull_request|issue|comment|review|review_comment|head_commit|commits|pages"
+    r"|workflow_run|discussion|client_payload)\b)"
+)
+EXPANSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
+
 
 def workflow_files(github_dir: Path) -> list[Path]:
     """Return the workflow definitions under `<github_dir>/workflows`, sorted."""
@@ -198,6 +214,7 @@ def check_workflow(text: str) -> list[str]:
         problems.extend(check_workflow_conditions(jobs))
         problems.extend(check_cache_endpoint_isolation(jobs))
         problems.extend(check_suite_visibility(jobs, is_scheduled(document)))
+        problems.extend(check_untrusted_expansions(document, jobs))
 
     return problems
 
@@ -416,6 +433,53 @@ def check_suite_visibility(jobs: dict, scheduled: bool) -> list[str]:
                     "the job's conclusion reports every suite"
                 )
             a_suite_ran = a_suite_ran or runs_a_suite
+    return problems
+
+
+def _holds_id_token(permissions: object) -> bool:
+    return permissions == "write-all" or (
+        isinstance(permissions, dict) and permissions.get("id-token") == "write"
+    )
+
+
+def check_untrusted_expansions(document: dict, jobs: dict) -> list[str]:
+    """Report scripts that expand a dispatcher's or a branch's value in place.
+
+    Scoped to workflows where some job can mint an OIDC token (`id-token: write`),
+    because that token buys the repository's store credentials. Every job of such a
+    workflow is checked, since one job's outputs feed the next. A `run:` script and a
+    github-script `script:` are code; `name:`, `if:`, `with:` and `env:` are not, and
+    `env:` is the fix: `NAME: ${{ inputs.x }}` there, `"$NAME"` in the script.
+
+    What this does not follow: a step output or `env` value derived from such a
+    value and expanded later as `${{ steps.… }}` or `${{ env.… }}`. Those were moved
+    by hand when this rule was added; the rule catches the direct form.
+    """
+    workflow_permissions = document.get("permissions")
+    if not (
+        _holds_id_token(workflow_permissions)
+        or any(isinstance(job, dict) and _holds_id_token(job.get("permissions")) for job in jobs.values())
+    ):
+        return []
+    problems = []
+    for name, job in jobs.items():
+        if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
+            continue
+        for position, step in enumerate(job["steps"], start=1):
+            if not isinstance(step, dict):
+                continue
+            scripts = [("run", step.get("run"))]
+            if "github-script" in str(step.get("uses", "")) and isinstance(step.get("with"), dict):
+                scripts.append(("script", step["with"].get("script")))
+            for key, script in scripts:
+                for match in EXPANSION.finditer(str(script or "")):
+                    if UNTRUSTED_CONTEXT.search(match.group(1)):
+                        label = step.get("name") or f"step {position}"
+                        problems.append(
+                            f"job `{name}` step `{label}` expands `{match.group(0).strip()}` inside its "
+                            f"`{key}:`, where a value with `$(…)` runs as code in a workflow that holds "
+                            f"`id-token: write` — pass it through the step's `env:` and read the variable"
+                        )
     return problems
 
 

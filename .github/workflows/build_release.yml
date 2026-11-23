@@ -455,7 +455,7 @@ jobs:
       - name: Build spiced and spice CLI
         if: contains(matrix.target.tags, 'default') && matrix.target.target_os != 'windows'
         working-directory: bin/spiced
-        run: cargo build --profile ${{ env.RUST_PROFILE }} --features "$SPICED_FEATURES" -p spiced -p spice --target-dir ../../target
+        run: cargo build --profile "${RUST_PROFILE}" --features "$SPICED_FEATURES" -p spiced -p spice --target-dir ../../target
 
       - name: tar binary
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
@@ -572,7 +572,8 @@ jobs:
       ## Windows CLI - build and package (runtime not supported on Windows, CLI only)
       - name: Build spice CLI (Windows)
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
-        run: cargo build --profile ${{ env.RUST_PROFILE }} -p spice --target-dir target
+        # Windows runs this step in pwsh, where the job's env reads as $env:NAME.
+        run: cargo build --profile $env:RUST_PROFILE -p spice --target-dir target
 
       - name: tar CLI binary (Windows)
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')

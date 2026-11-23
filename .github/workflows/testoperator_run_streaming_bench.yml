@@ -88,9 +88,11 @@ jobs:
 
       - name: Set spicepod path
         id: set_spicepod_path
+        env:
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
         run: |
           # Support both relative paths (from repo root) and paths with ./ prefix
-          INPUT_PATH="${{ github.event.inputs.spicepod_path }}"
+          INPUT_PATH="${INPUT_SPICEPOD_PATH}"
           if [[ "${INPUT_PATH}" == ./* ]]; then
             SPICEPOD_PATH="${INPUT_PATH}"
           else
@@ -99,12 +101,14 @@ jobs:
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
 
       - name: Validate spicepod file exists
+        env:
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
         run: |
-          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
-            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          if [ ! -f "${SPICEPOD_PATH}" ]; then
+            echo "Error: Spicepod file not found at ${SPICEPOD_PATH}"
             exit 1
           fi
-          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          echo "Spicepod file found at ${SPICEPOD_PATH}"
 
       - name: Get RustFS credentials
         id: rustfs
@@ -129,7 +133,9 @@ jobs:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
 
       - name: Display spiced commit
-        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+        env:
+          SETUP_SPICED_SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+        run: echo "SPICED_COMMIT=${SETUP_SPICED_SPICED_COMMIT}"
 
       # testoperator generates and checks its data with the DuckDB library installed on the host.
       - name: Set up libduckdb
@@ -147,21 +153,21 @@ jobs:
         run: |
 
           LIVENESS_FLAG=""
-          if [ "${{ github.event.inputs.enable_liveness }}" = "true" ]; then
+          if [ "${INPUT_ENABLE_LIVENESS}" = "true" ]; then
             LIVENESS_FLAG="--enable-liveness"
           fi
 
           QUERY_LIVENESS_FLAG=""
-          if [ "${{ github.event.inputs.enable_query_liveness }}" = "true" ]; then
-            QUERY_LIVENESS_FLAG="--enable-query-liveness --query-liveness-interval-ms ${{ github.event.inputs.query_liveness_interval_ms }}"
+          if [ "${INPUT_ENABLE_QUERY_LIVENESS}" = "true" ]; then
+            QUERY_LIVENESS_FLAG="--enable-query-liveness --query-liveness-interval-ms ${INPUT_QUERY_LIVENESS_INTERVAL_MS}"
           fi
 
           testoperator run streaming-dynamodb \
             -s /usr/local/bin/spiced \
-            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
-            --queryset ${{ github.event.inputs.queryset }} \
-            --scale-factor ${{ github.event.inputs.scale_factor }} \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            -p "${SPICEPOD_PATH}" \
+            --queryset "${INPUT_QUERYSET}" \
+            --scale-factor "${INPUT_SCALE_FACTOR}" \
+            --ready-wait "${INPUT_READY_WAIT}" \
             --metrics \
             ${LIVENESS_FLAG} \
             ${QUERY_LIVENESS_FLAG}
@@ -180,3 +186,10 @@ jobs:
           # Metrics
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          INPUT_ENABLE_LIVENESS: ${{ github.event.inputs.enable_liveness }}
+          INPUT_ENABLE_QUERY_LIVENESS: ${{ github.event.inputs.enable_query_liveness }}
+          INPUT_QUERY_LIVENESS_INTERVAL_MS: ${{ github.event.inputs.query_liveness_interval_ms }}
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+          INPUT_QUERYSET: ${{ github.event.inputs.queryset }}
+          INPUT_SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
+          INPUT_READY_WAIT: ${{ github.event.inputs.ready_wait }}

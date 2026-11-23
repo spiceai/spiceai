@@ -208,6 +208,96 @@ def _hidden(label: str) -> str:
     )
 
 
+CREDENTIALED = """\
+---
+name: Bench
+on:
+  workflow_dispatch:
+    inputs:
+      spicepod_path:
+        type: string
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+{steps}
+"""
+
+
+class CheckUntrustedExpansionsTest(unittest.TestCase):
+    def problems(self, steps, document=CREDENTIALED):
+        return [p for p in check_workflow_yaml.check_workflow(document.format(steps=steps)) if "expands" in p]
+
+    def test_a_dispatch_input_in_a_script_is_reported(self):
+        problems = self.problems("      - name: Run\n        run: testoperator -p ${{ github.event.inputs.spicepod_path }}")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("job `bench` step `Run` expands `${{ github.event.inputs.spicepod_path }}`", problems[0])
+
+    def test_every_untrusted_context_is_reported(self):
+        for expression in (
+            "inputs.spicepod_path",
+            "github.ref_name",
+            "github.head_ref",
+            "github.event.pull_request.title",
+            "github.event.inputs.x != '' && format('--x {0}', github.event.inputs.x) || ''",
+        ):
+            with self.subTest(expression=expression):
+                self.assertEqual(len(self.problems(f"      - run: echo \"${{{{ {expression} }}}}\"")), 1)
+
+    def test_a_github_script_is_checked_too(self):
+        steps = (
+            "      - uses: actions/github-script@v7\n"
+            "        with:\n"
+            "          script: core.info('${{ inputs.spicepod_path }}')"
+        )
+        self.assertEqual(len(self.problems(steps)), 1)
+
+    def test_the_value_through_env_is_accepted(self):
+        steps = (
+            "      - env:\n"
+            "          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}\n"
+            "        run: testoperator -p \"$INPUT_SPICEPOD_PATH\""
+        )
+        self.assertEqual(self.problems(steps), [])
+
+    def test_trusted_contexts_and_non_script_keys_are_accepted(self):
+        steps = (
+            "      - name: Run ${{ github.event.inputs.spicepod_path }}\n"
+            "        if: ${{ contains(github.event.inputs.spicepod_path, 'mysql') }}\n"
+            "        with:\n"
+            "          path: ${{ inputs.spicepod_path }}\n"
+            "        uses: ./.github/actions/x\n"
+            "      - run: echo ${{ github.sha }} ${{ runner.temp }} ${{ secrets.TOKEN }} ${{ steps.a.outputs.b }}"
+        )
+        self.assertEqual(self.problems(steps), [])
+
+    def test_a_workflow_without_id_token_is_left_alone(self):
+        document = CREDENTIALED.replace("      id-token: write\n", "")
+        self.assertEqual(self.problems("      - run: echo ${{ inputs.spicepod_path }}", document), [])
+
+    def test_write_all_at_the_workflow_level_counts_as_holding_the_token(self):
+        document = CREDENTIALED.replace(
+            "    permissions:\n      contents: read\n      id-token: write\n", ""
+        ).replace("jobs:\n", "permissions: write-all\njobs:\n")
+        self.assertEqual(len(self.problems("      - run: echo ${{ inputs.spicepod_path }}", document)), 1)
+
+    def test_a_job_without_the_token_in_a_credentialed_workflow_is_checked(self):
+        document = CREDENTIALED + (
+            "  setup:\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    steps:\n"
+            # Doubled braces: the document goes through str.format.
+            "      - run: echo ${{{{ inputs.spicepod_path }}}}\n"
+        )
+        problems = self.problems("      - run: echo ok", document)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("job `setup`", problems[0])
+
+
 class CheckSuiteVisibilityTest(unittest.TestCase):
     """#12625: a nightly's first failing suite skips every suite behind it."""
 

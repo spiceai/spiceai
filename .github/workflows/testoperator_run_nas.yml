@@ -42,17 +42,21 @@ jobs:
 
       - name: Set spicepod path
         id: set_spicepod_path
+        env:
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
         run: |
-          SPICEPOD_PATH="./test/spicepods/tpch/sf1/${{ github.event.inputs.spicepod_path }}"
+          SPICEPOD_PATH="./test/spicepods/tpch/sf1/${INPUT_SPICEPOD_PATH}"
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
 
       - name: Validate spicepod file exists
+        env:
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
         run: |
-          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
-            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          if [ ! -f "${SPICEPOD_PATH}" ]; then
+            echo "Error: Spicepod file not found at ${SPICEPOD_PATH}"
             exit 1
           fi
-          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          echo "Spicepod file found at ${SPICEPOD_PATH}"
 
       - name: Get RustFS credentials
         id: rustfs
@@ -71,8 +75,10 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate spicepod
+        env:
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
         run: |
-          spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          spicepod-validator "${SPICEPOD_PATH}"
 
       - name: Setup spiced
         uses: $/.github/actions/setup-spiced
@@ -81,7 +87,9 @@ jobs:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
 
       - name: Display spiced commit
-        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+        env:
+          SETUP_SPICED_SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+        run: echo "SPICED_COMMIT=${SETUP_SPICED_SPICED_COMMIT}"
 
       - name: Build Testoperator
         uses: $/.github/actions/build-testoperator
@@ -101,12 +109,12 @@ jobs:
           rm -rf .spice/data
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
             -s /usr/local/bin/spiced \
-            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
+            -p "${SPICEPOD_PATH}" \
             -d /opt/spiced/data \
             --query-set tpch \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --ready-wait "${INPUT_READY_WAIT}" \
             --disable-progress-bars \
-            --validate=${{ github.event.inputs.validate_results }} \
+            --validate="${INPUT_VALIDATE_RESULTS}" \
             --metrics \
             --scale-factor 1
         env:
@@ -117,3 +125,6 @@ jobs:
           SMB_PASSWORD: ${{ secrets.SMB_PASSWORD }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+          INPUT_READY_WAIT: ${{ github.event.inputs.ready_wait }}
+          INPUT_VALIDATE_RESULTS: ${{ github.event.inputs.validate_results }}

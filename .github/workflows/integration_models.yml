@@ -103,9 +103,10 @@ jobs:
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          INPUT_RUN_ALL_TESTS: ${{ github.event.inputs.run_all_tests }}
         run: |
           FEATURES="flightsql,models,metal,s3_vectors,kafka"
-          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
+          if [[ "${INPUT_RUN_ALL_TESTS}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
             FEATURES="${FEATURES},bedrock,extended_tests"
             echo "Including extended_tests"
           else
@@ -777,9 +778,10 @@ jobs:
       - name: Build AI integration test binary
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          INPUT_RUN_ALL_TESTS: ${{ github.event.inputs.run_all_tests }}
         run: |
           FEATURES="flightsql,models,s3_vectors,kafka"
-          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
+          if [[ "${INPUT_RUN_ALL_TESTS}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
             FEATURES="${FEATURES},bedrock,extended_tests"
             echo "Including extended_tests"
           else

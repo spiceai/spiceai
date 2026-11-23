@@ -130,8 +130,10 @@ jobs:
 
       - name: Set spicepod path
         id: set_spicepod_path
+        env:
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
         run: |
-          SPICEPOD_PATH="./test/spicepods/chbench/${{ github.event.inputs.spicepod_path }}"
+          SPICEPOD_PATH="./test/spicepods/chbench/${INPUT_SPICEPOD_PATH}"
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
           # Derive the source database from the spicepod filename so the DB setup can
           # never disagree with the spicepod under test. By convention the connector is
@@ -156,12 +158,14 @@ jobs:
           exit 1
 
       - name: Validate spicepod file exists
+        env:
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
         run: |
-          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
-            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          if [ ! -f "${SPICEPOD_PATH}" ]; then
+            echo "Error: Spicepod file not found at ${SPICEPOD_PATH}"
             exit 1
           fi
-          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          echo "Spicepod file found at ${SPICEPOD_PATH}"
 
       # The adaptive configs place their Cayenne datalake tier under this run's id, via
       # `${env:GITHUB_RUN_ID}` in `cayenne_datalake_location`. spiced does not resolve references
@@ -229,7 +233,9 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Display spiced commit
-        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT || steps.release-spiced.outputs.SPICED_COMMIT }}"
+        env:
+          SPICED_COMMIT_OUTPUT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT || steps.release-spiced.outputs.SPICED_COMMIT }}
+        run: echo "SPICED_COMMIT=${SPICED_COMMIT_OUTPUT}"
 
       # Write the commit + high-level config to the job summary up front, so the
       # run is identifiable and reproducible even if it crashes mid-run. Results
@@ -241,6 +247,17 @@ jobs:
           # shell re-parses. See the "Export extra spiced env vars" step below for the same
           # rule applied to the actual export.
           SPICED_ENV_INPUT: ${{ github.event.inputs.spiced_env }}
+          SPICED_COMMIT_OUTPUT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT || steps.release-spiced.outputs.SPICED_COMMIT }}
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
+          SOURCE_TYPE: ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE }}
+          INPUT_SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
+          INPUT_TERMINALS: ${{ github.event.inputs.terminals || 'scale_factor × 10' }}
+          INPUT_RATE: ${{ github.event.inputs.rate || 'unlimited' }}
+          INPUT_DURATION: ${{ github.event.inputs.duration }}
+          INPUT_CONCURRENCY: ${{ github.event.inputs.concurrency }}
+          INPUT_QUERY_OVERRIDES: ${{ github.event.inputs.query_overrides || 'none' }}
+          INPUT_RUNNER_TYPE: ${{ github.event.inputs.runner_type }}
+          ANALYTIC_GATE_STATE: ${{ github.event.inputs.skip_analytic_gate == 'true' && 'skipped' || 'enabled' }}
         run: |
           # Flatten to one line and escape Markdown table-breaking characters (`|`, backtick,
           # CR) so a multi-entry or adversarial value can't corrupt the summary table.
@@ -262,18 +279,18 @@ jobs:
             echo ""
             echo "| Parameter | Value |"
             echo "| --- | --- |"
-            echo "| spiced commit | \`${{ steps.setup-spiced.outputs.SPICED_COMMIT || steps.release-spiced.outputs.SPICED_COMMIT }}\` |"
+            echo "| spiced commit | \`${SPICED_COMMIT_OUTPUT}\` |"
             echo "| testoperator commit | \`${{ github.sha }}\` |"
-            echo "| spicepod | \`${{ github.event.inputs.spicepod_path }}\` |"
-            echo "| source database | ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE }} |"
-            echo "| scale factor (warehouses) | ${{ github.event.inputs.scale_factor }} |"
-            echo "| terminals | ${{ github.event.inputs.terminals || 'scale_factor × 10' }} |"
-            echo "| target OLTP rate | ${{ github.event.inputs.rate || 'unlimited' }} |"
-            echo "| duration (s) | ${{ github.event.inputs.duration }} |"
-            echo "| analytical concurrency | ${{ github.event.inputs.concurrency }} |"
-            echo "| query overrides | ${{ github.event.inputs.query_overrides || 'none' }} |"
-            echo "| runner | ${{ github.event.inputs.runner_type }} |"
-            echo "| analytic gate | ${{ github.event.inputs.skip_analytic_gate == 'true' && 'skipped' || 'enabled' }} |"
+            echo "| spicepod | \`${INPUT_SPICEPOD_PATH}\` |"
+            echo "| source database | ${SOURCE_TYPE} |"
+            echo "| scale factor (warehouses) | ${INPUT_SCALE_FACTOR} |"
+            echo "| terminals | ${INPUT_TERMINALS} |"
+            echo "| target OLTP rate | ${INPUT_RATE} |"
+            echo "| duration (s) | ${INPUT_DURATION} |"
+            echo "| analytical concurrency | ${INPUT_CONCURRENCY} |"
+            echo "| query overrides | ${INPUT_QUERY_OVERRIDES} |"
+            echo "| runner | ${INPUT_RUNNER_TYPE} |"
+            echo "| analytic gate | ${ANALYTIC_GATE_STATE} |"
             echo "| extra spiced env | ${extra_spiced_env} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -406,7 +423,7 @@ jobs:
           #   testoperator -> cores 32-37 (logical CPUs 32-37,96-101 = 12 threads)
           SPICED_BIN=/usr/local/bin/spiced
           TESTOP_PREFIX=""
-          if [ "${{ github.event.inputs.runner_type }}" = "spiceai-dev-xlarge-runners" ] && command -v taskset >/dev/null 2>&1; then
+          if [ "${INPUT_RUNNER_TYPE}" = "spiceai-dev-xlarge-runners" ] && command -v taskset >/dev/null 2>&1; then
             cat > /tmp/spiced-pinned.sh <<'EOF'
           #!/usr/bin/env bash
           exec taskset -c 0-31,64-95 /usr/local/bin/spiced "$@"
@@ -420,7 +437,7 @@ jobs:
           # Optionally capture under-load troubleshooting artifacts
           DIAG_DIR="${GITHUB_WORKSPACE}/htap-diagnostics"
           DIAG_PIDS=""
-          if [ "${{ github.event.inputs.collect_diagnostics }}" = "true" ]; then
+          if [ "${INPUT_COLLECT_DIAGNOSTICS}" = "true" ]; then
             mkdir -p "$DIAG_DIR"
             OUTDIR="$DIAG_DIR" HTTP_HOST=localhost HTTP_PORT=8090 \
               EXPLAIN_QUERIES=all EXPLAIN_INTERVAL=30 READY_TIMEOUT=3600 \
@@ -432,19 +449,19 @@ jobs:
           set +e
           $TESTOP_PREFIX testoperator run htap \
             -s "${SPICED_BIN}" \
-            -p '${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}' \
-            --source-type ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE }} \
+            -p "${SPICEPOD_PATH}" \
+            --source-type "${SOURCE_TYPE}" \
             --query-set chbench \
-            --scale-factor ${{ github.event.inputs.scale_factor }} \
-            ${{ github.event.inputs.terminals && format('--terminals {0}', github.event.inputs.terminals) || '' }} \
-            ${{ github.event.inputs.rate && format('--rate {0}', github.event.inputs.rate) || '' }} \
-            --duration ${{ github.event.inputs.duration }} \
-            --concurrency ${{ github.event.inputs.concurrency }} \
-            ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
-            ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && '--skip-prepare' || '' }} \
-            ${{ github.event.inputs.skip_analytic_gate == 'true' && '--skip-analytic-gate' || '' }} \
-            ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE == 'mysql' && '--analytic-gate-concurrency 16' || '' }} \
+            --scale-factor "${INPUT_SCALE_FACTOR}" \
+            ${INPUT_TERMINALS:+--terminals "${INPUT_TERMINALS}"} \
+            ${INPUT_RATE:+--rate "${INPUT_RATE}"} \
+            --duration "${INPUT_DURATION}" \
+            --concurrency "${INPUT_CONCURRENCY}" \
+            ${INPUT_QUERY_OVERRIDES:+--query-overrides "${INPUT_QUERY_OVERRIDES}"} \
+            --ready-wait "${INPUT_READY_WAIT}" \
+            ${ARG_SKIP_PREPARE:+"${ARG_SKIP_PREPARE}"} \
+            ${ARG_SKIP_ANALYTIC_GATE:+"${ARG_SKIP_ANALYTIC_GATE}"} \
+            ${ARGS_ANALYTIC_GATE_CONCURRENCY} \
             --disable-progress-bars \
             --metrics \
             ${LAYOUT:+--layout "$LAYOUT"} \
@@ -476,6 +493,20 @@ jobs:
           S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
           S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
           S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
+          INPUT_RUNNER_TYPE: ${{ github.event.inputs.runner_type }}
+          INPUT_COLLECT_DIAGNOSTICS: ${{ github.event.inputs.collect_diagnostics }}
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+          SOURCE_TYPE: ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE }}
+          INPUT_SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
+          INPUT_TERMINALS: ${{ github.event.inputs.terminals }}
+          INPUT_RATE: ${{ github.event.inputs.rate }}
+          INPUT_DURATION: ${{ github.event.inputs.duration }}
+          INPUT_CONCURRENCY: ${{ github.event.inputs.concurrency }}
+          INPUT_QUERY_OVERRIDES: ${{ github.event.inputs.query_overrides }}
+          INPUT_READY_WAIT: ${{ github.event.inputs.ready_wait }}
+          ARG_SKIP_PREPARE: ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && '--skip-prepare' || '' }}
+          ARG_SKIP_ANALYTIC_GATE: ${{ github.event.inputs.skip_analytic_gate == 'true' && '--skip-analytic-gate' || '' }}
+          ARGS_ANALYTIC_GATE_CONCURRENCY: ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE == 'mysql' && '--analytic-gate-concurrency 16' || '' }}
 
       # Upload the under-load diagnostics dir
       - name: Upload HTAP diagnostics

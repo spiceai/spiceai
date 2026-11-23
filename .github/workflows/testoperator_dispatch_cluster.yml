@@ -70,9 +70,10 @@ jobs:
         env:
           FORCE_REBUILD: ${{ github.event.inputs.force_rebuild || 'false' }}
           CUSTOM_IMAGE_TAG: ${{ github.event.inputs.custom_image_tag || '' }}
+          INPUT_SPICED_REF: ${{ github.event.inputs.spiced_ref || 'trunk' }}
         run: |
           set -euo pipefail
-          spiced_ref="${{ github.event.inputs.spiced_ref || 'trunk' }}"
+          spiced_ref="${INPUT_SPICED_REF}"
           spiced_sha="$(git rev-parse HEAD)"
           spiced_sha_short="$(git rev-parse --short=12 HEAD)"
           image_tag="trunk-${spiced_sha_short}"

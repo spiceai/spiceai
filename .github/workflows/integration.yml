@@ -267,6 +267,7 @@ jobs:
         env:
           CARGO_INCREMENTAL: 0
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          INPUT_RUN_ALL_TESTS: ${{ github.event.inputs.run_all_tests }}
         run: |
           set -euo pipefail
 
@@ -299,7 +300,7 @@ jobs:
           # `debezium` compiles the `cdc_ingest` and `cdc_cayenne` Debezium tests, which
           # are gated on it and run nowhere else.
           FEATURES="postgres,mysql,delta_lake,adbc,sqlite,spark,databricks,dynamodb,oracle,kafka,debezium,iceberg-write,snapshots,mongodb"
-          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
+          if [[ "${INPUT_RUN_ALL_TESTS}" == "true" ]]; then
             FEATURES="${FEATURES},extended_tests"
             echo "Including extended_tests"
           else

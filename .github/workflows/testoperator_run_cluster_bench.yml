@@ -242,7 +242,7 @@ jobs:
           # snapshot policy is consistent with the single-node bench.
           update_mode="${CB_UPDATE_SNAPSHOTS}"
           if [ "${update_mode}" = "default" ] || [ -z "${update_mode}" ]; then
-            branch_name="${{ github.ref_name }}"
+            branch_name="${GITHUB_REF_NAME}"
             if [[ "${branch_name}" == "release/"* ]]; then
               update_mode="no"
             else
@@ -790,7 +790,7 @@ jobs:
           gh pr create \
             --title "${title}" \
             --body-file "${body_file}" \
-            --base "${{ github.ref_name }}" \
+            --base "${GITHUB_REF_NAME}" \
             --head "${BRANCH_NAME}" \
             --label kind/bug \
             --label area/ci

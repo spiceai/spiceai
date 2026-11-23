@@ -138,8 +138,10 @@ jobs:
 
       - name: Download the baseline release
         id: baseline
+        env:
+          INPUT_BASELINE_VERSION: ${{ github.event.inputs.baseline_version }}
         run: |
-          version="${{ github.event.inputs.baseline_version }}"
+          version="${INPUT_BASELINE_VERSION}"
           if [ -z "$version" ]; then
             latest=$(curl -sSLI -o /dev/null -w '%{url_effective}' https://github.com/spiceai/spiceai/releases/latest)
             version="${latest##*/}"
@@ -165,9 +167,9 @@ jobs:
           testoperator run cold-start \
             -s /usr/local/bin/spiced \
             -p "test/spicepods/cold_start/${{ matrix.spicepod }}" \
-            --baseline-spiced-path "${{ steps.baseline.outputs.path }}" \
-            --runs "${{ github.event.inputs.runs || '3' }}" \
-            --max-ready-ratio "${{ github.event.inputs.max_ready_ratio || '2.0' }}" \
+            --baseline-spiced-path "${BASELINE_PATH}" \
+            --runs "${INPUT_RUNS}" \
+            --max-ready-ratio "${INPUT_MAX_READY_RATIO}" \
             ${{ matrix.max_full_compactions != '' && format('--max-full-compactions {0}', matrix.max_full_compactions) || '' }} \
             --ready-wait 600 \
             --disable-progress-bars \
@@ -178,6 +180,9 @@ jobs:
           S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
           S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
           S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
+          BASELINE_PATH: ${{ steps.baseline.outputs.path }}
+          INPUT_RUNS: ${{ github.event.inputs.runs || '3' }}
+          INPUT_MAX_READY_RATIO: ${{ github.event.inputs.max_ready_ratio || '2.0' }}
 
       - name: Upload results
         if: always()

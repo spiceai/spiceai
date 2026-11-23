@@ -57,12 +57,14 @@ jobs:
           persist-credentials: false
 
       - name: Validate spicepod file exists
+        env:
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
         run: |
-          if [ ! -f "${{ github.event.inputs.spicepod_path }}" ]; then
-            echo "Error: Spicepod file not found at ${{ github.event.inputs.spicepod_path }}"
+          if [ ! -f "${INPUT_SPICEPOD_PATH}" ]; then
+            echo "Error: Spicepod file not found at ${INPUT_SPICEPOD_PATH}"
             exit 1
           fi
-          echo "Spicepod file found at ${{ github.event.inputs.spicepod_path }}"
+          echo "Spicepod file found at ${INPUT_SPICEPOD_PATH}"
 
       - name: Validate SQL pipeline
         if: github.event.inputs.sql_pipeline != ''
@@ -105,8 +107,10 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate spicepod
+        env:
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
         run: |
-          spicepod-validator "${{ github.event.inputs.spicepod_path }}"
+          spicepod-validator "${INPUT_SPICEPOD_PATH}"
 
       - name: Setup spiced
         uses: $/.github/actions/setup-spiced
@@ -115,7 +119,9 @@ jobs:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
 
       - name: Display spiced commit
-        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+        env:
+          SETUP_SPICED_SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+        run: echo "SPICED_COMMIT=${SETUP_SPICED_SPICED_COMMIT}"
 
       - name: Build Testoperator
         uses: $/.github/actions/build-testoperator
@@ -127,9 +133,11 @@ jobs:
 
       - name: Extract spicepod filename path
         id: extract_spicepod_filename
+        env:
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
         run: |
-          SPICEPOD_PATH="${{ github.event.inputs.spicepod_path }}"
-          SPICEPOD_FILENAME=$(basename $SPICEPOD_PATH)
+          SPICEPOD_PATH="${INPUT_SPICEPOD_PATH}"
+          SPICEPOD_FILENAME=$(basename "$SPICEPOD_PATH")
           echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
 
       # Over HTTP, spiced reads a Hub dataset with one anonymous request per Parquet row group, and a
@@ -177,6 +185,8 @@ jobs:
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           DATA_DIR: ${{ steps.hf_data.outputs.data_dir }}
+          INPUT_READY_WAIT: ${{ github.event.inputs.ready_wait }}
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
         run: |
           rm -rf .spice/data
           # The spicepod loads its own data and names it in `metadata.benchmark_dataset`.
@@ -187,9 +197,9 @@ jobs:
             sql_pipeline_args=(--sql-pipeline "$SQL_PIPELINE")
           fi
           testoperator run search \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --ready-wait "${INPUT_READY_WAIT}" \
             --concurrency 10 \
             "${sql_pipeline_args[@]}" \
             --data-dir "$DATA_DIR" \
             --metrics \
-            -p "${{ github.event.inputs.spicepod_path }}"
+            -p "${INPUT_SPICEPOD_PATH}"

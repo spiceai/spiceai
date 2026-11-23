@@ -192,12 +192,13 @@ jobs:
         id: determine_update_snapshots
         env:
           SPICED_REF: ${{ github.event.inputs.spiced_ref }}
+          INPUT_UPDATE_SNAPSHOTS: ${{ github.event.inputs.update_snapshots }}
         run: |
-          update_mode="${{ github.event.inputs.update_snapshots }}"
+          update_mode="${INPUT_UPDATE_SNAPSHOTS}"
           if [ -n "${SPICED_REF}" ]; then
             update_mode="no"
           elif [ "${update_mode}" = "default" ] || [ -z "${update_mode}" ]; then
-            branch_name="${{ github.ref_name }}"
+            branch_name="${GITHUB_REF_NAME}"
             if [[ "${branch_name}" == "release/"* ]]; then
               update_mode="no"
             else
@@ -210,14 +211,18 @@ jobs:
 
       - name: Set spicepod path
         id: set_spicepod_path
+        env:
+          INPUT_QUERY_SET: ${{ github.event.inputs.query_set }}
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
+          INPUT_SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
         run: |
-          query_set="${{ github.event.inputs.query_set }}"
+          query_set="${INPUT_QUERY_SET}"
           query_set="${query_set%%\[*\]*}"
 
           if [ "${query_set}" = "chbench" ]; then
-            SPICEPOD_PATH="./test/spicepods/${query_set}/${{ github.event.inputs.spicepod_path }}"
+            SPICEPOD_PATH="./test/spicepods/${query_set}/${INPUT_SPICEPOD_PATH}"
           else
-            SPICEPOD_PATH="./test/spicepods/${query_set}/sf${{ github.event.inputs.scale_factor }}/${{ github.event.inputs.spicepod_path }}"
+            SPICEPOD_PATH="./test/spicepods/${query_set}/sf${INPUT_SCALE_FACTOR}/${INPUT_SPICEPOD_PATH}"
           fi
 
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
@@ -235,12 +240,14 @@ jobs:
           fi
 
       - name: Validate spicepod file exists
+        env:
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
         run: |
-          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
-            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          if [ ! -f "${SPICEPOD_PATH}" ]; then
+            echo "Error: Spicepod file not found at ${SPICEPOD_PATH}"
             exit 1
           fi
-          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          echo "Spicepod file found at ${SPICEPOD_PATH}"
 
       - name: Get RustFS credentials
         id: rustfs
@@ -267,8 +274,10 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate spicepod
+        env:
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
         run: |
-          spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          spicepod-validator "${SPICEPOD_PATH}"
 
       # A release tag benchmarks the binary that release published, so releases older than the
       # MinIO builds (kept only for recent commits) can be measured.
@@ -304,7 +313,9 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Display spiced commit
-        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT || steps.release-spiced.outputs.SPICED_COMMIT }}"
+        env:
+          SPICED_COMMIT_OUTPUT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT || steps.release-spiced.outputs.SPICED_COMMIT }}
+        run: echo "SPICED_COMMIT=${SPICED_COMMIT_OUTPUT}"
 
       - name: Build Testoperator
         uses: $/.github/actions/build-testoperator
@@ -320,10 +331,12 @@ jobs:
           query_set: ${{ github.event.inputs.query_set }}
 
       - name: Setup MySQL
+        env:
+          INPUT_QUERY_SET: ${{ github.event.inputs.query_set }}
         run: |
-          if [[ ${{ github.event.inputs.query_set }} == "tpcds" ]]; then
+          if [[ "${INPUT_QUERY_SET}" == "tpcds" ]]; then
             echo "MYSQL_DB=tpcds_sf1" >> $GITHUB_ENV
-          elif [[ ${{ github.event.inputs.query_set }} == "tpch" ]]; then
+          elif [[ "${INPUT_QUERY_SET}" == "tpch" ]]; then
             echo "MYSQL_DB=tpch_sf1" >> $GITHUB_ENV
             echo "MYSQL_DB_SF100=tpch_sf100" >> $GITHUB_ENV
           fi
@@ -342,11 +355,13 @@ jobs:
         env:
           PGHOST: ${{ (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10') && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
           PGPASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+          INPUT_QUERY_SET: ${{ github.event.inputs.query_set }}
+          INPUT_SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
         run: |
           set -e
-          QUERY_SET="${{ github.event.inputs.query_set }}"
+          QUERY_SET="${INPUT_QUERY_SET}"
           QUERY_SET="${QUERY_SET%%\[*\]*}"
-          SCALE_FACTOR="${{ github.event.inputs.scale_factor }}"
+          SCALE_FACTOR="${INPUT_SCALE_FACTOR}"
           DB_NAME="${QUERY_SET}_sf${SCALE_FACTOR}"
 
           sudo apt-get update -y
@@ -680,19 +695,19 @@ jobs:
           rm -rf .spice/data
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
             -s /usr/local/bin/spiced \
-            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
+            -p "${SPICEPOD_PATH}" \
             -d /opt/spiced/data \
-            --query-set ${{ github.event.inputs.query_set }} \
-            ${{ github.event.inputs.scenario_query_file != '' && format('--scenario-query-file ./test/scenario/{0}', github.event.inputs.scenario_query_file) || '' }} \
-            ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --query-set "${INPUT_QUERY_SET}" \
+            ${INPUT_SCENARIO_QUERY_FILE:+--scenario-query-file "./test/scenario/${INPUT_SCENARIO_QUERY_FILE}"} \
+            ${INPUT_QUERY_OVERRIDES:+--query-overrides "${INPUT_QUERY_OVERRIDES}"} \
+            --ready-wait "${INPUT_READY_WAIT}" \
             --disable-progress-bars \
-            --disable-caching=${{ github.event.inputs.disable_caching }} \
-            --validate=${{ github.event.inputs.validate_results }} \
+            --disable-caching="${INPUT_DISABLE_CACHING}" \
+            --validate="${INPUT_VALIDATE_RESULTS}" \
             ${LAYOUT:+--layout "$LAYOUT"} \
-            --snapshots=${{ github.event.inputs.spiced_ref == '' }} \
+            --snapshots="${SNAPSHOTS_ON}" \
             --metrics \
-            --scale-factor ${{ github.event.inputs.scale_factor }}
+            --scale-factor "${INPUT_SCALE_FACTOR}"
         env:
           LAYOUT: ${{ github.event.inputs.layout }}
           S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
@@ -753,6 +768,15 @@ jobs:
           SCYLLADB_PORT: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '9042' || '' }}
           SCYLLADB_KEYSPACE: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && 'tpch_sf1' || '' }}
           CHBENCH_PG_HOST: 127.0.0.1
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+          INPUT_QUERY_SET: ${{ github.event.inputs.query_set }}
+          INPUT_SCENARIO_QUERY_FILE: ${{ github.event.inputs.scenario_query_file }}
+          INPUT_QUERY_OVERRIDES: ${{ github.event.inputs.query_overrides }}
+          INPUT_READY_WAIT: ${{ github.event.inputs.ready_wait }}
+          INPUT_DISABLE_CACHING: ${{ github.event.inputs.disable_caching }}
+          INPUT_VALIDATE_RESULTS: ${{ github.event.inputs.validate_results }}
+          SNAPSHOTS_ON: ${{ github.event.inputs.spiced_ref == '' }}
+          INPUT_SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
 
       - name: Install GH CLI
         if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
@@ -772,8 +796,8 @@ jobs:
           git fetch --unshallow || true
 
           # if the spiced commit is set, use that as the branch ID
-          if [ -n "${{ github.event.inputs.spiced_commit || '' }}" ]; then
-            BRANCH_ID=${{ github.event.inputs.spiced_commit }}
+          if [ -n "${INPUT_SPICED_COMMIT}" ]; then
+            BRANCH_ID="${INPUT_SPICED_COMMIT}"
           else
             BRANCH_ID=${{ github.run_id }}
           fi
@@ -783,12 +807,12 @@ jobs:
 
           git config --global user.name 'Spice Benchmark Snapshot Update Bot'
           git config --global user.email 'spiceaibot@spice.ai'
-          git checkout -b ${BRANCH_NAME}
+          git checkout -b "${BRANCH_NAME}"
           git add '*.snap'
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}"
+            git commit -m "fix: Update ${INPUT_QUERY_SET} benchmark snapshots for ${INPUT_SPICEPOD_PATH}"
             SNAPSHOT_COMMIT="$(git rev-parse HEAD)"
 
             # Every run dispatched for one spiced commit pushes to the same
@@ -846,7 +870,7 @@ jobs:
                 # keep the snapshots as an artifact and say so.
                 printf '%s\n' "${push_log}" >"${RUNNER_TEMP}/snapshot-push.log"
                 if bash .github/scripts/save_unpushable_snapshots.sh \
-                  "${RUNNER_TEMP}/snapshot-push.log" "${BRANCH_NAME}" "${{ github.ref_name }}"; then
+                  "${RUNNER_TEMP}/snapshot-push.log" "${BRANCH_NAME}" "${GITHUB_REF_NAME}"; then
                   exit 1
                 fi
                 echo "::error::Pushing the benchmark snapshots to ${BRANCH_NAME} was rejected for a reason other than a concurrent push or a queued branch; see the git output above."
@@ -865,19 +889,19 @@ jobs:
               BODY=$(cat <<EOF
           Automated benchmark snapshot update from workflow run [#${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
 
-          **Query set:** \`${{ github.event.inputs.query_set }}\`
-          **Spicepod:** \`${{ github.event.inputs.spicepod_path }}\`
-          **Profile:** \`${{ github.event.inputs.profile_option || 'release' }}\`
+          **Query set:** \`${INPUT_QUERY_SET}\`
+          **Spicepod:** \`${INPUT_SPICEPOD_PATH}\`
+          **Profile:** \`${INPUT_PROFILE_OPTION}\`
           EOF
           )
               # Target the branch the run was dispatched on. enforce-pull-with-spice, a required
               # check, fails a PR without both a kind/ and an area/ label.
-              gh pr create --title "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}" --body "${BODY}" --base "${{ github.ref_name }}" --head ${BRANCH_NAME} --label kind/bug --label area/tests
+              gh pr create --title "fix: Update ${INPUT_QUERY_SET} benchmark snapshots for ${INPUT_SPICEPOD_PATH}" --body "${BODY}" --base "${GITHUB_REF_NAME}" --head "${BRANCH_NAME}" --label kind/bug --label area/tests
               # Auto-merge only into trunk: on an unprotected feature branch
               # --auto merges immediately, before the branch owner can review
               # the snapshots.
-              if [ "${{ github.ref_name }}" = "trunk" ]; then
-                gh pr merge --squash --auto ${BRANCH_NAME}
+              if [ "${GITHUB_REF_NAME}" = "trunk" ]; then
+                gh pr merge --squash --auto "${BRANCH_NAME}"
               fi
             fi
             # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
@@ -888,6 +912,10 @@ jobs:
           # Never fall back to an interactive prompt; fail fast if auth is rejected.
           GIT_TERMINAL_PROMPT: '0'
           GCM_INTERACTIVE: 'never'
+          INPUT_SPICED_COMMIT: ${{ github.event.inputs.spiced_commit }}
+          INPUT_QUERY_SET: ${{ github.event.inputs.query_set }}
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
+          INPUT_PROFILE_OPTION: ${{ github.event.inputs.profile_option || 'release' }}
 
       - name: Upload snapshots GitHub refused to push
         # save_unpushable_snapshots.sh leaves the snapshot commit here when

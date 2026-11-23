@@ -93,12 +93,14 @@ jobs:
           persist-credentials: false
 
       - name: Validate spicepod file exists
+        env:
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
         run: |
-          if [ ! -f "${{ github.event.inputs.spicepod_path }}" ]; then
-            echo "Error: Spicepod file not found at ${{ github.event.inputs.spicepod_path }}"
+          if [ ! -f "${INPUT_SPICEPOD_PATH}" ]; then
+            echo "Error: Spicepod file not found at ${INPUT_SPICEPOD_PATH}"
             exit 1
           fi
-          echo "Spicepod file found at ${{ github.event.inputs.spicepod_path }}"
+          echo "Spicepod file found at ${INPUT_SPICEPOD_PATH}"
 
       - name: Get RustFS credentials
         id: rustfs
@@ -125,8 +127,10 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate spicepod
+        env:
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
         run: |
-          spicepod-validator "${{ github.event.inputs.spicepod_path }}"
+          spicepod-validator "${INPUT_SPICEPOD_PATH}"
 
       - name: Setup spiced
         uses: $/.github/actions/setup-spiced
@@ -135,7 +139,9 @@ jobs:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
 
       - name: Display spiced commit
-        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+        env:
+          SETUP_SPICED_SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+        run: echo "SPICED_COMMIT=${SETUP_SPICED_SPICED_COMMIT}"
 
       - name: Build Testoperator
         uses: $/.github/actions/build-testoperator
@@ -146,24 +152,30 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate queryset inputs
+        env:
+          INPUT_QUERYSET: ${{ github.event.inputs.queryset }}
+          INPUT_QUERYSET_FILE: ${{ github.event.inputs.queryset_file }}
+          INPUT_BENCHMARK_QUERYSET: ${{ github.event.inputs.benchmark_queryset }}
         run: |
-          if ([ -n "${{ github.event.inputs.queryset }}" ] && [ -n "${{ github.event.inputs.queryset_file }}" ]) || \
-              ([ -n "${{ github.event.inputs.queryset }}" ] && [ -n "${{ github.event.inputs.benchmark_queryset }}" ]) || \
-              ([ -n "${{ github.event.inputs.queryset_file }}" ] && [ -n "${{ github.event.inputs.benchmark_queryset }}" ]); then
+          if ([ -n "${INPUT_QUERYSET}" ] && [ -n "${INPUT_QUERYSET_FILE}" ]) || \
+              ([ -n "${INPUT_QUERYSET}" ] && [ -n "${INPUT_BENCHMARK_QUERYSET}" ]) || \
+              ([ -n "${INPUT_QUERYSET_FILE}" ] && [ -n "${INPUT_BENCHMARK_QUERYSET}" ]); then
               echo "Error: Only one of 'queryset', 'queryset_file' or 'benchmark_queryset' can be provided"
               exit 1
             fi
 
-          if [ -z "${{ github.event.inputs.queryset }}" ] && [ -z "${{ github.event.inputs.queryset_file }}" ] && [ -z "${{ github.event.inputs.benchmark_queryset }}" ]; then
+          if [ -z "${INPUT_QUERYSET}" ] && [ -z "${INPUT_QUERYSET_FILE}" ] && [ -z "${INPUT_BENCHMARK_QUERYSET}" ]; then
             echo "Error: Either 'queryset', 'queryset_file' or 'benchmark_queryset' must be provided"
             exit 1
           fi
 
       - name: Extract spicepod filename path
         id: extract_spicepod_filename
+        env:
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
         run: |
-          SPICEPOD_PATH="${{ github.event.inputs.spicepod_path }}"
-          SPICEPOD_FILENAME=$(basename $SPICEPOD_PATH)
+          SPICEPOD_PATH="${INPUT_SPICEPOD_PATH}"
+          SPICEPOD_FILENAME=$(basename "$SPICEPOD_PATH")
           echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
 
       - name: Prepare Bird-Bench Data
@@ -180,26 +192,26 @@ jobs:
           rm -rf .spice/data
           QUERYSET_ARG=""
           SPICEPOD_DEPENDENCY=""
-          if [ -n "${{ github.event.inputs.queryset_file }}" ]; then
-            QUERYSET_ARG="--queryset-file ${{ github.event.inputs.queryset_file }}"
-          elif [ -n "${{ github.event.inputs.queryset }}" ]; then
-            QUERYSET_ARG="--queryset ${{ github.event.inputs.queryset }}"
-          elif [ -n "${{ github.event.inputs.benchmark_queryset }}" ]; then
+          if [ -n "${INPUT_QUERYSET_FILE}" ]; then
+            QUERYSET_ARG="--queryset-file ${INPUT_QUERYSET_FILE}"
+          elif [ -n "${INPUT_QUERYSET}" ]; then
+            QUERYSET_ARG="--queryset ${INPUT_QUERYSET}"
+          elif [ -n "${INPUT_BENCHMARK_QUERYSET}" ]; then
             QUERYSET_ARG='--queryset-file /opt/spiced/data/queryset.json'
-            SPICEPOD_DEPENDENCY="--spicepod-dependencies ${{ steps.bird_bench_setup.outputs.spicepod_dependency }}"
+            SPICEPOD_DEPENDENCY="--spicepod-dependencies ${BIRD_BENCH_SETUP_SPICEPOD_DEPENDENCY}"
           else
             echo "Error: No valid queryset input provided"
             exit 1
           fi
 
           LIMIT_ARG=""
-          if [ -n "${{ github.event.inputs.limit }}" ]; then
-            LIMIT_ARG="-n ${{ github.event.inputs.limit }}"
+          if [ -n "${INPUT_LIMIT}" ]; then
+            LIMIT_ARG="-n ${INPUT_LIMIT}"
           fi
 
           CONFIG_NAME_ARG=""
-          if [ -n "${{ github.event.inputs.configuration_name }}" ]; then
-            CONFIG_NAME_ARG="--configuration-name ${{ github.event.inputs.configuration_name }}"
+          if [ -n "${INPUT_CONFIGURATION_NAME}" ]; then
+            CONFIG_NAME_ARG="--configuration-name ${INPUT_CONFIGURATION_NAME}"
           fi
 
           printf '%s\n' \
@@ -210,8 +222,8 @@ jobs:
             "  $LIMIT_ARG" \
             "  $CONFIG_NAME_ARG" \
             "  -d /opt/spiced/data" \
-            "  --model ${{ github.event.inputs.model_name }}" \
-            "  -p ${{ github.event.inputs.spicepod_path }}"
+            "  --model ${INPUT_MODEL_NAME}" \
+            "  -p ${INPUT_SPICEPOD_PATH}"
 
           testoperator run text-to-sql \
             --ready-wait 1800 \
@@ -220,8 +232,8 @@ jobs:
             $LIMIT_ARG \
             $CONFIG_NAME_ARG \
             -d /opt/spiced/data \
-            --model ${{ github.event.inputs.model_name }} \
-            -p "${{ github.event.inputs.spicepod_path }}"
+            --model "${INPUT_MODEL_NAME}" \
+            -p "${INPUT_SPICEPOD_PATH}"
         env:
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
@@ -231,3 +243,11 @@ jobs:
           MINIO_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+          INPUT_QUERYSET_FILE: ${{ github.event.inputs.queryset_file }}
+          INPUT_QUERYSET: ${{ github.event.inputs.queryset }}
+          INPUT_BENCHMARK_QUERYSET: ${{ github.event.inputs.benchmark_queryset }}
+          BIRD_BENCH_SETUP_SPICEPOD_DEPENDENCY: ${{ steps.bird_bench_setup.outputs.spicepod_dependency }}
+          INPUT_LIMIT: ${{ github.event.inputs.limit }}
+          INPUT_CONFIGURATION_NAME: ${{ github.event.inputs.configuration_name }}
+          INPUT_MODEL_NAME: ${{ github.event.inputs.model_name }}
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}

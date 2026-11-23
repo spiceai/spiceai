@@ -82,17 +82,21 @@ jobs:
 
       - name: Set spicepod path
         id: set_spicepod_path
+        env:
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
         run: |
-          SPICEPOD_PATH="./test/spicepods/tpch/sf1/${{ github.event.inputs.spicepod_path }}"
+          SPICEPOD_PATH="./test/spicepods/tpch/sf1/${INPUT_SPICEPOD_PATH}"
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
 
       - name: Validate spicepod file exists
+        env:
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
         run: |
-          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
-            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          if [ ! -f "${SPICEPOD_PATH}" ]; then
+            echo "Error: Spicepod file not found at ${SPICEPOD_PATH}"
             exit 1
           fi
-          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          echo "Spicepod file found at ${SPICEPOD_PATH}"
 
       - name: Get RustFS credentials
         id: rustfs
@@ -119,8 +123,10 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate spicepod
+        env:
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
         run: |
-          spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          spicepod-validator "${SPICEPOD_PATH}"
 
       - name: Setup spiced
         uses: $/.github/actions/setup-spiced
@@ -129,7 +135,9 @@ jobs:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
 
       - name: Display spiced commit
-        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+        env:
+          SETUP_SPICED_SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+        run: echo "SPICED_COMMIT=${SETUP_SPICED_SPICED_COMMIT}"
 
       - name: Build Testoperator
         uses: $/.github/actions/build-testoperator
@@ -336,9 +344,9 @@ jobs:
           rm -rf .spice/data
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run schema \
             -s /usr/local/bin/spiced \
-            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
+            -p "${SPICEPOD_PATH}" \
             --ready-wait 120 \
-            ${{ github.event.inputs.min_tables != '' && format('--min-tables {0}', github.event.inputs.min_tables) || '' }}
+            ${INPUT_MIN_TABLES:+--min-tables "${INPUT_MIN_TABLES}"}
         env:
           S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
@@ -385,6 +393,8 @@ jobs:
           INSTA_UPDATE: always
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+          INPUT_MIN_TABLES: ${{ github.event.inputs.min_tables }}
 
       - name: Install GH CLI
         run: |
@@ -404,7 +414,7 @@ jobs:
           # never shares a branch with a release run of the same connector. A
           # run-scoped name would make the "is a PR already open" check below
           # unreachable, opening a new PR on every run.
-          SLUG="$(printf '%s' '${{ github.ref_name }}/${{ github.event.inputs.spicepod_path }}' \
+          SLUG="$(printf '%s' "${GITHUB_REF_NAME}/${INPUT_SPICEPOD_PATH}" \
             | sed -e 's/\.[Yy][Aa][Mm][Ll]$//' -e 's/[^A-Za-z0-9]\{1,\}/-/g' -e 's/^-//' -e 's/-$//' \
             | tr '[:upper:]' '[:lower:]')"
           BRANCH_NAME="testoperator-snapshot-update/${SLUG}"
@@ -429,7 +439,7 @@ jobs:
             exit 0
           fi
 
-          git commit -m "fix: Update schema snapshots for: ${{ github.event.inputs.spicepod_path }}"
+          git commit -m "fix: Update schema snapshots for: ${INPUT_SPICEPOD_PATH}"
           # The checkout persists no credentials, so authenticate the push
           # itself rather than leaving a token in the local git config for the
           # rest of the job. Disable any credential helper configured on the
@@ -444,7 +454,7 @@ jobs:
             # snapshots as an artifact and say so.
             printf '%s\n' "${push_log}" >"${RUNNER_TEMP}/snapshot-push.log"
             bash .github/scripts/save_unpushable_snapshots.sh \
-              "${RUNNER_TEMP}/snapshot-push.log" "${BRANCH_NAME}" "${{ github.ref_name }}" || true
+              "${RUNNER_TEMP}/snapshot-push.log" "${BRANCH_NAME}" "${GITHUB_REF_NAME}" || true
             exit 1
           fi
           echo "${push_log}"
@@ -457,9 +467,9 @@ jobs:
             # snapshots describe that branch, not trunk. enforce-pull-with-spice, a
             # required check, fails a PR without both a kind/ and an area/ label.
             gh pr create \
-              --title "fix: Update schema snapshots for ${{ github.event.inputs.spicepod_path }}" \
-              --body "Updates the schema snapshots for \`${{ github.event.inputs.spicepod_path }}\` on \`${{ github.ref_name }}\`." \
-              --base "${{ github.ref_name }}" \
+              --title "fix: Update schema snapshots for ${INPUT_SPICEPOD_PATH}" \
+              --body "Updates the schema snapshots for \`${INPUT_SPICEPOD_PATH}\` on \`${GITHUB_REF_NAME}\`." \
+              --base "${GITHUB_REF_NAME}" \
               --head "${BRANCH_NAME}" \
               --label kind/bug \
               --label area/tests
@@ -471,6 +481,7 @@ jobs:
           # Never fall back to an interactive prompt; fail fast if auth is rejected.
           GIT_TERMINAL_PROMPT: '0'
           GCM_INTERACTIVE: 'never'
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
 
       - name: Upload snapshots GitHub refused to push
         # save_unpushable_snapshots.sh leaves the snapshot commit here when

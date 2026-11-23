@@ -78,18 +78,21 @@ jobs:
           persist-credentials: false
 
       - name: Validate spicepod files exist
+        env:
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
+          INPUT_COMPARE_SPICEPOD_PATH: ${{ github.event.inputs.compare_spicepod_path }}
         run: |
-          if [ ! -f "${{ github.event.inputs.spicepod_path }}" ]; then
-            echo "Error: Spicepod file not found at ${{ github.event.inputs.spicepod_path }}"
+          if [ ! -f "${INPUT_SPICEPOD_PATH}" ]; then
+            echo "Error: Spicepod file not found at ${INPUT_SPICEPOD_PATH}"
             exit 1
           fi
-          echo "Spicepod file found at ${{ github.event.inputs.spicepod_path }}"
+          echo "Spicepod file found at ${INPUT_SPICEPOD_PATH}"
 
-          if [ ! -f "${{ github.event.inputs.compare_spicepod_path }}" ]; then
-            echo "Error: Compare spicepod file not found at ${{ github.event.inputs.compare_spicepod_path }}"
+          if [ ! -f "${INPUT_COMPARE_SPICEPOD_PATH}" ]; then
+            echo "Error: Compare spicepod file not found at ${INPUT_COMPARE_SPICEPOD_PATH}"
             exit 1
           fi
-          echo "Compare spicepod file found at ${{ github.event.inputs.compare_spicepod_path }}"
+          echo "Compare spicepod file found at ${INPUT_COMPARE_SPICEPOD_PATH}"
 
       - name: Get RustFS credentials
         id: rustfs
@@ -116,9 +119,12 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate spicepods
+        env:
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
+          INPUT_COMPARE_SPICEPOD_PATH: ${{ github.event.inputs.compare_spicepod_path }}
         run: |
-          spicepod-validator "${{ github.event.inputs.spicepod_path }}"
-          spicepod-validator "${{ github.event.inputs.compare_spicepod_path }}"
+          spicepod-validator "${INPUT_SPICEPOD_PATH}"
+          spicepod-validator "${INPUT_COMPARE_SPICEPOD_PATH}"
 
       - name: Setup spiced
         uses: $/.github/actions/setup-spiced
@@ -155,13 +161,13 @@ jobs:
           rm -rf .spice/data
           testoperator run data-consistency \
             -s /usr/local/bin/spiced \
-            -p ${{ github.event.inputs.spicepod_path }} \
+            -p "${INPUT_SPICEPOD_PATH}" \
             -d /opt/spiced/data \
-            --query-set ${{ github.event.inputs.query_set }} \
-            ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --query-set "${INPUT_QUERY_SET}" \
+            ${INPUT_QUERY_OVERRIDES:+--query-overrides "${INPUT_QUERY_OVERRIDES}"} \
+            --ready-wait "${INPUT_READY_WAIT}" \
             --disable-progress-bars \
-            --compare-spicepod-path ${{ github.event.inputs.compare_spicepod_path }}
+            --compare-spicepod-path "${INPUT_COMPARE_SPICEPOD_PATH}"
         env:
           S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT}}
           S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
@@ -191,3 +197,8 @@ jobs:
           SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.CI_DATABRICKS_SQL_WAREHOUSE_ID }}
           MONGODB_HOST: ${{ vars.TEST_MONGODB_HOST }}
           MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
+          INPUT_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
+          INPUT_QUERY_SET: ${{ github.event.inputs.query_set }}
+          INPUT_QUERY_OVERRIDES: ${{ github.event.inputs.query_overrides }}
+          INPUT_READY_WAIT: ${{ github.event.inputs.ready_wait }}
+          INPUT_COMPARE_SPICEPOD_PATH: ${{ github.event.inputs.compare_spicepod_path }}
