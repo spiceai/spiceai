@@ -981,6 +981,7 @@ pub use codec::zstandard::ZstandardSettings;
 pub use codec::{Codec, DeflateSettings};
 pub use de::from_value;
 pub use decimal::Decimal;
+pub use decode::decode_with_max_allocation;
 pub use duration::{Days, Duration, Millis, Months};
 pub use error::Error;
 pub use reader::{

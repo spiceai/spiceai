@@ -14,11 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Decoding a CDC Avro body against a client-supplied schema allocates in
-//! proportion to the body, not to the item counts its array and map block
-//! headers declare. An Avro block header states its item count before the
-//! items, so a five-byte body can declare 536,870,912 of them, and items such
-//! as a record of `null` fields decode from zero bytes.
+//! Decoding an Avro datum allocates in proportion to its input, not to the
+//! item counts its array and map block headers declare. A block header states
+//! its item count before the items, and items such as a record of `null` fields
+//! decode from zero bytes.
+//!
+//! CDC ingest holds a body to a budget that scales with the body's size. Other
+//! decodes, such as Iceberg manifest reads, hold each datum to apache-avro's
+//! per-datum limit.
 //!
 //! Measures the heap with a counting `#[global_allocator]`, so it is its own
 //! test binary, and runs every case from one test so no other test's
@@ -32,7 +35,7 @@ limitations under the License.
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use apache_avro::{Schema, to_avro_datum, types::Value};
+use apache_avro::{Schema, from_avro_datum, to_avro_datum, types::Value};
 use data_components::debezium::avro::{AvroDecodeOptions, parse_avro_change_events};
 
 struct PeakAllocator;
@@ -106,14 +109,26 @@ const MAX_HEAP_BYTES: usize = 1024 * 1024;
 /// datum together.
 const MAX_ALLOCATION_BYTES: usize = 512 * 1024 * 1024;
 
+/// The budget of a CDC body smaller than 256 KiB.
+const CDC_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
 /// A block header declaring 536,870,912 items (zig-zag varint `2^29`) and
 /// nothing after it.
 const HUGE_BLOCK_COUNT: [u8; 5] = [0x80, 0x80, 0x80, 0x80, 0x04];
 
+/// Runs `decode`, returning its result and the peak heap growth while it ran.
+fn with_peak_heap<T>(decode: impl FnOnce() -> T) -> (T, usize) {
+    let base = LIVE_BYTES.load(Ordering::Relaxed);
+    PEAK_BYTES.store(base, Ordering::Relaxed);
+    let result = decode();
+    let peak = PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(base);
+    (result, peak)
+}
+
 /// Decodes `body` against `schema_json` the way a CDC ingest request with an
 /// `X-Avro-Schema` header does, returning the error text and the peak heap
 /// growth during the decode.
-fn decode_error_and_peak_heap(
+fn cdc_error_and_peak_heap(
     runtime: &tokio::runtime::Runtime,
     schema_json: &str,
     body: &[u8],
@@ -122,16 +137,26 @@ fn decode_error_and_peak_heap(
         avro_schema_json: Some(schema_json.to_string()),
         ..Default::default()
     };
-    let base = LIVE_BYTES.load(Ordering::Relaxed);
-    PEAK_BYTES.store(base, Ordering::Relaxed);
-    let result = runtime.block_on(parse_avro_change_events(body, &options));
-    let peak = PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(base);
+    let (result, peak) =
+        with_peak_heap(|| runtime.block_on(parse_avro_change_events(body, &options)));
     match result {
         Ok(events) => panic!(
             "a body of {} bytes decoded to {} change events",
             body.len(),
             events.len()
         ),
+        Err(err) => (err.to_string(), peak),
+    }
+}
+
+/// Decodes `body` against `schema_json` with apache-avro's per-datum limit, as
+/// an Iceberg manifest read does, returning the error text and the peak heap
+/// growth during the decode.
+fn datum_error_and_peak_heap(schema_json: &str, body: &[u8]) -> (String, usize) {
+    let schema = Schema::parse_str(schema_json).expect("the schema parses");
+    let (result, peak) = with_peak_heap(|| from_avro_datum(&schema, &mut &body[..], None));
+    match result {
+        Ok(_) => panic!("a body of {} bytes decoded", body.len()),
         Err(err) => (err.to_string(), peak),
     }
 }
@@ -155,7 +180,7 @@ fn declared_collection_sizes_do_not_drive_allocation() {
     let map_entry = size_of::<(String, Value)>();
     let array_item = size_of::<Value>();
 
-    // A declared count whose items would not fit in the allocation limit is
+    // A declared count whose items would not fit in a CDC body's budget is
     // refused before anything is reserved. Items of `null` encode in zero bytes,
     // so for them the declared count is all that bounds the collection.
     for (schema, item_bytes) in [
@@ -163,11 +188,11 @@ fn declared_collection_sizes_do_not_drive_allocation() {
         (array, array_item),
         (null_array, array_item),
     ] {
-        let (error, peak) = decode_error_and_peak_heap(&runtime, schema, &HUGE_BLOCK_COUNT);
+        let (error, peak) = cdc_error_and_peak_heap(&runtime, schema, &HUGE_BLOCK_COUNT);
         assert_eq!(
             error,
             format!(
-                "Failed to decode Avro datum: Unable to allocate {} bytes (maximum allowed: {MAX_ALLOCATION_BYTES})",
+                "Failed to decode Avro datum: Unable to allocate {} bytes (maximum allowed: {CDC_BUDGET_BYTES})",
                 declared * item_bytes
             ),
             "{schema}"
@@ -178,12 +203,67 @@ fn declared_collection_sizes_do_not_drive_allocation() {
         );
     }
 
+    // A small CDC body holds its `null` items to the 64 MiB budget, less the
+    // record that holds them: the most that fit decode, and one more is refused
+    // before anything is reserved. Growing the array to its last block's size
+    // briefly holds its old and its new buffer.
+    let null_field = r#"{"type": "record", "name": "r", "fields": [{"name": "a", "type": {"type": "array", "items": "null"}}]}"#;
+    let fitting = (CDC_BUDGET_BYTES - map_entry - "a".len()) / array_item;
+    let mut body = block_count(i64::try_from(fitting).expect("the count fits in a long"));
+    body.push(0);
+    let (error, peak) = cdc_error_and_peak_heap(&runtime, null_field, &body);
+    assert_eq!(
+        error,
+        "Failed to map Avro Debezium payload: missing or invalid op field: None"
+    );
+    assert!(
+        peak < 2 * CDC_BUDGET_BYTES + MAX_HEAP_BYTES,
+        "{fitting} null items grew the heap by {peak} bytes"
+    );
+    let mut body = block_count(i64::try_from(fitting + 1).expect("the count fits in a long"));
+    body.push(0);
+    let (error, peak) = cdc_error_and_peak_heap(&runtime, null_field, &body);
+    assert_eq!(
+        error,
+        format!(
+            "Failed to decode Avro datum: Unable to allocate {} bytes (maximum allowed: {CDC_BUDGET_BYTES})",
+            (fitting + 1) * array_item
+        )
+    );
+    assert!(
+        peak < MAX_HEAP_BYTES,
+        "{} null items grew the heap by {peak} bytes",
+        fitting + 1
+    );
+
+    // A fixed value's size comes from the schema, and its buffer is allocated
+    // before the input is read, so it is checked against the body's budget.
+    let fixed = format!(
+        r#"{{"type": "fixed", "name": "f", "size": {}}}"#,
+        CDC_BUDGET_BYTES + 1
+    );
+    let (error, peak) = cdc_error_and_peak_heap(&runtime, &fixed, b"x");
+    assert_eq!(
+        error,
+        format!(
+            "Failed to decode Avro datum: Unable to allocate {} bytes (maximum allowed: {CDC_BUDGET_BYTES})",
+            CDC_BUDGET_BYTES + 1
+        )
+    );
+    assert!(
+        peak < MAX_HEAP_BYTES,
+        "a one-byte body with a fixed schema past the budget grew the heap by {peak} bytes"
+    );
+
+    // The cases below decode with apache-avro's per-datum limit.
+
     // A declared count that fits in the limit but has no items behind it fails
     // on the first missing item, having reserved only a bounded prefix.
-    let truncated = "Failed to decode Avro datum: Failed to read bytes for decoding variable length integer: failed to fill whole buffer";
+    let truncated =
+        "Failed to read bytes for decoding variable length integer: failed to fill whole buffer";
     for schema in [map, array] {
         let body = block_count(1_000_000);
-        let (error, peak) = decode_error_and_peak_heap(&runtime, schema, &body);
+        let (error, peak) = datum_error_and_peak_heap(schema, &body);
         assert_eq!(error, truncated, "{schema}");
         assert!(
             peak < MAX_HEAP_BYTES,
@@ -212,11 +292,11 @@ fn declared_collection_sizes_do_not_drive_allocation() {
         (record_array, record_fields_bytes),
         (union_array, array_item),
     ] {
-        let (error, peak) = decode_error_and_peak_heap(&runtime, &schema, &block_of_9m);
+        let (error, peak) = datum_error_and_peak_heap(&schema, &block_of_9m);
         assert_eq!(
             error,
             format!(
-                "Failed to decode Avro datum: Unable to allocate {refused_bytes} bytes (maximum allowed: {MAX_ALLOCATION_BYTES})"
+                "Unable to allocate {refused_bytes} bytes (maximum allowed: {MAX_ALLOCATION_BYTES})"
             ),
             "{schema}"
         );
@@ -232,13 +312,13 @@ fn declared_collection_sizes_do_not_drive_allocation() {
     let enum_array = format!(
         r#"{{"type": "array", "items": {{"type": "enum", "name": "e", "symbols": ["{symbol}"]}}}}"#
     );
-    let mut enum_body = block_of_9m.clone();
+    let mut enum_body = block_of_9m;
     enum_body.resize(enum_body.len() + 9_000, 0);
-    let (error, peak) = decode_error_and_peak_heap(&runtime, &enum_array, &enum_body);
+    let (error, peak) = datum_error_and_peak_heap(&enum_array, &enum_body);
     assert_eq!(
         error,
         format!(
-            "Failed to decode Avro datum: Unable to allocate {} bytes (maximum allowed: {MAX_ALLOCATION_BYTES})",
+            "Unable to allocate {} bytes (maximum allowed: {MAX_ALLOCATION_BYTES})",
             symbol.len()
         )
     );
@@ -268,7 +348,7 @@ fn declared_collection_sizes_do_not_drive_allocation() {
             }
             body.extend(to_avro_datum(&Schema::Long, Value::Long(i)).expect("a long encodes"));
         }
-        let (error, peak) = decode_error_and_peak_heap(&runtime, schema, &body);
+        let (error, peak) = datum_error_and_peak_heap(schema, &body);
         assert_eq!(error, truncated, "{schema}");
         assert!(
             peak < max_peak + MAX_HEAP_BYTES,
@@ -280,30 +360,29 @@ fn declared_collection_sizes_do_not_drive_allocation() {
     // and no further, though growing briefly holds the old and the new buffer:
     // two blocks of `null` items totalling 9,500,000 peak at the first block's
     // 5,000,000 slots plus 9,500,000, not at a doubled 10,000,000.
-    let two_blocks = r#"{"type": "record", "name": "r", "fields": [{"name": "a", "type": {"type": "array", "items": "null"}}]}"#;
+    let schema = Schema::parse_str(null_array).expect("the schema parses");
     let mut body = block_count(5_000_000);
     body.extend(block_count(4_500_000));
     body.push(0);
-    let (error, peak) = decode_error_and_peak_heap(&runtime, two_blocks, &body);
-    assert_eq!(
-        error,
-        "Failed to map Avro Debezium payload: missing or invalid op field: None"
-    );
+    let (decoded, peak) = with_peak_heap(|| from_avro_datum(&schema, &mut &body[..], None));
+    let Ok(Value::Array(items)) = decoded else {
+        panic!("two blocks of null items did not decode to an array: {decoded:?}");
+    };
+    assert_eq!(items.len(), 9_500_000);
+    drop(items);
     assert!(
         peak < (5_000_000 + 9_500_000) * array_item + MAX_HEAP_BYTES,
         "an array of two blocks grew the heap by {peak} bytes"
     );
 
-    // A fixed value's size comes from the schema, and its buffer is allocated
-    // before the input is read.
+    // A fixed value's size is checked against the limit before its buffer is
+    // allocated.
     let fixed_size: usize = 1 << 40;
     let fixed = format!(r#"{{"type": "fixed", "name": "f", "size": {fixed_size}}}"#);
-    let (error, peak) = decode_error_and_peak_heap(&runtime, &fixed, b"x");
+    let (error, peak) = datum_error_and_peak_heap(&fixed, b"x");
     assert_eq!(
         error,
-        format!(
-            "Failed to decode Avro datum: Unable to allocate {fixed_size} bytes (maximum allowed: {MAX_ALLOCATION_BYTES})"
-        )
+        format!("Unable to allocate {fixed_size} bytes (maximum allowed: {MAX_ALLOCATION_BYTES})")
     );
     assert!(
         peak < MAX_HEAP_BYTES,

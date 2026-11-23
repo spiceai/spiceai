@@ -76,6 +76,24 @@ pub fn decode<R: Read>(schema: &Schema, reader: &mut R) -> AvroResult<Value> {
     decode_internal(schema, rs.get_names(), &None, reader)
 }
 
+/// [`decode`], with a datum budget of `limit` bytes in place of
+/// [`max_allocation_bytes`]. The limit also caps the declared length of each
+/// bytes, string and fixed value.
+pub fn decode_with_max_allocation<R: Read>(
+    schema: &Schema,
+    reader: &mut R,
+    limit: usize,
+) -> AvroResult<Value> {
+    let rs = ResolvedSchema::try_from(schema)?;
+    decode_with_budget(
+        schema,
+        rs.get_names(),
+        &None,
+        reader,
+        &mut Budget::new(limit),
+    )
+}
+
 /// Array or map items reserved before any of them is decoded. A block header
 /// declares its item count before the items, so a block reserves its count in
 /// steps as items actually decode: this many first, then, each time the
@@ -95,44 +113,68 @@ const RESERVATION_GROWTH: usize = 1024;
 /// such as `null`, or a record of them, encode in zero bytes, so the budget, not
 /// the input length, is what bounds how many of them one datum can hold. Bytes,
 /// strings and fixed values are not debited: each is allocated at its declared
-/// length, which [`safe_len`] caps at [`max_allocation_bytes`], and is kept only
-/// once the input has filled it.
+/// length, which may not exceed the budget's limit, and is kept only once the
+/// input has filled it.
 pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
     schema: &Schema,
     names: &HashMap<Name, S>,
     enclosing_namespace: &Namespace,
     reader: &mut R,
 ) -> AvroResult<Value> {
-    let mut budget = max_allocation_bytes(DEFAULT_MAX_ALLOCATION_BYTES);
+    let mut budget = Budget::new(max_allocation_bytes(DEFAULT_MAX_ALLOCATION_BYTES));
     decode_with_budget(schema, names, enclosing_namespace, reader, &mut budget)
 }
 
-#[inline]
-fn debit_items<T>(budget: &mut usize, items: usize) -> AvroResult<()> {
-    match items.checked_mul(std::mem::size_of::<T>()) {
-        Some(desired) => debit_bytes(budget, desired),
-        None => Err(Details::IntegerOverflow.into()),
-    }
+/// The bytes one datum may still allocate, out of `limit`.
+struct Budget {
+    remaining: usize,
+    limit: usize,
 }
 
-#[inline]
-fn debit_bytes(budget: &mut usize, desired: usize) -> AvroResult<()> {
-    match budget.checked_sub(desired) {
-        Some(remaining) => {
-            *budget = remaining;
-            Ok(())
+impl Budget {
+    fn new(limit: usize) -> Self {
+        Self {
+            remaining: limit,
+            limit,
         }
-        None => Err(budget_exceeded(desired)),
     }
-}
 
-#[cold]
-fn budget_exceeded(desired: usize) -> Error {
-    Details::MemoryAllocation {
-        desired,
-        maximum: max_allocation_bytes(DEFAULT_MAX_ALLOCATION_BYTES),
+    #[inline]
+    fn debit_items<T>(&mut self, items: usize) -> AvroResult<()> {
+        match items.checked_mul(std::mem::size_of::<T>()) {
+            Some(desired) => self.debit_bytes(desired),
+            None => Err(Details::IntegerOverflow.into()),
+        }
     }
-    .into()
+
+    #[inline]
+    fn debit_bytes(&mut self, desired: usize) -> AvroResult<()> {
+        match self.remaining.checked_sub(desired) {
+            Some(remaining) => {
+                self.remaining = remaining;
+                Ok(())
+            }
+            None => Err(self.exceeded(desired)),
+        }
+    }
+
+    #[inline]
+    fn check_len(&self, len: usize) -> AvroResult<usize> {
+        if len <= self.limit {
+            Ok(len)
+        } else {
+            Err(self.exceeded(len))
+        }
+    }
+
+    #[cold]
+    fn exceeded(&self, desired: usize) -> Error {
+        Details::MemoryAllocation {
+            desired,
+            maximum: self.limit,
+        }
+        .into()
+    }
 }
 
 /// Reserve room for `more` items, growing geometrically as `Vec::reserve` does,
@@ -153,7 +195,7 @@ fn decode_with_budget<R: Read, S: Borrow<Schema>>(
     names: &HashMap<Name, S>,
     enclosing_namespace: &Namespace,
     reader: &mut R,
-    budget: &mut usize,
+    budget: &mut Budget,
 ) -> AvroResult<Value> {
     match *schema {
         Schema::Null => Ok(Value::Null),
@@ -242,13 +284,13 @@ fn decode_with_budget<R: Read, S: Borrow<Schema>>(
             Ok(Value::Double(f64::from_le_bytes(buf)))
         }
         Schema::Bytes => {
-            let len = decode_len(reader)?;
+            let len = budget.check_len(decode_len(reader)?)?;
             let mut buf = vec![0u8; len];
             reader.read_exact(&mut buf).map_err(Details::ReadBytes)?;
             Ok(Value::Bytes(buf))
         }
         Schema::String => {
-            let len = decode_len(reader)?;
+            let len = budget.check_len(decode_len(reader)?)?;
             let mut buf = vec![0u8; len];
             match reader.read_exact(&mut buf) {
                 Ok(_) => Ok(Value::String(
@@ -264,7 +306,7 @@ fn decode_with_budget<R: Read, S: Borrow<Schema>>(
             }
         }
         Schema::Fixed(FixedSchema { size, .. }) => {
-            let mut buf = vec![0u8; safe_len(size)?];
+            let mut buf = vec![0u8; budget.check_len(size)?];
             reader
                 .read_exact(&mut buf)
                 .map_err(|e| Details::ReadFixed(e, size))?;
@@ -280,7 +322,7 @@ fn decode_with_budget<R: Read, S: Borrow<Schema>>(
                     break;
                 }
 
-                debit_items::<Value>(budget, len)?;
+                budget.debit_items::<Value>(len)?;
                 debited += len;
                 let mut reserved_through = len.min(MAX_PREALLOCATED_ITEMS);
                 reserve_within(&mut items, reserved_through, debited);
@@ -311,7 +353,7 @@ fn decode_with_budget<R: Read, S: Borrow<Schema>>(
                     break;
                 }
 
-                debit_items::<(String, Value)>(budget, len)?;
+                budget.debit_items::<(String, Value)>(len)?;
                 let mut reserved_through = len.min(MAX_PREALLOCATED_ITEMS);
                 items.reserve(reserved_through);
                 for decoded in 0..len {
@@ -354,14 +396,14 @@ fn decode_with_budget<R: Read, S: Borrow<Schema>>(
                         index,
                         num_variants: variants.len(),
                     })?;
-                debit_items::<Value>(budget, 1)?;
+                budget.debit_items::<Value>(1)?;
                 let value =
                     decode_with_budget(variant, names, enclosing_namespace, reader, budget)?;
                 Ok(Value::Union(index as u32, Box::new(value)))
             }
             Err(Details::ReadVariableIntegerBytes(io_err)) => {
                 if let ErrorKind::UnexpectedEof = io_err.kind() {
-                    debit_items::<Value>(budget, 1)?;
+                    budget.debit_items::<Value>(1)?;
                     Ok(Value::Union(0, Box::new(Value::Null)))
                 } else {
                     Err(Details::ReadVariableIntegerBytes(io_err).into())
@@ -375,8 +417,8 @@ fn decode_with_budget<R: Read, S: Borrow<Schema>>(
             ..
         }) => {
             let fully_qualified_name = name.fully_qualified_name(enclosing_namespace);
-            debit_items::<(String, Value)>(budget, fields.len())?;
-            debit_bytes(budget, fields.iter().map(|field| field.name.len()).sum())?;
+            budget.debit_items::<(String, Value)>(fields.len())?;
+            budget.debit_bytes(fields.iter().map(|field| field.name.len()).sum())?;
             // Benchmarks indicate ~10% improvement using this method.
             let mut items = Vec::with_capacity(fields.len());
             for field in fields {
@@ -399,7 +441,7 @@ fn decode_with_budget<R: Read, S: Borrow<Schema>>(
                 let index = usize::try_from(raw_index)
                     .map_err(|e| Details::ConvertI32ToUsize(e, raw_index))?;
                 if (0..symbols.len()).contains(&index) {
-                    debit_bytes(budget, symbols[index].len())?;
+                    budget.debit_bytes(symbols[index].len())?;
                     let symbol = symbols[index].clone();
                     Value::Enum(raw_index as u32, symbol)
                 } else {

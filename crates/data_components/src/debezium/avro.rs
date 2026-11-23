@@ -30,7 +30,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use apache_avro::{Schema as AvroSchema, from_avro_datum, schema::Name, types::Value as AvroValue};
+use apache_avro::util::{DEFAULT_MAX_ALLOCATION_BYTES, max_allocation_bytes};
+use apache_avro::{
+    Schema as AvroSchema, decode_with_max_allocation, schema::Name, types::Value as AvroValue,
+};
 use arrow::datatypes::SchemaRef;
 use parking_lot::Mutex;
 use snafu::prelude::*;
@@ -115,6 +118,21 @@ static REGISTRY_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLo
 /// enforced independently of the HTTP client's own timeouts.
 const REGISTRY_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Bytes of decoded values a CDC Avro body may build per byte of the body, once past
+/// [`http_body_limit::RATIO_CHECK_FLOOR_BYTES`]. A one-byte nullable field decodes to
+/// under 150 bytes plus its name; items such as `null` decode from no input at all.
+const MAX_DECODED_BYTES_PER_BODY_BYTE: usize = 256;
+
+/// The decode budget for an Avro datum of `encoded_len` bytes:
+/// [`MAX_DECODED_BYTES_PER_BODY_BYTE`] times its length, at least
+/// [`http_body_limit::RATIO_CHECK_FLOOR_BYTES`] and at most apache-avro's per-datum limit.
+fn decode_budget(encoded_len: usize) -> usize {
+    encoded_len
+        .saturating_mul(MAX_DECODED_BYTES_PER_BODY_BYTE)
+        .max(http_body_limit::RATIO_CHECK_FLOOR_BYTES)
+        .min(max_allocation_bytes(DEFAULT_MAX_ALLOCATION_BYTES))
+}
+
 /// Options for decoding an Avro CDC body.
 #[derive(Debug, Clone, Default)]
 pub struct AvroDecodeOptions {
@@ -151,12 +169,14 @@ pub async fn parse_avro_change_events(
         return MissingSchemaSnafu.fail();
     };
 
-    let value =
-        from_avro_datum(schema.as_ref(), &mut std::io::Cursor::new(datum), None).map_err(|e| {
-            Error::DecodeDatum {
-                source: Box::new(e),
-            }
-        })?;
+    let value = decode_with_max_allocation(
+        schema.as_ref(),
+        &mut std::io::Cursor::new(datum),
+        decode_budget(datum.len()),
+    )
+    .map_err(|e| Error::DecodeDatum {
+        source: Box::new(e),
+    })?;
     let event = avro_value_to_change_event(&value)?;
     Ok(vec![event])
 }
@@ -546,6 +566,107 @@ mod tests {
         assert_eq!(events[0].payload.ts_ms, 42);
     }
 
+    #[test]
+    fn decode_budget_scales_with_the_body_between_the_floor_and_the_datum_limit() {
+        let floor = http_body_limit::RATIO_CHECK_FLOOR_BYTES;
+        let ceiling = max_allocation_bytes(DEFAULT_MAX_ALLOCATION_BYTES);
+        let ratio = MAX_DECODED_BYTES_PER_BODY_BYTE;
+        assert_eq!(decode_budget(1), floor);
+        assert_eq!(decode_budget(floor / ratio), floor);
+        assert_eq!(decode_budget(floor / ratio + 1), floor + ratio);
+        assert_eq!(decode_budget(ceiling / ratio - 1), ceiling - ratio);
+        assert_eq!(decode_budget(ceiling / ratio), ceiling);
+        assert_eq!(decode_budget(usize::MAX), ceiling);
+    }
+
+    #[test]
+    fn a_datum_decodes_within_the_budget_it_is_given() {
+        let limit = 1000 * size_of::<AvroValue>();
+        let nulls = AvroSchema::parse_str(r#"{"type": "array", "items": "null"}"#).expect("schema");
+        let block = |count: i64| {
+            let mut body = to_avro_datum(&AvroSchema::Long, AvroValue::Long(count)).expect("datum");
+            body.push(0);
+            body
+        };
+        let decoded = decode_with_max_allocation(&nulls, &mut &block(1000)[..], limit)
+            .expect("1000 null items fit");
+        assert_eq!(decoded, AvroValue::Array(vec![AvroValue::Null; 1000]));
+        let refused = decode_with_max_allocation(&nulls, &mut &block(1001)[..], limit)
+            .expect_err("1001 null items do not fit");
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "Unable to allocate {} bytes (maximum allowed: {limit})",
+                1001 * size_of::<AvroValue>()
+            )
+        );
+
+        let string = |len: usize| {
+            to_avro_datum(&AvroSchema::String, AvroValue::String("x".repeat(len))).expect("datum")
+        };
+        let decoded =
+            decode_with_max_allocation(&AvroSchema::String, &mut &string(limit)[..], limit)
+                .expect("a string as long as the limit fits");
+        assert_eq!(decoded, AvroValue::String("x".repeat(limit)));
+        let refused =
+            decode_with_max_allocation(&AvroSchema::String, &mut &string(limit + 1)[..], limit)
+                .expect_err("a string longer than the limit does not fit");
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "Unable to allocate {} bytes (maximum allowed: {limit})",
+                limit + 1
+            )
+        );
+    }
+
+    /// A body large enough to raise its budget past the floor decodes values
+    /// past the floor.
+    #[tokio::test]
+    async fn decodes_an_event_past_the_floor_when_its_body_is_large_enough() {
+        let schema = r#"{
+            "type": "record",
+            "name": "Envelope",
+            "fields": [
+                {"name": "after", "type": ["null", {
+                    "type": "record", "name": "Value",
+                    "fields": [{"name": "readings", "type": {"type": "array", "items": "long"}}]
+                }], "default": null},
+                {"name": "op", "type": "string"}
+            ]
+        }"#;
+        let readings = http_body_limit::RATIO_CHECK_FLOOR_BYTES / size_of::<AvroValue>() + 1;
+        let avro_schema = AvroSchema::parse_str(schema).expect("schema");
+        let mut record = Record::new(&avro_schema).expect("record");
+        record.put(
+            "after",
+            AvroValue::Union(
+                1,
+                Box::new(AvroValue::Record(vec![(
+                    "readings".to_string(),
+                    AvroValue::Array(vec![AvroValue::Long(1); readings]),
+                )])),
+            ),
+        );
+        record.put("op", AvroValue::String("c".into()));
+        let datum = to_avro_datum(&avro_schema, record).expect("datum");
+
+        let events = parse_avro_change_events(
+            &datum,
+            &AvroDecodeOptions {
+                avro_schema_json: Some(schema.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("parse");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].payload.after["readings"].as_array().map(Vec::len),
+            Some(readings)
+        );
+    }
+
     /// Arrays and maps longer than the decoder reserves up front still decode
     /// whole, item for item.
     #[tokio::test]
@@ -579,9 +700,7 @@ mod tests {
                     ("id".to_string(), AvroValue::Long(1)),
                     (
                         "tags".to_string(),
-                        AvroValue::Array(
-                            tags.iter().cloned().map(AvroValue::String).collect(),
-                        ),
+                        AvroValue::Array(tags.iter().cloned().map(AvroValue::String).collect()),
                     ),
                     (
                         "attrs".to_string(),
