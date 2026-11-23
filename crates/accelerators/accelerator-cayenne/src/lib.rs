@@ -5317,7 +5317,7 @@ impl CayenneAccelerator {
             data_dir: data_dir.to_string(),
             source: std::io::Error::other(error),
         };
-        let prefix = object_store::path::Path::from_url_path(config.url.path())
+        let prefix = cayenne::dataset_storage::object_key_of_url(&config.url)
             .map_err(|error| removal_failed(error.into()))?;
         let locations = config
             .store

@@ -428,7 +428,9 @@ pub async fn build_unmetered_object_store(
     } else if cayenne {
         // Cayenne keys objects by the URL's path decoded once (`state dir`, not
         // `state%20dir`), as it does in a local directory, so the `s3://` URL of
-        // a key it derives names the same object.
+        // a key it derives names the same object. Other features keep the path
+        // undecoded: their existing objects are stored under that prefix, and
+        // moving them needs a migration.
         let key = object_store::path::Path::from_url_path(url.path()).map_err(|source| {
             Error::ObjectStoreParse {
                 usage,

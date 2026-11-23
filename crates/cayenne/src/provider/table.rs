@@ -9779,7 +9779,7 @@ impl CayenneTableProvider {
             });
         }
 
-        ObjectStorePath::from_url_path(url.path()).map_err(|source| Error::ObjectStore {
+        crate::dataset_storage::object_key_of_url(&url).map_err(|source| Error::ObjectStore {
             operation: "resolve the object path of a data URL",
             table: self.table_metadata.table_name.clone(),
             source: source.into(),
@@ -10021,7 +10021,7 @@ impl CayenneTableProvider {
                 source,
             })?;
 
-        let prefix = ObjectStorePath::from_url_path(base_url.path())
+        let prefix = crate::dataset_storage::object_key_of_url(&base_url)
             .map_err(|source| Error::ObjectStore {
                 operation: "resolve the object path of a data URL",
                 table: self.table_metadata.table_name.clone(),

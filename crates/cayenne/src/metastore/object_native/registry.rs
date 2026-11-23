@@ -19,6 +19,7 @@ limitations under the License.
 use super::{Domain, NativeCatalogConfig, OpenSummary, ValueChange, invalid, position};
 use crate::{
     catalog::{CatalogError, CatalogResult, MetadataCatalog},
+    dataset_storage::object_key_of_url,
     metadata::CreateTableOptions,
 };
 use cayenne_metastore_actions::proto;
@@ -610,15 +611,8 @@ fn location_anchor(location: &str, prefix: &Path) -> Option<Arc<str>> {
     }
     let folder: Vec<_> = prefix.parts().collect();
     let folder = Path::from_iter(folder[..folder.len().checked_sub(1)?].iter().cloned());
-    // The anchor is the URL's serialized form, percent-encoded as every data path
-    // URL the catalog records or compares with it is.
-    (Path::from_url_path(url.path()).ok()? == folder)
-        .then(|| Arc::from(url.as_str().trim_end_matches('/')))
-}
-
-/// The object key `url` names: its path, percent-decoded once.
-fn object_key_of(url: &url::Url) -> Option<Path> {
-    Path::from_url_path(url.path()).ok()
+    // Percent-encoded, like the data path URLs it is compared with.
+    (object_key_of_url(&url).ok()? == folder).then(|| Arc::from(url.as_str().trim_end_matches('/')))
 }
 
 /// A new folder for dataset `name`: its slug and a fresh `UUIDv7`. A caller that
@@ -720,7 +714,7 @@ impl ObjectNativeCatalog {
     /// `…/<datasets>/<folder>/data` in this catalog's location whose folder is one
     /// [`new_dataset_folder`] makes for `name`.
     pub(super) fn folder_named_by(&self, name: &str, base_path: &str) -> Option<String> {
-        let key = object_key_of(&url::Url::parse(base_path).ok()?)?;
+        let key = object_key_of_url(&url::Url::parse(base_path).ok()?).ok()?;
         let rest = key
             .as_ref()
             .strip_prefix(self.datasets.as_ref())?
@@ -775,35 +769,31 @@ impl ObjectNativeCatalog {
     /// `datasets/<folder>/data`.
     #[must_use]
     pub fn holds_data_at(&self, path: &str) -> bool {
-        let in_datasets = match url::Url::parse(path) {
-            Ok(url) => {
-                // Opened at a location URL: the data must be under that URL, not
-                // under the same key prefix of another bucket.
-                if let Some(anchor) = self.anchor.as_deref()
-                    && !url
-                        .as_str()
-                        .strip_prefix(anchor)
-                        .is_some_and(|rest| rest.starts_with('/'))
-                {
-                    return false;
-                }
-                object_key_of(&url).and_then(|key| {
-                    key.as_ref()
-                        .strip_prefix(self.datasets.as_ref())
-                        .and_then(|rest| rest.strip_prefix('/'))
-                        .map(str::to_string)
-                })
-            }
-            Err(_) => path
+        let Ok(url) = url::Url::parse(path) else {
+            return path
                 .trim_matches('/')
                 .strip_prefix("datasets/")
-                .map(str::to_string),
+                .and_then(|rest| rest.split_once('/'))
+                .is_some_and(|(folder, rest)| {
+                    !folder.is_empty() && (rest == "data" || rest.starts_with("data/"))
+                });
         };
-        in_datasets
-            .as_deref()
-            .and_then(|rest| rest.split_once('/'))
-            .is_some_and(|(folder, rest)| {
-                !folder.is_empty() && (rest == "data" || rest.starts_with("data/"))
-            })
+        // Opened at a location URL: the data must be under that URL, not under
+        // the same key prefix of another bucket.
+        if let Some(anchor) = self.anchor.as_deref()
+            && !url
+                .as_str()
+                .strip_prefix(anchor)
+                .is_some_and(|rest| rest.starts_with('/'))
+        {
+            return false;
+        }
+        let Ok(key) = object_key_of_url(&url) else {
+            return false;
+        };
+        // `<folder>/data[/…]` under the datasets prefix.
+        key.prefix_match(&self.datasets).is_some_and(|mut rest| {
+            rest.next().is_some() && rest.next().is_some_and(|part| part.as_ref() == "data")
+        })
     }
 }

@@ -254,7 +254,7 @@ impl DatasetStorage {
     ) -> Result<Self, String> {
         let recorded = url::Url::parse(table_path)
             .map_err(|error| format!("data path '{table_path}' is not a URL: {error}"))?;
-        let prefix = Path::from_url_path(recorded.path())
+        let prefix = object_key_of_url(&recorded)
             .map_err(|error| format!("data path '{table_path}' has no object path: {error}"))?;
         let in_location = crate::metastore_layout::is_object_native_data_path(table_path);
         // A dataset in the object-native location is served by its location's
@@ -415,13 +415,24 @@ impl DatasetStorage {
         if authority != self.recorded_authority && authority != own {
             return Err(outside(&self.recorded_authority, location));
         }
-        Path::from_url_path(url.path())
+        object_key_of_url(&url)
             .map(Some)
             .map_err(|error| ObjectStoreError::Generic {
                 store: STORE_NAME,
                 source: Box::new(error),
             })
     }
+}
+
+/// The object key a data-path URL (`s3://bucket/…`, `file:///…`,
+/// `cayenne://<id>/…`) names: its path, percent-decoded once. Every data-path URL
+/// encodes each key part once, so a key with a space or a `%` round-trips.
+///
+/// # Errors
+///
+/// Returns an error if the decoded path is not a valid object key.
+pub fn object_key_of_url(url: &url::Url) -> Result<Path, object_store::path::Error> {
+    Path::from_url_path(url.path())
 }
 
 /// `location` relative to the dataset's `prefix`, as a user finds it under the
