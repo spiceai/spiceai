@@ -517,7 +517,18 @@ Per dataset, a **dataset entry** (name, partitions), and per table:
   `AddDeleteFiles`, `RemoveDeleteFiles{ids}` (the deletion-vector sweep) and
   `ClearDeleteFiles{seq_le: d}`, which is guarded by **coverage**: every live
   file, cold files included, whose `min_seq` is at most d has `applied_through`
-  of at least d, so no file can still hold a row those deletes hide.
+  of at least d, and no inline record, a seal's shadow included, holds a row
+  with `seq` at most d, so no file or record can still hold a row those deletes
+  hide.
+  - *Coverage includes inline rows.* A seal's shadow is an inline record, not a
+    file, and a later seal's delete is what hides a superseded shadow row. If a
+    clear dropped that delete while the shadow still held the row, recovery would
+    read the key twice. The clear waits for the checkpoint that moves the shadow
+    into a file. The mem-tier model met the same case in memory: after two
+    seals, its bake dropped the in-memory delete at the delete fence and served
+    the shadow row beside its replacement. The engine's bake prunes at the lowest
+    of that fence, the highest `seq` it folds and its cold-tier cap, which keeps
+    the delete.
   - *Clearing follows coverage, not one compaction.* A compaction that rewrites
     every file a delete could hide rows in clears it in its own record; otherwise
     a later record, such as a cold promotion, clears it once the rest are
@@ -627,7 +638,20 @@ deletion-vector metadata. This design changes neither allocation nor stamping.
 **What the rule guarantees.** Per-key visibility is unchanged: it compares one
 key's `seq`s in one table, so a row with data `seq` s is hidden by a delete with
 `seq ≥ s`, and a re-inserted row is visible iff its insert `seq` exceeds the
-delete's. Cross-key cutoffs within a table equal commit order: the seq-prefix
+delete's. Only the files in no file group read a reinsert `seq`, and only while
+the table has no file group, as today only the current snapshot does, and only
+while no protected snapshot exists. A re-inserted row is read from the newer
+file that holds it, so honoring the re-insert over an older file's version of
+the key would serve both. The shared key-delete pushdown also reads reinsert
+`seq`s, for every file, but only to decide which keys it may skip before the
+per-file filter; a key it keeps is still hidden or shown by that filter. That
+rule is also why a checkpoint's insert records need not be stamped at the
+checkpoint's own `seq`: no per-file filter honors a stamp while the snapshot it
+describes is live, and `mem-tier-late-stamp`, which stamps late, holds within
+its bounds.
+Leaving the insert records out altogether does fail (`mem-tier-no-insert-records`).
+A design that let group files honor a reinsert `seq` would make that stamp's
+order load-bearing. Cross-key cutoffs within a table equal commit order: the seq-prefix
 bake's cutoff, compaction's "clear deletes at or below the cutoff", the orphan
 deletion-vector sweep's floor, file-group fences, and the transaction begin
 token `sequence_high_water()`.
@@ -1113,7 +1137,14 @@ every request:
 - **Seal.** A seal writes the mem-tier's rows as an unpublished inline record,
   the *shadow*, which only recovery reads, and its tombstones as key deletion
   vectors. With the object-native metastore, its changes and the source
-  position it acknowledges commit as one record.
+  position it acknowledges commit as one record. The shadow's rows carry one
+  `seq`, reserved while the capture still holds the mem-tier, so every apply
+  after the capture deletes at a higher `seq`. A later seal acknowledges such
+  an apply, and the source does not re-deliver it, so its delete must hide the
+  shadow row after a restart. Reserving after the capture lets the shadow row
+  outrank that delete and leaves the key twice (`mem-tier-no-capture-reservation`,
+  replayed against the engine by
+  `mem_tier_model_replay_control_capture_reservation`).
 - **Checkpoint.** A checkpoint writes the same rows into a new protected
   snapshot (keyed tables) or into the current snapshot (position-based tables)
   and records the files in the manifest from the writer's record
@@ -2282,7 +2313,12 @@ one safeguard removed, which the checker must reject.
   statistics that exist only for live or retired files; and dataset drop and
   the deletion-vector sweep.
 - **I16** is checked by engine tests and a spicescript scenario, not by the
-  model ([The in-memory tier's seal and checkpoint](#the-in-memory-tiers-seal-and-checkpoint)).
+  model. The mem-tier model's "recovered reads match the source" catches a row
+  in both the shadow and a snapshot only while that row is visible: once a later
+  delete hides both copies, the reads still match. The model always commits the
+  shadow clear with the snapshot, and checking I16 itself needs a property over
+  the durable copies, with a control that separates the two
+  ([The in-memory tier's seal and checkpoint](#the-in-memory-tiers-seal-and-checkpoint)).
 
 ## Appendix: the store contract
 

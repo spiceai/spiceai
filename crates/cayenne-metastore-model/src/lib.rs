@@ -98,7 +98,10 @@ pub fn runs() -> Vec<Run> {
             mode: "mem-tier-seal-delete-only-no-early-stamp",
             bound: 3,
             seed: None,
-            failure: "recovered reads match the source",
+            // A late stamp never makes a row visible while the snapshot it
+            // describes is live, so this mutation must hold (see the mem-tier
+            // README).
+            failure: "",
         },
         Run {
             name: "dataset-lifecycle",
