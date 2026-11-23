@@ -820,8 +820,8 @@ front of the destination is out of scope.
   more durability than the commit that names it, so both use one tier. A local
   data file is written through a store that syncs the file and every directory
   the write created, with `sync_all` (`F_FULLFSYNC` on macOS), before the call
-  returns (`object_store_occ/src/durable_local.rs`, `DurableLocalFileSystem`):
-  the same tier as the metastore's [durable local writes](#the-write-path).
+  returns (`LocalConditionalPut::new_durable_keyed_by_absolute_path`,
+  `object_store_occ/src/local_conditional_put.rs`): the same tier as the metastore's [durable local writes](#the-write-path).
   `object_store` 0.14 adds the same syncs as an option (`with_fsync`). One
   local store for data and metastore, and whether its flushes survive a power
   loss, are an [open decision](#open-decisions).
@@ -1344,7 +1344,9 @@ the writer's process.
 
 - The sweep deletes a retired file no earlier than T after it first observes
   the removal, timed on the sweeping process's clock and kept in memory. A restart or takeover reads the retired set from the state and
-  restarts every timer, which only delays a delete.
+  restarts every timer, which only delays a delete. In the first version a
+  writer that restarts more often than T never reaches T, so its retired files
+  are not deleted until it stays up for T; a durable removal time is deferred.
 - Every instance confirms its heads about every 10 s, and a query
   starts from a head confirmed within S. So a query on any instance reads its
   files for at least T − S. One that runs longer may fail with the
@@ -1434,11 +1436,10 @@ the writer's process.
   lease fences every other writer's commit, so no commit can name a file the
   sweep deletes. The model checks this with the record and the lease alone
   (`data-files-intent`), and the floor is a backstop.
-- **Unfinished multipart uploads** under the table's prefix are aborted after
-  the same floor, counted from the time the store says each was initiated
-  (`ListMultipartUploads`, `AbortMultipartUpload`). A listing does not show
+- **Unfinished multipart uploads are not aborted.** A listing does not show
   them, they cost storage, and S3 Express directory buckets have no lifecycle
-  rule that would remove them.
+  rule that would remove them; aborting them is tracked in
+  [#16688](https://github.com/spiceai/spiceai/issues/16688).
 - **When it runs.** Once when the table opens, then at most once every 15
   minutes per table, started by the cleanup that follows a commit or by the
   maintenance tick. It does not run while the
@@ -2036,8 +2037,8 @@ committed file sets, CDC, and the data-file lifecycle.
 - **Code:** `crates/cayenne` (`dataset_storage.rs`, `provider/table.rs`,
   `provider/uncommitted_files.rs`, `provider/orphan_sweep.rs`,
   `provider/delete/vector_io.rs`, `metastore/object_native/`);
-  `object_store_occ` (`durable_local.rs`); `accelerators/accelerator-cayenne`
-  (placement, the multipart-upload abort); `runtime-state-location` (the
+  `object_store_occ` (`local_conditional_put.rs`); `accelerators/accelerator-cayenne`
+  (placement); `runtime-state-location` (the
   `cayenne_data` meter).
 - **Exit:** the spicescript scenario `object-native-data.yaml`, against the
   source and a variant with the flag off: every acknowledged append is counted

@@ -471,7 +471,9 @@ deleted object or a query within the retention fails.
   never by a listing or a prefix, and one record then forgets it. Its own
   retired entry does not block the delete; a live or prepared entry that names
   the key does. The timer is in memory: a restart restarts it from the retired
-  set, which only delays a delete.
+  set, which only delays a delete. A known limitation of the first version: a
+  writer that restarts more often than T never reaches T, so its retired files
+  are not deleted until it stays up for T. A durable removal time is deferred.
 - *Every instance polls its heads,* so a query on any instance, the writer's or
   another's, reads its files for at least T − S.
 - *Orphans* follow decision 1.12, not T_O.
