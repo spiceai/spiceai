@@ -1248,7 +1248,7 @@ impl EndpointOverrideCheck for ConfigEndpointGuard {
         match reason {
             Some(reason) => Err(iceberg::Error::new(
                 iceberg::ErrorKind::DataInvalid,
-                config_endpoint_refused_message(&self.component, key, endpoint, &reason),
+                config_endpoint_refused_message(&self.component, key, url.as_ref(), &reason),
             )),
             None => Ok(()),
         }
@@ -1258,19 +1258,29 @@ impl EndpointOverrideCheck for ConfigEndpointGuard {
 /// The REST catalog property that sets the OAuth2 token endpoint.
 const REST_CATALOG_PROP_OAUTH2_SERVER_URI: &str = "oauth2-server-uri";
 
+/// Names the refused endpoint by its origin only: the rest of a URL the
+/// catalog sent may carry credentials, and this message becomes the dataset
+/// status and a log line.
 fn config_endpoint_refused_message(
     component: &str,
     key: &str,
-    endpoint: &str,
+    endpoint: Option<&Url>,
     reason: &str,
 ) -> String {
+    let endpoint = endpoint
+        .map(Url::origin)
+        .filter(url::Origin::is_tuple)
+        .map_or_else(
+            || "an endpoint that is not a valid URL".to_string(),
+            |origin| format!("an endpoint on {:?}", origin.ascii_serialization()),
+        );
     let param_hint = if key == REST_CATALOG_PROP_OAUTH2_SERVER_URI {
         "set the `iceberg_oauth2_server_url` parameter to it"
     } else {
         "use it as the catalog URL in the Spicepod"
     };
     format!(
-        "The Iceberg catalog for {component} answered `GET /v1/config` with `{key}` set to {endpoint:?}, but {reason}, so no catalog request or credential is sent to it and the catalog cannot be read. If this endpoint is trusted, {param_hint}, or set `{}=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
+        "The Iceberg catalog for {component} answered `GET /v1/config` with `{key}` set to {endpoint}, but {reason}, so no catalog request or credential is sent to it and the catalog cannot be read. If this endpoint is trusted, {param_hint}, or set `{}=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
         url_table::ALLOW_PRIVATE_HOSTS_ENV
     )
 }
@@ -1764,8 +1774,8 @@ mod tests {
         use serde_json::{Value, json};
 
         /// Serves an Iceberg REST catalog whose `GET /v1/config` answers with
-        /// `overrides`. It lists namespace `db` at `/v1/namespaces` and at
-        /// `/sub/v1/namespaces`, and issues OAuth2 tokens.
+        /// `overrides`. It lists namespace `db` at `/v1/namespaces` and
+        /// `sub_db` at `/sub/v1/namespaces`, and issues OAuth2 tokens.
         async fn start_rest_catalog(overrides: impl FnOnce(&str) -> Value) -> String {
             start_rest_catalog_with_config(
                 |uri| json!({"defaults": {}, "overrides": overrides(uri)}),
@@ -1801,7 +1811,10 @@ mod tests {
                     }),
                 )
                 .route("/v1/namespaces", get(namespaces))
-                .route("/sub/v1/namespaces", get(namespaces));
+                .route(
+                    "/sub/v1/namespaces",
+                    get(|| async { Json(json!({"namespaces": [["sub_db"]]})) }),
+                );
             tokio::spawn(async move { axum::serve(listener, app).await });
             uri
         }
@@ -1821,14 +1834,14 @@ mod tests {
             HashMap::from([("token".to_string(), "bootstrap-token".to_string())])
         }
 
-        fn refusal(key: &str, endpoint: &str, reason: &str) -> String {
+        fn refusal(key: &str, origin: &str, reason: &str) -> String {
             let hint = if key == "uri" {
                 "use it as the catalog URL in the Spicepod"
             } else {
                 "set the `iceberg_oauth2_server_url` parameter to it"
             };
             format!(
-                "The Iceberg catalog for catalog 'ice' answered `GET /v1/config` with `{key}` set to {endpoint:?}, but {reason}, so no catalog request or credential is sent to it and the catalog cannot be read. If this endpoint is trusted, {hint}, or set `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg"
+                "The Iceberg catalog for catalog 'ice' answered `GET /v1/config` with `{key}` set to an endpoint on {origin:?}, but {reason}, so no catalog request or credential is sent to it and the catalog cannot be read. If this endpoint is trusted, {hint}, or set `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg"
             )
         }
 
@@ -1837,14 +1850,30 @@ mod tests {
         #[tokio::test]
         async fn a_catalog_uri_override_to_an_internal_host_is_refused_without_a_request() {
             let sentinel = start_sentinel().await;
+            let port = sentinel.port;
             let endpoints = [
-                sentinel.endpoint.clone(),
-                format!("http://localhost:{}", sentinel.port),
-                format!("http://[::ffff:127.0.0.1]:{}", sentinel.port),
-                "http://169.254.169.254/latest/meta-data".to_string(),
-                "http://10.0.0.5:8181".to_string(),
+                (
+                    sentinel.endpoint.clone(),
+                    format!("http://127.0.0.1:{port}"),
+                ),
+                (
+                    format!("http://localhost:{port}"),
+                    format!("http://localhost:{port}"),
+                ),
+                (
+                    format!("http://[::ffff:127.0.0.1]:{port}"),
+                    format!("http://[::ffff:7f00:1]:{port}"),
+                ),
+                (
+                    "http://169.254.169.254/latest/meta-data".to_string(),
+                    "http://169.254.169.254".to_string(),
+                ),
+                (
+                    "http://user:pass-secret@10.0.0.5:8181/catalog?api_key=key-secret".to_string(),
+                    "http://10.0.0.5:8181".to_string(),
+                ),
             ];
-            for endpoint in endpoints {
+            for (endpoint, origin) in endpoints {
                 let override_uri = endpoint.clone();
                 let catalog_uri = start_rest_catalog(move |_| json!({ "uri": override_uri })).await;
                 let err = list_namespaces(catalog_uri, token_props())
@@ -1853,7 +1882,7 @@ mod tests {
                 assert_eq!(err.kind(), iceberg::ErrorKind::DataInvalid, "{endpoint}");
                 assert_eq!(
                     err.message(),
-                    refusal("uri", &endpoint, INTERNAL),
+                    refusal("uri", &origin, INTERNAL),
                     "{endpoint}"
                 );
             }
@@ -1873,7 +1902,7 @@ mod tests {
                 .expect_err("an internal token endpoint override must be refused");
             assert_eq!(
                 err.message(),
-                refusal("oauth2-server-uri", &endpoint, INTERNAL)
+                refusal("oauth2-server-uri", &sentinel.endpoint, INTERNAL)
             );
             assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
         }
@@ -1893,7 +1922,7 @@ mod tests {
                 .expect_err("an internal token endpoint default must be refused");
             assert_eq!(
                 err.message(),
-                refusal("oauth2-server-uri", &endpoint, INTERNAL)
+                refusal("oauth2-server-uri", &sentinel.endpoint, INTERNAL)
             );
             assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
         }
@@ -1921,12 +1950,16 @@ mod tests {
             for (host, addrs, reason) in cases {
                 let _dns = ResolverOverride::set(host, addrs, false);
                 let endpoint = format!("http://{host}:{}", sentinel.port);
-                let override_uri = endpoint.clone();
+                let override_uri = format!(
+                    "http://user:secret@{host}:{}/path?token=secret",
+                    sentinel.port
+                );
                 let catalog_uri = start_rest_catalog(move |_| json!({ "uri": override_uri })).await;
                 let err = list_namespaces(catalog_uri, token_props())
                     .await
                     .expect_err("a catalog URI override resolving internally must be refused");
                 assert_eq!(err.message(), refusal("uri", &endpoint, reason), "{host}");
+                assert!(!err.message().contains("secret"), "{host}");
             }
             assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
         }
@@ -1938,7 +1971,7 @@ mod tests {
             let namespaces = list_namespaces(catalog_uri, token_props())
                 .await
                 .expect("an override on the catalog's own origin is followed");
-            assert_eq!(namespaces, vec![NamespaceIdent::new("db".to_string())]);
+            assert_eq!(namespaces, vec![NamespaceIdent::new("sub_db".to_string())]);
         }
 
         #[tokio::test]
