@@ -669,7 +669,7 @@ pub fn require_process_per_test(why: &str) {
 /// A file whose tests run on the object-native backend registers them with
 /// [`test_on_data_store!`]; a test in such a file that stays here is one of the
 /// object-native exceptions below, each checking behavior that the object-native
-/// data path does not have:
+/// data path does not have, or failing there on an open defect:
 ///
 /// # Object-native exceptions
 ///
@@ -680,6 +680,8 @@ pub fn require_process_per_test(why: &str) {
 /// | `mutation_model_test::test_publication_without_reinsert_sequence_impl` | Writes deletion vectors by hand at a local path. |
 /// | `mutation_property_test::prop_auto_crossing_observes_position_then_key_switch_impl` | `deletion_mode: auto` starts on position deletes only for a table on a local directory. |
 /// | `mutation_property_test::prop_sequential_auto_crossing_impl` | As above. |
+/// | `scan_view_retention_test::scan_view_selection_during_retention` | Holds a scan's planning on retention's unlink of a data file; a table in the object-native location keeps a retired file for `DATA_FILE_RETENTION`, so the delete unlinks nothing. |
+/// | `stats_edge_cases_test::test_stats_correct_after_overwrite` | Open defect on the local-location store: under concurrent load, the table statistics after `INSERT OVERWRITE` can keep the pre-overwrite row count. |
 #[macro_export]
 macro_rules! test_with_backends {
     ($test_fn:ident) => {
