@@ -70,7 +70,6 @@ impl MetadataCatalog for Domain {
         Ok(self
             .read()
             .await?
-            .reader
             .list_pending_write_back(table_id, limit, after))
     }
     async fn clear_pending_write_back(
@@ -97,7 +96,7 @@ impl MetadataCatalog for Domain {
             .await
     }
     async fn pending_write_back_count(&self, table_id: &str) -> CatalogResult<i64> {
-        self.read().await?.reader.pending_write_back_count(table_id)
+        self.read().await?.pending_write_back_count(table_id)
     }
     async fn init(&self) -> CatalogResult<()> {
         self.read().await?;
@@ -109,16 +108,16 @@ impl MetadataCatalog for Domain {
         Ok(())
     }
     async fn list_table_names(&self) -> CatalogResult<Vec<String>> {
-        Ok(self.read().await?.reader.list_table_names())
+        Ok(self.read().await?.list_table_names())
     }
     async fn get_table(&self, table_name: &str) -> CatalogResult<TableMetadata> {
-        self.read().await?.reader.get_table(table_name).await
+        self.read().await?.get_table(table_name).await
     }
     async fn get_sequence_number(&self, table_id: &str) -> CatalogResult<i64> {
-        self.read().await?.reader.get_sequence_number(table_id)
+        self.read().await?.get_sequence_number(table_id)
     }
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>> {
-        Ok(self.read().await?.reader.get_table_delete_files(table_id))
+        Ok(self.read().await?.get_table_delete_files(table_id))
     }
     async fn get_orphan_eligible_delete_files(
         &self,
@@ -126,14 +125,13 @@ impl MetadataCatalog for Domain {
         max_sequence: i64,
         limit: usize,
     ) -> CatalogResult<Vec<DeleteFile>> {
-        Ok(self.read().await?.reader.get_orphan_eligible_delete_files(
-            table_id,
-            max_sequence,
-            limit,
-        ))
+        Ok(self
+            .read()
+            .await?
+            .get_orphan_eligible_delete_files(table_id, max_sequence, limit))
     }
     async fn get_insert_records(&self, table_id: &str) -> CatalogResult<HashMap<Box<[u8]>, i64>> {
-        Ok(self.read().await?.reader.get_insert_records(table_id))
+        Ok(self.read().await?.get_insert_records(table_id))
     }
     async fn get_snapshot_sequence(
         &self,
@@ -143,28 +141,19 @@ impl MetadataCatalog for Domain {
         Ok(self
             .read()
             .await?
-            .reader
             .get_snapshot_sequence(table_id, snapshot_id))
     }
     async fn get_all_snapshot_sequences(
         &self,
         table_id: &str,
     ) -> CatalogResult<HashMap<String, i64>> {
-        Ok(self
-            .read()
-            .await?
-            .reader
-            .get_all_snapshot_sequences(table_id))
+        Ok(self.read().await?.get_all_snapshot_sequences(table_id))
     }
     async fn get_partitions(&self, table_id: &str) -> CatalogResult<Vec<PartitionMetadata>> {
-        Ok(self.read().await?.reader.get_partitions(table_id))
+        Ok(self.read().await?.get_partitions(table_id))
     }
     async fn get_table_statistics(&self, table_id: &str) -> CatalogResult<Option<TableStatistics>> {
-        self.read()
-            .await?
-            .reader
-            .get_table_statistics(table_id)
-            .await
+        self.read().await?.get_table_statistics(table_id).await
     }
     async fn get_snapshot_file_statistics(
         &self,
@@ -174,39 +163,30 @@ impl MetadataCatalog for Domain {
     ) -> CatalogResult<Option<SnapshotFileStatistics>> {
         self.read()
             .await?
-            .reader
             .get_snapshot_file_statistics(table_id, snapshot_id, file_path)
             .await
     }
     async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>> {
-        Ok(self.read().await?.reader.get_all_snapshot_files(table_id))
+        Ok(self.read().await?.get_all_snapshot_files(table_id))
     }
     async fn get_snapshot_files(
         &self,
         table_id: &str,
         snapshot_id: &str,
     ) -> CatalogResult<Vec<SnapshotFile>> {
-        Ok(self
-            .read()
-            .await?
-            .reader
-            .get_snapshot_files(table_id, snapshot_id))
+        Ok(self.read().await?.get_snapshot_files(table_id, snapshot_id))
     }
     async fn list_cold_tier_files(&self, table_id: &str) -> CatalogResult<Vec<ColdTierFile>> {
-        self.read()
-            .await?
-            .reader
-            .list_cold_tier_files(table_id)
-            .await
+        self.read().await?.list_cold_tier_files(table_id).await
     }
     async fn get_pk_index(&self, table_id: &str) -> CatalogResult<Option<(String, Vec<u8>)>> {
-        self.read().await?.reader.get_pk_index(table_id).await
+        self.read().await?.get_pk_index(table_id).await
     }
     async fn list_index_runs(&self, table_id: &str) -> CatalogResult<Vec<IndexRunRecord>> {
-        Ok(self.read().await?.reader.list_index_runs(table_id))
+        Ok(self.read().await?.list_index_runs(table_id))
     }
     async fn get_inlined_data(&self, table_id: &str) -> CatalogResult<Vec<InlinedData>> {
-        Ok(self.read().await?.reader.get_inlined_data(table_id))
+        Ok(self.read().await?.get_inlined_data(table_id))
     }
     async fn get_inlined_data_for_partition(
         &self,
@@ -216,27 +196,22 @@ impl MetadataCatalog for Domain {
         Ok(self
             .read()
             .await?
-            .reader
             .get_inlined_data_for_partition(table_id, partition_key))
     }
     async fn get_inlined_data_count(&self, table_id: &str) -> CatalogResult<i64> {
-        self.read().await?.reader.get_inlined_data_count(table_id)
+        self.read().await?.get_inlined_data_count(table_id)
     }
     async fn get_inlined_data_stats(&self, table_id: &str) -> CatalogResult<InlinedDataStats> {
-        self.read().await?.reader.get_inlined_data_stats(table_id)
+        self.read().await?.get_inlined_data_stats(table_id)
     }
     async fn get_inlined_deletes(&self, table_id: &str) -> CatalogResult<Vec<InlinedDelete>> {
-        Ok(self.read().await?.reader.get_inlined_deletes(table_id))
+        Ok(self.read().await?.get_inlined_deletes(table_id))
     }
     async fn get_published_inlined_deletes(
         &self,
         table_id: &str,
     ) -> CatalogResult<Vec<InlinedDelete>> {
-        Ok(self
-            .read()
-            .await?
-            .reader
-            .get_published_inlined_deletes(table_id))
+        Ok(self.read().await?.get_published_inlined_deletes(table_id))
     }
     async fn get_unpublished_inlined_delete_ids(
         &self,
@@ -245,11 +220,10 @@ impl MetadataCatalog for Domain {
         Ok(self
             .read()
             .await?
-            .reader
             .get_unpublished_inlined_delete_ids(table_id))
     }
     async fn table_storage_stats(&self, table_id: &str) -> CatalogResult<TableStorageStats> {
-        self.read().await?.reader.table_storage_stats(table_id)
+        self.read().await?.table_storage_stats(table_id)
     }
     async fn create_table(&self, options: CreateTableOptions) -> CatalogResult<String> {
         self.create_identified(
@@ -846,17 +820,15 @@ impl MetadataCatalog for Domain {
         inner.commit(batch).await
     }
     async fn verify_existing_stored_data_files(&self, table_name: &str) -> CatalogResult<()> {
-        let inner = self.read().await?;
-        let table = inner.reader.get_table(table_name).await?;
+        let reader = self.read().await?;
+        let table = reader.get_table(table_name).await?;
         crate::cayenne_catalog::verify_stored_data_files_in(
             &table,
             table.vortex_config.memory_mode,
             crate::metadata::SettingsChangeAction::KeepStored,
-            async { Ok(inner.reader.get_all_snapshot_sequences(&table.table_id)) },
+            async { Ok(reader.get_all_snapshot_sequences(&table.table_id)) },
             |snapshot_id| {
-                std::future::ready(Ok(inner
-                    .reader
-                    .get_snapshot_files(&table.table_id, &snapshot_id)))
+                std::future::ready(Ok(reader.get_snapshot_files(&table.table_id, &snapshot_id)))
             },
         )
         .await
@@ -1057,7 +1029,6 @@ impl MetadataCatalog for Domain {
         Ok(self
             .read()
             .await?
-            .reader
             .get_inlined_data_above_sequence(table_id, after_sequence))
     }
     async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()> {

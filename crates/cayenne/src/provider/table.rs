@@ -45283,37 +45283,24 @@ impl CayenneTableProvider {
         // wait for their commits. A row is written only while the live schema is
         // the one it was collected under, and evolution only widens the schema, so
         // a row read while the live schema equals `table_schema` before and after
-        // the read was collected under it. Otherwise evolution raced the read, and
-        // the read is repeated under the lock evolution holds. Footer I/O below
-        // stays outside the lock.
-        let read_persisted = || async {
-            self.catalog
-                .get_snapshot_file_statistics(
-                    &self.table_metadata.table_id,
-                    request.snapshot_id,
-                    &file_path,
-                )
-                .await
-                .ok()
-                .flatten()
-        };
-        let persisted = if written_since_open
-            || table_schema.as_ref() != self.table_schema().as_ref()
-        {
-            None
-        } else {
-            let unlocked = read_persisted().await;
-            if table_schema.as_ref() == self.table_schema().as_ref() {
-                unlocked
+        // the read was collected under it. A schema that changed during the read
+        // never returns to `table_schema`, so the row is not used. Footer I/O
+        // below stays outside the lock.
+        let persisted =
+            if written_since_open || table_schema.as_ref() != self.table_schema().as_ref() {
+                None
             } else {
-                let _guard = self.table_statistics_persistence_lock.lock().await;
-                if table_schema.as_ref() == self.table_schema().as_ref() {
-                    read_persisted().await
-                } else {
-                    None
-                }
-            }
-        };
+                self.catalog
+                    .get_snapshot_file_statistics(
+                        &self.table_metadata.table_id,
+                        request.snapshot_id,
+                        &file_path,
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|_| table_schema.as_ref() == self.table_schema().as_ref())
+            };
         if let Some(persisted) = persisted
             && persisted.file_size_bytes == file_size_bytes
             && let Some(restored) = crate::stats::restore_persisted_statistics(

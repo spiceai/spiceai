@@ -23,7 +23,7 @@ use super::{
     },
     Domain, Inner, NativeCatalogConfig, OpenSummary, Stop, ValueChange, fenced_message, invalid,
     refused_change_message,
-    slot::{PublishedState, StateSlot},
+    slot::StateSlot,
     subject,
 };
 use crate::{
@@ -162,18 +162,15 @@ impl Domain {
     /// The state for a read: as of the last change that returned, without
     /// waiting for one in progress ([`StateSlot::published`]). While nothing is
     /// published it waits for the state, and fails as the stopped log does.
-    pub(super) async fn read(&self) -> CatalogResult<PublishedState> {
-        loop {
-            if let Some(published) = self.inner.published() {
-                return Ok(published);
-            }
-            let inner = self.inner.take().await;
-            if let Some(stop) = inner.stop
-                && stop != (Stop::Fenced { reloaded: true })
-            {
-                return Err(inner.stopped(stop));
-            }
-            // Returning the lease of a log that serves reads publishes its state.
+    pub(super) async fn read(&self) -> CatalogResult<Arc<DatasetStateReader>> {
+        if let Some(published) = self.inner.published() {
+            return Ok(published);
+        }
+        // A returned lease of a log that serves reads holds the state it published.
+        let inner = self.inner.take().await;
+        match inner.stop {
+            None | Some(Stop::Fenced { reloaded: true }) => Ok(Arc::clone(&inner.reader)),
+            Some(stop) => Err(inner.stopped(stop)),
         }
     }
 
@@ -224,7 +221,7 @@ impl Domain {
                 available: Notify::new(),
                 reserved: std::sync::atomic::AtomicBool::new(false),
                 inner: Mutex::new(Some(inner)),
-                published: parking_lot::RwLock::new(None),
+                published: arc_swap::ArcSwapOption::empty(),
             }),
         })
     }
@@ -394,14 +391,41 @@ impl Inner {
         // Applied without a copy of the state. A refused record is a guard this
         // catalog's own checks should have caught, and leaves the state partly
         // changed, so the log stops until the process restarts.
-        if let Err(error) = self.reader.state.apply_in_place(&record) {
+        if let Err(error) = self.apply_record(&record, false) {
             self.stop = Some(Stop::Refused);
             let message = refused_change_message(&self.dataset, &error.to_string());
             tracing::error!("{message}");
             return Err(CatalogError::InvalidOperationNoSource { message });
         }
-        self.unpublished.push(record.clone());
         self.buffer(record).await
+    }
+
+    /// Apply `record` to the state, copying it first while it is published for
+    /// reads. With `restore`, a refused record leaves the state as it was;
+    /// without, it leaves it partly changed.
+    pub(super) fn apply_record(
+        &mut self,
+        record: &Record,
+        restore: bool,
+    ) -> cayenne_metastore_actions::state::Result<()> {
+        let state = &mut Arc::make_mut(&mut self.reader).state;
+        if restore {
+            state.apply(record)
+        } else {
+            state.apply_in_place(record)
+        }
+    }
+
+    /// Replace the state with `state`, read back from the log.
+    fn replace_state(&mut self, state: DatasetState) {
+        self.reader = Arc::new(
+            DatasetStateReader::from_state(
+                state,
+                Arc::clone(&self.reader.store),
+                self.reader.prefix.clone(),
+            )
+            .with_anchor(self.reader.anchor.clone()),
+        );
     }
 
     /// Set the commit time on the actions that keep one.
@@ -434,9 +458,8 @@ impl Domain {
     /// # Errors
     /// Returns an error when the catalog must be reopened.
     pub async fn sidecar_value(&self, key: &str) -> CatalogResult<Option<Vec<u8>>> {
-        let inner = self.read().await?;
-        Ok(inner
-            .reader
+        let reader = self.read().await?;
+        Ok(reader
             .state
             .positions
             .get(&(key.to_string(), String::new()))
@@ -447,10 +470,9 @@ impl Domain {
     /// # Errors
     /// Returns an error when the catalog must be reopened.
     pub async fn sidecar_counters(&self, key: &str) -> CatalogResult<Vec<(String, i64)>> {
-        let inner = self.read().await?;
+        let reader = self.read().await?;
         let start = (key.to_string(), "\0".to_string());
-        inner
-            .reader
+        reader
             .state
             .positions
             .range(start..)
@@ -886,7 +908,9 @@ impl Inner {
                     prefix.clone(),
                     config.retain_below_floor,
                 ))),
-                reader: DatasetStateReader::from_state(state, store, prefix).with_anchor(anchor),
+                reader: Arc::new(
+                    DatasetStateReader::from_state(state, store, prefix).with_anchor(anchor),
+                ),
                 writer,
                 stop: None,
                 recovering: false,
@@ -897,8 +921,6 @@ impl Inner {
                 staged_checkpoint: 0,
                 pending: Vec::new(),
                 immediate,
-                unpublished: Vec::new(),
-                republish: true,
             },
             opened,
         ))
@@ -997,8 +1019,7 @@ impl Inner {
             .await
             .map_err(invalid)?;
         let replayed = replay_state(opened)?;
-        self.reader.state = replayed.state;
-        self.republish = true;
+        self.replace_state(replayed.state);
         self.floor_state = replayed.floor_state;
         self.since_floor = replayed.since_floor;
         self.pending.clear();

@@ -17,7 +17,8 @@ limitations under the License.
 //! State slots and transaction reservations.
 
 use super::{super::state_reader::DatasetStateReader, Domain, Inner, Stop, subject};
-use parking_lot::{Mutex, RwLock};
+use arc_swap::ArcSwapOption;
+use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
@@ -31,15 +32,11 @@ pub(super) struct StateSlot {
     /// by the reservation.
     pub(super) reserved: std::sync::atomic::AtomicBool,
     /// The state as of the last lease returned while the log served reads, or
-    /// `None` while it serves none. Reads use it without taking the state, so a
+    /// `None` while it serves none. Reads load it without taking the state, so a
     /// read never waits for a lease holder's storage I/O, and never sees a change
     /// whose commit is still in flight: a commit applies its record to the
     /// lease's state, which is published only when the lease is returned.
-    pub(super) published: RwLock<Option<Arc<DatasetStateReader>>>,
-}
-/// The state a read sees: see [`StateSlot::published`].
-pub(super) struct PublishedState {
-    pub(super) reader: Arc<DatasetStateReader>,
+    pub(super) published: ArcSwapOption<DatasetStateReader>,
 }
 pub(super) struct StateLease<'a> {
     slot: &'a Arc<StateSlot>,
@@ -77,53 +74,36 @@ impl StateSlot {
     }
 
     /// The published state, unless a transaction across datasets holds the
-    /// reservation: its tables are read after it resolves, as every other
-    /// caller waits for it.
-    pub(super) fn published(&self) -> Option<PublishedState> {
+    /// reservation: its tables are read once it resolves, as every other caller
+    /// waits for it. A read that loaded the state just before a reservation
+    /// began sees the state from before the transaction's `Prepare`, which is
+    /// the state of a read ordered before the transaction.
+    pub(super) fn published(&self) -> Option<Arc<DatasetStateReader>> {
         if self.reserved.load(std::sync::atomic::Ordering::Acquire) {
             return None;
         }
-        self.published
-            .read()
-            .clone()
-            .map(|reader| PublishedState { reader })
+        self.published.load_full()
     }
 
     /// Publish `inner`'s state for reads, or withdraw it while the log serves
-    /// none. The records applied since the last publication are applied again
-    /// to the published copy, which is cloned only when a read still holds it.
-    fn publish(&self, inner: &mut Inner) {
-        let mut published = self.published.write();
+    /// none. The lease's state is shared, not copied: a change copies a shared
+    /// state first ([`Inner::apply_record`]), so a state that changed is never
+    /// the one already published, and a lease that changed nothing publishes
+    /// nothing.
+    fn publish(&self, inner: &Inner) {
         if !matches!(inner.stop, None | Some(Stop::Fenced { reloaded: true })) {
-            *published = None;
+            self.published.store(None);
             return;
         }
-        let unpublished = std::mem::take(&mut inner.unpublished);
-        let replayed = match published.as_mut() {
-            Some(current) if !inner.republish => {
-                let state = &mut Arc::make_mut(current).state;
-                unpublished
-                    .iter()
-                    .all(|record| state.apply_in_place(record).is_ok())
-            }
-            _ => false,
-        };
-        // A record that applied to the lease's state applies to the same state
-        // here, so only a replaced state is copied whole.
-        debug_assert!(
-            replayed || inner.republish || published.is_none(),
-            "a record applied to the catalog state did not apply to its published copy"
-        );
-        if !replayed {
-            *published = Some(Arc::new(inner.reader.clone()));
+        if self
+            .published
+            .load()
+            .as_ref()
+            .is_some_and(|published| Arc::ptr_eq(published, &inner.reader))
+        {
+            return;
         }
-        inner.republish = false;
-        debug_assert!(
-            published
-                .as_ref()
-                .is_some_and(|reader| reader.state == inner.reader.state),
-            "the published catalog state differs from the state it publishes"
-        );
+        self.published.store(Some(Arc::clone(&inner.reader)));
     }
 
     /// Wait for the reservation and hold it until the returned guard drops.

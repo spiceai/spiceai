@@ -49,7 +49,10 @@ struct OpenSummary {
     lease: u64,
 }
 struct Inner {
-    reader: DatasetStateReader,
+    /// Shared with the state published for reads until the next change, which
+    /// copies it first if it is still shared: a copy shares the state's
+    /// collections, so it costs what the change touches, not the state's size.
+    reader: Arc<DatasetStateReader>,
     writer: Writer,
     /// Why this log accepts no change, when it does not.
     stop: Option<Stop>,
@@ -77,12 +80,6 @@ struct Inner {
     /// Deletes the log's objects below its floor, off the commit path: at
     /// most one collection runs at a time, started after a checkpoint.
     collector: Arc<tokio::sync::Mutex<Collector>>,
-    /// The records applied to `reader.state` since it was last published for
-    /// reads ([`slot::StateSlot::published`]), oldest first.
-    unpublished: Vec<Record>,
-    /// `reader.state` was replaced rather than changed by records, so its next
-    /// publication copies it whole.
-    republish: bool,
 }
 
 /// Buffered changes for a set of tables. Actions on different tables commute,
