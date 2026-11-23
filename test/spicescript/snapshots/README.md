@@ -17,6 +17,7 @@ rewrites it). A script moves up to this directory once its bug is fixed.
 
 | Scenario | Bug |
 | --- | --- |
+| `cayenne-snapshot-position-deletes-moved-dir` | A Cayenne snapshot of a table with no primary key, restored with a different `cayenne_file_path`, serves the rows a `DELETE` removed before the snapshot: the deletion vectors still name the writer's data files (#16735). |
 | `cayenne-snapshot-reader-path-change` | A reader whose `cayenne_file_path` changes while the snapshot store is down stops answering until the store is back. |
 | `snapshot-source-moved-location` | A `file_format: snapshot` dataset moved to a location whose snapshot it cannot restore serves the previous location's rows (#16098). |
 | `snapshot-source-projected-publisher` | Snapshots of a publisher whose `refresh_sql` drops columns are served instead of refused, and newer snapshots are then rejected (#16099). |
