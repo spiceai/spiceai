@@ -47,6 +47,7 @@ mod messages_tests;
 #[cfg(feature = "models")]
 mod model_capability_tests;
 mod mtls;
+pub(crate) mod optional_json;
 mod response_outcome;
 mod routes;
 mod server_timing;
@@ -206,6 +207,7 @@ where
                             identity_source,
                             config.client_auth,
                             shutdown_notify.subscribe(),
+                            runtime_tls::TLS_HANDSHAKE_TIMEOUT,
                         );
                     }
                     None => {
@@ -262,10 +264,11 @@ fn process_tls_tcp_stream(
     identity_source: IdentitySource,
     client_auth: runtime_tls::ClientAuthEnforcement,
     on_shutdown: Receiver<()>,
+    handshake_timeout: Duration,
 ) {
     set_tcp_nodelay(&stream);
     tokio::spawn(async move {
-        match acceptor.accept(stream).await {
+        match runtime_tls::accept_within(&acceptor, stream, handshake_timeout).await {
             Ok(tls_stream) => {
                 // Pre-compute the per-connection mTLS identities
                 // (`ChannelIdentity` always; `MtlsPrincipal` only in
@@ -347,29 +350,37 @@ async fn handle_connection<S>(
     }
 }
 
+/// A TLS acceptor for the repository's test certificate.
+#[cfg(test)]
+pub(crate) fn test_tls_acceptor() -> TlsAcceptor {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+    let cert =
+        CertificateDer::from_pem_slice(include_bytes!("../../../../test/tls/spiced_cert.pem"))
+            .expect("the fixture is a PEM certificate");
+    let key = PrivateKeyDer::from_pem_slice(include_bytes!("../../../../test/tls/spiced_key.pem"))
+        .expect("the fixture is a PEM private key");
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .expect("the fixture certificate and key match");
+    TlsAcceptor::from(Arc::new(config))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{Router, routing::get};
-    use futures::future;
     use http::StatusCode;
     use std::time::Duration;
-    use tokio::{net::TcpListener, sync::watch, time::timeout};
+    use tokio::{io::AsyncReadExt, net::TcpListener, sync::watch, time::timeout};
 
     // Router that immediately responds with "ok"
     fn ok_router() -> Router {
         Router::new().route("/", get(|| async { "ok" }))
-    }
-
-    // Router that never responds (simulate a hanging request)
-    fn pending_router() -> Router {
-        Router::new().route(
-            "/",
-            get(|| async {
-                future::pending::<()>().await;
-                "pending"
-            }),
-        )
     }
 
     #[tokio::test]
@@ -421,6 +432,11 @@ mod tests {
             .expect("should complete shutdown notification");
     }
 
+    /// Shutdown is graceful: a request already being handled when the signal
+    /// arrives still gets its whole response, and the connection closes after
+    /// it. The handler reports when it has started, so the signal is sent while
+    /// the request is in flight on every run, rather than only when the server
+    /// happens to see the signal before it reads the request.
     #[tokio::test]
     async fn test_process_tcp_stream_graceful_shutdown() {
         // Bind a listener on a system assigned available port
@@ -430,35 +446,67 @@ mod tests {
         let addr = listener.local_addr().expect("to get local addr");
         let (shutdown_notify, shutdown_rx) = watch::channel(());
 
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let router = Router::new().route(
+            "/",
+            get({
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                move || {
+                    let started = Arc::clone(&started);
+                    let release = Arc::clone(&release);
+                    async move {
+                        started.notify_one();
+                        release.notified().await;
+                        "finished"
+                    }
+                }
+            }),
+        );
+
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("to accept connection");
-            process_tcp_stream(stream, pending_router(), shutdown_rx);
+            process_tcp_stream(stream, router, shutdown_rx);
+        });
+        let request = tokio::spawn(async move {
+            let response = build_test_http_client()
+                .get(format!("http://{addr}/"))
+                .send()
+                .await?;
+            let status = response.status();
+            Ok::<_, reqwest::Error>((status, response.text().await?))
         });
 
-        // the request handler will hang until the connection is closed
-        let request_completion_handle = tokio::spawn(async move {
-            let client = build_test_http_client();
-            client.get(format!("http://{addr}/")).send().await
-        });
-
-        assert_eq!(
-            shutdown_notify.receiver_count(),
-            1,
-            "Must be one active connection"
-        );
-        assert!(
-            !request_completion_handle.is_finished(),
-            "Request should not be completed"
-        );
-
-        // Verify that the shutdown will close the active request and drop all receivers
+        timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("the handler should start before shutdown is signalled");
         shutdown_notify.send(()).ok();
-        let _ = timeout(Duration::from_secs(5), request_completion_handle)
+        // Let the connection task see the signal while the handler is still
+        // waiting, so graceful shutdown begins with the request in flight.
+        tokio::task::yield_now().await;
+        assert!(
+            !request.is_finished(),
+            "shutdown must not cut off the request in flight"
+        );
+
+        release.notify_one();
+        let (status, body) = timeout(Duration::from_secs(5), request)
             .await
-            .expect("should complete request after shutdown");
-        timeout(Duration::from_secs(1), shutdown_notify.closed())
+            .expect("the request in flight should finish after shutdown")
+            .expect("the request task should not panic")
+            .expect("the request in flight should get its response");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "finished");
+
+        timeout(Duration::from_secs(5), shutdown_notify.closed())
             .await
-            .expect("should complete shutdown notification");
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the connection should close after its last response once shutdown is signalled; {} connection(s) still open",
+                    shutdown_notify.receiver_count()
+                )
+            });
     }
 
     /// A small `/v1/sql` result leaves the server as several short writes (the
@@ -512,6 +560,44 @@ mod tests {
                 .expect("to read the accepted socket options"),
             "the server must disable Nagle's algorithm on connections it accepts"
         );
+    }
+
+    #[tokio::test]
+    async fn a_client_that_never_completes_the_tls_handshake_is_disconnected() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("to create listener");
+        let addr = listener.local_addr().expect("to get local addr");
+        let (shutdown_notify, shutdown_rx) = watch::channel(());
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("to accept connection");
+            process_tls_tcp_stream(
+                stream,
+                test_tls_acceptor(),
+                ok_router(),
+                IdentitySource::Anonymous,
+                runtime_tls::ClientAuthEnforcement::Disabled,
+                shutdown_rx,
+                Duration::from_millis(200),
+            );
+        });
+
+        // Connects and never sends a `ClientHello`.
+        let mut silent = TcpStream::connect(addr).await.expect("to connect");
+        let mut buf = [0u8; 1];
+        let read = timeout(Duration::from_secs(5), silent.read(&mut buf))
+            .await
+            .expect("the server closes the connection once its handshake deadline passes");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "the server closes the connection without sending anything: {read:?}"
+        );
+        // The connection task holds a shutdown receiver until it ends, so a
+        // graceful shutdown does not wait for this connection.
+        timeout(Duration::from_secs(5), shutdown_notify.closed())
+            .await
+            .expect("the connection task ends");
     }
 
     fn build_test_http_client() -> reqwest::Client {

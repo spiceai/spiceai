@@ -108,6 +108,26 @@ fn release_asset(version: &str, what: &str, override_var: &str) -> Result<String
 }
 
 async fn download(version: &str, asset: &str, file: &str, override_var: &str) -> Result<String> {
+    // In a task of its own, so that a caller that stops waiting (a source
+    // start cancelled because another source failed) cannot leave a half-
+    // unpacked release in the cache for the next run to find.
+    let (version, asset, file, override_var) = (
+        version.to_string(),
+        asset.to_string(),
+        file.to_string(),
+        override_var.to_string(),
+    );
+    tokio::spawn(async move { download_to_cache(&version, &asset, &file, &override_var).await })
+        .await
+        .context("the DuckDB download task failed")?
+}
+
+async fn download_to_cache(
+    version: &str,
+    asset: &str,
+    file: &str,
+    override_var: &str,
+) -> Result<String> {
     // Matrix combinations can resolve the same release concurrently.
     static DOWNLOAD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _download = DOWNLOAD.lock().await;
@@ -119,6 +139,7 @@ async fn download(version: &str, asset: &str, file: &str, override_var: &str) ->
         let archive = dir.join(asset);
         let url = format!("https://github.com/duckdb/duckdb/releases/download/v{version}/{asset}");
         let status = tokio::process::Command::new("curl")
+            .args(crate::release::CURL_RELEASE_RETRY)
             .args(["-fsSL", "-o"])
             .arg(&archive)
             .arg(&url)

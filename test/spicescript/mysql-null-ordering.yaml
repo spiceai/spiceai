@@ -1,4 +1,5 @@
 name: mysql-null-ordering
+tags: [long]
 description: Numeric NULL placement and window ranking agree with PostgreSQL across federation and acceleration.
 sources:
   my: { kind: mysql }
@@ -7,6 +8,8 @@ variants:
   federated: {}
   postgres: { datasets: { e: { from: 'postgres:e', params: '${sources.pg.params}' } } }
   cayenne: { datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: { datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file } } }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
 spicepod:
   version: v1
   kind: Spicepod

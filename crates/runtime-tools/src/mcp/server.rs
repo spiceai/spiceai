@@ -24,7 +24,7 @@ use rmcp::{
         CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
         Implementation, ListResourceTemplatesRequestMethod, ListResourceTemplatesResult,
         ListResourcesRequestMethod, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
-        ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+        ProtocolVersion, ServerCapabilities, ServerConfig, Tool,
     },
     service::RequestContext,
 };
@@ -418,10 +418,12 @@ impl RuntimeServer {
             // expired page (`Runtime::get_tool`); using it here when a
             // listed spec exists would execute Zone after Streamable
             // HTTP authorized Region.
+            // A catalog's tool is resolved under the name it is exposed as, so it is named the
+            // same in its errors and `task_history` whichever path called it.
             if let Some(tool) = listed_gateway_spec(catalog.as_ref(), &name) {
                 return self.resolved_against_snapshot(
                     validated_schema.as_ref(),
-                    tool,
+                    with_name(&tool, &exposed_name),
                     exposed_name,
                     Some(catalog_name),
                 );
@@ -435,7 +437,7 @@ impl RuntimeServer {
             if let Some(tool) = catalog.get(&name).await {
                 return self.resolved_against_snapshot(
                     validated_schema.as_ref(),
-                    tool,
+                    with_name(&tool, &exposed_name),
                     exposed_name,
                     Some(catalog_name),
                 );
@@ -608,9 +610,9 @@ impl RuntimeServer {
 /// rmcp's Streamable HTTP transport runs `call_tool` on a session worker
 /// task (`tokio::spawn`) that does **not** inherit the task-local
 /// [`SpiceRequestContext`] installed by the HTTP `track_metrics` middleware.
-/// Without re-entering that context here, `current_principal_requires_read_only`
-/// sees no principal and treats the call as auth-disabled (writes allowed) —
-/// a privilege escalation for read-only API keys.
+/// Without re-entering that context here, the tool call sees no principal, so
+/// it is refused a read-write tool even for a read-write API key, and it would
+/// run under no identity of its own.
 ///
 /// Each `/v1/mcp` request carries its own `http::request::Parts` (injected by
 /// rmcp). Auth and metrics middleware stash the concrete
@@ -717,8 +719,18 @@ impl RuntimeServer {
             }
         };
 
-        // If possible, we pass the call through to the MCP server.
-        if let Some(mcp_proxy) = resolved.tool.as_mcp_proxy().await {
+        // If possible, we pass the call through to the MCP server, once the caller is
+        // authorized for the tool as `call` below would authorize it. A refusal is reported
+        // in-band, like any other failure to run the tool.
+        let mcp_proxy = match resolved.tool.authorized_mcp_proxy().await {
+            Ok(proxy) => proxy,
+            Err(denied) => {
+                return Ok(
+                    CallToolResult::error(vec![ContentBlock::text(denied.to_string())]).into(),
+                );
+            }
+        };
+        if let Some(mcp_proxy) = mcp_proxy {
             tracing::debug!("{tool_name} uses MCP. Will call directly");
 
             // `call_tool_once` forwards the whole MRTR request
@@ -787,8 +799,14 @@ impl RuntimeServer {
             }
         };
 
-        // Tools such as `sql` already return JSON as a string; re-encoding it
-        // would make clients parse the text into a string instead of the data.
+        // A tool that declares an `outputSchema` returns an object matching it, which MCP
+        // carries as `structuredContent` and, for clients that read only text, as JSON text.
+        if resolved.tool.output_schema().is_some() && result.is_object() {
+            return Ok(CallToolResult::structured(result).into());
+        }
+
+        // Tools such as `table_schema` return text; re-encoding it as JSON would make clients
+        // parse the text into a string instead of reading it.
         let text = match result {
             Value::String(text) => text,
             other => serde_json::to_string(&other)
@@ -800,8 +818,8 @@ impl RuntimeServer {
 }
 
 impl ServerHandler for RuntimeServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "Spice.ai Open Source",
                 env!("CARGO_PKG_VERSION"),
@@ -998,7 +1016,11 @@ fn mcp_tool_from_spice(name: impl Into<Cow<'static, str>>, tool: &dyn SpiceModel
     let description: Option<Cow<'static, str>> =
         tool.description().map(|s| Cow::Owned(s.into_owned()));
     let schema = to_map(tool.parameters().unwrap_or_else(empty_input_schema));
-    Tool::new_with_raw(name.into(), description, schema)
+    let definition = Tool::new_with_raw(name.into(), description, schema);
+    match tool.output_schema() {
+        Some(output_schema) => definition.with_raw_output_schema(Arc::new(to_map(output_schema))),
+        None => definition,
+    }
 }
 
 /// 1 MiB cap for a `tools/call` payload we will execute or forward.
@@ -1083,7 +1105,6 @@ fn tools_listed_by_name_vec(mut tools: Vec<Tool>) -> Vec<Tool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builtin::function_tool::current_principal_requires_read_only;
     use crate::catalog::SpiceToolCatalog;
     use rmcp::model::InputRequiredResult;
     use rmcp::service::ServiceError;
@@ -1104,10 +1125,11 @@ mod tests {
         fn parameters(&self) -> Option<Value> {
             None
         }
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Value::Null)
         }
     }
@@ -1192,10 +1214,11 @@ mod tests {
                 }
             }))
         }
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(json!({ "executed": "Zone" }))
         }
     }
@@ -1218,10 +1241,11 @@ mod tests {
                 }
             }))
         }
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(json!({ "executed": "Region" }))
         }
     }
@@ -2732,7 +2756,11 @@ mod tests {
                     }
                 }))
             }
-            async fn call(
+            fn access(&self) -> ::tools::ToolAccess {
+                ::tools::ToolAccess::ReadOnly
+            }
+
+            async fn run(
                 &self,
                 _arg: &str,
             ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
@@ -3199,8 +3227,8 @@ mod tests {
     struct SchemaLessServer;
 
     impl ServerHandler for SchemaLessServer {
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
                 .with_protocol_version(ProtocolVersion::V_2026_07_28)
         }
 
@@ -3322,8 +3350,9 @@ mod tests {
         );
     }
 
-    /// rmcp caches `get_tool == None`. A later registry update is invisible
-    /// until Streamable HTTP is rebuilt (the HTTP layer watches snapshot epoch).
+    /// rmcp looks a tool's schema up per request, so a tool registered after
+    /// a miss is validated by the existing Streamable HTTP service at once,
+    /// and by a service rebuilt when the snapshot epoch moves.
     #[tokio::test]
     async fn rebuilt_service_validates_after_tool_registers_following_a_miss() {
         let tools = Arc::new(RwLock::new(HashMap::new()));
@@ -3357,7 +3386,7 @@ mod tests {
         assert_ne!(
             json.pointer("/error/code").and_then(Value::as_i64),
             Some(-32020),
-            "a miss must skip HeaderMismatch so the cached None is load-bearing: {status} {json}"
+            "an unregistered tool has no schema, so a miss must skip HeaderMismatch: {status} {json}"
         );
         let epoch_after_miss = schemas.epoch();
 
@@ -3377,10 +3406,15 @@ mod tests {
 
         let (status, json) =
             post_tools_call(&service, "deploy", Some("us-west1"), "eu-west1").await;
-        assert_ne!(
+        assert_eq!(
+            status,
+            http::StatusCode::BAD_REQUEST,
+            "the existing StreamableHttpService must validate Mcp-Param once the tool appears: {status} {json}"
+        );
+        assert_eq!(
             json.pointer("/error/code").and_then(Value::as_i64),
             Some(-32020),
-            "the same StreamableHttpService must keep the cached miss: {status} {json}"
+            "expected HeaderMismatch (-32020) from the existing service, got {json}"
         );
 
         let rebuilt = rmcp::transport::streamable_http_server::StreamableHttpService::new(
@@ -3407,10 +3441,9 @@ mod tests {
         );
     }
 
-    /// rmcp caches `get_tool` per name. After `deploy` rewrites
-    /// `x-mcp-header` from `Region` to `Zone`, the existing
-    /// `StreamableHttpService` still validates `mcp-param-region`; a
-    /// rebuilt service validates `mcp-param-zone`.
+    /// rmcp looks a tool's schema up per request. After `deploy` rewrites
+    /// `x-mcp-header` from `Region` to `Zone`, both the existing
+    /// `StreamableHttpService` and a rebuilt one validate `mcp-param-zone`.
     #[tokio::test]
     async fn rebuilt_service_validates_after_same_name_schema_identity_change() {
         let mut tools = HashMap::new();
@@ -3475,10 +3508,9 @@ mod tests {
 
         let (status, json) =
             post_tools_call_param(&service, "deploy", "zone", Some("us-west1"), "us-west1").await;
-        assert_eq!(
-            json.pointer("/error/code").and_then(Value::as_i64),
-            Some(-32020),
-            "existing StreamableHttpService must still validate mcp-param-region: {status} {json}"
+        assert!(
+            status.is_success() && json.get("error").is_none(),
+            "the existing StreamableHttpService must validate mcp-param-zone after the schema rewrite: {status} {json}"
         );
 
         let rebuilt = rmcp::transport::streamable_http_server::StreamableHttpService::new(
@@ -3522,10 +3554,11 @@ mod tests {
         async fn as_mcp_proxy(&self) -> Option<&dyn McpProxy> {
             Some(self)
         }
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(json!({ "ok": true }))
         }
     }
@@ -3655,6 +3688,7 @@ mod tests {
 
     struct RecordingProxyTool {
         forwarded: std::sync::atomic::AtomicU64,
+        access: ::tools::ToolAccess,
     }
 
     #[async_trait::async_trait]
@@ -3671,10 +3705,11 @@ mod tests {
         async fn as_mcp_proxy(&self) -> Option<&dyn McpProxy> {
             Some(self)
         }
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            self.access
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(json!({ "ok": true }))
         }
     }
@@ -3702,6 +3737,7 @@ mod tests {
     async fn proxied_call_rejects_oversized_request_state_before_forward() {
         let tool = Arc::new(RecordingProxyTool {
             forwarded: std::sync::atomic::AtomicU64::new(0),
+            access: ::tools::ToolAccess::ReadOnly,
         });
         let mut tools = HashMap::new();
         tools.insert(
@@ -3784,10 +3820,10 @@ mod tests {
         );
     }
 
-    /// A proxied catalog TTL refresh used to update only the catalog
-    /// cache. Streamable HTTP kept validating `mcp-param-region` until a
-    /// gateway `tools/list`. Publishing the cache into the snapshot and
-    /// rebuilding the service validates `mcp-param-zone` without that list.
+    /// A proxied catalog TTL refresh publishes the catalog cache into the
+    /// snapshot. Streamable HTTP then validates `mcp-param-zone` without a
+    /// gateway `tools/list`, in the existing service (rmcp looks the schema
+    /// up per request) and in a rebuilt one.
     #[tokio::test]
     async fn rebuilt_service_validates_after_catalog_cache_schema_identity_change() {
         let exposed = encode_tool_name("srv", "deploy");
@@ -3855,10 +3891,9 @@ mod tests {
 
         let (status, json) =
             post_tools_call_param(&service, &exposed, "zone", Some("us-west1"), "us-west1").await;
-        assert_eq!(
-            json.pointer("/error/code").and_then(Value::as_i64),
-            Some(-32020),
-            "existing StreamableHttpService must still validate mcp-param-region: {status} {json}"
+        assert!(
+            status.is_success() && json.get("error").is_none(),
+            "the existing StreamableHttpService must validate mcp-param-zone after the catalog cache rewrite: {status} {json}"
         );
 
         let rebuilt = rmcp::transport::streamable_http_server::StreamableHttpService::new(
@@ -4327,17 +4362,19 @@ mod tests {
         fn parameters(&self) -> Option<Value> {
             Some(json!({"type": "object", "properties": {}}))
         }
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(json!({
-                "read_only": current_principal_requires_read_only().await
+                "read_only": !::tools::caller_can_write().await
             }))
         }
     }
 
-    /// Tool that refuses when the principal is read-only (mimics `sql` / `store_memory`).
+    /// A read-write tool, as an MCP server's tools and `store_memory` are: only a caller with
+    /// write access may call it, and it records whether it ran.
     struct WriteGatedTool;
 
     #[async_trait::async_trait]
@@ -4351,13 +4388,11 @@ mod tests {
         fn parameters(&self) -> Option<Value> {
             Some(json!({"type": "object", "properties": {}}))
         }
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-            if current_principal_requires_read_only().await {
-                return Err("read-only SQL context: write rejected".into());
-            }
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadWrite
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(json!({"wrote": true}))
         }
     }
@@ -4417,6 +4452,94 @@ mod tests {
     /// `request` as a real `/v1/mcp` request reaches rmcp: authenticated, here
     /// with a read-write API key. For tests of something other than auth, which
     /// would otherwise be refused for having no principal.
+    /// A tool that returns a tool result object, and declares its `outputSchema` or not.
+    struct RowsTool {
+        name: &'static str,
+        declares_schema: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl SpiceModelTool for RowsTool {
+        fn name(&self) -> Cow<'_, str> {
+            Cow::Borrowed(self.name)
+        }
+        fn description(&self) -> Option<Cow<'_, str>> {
+            None
+        }
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+        fn output_schema(&self) -> Option<Value> {
+            self.declares_schema.then(crate::result::result_schema)
+        }
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(json!({"columns": ["n"], "rows": [[1]]}))
+        }
+    }
+
+    /// A tool with an `outputSchema` lists it, and answers with its object as `structuredContent`
+    /// and the same JSON as its one text block, for clients that read only text. A tool without
+    /// one answers with the text alone.
+    #[tokio::test]
+    async fn a_tool_with_an_output_schema_answers_with_structured_content() {
+        let mut tools = HashMap::new();
+        for (name, declares_schema) in [("rows", true), ("plain_rows", false)] {
+            tools.insert(
+                name.to_string(),
+                Tooling::Tool(Arc::new(RowsTool {
+                    name,
+                    declares_schema,
+                }) as Arc<dyn SpiceModelTool>),
+            );
+        }
+        let service = mcp_http_service(RuntimeServer::new(Arc::new(RwLock::new(tools))));
+
+        let (status, listed) = post_tools_list(&service).await;
+        assert!(status.is_success(), "tools/list: {status} {listed}");
+        let output_schema = |name: &str| {
+            listed
+                .pointer("/result/tools")
+                .and_then(Value::as_array)
+                .and_then(|tools| tools.iter().find(|tool| tool["name"] == name))
+                .map(|tool| tool["outputSchema"].clone())
+        };
+        assert_eq!(output_schema("rows"), Some(crate::result::result_schema()));
+        assert_eq!(output_schema("plain_rows"), Some(Value::Null));
+
+        let object = json!({"columns": ["n"], "rows": [[1]]});
+        let text_of = |called: &Value| -> Value {
+            let content = called["result"]["content"]
+                .as_array()
+                .expect("content blocks");
+            assert_eq!(content.len(), 1, "{called}");
+            assert_eq!(content[0]["type"], "text", "{called}");
+            serde_json::from_str(content[0]["text"].as_str().expect("text")).expect("JSON text")
+        };
+
+        let (status, called) = post_tools_call_param(&service, "rows", "region", None, "x").await;
+        assert!(status.is_success(), "tools/call rows: {status} {called}");
+        assert_eq!(called["result"]["structuredContent"], object, "{called}");
+        assert_eq!(text_of(&called), object);
+        assert_ne!(called["result"]["isError"], json!(true), "{called}");
+
+        let (status, called) =
+            post_tools_call_param(&service, "plain_rows", "region", None, "x").await;
+        assert!(
+            status.is_success(),
+            "tools/call plain_rows: {status} {called}"
+        );
+        assert_eq!(
+            called["result"]["structuredContent"],
+            Value::Null,
+            "{called}"
+        );
+        assert_eq!(text_of(&called), object);
+    }
+
     fn authenticated<B>(mut request: http::Request<B>) -> http::Request<B> {
         insert_spice_ctx(&mut request, spice_ctx_with_api_key("test-key:rw"));
         request
@@ -4435,7 +4558,7 @@ mod tests {
         let restored = spice_request_context_from_http_parts(&parts)
             .expect("must restore RequestContext from Parts");
         let read_only = restored
-            .scope(async { current_principal_requires_read_only().await })
+            .scope(async { !::tools::caller_can_write().await })
             .await;
         assert!(
             read_only,
@@ -4450,7 +4573,7 @@ mod tests {
         let restored = spice_request_context_from_http_parts(&parts)
             .expect("must restore RequestContext from Parts");
         let read_only = restored
-            .scope(async { current_principal_requires_read_only().await })
+            .scope(async { !::tools::caller_can_write().await })
             .await;
         assert!(
             !read_only,
@@ -4469,7 +4592,7 @@ mod tests {
         let restored = spice_request_context_from_http_parts(&parts)
             .expect("must rebuild from AuthPrincipalRef");
         let read_only = restored
-            .scope(async { current_principal_requires_read_only().await })
+            .scope(async { !::tools::caller_can_write().await })
             .await;
         assert!(read_only, "rebuilt RO principal must require read-only");
     }
@@ -4631,18 +4754,87 @@ mod tests {
             http::StatusCode::OK,
             "MCP returns 200 with error payload: {json}"
         );
-        // A refused write is the tool's own failure, reported in its result.
+        // A refused call is reported in the tool's result, like any failure to run it.
         assert_eq!(
             json.pointer("/result/isError").and_then(Value::as_bool),
             Some(true),
             "RO key must reject write_gated tool; got {json}"
         );
-        assert!(
+        assert_eq!(
             json.pointer("/result/content/0/text")
-                .and_then(Value::as_str)
-                .is_some_and(|text| text.contains("read-only")),
+                .and_then(Value::as_str),
+            Some(READ_ONLY_KEY_REFUSAL_WRITE_GATED),
             "RO key must reject write_gated tool; got {json}"
         );
+    }
+
+    /// What a read-only key gets for `write_gated`.
+    const READ_ONLY_KEY_REFUSAL_WRITE_GATED: &str = "Failed to call tool 'write_gated': the tool can change data or act outside Spice, and the credentials on this request do not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth";
+
+    /// A server with one MCP pass-through tool of `access`, and the tool, to count what reached
+    /// the MCP server.
+    fn recording_proxy_server(
+        access: ::tools::ToolAccess,
+    ) -> (RuntimeServer, Arc<RecordingProxyTool>) {
+        let tool = Arc::new(RecordingProxyTool {
+            forwarded: std::sync::atomic::AtomicU64::new(0),
+            access,
+        });
+        let mut tools = HashMap::new();
+        tools.insert(
+            "ask".to_string(),
+            Tooling::Tool(Arc::clone(&tool) as Arc<dyn SpiceModelTool>),
+        );
+        (RuntimeServer::new(Arc::new(RwLock::new(tools))), tool)
+    }
+
+    /// The pass-through to an MCP server is held to the tool's access like `call` is: a
+    /// read-only key is refused a read-write MCP tool before anything reaches its server, and
+    /// a read-write key's call is forwarded.
+    #[tokio::test]
+    async fn mcp_pass_through_refuses_read_only_key_before_forwarding() {
+        let (server, tool) = recording_proxy_server(::tools::ToolAccess::ReadWrite);
+        let service = mcp_http_service(server);
+
+        let (status, json) = post_tools_call_with_spice_ctx(
+            &service,
+            "ask",
+            Some(spice_ctx_with_api_key("topsecret123")),
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::OK, "unexpected status: {json}");
+        assert_eq!(
+            json.pointer("/result/isError").and_then(Value::as_bool),
+            Some(true),
+            "RO key must be refused; got {json}"
+        );
+        assert_eq!(
+            json.pointer("/result/content/0/text")
+                .and_then(Value::as_str),
+            Some(
+                "Failed to call tool 'ask': the tool can change data or act outside Spice, and the credentials on this request do not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth"
+            ),
+            "got {json}"
+        );
+        assert_eq!(
+            tool.forwarded.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused call must not reach the MCP server"
+        );
+
+        let (status, json) = post_tools_call_with_spice_ctx(
+            &service,
+            "ask",
+            Some(spice_ctx_with_api_key("writer456:rw")),
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::OK, "unexpected status: {json}");
+        assert_ne!(
+            json.pointer("/result/isError").and_then(Value::as_bool),
+            Some(true),
+            "RW key must be forwarded; got {json}"
+        );
+        assert_eq!(tool.forwarded.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -4680,7 +4872,11 @@ mod tests {
                 "required": ["query"]
             }))
         }
-        async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             #[derive(serde::Deserialize)]
             struct Args {
                 query: String,
@@ -4709,16 +4905,20 @@ mod tests {
             "message": "Unknown tool: no_such_tool"
         });
 
+        // An unknown tool is a JSON-RPC protocol error answered in-band, in an
+        // HTTP 200: MCP's Streamable HTTP transport keeps 400 for a mismatched
+        // header, an unsupported protocol version or malformed `_meta`, and a
+        // client that gets a 400 may fall back to the legacy `initialize`.
         let (status, json) = post_tools_call_with_spice_ctx(
             &service,
             "no_such_tool",
             Some(spice_ctx_with_api_key("test-key:rw")),
         )
         .await;
-        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(status, http::StatusCode::OK, "{json}");
         assert_eq!(json.get("error"), Some(&expected), "{json}");
 
-        // A legacy session reports the same error, in an HTTP 200.
+        // A legacy session reports the same error, also in an HTTP 200.
         let session_id = initialize_legacy_mcp_session(&service).await;
         let (status, json) = post_legacy_tools_call_with_session(
             &service,

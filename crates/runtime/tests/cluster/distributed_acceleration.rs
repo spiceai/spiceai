@@ -1381,7 +1381,7 @@ fn make_named_scheduler_config_with_max_partitions_per_executor(
     ));
     SchedulerConfig {
         state_location: Some(format!(
-            "s3://spiceai-integration-tests/cluster-state/{test_name}/{run_id}/"
+            "s3://spiceai-ci-integration-tests/cluster-state/{test_name}/{run_id}/"
         )),
         params: Some(spicepod::param::Params::from_string_map(params)),
         partition_assignment_interval: "1s".to_string(),

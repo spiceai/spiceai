@@ -204,6 +204,114 @@ mod tests {
         Ok(())
     }
 
+    /// Timestamps at the edges of the `i64` range Arrow stores, the `9999-12-31` "no end
+    /// date" sentinel included, have to write to and read back from a Vortex file.
+    ///
+    /// The fork's `vortex.timestamp` once bounded its scalars by Jiff's calendar range, which
+    /// ends at 9999-12-30T22:00Z. Building a file's min/max statistics as scalars then failed
+    /// the whole write with "Invalid timestamp scalar … is outside the instants a timestamp
+    /// can represent", and a Cayenne dataset holding the sentinel never loaded. The filter
+    /// checks that pruning on an out-of-calendar statistic still keeps the matching rows.
+    #[rstest]
+    #[case::seconds(datafusion::arrow::datatypes::TimeUnit::Second, &[-377_705_116_800, -62_135_596_800, 253_402_214_400, 253_402_300_799])]
+    #[case::milliseconds(datafusion::arrow::datatypes::TimeUnit::Millisecond, &[-377_705_116_800_000, -62_135_596_800_000, 253_402_214_400_000, 253_402_300_799_999])]
+    #[case::microseconds(datafusion::arrow::datatypes::TimeUnit::Microsecond, &[-377_705_116_800_000_000, -62_135_596_800_000_000, 253_402_214_400_000_000, 253_402_300_799_999_999])]
+    #[case::nanoseconds(datafusion::arrow::datatypes::TimeUnit::Nanosecond, &[i64::MIN, -1, 0, i64::MAX])]
+    // Day counts past `i32` (2^32 days is the first that datetime parts would truncate to 0),
+    // so the write's compression has to keep these out of datetime parts.
+    #[case::seconds_past_i32_days(datafusion::arrow::datatypes::TimeUnit::Second, &[i64::MIN, -371_085_174_374_400, 371_085_174_374_400, i64::MAX])]
+    #[case::milliseconds_past_i32_days(datafusion::arrow::datatypes::TimeUnit::Millisecond, &[i64::MIN, -371_085_174_374_400_000, 371_085_174_374_400_000, i64::MAX])]
+    #[tokio::test]
+    async fn timestamps_at_the_type_limits_roundtrip_through_a_vortex_file(
+        #[case] unit: datafusion::arrow::datatypes::TimeUnit,
+        #[case] extremes: &[i64],
+    ) -> anyhow::Result<()> {
+        use std::sync::Arc;
+
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::array::PrimitiveArray;
+        use datafusion::arrow::array::RecordBatch;
+        use datafusion::arrow::array::cast::AsArray;
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::arrow::datatypes::Field;
+        use datafusion::arrow::datatypes::Int64Type;
+        use datafusion::arrow::datatypes::Schema;
+        use datafusion::dataframe::DataFrameWriteOptions;
+        use datafusion::datasource::listing::ListingOptions;
+        use datafusion::datasource::listing::ListingTable;
+        use datafusion::datasource::listing::ListingTableConfig;
+        use datafusion::datasource::listing::ListingTableUrl;
+
+        use crate::VortexFormat;
+
+        let ctx = TestSessionContext::default();
+        let ts_type = DataType::Timestamp(unit, None);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", ts_type.clone(), false),
+        ]));
+
+        // Enough ordinary rows around the extremes that the column is a real chunk with
+        // statistics, not a constant.
+        let mut values: Vec<i64> = (0..2000_i64).collect();
+        values.extend_from_slice(extremes);
+        let ids: Vec<i64> = (0..i64::try_from(values.len())?).collect();
+        let ts = datafusion::arrow::compute::cast(
+            &PrimitiveArray::<Int64Type>::from(values.clone()),
+            &ts_type,
+        )?;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(ids)), ts],
+        )?;
+
+        let format = Arc::new(VortexFormat::new(VortexSession::default()));
+        let config = ListingTableConfig::new(ListingTableUrl::parse("file:///ts_limits/")?)
+            .with_listing_options(ListingOptions::new(format))
+            .with_schema(Arc::clone(&schema));
+        ctx.session
+            .register_table("ts_limits", Arc::new(ListingTable::try_new(config)?))?;
+        ctx.session
+            .read_batch(batch)?
+            .write_table("ts_limits", DataFrameWriteOptions::new())
+            .await?;
+
+        let read_back = ctx
+            .session
+            .sql("SELECT arrow_cast(ts, 'Int64') FROM ts_limits ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+        let read: Vec<i64> = read_back
+            .iter()
+            .flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().to_vec())
+            .collect();
+        assert_eq!(read, values, "every stored instant reads back unchanged");
+
+        // A filter above the largest ordinary value keeps exactly the rows past it, so the
+        // file is not pruned on its out-of-calendar `max`.
+        let max = *extremes.iter().max().expect("extremes");
+        let above_ordinary = ctx
+            .session
+            .sql(&format!(
+                "SELECT count(*) FROM ts_limits \
+                 WHERE ts >= arrow_cast(arrow_cast({max}, 'Int64'), '{ts_type:?}')"
+            ))
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            above_ordinary[0]
+                .column(0)
+                .as_primitive::<Int64Type>()
+                .value(0),
+            1,
+            "the largest instant matches its own filter"
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_addition_pushdown() -> anyhow::Result<()> {
         let ctx = TestSessionContext::default();

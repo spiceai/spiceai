@@ -2,10 +2,11 @@ name: build_release
 
 # Builds the binaries. A release build is a dispatch with `release_version`
 # on the release branch: it builds every release binary, CUDA included, on
-# GitHub-hosted runners and keeps them as artifacts of this run with a
-# SHA256SUMS manifest. It creates no tag and publishes nothing. publish_release
-# publishes them after approval, and creates the release tag at the commit
-# this run built.
+# GitHub-hosted runners and keeps them, with the install scripts and a
+# SHA256SUMS manifest of them all, as artifacts of this run. Each of those files
+# gets a build provenance attestation. It creates no tag and publishes nothing.
+# publish_release publishes them after approval, and creates the release tag at
+# the commit this run built.
 on:
   push:
     # Release branches build for the same reason trunk does: the `build` job uploads
@@ -73,8 +74,21 @@ on:
           - 'release'
           - 'release-lto'
         default: 'release'
+      unhealthy_reason:
+        description: 'Release build only: why to build a commit whose trunk tests did not pass (a known flake, an infrastructure fault). Empty requires a green trunk-tests status on the commit.'
+        required: false
+        type: string
+        default: ''
+
+# Jobs that need more ask for it; setup-matrix reads only the event payload.
+permissions:
+  contents: read
 
 env:
+  # The CI cache's anonymous read URL (.github/ci-cache/README.md). setup-rust and
+  # install-cargo-deny read pinned downloads from it, falling back to the source; empty
+  # where the repository has no CI object store, which turns the cache off.
+  CI_CACHE_URL: ${{ vars.TEST_MINIO_ENDPOINT && format('{0}/ci-cache', vars.TEST_MINIO_ENDPOINT) || '' }}
   # Checked against version.txt by get_release_version.py; empty except on a release build.
   RELEASE_VERSION: ${{ inputs.release_version }}
   # CI performance optimizations
@@ -92,9 +106,75 @@ concurrency:
   cancel-in-progress: ${{ inputs.release_version && true || false }}
 
 jobs:
+  # A release is built only from a commit that passed the full post-merge
+  # suite: trunk_tests.yml posts a `trunk-tests` commit status on the exact
+  # commit it tested, for trunk and for each changed release branch head. The
+  # merge queue runs only the quick set, so a release branch commit can be
+  # green there and still fail the rest. Checked before any build, so a
+  # failure costs seconds, not hours. Test builds (no release_version) skip it.
+  release-health:
+    environment: secret-free
+    name: Release health
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read   # whether the commit has trunk_tests.yml
+      statuses: read   # its trunk-tests status
+    steps:
+      - name: Require a green trunk-tests status on the release commit
+        if: ${{ inputs.release_version != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref_name }}
+          REASON: ${{ inputs.unhealthy_reason }}
+        run: |
+          set -euo pipefail
+          # A commit without trunk_tests.yml predates the post-merge split: its
+          # own merge queue ran the full suite, so it needs no post-merge verdict.
+          # Absence counts only from a listing that succeeded; a lookup that
+          # fails must not exempt a release.
+          if ! workflows=$(gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows?ref=$SHA" -q '.[].name'); then
+            echo "::error::Could not list the workflows of commit $SHA, so cannot tell whether it needs a trunk-tests result. Re-run this job."
+            exit 1
+          fi
+          if ! grep -qx trunk_tests.yml <<<"$workflows"; then
+            echo "::notice::Commit $SHA predates trunk_tests.yml; its merge queue ran the full suite, so no trunk-tests result is required."
+            exit 0
+          fi
+          # The newest trunk-tests status posted by this repository's Actions,
+          # chosen by its own timestamp and id rather than the list's order.
+          status=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/statuses?per_page=100" \
+            -q '[.[] | select(.context == "trunk-tests" and .creator.login == "github-actions[bot]")] | sort_by(.created_at, .id) | last // empty | "\(.state) \(.target_url)"')
+          state=${status%% *}
+          url=${status#* }
+          if [ "$state" = success ]; then
+            echo "Commit $SHA passed trunk tests: $url"
+            exit 0
+          fi
+          if [ -z "$status" ]; then
+            problem="Commit $SHA has no trunk-tests result, so it has not been through the full post-merge suite. Run it with: gh workflow run trunk_tests.yml -f branch=$REF, then build again once it passes."
+          else
+            problem="Commit $SHA failed trunk tests ($state): $url. Fix the failure on $REF, or, if it is a known flake or infrastructure fault, build again with unhealthy_reason set."
+          fi
+          if [ -n "$REASON" ]; then
+            echo "::warning::Building release $RELEASE_VERSION anyway. $problem Reason given: $REASON"
+            {
+              echo "### Release built without a green trunk-tests result"
+              echo
+              echo "$problem"
+              echo
+              echo "**Reason given:** $REASON"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "::error::$problem"
+          exit 1
+
   setup-matrix:
     environment: secret-free
     name: Setup strategy matrix
+    needs: release-health
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
@@ -183,6 +263,16 @@ jobs:
                 return [];
               }
 
+              // The checksums job attests the release files as this workflow at the
+              // dispatched ref, and the install scripts accept only attestations made on a
+              // release branch, so a release build runs on one. Downstream repositories
+              // that merge this workflow attest nothing and keep their own branches.
+              const isSpiceaiRepo = context.repo.owner === 'spiceai' && context.repo.repo === 'spiceai';
+              if (isRelease && isSpiceaiRepo && !context.ref.startsWith('refs/heads/release/')) {
+                core.setFailed(`A release build runs on a release/* branch, not on '${context.ref}': the install scripts accept only release files attested on a release branch.`);
+                return [];
+              }
+
               // Filter by platform
               let filtered = matrix;
               if (platform_option !== 'all') {
@@ -222,8 +312,7 @@ jobs:
       cancel-in-progress: false
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
-      # Internal builds include PostgreSQL acceleration for benchmarks; release builds omit it.
-      SPICED_FEATURES: ${{ matrix.target.is_release && 'release,models' || 'release,models,postgres-accel' }}
+      SPICED_FEATURES: release,models
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       CARGO_NET_GIT_FETCH_WITH_CLI: true
@@ -242,18 +331,18 @@ jobs:
 
       - name: Install Visual Studio Build Tools
         if: matrix.target.target_os == 'windows'
-        uses: ./.github/actions/install-vs-buildtools
+        uses: $/.github/actions/install-vs-buildtools
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Set up make
         if: matrix.target.target_os == 'linux'
-        uses: ./.github/actions/setup-make
+        uses: $/.github/actions/setup-make
 
       - name: Set up cc
         if: matrix.target.target_os == 'linux'
-        uses: ./.github/actions/setup-cc
+        uses: $/.github/actions/setup-cc
 
       # The aarch64 runner does not have any tools pre-installed
       - name: Install missing tools (Linux aarch64)
@@ -360,7 +449,7 @@ jobs:
           echo "LIBRARY_PATH=$library_path" >> "$GITHUB_ENV"
 
       - name: Install protoc
-        uses: ./.github/actions/install-protoc
+        uses: $/.github/actions/install-protoc
 
       # Default flavor - build both spiced and spice CLI together (runtime not built on Windows - use WSL)
       - name: Build spiced and spice CLI
@@ -379,7 +468,7 @@ jobs:
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
         run: ./spiced --version
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -388,7 +477,7 @@ jobs:
       - name: Get RustFS credentials
         id: rustfs
         if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64'
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '21600'
@@ -396,7 +485,7 @@ jobs:
 
       - name: Upload spiced to Minio
         if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'default')
-        uses: ./.github/actions/upload-to-minio
+        uses: $/.github/actions/upload-to-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -423,7 +512,7 @@ jobs:
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc')
         run: ./spiced --version
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc')
         with:
           name: spiced_odbc_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -431,7 +520,7 @@ jobs:
 
       - name: Upload spiced_odbc to Minio
         if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'odbc')
-        uses: ./.github/actions/upload-to-minio
+        uses: $/.github/actions/upload-to-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -466,7 +555,7 @@ jobs:
         if: matrix.target.target_os == 'darwin'
         run: ./spiced --version
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: matrix.target.target_os == 'darwin'
         with:
           name: spiced_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -499,13 +588,13 @@ jobs:
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         run: ./spice.exe version
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -513,7 +602,7 @@ jobs:
 
       - name: Upload spice CLI to Minio
         if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'default')
-        uses: ./.github/actions/upload-to-minio
+        uses: $/.github/actions/upload-to-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -527,6 +616,9 @@ jobs:
   # build_and_release_cuda's own runs.
   build-cuda:
     name: Build CUDA binaries
+    # setup-matrix validates the release dispatch (the version, the filters, and the release/*
+    # branch), so a dispatch it rejects starts no CUDA build either.
+    needs: setup-matrix
     if: inputs.release_version
     permissions:
       contents: read
@@ -535,21 +627,42 @@ jobs:
       release_version: ${{ inputs.release_version }}
 
   # publish_release checks every artifact against this manifest before it
-  # publishes, and publishes exactly the files it lists. It finds this run by
-  # the manifest's artifact name, which carries the version. A release build
-  # that misses a binary fails here, so publish_release never finds it.
+  # publishes, and publishes exactly the files it lists, plus the manifest. It
+  # finds this run by the manifest's artifact name, which carries the version,
+  # so the manifest is uploaded last: a release build that misses a file, or
+  # whose attestations fail, never uploads it, and publish_release never finds it.
+  #
+  # Every file the manifest lists, and the manifest, get a build provenance
+  # attestation signed as this workflow on the release branch. The install
+  # scripts check a download against SHA256SUMS and, with the GitHub CLI, its
+  # attestation; anyone can run the same check (docs/DISTRIBUTIONS.md).
   checksums:
     environment: secret-free
-    name: Record release checksums
+    name: Record and attest release checksums
     needs: [build, build-cuda]
     if: inputs.release_version
     runs-on: ubuntu-24.04
-    permissions: {}
+    permissions:
+      # Checks out the install scripts.
+      contents: read
+      # Signs the attestations with this run's OIDC identity, and stores them.
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+      # The install scripts are published as they are at the built commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: source
+          sparse-checkout: install
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: release
           merge-multiple: true
+
+      - name: Add the install scripts
+        run: cp source/install/install.sh source/install/install-spiced.sh source/install/Install.ps1 release/
 
       - name: Write SHA256SUMS
         working-directory: release
@@ -557,6 +670,9 @@ jobs:
           set -euo pipefail
           # The ODBC build is for internal testing and has never been a release asset.
           assets=(
+            install.sh
+            install-spiced.sh
+            Install.ps1
             spice_linux_x86_64.tar.gz
             spice_linux_aarch64.tar.gz
             spice_darwin_aarch64.tar.gz
@@ -582,7 +698,30 @@ jobs:
           sha256sum "${assets[@]}" > SHA256SUMS
           cat SHA256SUMS
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      # Downstream repositories that merge this workflow publish their own way.
+      - name: Attest every file SHA256SUMS lists
+        if: github.repository == 'spiceai/spiceai'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: release/SHA256SUMS
+
+      - name: Attest SHA256SUMS
+        if: github.repository == 'spiceai/spiceai'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/SHA256SUMS
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-v${{ inputs.release_version }}-install-scripts
+          path: |
+            release/install.sh
+            release/install-spiced.sh
+            release/Install.ps1
+          if-no-files-found: error
+
+      # Last: its artifact marks the run as a complete release build.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-v${{ inputs.release_version }}-sha256sums
           path: release/SHA256SUMS

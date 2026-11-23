@@ -1,4 +1,5 @@
 name: views
+tags: [long]
 description: >
   Views answer as their SQL does over the source tables: a join across
   datasets, a view over another view, several views over one dataset, and an
@@ -12,6 +13,12 @@ sources:
 
 matrix:
   engine: [cayenne]
+
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
 
 spicepod:
   version: v1

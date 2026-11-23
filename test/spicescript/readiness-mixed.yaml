@@ -1,4 +1,5 @@
 name: readiness-mixed
+tags: [long]
 description: >
   Datasets with different ready_state settings in one runtime each follow
   their own: while their slow first loads run, the on_registration dataset
@@ -11,6 +12,8 @@ sources:
 
 variants:
   cayenne: {}
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1

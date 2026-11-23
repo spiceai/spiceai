@@ -33,8 +33,8 @@ limitations under the License.
 use crate::common;
 
 use arrow::datatypes::{DataType, Field, Schema};
+use cayenne::MetadataCatalog;
 use cayenne::metadata::{CreateTableOptions, DeleteFile, DeletionType, PartitionMetadata};
-use cayenne::{CayenneCatalog, MetadataCatalog};
 use common::TestFixture;
 use std::sync::Arc;
 
@@ -65,7 +65,7 @@ fn create_test_schema() -> Arc<Schema> {
 }
 
 async fn create_partitioned_table(
-    catalog: &Arc<CayenneCatalog>,
+    catalog: &Arc<impl MetadataCatalog + ?Sized>,
     table_name: &str,
     base_path: &str,
 ) -> TestResult<String> {

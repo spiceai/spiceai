@@ -1,4 +1,5 @@
 name: postgres-cdc-shared-slot
+tags: [long]
 description: >
   Datasets that name the same PostgreSQL replication slot share one replication
   connection, beside a dataset on its own slot, and each follows its own table
@@ -14,6 +15,12 @@ sources:
 # The rejoin order after a restart is not fixed; repeat to vary it.
 matrix:
   run: [1, 2, 3]
+
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
 
 spicepod:
   version: v1

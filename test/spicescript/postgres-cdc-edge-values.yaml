@@ -1,4 +1,5 @@
 name: postgres-cdc-edge-values
+tags: [long]
 description: >
   The boundary values of each type (as in edge-values.yaml) arriving through
   PostgreSQL CDC rather than the initial snapshot: inserted, then rotated
@@ -16,6 +17,8 @@ matrix:
 variants:
   cayenne: {}
   cayenne-memory: { datasets: { '*': { acceleration: { mode: memory } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1

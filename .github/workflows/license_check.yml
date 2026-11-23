@@ -42,6 +42,10 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   # Required check, so it runs on every merge-queue entry (merge_group can't
   # path-filter). Dependency licenses are the gate here; running
@@ -64,10 +68,12 @@ jobs:
           persist-credentials: false
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
+      # The release pinned in .github/ci-cache/pins.json, from the CI cache or GitHub,
+      # rather than a build from source on every run.
       - name: Install cargo-deny
-        run: cargo install cargo-deny --version 0.19.6 --locked --force
+        uses: $/.github/actions/install-cargo-deny
 
       - name: Check Rust Licenses
         run: cargo deny check licenses

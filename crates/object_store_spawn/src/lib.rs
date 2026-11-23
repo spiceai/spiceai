@@ -17,23 +17,35 @@ limitations under the License.
 //! An `object_store` [`HttpConnector`] that performs request I/O on a dedicated Tokio runtime.
 //!
 //! Use it in place of `object_store::client::SpawnedReqwestConnector`. Both run each request on
-//! the given runtime and pass the response body back over an unbounded channel. This connector
-//! stops reading the body at its first error. Once a body outlives the request timeout
-//! (`ClientOptions::with_timeout`), reqwest returns a new timeout error on every later poll, so a
-//! task that forwards frames until the body ends never stops: it fills the channel with errors
-//! as fast as it can allocate them until the reader drops the body, which `object_store` does
-//! only after its retry backoff and the retry request complete.
+//! the given runtime and pass the response body back to the reader over a channel. Two things
+//! differ:
+//!
+//! - **The body is read at most [`RESPONSE_READ_AHEAD_BYTES`] ahead of its reader.** The
+//!   `object_store` connector drains every body into an unbounded channel as fast as the network
+//!   delivers it, so a reader slower than the network (a scan whose downstream is busy, a client
+//!   fetching results slowly) holds the difference in memory, up to the whole object, for every
+//!   response at once. Here the request task waits for the reader before it reads further, so the
+//!   network is paced by the reader, as it is on a connector that does not spawn: the response
+//!   stays in the socket and the sender's buffers rather than in this process.
+//! - **The body stops at its first error.** Once a body outlives the request timeout
+//!   (`ClientOptions::with_timeout`), reqwest returns a new timeout error on every later poll, so
+//!   a task that forwards frames until the body ends never stops: it fills the channel with
+//!   errors as fast as it can allocate them until the reader drops the body, which
+//!   `object_store` does only after its retry backoff and the retry request complete.
 //!
 //! [`SpawnedReqwestConnector::with_destination_guard`] additionally refuses redirects to, and
 //! connections to, the destinations a [`DestinationGuard`] blocks.
 
 mod guard;
 
-pub use guard::{DestinationGuard, DestinationRefused};
+pub use guard::{
+    DestinationGuard, DestinationRefused, REDIRECT_CHAIN_REFUSED, redirect_continues_off_origin,
+};
 
 use std::{
     future::poll_fn,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -50,9 +62,31 @@ use object_store::{
 use snafu::Snafu;
 use tokio::{
     runtime::Handle,
-    sync::{mpsc, oneshot},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     task::JoinHandle,
 };
+
+/// How far the request task reads a response body ahead of the reader, in bytes.
+///
+/// Enough to keep the network busy while the reader works through what it has, and small
+/// enough that a reader that stops reading holds no more than this per response. The task
+/// holds at most one more frame while it waits for room, and a frame is no larger than one
+/// read from the connection.
+pub const RESPONSE_READ_AHEAD_BYTES: usize = 8 * 1024 * 1024;
+
+/// What a frame costs against [`RESPONSE_READ_AHEAD_BYTES`]: its data, and at least one byte
+/// so the number of queued frames is bounded too. A frame larger than the whole budget waits
+/// until the reader has taken everything before it.
+fn read_ahead_cost(frame: &Result<Frame<Bytes>, HttpError>) -> u32 {
+    let bytes = frame
+        .as_ref()
+        .ok()
+        .and_then(Frame::data_ref)
+        .map_or(1, |data| data.len().max(1));
+    u32::try_from(bytes.min(RESPONSE_READ_AHEAD_BYTES)).unwrap_or(u32::MAX)
+}
+
+type QueuedFrame = (Result<Frame<Bytes>, HttpError>, OwnedSemaphorePermit);
 
 /// [`HttpConnector`] that sends every request with `reqwest` on `runtime`.
 #[derive(Debug)]
@@ -106,8 +140,11 @@ impl HttpService for SpawnService {
     async fn call(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
         let client = self.client.clone();
         let (parts_tx, parts_rx) = oneshot::channel();
-        // Unbounded so that a slow reader never stalls I/O on `runtime`.
-        let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+        // Bounded in bytes rather than frames: every queued frame holds permits from
+        // `read_ahead` until the reader takes it. The task waits for permits without
+        // blocking `runtime`, so other requests' I/O carries on while this one waits.
+        let read_ahead = Arc::new(Semaphore::new(RESPONSE_READ_AHEAD_BYTES));
+        let (frames_tx, frames_rx) = mpsc::unbounded_channel::<QueuedFrame>();
 
         let worker = AbortOnDrop(self.runtime.spawn(async move {
             let response = match client.execute(req).await {
@@ -123,7 +160,15 @@ impl HttpService for SpawnService {
             }
             while let Some(frame) = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
                 let failed = frame.is_err();
-                if frames_tx.send(frame).is_err() || failed {
+                // The semaphore is never closed, and the receiver going away aborts this
+                // task, so a failed acquire only ends a body nobody is reading.
+                let Ok(permit) = Arc::clone(&read_ahead)
+                    .acquire_many_owned(read_ahead_cost(&frame))
+                    .await
+                else {
+                    return;
+                };
+                if frames_tx.send((frame, permit)).is_err() || failed {
                     return;
                 }
             }
@@ -143,9 +188,10 @@ impl HttpService for SpawnService {
     }
 }
 
-/// Response body fed by the request task. Dropping it aborts the task.
+/// Response body fed by the request task. Taking a frame returns its read-ahead permits to the
+/// task; dropping the body aborts the task.
 struct SpawnedBody {
-    frames: mpsc::UnboundedReceiver<Result<Frame<Bytes>, HttpError>>,
+    frames: mpsc::UnboundedReceiver<QueuedFrame>,
     _worker: AbortOnDrop,
 }
 
@@ -157,7 +203,9 @@ impl Body for SpawnedBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, HttpError>>> {
-        self.frames.poll_recv(cx)
+        self.frames
+            .poll_recv(cx)
+            .map(|queued| queued.map(|(frame, _permit)| frame))
     }
 }
 

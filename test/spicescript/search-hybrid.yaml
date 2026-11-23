@@ -1,4 +1,5 @@
 name: search-hybrid
+tags: [long]
 description: >
   Search on Cayenne beyond single queries: rrf fuses text_search and
   vector_search into exactly the documents either finds; a text_search
@@ -9,6 +10,12 @@ description: >
 
 sources:
   src: { kind: postgres }
+
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
 
 spicepod:
   version: v1

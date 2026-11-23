@@ -1,4 +1,5 @@
 name: results-cache
+tags: [long]
 description: >
   The SQL results cache answers a repeated query from the cache (case and
   whitespace aside), empty answers included but not statements about the
@@ -13,6 +14,12 @@ sources:
 
 matrix:
   role: [server, sidecar]
+
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
 
 spicepod:
   version: v1

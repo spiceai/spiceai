@@ -10,6 +10,8 @@ description: >
 sources:
   api: { kind: mock-http }
 
+# `refresh_mode: caching` fails to load with `runtime.params.cayenne_vnext`
+# enabled, so there is no object-native variant.
 variants:
   cayenne: {}
 

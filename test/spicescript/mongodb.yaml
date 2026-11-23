@@ -1,4 +1,5 @@
 name: mongodb
+tags: [long]
 description: >
   The MongoDB connector against a replica set: a collection answers the
   corpus as PostgreSQL does over the same rows, federated (filters, ORDER BY
@@ -22,6 +23,9 @@ variants:
   federated: {}
   cayenne: { datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
   cayenne-changes:
+    datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: _id } } }
+  cayenne-changes-object-native:
+    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
     datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: _id } } }
 
 spicepod:

@@ -70,7 +70,7 @@ impl GoogleMetadataIdentity {
     ///
     /// When the HTTP client cannot be built.
     pub fn new(base_url: impl Into<String>, audience: impl Into<String>) -> Result<Self, String> {
-        let http = reqwest::Client::builder()
+        let http = http_retry::client_builder()
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)

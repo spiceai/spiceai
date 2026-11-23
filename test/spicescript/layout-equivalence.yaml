@@ -1,4 +1,5 @@
 name: layout-equivalence
+tags: [long]
 description: >
   How Cayenne lays data out never changes an answer: sorted, sharded,
   partitioned, indexed, and cold-tiered (to an S3-compatible bucket)
@@ -16,6 +17,7 @@ matrix:
 
 variants:
   baseline: {}
+  object-native: object-native
   sorted:
     datasets: { facts: { acceleration: { params: { cayenne_sort_columns: 'grp,ts' } } } }
   sharded:

@@ -51,15 +51,14 @@ pub const CHBENCH_TABLES: &[&str] = &[
 /// SSB fixtures.
 pub fn ensure_chbench_fixture(out_dir: &Path, warehouses: i64) {
     let revision = super::generator_revision(include_str!("chbench_data.rs"));
-    if super::fixture_is_current(out_dir, &revision) {
-        return;
-    }
-    let _ = std::fs::remove_dir_all(out_dir);
-    std::fs::create_dir_all(out_dir).expect("chbench out dir");
-    for (name, batch) in chbench_batches(warehouses) {
-        super::write_parquet(&batch, &out_dir.join(format!("{name}.parquet")));
-    }
-    super::mark_fixture_complete(out_dir, &revision);
+    super::ensure_fixture(out_dir, &revision, |dir| {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("chbench out dir");
+        for (name, batch) in chbench_batches(warehouses) {
+            super::write_parquet(&batch, &dir.join(format!("{name}.parquet")));
+        }
+        true
+    });
 }
 
 /// Every CH-benCHmark table as an Arrow batch.

@@ -86,7 +86,7 @@ fn a_zero_float_bound_takes_in_both_zeros() {
     assert!(condition.contains(r#"c["score"] <= @p0"#), "{condition}");
     let (condition, parameters) = translate(&col("score").not_eq(lit(0.0))).expect("translatable");
     assert!(condition.contains("AND true)"), "{condition}");
-    assert!(parameters.is_empty());
+    assert_eq!(parameters, [] as [(String, azure_core::Value); 0]);
 }
 
 #[test]
@@ -175,7 +175,10 @@ fn a_disjunction_needs_both_sides_and_a_failed_one_allocates_nothing() {
             .condition(&expr, &mut parameters)
             .is_none()
     );
-    assert!(parameters.into_named().is_empty());
+    assert_eq!(
+        parameters.into_named(),
+        [] as [(String, azure_core::Value); 0]
+    );
     // A conjunction keeps the side that translates.
     let (condition, parameters) =
         translate(&col("tags").is_null().and(col("vip").eq(lit(true)))).expect("translatable");

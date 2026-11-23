@@ -88,6 +88,8 @@ md5 = { version = "0.7", optional = true }
 # were the un-vendored `tests/integration_postgres.rs`. `tempfile` is used by
 # the `tls` unit tests, `tokio-postgres` by the examples, `criterion` by the bench.
 tempfile = "3"
+# `test-util` lets the worker's timing tests run on a paused clock.
+tokio = { version = "1", features = ["test-util"] }
 tokio-postgres = "0.7"
 
 criterion = { version = "0.5", features = ["html_reports"] }

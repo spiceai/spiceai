@@ -1,4 +1,5 @@
 name: dynamodb
+tags: [long]
 description: >
   The DynamoDB connector against LocalStack: a table answers the corpus as
   PostgreSQL does over the same rows, federated, accelerated into Cayenne,
@@ -18,6 +19,7 @@ variants:
   federated: {}
   cayenne: { datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
   cayenne-changes: { datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes } } } }
+  cayenne-changes-object-native: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } }, datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes } } } }
 
 spicepod:
   version: v1

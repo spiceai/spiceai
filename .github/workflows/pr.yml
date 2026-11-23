@@ -53,6 +53,10 @@ env:
   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: clang
   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=lld
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   # On a pull request this is the ONLY job that runs. It validates the developer
   # sign-off — the `signoff` commit status posted by `make signoff` — for the PR's
@@ -278,7 +282,7 @@ jobs:
               return;
             }
 
-            const rustAffecting = /(^(crates|bin|tools|vendor)\/|\.(rs|snap|proto)$|(^|\/)Cargo\.(toml|lock)$|(^|\/)rust-toolchain(\.toml)?$|(^|\/)\.cargo\/|(^|\/)\.?(clippy|rustfmt)\.toml$|(^|\/)nextest\.toml$|(^|\/)layers\.toml$|^scripts\/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches|bench_mysql_load_nulls)\.py$|^scripts\/(test_)?rust_guard_common\.py$|^scripts\/(test_)?nextest_build_targets\.py$|^docs\/dev\/fork_patches\.md$|^(Makefile|version\.txt)$|^test\/tpc-bench\/(Makefile|mysql-null-spec\.awk)$|^test\/tls\/|^test\/spicepods\/tpch\/sf1\/accelerated\/postgres\[catalog\]\[changes\]\.yaml$|^test\/source_versions\.json$)/;
+            const rustAffecting = /(^(crates|bin|tools|vendor)\/|\.(rs|snap|proto)$|(^|\/)Cargo\.(toml|lock)$|(^|\/)rust-toolchain(\.toml)?$|(^|\/)\.cargo\/|(^|\/)\.?(clippy|rustfmt)\.toml$|(^|\/)nextest\.toml$|(^|\/)layers\.toml$|^scripts\/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches|bench_mysql_load_nulls|cayenne_data_path_fs)\.py$|^scripts\/cayenne_data_path_fs_allowlist\.json$|^scripts\/(test_)?rust_guard_common\.py$|^scripts\/(test_)?nextest_build_targets\.py$|^docs\/dev\/fork_patches\.md$|^(Makefile|version\.txt)$|^test\/tpc-bench\/(Makefile|mysql-null-spec\.awk)$|^test\/tls\/|^test\/spicepods\/tpch\/sf1\/accelerated\/postgres\[catalog\]\[changes\]\.yaml$|^test\/source_versions\.json$|^\.schema\/spicepod\.schema\.json$)/;
             for (const file of files) {
               // A rename off a .rs path changes Rust sources even though the new
               // name doesn't match, so both sides of the rename must be clean.
@@ -302,6 +306,23 @@ jobs:
               `run no Rust checks. The full suite still runs in the merge queue.`
             );
 
+      # The pure-revert rule lives in .github/scripts/pure_revert.mjs, which Trunk
+      # Health also uses. It is read from the BASE commit, never the PR's: this
+      # job otherwise checks nothing out, so a fork's code never runs in the job
+      # that decides its sign-off, and a PR cannot rewrite the rule that judges
+      # it. Only `.github/scripts` is checked out, without credentials.
+      - name: Check out the base commit's scripts
+        if: ${{ github.event_name == 'pull_request' }}
+        # Only the revert fast-track needs these. If the checkout fails, the
+        # import below fails too and the PR takes the normal sign-off path.
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
       # Pure reverts are fast-tracked: undoing a commit that already landed on
       # (and so passed the full suite through) the base branch is low-risk, and
       # the merge queue re-runs the whole suite on the merged result anyway. A
@@ -315,18 +336,14 @@ jobs:
       - name: Fast-track pure reverts
         id: revert
         if: ${{ github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track != 'true' && steps.no_rust.outputs.fast_track != 'true' }}
-        # Best-effort: any unexpected script failure must fall through to the
-        # normal developer sign-off path, not fail required Attestation for
-        # every PR. listCommits/compare errors are also try/caught inside.
+        # Best-effort: any unexpected script failure — including a base commit
+        # that predates pure_revert.mjs, where the import throws — must fall
+        # through to the normal developer sign-off path, not fail required
+        # Attestation for every PR. API errors are caught inside the module.
         continue-on-error: true
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const pull_number = context.payload.pull_request.number;
-            const baseSha = context.payload.pull_request.base.sha;
-
             const headRepo = context.payload.pull_request.head.repo?.full_name;
             const baseRepo = context.payload.pull_request.base.repo?.full_name;
             if (!headRepo || headRepo !== baseRepo) {
@@ -334,82 +351,25 @@ jobs:
               return;
             }
 
-            // Failures here must fall through to the normal sign-off path — never
-            // fail Attestation for the whole PR because we couldn't prove purity.
-            let commits;
-            try {
-              commits = await github.paginate(github.rest.pulls.listCommits, {
-                owner,
-                repo,
-                pull_number,
-                per_page: 100,
-              });
-            } catch (error) {
-              core.info(
-                `Could not list PR commits for revert fast-track (${error.message}); ` +
-                `falling back to developer sign-off.`
-              );
+            const { checkPureRevert } = await import(
+              `${process.env.GITHUB_WORKSPACE}/trusted/.github/scripts/pure_revert.mjs`
+            );
+            const result = await checkPureRevert({
+              github,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pullNumber: context.payload.pull_request.number,
+              baseSha: context.payload.pull_request.base.sha,
+            });
+            if (!result.pure) {
+              core.info(`Revert fast-track does not apply: ${result.reason}.`);
               return;
-            }
-            if (commits.length === 0) {
-              core.info('PR introduces no commits; revert fast-track does not apply.');
-              return;
-            }
-
-            // The footer Git writes for each reverted commit (full 40-char SHA).
-            // `git revert` creates one commit per reverted commit; a single
-            // --no-commit batch can carry several footers, so collect every match.
-            const revertFooter = /^This reverts commit ([0-9a-f]{40})\.$/gm;
-            const revertedShas = new Set();
-            for (const c of commits) {
-              const message = c.commit?.message ?? '';
-              const matches = [...message.matchAll(revertFooter)];
-              if (matches.length === 0) {
-                core.info(
-                  `Commit ${c.sha} is not a Git revert (no "This reverts commit ..." ` +
-                  `footer); revert fast-track does not apply.`
-                );
-                return;
-              }
-              for (const m of matches) {
-                revertedShas.add(m[1]);
-              }
-            }
-
-            // Each reverted commit must already be on the base branch — you can
-            // only fast-track undoing something that actually landed. compare
-            // base...sha reports ahead_by === 0 exactly when sha carries no
-            // commits the base lacks, i.e. sha is an ancestor of (or equal to)
-            // the base tip.
-            for (const sha of revertedShas) {
-              let ancestor = false;
-              try {
-                const { data } = await github.rest.repos.compareCommitsWithBasehead({
-                  owner,
-                  repo,
-                  basehead: `${baseSha}...${sha}`,
-                });
-                ancestor = data.ahead_by === 0;
-              } catch (error) {
-                core.info(
-                  `Could not confirm reverted commit ${sha} is on the base branch ` +
-                  `(${error.message}); revert fast-track does not apply.`
-                );
-                return;
-              }
-              if (!ancestor) {
-                core.info(
-                  `Reverted commit ${sha} is not on the base branch; revert ` +
-                  `fast-track does not apply.`
-                );
-                return;
-              }
             }
 
             core.setOutput('fast_track', 'true');
             core.notice(
-              `Fast-tracked ${commits.length} revert commit(s) reverting ` +
-              `${[...revertedShas].map((s) => s.slice(0, 12)).join(', ')}; ` +
+              `Fast-tracked ${result.commitCount} revert commit(s) reverting ` +
+              `${result.revertedShas.map((s) => s.slice(0, 12)).join(', ')}; ` +
               `the full suite still runs in the merge queue.`
             );
 
@@ -646,7 +606,7 @@ jobs:
 
       - name: Check for code changes
         id: check
-        uses: ./.github/actions/check-code-changes
+        uses: $/.github/actions/check-code-changes
 
       - name: Validate datafusion-table-providers commit
         run: bash .github/scripts/validate_table_providers_commit.sh
@@ -657,7 +617,7 @@ jobs:
   lint-rust:
     name: Rust Lint
     runs-on: spiceai-macos-large
-    environment: ci-build
+    environment: ci
     # Slowest observed success in the 2026-07-25..08-08 window: 126 min.
     timeout-minutes: 300
     needs: check_changes
@@ -685,12 +645,12 @@ jobs:
 
       - name: Set up Rust
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.SMB_PASSWORD }}
@@ -706,21 +666,21 @@ jobs:
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-sccache
+        uses: $/.github/actions/setup-sccache
         with:
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/install-protoc
+        uses: $/.github/actions/install-protoc
 
       - name: Set up make
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-make
+        uses: $/.github/actions/setup-make
 
       - name: Set up cc
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-cc
+        uses: $/.github/actions/setup-cc
 
       - name: Run Rust lint
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -745,7 +705,7 @@ jobs:
       # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload spiceio logs
         if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spiceio-lint-logs
           path: ${{ runner.temp }}/spiceio.log
@@ -753,9 +713,14 @@ jobs:
 
   # Build and test
   build-test:
+    # Read-only: this job compiles and runs the branch's code (build scripts,
+    # proc macros, tests), so it never holds a write token. Snapshot updates
+    # leave as an artifact for `push-snapshots` below.
+    permissions:
+      contents: read
     name: Build and Test
     runs-on: spiceai-macos-large
-    environment: ci-build
+    environment: ci
     # Slowest observed success in the 2026-07-25..08-08 window: 117 min.
     timeout-minutes: 300
     needs: [check_changes]
@@ -783,7 +748,7 @@ jobs:
 
       - name: Set up Rust
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       # Ask cargo, before anything is compiled, whether Cargo.lock still describes
       # these manifests — the question `Check if Cargo.lock is updated` asks at the
@@ -822,12 +787,12 @@ jobs:
 
       - name: Set up Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-nextest
+        uses: $/.github/actions/setup-nextest
 
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.SMB_PASSWORD }}
@@ -843,21 +808,21 @@ jobs:
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-sccache
+        uses: $/.github/actions/setup-sccache
         with:
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/install-protoc
+        uses: $/.github/actions/install-protoc
 
       - name: Set up make
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-make
+        uses: $/.github/actions/setup-make
 
       - name: Set up cc
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-cc
+        uses: $/.github/actions/setup-cc
 
       # No separate CLI build: nextest's build already emits the `spice`
       # binary, since cargo builds a package's bins alongside that package's
@@ -916,12 +881,34 @@ jobs:
             exit 1
           fi
 
-      - name: Push snapshots to branch
+      # `update_snapshots` exists only on workflow_dispatch, so on merge_group
+      # these two steps are skipped. The archive holds only the `*.snap` files
+      # nextest changed or added; `push-snapshots` checks that again before it
+      # writes anything.
+      - name: Archive updated snapshots
+        id: snapshot_archive
         if: ${{ github.event.inputs.update_snapshots == 'always' && needs.check_changes.outputs.relevant_changes == 'true' }}
-        timeout-minutes: 10
-        uses: ./.github/actions/push-snap-changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          { git diff --name-only --diff-filter=d -- '*.snap'; git ls-files -o --exclude-standard -- '*.snap'; } > "${RUNNER_TEMP}/snapshot-files"
+          if [ -s "${RUNNER_TEMP}/snapshot-files" ]; then
+            tr '\n' '\0' < "${RUNNER_TEMP}/snapshot-files" > "${RUNNER_TEMP}/snapshot-files-0"
+            tar --null -czf "${RUNNER_TEMP}/pr-snapshots.tar.gz" -T "${RUNNER_TEMP}/snapshot-files-0"
+            echo "created=true" >> "${GITHUB_OUTPUT}"
+            echo "Archived $(wc -l < "${RUNNER_TEMP}/snapshot-files" | tr -d ' ') snapshot file(s)"
+          else
+            echo "No snapshot changes"
+          fi
+
+      - name: Upload updated snapshots
+        if: ${{ steps.snapshot_archive.outputs.created == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          name: pr-snapshots
+          path: ${{ runner.temp }}/pr-snapshots.tar.gz
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
@@ -930,17 +917,67 @@ jobs:
       # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload spiceio logs
         if: always() && needs.check_changes.outputs.relevant_changes == 'true' && steps.setup-spiceio.outputs.pid != '' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spiceio-build-test-logs
           path: ${{ runner.temp }}/spiceio.log
           if-no-files-found: ignore
 
+  # Opens the snapshot-update PR from the `pr-snapshots` artifact `build-test`
+  # uploaded. Manual `update_snapshots: always` runs only: it never runs on
+  # pull_request or merge_group. It is the one job here with a write token, and
+  # it runs none of the branch's Rust code: a checkout, the archive check in
+  # extract_snapshot_archives.py (regular `*.snap` files only, nothing under
+  # .github/ or .git/, nothing outside the checkout), and push-snap-changes.
+  # GitHub-hosted, so the token never sits on a self-hosted runner that just
+  # ran the branch's build.
+  push-snapshots:
+    name: Push snapshot updates
+    environment: secret-free
+    needs: [check_changes, build-test]
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.update_snapshots == 'always' && needs.check_changes.outputs.relevant_changes == 'true' }}
+    runs-on: ubuntu-latest
+    # A checkout, a download, a commit and a push.
+    timeout-minutes: 20
+    permissions:
+      contents: write  # push-snap-changes: git push of the snapshot-update branch, gh pr merge --auto
+      pull-requests: write  # push-snap-changes: gh pr create/close/list
+      actions: write  # approve_bot_pr_runs.sh: approve the pull_request runs held on its GITHUB_TOKEN push
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Download updated snapshots
+        id: download
+        # No artifact means nextest changed no snapshot.
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: pr-snapshots
+          path: ${{ runner.temp }}/pr-snapshots
+
+      - name: Extract snapshots
+        if: steps.download.outcome == 'success'
+        run: python3 .github/scripts/extract_snapshot_archives.py "${RUNNER_TEMP}/pr-snapshots" .
+
+      - name: Push snapshots to branch
+        if: steps.download.outcome == 'success'
+        timeout-minutes: 10
+        uses: $/.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: No snapshot changes
+        if: steps.download.outcome != 'success'
+        run: echo "build-test uploaded no snapshot archive; nothing to push."
+
   # Release-profile installs (make install, install-cli, install-spiced)
   build-install-release:
     name: Build (release profile)
     runs-on: spiceai-macos-large
-    environment: ci-build
+    environment: ci
     # Slowest observed success in the 2026-07-25..08-08 window: 106 min.
     timeout-minutes: 300
     needs: [check_changes]
@@ -956,12 +993,12 @@ jobs:
 
       - name: Set up Rust
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.SMB_PASSWORD }}
@@ -977,21 +1014,21 @@ jobs:
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-sccache
+        uses: $/.github/actions/setup-sccache
         with:
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/install-protoc
+        uses: $/.github/actions/install-protoc
 
       - name: Set up make
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-make
+        uses: $/.github/actions/setup-make
 
       - name: Set up cc
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-cc
+        uses: $/.github/actions/setup-cc
 
       - name: make install
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -1030,7 +1067,7 @@ jobs:
       # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload spiceio logs
         if: always() && needs.check_changes.outputs.relevant_changes == 'true' && steps.setup-spiceio.outputs.pid != '' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spiceio-build-install-release-logs
           path: ${{ runner.temp }}/spiceio.log

@@ -1,4 +1,5 @@
 name: source-down-at-start
+tags: [long]
 description: >
   A dataset whose source is unreachable when Spice first starts reports the
   failure and then loads, by full refresh or by change capture, once the
@@ -10,6 +11,12 @@ sources:
 
 matrix:
   refresh_mode: [full, changes]
+
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
 
 spicepod:
   version: v1

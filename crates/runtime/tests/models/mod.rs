@@ -39,6 +39,7 @@ use serde_json::{Value, json};
 mod ai_udf;
 mod anthropic;
 mod bedrock;
+mod decisions;
 mod embedding;
 mod embedding_filter_limit;
 mod fts_caching_restart;
@@ -227,7 +228,7 @@ fn get_taxi_trips_dataset() -> Dataset {
 
 fn get_small_clickbench_dataset(name: &str) -> Dataset {
     let mut dataset = Dataset::new(
-        "s3://spiceai-public-datasets/clickbench/hits_small.parquet",
+        "s3://spice-datasets-gjezag77s0hu/clickbench/hits_small.parquet",
         name,
     );
     dataset.params = Some(Params::from_string_map(
@@ -268,7 +269,7 @@ fn mega_science_dataset(spice_name: Option<&str>, accelerate: bool) -> Dataset {
     let mut dataset = Dataset::new(
         // Can use this to run efficiently, locally:
         // "file:../../data/mega-science-small.jsonl",
-        "s3://spiceai-public-datasets/MegaScience/mega-science-small.jsonl",
+        "s3://spice-datasets-gjezag77s0hu/MegaScience/mega-science-small.jsonl",
         spice_name.unwrap_or("megascience"),
     );
     dataset.params = Some(Params::from_string_map(
@@ -348,7 +349,7 @@ pub fn get_tpcds_dataset(
     refresh_sql: Option<&str>,
 ) -> Dataset {
     let mut dataset = Dataset::new(
-        format!("s3://spiceai-public-datasets/tpcds/{ds_name}/"),
+        format!("s3://spice-datasets-gjezag77s0hu/tpcds/{ds_name}/"),
         spice_name.unwrap_or(ds_name),
     );
     dataset.params = Some(Params::from_string_map(

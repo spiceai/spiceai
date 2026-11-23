@@ -155,6 +155,9 @@ pub enum Error {
 
     #[snafu(display("Failed to acquire the enrollment transaction: {source}"))]
     AcquireTaskPanicked { source: tokio::task::JoinError },
+
+    #[snafu(display("{source}"))]
+    StateDirectory { source: crate::state_dir::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -217,55 +220,54 @@ impl EnrollmentTransactionLock {
             None
         };
 
-        if !directory_is_pinned {
-            std::fs::create_dir_all(config_dir).context(IoSnafu {
-                path: config_dir.to_path_buf(),
-            })?;
-        }
-        // Pin every later draft and identity operation to the directory named
-        // at acquisition time. Retargeting a symlink ancestor after this point
-        // must not redirect state while the lock stays on the original inode.
-        #[cfg(target_os = "linux")]
-        let config_dir = if let Some(directory) = pinned_directory.as_ref() {
-            use std::os::fd::AsRawFd as _;
-            PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
-        } else {
-            std::fs::canonicalize(config_dir).context(IoSnafu {
-                path: config_dir.to_path_buf(),
-            })?
-        };
-        #[cfg(not(target_os = "linux"))]
-        let config_dir = std::fs::canonicalize(config_dir).context(IoSnafu {
-            path: config_dir.to_path_buf(),
-        })?;
-        if !config_dir.is_dir() {
-            return Err(Error::Io {
-                path: config_dir,
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "the Cloud Connect config path must resolve to a directory",
-                ),
-            });
-        }
+        // Every later draft and identity operation is pinned to the directory
+        // opened here, which is also the one the state-directory rule is
+        // applied to and the one the publication lock is created in. Looking
+        // the name up again after the rule ran could reach a replacement.
         #[cfg(unix)]
-        let directory = {
+        let (config_dir, directory) = {
             #[cfg(target_os = "linux")]
             if let Some(directory) = pinned_directory {
-                directory
+                use std::os::fd::AsRawFd as _;
+                (
+                    PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())),
+                    directory,
+                )
             } else {
-                std::fs::File::open(&config_dir).context(IoSnafu {
-                    path: config_dir.clone(),
-                })?
+                open_state_directory(config_dir)?
             }
             #[cfg(not(target_os = "linux"))]
             {
-                std::fs::File::open(&config_dir).context(IoSnafu {
-                    path: config_dir.clone(),
-                })?
+                open_state_directory(config_dir)?
             }
         };
+        #[cfg(not(unix))]
+        let config_dir = {
+            crate::state_dir::check(config_dir, true).context(StateDirectorySnafu)?;
+            let config_dir = std::fs::canonicalize(config_dir).context(IoSnafu {
+                path: config_dir.to_path_buf(),
+            })?;
+            if !config_dir.is_dir() {
+                return Err(Error::Io {
+                    path: config_dir,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "the Cloud Connect config path must resolve to a directory",
+                    ),
+                });
+            }
+            config_dir
+        };
         let lock_path = EnrollmentDraft::lock_path(&EnrollmentDraft::path_in(&config_dir));
-        let file = EnrollmentDraft::acquire_publication_lock_with_budget(&lock_path, wait_budget)?;
+        #[cfg(unix)]
+        let file = EnrollmentDraft::acquire_publication_lock_with_budget(
+            &lock_path,
+            Some(&directory),
+            wait_budget,
+        )?;
+        #[cfg(not(unix))]
+        let file =
+            EnrollmentDraft::acquire_publication_lock_with_budget(&lock_path, None, wait_budget)?;
 
         #[cfg(target_os = "linux")]
         let protected_config_dir = if directory_is_pinned {
@@ -466,6 +468,60 @@ impl EnrollmentTransactionLock {
     }
 }
 
+/// Open the state directory `state_dir` for an enrollment transaction.
+///
+/// The config directory above it is resolved like any config path, so a link
+/// there or higher up is followed, as [`crate::state_dir::check`] follows it.
+/// The state directory is then opened relative to that descriptor without
+/// following a link, created owner-only when missing, and held to the
+/// state-directory rule on the descriptor that was opened
+/// ([`crate::state_dir::open_at`]). The caller locks and retains that same
+/// descriptor, so the directory checked is the directory locked.
+///
+/// Returns the pathname the transaction reports and re-checks, the canonical
+/// config directory joined with the state directory's name, and the
+/// descriptor.
+#[cfg(unix)]
+fn open_state_directory(state_dir: &Path) -> Result<(PathBuf, std::fs::File)> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let Some(name) = state_dir.file_name() else {
+        return Err(Error::Io {
+            path: state_dir.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the Cloud Connect state directory path has no directory name",
+            ),
+        });
+    };
+    let parent = match state_dir.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(parent).context(IoSnafu {
+        path: parent.to_path_buf(),
+    })?;
+    let parent = std::fs::canonicalize(parent).context(IoSnafu {
+        path: parent.to_path_buf(),
+    })?;
+    let parent_directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(&parent)
+        .context(IoSnafu {
+            path: parent.clone(),
+        })?;
+    #[cfg(test)]
+    crate::mutation_lock::acquire_hooks::run(state_dir);
+    let directory = crate::state_dir::open_at(&parent_directory, state_dir, true)
+        .context(StateDirectorySnafu)?
+        .ok_or_else(|| Error::Io {
+            path: state_dir.to_path_buf(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        })?;
+    Ok((parent.join(name), directory))
+}
+
 /// Open the config directory one descriptor at a time, then create/open the
 /// persistent transaction lock relative to that pinned directory. Neither an
 /// ancestor symlink substitution nor a final-name symlink can redirect a
@@ -532,20 +588,32 @@ fn open_unix_publication_lock(lock_path: &Path) -> std::io::Result<(std::fs::Fil
         }
     }
 
+    let lock = open_publication_lock_at(&directory, lock_path)?;
+    Ok((lock, directory))
+}
+
+/// Create or open the publication lock `lock_path` names inside the open
+/// `directory`, by its file name alone and without following a link.
+#[cfg(unix)]
+fn open_publication_lock_at(
+    directory: &std::fs::File,
+    lock_path: &Path,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::ffi::OsStrExt as _;
+
     let name = lock_path.file_name().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "the enrollment transaction lock has no file name",
         )
     })?;
-    let name = CString::new(name.as_bytes()).map_err(|_| {
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "the enrollment transaction lock name contains a NUL byte",
         )
     })?;
-    let lock = crate::lock_file::create_or_open_lock_at(&directory, &name)?;
-    Ok((lock, directory))
+    crate::lock_file::create_or_open_lock_at(directory, &name)
 }
 
 /// Whether two paths name the same directory, rather than the same spelling.
@@ -751,11 +819,17 @@ impl EnrollmentDraft {
 
     #[cfg(test)]
     fn acquire_publication_lock(lock_path: &Path) -> Result<std::fs::File> {
-        Self::acquire_publication_lock_with_budget(lock_path, LOCK_WAIT_BUDGET)
+        Self::acquire_publication_lock_with_budget(lock_path, None, LOCK_WAIT_BUDGET)
     }
 
+    /// Take the publication lock at `lock_path`. With `directory`, the open
+    /// directory `lock_path` names a file in, the lock is created relative to
+    /// that descriptor and the name is never looked up again; without it (and
+    /// on platforms without descriptor-relative opens) it is opened by
+    /// pathname.
     fn acquire_publication_lock_with_budget(
         lock_path: &Path,
+        directory: Option<&std::fs::File>,
         wait_budget: std::time::Duration,
     ) -> Result<std::fs::File> {
         #[cfg(unix)]
@@ -764,9 +838,24 @@ impl EnrollmentDraft {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         #[cfg(unix)]
-        let (file, lock_directory) = open_unix_publication_lock(lock_path).context(IoSnafu {
-            path: lock_path.to_path_buf(),
-        })?;
+        let opened_directory;
+        #[cfg(unix)]
+        let (file, lock_directory) = if let Some(directory) = directory {
+            (
+                open_publication_lock_at(directory, lock_path).context(IoSnafu {
+                    path: lock_path.to_path_buf(),
+                })?,
+                directory,
+            )
+        } else {
+            let (file, directory) = open_unix_publication_lock(lock_path).context(IoSnafu {
+                path: lock_path.to_path_buf(),
+            })?;
+            opened_directory = directory;
+            (file, &opened_directory)
+        };
+        #[cfg(not(unix))]
+        let _ = directory;
         #[cfg(not(unix))]
         let mut options = std::fs::OpenOptions::new();
         #[cfg(not(unix))]
@@ -1058,6 +1147,104 @@ fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec
 #[cfg(test)]
 mod tests {
 
+    /// The state directory's name is replaced by a link after acquisition
+    /// starts and before the enrollment transaction opens it. The transaction
+    /// must not lock the link's target, a directory the state rule never
+    /// looked at.
+    #[cfg(unix)]
+    #[test]
+    fn an_enrollment_state_directory_replaced_by_a_link_is_refused() {
+        use crate::mutation_lock::acquire_hooks::{
+            self, Acquisition, existing_state_directory, identify, mode_of, shared_directory,
+        };
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = existing_state_directory(root.path());
+        let moved = root.path().join("moved-state");
+        let shared = shared_directory(root.path());
+        acquire_hooks::before_opening(&state, {
+            let (state, moved, shared) = (state.clone(), moved.clone(), shared.clone());
+            move || {
+                std::fs::rename(&state, &moved).expect("move the state directory");
+                std::os::unix::fs::symlink(&shared, &state).expect("link its name elsewhere");
+            }
+        });
+
+        let result = EnrollmentTransactionLock::try_acquire(&state);
+
+        let candidates = [("checked", moved.as_path()), ("shared", shared.as_path())];
+        let held = result.as_ref().ok();
+        assert_eq!(
+            Acquisition {
+                acquired: held.is_some(),
+                locked: held.map(|held| identify(&held.directory, &candidates)),
+                locked_mode: held.map(|held| mode_of(&held.directory)),
+                lock_created_through_link: shared.join(ENROLLMENT_DRAFT_LOCK_FILE).exists(),
+            },
+            Acquisition {
+                acquired: false,
+                locked: None,
+                locked_mode: None,
+                lock_created_through_link: false,
+            }
+        );
+        assert_eq!(
+            result.err().map(|error| error.to_string()),
+            Some(format!(
+                "could not use the Spice Cloud Connect state directory '{}': it is a symbolic link, and Spice keeps this state only in a real directory",
+                state.display()
+            ))
+        );
+    }
+
+    /// The state directory is replaced by another real directory, writable by
+    /// group and others, before the enrollment transaction opens it. The rule
+    /// must be applied to the directory the transaction locks, so its mode is
+    /// repaired before the lock is taken in it.
+    #[cfg(unix)]
+    #[test]
+    fn an_enrollment_state_directory_replaced_by_a_shared_directory_is_held_to_the_state_rule() {
+        use crate::mutation_lock::acquire_hooks::{
+            self, Acquisition, existing_state_directory, identify, mode_of,
+        };
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = existing_state_directory(root.path());
+        let moved = root.path().join("moved-state");
+        acquire_hooks::before_opening(&state, {
+            let (state, moved) = (state.clone(), moved.clone());
+            move || {
+                std::fs::rename(&state, &moved).expect("move the state directory");
+                std::fs::create_dir(&state).expect("create a replacement");
+                std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o777))
+                    .expect("make the replacement writable by anyone");
+            }
+        });
+
+        let result = EnrollmentTransactionLock::try_acquire(&state);
+
+        let candidates = [
+            ("checked", moved.as_path()),
+            ("replacement", state.as_path()),
+        ];
+        let held = result.as_ref().ok();
+        assert_eq!(
+            Acquisition {
+                acquired: held.is_some(),
+                locked: held.map(|held| identify(&held.directory, &candidates)),
+                locked_mode: held.map(|held| mode_of(&held.directory)),
+                lock_created_through_link: false,
+            },
+            Acquisition {
+                acquired: true,
+                locked: Some("replacement"),
+                locked_mode: Some("0755".to_string()),
+                lock_created_through_link: false,
+            }
+        );
+    }
+
     /// A bare relative identity path has an empty parent, which is the current
     /// directory written a different way. Canonicalizing `""` fails while `"."`
     /// succeeds, so comparing the two spellings would make one directory look
@@ -1152,7 +1339,7 @@ mod tests {
         let draft = load_or_create(dir.path()).expect("create");
 
         assert_eq!(draft.schema_version, DRAFT_SCHEMA_VERSION);
-        assert!(!draft.enrollment_operation_id.is_empty());
+        assert_ne!(draft.enrollment_operation_id, "");
         assert!(draft.csr_pem.contains("CERTIFICATE REQUEST"));
         assert_eq!(draft.instance.runtime_version, "v2.2.0-test");
         assert_eq!(draft.region.as_deref(), Some("us-west-2"));
@@ -1436,7 +1623,7 @@ mod tests {
         drop(abandoned);
 
         let draft = load_or_create(dir.path()).expect("reclaim abandoned lock");
-        assert!(!draft.enrollment_operation_id.is_empty());
+        assert_ne!(draft.enrollment_operation_id, "");
         assert!(path.exists(), "the recovered creator publishes the draft");
         assert!(lock_path.exists(), "the stable lock inode remains in place");
     }

@@ -255,7 +255,8 @@ For release lines 2.4 and earlier, follow the release steps in that branch's cop
 In these steps, `{version}` is the version in `version.txt` on the release branch, without a leading `v` (for example `1.0.0-rc.1`).
 
 - [ ] Cherry-pick the release notes (`docs/release_notes/v{version}.md`) onto the release branch. Without them, `publish_release` publishes a stable version as a pre-release.
-- [ ] Run [build_release](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) on the release branch with `release_version` set to `{version}`. Don't create or push the release tag: `publish_release` creates it.
+- [ ] Check the release branch head has a green `trunk-tests` status, the full post-merge suite. If it has none yet, run `gh workflow run trunk_tests.yml -f branch=release/{major.minor}` and wait for it.
+- [ ] Run [build_release](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) on the release branch with `release_version` set to `{version}`. Don't create or push the release tag: `publish_release` creates it. Its `Release health` job refuses a commit without a green `trunk-tests` status; set `unhealthy_reason` only for a known flake or infrastructure fault.
   - [ ] Wait for the [build_release run](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) to finish successfully.
 - [ ] Create a [draft GitHub Release](https://github.com/spiceai/spiceai/releases/new) with the new tag `v{version}`, targeting the release branch. Leave the description empty to use the checked-in release notes, or paste the notes. Don't set the pre-release or latest options: `publish_release` sets them when it publishes.
 - [ ] Run [publish_release](https://github.com/spiceai/spiceai/actions/workflows/publish_release.yml) on the release branch with `release_version` set to `{version}`. If commits that don't change the release were merged to the release branch after the build, set `commit` to the full SHA that `build_release` built.
@@ -264,6 +265,7 @@ In these steps, `{version}` is the version in `version.txt` on the release branc
   - [ ] Monitor the [publish_release run](https://github.com/spiceai/spiceai/actions/workflows/publish_release.yml) for the Docker image builds. When they finish, approve the two Docker image publish jobs. They push the `{version}` and `{version}-cuda` image tags, and move `latest` and `latest-cuda` automatically when the release is the latest release.
   - [ ] Check the [Docker Hub](https://hub.docker.com/r/spiceai/spiceai/tags) and [GHCR](https://github.com/spiceai/spiceai/pkgs/container/spiceai) image tags.
   - If a job fails, re-run the failed jobs of the same run.
+- [ ] **Latest release only:** Pin `v{version}` on install.spiceai.org. Follow "Updating the scripts" in the install.spiceai.org Worker's README, and merge the pull request once its `install-scripts` check passes. Until then, the `Check install.spiceai.org` job of the publish_release run warns with the pin to make.
 - [ ] Ensure all newly released SDKs (mentioned in release notes) are published
 - [ ] Publish [spiceai/skills](https://github.com/spiceai/skills) GitHub Release for this runtime version (bump `.claude-plugin/plugin.json` + `marketplace.json` version to match runtime; tag `vX.Y.Z`; confirm [Release Plugin](https://github.com/spiceai/skills/actions/workflows/release.yml) uploaded the zip asset)
 - [ ] Update the [Helm chart](https://github.com/spiceai/spiceai/blob/trunk/deploy/chart) (chart version e.g. `1.8.3` & image.tag e.g. `1.8.3-models`) in the release branch (not in trunk).
@@ -271,7 +273,7 @@ In these steps, `{version}` is the version in `version.txt` on the release branc
   - [ ] [Release Chart workflow](https://github.com/spiceai/helm-charts/actions/workflows/release.yml) is triggered using the release branch.
 - [ ] Perform a final test pass on the released binaries and Docker images.
 - [ ] Run the following workflows to confirm installation health after the release is marked as official:
-  - [ ] [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
+  - [ ] [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml), with no inputs. Its `install.spiceai.org serves the latest release` job checks the release, commit and sha256 the site serves against GitHub, and fails until the pin above is live.
   - [ ] [E2E Test Release Installation (Helm)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install_helm.yml)
   - [ ] [E2E Test CLI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_spice_cli.yml)
     - Use parameters:

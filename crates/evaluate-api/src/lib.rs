@@ -37,6 +37,7 @@ use serde_json::{Map, Value};
 use snafu::Snafu;
 
 mod check;
+pub mod conformance;
 pub mod openai;
 
 pub use check::{check_answers, is_probability, probability_sum_tolerance};

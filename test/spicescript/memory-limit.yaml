@@ -1,4 +1,5 @@
 name: memory-limit
+tags: [long]
 description: >
   Under a `runtime.query.memory_limit` (1 GiB) smaller than what the
   queries hold at once, queries over a Cayenne acceleration of 2 million
@@ -13,6 +14,8 @@ sources:
 variants:
   cayenne: {}
   federated: { datasets: { '*': { acceleration: null } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1

@@ -1,4 +1,5 @@
 name: unparse-set-operations
+tags: [long]
 description: >
   INTERSECT and EXCEPT answer as the source does, NULLs included, wherever the
   query runs. Federated, the whole query is sent to the source, PostgreSQL or
@@ -12,8 +13,9 @@ matrix:
 
 variants:
   federated: {}
-  arrow: arrow
   cayenne: cayenne-file
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
   cayenne-memory: cayenne-memory
 
 spicepod:

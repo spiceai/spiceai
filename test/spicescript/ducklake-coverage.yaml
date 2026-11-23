@@ -1,4 +1,5 @@
 name: ducklake-coverage
+tags: [long]
 description: >
   DuckLake tables answer the extended corpus and ternary logic partitioning as PostgreSQL answers them over the same generated rows: federated to DuckLake, and accelerated into Cayenne.
 
@@ -13,6 +14,8 @@ matrix:
 variants:
   federated: {}
   cayenne: cayenne-file
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
 
 spicepod:
   version: v1

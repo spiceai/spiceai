@@ -24,7 +24,7 @@ use snafu::ResultExt;
 
 use crate::context::Context;
 use crate::model::Vocab;
-use crate::{GrammarNulSnafu, GrammarSnafu, Result, Token, sys};
+use crate::{GrammarNulSnafu, GrammarSnafu, NothingToPickSnafu, Result, Token, sys};
 
 /// A llama.cpp sampler, or a chain of them applied in order. A grammar sampler reads its
 /// model's vocabulary, so it lives no longer than `'v`.
@@ -35,6 +35,9 @@ pub struct Sampler<'v> {
     /// alone. Such a sampler picks a row's largest logit, which `sample` reads from the row
     /// itself instead of handing llama.cpp the row to copy into a candidate per token.
     greedy: bool,
+    /// The candidates `sample` hands the chain, one per vocabulary token, kept between picks so
+    /// that each pick fills them rather than allocating them again.
+    candidates: Vec<sys::llama_token_data>,
     _vocab: PhantomData<&'v ()>,
 }
 
@@ -51,6 +54,7 @@ impl<'v> Sampler<'v> {
         Self {
             raw,
             greedy: false,
+            candidates: Vec::new(),
             _vocab: PhantomData,
         }
     }
@@ -62,6 +66,13 @@ impl<'v> Sampler<'v> {
         let mut greedy = Self::from_raw(unsafe { sys::llama_sampler_init_greedy() });
         greedy.greedy = true;
         greedy
+    }
+
+    /// Whether the sampler is greedy and nothing else, so that a context's argmax output
+    /// ([`Context::set_argmax_output`]) picks what it would.
+    #[must_use]
+    pub fn is_greedy(&self) -> bool {
+        self.greedy
     }
 
     /// A draw from the distribution, seeded.
@@ -132,6 +143,7 @@ impl<'v> Sampler<'v> {
         Ok(Self {
             raw,
             greedy: false,
+            candidates: Vec::new(),
             _vocab: PhantomData,
         })
     }
@@ -241,18 +253,83 @@ impl<'v> Sampler<'v> {
             .any(|d| d.id == token.0 && d.logit.is_finite())
     }
 
-    /// Picks the token for output row `index` of the last decoded batch.
-    pub fn sample(&mut self, context: &Context<'_>, index: i32) -> Token {
-        if self.greedy
-            && let Some(token) = context.logits(index).and_then(first_max)
-        {
-            // SAFETY: the sampler is live. `llama_sampler_sample` tells the sampler of its pick
-            // the same way, which leaves a greedy sampler as it was.
-            unsafe { sys::llama_sampler_accept(self.raw.as_ptr(), token.0) };
-            return token;
+    /// Picks the token for output row `index` of the last decoded batch. A greedy sampler takes
+    /// a context's argmax output when it is on, which has no logits to read. Fails when a backend
+    /// failed computing the decode, which leaves nothing to pick from, and when the chain leaves
+    /// no token possible, as a grammar does when no token of the vocabulary continues its text.
+    pub fn sample(&mut self, context: &Context<'_>, index: i32) -> Result<Token> {
+        debug_assert!(
+            self.greedy || !context.argmax_output(),
+            "only a greedy sampler picks from a context's argmax output, which has no logits"
+        );
+        if self.greedy {
+            let pick = if context.argmax_output() {
+                context.argmax(index)?
+            } else {
+                context.logits(index)?.and_then(first_max)
+            };
+            if let Some(token) = pick {
+                // SAFETY: the sampler is live. `llama_sampler_sample` tells the sampler of its
+                // pick the same way, which leaves a greedy sampler as it was.
+                unsafe { sys::llama_sampler_accept(self.raw.as_ptr(), token.0) };
+                return Ok(token);
+            }
+        }
+        // A row with its logits is picked here rather than by `llama_sampler_sample`, which
+        // tells the chain of its pick even when the chain ruled every token out, and a grammar
+        // told of a token it ruled out throws a C++ exception, which aborts the process.
+        if let Some(logits) = context.logits(index)? {
+            return self.pick(logits);
         }
         // SAFETY: the context is live and its last decode marked row `index` for output.
-        Token(unsafe { sys::llama_sampler_sample(self.raw.as_ptr(), context.as_ptr(), index) })
+        let token = context.waited(|| unsafe {
+            sys::llama_sampler_sample(self.raw.as_ptr(), context.as_ptr(), index)
+        });
+        // the sample waited for the decode: a failed one leaves LLAMA_TOKEN_NULL
+        context.computed()?;
+        Ok(Token(token))
+    }
+
+    /// Picks from `logits`, one per vocabulary token by id, as `llama_sampler_sample` picks
+    /// from a row's logits: the chain is applied to a candidate per token and its pick is the
+    /// candidate it selects. The chain is told of the pick only when the pick is possible, a
+    /// candidate the chain left a logit above minus infinity; otherwise it ruled out every
+    /// token, and the pick fails.
+    fn pick(&mut self, logits: &[f32]) -> Result<Token> {
+        let mut data = std::mem::take(&mut self.candidates);
+        data.clear();
+        data.extend(
+            logits
+                .iter()
+                .enumerate()
+                .map(|(id, &logit)| sys::llama_token_data {
+                    id: i32::try_from(id).unwrap_or(i32::MAX),
+                    logit,
+                    p: 0.0,
+                }),
+        );
+        let mut candidates = sys::llama_token_data_array {
+            data: data.as_mut_ptr(),
+            size: data.len(),
+            selected: -1,
+            sorted: false,
+        };
+        // SAFETY: `candidates` points at `data`, which outlives the call. A sampler may
+        // repoint it at a buffer of its own, which lives as long as the sampler.
+        unsafe { sys::llama_sampler_apply(self.raw.as_ptr(), &raw mut candidates) };
+        let picked = usize::try_from(candidates.selected)
+            .ok()
+            .filter(|&at| !candidates.data.is_null() && at < candidates.size)
+            // SAFETY: after the call `candidates` describes `size` live entries, in `data` or
+            // in the sampler's own buffer, and `at` is one of them.
+            .map(|at| unsafe { *candidates.data.add(at) });
+        self.candidates = data;
+        let Some(picked) = picked.filter(|d| d.logit > f32::NEG_INFINITY) else {
+            return NothingToPickSnafu.fail();
+        };
+        // SAFETY: the sampler is live, and `picked` is a token it left possible.
+        unsafe { sys::llama_sampler_accept(self.raw.as_ptr(), picked.id) };
+        Ok(Token(picked.id))
     }
 }
 
@@ -395,6 +472,36 @@ mod tests {
         assert!(far > 1_500, "only {far} of 20000 picks past token 127");
         assert_eq!(first_max(&[]), None);
         assert_eq!(first_max(&[1.0, 3.0, 2.0, 3.0]), Some(Token(1)));
+    }
+
+    /// A chain picks from a row as llama.cpp's `llama_sampler_sample` does, its greedy pick
+    /// llama.cpp's greedy pick; and a row the chain leaves no token of, every logit minus
+    /// infinity as a grammar leaves them when nothing continues its text, fails the pick
+    /// instead of telling the chain of a token it ruled out.
+    #[test]
+    fn a_chain_picks_what_llama_cpp_picks_and_fails_when_it_leaves_nothing() {
+        let mut greedy = Sampler::chain([Sampler::greedy(), Sampler::greedy()]);
+        for row in [
+            vec![1.0, 3.0, 2.0, 3.0],
+            vec![f32::NEG_INFINITY, -2.0, f32::NEG_INFINITY],
+        ] {
+            assert_eq!(
+                greedy.pick(&row).expect("a token is left"),
+                greedy_pick(&row)
+            );
+        }
+        let nothing = [f32::NEG_INFINITY; 4];
+        for mut chain in [
+            greedy,
+            Sampler::chain([Sampler::temp(0.7), Sampler::top_p(0.9, 1), Sampler::dist(7)]),
+        ] {
+            assert!(
+                matches!(chain.pick(&nothing), Err(crate::Error::NothingToPick)),
+                "{chain:?}"
+            );
+            // the chain is left as it was, so it picks from the next row
+            assert_eq!(chain.pick(&[0.0, 5.0]).expect("a token is left"), Token(1));
+        }
     }
 
     /// Set in the child process that runs the failed check.

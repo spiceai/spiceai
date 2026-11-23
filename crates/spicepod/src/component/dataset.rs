@@ -654,13 +654,13 @@ mod tests {
             from: https://api.example.com
         ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
-        assert!(
+        assert_eq!(
             dataset
                 .acceleration
                 .as_ref()
                 .map(Acceleration::fields_ignored_when_disabled)
-                .unwrap_or_default()
-                .is_empty()
+                .unwrap_or_default(),
+            [] as [String; 0]
         );
     }
 

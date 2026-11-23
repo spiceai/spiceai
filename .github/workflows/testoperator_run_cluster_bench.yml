@@ -177,19 +177,9 @@ on:
           - 'spiceai-dev-runners'
           - 'spiceai-dev-large-runners'
 
+# run-cluster-bench declares the write grants it uses.
 permissions:
-  # `write` on contents + pull-requests so the "Open snapshot-update PR" step
-  # can push a branch and open a PR. `packages: read` covers the spidapter
-  # GHCR image pull. Matches the implicit permissions
-  # `testoperator_run_bench.yml` inherits from the repo default.
-  contents: write
-  packages: read
-  pull-requests: write
-  # `actions: write` approves the PR's held pull_request runs
-  # (.github/scripts/approve_bot_pr_runs.sh).
-  actions: write
-  # `compute: ec2` assumes the sandbox benchmark role over OIDC.
-  id-token: write
+  contents: read
 
 # Centralized defaults so workflow_dispatch runs have one fallback chain.
 # Defaults exercise the public-S3 TPC-H Ballista distributed-query path
@@ -223,6 +213,18 @@ env:
 jobs:
   run-cluster-bench:
     environment: ci
+    permissions:
+      # `write` on contents + pull-requests so the "Open snapshot-update PR" step
+      # can push a branch and open a PR. `packages: read` covers the spidapter
+      # GHCR image pull.
+      contents: write
+      packages: read
+      pull-requests: write
+      # `actions: write` approves the PR's held pull_request runs
+      # (.github/scripts/approve_bot_pr_runs.sh).
+      actions: write
+      # `compute: ec2` assumes the sandbox benchmark role over OIDC.
+      id-token: write
     name: Run cluster benchmark
     runs-on: ${{ github.event.inputs.runner_type || 'spiceai-dev-runners' }}
     timeout-minutes: 600
@@ -230,7 +232,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Rust toolchain
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Determine snapshot update mode
         id: determine_update_snapshots
@@ -269,14 +271,14 @@ jobs:
 
       - name: Get RustFS credentials
         id: rustfs
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '36000'
           export-env: 'false'
 
       - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -284,7 +286,7 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
-        uses: ./.github/actions/build-spicepod-validator
+        uses: $/.github/actions/build-spicepod-validator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -296,7 +298,7 @@ jobs:
           spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
       - name: Build Testoperator
-        uses: ./.github/actions/build-testoperator
+        uses: $/.github/actions/build-testoperator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -304,12 +306,12 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup Testoperator
-        uses: ./.github/actions/setup-testoperator-data
+        uses: $/.github/actions/setup-testoperator-data
         with:
           query_set: ${{ env.CB_QUERY_SET }}
 
       - name: Build Spidapter
-        uses: ./.github/actions/build-spidapter
+        uses: $/.github/actions/build-spidapter
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -318,7 +320,7 @@ jobs:
 
       - name: Management login (prod)
         if: env.CB_COMPUTE == 'scp'
-        uses: ./.github/actions/management-login
+        uses: $/.github/actions/management-login
         with:
           token-url: https://spice.ai/api/oauth/token
           client-id: ${{ secrets.SPICE_MANAGEMENT_CLIENT_ID_PROD }}
@@ -339,11 +341,11 @@ jobs:
 
       # Credentials must outlast every image's run and its teardown, so they
       # match the job timeout rather than the 1-hour default.
-      - name: Authorize with the sandbox benchmark role
+      - name: Authorize with the benchmark role
         if: env.CB_COMPUTE == 'ec2'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: arn:aws:iam::211125479522:role/spiceai-github-actions-ballista-bench
+          role-to-assume: ${{ secrets.CI_AWS_EC2_BENCH_ROLE_ARN }}
           role-session-name: gha-ballista-bench-${{ github.run_id }}
           role-duration-seconds: 36000
           aws-region: ${{ env.CB_EC2_REGION }}
@@ -351,7 +353,7 @@ jobs:
       - name: Resolve the EC2 cluster inputs
         if: env.CB_COMPUTE == 'ec2'
         env:
-          SUBNET_ID: ${{ vars.BALLISTA_BENCH_SUBNET_ID }}
+          SUBNET_ID: ${{ vars.CI_BALLISTA_BENCH_SUBNET_ID }}
         run: |
           set -euo pipefail
           if [ -z "${CB_EC2_IMAGES}" ]; then
@@ -359,7 +361,7 @@ jobs:
             exit 1
           fi
           if [ -z "${SUBNET_ID}" ]; then
-            echo "::error::Repository variable BALLISTA_BENCH_SUBNET_ID is not set"
+            echo "::error::Variable CI_BALLISTA_BENCH_SUBNET_ID is not set in the ci environment"
             exit 1
           fi
           ami_id="$(aws ssm get-parameters --region "${CB_EC2_REGION}" \
@@ -380,7 +382,7 @@ jobs:
         if: env.CB_COMPUTE != 'ec2'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_ICEBERG_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_ICEBERG_ROLE_ARN }}
           role-session-name: gha-iceberg-${{ github.run_id }}
           role-duration-seconds: 36000
           aws-region: us-east-1
@@ -404,7 +406,7 @@ jobs:
           # Defaults to the dedicated spicehq nodegroup; without it the app lands on
           # the shared default nodegroup.
           SPIDAPTER_ORGANIZATION_TAG: ${{ env.CB_ORGANIZATION_TAG }}
-          SCHEDULER_STATE_LOCATION: 's3://spiceai-testing-cluster-state/testoperator-cluster-bench-${{ github.run_id }}/'
+          SCHEDULER_STATE_LOCATION: 's3://spiceai-ci-testing-cluster-state/testoperator-cluster-bench-${{ github.run_id }}/'
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           EXECUTOR_REPLICAS: ${{ env.CB_EXECUTOR_REPLICAS }}
           CHANNEL: ${{ env.CB_CHANNEL }}
@@ -542,7 +544,7 @@ jobs:
         if: always() && env.CB_COMPUTE == 'ec2'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: arn:aws:iam::211125479522:role/spiceai-github-actions-ballista-bench
+          role-to-assume: ${{ secrets.CI_AWS_EC2_BENCH_ROLE_ARN }}
           role-session-name: gha-ballista-bench-cleanup-${{ github.run_id }}
           aws-region: ${{ env.CB_EC2_REGION }}
 
@@ -670,7 +672,16 @@ jobs:
 
           git commit -m "fix(cluster-bench): ${commit_summary}"
           if git ls-remote --exit-code --heads origin "${BRANCH_NAME}" >/dev/null 2>&1; then
-            git pull --rebase origin "${BRANCH_NAME}"
+            # Move only the snapshot commit. Runs against one image can check
+            # out different trunk heads, and `git pull --rebase` would also
+            # replay every trunk commit between them onto the branch as new
+            # commits, putting unrelated source changes in the PR.
+            git fetch origin "refs/heads/${BRANCH_NAME}"
+            if ! git rebase --onto FETCH_HEAD HEAD^; then
+              git rebase --abort || true
+              echo "::error::This run's snapshots conflict with snapshots another run already pushed to ${BRANCH_NAME}; resolve the .snap conflict on that branch by hand."
+              exit 1
+            fi
           fi
           # Non-interactive: a credential helper on the runner can otherwise intercept
           # this push and block on a prompt forever. See

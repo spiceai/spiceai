@@ -1913,7 +1913,7 @@ mod tests {
         let pdf = pdf_with_dict("", b"hello stream world");
         let streams = pdf_streams(&pdf);
         assert_eq!(streams.len(), 1);
-        assert!(streams[0].filters.is_empty());
+        assert_eq!(streams[0].filters, [] as [PdfFilter; 0]);
     }
 
     /// An indirect `/Length` is how most writers declare a stream. It must not
