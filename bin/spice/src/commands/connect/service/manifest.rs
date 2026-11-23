@@ -34,8 +34,8 @@ use super::backend::ServiceBackend;
 use super::model::{LogSource, ServiceScope, Supervisor};
 use crate::error::{Error, Result};
 
-/// File name (relative to the resolved Spice config dir) of the manifest.
-pub(crate) const SERVICE_MANIFEST_FILE: &str = "service.json";
+/// File name (relative to the Cloud Connect state directory) of the manifest.
+pub(crate) use runtime_cloud_connect::config::SERVICE_MANIFEST_FILE;
 
 /// [`SERVICE_MANIFEST_FILE`] as a C string, for the descriptor-relative
 /// syscalls. Spelled as a literal rather than built with `CString::new` so this
@@ -396,11 +396,10 @@ impl ServiceManifest {
             // pathname now points at, which is what the descriptor exists to
             // stop being trusted.
             if config.descriptor().is_none() && !nix::unistd::Uid::effective().is_root() {
-                std::fs::create_dir_all(config_dir).map_err(|e| Error::CloudConnectIo {
-                    message: format!(
-                        "create the Spice config directory {}: {e}",
-                        config_dir.display()
-                    ),
+                runtime_cloud_connect::state_dir::check(config_dir, true).map_err(|e| {
+                    Error::CloudConnectIo {
+                        message: e.to_string(),
+                    }
                 })?;
             }
             let directory = open_pinned_manifest_directory(config, &self.owner)?;

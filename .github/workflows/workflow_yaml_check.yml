@@ -22,6 +22,12 @@ on:
       - '.github/scripts/test_docker_pull.py'
       - '.github/scripts/mc_cp.sh'
       - '.github/scripts/test_mc_cp.py'
+      - '.github/scripts/cached_fetch.sh'
+      - '.github/scripts/test_cached_fetch.py'
+      - '.github/scripts/check_ci_cache_pins.py'
+      - '.github/scripts/test_check_ci_cache_pins.py'
+      - '.github/ci-cache/**'
+      - 'rust-toolchain.toml'
       - '.github/scripts/mssql_tpch_restore.sh'
       - '.github/scripts/test_mssql_tpch_restore.py'
       - '.github/scripts/extract_snapshot_archives.py'
@@ -40,6 +46,12 @@ on:
       - '.github/scripts/test_docker_pull.py'
       - '.github/scripts/mc_cp.sh'
       - '.github/scripts/test_mc_cp.py'
+      - '.github/scripts/cached_fetch.sh'
+      - '.github/scripts/test_cached_fetch.py'
+      - '.github/scripts/check_ci_cache_pins.py'
+      - '.github/scripts/test_check_ci_cache_pins.py'
+      - '.github/ci-cache/**'
+      - 'rust-toolchain.toml'
       - '.github/scripts/mssql_tpch_restore.sh'
       - '.github/scripts/test_mssql_tpch_restore.py'
       - '.github/scripts/extract_snapshot_archives.py'
@@ -87,11 +99,18 @@ jobs:
           python .github/scripts/test_codeql_workflow.py -v
           python .github/scripts/test_docker_pull.py -v
           python .github/scripts/test_mc_cp.py -v
+          python .github/scripts/test_cached_fetch.py -v
+          python .github/scripts/test_check_ci_cache_pins.py -v
           python .github/scripts/test_mssql_tpch_restore.py -v
           python .github/scripts/test_extract_snapshot_archives.py -v
 
       - name: Validate GitHub Actions definitions
         run: python .github/scripts/check_workflow_yaml.py
+
+      # A toolchain bump without its pin would quietly send every runner back to
+      # static.rust-lang.org; see .github/ci-cache/README.md.
+      - name: Check the CI cache pins
+        run: python .github/scripts/check_ci_cache_pins.py
 
       # `check_workflow_yaml.py` above encodes the failures this repository has
       # actually been bitten by, cell by cell, each one added after an incident.

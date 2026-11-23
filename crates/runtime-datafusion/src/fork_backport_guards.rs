@@ -1264,3 +1264,83 @@ fn the_unparser_compiles_its_identifier_pattern_once() {
          pattern on every call again (spiceai/datafusion#301)"
     );
 }
+
+/// spiceai/datafusion#303. A bzip2, xz or zstd CSV file made of two
+/// concatenated members, as `cat a.csv.zst b.csv.zst` makes, returns every row
+/// when it is read from an object store, as it does from a local file.
+/// Unpatched, the object-store read stops after the first member and returns
+/// only its rows, with no error.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compressed_file_of_concatenated_members_is_read_in_full_from_an_object_store() {
+    use object_store::memory::InMemory;
+    use object_store::path::Path as ObjectPath;
+    use object_store::{ObjectStore, ObjectStoreExt};
+    use std::sync::Arc;
+    use url::Url;
+
+    let ctx = spice_session(|_| {});
+    let store = Arc::new(InMemory::new());
+    ctx.register_object_store(
+        &Url::parse("memory://").expect("memory URL"),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+    );
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let mut answers = Vec::new();
+    for (codec, extension) in [("bzip2", "bz2"), ("xz", "xz"), ("zstd", "zst")] {
+        let mut file = Vec::new();
+        for (member, first, last, header) in [(0, 0, 9_999, true), (1, 10_000, 19_999, false)] {
+            let name = format!("member{member}.csv.{extension}");
+            run_statements(
+                &ctx,
+                &[&format!(
+                    "COPY (SELECT value AS a FROM generate_series({first}, {last})) \
+                     TO 'memory:///{name}' STORED AS CSV \
+                     OPTIONS ('format.compression' '{codec}', 'format.has_header' '{header}')"
+                )],
+            )
+            .await;
+            let bytes = store
+                .get(&ObjectPath::from(name))
+                .await
+                .expect("member written")
+                .bytes()
+                .await
+                .expect("member read");
+            file.extend_from_slice(&bytes);
+        }
+        let name = format!("members.csv.{extension}");
+        let local = dir.path().join(&name);
+        std::fs::write(&local, &file).expect("concatenated file written to a local file");
+        store
+            .put(&ObjectPath::from(name.as_str()), file.into())
+            .await
+            .expect("concatenated file written to the object store");
+
+        for (source, location) in [
+            ("object_store", format!("memory:///{name}")),
+            ("local_file", local.display().to_string()),
+        ] {
+            let table = format!("members_{codec}_{source}");
+            run_statements(
+                &ctx,
+                &[&format!(
+                    "CREATE EXTERNAL TABLE {table} (a BIGINT) STORED AS CSV LOCATION '{location}' \
+                     OPTIONS ('format.compression' '{codec}', 'format.has_header' 'true')"
+                )],
+            )
+            .await;
+            let rows = answer(&ctx, &format!("SELECT count(a), sum(a) FROM {table}")).await;
+            answers.push((table, rows));
+        }
+    }
+    // Both members' rows: 20,000 values, 0 to 19,999, summing to 19,999 * 20,000 / 2.
+    let expected = Ok(owned(&["20000,199990000"]));
+    let wrong: Vec<_> = answers
+        .iter()
+        .filter(|(_, rows)| *rows != expected)
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "expected {expected:?} from every table, got {wrong:#?}"
+    );
+}

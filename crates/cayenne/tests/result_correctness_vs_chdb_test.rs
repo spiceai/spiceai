@@ -330,7 +330,8 @@ async fn micro_bench_shapes_full_result_parity_vs_chdb_inner() {
     log.push('\n');
     std::fs::write(&log_path, &log).expect("write chdb log");
 
-    let coverage_path = scratch.join("parity_coverage_chdb.md");
+    // One report per lane: `cargo test` runs these lanes on concurrent threads.
+    let coverage_path = scratch.join("parity_coverage_chdb_micro.md");
     write_coverage_report(&coverage_path, &results).expect("coverage");
     eprintln!("{}", summary_line(&results));
 
@@ -550,7 +551,7 @@ async fn sqllancer_corpus_parity_vs_chdb_inner() {
     log.push_str(&summary_line(&results));
     log.push('\n');
     std::fs::write(&log_path, &log).expect("write chdb sqllancer log");
-    write_coverage_report(&scratch.join("parity_coverage_chdb.md"), &results).ok();
+    write_coverage_report(&scratch.join("parity_coverage_chdb_sqllancer.md"), &results).ok();
     eprintln!("{}", summary_line(&results));
 
     let sqllancer: Vec<RunResult> = results

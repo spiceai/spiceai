@@ -29,7 +29,7 @@ limitations under the License.
 //!    then enrolls this instance *before the runtime is built or any
 //!    listener binds*, so the durable identity exists by the time anything
 //!    else here runs.
-//! 2. `$SPICE_CONFIG_DIR/identity.json` contains a usable previously-enrolled
+//! 2. `$SPICE_CONFIG_DIR/cloud-connect/identity.json` contains a usable previously-enrolled
 //!    identity — reconnection is automatic, with no flag.
 //!
 //! If neither is true, this module never opens a connection. An existing
@@ -82,6 +82,7 @@ use runtime::datafusion::query::Error as QueryError;
 use runtime::status::ComponentStatus;
 #[cfg(test)]
 use runtime_cloud_connect::config::IDENTITY_FILE;
+use runtime_cloud_connect::config::INCOMING_CLOUD_MANAGED_SPICEPOD_FILE;
 use runtime_cloud_connect::config::{
     CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig, DEPLOYMENT_TRANSACTION_FILE,
     DEPLOYMENT_TRANSACTION_INCOMING_FILE, INCOMING_SECRET_CACHE_FILE,
@@ -335,6 +336,53 @@ fn reconcile_requested_endpoint(
     }
 }
 
+/// Why this instance's Cloud Connect state directory cannot be used, so the
+/// runtime does not start.
+#[derive(Debug, snafu::Snafu)]
+#[snafu(display("Failed to start: {source}"))]
+pub struct StateDirectoryError {
+    source: runtime_cloud_connect::state_dir::Error,
+}
+
+/// Move Cloud Connect state an earlier version kept in the config directory
+/// into the state directory, then apply the state-directory rule to it.
+///
+/// Called from `main` with the instance directory claimed and before the
+/// `--token` bootstrap, so that nothing is read from or written to a state
+/// directory another account could have changed. An instance that has never
+/// enrolled and starts without `--token` has no state directory; nothing is
+/// created and nothing is logged for it.
+///
+/// # Errors
+///
+/// Returns [`StateDirectoryError`] when the state directory, or a config
+/// directory that still holds state to move, cannot be trusted or used.
+pub async fn prepare_state_directory(args: &crate::Args) -> Result<(), StateDirectoryError> {
+    let config_dir = CloudConnectConfig::default_config_dir();
+    runtime_cloud_connect::state_dir::migrate_legacy_state(&config_dir)
+        .await
+        .map_err(|source| StateDirectoryError { source })?;
+    let state_dir = runtime_cloud_connect::state_dir::state_dir(&config_dir);
+    let create = args.token.is_some();
+    // `main`'s subscriber is thread-local until the runtime installs the
+    // global one, so it goes with the check to the blocking thread.
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    tokio::task::spawn_blocking(move || {
+        tracing::dispatcher::with_default(&dispatch, || {
+            runtime_cloud_connect::state_dir::check(&state_dir, create)
+        })
+    })
+    .await
+    .map_err(|source| StateDirectoryError {
+        source: runtime_cloud_connect::state_dir::Error::Io {
+            path: CloudConnectConfig::default_state_dir(),
+            source: std::io::Error::other(format!("state directory task panicked: {source}")),
+        },
+    })?
+    .map_err(|source| StateDirectoryError { source })?;
+    Ok(())
+}
+
 /// Why a `--token` bootstrap could not produce a durable identity. Every
 /// message is safe to print: none can contain the enrollment key.
 #[derive(Debug, snafu::Snafu)]
@@ -421,10 +469,16 @@ pub async fn bootstrap_enrollment(args: &mut crate::Args) -> Result<(), Bootstra
 #[derive(Debug)]
 pub struct CloudManagedSpicepod {
     pub path: PathBuf,
-    /// The persisted YAML, kept so an `ApplySpicepod` can tell a redelivery of
-    /// the running deployment from a new one without re-reading the file.
+    /// The persisted YAML. Startup builds the app's root manifest from these
+    /// bytes rather than reopening `path`, so it is the file that was checked
+    /// when it was read; an `ApplySpicepod` also compares against them to tell
+    /// a redelivery of the running deployment from a new one.
     pub spicepod_yaml: String,
 }
+
+/// Largest cloud-managed Spicepod read back at startup: the most a deployment
+/// can deliver, since the control stream decodes no message larger than this.
+const MAX_CLOUD_MANAGED_SPICEPOD_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct CloudManagedSpicepodReadError {
@@ -455,17 +509,63 @@ pub async fn cloud_managed_spicepod(
     read_cloud_managed_spicepod(path).await
 }
 
+/// Read the persisted deployment, accepting only the file a deployment writes:
+/// a singly-linked regular file owned by this service, never a link.
+///
+/// The name is fixed and known before any deployment lands, so in a config
+/// directory another account can add entries to, anything else at it may have
+/// been put there to choose this instance's configuration. That is refused
+/// with an error naming the file rather than started from.
 async fn read_cloud_managed_spicepod(
     path: PathBuf,
 ) -> std::result::Result<Option<CloudManagedSpicepod>, CloudManagedSpicepodReadError> {
-    match tokio::fs::read_to_string(&path).await {
+    let read_path = path.clone();
+    let read = tokio::task::spawn_blocking(move || {
+        runtime_cloud_connect::identity::read_owned_state_file_optional(
+            &read_path,
+            MAX_CLOUD_MANAGED_SPICEPOD_BYTES,
+        )
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err(std::io::Error::other(format!(
+            "the read task stopped: {error}"
+        )))
+    });
+    let bytes = match read {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(None),
+        Err(source) => {
+            let source = unsafe_deployment_file(source, &path);
+            return Err(CloudManagedSpicepodReadError { path, source });
+        }
+    };
+    match String::from_utf8(bytes) {
         Ok(spicepod_yaml) => Ok(Some(CloudManagedSpicepod {
             path,
             spicepod_yaml,
         })),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(CloudManagedSpicepodReadError { path, source }),
+        Err(source) => Err(CloudManagedSpicepodReadError {
+            path,
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+        }),
     }
+}
+
+/// Add the fix to a refusal of the persisted deployment file at `path`. I/O
+/// failures that are not about the file's shape pass through unchanged.
+fn unsafe_deployment_file(source: std::io::Error, path: &Path) -> std::io::Error {
+    if source.kind() != std::io::ErrorKind::InvalidData {
+        return source;
+    }
+    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::io::Error::new(
+        source.kind(),
+        format!(
+            "{source}. Spice loads only the deployment file it wrote itself, so this one is not loaded. Delete it; the next Spice Cloud deployment writes it again, and `chmod go-w '{}'` keeps others from replacing it. See: https://spiceai.org/docs/cli/reference/cloud",
+            config_dir.display()
+        ),
+    )
 }
 
 /// The delivered-secrets store and its cache key, restored from local state.
@@ -714,6 +814,7 @@ fn reconcile(active: &App, deployed: App) -> Reconciled {
         runtime,
         management,
         snapshots,
+        refused_components,
     } = deployed;
 
     let mut restart_required = Vec::new();
@@ -740,6 +841,10 @@ fn reconcile(active: &App, deployed: App) -> Reconciled {
         views,
         models,
         functions,
+        // What the deployment's dependencies may not load. It describes the
+        // deployed components, which are reconciled, and a reload logs any it
+        // newly refuses.
+        refused_components,
         // Read at start only to label anonymous telemetry, which is already
         // running: the label keeps the name the instance started under, and
         // nothing else in a running process is built from the app's name. Take
@@ -2203,6 +2308,11 @@ struct StagedSpicepod {
     app: App,
     incoming: std::path::PathBuf,
     canonical: std::path::PathBuf,
+    /// The bytes that were validated. Promotion checks that the file it renamed
+    /// onto `canonical` holds exactly these, as a regular file this service
+    /// owns, so a file swapped in at `incoming` after validation is never
+    /// committed.
+    spicepod_yaml: Vec<u8>,
 }
 
 /// What the deployment transaction should do with the delivered-secret cache.
@@ -2320,6 +2430,16 @@ impl StagedSpicepod {
         let promotion = async {
             remove_optional_file(&self.canonical).await?;
             tokio::fs::rename(&self.incoming, &self.canonical).await?;
+            // The rename moves whatever entry is at `incoming`. Commit only the
+            // deployment that was validated.
+            if !holds_staged_spicepod(&self.canonical, &self.spicepod_yaml).await? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{INCOMING_CLOUD_MANAGED_SPICEPOD_FILE} in the config directory was replaced after it was validated, so it was not committed. Check who else can write to the config directory, then deploy again"
+                    ),
+                ));
+            }
             match &cache {
                 SecretCachePromotion::Replace(incoming) => {
                     remove_optional_file(&cache_path).await?;
@@ -2425,7 +2545,26 @@ async fn restore_optional_snapshot(
     }
     remove_optional_file(canonical).await?;
     // Copy instead of rename so recovery is idempotent if this process exits
-    // before the transaction marker itself can be removed.
+    // before the transaction marker itself can be removed. The copy creates the
+    // canonical file exclusively and follows no link on either side, so an
+    // entry planted at either name after the checks above is refused rather
+    // than read or written through.
+    #[cfg(unix)]
+    {
+        let (snapshot, canonical) = (snapshot.to_path_buf(), canonical.to_path_buf());
+        let copied = tokio::task::spawn_blocking(move || {
+            runtime_cloud_connect::identity::snapshot_regular_file_create_new(&snapshot, &canonical)
+        })
+        .await
+        .map_err(|error| std::io::Error::other(format!("the restore task stopped: {error}")))??;
+        if !copied {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "the snapshot to restore disappeared",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
     tokio::fs::copy(snapshot, canonical).await?;
     Ok(())
 }
@@ -2474,11 +2613,16 @@ async fn recover_deployment_transaction(config_dir: &Path) -> std::io::Result<()
     Ok(())
 }
 
-/// Validate a cloud-managed spicepod against a sibling `*.incoming.yml` temp
+/// Validate a cloud-managed spicepod and write it to a sibling `*.incoming.yml`
 /// file, so a bad push never clobbers the last known-good spicepod on disk.
 ///
 /// On any failure the canonical file is left untouched — the instance keeps
-/// serving it — and the temp file is cleaned up.
+/// serving it — and the staged file is cleaned up.
+///
+/// The staged file is always one this call creates: any entry already at its
+/// name is removed, then the file is created exclusively without following a
+/// link, owner-only. The root manifest is built from the delivered bytes, not
+/// by reading the file back, so what is validated is what was delivered.
 ///
 /// `runtime_overrides` are applied to the built app exactly as the start path
 /// applies them, so a deployment applied to this process lands the app a restart
@@ -2499,12 +2643,13 @@ async fn stage_cloud_managed_spicepod(
         .await
         .map_err(|e| CommandError::failed(format!("create config dir: {e}")))?;
 
-    let incoming = config_dir.join("spicepod-cloud-managed.incoming.yml");
-    tokio::fs::write(&incoming, spicepod_yaml)
+    let incoming = config_dir.join(INCOMING_CLOUD_MANAGED_SPICEPOD_FILE);
+    write_staged_spicepod(&incoming, spicepod_yaml)
         .await
         .map_err(|e| CommandError::failed(format!("write spicepod: {e}")))?;
 
-    match AppBuilder::build_from_path(incoming.clone()).await {
+    match AppBuilder::build_from_manifest_bytes(spicepod_yaml.as_bytes().to_vec(), &incoming).await
+    {
         Ok(mut app) => {
             // Rendered before the cleanup below: the error is not `Send`, so
             // holding it across an `.await` would make this future unspawnable.
@@ -2522,6 +2667,7 @@ async fn stage_cloud_managed_spicepod(
                 app,
                 incoming,
                 canonical,
+                spicepod_yaml: spicepod_yaml.as_bytes().to_vec(),
             })
         }
         Err(e) => {
@@ -2531,6 +2677,54 @@ async fn stage_cloud_managed_spicepod(
                 "invalid spicepod: {e}"
             )))
         }
+    }
+}
+
+/// Create `incoming` afresh and write `spicepod_yaml` to it durably.
+///
+/// Removing the name first unlinks whatever entry is there (a link is removed,
+/// not followed), and the exclusive no-follow create then fails rather than
+/// open anything that reappears at the name. A file this call created but could
+/// not finish writing is removed.
+async fn write_staged_spicepod(incoming: &Path, spicepod_yaml: &str) -> std::io::Result<()> {
+    remove_optional_file(incoming).await?;
+    let staged = incoming.to_path_buf();
+    let bytes = spicepod_yaml.as_bytes().to_vec();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        let mut file = runtime_cloud_connect::identity::create_state_file_new(&staged)?;
+        let written = file.write_all(&bytes).and_then(|()| file.sync_all());
+        if written.is_err() {
+            let _ = std::fs::remove_file(&staged);
+        }
+        written
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("the staging task stopped: {error}")))?
+}
+
+/// Whether the file now at `path` is the validated deployment: exactly
+/// `expected`, in a singly-linked regular file this service owns.
+///
+/// Read without following a link, so a link at `path` never passes even when
+/// it points at the right bytes. Comparing the bytes, rather than an inode
+/// number, keeps the check meaningful on filesystems that do not preserve
+/// inode numbers across a rename.
+async fn holds_staged_spicepod(path: &Path, expected: &[u8]) -> std::io::Result<bool> {
+    let path = path.to_path_buf();
+    let max_bytes = u64::try_from(expected.len()).unwrap_or(u64::MAX);
+    let read = tokio::task::spawn_blocking(move || {
+        runtime_cloud_connect::identity::read_owned_state_file_optional(&path, max_bytes)
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("the check task stopped: {error}")))?;
+    match read {
+        Ok(Some(bytes)) => Ok(bytes == expected),
+        Ok(None) => Ok(false),
+        // A link, a second hard link, another owner, or more bytes than were
+        // validated: not the staged file.
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -2985,6 +3179,87 @@ mod tests {
             )
             .expect("committed cache"),
             "new cache"
+        );
+        assert!(!dir.join(DEPLOYMENT_TRANSACTION_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A deployment never writes through an entry already at the staging name:
+    /// the staged file is always one the deployment creates. A link planted
+    /// there is replaced, its target is untouched, and the canonical file that
+    /// is committed is a regular, owner-only file with the delivered bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_at_the_staging_name_is_replaced_not_written_through() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = scratch_dir("staging-name-link");
+        let outside = scratch_dir("staging-name-link-target");
+        let victim = outside.join("operator-owned.yml");
+        std::fs::write(&victim, "leave me alone\n").expect("write the link target");
+        std::os::unix::fs::symlink(&victim, dir.join("spicepod-cloud-managed.incoming.yml"))
+            .expect("plant a link at the staging name");
+
+        let (_, canonical) = stage_cloud_managed_spicepod(&dir, VALID_SPICEPOD, &[])
+            .await
+            .expect("stage the deployment")
+            .promote_with_secret_cache(&dir, SecretCachePromotion::Remove)
+            .await
+            .expect("commit the deployment");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read the link target"),
+            "leave me alone\n",
+            "the deployment must not be written through the planted link"
+        );
+        let metadata = std::fs::symlink_metadata(&canonical).expect("stat the canonical file");
+        assert!(
+            metadata.file_type().is_file(),
+            "the committed deployment must be a regular file, not the planted link"
+        );
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&canonical).expect("read the canonical file"),
+            VALID_SPICEPOD
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// What is committed is what was validated. A staged file replaced between
+    /// validation and promotion is not committed, and the previous deployment
+    /// is restored.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_staged_file_replaced_after_validation_is_not_committed() {
+        const PREVIOUS: &str = "version: v2\nkind: Spicepod\nname: previous-deployment\n";
+        const SUBSTITUTED: &str = "version: v2\nkind: Spicepod\nname: substituted\n";
+
+        let dir = scratch_dir("staging-substituted");
+        let canonical = dir.join(CLOUD_MANAGED_SPICEPOD_FILE);
+        std::fs::write(&canonical, PREVIOUS).expect("write the previous deployment");
+
+        let staged = stage_cloud_managed_spicepod(&dir, VALID_SPICEPOD, &[])
+            .await
+            .expect("stage the deployment");
+        let incoming = dir.join("spicepod-cloud-managed.incoming.yml");
+        std::fs::remove_file(&incoming).expect("remove the staged file");
+        std::fs::write(&incoming, SUBSTITUTED).expect("put another file in its place");
+
+        let err = staged
+            .promote_with_secret_cache(&dir, SecretCachePromotion::Remove)
+            .await
+            .expect_err("a substituted staged file must not be committed");
+        assert_eq!(
+            err.to_string(),
+            "promote the Cloud Connect deployment transaction: spicepod-cloud-managed.incoming.yml in the config directory was replaced after it was validated, so it was not committed. Check who else can write to the config directory, then deploy again; the previous deployment was restored"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&canonical).expect("read the canonical file"),
+            PREVIOUS,
+            "the previous deployment must be what the next start serves"
         );
         assert!(!dir.join(DEPLOYMENT_TRANSACTION_FILE).exists());
 

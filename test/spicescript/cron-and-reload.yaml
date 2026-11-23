@@ -35,7 +35,7 @@ spicepod:
     - from: postgres:public.t
       name: slow_cron
       params: ${sources.src.params}
-      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_cron: '0 0 * * * *' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_cron: '0 0 0 1 1 *' }
     - from: postgres:public.t
       name: removed_later
       params: ${sources.src.params}
@@ -74,7 +74,9 @@ steps:
   - query: SELECT id, v FROM v
     oracle-sql: SELECT id, v FROM t WHERE id <= 10
     eventually: 30s
-  # The hourly schedule has not run.
+  # The yearly schedule (midnight on 1 January, in the runtime's local time
+  # zone) has not run; an hourly one would fire during any run that crosses
+  # the top of an hour.
   - query: SELECT count(*) AS n FROM slow_cron
     expect: { rows: [['100']] }
     consistently: 5s
