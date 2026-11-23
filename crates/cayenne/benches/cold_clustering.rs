@@ -176,7 +176,8 @@ fn print_unequal_range_effectiveness() {
 fn bench_kernel(c: &mut Criterion) {
     let n = 100_000i64;
     // One column per clustering key, with distinct cardinalities so every axis
-    // contributes bits: a unique id, then 1000, 50, 20, 8 and 3 distinct values.
+    // contributes bits: a unique id, then 1000, 50, 20, 8, 3, 500, 30 and 12
+    // distinct values.
     let axes: Vec<Vec<i64>> = vec![
         (0..n).collect(),
         (0..n).map(|i| (i * 7) % 1000).collect(),
@@ -184,12 +185,15 @@ fn bench_kernel(c: &mut Criterion) {
         (0..n).map(|i| (i * 3) % 20).collect(),
         (0..n).map(|i| (i * 5) % 8).collect(),
         (0..n).map(|i| i % 3).collect(),
+        (0..n).map(|i| (i * 11) % 500).collect(),
+        (0..n).map(|i| (i * 13) % 30).collect(),
+        (0..n).map(|i| (i * 17) % 12).collect(),
     ];
 
     let mut group = c.benchmark_group("cluster_keys");
     group.throughput(Throughput::Elements(n as u64));
-    // 1 column skips the Hilbert transform, 2-5 columns use the byte-spread
-    // interleave, and 6 columns takes the generic bitwise interleave.
+    // 1 column skips the Hilbert transform, 1-8 columns use the byte-spread
+    // interleave, and 9 columns takes the generic bitwise interleave.
     for k in 1..=axes.len() {
         let bounds: Vec<_> = axes[..k].iter().map(|axis| bounds_of(axis)).collect();
         let cols: Vec<ArrayRef> = axes[..k]
