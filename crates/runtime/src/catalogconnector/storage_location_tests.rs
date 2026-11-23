@@ -115,6 +115,10 @@ struct MockState {
 
 /// A Unity Catalog API with the one schema `cat.sch`, plus an S3 endpoint serving
 /// the bucket `bucket` from a local directory.
+///
+/// It denies every credential-vending request, because a vended S3 store always
+/// connects to AWS. A vended catalog therefore reads its tables with the static
+/// storage credentials it falls back to.
 struct MockCatalog {
     endpoint: String,
     state: Arc<MockState>,
@@ -172,14 +176,10 @@ async fn handle(State(state): State<Arc<MockState>>, request: Request) -> Respon
         }
         (Method::POST, "/api/2.1/unity-catalog/temporary-table-credentials") => {
             state.credential_requests.fetch_add(1, Ordering::SeqCst);
-            json_response(&serde_json::json!({
-                "aws_temp_credentials": {
-                    "access_key_id": "AKIAVENDED",
-                    "secret_access_key": "vended",
-                    "session_token": "vended"
-                },
-                "expiration_time": 4_102_444_800_000_i64
-            }))
+            Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::from("PERMISSION_DENIED"))
+                .expect("response builds")
         }
         (Method::GET, "/bucket") => list_objects(&state.bucket, &query),
         (Method::GET | Method::HEAD, _) => match path.strip_prefix("/bucket/") {
@@ -380,31 +380,42 @@ impl Fixture {
 
 const NOT_FOUND: &str = "table 'uc.sch.local_table' not found";
 
-#[tokio::test(flavor = "multi_thread")]
-async fn unity_catalog_refuses_a_local_storage_location() {
-    let fixture = Fixture::new();
-    let mock = MockCatalog::start(
+/// A Unity Catalog catalog over `mock` with static S3 credentials for its bucket,
+/// plus `extra` params.
+fn unity_catalog(mock: &MockCatalog, extra: &[(&str, &str)]) -> Catalog {
+    let mut params = vec![
+        ("unity_catalog_aws_endpoint", mock.endpoint.as_str()),
+        ("unity_catalog_aws_allow_http", "true"),
+        ("unity_catalog_aws_region", "us-east-1"),
+        ("unity_catalog_aws_access_key_id", "AKIASTATIC"),
+        ("unity_catalog_aws_secret_access_key", "static"),
+    ];
+    params.extend_from_slice(extra);
+    catalog(
+        format!(
+            "unity_catalog:{}/api/2.1/unity-catalog/catalogs/cat",
+            mock.endpoint
+        ),
+        &params,
+    )
+}
+
+async fn start_mock(fixture: &Fixture) -> MockCatalog {
+    MockCatalog::start(
         vec![
             uc_table("local_table", &fixture.local_location),
             uc_table("remote_table", "s3://bucket/tables/remote/"),
         ],
         fixture.bucket.clone(),
     )
-    .await;
-    let runtime = load_catalog(catalog(
-        format!(
-            "unity_catalog:{}/api/2.1/unity-catalog/catalogs/cat",
-            mock.endpoint
-        ),
-        &[
-            ("unity_catalog_aws_endpoint", mock.endpoint.as_str()),
-            ("unity_catalog_aws_allow_http", "true"),
-            ("unity_catalog_aws_region", "us-east-1"),
-            ("unity_catalog_aws_access_key_id", "AKIASTATIC"),
-            ("unity_catalog_aws_secret_access_key", "static"),
-        ],
-    ))
-    .await;
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unity_catalog_refuses_a_local_storage_location() {
+    let fixture = Fixture::new();
+    let mock = start_mock(&fixture).await;
+    let runtime = load_catalog(unity_catalog(&mock, &[])).await;
 
     assert_eq!(registered_tables(&runtime, "uc"), vec!["remote_table"]);
     assert_eq!(
@@ -421,25 +432,23 @@ async fn unity_catalog_refuses_a_local_storage_location() {
 #[tokio::test(flavor = "multi_thread")]
 async fn unity_catalog_with_credential_vending_refuses_a_local_storage_location() {
     let fixture = Fixture::new();
-    let mock = MockCatalog::start(
-        vec![uc_table("local_table", &fixture.local_location)],
-        fixture.bucket.clone(),
-    )
-    .await;
-    let runtime = load_catalog(catalog(
-        format!(
-            "unity_catalog:{}/api/2.1/unity-catalog/catalogs/cat",
-            mock.endpoint
-        ),
+    let mock = start_mock(&fixture).await;
+    let runtime = load_catalog(unity_catalog(
+        &mock,
         &[("unity_catalog_credential_vending", "enabled")],
     ))
     .await;
 
-    assert_eq!(registered_tables(&runtime, "uc"), Vec::<String>::new());
+    assert_eq!(registered_tables(&runtime, "uc"), vec!["remote_table"]);
     assert_eq!(
         mock.credential_requests(),
-        0,
-        "the table must be refused before credentials are vended for it"
+        1,
+        "credentials must be requested for the object storage table, and not for the local table"
+    );
+    assert_eq!(
+        select_values(&runtime, "uc.sch.remote_table").await,
+        Ok(vec![OBJECT_STORE_ROW.to_string()]),
+        "a table stored in object storage must still load"
     );
     let error = select_values(&runtime, "uc.sch.local_table")
         .await
