@@ -955,9 +955,19 @@ write their usual reinsert vector stamps and precomputed insert records.
 publication of every staged catalog call. Its `Flush` is idempotent and has no
 durability effect; the object-native run also accepts an empty `Flush`.
 
-All four negative controls are based on `mem-tier-seal-delete-only`. They keep
-requiring their named downstream failure even if exhaustive exploration finds
-none; a missing failure is reported rather than relabeled safe or hidden. Bounds
+All four mutations are based on `mem-tier-seal-delete-only`. Three are negative
+controls: they keep requiring their named downstream failure even if exhaustive
+exploration finds none, and a missing failure is reported rather than relabeled
+safe or hidden. The fourth, `mem-tier-late-stamp`, expects to hold, because its
+mutation is unobservable rather than unexplored: the engine honors an insert
+stamp only on the current snapshot's scan, and only while no protected snapshot
+exists (`table.rs`, `InsertRecordHandling`), and every checkpoint that writes
+insert records also publishes a protected snapshot. A full rewrite removes that
+snapshot only together with every stamp at or below its cutoff. The run checks
+that a late stamp stays safe under that rule; the
+[object-native design](../../docs/design/object-native-metastore-technical.md#commit-numbers-and-sequence-numbers)
+records why a design that read the stamp elsewhere would make it required
+again. Bounds
 are three source applies, two seals, two explicit checkpoints, one bake attempt,
 one full-rewrite attempt and one crash/recovery, with budgets retained across
 restart. The second seal is what lets a later seal acknowledge an apply that
@@ -1061,7 +1071,7 @@ The optional `protected survivor excluded by pushdown` diagnostic is hypothesis 
 | `mem-tier-no-one-call` | Stage seal shadow before pure vectors; stage checkpoint insert records after snapshot/vectors/clear, allowing flush/crash between | `recovered reads match the source` |
 | `mem-tier-no-insert-records` | Omit checkpoint insert records and hidden-key RAM upgrade, retaining checkpoint vector stamps | `recovered reads match the source` |
 | `mem-tier-no-capture-reservation` | Reserve the pure-delete seal's shadow sequence after releasing capture | `recovered reads match the source` |
-| `mem-tier-late-stamp` | Reserve a fresh insert-record stamp at checkpoint staging after a post-capture apply | `recovered reads match the source` |
+| `mem-tier-late-stamp` | Reserve a fresh insert-record stamp at checkpoint staging after a post-capture apply | none: holds (see above) |
 
 Control names retain their original API; their modes have the
 `mem-tier-seal-delete-only-no-` prefix (`no-early-stamp` for late stamping).

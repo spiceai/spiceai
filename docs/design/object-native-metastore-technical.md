@@ -646,7 +646,8 @@ the key would serve both. The shared key-delete pushdown also reads reinsert
 per-file filter; a key it keeps is still hidden or shown by that filter. That
 rule is also why a checkpoint's insert records need not be stamped at the
 checkpoint's own `seq`: no per-file filter honors a stamp while the snapshot it
-describes is live, and `mem-tier-late-stamp` finds no failure within its bounds.
+describes is live, and `mem-tier-late-stamp`, which stamps late, holds within
+its bounds.
 Leaving the insert records out altogether does fail (`mem-tier-no-insert-records`).
 A design that let group files honor a reinsert `seq` would make that stamp's
 order load-bearing. Cross-key cutoffs within a table equal commit order: the seq-prefix
