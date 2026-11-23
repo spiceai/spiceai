@@ -1,4 +1,5 @@
 name: files-coverage
+tags: [long]
 description: >
   Tables read from Parquet and CSV files answer the extended corpus and
   ternary logic partitioning as PostgreSQL answers them over the same
