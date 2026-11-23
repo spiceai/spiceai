@@ -343,7 +343,7 @@ jobs:
         if: ${{ matrix.live }}
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
           role-session-name: gha-databricks-delta-${{ github.run_id }}
           aws-region: us-east-1
           output-env-credentials: false
@@ -352,7 +352,7 @@ jobs:
       - name: Run live scripts
         if: ${{ !cancelled() && matrix.live }}
         env:
-          DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
+          DATABRICKS_HOST: ${{ vars.CI_DATABRICKS_HOST }}
           DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
           DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta.outputs.aws-access-key-id }}

@@ -41,6 +41,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # The CI cache's anonymous read URL (.github/ci-cache/README.md). setup-rust and
+  # install-cargo-deny read pinned downloads from it, falling back to the source; empty
+  # where the repository has no CI object store, which turns the cache off.
+  CI_CACHE_URL: ${{ vars.TEST_MINIO_ENDPOINT && format('{0}/ci-cache', vars.TEST_MINIO_ENDPOINT) || '' }}
   # CI performance optimizations
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   CARGO_NET_RETRY: 10
@@ -181,8 +185,8 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         env:
-          DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
-          DATABRICKS_CLUSTER_ID: ${{ vars.NEW_DATABRICKS_CLUSTER_ID }}
+          DATABRICKS_HOST: ${{ vars.CI_DATABRICKS_HOST }}
+          DATABRICKS_CLUSTER_ID: ${{ vars.CI_DATABRICKS_CLUSTER_ID }}
           DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
           DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
         run: bash .github/scripts/databricks_cluster.sh start
@@ -484,7 +488,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
           role-session-name: gha-databricks-delta-${{ github.run_id }}
           role-duration-seconds: 5400
           aws-region: us-east-1
@@ -533,8 +537,8 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true' && github.event.inputs.run_all_tests == 'true'
         timeout-minutes: 14
         env:
-          DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
-          DATABRICKS_CLUSTER_ID: ${{ vars.NEW_DATABRICKS_CLUSTER_ID }}
+          DATABRICKS_HOST: ${{ vars.CI_DATABRICKS_HOST }}
+          DATABRICKS_CLUSTER_ID: ${{ vars.CI_DATABRICKS_CLUSTER_ID }}
           DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
           DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
           DATABRICKS_CLUSTER_WAIT_SECONDS: '720'
@@ -570,10 +574,10 @@ jobs:
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta-new.outputs.aws-access-key-id }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta-new.outputs.aws-secret-access-key }}
           AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta-new.outputs.aws-session-token }}
-          TEST_DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
-          NEW_DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
-          NEW_DATABRICKS_CLUSTER_ID: ${{ vars.NEW_DATABRICKS_CLUSTER_ID }}
-          NEW_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
+          TEST_DATABRICKS_HOST: ${{ vars.CI_DATABRICKS_HOST }}
+          NEW_DATABRICKS_HOST: ${{ vars.CI_DATABRICKS_HOST }}
+          NEW_DATABRICKS_CLUSTER_ID: ${{ vars.CI_DATABRICKS_CLUSTER_ID }}
+          NEW_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.CI_DATABRICKS_SQL_WAREHOUSE_ID }}
           DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
           DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
           SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
@@ -1232,7 +1236,7 @@ jobs:
         id: aws-databricks-delta
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_DATABRICKS_DELTA_ROLE_ARN }}
           role-session-name: gha-databricks-delta-${{ github.run_id }}
           aws-region: us-east-1
           output-env-credentials: false
