@@ -151,9 +151,7 @@ impl PreparedResolvedAppend {
             .map_err(Failure::discard)?;
         let reserved_delta = self.table.reserve_live_rows_delta();
         commit_metadata(catalog, &mut prepared, &manifest).await?;
-        if !manifest.is_empty() {
-            self.table.uncommitted_files().forget(&self.snapshot_id);
-        }
+        self.table.uncommitted_files().forget(&self.snapshot_id);
 
         let cas_start = Instant::now();
         self.table.publish_prepared_on_conflict_deletions(prepared);

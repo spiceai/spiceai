@@ -9663,17 +9663,8 @@ impl CayenneTableProvider {
         if !self.data_in_object_native_location() {
             return Ok(Vec::new());
         }
-        let (_, rows) = self
-            .snapshot_manifest_rows(
-                snapshot_id,
-                ManifestSequenceTag::Uniform {
-                    min: sequence,
-                    max: sequence,
-                },
-                Vec::new(),
-            )
-            .await?;
-        Ok(rows)
+        self.uniform_snapshot_manifest_rows(snapshot_id, sequence, sequence)
+            .await
     }
 
     /// Records `files` (`(file name, size)` in `snapshot_id`'s directory) in the
@@ -27933,32 +27924,45 @@ impl CayenneTableProvider {
         Ok(rows)
     }
 
-    /// The manifest of `snapshot_id`, a merge's output, tagged `[min, max]`. A
-    /// table in the object-native location gets it back for the swap that makes
-    /// the snapshot live to record, so no crash between two commits leaves its
-    /// files named but never live. Other tables record it here, ahead of the
-    /// swap, and get `None`.
+    /// The manifest of `snapshot_id`, the output of a `pass` merge, tagged
+    /// `[min, max]`. A table in the object-native location gets it back for the
+    /// swap that makes the snapshot live to record, so no crash between two
+    /// commits leaves its files named but never live; such a table scans only
+    /// its manifest, so a failure discards the output. Other tables record it
+    /// here, ahead of the swap, and get `None`, best-effort: a failure leaves
+    /// the scan on directory listing.
     async fn merged_snapshot_manifest(
         &self,
         snapshot_id: &str,
-        min_sequence: i64,
-        max_sequence: i64,
-    ) -> CatalogResult<Option<Vec<SnapshotFile>>> {
-        let (_, rows) = self
-            .snapshot_manifest_rows(
-                snapshot_id,
-                ManifestSequenceTag::Uniform {
-                    min: min_sequence,
-                    max: max_sequence,
-                },
-                Vec::new(),
-            )
-            .await?;
-        if self.data_in_object_native_location() {
-            return Ok(Some(rows));
+        (min_sequence, max_sequence): (i64, i64),
+        pass: &str,
+    ) -> Result<Option<Vec<SnapshotFile>>> {
+        let in_location = self.data_in_object_native_location();
+        let recorded = match self
+            .uniform_snapshot_manifest_rows(snapshot_id, min_sequence, max_sequence)
+            .await
+        {
+            Ok(rows) if in_location => return Ok(Some(rows)),
+            Ok(rows) => self.record_snapshot_manifest(snapshot_id, &rows).await,
+            Err(error) => Err(error),
+        };
+        match recorded {
+            Ok(()) => Ok(None),
+            Err(error) if in_location => {
+                self.cleanup_failed_compaction_snapshot(snapshot_id).await;
+                Err(Error::Catalog { source: error })
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    new_snapshot_id = snapshot_id,
+                    "Failed to author merged {pass} manifest before swap; scan falls back to directory listing"
+                );
+                Ok(None)
+            }
         }
-        self.record_snapshot_manifest(snapshot_id, &rows).await?;
-        Ok(None)
     }
 
     /// Fold the manifest of every snapshot in `snapshot_ids` into one
@@ -31859,37 +31863,21 @@ impl CayenneTableProvider {
         // `[fence_max_delete_seq, ...]`. When no input manifest is available,
         // fall back to the conservative `[0, fence_max_delete_seq]` (always
         // bake-eligible — `min = 0` — so a missing input manifest can never make
-        // the output wrongly referenced and resurrect a deleted row). Outside the object-native location it is
-        // best-effort (matches the full-rewrite path): a manifest failure leaves
-        // the scan on directory listing, never loses rows.
+        // the output wrongly referenced and resurrect a deleted row). Outside
+        // the object-native location it is best-effort (matches the
+        // full-rewrite path): a manifest failure leaves the scan on directory
+        // listing, never loses rows.
         let (merged_min, merged_max) = self
             .merged_sequence_range_over_snapshots(&old_ids)
             .await
             .unwrap_or((0, fence_max_delete_seq));
-        let manifest = match self
-            .merged_snapshot_manifest(&new_snapshot_id, merged_min, merged_max)
-            .await
-        {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                // A table in the object-native location scans only its manifest,
-                // so its compaction does not commit a snapshot the manifest lacks.
-                if self.data_in_object_native_location() {
-                    self.cleanup_failed_compaction_snapshot(&new_snapshot_id)
-                        .await;
-                    return Err(Error::Catalog { source: error });
-                }
-                tracing::warn!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    %error,
-                    new_snapshot_id = new_snapshot_id.as_str(),
-                    "Failed to author merged subset-compaction manifest before swap; \
-                     scan falls back to directory listing"
-                );
-                None
-            }
-        };
+        let manifest = self
+            .merged_snapshot_manifest(
+                &new_snapshot_id,
+                (merged_min, merged_max),
+                "subset-compaction",
+            )
+            .await?;
 
         // --- Phase 3: CAS commit. ---
         let phase2_rewrite_ms = phase2_start.elapsed().as_millis();
@@ -31931,10 +31919,7 @@ impl CayenneTableProvider {
             );
             return Ok(false);
         }
-        if manifest.is_some() {
-            // Named by the swap, the files are no longer a write in flight.
-            self.uncommitted_files.forget(&new_snapshot_id);
-        }
+        self.uncommitted_files.forget(&new_snapshot_id);
 
         #[cfg(test)]
         self.run_test_pre_publish_hook().await;
@@ -32652,30 +32637,13 @@ impl CayenneTableProvider {
             .merged_sequence_range_over_snapshots(&old_ids)
             .await
             .unwrap_or((0, fence_max_delete_seq));
-        let manifest = match self
-            .merged_snapshot_manifest(&new_snapshot_id, merged_min, merged_max)
-            .await
-        {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                // A table in the object-native location scans only its manifest,
-                // so its compaction does not commit a snapshot the manifest lacks.
-                if self.data_in_object_native_location() {
-                    self.cleanup_failed_compaction_snapshot(&new_snapshot_id)
-                        .await;
-                    return Err(Error::Catalog { source: error });
-                }
-                tracing::warn!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    %error,
-                    new_snapshot_id = new_snapshot_id.as_str(),
-                    "Failed to author merged seq-prefix-bake manifest before swap; \
-                     scan falls back to directory listing"
-                );
-                None
-            }
-        };
+        let manifest = self
+            .merged_snapshot_manifest(
+                &new_snapshot_id,
+                (merged_min, merged_max),
+                "seq-prefix-bake",
+            )
+            .await?;
 
         // --- Phase 3: CAS commit (atomically deactivate inputs, activate M). ---
         let swapped = match self
@@ -32711,10 +32679,7 @@ impl CayenneTableProvider {
             );
             return Ok(false);
         }
-        if manifest.is_some() {
-            // Named by the swap, the files are no longer a write in flight.
-            self.uncommitted_files.forget(&new_snapshot_id);
-        }
+        self.uncommitted_files.forget(&new_snapshot_id);
 
         #[cfg(test)]
         self.run_test_pre_publish_hook().await;

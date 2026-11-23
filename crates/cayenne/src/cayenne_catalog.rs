@@ -4103,7 +4103,8 @@ impl MetadataCatalog for CayenneCatalog {
             .await;
             match swapped {
                 // CAS guard failed — an input snapshot is no longer active.
-                // The transaction made no changes; nothing to commit.
+                // Nothing commits: dropping the transaction rolls back any
+                // manifest rows it wrote.
                 Ok(false) => return Ok(false),
                 Ok(true) => match tx.commit().await {
                     Ok(()) => return Ok(true),

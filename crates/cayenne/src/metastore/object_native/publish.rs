@@ -23,11 +23,31 @@ use super::{
 };
 use crate::{
     catalog::{CatalogError, CatalogResult, SnapshotSequenceCommit},
-    metadata::{DeleteFile, InlinedData},
+    metadata::{DeleteFile, InlinedData, SnapshotFile},
 };
 use cayenne_metastore_actions::{Action, Kind, Record, proto};
 use object_store_occ::headlog::Outcome;
 use prost::Message;
+
+/// The action that records `files` as manifest rows of `snapshot_id`, refusing a
+/// row of another table or snapshot. `upsert` replaces rows the snapshot already
+/// names instead of refusing them.
+pub(super) fn snapshot_manifest_action(
+    table_id: &str,
+    snapshot_id: &str,
+    files: &[SnapshotFile],
+    upsert: bool,
+) -> CatalogResult<Action> {
+    if files
+        .iter()
+        .any(|f| f.table_id != table_id || f.snapshot_id != snapshot_id)
+    {
+        return Err(invalid(format!(
+            "snapshot file identity does not match snapshot '{snapshot_id}' of table '{table_id}'"
+        )));
+    }
+    Ok(actions::add_files(table_id, snapshot_id, files, upsert))
+}
 
 impl Inner {
     /// Buffer an applied record with the buffers it shares a table with, or
@@ -209,20 +229,12 @@ impl Inner {
         let mut batch = Vec::new();
         for publication in publications {
             if !publication.files.is_empty() {
-                if publication.files.iter().any(|file| {
-                    file.table_id != publication.table_id
-                        || file.snapshot_id != publication.snapshot_id
-                }) {
-                    return Err(invalid(
-                        "a published file does not belong to the published snapshot",
-                    ));
-                }
-                batch.push(actions::add_files(
+                batch.push(snapshot_manifest_action(
                     publication.table_id,
                     publication.snapshot_id,
                     publication.files,
                     true,
-                ));
+                )?);
             }
             batch.extend(self.conflict_batch(
                 publication.delete_files.to_vec(),

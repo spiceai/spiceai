@@ -1674,6 +1674,9 @@ async fn a_dropped_dataset_with_no_reader_is_deleted_after_the_grace() {
 enum Step {
     /// Merge the protected snapshots of a keyed table.
     Merge,
+    /// [`Self::Merge`] by the sequence-prefix bake, which also prunes the
+    /// deletes the merged snapshot has applied.
+    Bake,
     /// Replace an append-only table's rows.
     Overwrite,
     /// Append rows to an append-only table.
@@ -1687,7 +1690,10 @@ enum Step {
 
 impl Step {
     fn keyed(self) -> bool {
-        matches!(self, Self::Merge | Self::Upsert | Self::ChangeStreamUpsert)
+        matches!(
+            self,
+            Self::Merge | Self::Bake | Self::Upsert | Self::ChangeStreamUpsert
+        )
     }
 
     /// The settings a process runs the step with: a merge and an overwrite with
@@ -1695,7 +1701,7 @@ impl Step {
     /// parked, so the step's requests are its own.
     fn config(self) -> VortexConfig {
         match self {
-            Self::Merge | Self::Overwrite => armed(),
+            Self::Merge | Self::Bake | Self::Overwrite => armed(),
             Self::Append | Self::Upsert => parked(),
             Self::ChangeStreamUpsert => VortexConfig {
                 cdc_durability: CdcDurability::File,
@@ -1743,7 +1749,7 @@ impl Step {
     fn live_actions(self) -> &'static [&'static str] {
         match self {
             Self::Overwrite => &["RemoveGroups", "SetCurrentSnapshot"],
-            Self::Merge => &["RemoveGroups", "SetGroup"],
+            Self::Merge | Self::Bake => &["RemoveGroups", "SetGroup"],
             Self::Upsert | Self::ChangeStreamUpsert => &["SetGroup"],
             Self::Append => &[],
         }
@@ -1760,7 +1766,7 @@ impl Step {
     fn after(self) -> Vec<(i64, i64)> {
         match self {
             Self::Overwrite => (5_000..5_700).map(|id| (id, -id)).collect(),
-            Self::Merge => self.before(),
+            Self::Merge | Self::Bake => self.before(),
             Self::Append => {
                 let mut rows = self.before();
                 rows.extend((5_000..5_500).map(|id| (id, id)));
@@ -1776,6 +1782,10 @@ impl Step {
         let committed = match self {
             Self::Merge => table
                 .compact_protected_snapshots_subset(usize::MAX)
+                .await
+                .map_err(|error| error.to_string()),
+            Self::Bake => table
+                .bake_seq_prefix_protected_snapshots()
                 .await
                 .map_err(|error| error.to_string()),
             Self::Overwrite => common::write_batches(
@@ -2095,6 +2105,11 @@ async fn a_kill_at_any_storage_request_of_a_change_stream_upsert_is_all_or_nothi
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kill_at_any_storage_request_of_a_protected_merge_loses_nothing() {
     kill_at_every_request(Step::Merge).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_at_any_storage_request_of_a_sequence_prefix_bake_loses_nothing() {
+    kill_at_every_request(Step::Bake).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -1115,10 +1115,10 @@ pub trait MetadataCatalog: Send + Sync {
     /// Returns `Ok(false)` if any input snapshot is no longer active (the
     /// caller should discard the rewritten output and retry on a later trigger).
     ///
-    /// `files` is the merged snapshot's complete manifest, recorded in the same
-    /// commit as the swap so that no crash leaves the files of a snapshot that
-    /// never became live named, where no sweep reclaims them. `None` when the
-    /// caller recorded the manifest already.
+    /// `files` names the files of the merged snapshot, which has no manifest
+    /// rows yet, in the same commit as the swap, so that no crash leaves the
+    /// files of a snapshot that never became live named, where no sweep
+    /// reclaims them. `None` when the caller recorded the manifest already.
     async fn swap_protected_snapshots(
         &self,
         table_id: &str,
