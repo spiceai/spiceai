@@ -56,7 +56,7 @@ Three Spice changes that are not upstream:
   engine fails to parse the query or runs a different one. Federated queries send client filters
   to the source this way.
 
-One more Spice change, not upstream, that bounds the trees the parser builds:
+Two more Spice changes, not upstream, that keep deep trees from overflowing the stack:
 
 - `src/parser/mod.rs`, `Parser::parse_subexpr`, `Parser::parse_query_body` and
   `Parser::parse_remaining_set_exprs`: the parser tracks the depth of each expression and
@@ -68,6 +68,11 @@ One more Spice change, not upstream, that bounds the trees the parser builds:
   worker stack and aborted the process even when Spice rejected the statement before planning it.
   2048 is four times Spice's own expression depth limit (`MAX_SQL_EXPR_DEPTH`, 512), so every
   statement that limit admits still parses and gets that limit's error instead.
+- `src/ast/spans.rs`, `Spanned for SetExpr`: the span of a set-operation chain is computed by
+  walking its left spine in a loop; upstream recurses once per operation. DataFusion takes that
+  span at every level while planning the chain, inside a 256 KiB stack red zone, and a chain at
+  the bound above needs 256–512 KiB to span recursively, so planning it overflowed the stack.
+  `test_set_operation_chain_span` in that file fails if this is lost.
 
 The rest of the crate is byte-for-byte the published 0.62.0 (`src/`, `Cargo.toml` apart from a
 header comment, `LICENSE.TXT`).

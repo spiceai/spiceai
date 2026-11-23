@@ -25,7 +25,8 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::parser::ParserError;
 
 use super::sql_depth_guard::{
-    self, MAX_QUERY_NESTING_DEPTH, MAX_SQL_EXPR_DEPTH, MAX_UNPROTECTED_EXPR_DEPTH,
+    self, MAX_QUERY_NESTING_DEPTH, MAX_SQL_DATA_TYPE_DEPTH, MAX_SQL_EXPR_DEPTH,
+    MAX_UNPROTECTED_EXPR_DEPTH,
 };
 
 /// The deepest expression or set-operation tree the vendored `sqlparser`
@@ -147,7 +148,8 @@ async fn chains_at_the_parser_bound_are_refused_on_the_worker_stack() {
 
 /// A chain of set operations is built in a loop like an operator chain, and
 /// its tree is bounded the same way: the deepest one the parser builds is
-/// dropped on the worker stack, and one level deeper is a parse error.
+/// planned and dropped on the worker stack, and one level deeper is a parse
+/// error.
 #[tokio::test]
 async fn set_operation_chains_are_bounded_by_the_parser() {
     for (terms, past_the_bound) in [
@@ -166,6 +168,17 @@ async fn set_operation_chains_are_bounded_by_the_parser() {
             "{terms} UNION ALL terms: {parsed:?}"
         );
         assert_eq!(parsed.is_ok(), !past_the_bound, "{terms} UNION ALL terms");
+    }
+
+    for operator in ["UNION ALL", "UNION"] {
+        let chain = |terms| vec!["SELECT 1 AS x"; terms].join(&format!(" {operator} "));
+        plan_on_default_worker_stack(chain(MAX_PARSED_TREE_DEPTH))
+            .await
+            .unwrap_or_else(|e| panic!("a {operator} chain at the bound must plan: {e}"));
+        let err = plan_on_default_worker_stack(chain(MAX_PARSED_TREE_DEPTH + 1))
+            .await
+            .expect_err("a chain past the bound does not plan");
+        assert!(is_parser_depth_error(&err), "{operator}: {err}");
     }
 }
 
@@ -244,7 +257,8 @@ async fn cte_chains_are_bounded_on_the_worker_stack() {
 
 /// Regression test: a view's SQL was planned at load without the depth guard,
 /// so a `WHERE` chain deeper than the planner handles overflowed the stack it
-/// was planned on. The view is now refused at load with the guard's error, and
+/// was planned on, and a deeply nested data type overflowed the stack it was
+/// parsed on. Both views are now refused at load with the guard's error, and
 /// the runtime keeps serving its datasets.
 #[tokio::test]
 async fn an_over_deep_view_is_refused_at_load() {
@@ -259,12 +273,19 @@ async fn an_over_deep_view_is_refused_at_load() {
         "SELECT id FROM depth_source WHERE {}",
         vec!["id > 0"; 2000].join(" AND ")
     ));
+    let mut type_view = spicepod::component::view::View::new("deep_type_view".to_string());
+    type_view.sql = Some(format!(
+        "SELECT id FROM depth_source WHERE CAST(NULL AS {}INT{}) IS NULL",
+        "ARRAY<".repeat(10_000),
+        ">".repeat(10_000)
+    ));
     let app = app::AppBuilder::new("view_depth")
         .with_dataset(spicepod::component::dataset::Dataset::new(
             format!("file:{}", csv.display()),
             "depth_source",
         ))
         .with_view(view)
+        .with_view(type_view)
         .build();
     let rt = Arc::new(crate::Runtime::builder().with_app(app).build().await);
     tokio::time::timeout(
@@ -274,29 +295,44 @@ async fn an_over_deep_view_is_refused_at_load() {
     .await
     .expect("components load");
 
-    let view_status = || {
+    let view_status = |view: &str| {
         rt.status()
             .get_view_statuses()
             .into_iter()
-            .find_map(|(name, status)| (name.table() == "deep_view").then_some(status))
+            .find_map(|(name, status)| (name.table() == view).then_some(status))
     };
-    let mut status = view_status();
-    for _ in 0..600 {
-        if status.as_ref().is_some_and(|s| s.error_message().is_some()) {
-            break;
+    for (view, expected) in [
+        (
+            "deep_view",
+            format!(
+                "Failed to attach view: Unable to create view: Error during planning: Query \
+                 rejected: an expression is nested more than {MAX_SQL_EXPR_DEPTH} levels deep. \
+                 Simplify the query (for example, replace a long chain of OR/AND conditions \
+                 with an IN list or a join)."
+            ),
+        ),
+        (
+            "deep_type_view",
+            format!(
+                "Error during planning: Query rejected: a data type is nested more than \
+                 {MAX_SQL_DATA_TYPE_DEPTH} levels deep. Simplify the type."
+            ),
+        ),
+    ] {
+        let mut status = view_status(view);
+        for _ in 0..600 {
+            if status.as_ref().is_some_and(|s| s.error_message().is_some()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            status = view_status(view);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        status = view_status();
+        assert_eq!(
+            status,
+            Some(crate::status::ComponentStatus::error_with_message(expected)),
+            "{view}"
+        );
     }
-    assert_eq!(
-        status,
-        Some(crate::status::ComponentStatus::error_with_message(format!(
-            "Failed to attach view: Unable to create view: Error during planning: Query \
-             rejected: an expression is nested more than {MAX_SQL_EXPR_DEPTH} levels deep. \
-             Simplify the query (for example, replace a long chain of OR/AND conditions with an \
-             IN list or a join)."
-        )))
-    );
 
     assert!(rt.status().is_ready_allowing_unhealthy());
     let rows = rt
