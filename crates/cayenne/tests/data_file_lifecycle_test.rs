@@ -1484,6 +1484,87 @@ async fn a_superseded_deletion_vector_is_kept_until_the_retention_elapses() {
         .await;
 }
 
+/// The vector a position delete supersedes is deleted once the retention has
+/// passed even when the table takes no further write and no sweep was pending:
+/// the delete's own commit starts the retention. The table is reopened before
+/// the deletes so no earlier write's sweep is waiting, and nothing runs a sweep
+/// by hand; only the retention clock is moved.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_superseded_deletion_vector_of_an_idle_table_is_deleted_after_the_retention() {
+    let position = VortexConfig {
+        deletion_mode: DeletionMode::Position,
+        // The background maintenance tick runs, as it does in the runtime.
+        compaction_background_interval_ms: 100,
+        ..parked()
+    };
+    let (location, process) =
+        Location::create_with("events", false, SessionConfig::new(), &position).await;
+    common::insert_batch(&process.table, batch(0..KEYS, |id| id))
+        .await
+        .expect("load");
+    process
+        .table
+        .drain_in_flight_maintenance()
+        .await
+        .expect("drain");
+    process.table.quiesce().await;
+    drop(process);
+    let process = location
+        .open("events", &position, SessionConfig::new())
+        .await;
+    let delete = async |sql: &str| {
+        process
+            .ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("delete");
+    };
+
+    delete("DELETE FROM events WHERE id < 10").await;
+    let first = process.deletion_vector_keys().await;
+    assert_eq!(first.len(), 1, "one position vector: {first:?}");
+    delete("DELETE FROM events WHERE id < 20").await;
+    let second = process.deletion_vector_keys().await;
+    assert_eq!(second.len(), 1, "one position vector: {second:?}");
+    assert!(
+        first.is_disjoint(&second),
+        "the second delete replaced the vector"
+    );
+    assert_eq!(
+        process.retired_deletion_vectors(&location).await,
+        first,
+        "the commit that dropped the earlier vector retired it"
+    );
+
+    eventually(
+        Duration::from_secs(30),
+        "the idle table deletes the superseded vector once the retention has passed",
+        async || {
+            process.table.elapse_data_file_retention();
+            let stored = location.arrow_objects().await;
+            (stored == second, stored)
+        },
+    )
+    .await;
+    eventually(
+        Duration::from_secs(10),
+        "the deleted vector leaves the retirement record",
+        async || {
+            let retired = process.retired_deletion_vectors(&location).await;
+            (retired.is_empty(), retired)
+        },
+    )
+    .await;
+    let expected: Vec<(i64, i64)> = (20..KEYS).map(|id| (id, id)).collect();
+    assert_eq!(process.rows("events").await, expected);
+    process
+        .assert_named_files_stored(&location, "after the sweep")
+        .await;
+}
+
 /// A captured file list has the same retention bound as a remote reader:
 /// after T, reading a retired file fails rather than returning other rows.
 #[tokio::test(flavor = "multi_thread")]
