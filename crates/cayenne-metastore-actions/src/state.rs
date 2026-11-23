@@ -17,6 +17,37 @@ limitations under the License.
 //! The dataset state and the one function that changes it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+/// The ordered map a table's growing collections are kept in: a persistent
+/// map, so a copy of the state shares it and a change copies only the path
+/// to what it changes. Readers keep copies of the state while it changes.
+pub type SharedMap<K, V> = im::OrdMap<K, V>;
+/// The ordered set kept like [`SharedMap`].
+pub type SharedSet<T> = im::OrdSet<T>;
+
+/// A data file's key in a table: `(snapshot, path)`. Shared strings, so copying
+/// a map node copies pointers.
+pub type FileKey = (Arc<str>, Arc<str>);
+
+/// `retain` for a [`SharedMap`]: removes only the entries `keep` refuses, so
+/// the parts of the map it keeps stay shared with copies of it.
+trait Retain<K, V> {
+    fn retain(&mut self, keep: impl FnMut(&K, &V) -> bool);
+}
+
+impl<K: Ord + Clone, V: Clone> Retain<K, V> for SharedMap<K, V> {
+    fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {
+        let refused: Vec<K> = self
+            .iter()
+            .filter(|(key, value)| !keep(key, value))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in refused {
+            self.remove(&key);
+        }
+    }
+}
 
 use prost::Message;
 use snafu::{Snafu, ensure};
@@ -60,7 +91,7 @@ pub struct Inlined {
     pub partition_key: Option<String>,
     pub payload: ObjRef,
     /// Original inline bytes, retained so checkpoints can replay the row.
-    pub raw_payload: Vec<u8>,
+    pub raw_payload: Arc<[u8]>,
     pub count: i64,
     pub seq: i64,
     pub created_at: String,
@@ -70,7 +101,7 @@ pub struct Inlined {
 pub struct InlinedDel {
     pub payload: ObjRef,
     /// Original inline bytes, retained so checkpoints can replay the row.
-    pub raw_payload: Vec<u8>,
+    pub raw_payload: Arc<[u8]>,
     pub count: i64,
     pub seq: i64,
     pub created_at: String,
@@ -101,22 +132,22 @@ pub struct TableState {
     pub current_snapshot_id: String,
     pub seq: i64,
     /// Data files by `(snapshot, path)`.
-    pub files: BTreeMap<(String, String), FileEntry>,
+    pub files: SharedMap<FileKey, Arc<FileEntry>>,
     /// Per-file statistics by `(snapshot, path)`.
-    pub file_stats: BTreeMap<(String, String), FileStat>,
+    pub file_stats: SharedMap<FileKey, Arc<FileStat>>,
     /// Protected snapshots ("groups") and their delete fences.
-    pub groups: BTreeMap<String, i64>,
+    pub groups: SharedMap<String, i64>,
     /// Deletion vectors by id.
-    pub delete_files: BTreeMap<String, DvEntry>,
+    pub delete_files: SharedMap<String, DvEntry>,
     pub stats: Option<TableStats>,
     pub cold: BTreeMap<String, ColdEntry>,
     pub pk_index: Option<(String, ObjRef)>,
     pub index_runs: BTreeMap<(String, String), (u64, u64)>,
-    pub inlined_data: BTreeMap<String, Inlined>,
-    pub inlined_deletes: BTreeMap<String, InlinedDel>,
-    pub insert_records: BTreeMap<Vec<u8>, i64>,
-    pub pending_write_back: BTreeMap<Vec<u8>, i64>,
-    pub partitions: BTreeMap<String, Partition>,
+    pub inlined_data: SharedMap<String, Inlined>,
+    pub inlined_deletes: SharedMap<String, InlinedDel>,
+    pub insert_records: SharedMap<Vec<u8>, i64>,
+    pub pending_write_back: SharedMap<Vec<u8>, i64>,
+    pub partitions: SharedMap<String, Partition>,
     /// Keys of the files that left the live set and are not yet deleted: the
     /// durable retirement record. The record that takes a file out of the live
     /// set retires it: [`DatasetState::apply`] adds the keys live before the
@@ -125,7 +156,7 @@ pub struct TableState {
     /// forgets it (`ForgetRetired`), and no record may make a retired key live
     /// again. A retired data file keeps its entry and statistics until it is
     /// forgotten, so a scan that captured it before the record still reads it.
-    pub retired: BTreeSet<String>,
+    pub retired: SharedSet<String>,
 }
 
 /// The table-relative key of a data file.
@@ -183,7 +214,7 @@ impl TableState {
         let live = self.live_snapshots();
         self.files
             .keys()
-            .filter(|(snapshot, _)| live.contains(snapshot.as_str()))
+            .filter(|(snapshot, _)| live.contains(snapshot.as_ref()))
             .map(|(_, path)| Self::file_key(path))
             .chain(
                 self.delete_files
@@ -200,8 +231,8 @@ impl TableState {
         let live = self.live_snapshots();
         self.files
             .iter()
-            .filter(|((snapshot, _), _)| live.contains(snapshot.as_str()))
-            .map(|((snapshot, path), entry)| (path.as_str(), (snapshot.as_str(), entry)))
+            .filter(|((snapshot, _), _)| live.contains(snapshot.as_ref()))
+            .map(|((snapshot, path), entry)| (path.as_ref(), (snapshot.as_ref(), &**entry)))
             .collect()
     }
 }
@@ -516,8 +547,9 @@ impl DatasetState {
             Kind::AddFiles(a) => {
                 let table = self.table(name, &a.table_id)?;
                 let live = table.live_snapshots().contains(a.snapshot_id.as_str());
+                let snapshot: Arc<str> = Arc::from(a.snapshot_id.as_str());
                 for file in &a.files {
-                    let key = (a.snapshot_id.clone(), file.path.clone());
+                    let key: FileKey = (Arc::clone(&snapshot), Arc::from(file.path.as_str()));
                     ensure!(
                         a.upsert || !table.files.contains_key(&key),
                         GuardSnafu {
@@ -539,7 +571,7 @@ impl DatasetState {
                             }
                         );
                     }
-                    table.files.insert(key, file.clone());
+                    table.files.insert(key, Arc::new(file.clone()));
                 }
             }
             Kind::RemoveFiles(a) => {
@@ -552,9 +584,13 @@ impl DatasetState {
             Kind::SetFileStats(a) => {
                 let table = self.table(name, &a.table_id)?;
                 if let Some(stat) = &a.stat {
-                    table
-                        .file_stats
-                        .insert((stat.snapshot_id.clone(), stat.path.clone()), stat.clone());
+                    table.file_stats.insert(
+                        (
+                            Arc::from(stat.snapshot_id.as_str()),
+                            Arc::from(stat.path.as_str()),
+                        ),
+                        Arc::new(stat.clone()),
+                    );
                 }
             }
             Kind::RemoveFileStats(a) => {
@@ -694,7 +730,7 @@ impl DatasetState {
                     Inlined {
                         partition_key: a.partition_key.clone(),
                         payload: ObjRef::of(&a.payload),
-                        raw_payload: a.payload.clone(),
+                        raw_payload: a.payload.as_slice().into(),
                         created_at: a.created_at.clone(),
                         count: a.count,
                         seq: a.seq,
@@ -713,7 +749,7 @@ impl DatasetState {
                 );
                 if let Some(row) = table.inlined_data.get_mut(&a.id) {
                     row.payload = ObjRef::of(&a.payload);
-                    row.raw_payload.clone_from(&a.payload);
+                    row.raw_payload = a.payload.as_slice().into();
                     row.count = a.count;
                 }
             }
@@ -728,7 +764,7 @@ impl DatasetState {
                 let table = self.table(name, &a.table_id)?;
                 let entry = InlinedDel {
                     payload: ObjRef::of(&a.payload),
-                    raw_payload: a.payload.clone(),
+                    raw_payload: a.payload.as_slice().into(),
                     created_at: a.created_at.clone(),
                     count: a.count,
                     seq: a.seq,
@@ -751,8 +787,14 @@ impl DatasetState {
             Kind::SetInlinedDeletesPublished(a) => {
                 let table = self.table(name, &a.table_id)?;
                 let kind = select(a.select);
-                for (id, row) in &mut table.inlined_deletes {
-                    if selects(kind, &a.ids, id) {
+                let chosen: Vec<String> = table
+                    .inlined_deletes
+                    .keys()
+                    .filter(|id| selects(kind, &a.ids, id))
+                    .cloned()
+                    .collect();
+                for id in chosen {
+                    if let Some(row) = table.inlined_deletes.get_mut(&id) {
                         row.published = a.published;
                     }
                 }
@@ -843,7 +885,7 @@ impl DatasetState {
                 let forgotten: BTreeSet<&str> = a
                     .keys
                     .iter()
-                    .filter(|key| table.retired.remove(key.as_str()))
+                    .filter(|key| table.retired.remove(key.as_str()).is_some())
                     .map(String::as_str)
                     .collect();
                 if !forgotten.is_empty() {
@@ -853,8 +895,8 @@ impl DatasetState {
                     let mut live: BTreeSet<&str> =
                         table.groups.keys().map(String::as_str).collect();
                     live.insert(table.current_snapshot_id.as_str());
-                    let gone = |snapshot: &String, path: &String| {
-                        !live.contains(snapshot.as_str()) && forgotten.contains(path.as_str())
+                    let gone = |snapshot: &str, path: &str| {
+                        !live.contains(snapshot) && forgotten.contains(path)
                     };
                     table
                         .files
@@ -1444,13 +1486,13 @@ mod tests {
         let entries: Vec<(&str, &str)> = table
             .files
             .keys()
-            .map(|(snapshot, path)| (snapshot.as_str(), path.as_str()))
+            .map(|(snapshot, path)| (snapshot.as_ref(), path.as_ref()))
             .collect();
         assert_eq!(entries, [("s", "b"), ("s2", "c")]);
         let stat_keys: Vec<(&str, &str)> = table
             .file_stats
             .keys()
-            .map(|(snapshot, path)| (snapshot.as_str(), path.as_str()))
+            .map(|(snapshot, path)| (snapshot.as_ref(), path.as_ref()))
             .collect();
         assert_eq!(stat_keys, [("s", "b"), ("s2", "c")]);
 

@@ -824,8 +824,11 @@ impl MetadataCatalog for Domain {
             .table(table_id)?
             .files
             .iter()
-            .filter(|((snapshot, path), _)| snapshot == snapshot_id && !file_names.contains(path))
-            .map(|(_, file)| file.clone())
+            .filter(|((snapshot, path), _)| {
+                snapshot.as_ref() == snapshot_id
+                    && !file_names.iter().any(|name| name.as_str() == path.as_ref())
+            })
+            .map(|(_, file)| (**file).clone())
             .collect();
         let mut batch = vec![actions::remove_files(
             table_id,
