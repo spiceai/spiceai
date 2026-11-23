@@ -156,7 +156,7 @@ jobs:
     runs-on: spiceai-dev-runners
     permissions:
       contents: read
-      id-token: write  # RustFS credentials
+      id-token: write  # RustFS and Databricks credentials
     # Slowest successful run from 2026-08-20 to 2026-09-25 (UTC), after the archive
     # step was consolidated to one `nextest archive` invocation: 151.4 min
     # (run 34988348747, merge_group, 2026-09-15), p99 115 min over 880 `push`
@@ -171,6 +171,21 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+
+      # The Spark Connect tests, which only `extended_tests` builds compile, need a Databricks
+      # cluster that takes about 7 minutes to start. Requesting the start here lets it come
+      # up while the archive builds. The test jobs wait for it, and report a cluster that
+      # cannot start, so a failure here does not stop the build.
+      - name: Start the Databricks Spark cluster
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.event.inputs.run_all_tests == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          DATABRICKS_HOST: ${{ vars.CI_DATABRICKS_HOST }}
+          DATABRICKS_CLUSTER_ID: ${{ vars.CI_DATABRICKS_CLUSTER_ID }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
+        run: bash .github/scripts/databricks_cluster.sh start
 
       # Cache Cargo dependencies. Saved by the "Save Cargo registry" step at the
       # end of this job, and never from the merge queue (see there).
@@ -360,11 +375,12 @@ jobs:
     runs-on: spiceai-dev-runners
     environment: ci
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 30.7 min (run
-    # 34948795744, merge_group, 2026-09-15), p99 27.8 min. The two bounded steps
-    # below sum to 60, and everything else in the job (image pulls, the archive
-    # download, ODPI-C) has taken at most 6.0 min in the same window, so this
-    # sits above both and the step bounds are what fire first.
-    timeout-minutes: 90
+    # 34948795744, merge_group, 2026-09-15), p99 27.8 min. The bounded steps below
+    # sum to 84 (14 of it the Databricks wait, which runs only with run_all_tests),
+    # and everything else in the job (image pulls, the archive download, ODPI-C) has
+    # taken at most 6.0 min in the same window, so this sits above both and the step
+    # bounds are what fire first.
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       matrix:
@@ -464,7 +480,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
           role-session-name: gha-databricks-delta-${{ github.run_id }}
           role-duration-seconds: 5400
           aws-region: us-east-1
@@ -476,7 +492,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_ICEBERG_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_ICEBERG_ROLE_ARN }}
           role-session-name: gha-iceberg-${{ github.run_id }}
           role-duration-seconds: 5400
           aws-region: us-east-1
@@ -488,7 +504,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_DYNAMODB_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_DYNAMODB_ROLE_ARN }}
           role-session-name: gha-dynamodb-${{ github.run_id }}
           role-duration-seconds: 5400
           aws-region: us-east-1
@@ -500,7 +516,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_S3_VECTORS_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_S3_VECTORS_ROLE_ARN }}
           role-session-name: gha-s3-vectors-${{ github.run_id }}
           role-duration-seconds: 5400
           aws-region: us-east-1
@@ -539,7 +555,7 @@ jobs:
           AWS_ICEBERG_SECRET_ACCESS_KEY: ${{ steps.aws-iceberg.outputs.aws-secret-access-key }}
           AWS_ICEBERG_SESSION_TOKEN: ${{ steps.aws-iceberg.outputs.aws-session-token }}
           AWS_ICEBERG_REGION: ${{ vars.AWS_ICEBERG_REGION }}
-          AWS_ICEBERG_ACCOUNT_ID: ${{ vars.AWS_ICEBERG_ACCOUNT_ID }}
+          AWS_ICEBERG_ACCOUNT_ID: ${{ vars.CI_AWS_ICEBERG_ACCOUNT_ID }}
           AWS_GLUE_KEY: ${{ steps.aws-iceberg.outputs.aws-access-key-id }}
           AWS_GLUE_SECRET: ${{ steps.aws-iceberg.outputs.aws-secret-access-key }}
           AWS_GLUE_SESSION_TOKEN: ${{ steps.aws-iceberg.outputs.aws-session-token }}
@@ -1187,11 +1203,24 @@ jobs:
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
 
+      # The build job requested the cluster's start; a 7-minute start is longer than the
+      # Spark Connect tests wait. 12 minutes covers a start requested here instead.
+      - name: Wait for the Databricks Spark cluster
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.event.inputs.run_all_tests == 'true'
+        timeout-minutes: 14
+        env:
+          DATABRICKS_HOST: ${{ vars.CI_DATABRICKS_HOST }}
+          DATABRICKS_CLUSTER_ID: ${{ vars.CI_DATABRICKS_CLUSTER_ID }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
+          DATABRICKS_CLUSTER_WAIT_SECONDS: '720'
+        run: bash .github/scripts/databricks_cluster.sh wait
+
       - name: Get Databricks token
         id: databricks-token
         uses: ./.github/actions/databricks-oidc-token
         with:
-          host: ${{ vars.NEW_DATABRICKS_HOST }}
+          host: ${{ vars.CI_DATABRICKS_HOST }}
           client-id: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
           audience: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
 
@@ -1199,7 +1228,7 @@ jobs:
         id: aws-databricks-delta-new
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
           role-session-name: gha-databricks-delta-${{ github.run_id }}
           aws-region: us-east-1
           output-env-credentials: false
@@ -1212,17 +1241,17 @@ jobs:
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
           INSTA_WORKSPACE_ROOT: ${{ github.workspace }}
           CARGO_MANIFEST_DIR: ${{ github.workspace }}
-          TEST_DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
+          TEST_DATABRICKS_HOST: ${{ vars.CI_DATABRICKS_HOST }}
           TEST_DATABRICKS_TOKEN: ${{ steps.databricks-token.outputs.token }}
-          TEST_DATABRICKS_CLUSTER_ID: ${{ vars.NEW_DATABRICKS_CLUSTER_ID }}
-          TEST_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
+          TEST_DATABRICKS_CLUSTER_ID: ${{ vars.CI_DATABRICKS_CLUSTER_ID }}
+          TEST_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.CI_DATABRICKS_SQL_WAREHOUSE_ID }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta-new.outputs.aws-access-key-id }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta-new.outputs.aws-secret-access-key }}
           AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta-new.outputs.aws-session-token }}
-          NEW_DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
+          NEW_DATABRICKS_HOST: ${{ vars.CI_DATABRICKS_HOST }}
           NEW_DATABRICKS_TOKEN: ${{ steps.databricks-token.outputs.token }}
-          NEW_DATABRICKS_CLUSTER_ID: ${{ vars.NEW_DATABRICKS_CLUSTER_ID }}
-          NEW_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
+          NEW_DATABRICKS_CLUSTER_ID: ${{ vars.CI_DATABRICKS_CLUSTER_ID }}
+          NEW_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.CI_DATABRICKS_SQL_WAREHOUSE_ID }}
           NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta-new.outputs.aws-access-key-id }}
           NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta-new.outputs.aws-secret-access-key }}
           NEW_AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta-new.outputs.aws-session-token }}
@@ -1318,7 +1347,7 @@ jobs:
         id: databricks-token
         uses: ./.github/actions/databricks-oidc-token
         with:
-          host: ${{ vars.NEW_DATABRICKS_HOST }}
+          host: ${{ vars.CI_DATABRICKS_HOST }}
           client-id: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
           audience: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
 
@@ -1326,7 +1355,7 @@ jobs:
         id: aws-databricks-delta
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_DATABRICKS_DELTA_ROLE_ARN }}
           role-session-name: gha-databricks-delta-${{ github.run_id }}
           aws-region: us-east-1
           output-env-credentials: false
@@ -1405,7 +1434,7 @@ jobs:
         env:
           AWS_EC2_METADATA_DISABLED: true
           AWS_REGION: ${{ vars.AWS_REGION }}
-          AWS_ROLE_ARN: ${{ vars.AWS_WEB_IDENTITY_TEST_ROLE_ARN }}
+          AWS_ROLE_ARN: ${{ vars.CI_AWS_WEB_IDENTITY_TEST_ROLE_ARN }}
         # A GitHub OIDC token lives 5 minutes, enough for these tests' STS exchanges.
         run: |
           set -euo pipefail
@@ -1483,7 +1512,7 @@ jobs:
         if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_ICEBERG_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_ICEBERG_ROLE_ARN }}
           role-session-name: gha-iceberg-${{ github.run_id }}
           aws-region: us-east-1
           output-env-credentials: false

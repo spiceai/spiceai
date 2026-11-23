@@ -521,7 +521,8 @@ mod tests {
     async fn test_handle_object_store_error_surfaces_timeout() {
         let params = create_test_parameters(vec![]).await;
         let connector = create_test_connector(params);
-        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+        let dataset =
+            create_test_dataset("s3://spice-datasets-gjezag77s0hu/taxi_small_samples/").await;
 
         // A body-read timeout: object_store classifies this as HttpErrorKind::Timeout
         // and flattens it into Error::Generic before it reaches the connector.
@@ -554,7 +555,8 @@ mod tests {
         )])
         .await;
         let connector = create_test_connector(params);
-        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+        let dataset =
+            create_test_dataset("s3://spice-datasets-gjezag77s0hu/taxi_small_samples/").await;
 
         let error = object_store::Error::Generic {
             store: "S3",
@@ -577,7 +579,8 @@ mod tests {
     async fn test_handle_object_store_error_non_timeout_is_not_misreported() {
         let params = create_test_parameters(vec![]).await;
         let connector = create_test_connector(params);
-        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+        let dataset =
+            create_test_dataset("s3://spice-datasets-gjezag77s0hu/taxi_small_samples/").await;
 
         // A decode error is NOT a timeout — it must not be reported as one. (Phillip's
         // concern: typed detection must not mislead users into the wrong fix.)
@@ -602,7 +605,8 @@ mod tests {
     async fn test_url_style_not_set_omits_fragment() {
         let params = create_test_parameters(vec![]).await;
         let connector = create_test_connector(params);
-        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+        let dataset =
+            create_test_dataset("s3://spice-datasets-gjezag77s0hu/taxi_small_samples/").await;
 
         let object_store_url = connector
             .get_object_store_url(&dataset, None)
@@ -624,7 +628,8 @@ mod tests {
         )])
         .await;
         let connector = create_test_connector(params);
-        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+        let dataset =
+            create_test_dataset("s3://spice-datasets-gjezag77s0hu/taxi_small_samples/").await;
 
         let object_store_url = connector
             .get_object_store_url(&dataset, None)
@@ -641,7 +646,8 @@ mod tests {
         )])
         .await;
         let connector = create_test_connector(params);
-        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+        let dataset =
+            create_test_dataset("s3://spice-datasets-gjezag77s0hu/taxi_small_samples/").await;
 
         let object_store_url = connector
             .get_object_store_url(&dataset, None)
@@ -658,7 +664,8 @@ mod tests {
         )])
         .await;
         let connector = create_test_connector(params);
-        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+        let dataset =
+            create_test_dataset("s3://spice-datasets-gjezag77s0hu/taxi_small_samples/").await;
 
         let object_store_url = connector
             .get_object_store_url(&dataset, None)
@@ -674,7 +681,8 @@ mod tests {
     async fn test_iam_role_source_omitted_from_fragments_when_unset() {
         let params = create_test_parameters(vec![]).await;
         let connector = create_test_connector(params);
-        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+        let dataset =
+            create_test_dataset("s3://spice-datasets-gjezag77s0hu/taxi_small_samples/").await;
 
         let object_store_url = connector
             .get_object_store_url(&dataset, None)

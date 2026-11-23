@@ -104,7 +104,7 @@ async fn test_location_metadata_preserves_custom_s3_endpoint() -> Result<(), any
 
         // Create object store client for source (public S3)
         let source_store = AmazonS3Builder::new()
-            .with_bucket_name("spiceai-public-datasets")
+            .with_bucket_name("spice-datasets-gjezag77s0hu")
             .with_region("us-east-1")
             .with_skip_signature(true) // Anonymous access
             .build()?;
