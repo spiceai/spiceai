@@ -546,6 +546,74 @@ mod tests {
         assert_eq!(events[0].payload.ts_ms, 42);
     }
 
+    /// Arrays and maps longer than the decoder reserves up front still decode
+    /// whole, item for item.
+    #[tokio::test]
+    async fn decodes_arrays_and_maps_longer_than_the_up_front_reservation() {
+        let schema = r#"{
+            "type": "record",
+            "name": "Envelope",
+            "fields": [
+                {"name": "after", "type": ["null", {
+                    "type": "record", "name": "Value",
+                    "fields": [
+                        {"name": "id", "type": "long"},
+                        {"name": "tags", "type": {"type": "array", "items": "string"}},
+                        {"name": "attrs", "type": {"type": "map", "values": "long"}}
+                    ]
+                }], "default": null},
+                {"name": "op", "type": "string"}
+            ]
+        }"#;
+        let items = 3_000_i64;
+        let tags: Vec<String> = (0..items).map(|i| format!("t{i}")).collect();
+        let attrs: HashMap<String, i64> = (0..items).map(|i| (format!("k{i}"), i * 7)).collect();
+
+        let avro_schema = AvroSchema::parse_str(schema).expect("schema");
+        let mut record = Record::new(&avro_schema).expect("record");
+        record.put(
+            "after",
+            AvroValue::Union(
+                1,
+                Box::new(AvroValue::Record(vec![
+                    ("id".to_string(), AvroValue::Long(1)),
+                    (
+                        "tags".to_string(),
+                        AvroValue::Array(
+                            tags.iter().cloned().map(AvroValue::String).collect(),
+                        ),
+                    ),
+                    (
+                        "attrs".to_string(),
+                        AvroValue::Map(
+                            attrs
+                                .iter()
+                                .map(|(k, v)| (k.clone(), AvroValue::Long(*v)))
+                                .collect(),
+                        ),
+                    ),
+                ])),
+            ),
+        );
+        record.put("op", AvroValue::String("c".into()));
+        let datum = to_avro_datum(&avro_schema, record).expect("datum");
+
+        let events = parse_avro_change_events(
+            &datum,
+            &AvroDecodeOptions {
+                avro_schema_json: Some(schema.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("parse");
+        assert_eq!(events.len(), 1);
+        let after = &events[0].payload.after;
+        assert_eq!(after["id"], 1);
+        assert_eq!(after["tags"], serde_json::json!(tags));
+        assert_eq!(after["attrs"], serde_json::json!(attrs));
+    }
+
     fn recursive_schema_name(schema_json: &str) -> String {
         match parse_schema(schema_json) {
             Err(Error::RecursiveSchema { name }) => name,

@@ -26,7 +26,7 @@ use crate::{
         Schema,
     },
     types::Value,
-    util::{safe_len, zag_i32, zag_i64},
+    util::{DEFAULT_MAX_ALLOCATION_BYTES, max_allocation_bytes, safe_len, zag_i32, zag_i64},
 };
 use std::{
     borrow::Borrow,
@@ -76,11 +76,46 @@ pub fn decode<R: Read>(schema: &Schema, reader: &mut R) -> AvroResult<Value> {
     decode_internal(schema, rs.get_names(), &None, reader)
 }
 
+/// Array or map items reserved before any of them is decoded. A block header
+/// declares its item count before the items, so reserving the declared count
+/// would let a few bytes of input allocate gigabytes; past this, the collection
+/// grows as items actually decode.
+const MAX_PREALLOCATED_ITEMS: usize = 1024;
+
+/// Decode one datum. Every array and map block in it debits its declared item
+/// count, at the in-memory size of an item, from one budget of
+/// [`max_allocation_bytes`] bytes, so the input cannot make the decoder build
+/// collections larger than that. Items that encode in zero bytes, such as
+/// `null`, take no input, so the declared counts are all that bounds them.
 pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
     schema: &Schema,
     names: &HashMap<Name, S>,
     enclosing_namespace: &Namespace,
     reader: &mut R,
+) -> AvroResult<Value> {
+    let mut budget = max_allocation_bytes(DEFAULT_MAX_ALLOCATION_BYTES);
+    decode_with_budget(schema, names, enclosing_namespace, reader, &mut budget)
+}
+
+fn debit_items<T>(budget: &mut usize, items: usize) -> AvroResult<()> {
+    let desired = items
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or(Details::IntegerOverflow)?;
+    *budget = budget
+        .checked_sub(desired)
+        .ok_or(Details::MemoryAllocation {
+            desired,
+            maximum: max_allocation_bytes(DEFAULT_MAX_ALLOCATION_BYTES),
+        })?;
+    Ok(())
+}
+
+fn decode_with_budget<R: Read, S: Borrow<Schema>>(
+    schema: &Schema,
+    names: &HashMap<Name, S>,
+    enclosing_namespace: &Namespace,
+    reader: &mut R,
+    budget: &mut usize,
 ) -> AvroResult<Value> {
     match *schema {
         Schema::Null => Ok(Value::Null),
@@ -103,26 +138,28 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
         }
         Schema::Decimal(DecimalSchema { ref inner, .. }) => match &**inner {
             Schema::Fixed { .. } => {
-                match decode_internal(inner, names, enclosing_namespace, reader)? {
+                match decode_with_budget(inner, names, enclosing_namespace, reader, budget)? {
                     Value::Fixed(_, bytes) => Ok(Value::Decimal(Decimal::from(bytes))),
                     value => Err(Details::FixedValue(value).into()),
                 }
             }
-            Schema::Bytes => match decode_internal(inner, names, enclosing_namespace, reader)? {
-                Value::Bytes(bytes) => Ok(Value::Decimal(Decimal::from(bytes))),
-                value => Err(Details::BytesValue(value).into()),
-            },
+            Schema::Bytes => {
+                match decode_with_budget(inner, names, enclosing_namespace, reader, budget)? {
+                    Value::Bytes(bytes) => Ok(Value::Decimal(Decimal::from(bytes))),
+                    value => Err(Details::BytesValue(value).into()),
+                }
+            }
             schema => Err(Details::ResolveDecimalSchema(schema.into()).into()),
         },
         Schema::BigDecimal => {
-            match decode_internal(&Schema::Bytes, names, enclosing_namespace, reader)? {
+            match decode_with_budget(&Schema::Bytes, names, enclosing_namespace, reader, budget)? {
                 Value::Bytes(bytes) => deserialize_big_decimal(&bytes).map(Value::BigDecimal),
                 value => Err(Details::BytesValue(value).into()),
             }
         }
         Schema::Uuid => {
             let Value::Bytes(bytes) =
-                decode_internal(&Schema::Bytes, names, enclosing_namespace, reader)?
+                decode_with_budget(&Schema::Bytes, names, enclosing_namespace, reader, budget)?
             else {
                 // Calling decode_internal with Schema::Bytes can only return a Value::Bytes or an error
                 unreachable!();
@@ -204,13 +241,15 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
                     break;
                 }
 
-                items.reserve(len);
+                debit_items::<Value>(budget, len)?;
+                items.reserve(len.min(MAX_PREALLOCATED_ITEMS));
                 for _ in 0..len {
-                    items.push(decode_internal(
+                    items.push(decode_with_budget(
                         &inner.items,
                         names,
                         enclosing_namespace,
                         reader,
+                        budget,
                     )?);
                 }
             }
@@ -226,12 +265,24 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
                     break;
                 }
 
-                items.reserve(len);
+                debit_items::<(String, Value)>(budget, len)?;
+                items.reserve(len.min(MAX_PREALLOCATED_ITEMS));
                 for _ in 0..len {
-                    match decode_internal(&Schema::String, names, enclosing_namespace, reader)? {
+                    match decode_with_budget(
+                        &Schema::String,
+                        names,
+                        enclosing_namespace,
+                        reader,
+                        budget,
+                    )? {
                         Value::String(key) => {
-                            let value =
-                                decode_internal(&inner.types, names, enclosing_namespace, reader)?;
+                            let value = decode_with_budget(
+                                &inner.types,
+                                names,
+                                enclosing_namespace,
+                                reader,
+                                budget,
+                            )?;
                             items.insert(key, value);
                         }
                         value => return Err(Details::MapKeyType(value.into()).into()),
@@ -250,7 +301,8 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
                         index,
                         num_variants: variants.len(),
                     })?;
-                let value = decode_internal(variant, names, enclosing_namespace, reader)?;
+                let value =
+                    decode_with_budget(variant, names, enclosing_namespace, reader, budget)?;
                 Ok(Value::Union(index as u32, Box::new(value)))
             }
             Err(Details::ReadVariableIntegerBytes(io_err)) => {
@@ -274,11 +326,12 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
                 // TODO: This clone is also expensive. See if we can do away with it...
                 items.push((
                     field.name.clone(),
-                    decode_internal(
+                    decode_with_budget(
                         &field.schema,
                         names,
                         &fully_qualified_name.namespace,
                         reader,
+                        budget,
                     )?,
                 ));
             }
@@ -305,11 +358,12 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
         Schema::Ref { ref name } => {
             let fully_qualified_name = name.fully_qualified_name(enclosing_namespace);
             if let Some(resolved) = names.get(&fully_qualified_name) {
-                decode_internal(
+                decode_with_budget(
                     resolved.borrow(),
                     names,
                     &fully_qualified_name.namespace,
                     reader,
+                    budget,
                 )
             } else {
                 Err(Details::SchemaResolutionError(fully_qualified_name).into())
