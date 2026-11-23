@@ -87,7 +87,7 @@ async fn setup_table(
         schema: pk_schema(),
         primary_key: vec!["id".to_string()], // Int64 PK -> KEY-based deletion (the unguarded path)
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(name),
         partition_column: None,
         vortex_config: VortexConfig {
             // Every write lands in a Vortex file immediately, so the file-scan
@@ -99,8 +99,12 @@ async fn setup_table(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let table =
-        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
+    let table = Arc::new(
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), options)
+            .await?,
+    );
     ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
     Ok((table, ctx))
 }
@@ -192,4 +196,4 @@ async fn limit_underdelivery_key_deletion_impl(fixture: TestFixture) -> TestResu
     Ok(())
 }
 
-test_with_backends!(limit_underdelivery_key_deletion_impl);
+test_on_data_store!(limit_underdelivery_key_deletion_impl);

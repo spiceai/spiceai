@@ -44,20 +44,22 @@ async fn setup(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            catalog,
-            CreateTableOptions {
-                table_name: name.to_string(),
-                schema: Arc::clone(schema),
-                primary_key: primary_key.iter().map(ToString::to_string).collect(),
-                on_conflict: None,
-                base_path: fixture.data_path.to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config: cayenne::metadata::VortexConfig::default(),
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                catalog,
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: name.to_string(),
+                    schema: Arc::clone(schema),
+                    primary_key: primary_key.iter().map(ToString::to_string).collect(),
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path(name),
+                    partition_column: None,
+                    vortex_config: cayenne::metadata::VortexConfig::default(),
+                },
+            )
+            .await?,
     );
     ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
     Ok((table, ctx))
@@ -160,7 +162,7 @@ async fn composite_key_filtered_delete_impl(fixture: TestFixture) -> TestResult<
     assert_eq!(payloads(&ctx, "composite").await?, vec!["eu-a", "us-b"]);
     Ok(())
 }
-test_with_backends!(composite_key_filtered_delete_impl);
+test_on_data_store!(composite_key_filtered_delete_impl);
 
 /// `Int64` key: same, through its own key strategy.
 async fn int64_key_filtered_delete_impl(fixture: TestFixture) -> TestResult<()> {
@@ -196,4 +198,4 @@ async fn int64_key_filtered_delete_impl(fixture: TestFixture) -> TestResult<()> 
     assert_eq!(payloads(&ctx, "int64").await?, vec!["p1", "p2", "p5"]);
     Ok(())
 }
-test_with_backends!(int64_key_filtered_delete_impl);
+test_on_data_store!(int64_key_filtered_delete_impl);

@@ -425,7 +425,24 @@ impl FixtureDataStore {
         runtime_env: Arc<RuntimeEnv>,
         options: CreateTableOptions,
     ) -> Result<CayenneTableProvider, Box<dyn std::error::Error>> {
-        let table = self.builder(catalog, runtime_env).create(options).await?;
+        self.create_with(catalog, runtime_env, options, |builder| builder)
+            .await
+    }
+
+    /// [`Self::create`] with `configure` applied to the builder first, for a
+    /// table that needs builder settings such as retention filters.
+    /// # Errors
+    /// As [`Self::create`].
+    pub async fn create_with(
+        &self,
+        catalog: Arc<dyn MetadataCatalog>,
+        runtime_env: Arc<RuntimeEnv>,
+        options: CreateTableOptions,
+        configure: impl FnOnce(CayenneTableProviderBuilder) -> CayenneTableProviderBuilder,
+    ) -> Result<CayenneTableProvider, Box<dyn std::error::Error>> {
+        let table = configure(self.builder(catalog, runtime_env))
+            .create(options)
+            .await?;
         self.check_placement(&table)?;
         Ok(table)
     }
@@ -439,9 +456,41 @@ impl FixtureDataStore {
         runtime_env: Arc<RuntimeEnv>,
         table_name: &str,
     ) -> Result<CayenneTableProvider, Box<dyn std::error::Error>> {
-        let table = self.builder(catalog, runtime_env).open(table_name).await?;
+        self.open_with(catalog, runtime_env, table_name, |builder| builder)
+            .await
+    }
+
+    /// [`Self::open`] with `configure` applied to the builder first.
+    /// # Errors
+    /// As [`Self::create`].
+    pub async fn open_with(
+        &self,
+        catalog: Arc<dyn MetadataCatalog>,
+        runtime_env: Arc<RuntimeEnv>,
+        table_name: &str,
+        configure: impl FnOnce(CayenneTableProviderBuilder) -> CayenneTableProviderBuilder,
+    ) -> Result<CayenneTableProvider, Box<dyn std::error::Error>> {
+        let table = configure(self.builder(catalog, runtime_env))
+            .open(table_name)
+            .await?;
         self.check_placement(&table)?;
         Ok(table)
+    }
+
+    /// The bytes of a file the catalog names by `path`, such as a deletion
+    /// vector's: a local path, or a URL in this data store.
+    /// # Errors
+    /// The file could not be read.
+    pub async fn read(&self, path: &str) -> Result<bytes::Bytes, Box<dyn std::error::Error>> {
+        use object_store::ObjectStoreExt;
+        match &self.config {
+            None => Ok(tokio::fs::read(path).await?.into()),
+            Some(config) => {
+                let url = url::Url::parse(path)?;
+                let location = object_store::path::Path::from_url_path(url.path())?;
+                Ok(config.store.get(&location).await?.bytes().await?)
+            }
+        }
     }
 
     fn builder(
@@ -616,6 +665,21 @@ pub fn require_process_per_test(why: &str) {
 }
 
 /// Run a test on the SQLite backend, with its data files local.
+///
+/// A file whose tests run on the object-native backend registers them with
+/// [`test_on_data_store!`]; a test in such a file that stays here is one of the
+/// object-native exceptions below, each checking behavior that the object-native
+/// data path does not have:
+///
+/// # Object-native exceptions
+///
+/// | Test | Reason |
+/// |------|--------|
+/// | `small_files_compaction_test::link_or_copy_snapshot_files_hardlinks_locally` | Asserts a local hard link (same inode); an object store copies the file. |
+/// | `mutation_model_test::test_delete_file_replacement_same_path_impl` | Writes deletion vectors by hand at a local path. |
+/// | `mutation_model_test::test_publication_without_reinsert_sequence_impl` | Writes deletion vectors by hand at a local path. |
+/// | `mutation_property_test::prop_auto_crossing_observes_position_then_key_switch_impl` | `deletion_mode: auto` starts on position deletes only for a table on a local directory. |
+/// | `mutation_property_test::prop_sequential_auto_crossing_impl` | As above. |
 #[macro_export]
 macro_rules! test_with_backends {
     ($test_fn:ident) => {
