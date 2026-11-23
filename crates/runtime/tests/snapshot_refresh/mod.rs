@@ -75,7 +75,7 @@ mod sqlite;
 mod turso;
 
 const DATASET_NAME: &str = "trips";
-const SNAPSHOT_BUCKET: &str = "spiceai-snapshot-integration-tests";
+const SNAPSHOT_BUCKET: &str = "spiceai-ci-snapshot-integration-tests";
 const SNAPSHOT_REGION: &str = "us-west-2";
 
 /// Engine variants exercised by these tests. Each variant is enabled at

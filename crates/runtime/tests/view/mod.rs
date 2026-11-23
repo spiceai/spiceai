@@ -49,7 +49,7 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
                 std::fs::remove_file("./taxi_trips_vw.db").expect("to remove file");
             }
 
-            let dataset = Dataset::new("s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet", "taxi_trips");
+            let dataset = Dataset::new("s3://spice-datasets-gjezag77s0hu/taxi_small_samples/taxi_sample.parquet", "taxi_trips");
             let mut view = View::new("taxi_trips_vw".to_string());
             view.sql = Some("SELECT VendorID, AVG(trip_distance) AS avg_trip_distance, AVG(fare_amount) AS avg_fare_amount FROM taxi_trips GROUP BY VendorID".to_string());
             view.acceleration = Some(Acceleration {

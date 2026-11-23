@@ -1044,7 +1044,7 @@ async fn test_http_dynamic_request_headers_from_subquery() -> Result<(), String>
             tracing::debug!("HTTP test server started at {addr}");
 
             // 1. Register both datasets: the S3 CSV lookup table and the HTTP API.
-            let orgs_dataset = Dataset::new("s3://spiceai-public-datasets/orgs.csv", "orgs");
+            let orgs_dataset = Dataset::new("s3://spice-datasets-gjezag77s0hu/orgs.csv", "orgs");
 
             let mut http_dataset = Dataset::new(format!("http://{addr}/api"), "data_api");
             http_dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
@@ -1151,7 +1151,7 @@ async fn run_test_http_dynamic_request_headers_accelerated_view() -> Result<(), 
             tracing::debug!("HTTP test server started at {addr}");
 
             // 1. Register datasets: S3 CSV lookup table and HTTP API.
-            let orgs_dataset = Dataset::new("s3://spiceai-public-datasets/orgs.csv", "orgs");
+            let orgs_dataset = Dataset::new("s3://spice-datasets-gjezag77s0hu/orgs.csv", "orgs");
 
             let mut http_dataset = Dataset::new(format!("http://{addr}/api"), "data_api");
             http_dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
@@ -1881,7 +1881,7 @@ async fn test_http_dynamic_request_headers_from_subquery_with_pagination() -> Re
             tracing::debug!("HTTP test server started at {addr}");
 
             // 1. Register both datasets: the S3 CSV lookup table and the paginated HTTP API.
-            let orgs_dataset = Dataset::new("s3://spiceai-public-datasets/orgs.csv", "orgs");
+            let orgs_dataset = Dataset::new("s3://spice-datasets-gjezag77s0hu/orgs.csv", "orgs");
 
             let mut http_dataset = Dataset::new(format!("http://{addr}/api"), "paginated_api");
             http_dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
