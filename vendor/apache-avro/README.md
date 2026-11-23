@@ -46,14 +46,22 @@ decodes an item, and moving to it needs a matching `iceberg` release, so the fix
 - Bytes, strings and fixed values are not debited from the budget: each is allocated at its
   declared length, at most 512 MiB, and survives the decode only once the input has filled it, so
   what a datum keeps of them is bounded by the input length.
-- The array and map arms reserve at most `MAX_PREALLOCATED_ITEMS` (1024) items before decoding.
-  Past that, the collection grows as items actually decode, so a declared count with no items
-  behind it costs a bounded allocation.
+- The array and map arms reserve at most `MAX_PREALLOCATED_ITEMS` (1024) items before decoding,
+  so a declared count with no items behind it costs a bounded allocation. Once that many items
+  have decoded, the block reserves the rest of its declared count in one step, as 0.21.0 does up
+  front, so a long collection is not regrown and rehashed as it fills. That reservation is at
+  most what the budget was already debited for, and it is a `try_reserve`: if it fails, the
+  collection grows item by item.
 
 A datum holding more than 512 MiB of these decoded values now fails to decode; with a 56-byte
-`Value`, that is about 9.6 million array items in one datum. The budget counts values, not
-allocator overhead or the spare capacity of a growing `Vec`, so the heap one datum can claim is a
-small multiple of the budget rather than the budget itself.
+`Value`, that is about 9.6 million array items in one datum. The heap one datum claims stays at
+about the budget: in the allocation test, arrays of zero-byte records, unions and enums each peak
+within 40 KB of 512 MiB before they are refused.
+
+Decode time against upstream 0.21.0, in the same process with the arms interleaved, is within
+run-to-run noise for a 100,000-item `long` array, a 100,000-entry map, 50,000 eight-field records
+and a two-field CDC envelope.
+
 The callers of `decode_internal` (`decode`, `from_avro_datum`, the file
 reader and the single-object reader) are unchanged.
 

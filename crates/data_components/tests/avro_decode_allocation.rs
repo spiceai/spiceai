@@ -98,7 +98,8 @@ static ALLOC: PeakAllocator = PeakAllocator;
 
 /// Heap a rejected body may claim: the reserve a block is allowed before its
 /// items decode, plus the schema and the error, with room to spare. Without the
-/// bound, the within-budget cases below reserve 32 MB to 120 MB.
+/// bound, the within-budget cases below reserve 32 MB to 120 MB. Also the slack
+/// allowed past the budget for a datum that spends it.
 const MAX_HEAP_BYTES: usize = 1024 * 1024;
 
 /// apache-avro's default allocation limit, which bounds every collection in one
@@ -194,7 +195,9 @@ fn declared_collection_sizes_do_not_drive_allocation() {
     // of `null` fields allocates its field list and names, and a union read at
     // the end of the input defaults to a boxed `null`. The array's slots take
     // 504,000,000 of the 536,870,912-byte budget, and the items' own values
-    // spend the remaining 32,870,912 bytes until one does not fit.
+    // spend the remaining 32,870,912 bytes until one does not fit. Once 1024
+    // items have decoded, the array reserves the slots the budget was debited
+    // for, so the heap reaches the budget but not past it.
     let block_of_9m = block_count(9_000_000);
     let fields: Vec<String> = (0..64)
         .map(|i| format!(r#"{{"name": "field_{i:02}", "type": "null"}}"#))
@@ -205,9 +208,9 @@ fn declared_collection_sizes_do_not_drive_allocation() {
     );
     let union_array = r#"{"type": "array", "items": ["null", "long"]}"#.to_string();
     let record_fields_bytes = 64 * map_entry;
-    for (schema, refused_bytes, max_peak) in [
-        (record_array, record_fields_bytes, 48 * 1024 * 1024),
-        (union_array, array_item, 160 * 1024 * 1024),
+    for (schema, refused_bytes) in [
+        (record_array, record_fields_bytes),
+        (union_array, array_item),
     ] {
         let (error, peak) = decode_error_and_peak_heap(&runtime, &schema, &block_of_9m);
         assert_eq!(
@@ -218,7 +221,7 @@ fn declared_collection_sizes_do_not_drive_allocation() {
             "{schema}"
         );
         assert!(
-            peak < max_peak,
+            peak < MAX_ALLOCATION_BYTES + MAX_HEAP_BYTES,
             "{schema}: a block of zero-byte items grew the heap by {peak} bytes"
         );
     }
@@ -240,7 +243,7 @@ fn declared_collection_sizes_do_not_drive_allocation() {
         )
     );
     assert!(
-        peak < 48 * 1024 * 1024,
+        peak < MAX_ALLOCATION_BYTES + MAX_HEAP_BYTES,
         "an array of enum items grew the heap by {peak} bytes"
     );
 

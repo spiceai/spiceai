@@ -77,9 +77,10 @@ pub fn decode<R: Read>(schema: &Schema, reader: &mut R) -> AvroResult<Value> {
 }
 
 /// Array or map items reserved before any of them is decoded. A block header
-/// declares its item count before the items, so reserving the declared count
-/// would let a few bytes of input allocate gigabytes; past this, the collection
-/// grows as items actually decode.
+/// declares its item count before the items, so a block reserves the rest of
+/// its declared count, which the budget has already been debited for, only once
+/// this many items have decoded: input that stops short of them costs a bounded
+/// allocation, and a long collection is still reserved in one step.
 const MAX_PREALLOCATED_ITEMS: usize = 1024;
 
 /// Decode one datum. Every heap allocation the decoder makes that is not a copy
@@ -101,21 +102,32 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
     decode_with_budget(schema, names, enclosing_namespace, reader, &mut budget)
 }
 
+#[inline]
 fn debit_items<T>(budget: &mut usize, items: usize) -> AvroResult<()> {
-    let desired = items
-        .checked_mul(std::mem::size_of::<T>())
-        .ok_or(Details::IntegerOverflow)?;
-    debit_bytes(budget, desired)
+    match items.checked_mul(std::mem::size_of::<T>()) {
+        Some(desired) => debit_bytes(budget, desired),
+        None => Err(Details::IntegerOverflow.into()),
+    }
 }
 
+#[inline]
 fn debit_bytes(budget: &mut usize, desired: usize) -> AvroResult<()> {
-    *budget = budget
-        .checked_sub(desired)
-        .ok_or(Details::MemoryAllocation {
-            desired,
-            maximum: max_allocation_bytes(DEFAULT_MAX_ALLOCATION_BYTES),
-        })?;
-    Ok(())
+    match budget.checked_sub(desired) {
+        Some(remaining) => {
+            *budget = remaining;
+            Ok(())
+        }
+        None => Err(budget_exceeded(desired)),
+    }
+}
+
+#[cold]
+fn budget_exceeded(desired: usize) -> Error {
+    Details::MemoryAllocation {
+        desired,
+        maximum: max_allocation_bytes(DEFAULT_MAX_ALLOCATION_BYTES),
+    }
+    .into()
 }
 
 fn decode_with_budget<R: Read, S: Borrow<Schema>>(
@@ -251,7 +263,11 @@ fn decode_with_budget<R: Read, S: Borrow<Schema>>(
 
                 debit_items::<Value>(budget, len)?;
                 items.reserve(len.min(MAX_PREALLOCATED_ITEMS));
-                for _ in 0..len {
+                for decoded in 0..len {
+                    if decoded == MAX_PREALLOCATED_ITEMS {
+                        // Best effort: if it fails, the collection grows item by item.
+                        let _ = items.try_reserve(len - decoded);
+                    }
                     items.push(decode_with_budget(
                         &inner.items,
                         names,
@@ -275,7 +291,11 @@ fn decode_with_budget<R: Read, S: Borrow<Schema>>(
 
                 debit_items::<(String, Value)>(budget, len)?;
                 items.reserve(len.min(MAX_PREALLOCATED_ITEMS));
-                for _ in 0..len {
+                for decoded in 0..len {
+                    if decoded == MAX_PREALLOCATED_ITEMS {
+                        // Best effort: if it fails, the collection grows item by item.
+                        let _ = items.try_reserve(len - decoded);
+                    }
                     match decode_with_budget(
                         &Schema::String,
                         names,
