@@ -30,8 +30,9 @@ variants:
   object-native-position:
     spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
     datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: position, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
-  # `object-native-key` in an S3-compatible store: the head log and the data
-  # files are both in the location's `cayenne/v1/` folder. It differs from
+  # `object-native-rustfs`: `object-native-key`'s settings with the state
+  # location in an S3-compatible store, so the head log and the data files are
+  # both in the location's `cayenne/v1/` folder. It differs from
   # `object-native-s3` only in flushing the in-memory CDC tier on every tick,
   # which is its point: the log commits, seals and checkpoints many times
   # against a real object store within a short run.
