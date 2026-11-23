@@ -1,5 +1,5 @@
 {
-  "description": "SHA-256 pins of the files CI downloads through .github/scripts/cached_fetch.sh. A pin is what makes a cached copy safe to use: every copy, from the CI cache or the source, is checked against it, and a job that downloads a pinned file from its source writes it back to the cache. See .github/ci-cache/README.md.",
+  "description": "SHA-256 pins of the files CI downloads through .github/scripts/cached_fetch.sh. A pin is what makes a cached copy safe to use: every copy, from the CI cache or the source, is checked against it, and a job with an OIDC token that downloads a pinned file from its source writes it back to the cache. See .github/ci-cache/README.md.",
   "rust": {
     "components": [
       "rustc",

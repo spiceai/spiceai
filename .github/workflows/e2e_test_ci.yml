@@ -195,6 +195,13 @@ jobs:
   build:
     name: Build ${{ matrix.target.name }} binaries
     runs-on: ${{ matrix.target.builder }}
+    permissions:
+      contents: read
+      # Writes a pinned download the CI cache lacked back to it, which the CI object
+      # store accepts only with this job's OIDC credentials (.github/ci-cache/README.md).
+      # The job never runs on a pull request (check_changes is skipped there), so no
+      # unreviewed code holds the token.
+      id-token: write
     environment: ci
     needs: [setup-matrix, check_changes]
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}

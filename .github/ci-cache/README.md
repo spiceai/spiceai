@@ -10,8 +10,8 @@ order:
    self-hosted Macs, which keep their disks between jobs.
 2. `CI_CACHE_URL`, the `ci-cache` bucket of the CI object store, read anonymously over
    HTTP at `<CI_CACHE_URL>/sha256/<sha256>`. Two attempts (one retry); a 404 is a miss
-   and is not retried. Only runners inside the cluster reach it, and no credentials are
-   needed.
+   and is not retried. Only runners inside the cluster reach it, and reading needs no
+   credentials; writing does (see below).
 3. The file's source, such as a GitHub release or static.rust-lang.org. Four attempts
    (three retries), retrying only network errors and 408, 429 and 5xx answers.
 
@@ -19,6 +19,13 @@ Every copy, from any tier, is checked against its pin before it is used. A cache
 with the wrong bytes is a miss, so a damaged or tampered entry costs a download from the
 source and nothing more. A source copy with the wrong bytes fails the job, because the pin
 and the source disagree.
+
+Every copy is also bounded in size by `CI_FETCH_MAX_BYTES`, 256 MiB unless a workflow sets
+it, so a wrong copy cannot fill the runner's disk before its hash is checked. The largest
+file pinned today, the rustc archive for x86_64 Linux, is 80 MiB. curl refuses a response
+that announces a larger size before writing any of it, and from curl 8.4 also stops one
+that grows past the bound without announcing its size. A cached copy over the bound is a
+miss; a source copy over it fails the job, and the bound must be raised for that pin.
 
 ## What is pinned
 
@@ -38,15 +45,25 @@ and the source disagree.
 
 By the jobs that use it. When the bucket answers that it lacks a file (404) or holds the
 wrong bytes, the job downloads the file from its source, checks it against the pin, and
-writes it back with an anonymous `PUT`, so the next job reads it from the bucket. The write
-is best-effort: one try, and a failure is a warning. Nothing is written when the bucket
-could not be reached or refused the read. Objects expire 30 days after they are written,
-which drops files no pin names any more; a file still in use is written again by the next
-job that misses it.
+writes it back, so the next job reads it from the bucket. The write is best-effort: one
+try, and a failure is a warning. Nothing is written when the bucket could not be reached
+or refused the read. Objects expire 30 days after they are written, which drops files no
+pin names any more; a file still in use is written again by the next job that misses it.
 
-Anyone who can reach the bucket can write to it. That is safe because no reader uses bytes
-that do not match its pin, and a reader that finds wrong bytes replaces them with the
-verified download.
+The CI object store accepts writes only with OIDC credentials. `cached_fetch.sh` exchanges
+the job's GitHub OIDC token for temporary credentials of the store with
+`.github/scripts/rustfs_credentials.sh`, the exchange the `rustfs-credentials` action
+runs, and signs the `PUT` with them (AWS SigV4, with the file's SHA-256 as the signed
+payload hash). The credentials stay inside the script and are never printed. Signing needs
+curl 7.87 or later; with an older curl the write is skipped with a warning.
+
+A job has an OIDC token only with `permissions: id-token: write`. A job without one, which
+includes every pull request from a fork, still reads the cache and logs one line saying it
+did not write. Grant the permission only to jobs that never run unreviewed code, that is,
+jobs that do not run on `pull_request`: the token gets the repository's credentials for the
+CI object store, which reach more than this bucket. A reader never trusts the writer either
+way: no reader uses bytes that do not match its pin, and one that finds wrong bytes
+replaces them with the verified download.
 
 ## Adding a file
 
@@ -55,12 +72,16 @@ verified download.
 2. Fetch it with `bash .github/scripts/cached_fetch.sh <sha256> <dest> <source url>`.
 
 A workflow opts in by setting `CI_CACHE_URL` in its top-level `env`, as the workflows that
-run `setup-rust` on `spiceai-dev-runners` do:
+run `setup-rust` on `spiceai-dev-runners` do. The URL is the bucket's path-style URL,
+`<endpoint>/ci-cache`, and the write's credentials come from that endpoint:
 
 ```yaml
 env:
   CI_CACHE_URL: ${{ vars.TEST_MINIO_ENDPOINT && format('{0}/ci-cache', vars.TEST_MINIO_ENDPOINT) || '' }}
 ```
+
+A job that should also fill the cache needs `id-token: write` among its `permissions`, on
+the terms above.
 
 ## Bumping the Rust toolchain
 

@@ -26,6 +26,10 @@ jobs:
     permissions:
       contents: read
       issues: write
+      # Writes a pinned download the CI cache lacked back to it, which the CI object
+      # store accepts only with this job's OIDC credentials (.github/ci-cache/README.md).
+      # Scheduled or dispatched only, so it runs reviewed code.
+      id-token: write
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

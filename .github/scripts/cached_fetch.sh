@@ -21,12 +21,25 @@
 # source disagree. Only a verified file reaches DEST, and it is written to CI_CACHE_DIR
 # for the next job.
 #
+# Every copy is also bounded in size, by CI_FETCH_MAX_BYTES (default 256 MiB, three times
+# the largest file pinned today, the 80 MiB rustc archive for x86_64 Linux), so a wrong
+# copy cannot fill the runner's disk before its SHA-256 is checked. curl refuses a
+# response that announces a larger size before writing any of it, and from curl 8.4 also
+# stops one that grows past the bound without announcing its size; a CI_CACHE_DIR copy is
+# measured before it is read. A cached copy over the bound is a miss like any other wrong
+# copy. A source copy over it fails, since the pin then needs a larger bound.
+#
 # The bucket fills itself. When it answered that it lacks the file (404), or held the wrong
-# bytes, the verified download from the source is written back to it, anonymously, so the
-# next job reads it there. A write that fails is a warning, never a failed job. Nothing is
-# written when the bucket could not be reached or refused the read: it would refuse or
-# stall the write too. Anyone who can reach the bucket may write it, which is safe only
-# because no reader uses bytes that do not match its pin.
+# bytes, the verified download from the source is written back to it so the next job reads
+# it there. The CI object store accepts writes only with OIDC credentials, so the write is
+# signed (AWS SigV4, over the pinned SHA-256 of the body) with temporary credentials that
+# rustfs_credentials.sh gets for this job's GitHub OIDC token. Signing needs curl 7.87 or
+# later: an older curl leaves the session token and the body's hash out of the signature,
+# and the store refuses it. A job without an OIDC token (one without `permissions:
+# id-token: write`, or any pull request from a fork) only reads, and says so in one line.
+# A write that fails is a warning, never a failed job. Nothing is written when the bucket
+# could not be reached or refused the read: it would refuse or stall the write too. The
+# credentials never leave this script's process and are never printed.
 #
 # Usage: bash .github/scripts/cached_fetch.sh SHA256 DEST URL [URL...]
 # CI_SOURCE_DELAY_SECONDS (default 5, doubled after each failed attempt) and
@@ -46,7 +59,7 @@ if ! [[ "$sha256" =~ ^[0-9a-f]{64}$ ]]; then
   echo "::error::cached_fetch.sh: '$sha256' is not a lowercase hex SHA-256."
   exit 2
 fi
-for var in CI_CACHE_ATTEMPTS CI_SOURCE_ATTEMPTS; do
+for var in CI_CACHE_ATTEMPTS CI_SOURCE_ATTEMPTS CI_FETCH_MAX_BYTES; do
   value="${!var:-}"
   if [ -n "$value" ] && ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
     echo "::error::$var must be a whole number of at least 1, got '$value'."
@@ -64,7 +77,9 @@ cache_attempts="${CI_CACHE_ATTEMPTS:-2}"
 source_attempts="${CI_SOURCE_ATTEMPTS:-4}"
 cache_delay="${CI_CACHE_DELAY_SECONDS:-2}"
 source_delay="${CI_SOURCE_DELAY_SECONDS:-5}"
+max_bytes="${CI_FETCH_MAX_BYTES:-268435456}"
 name="$(basename "${sources[0]%%\?*}")"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 file_sha256() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -101,13 +116,15 @@ finish() {
   echo "$name: verified from ${origin} (sha256 $sha256)."
 }
 
-# 1. The host's cache directory.
+# 1. The host's cache directory. The copy is measured before it is copied.
 if [ -n "${CI_CACHE_DIR:-}" ] && [ -f "$CI_CACHE_DIR/sha256/$sha256" ]; then
-  if cp "$CI_CACHE_DIR/sha256/$sha256" "$tmp" 2>/dev/null && [ "$(file_sha256 "$tmp")" = "$sha256" ]; then
+  cached_size="$(wc -c <"$CI_CACHE_DIR/sha256/$sha256" 2>/dev/null | tr -d ' ')" || cached_size=''
+  if [[ "$cached_size" =~ ^[0-9]+$ ]] && [ "$cached_size" -le "$max_bytes" ] &&
+    cp "$CI_CACHE_DIR/sha256/$sha256" "$tmp" 2>/dev/null && [ "$(file_sha256 "$tmp")" = "$sha256" ]; then
     finish "$CI_CACHE_DIR"
     exit 0
   fi
-  echo "::warning::The copy of $name in $CI_CACHE_DIR cannot be read or does not match its pinned SHA-256; ignoring it."
+  echo "::warning::The copy of $name in $CI_CACHE_DIR cannot be read, is larger than CI_FETCH_MAX_BYTES ($max_bytes bytes), or does not match its pinned SHA-256; ignoring it."
   rm -f "$CI_CACHE_DIR/sha256/$sha256" 2>/dev/null || true
 fi
 
@@ -124,11 +141,12 @@ transient() {
   esac
 }
 
-# Fetches $1 into $tmp; sets `status` (curl's exit) and `code` (the HTTP status).
+# Fetches $1 into $tmp; sets `status` (curl's exit) and `code` (the HTTP status). A body
+# larger than max_bytes ends the transfer with curl exit 63.
 fetch() {
   status=0
   code="$(curl --fail --silent --show-error --location --connect-timeout "$2" --max-time "$3" \
-    --write-out '%{http_code}' --output "$tmp" "$1")" || status=$?
+    --max-filesize "$max_bytes" --write-out '%{http_code}' --output "$tmp" "$1")" || status=$?
 }
 
 # 2. The CI object store. cache_state records why the read ended without a verified copy:
@@ -145,6 +163,11 @@ if [ -n "${CI_CACHE_URL:-}" ]; then
         exit 0
       fi
       echo "::warning::The CI cache's copy of $name does not match its pinned SHA-256; downloading it from the source instead."
+      cache_state=wrong
+      break
+    fi
+    if [ "$status" -eq 63 ]; then
+      echo "::warning::The CI cache's copy of $name is larger than CI_FETCH_MAX_BYTES ($max_bytes bytes), so it is not the pinned file; downloading it from the source instead."
       cache_state=wrong
       break
     fi
@@ -169,10 +192,52 @@ write_back() {
     missing | wrong) ;;
     *) return 0 ;;
   esac
+  if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+    echo "$name: not written to the CI cache, which takes writes only from a job with an OIDC token (permissions: id-token: write; a pull request from a fork never has one)."
+    return 0
+  fi
+  local version major minor
+  version="$(curl --version 2>/dev/null | awk 'NR == 1 { print $2 }')" || version=''
+  IFS=. read -r major minor _ <<<"$version"
+  if ! [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || ((major < 7 || (major == 7 && minor < 87))); then
+    echo "::warning::Could not write $name to the CI cache: curl ${version:-of an unknown version} cannot sign the write, and 7.87 or later can. The next job downloads it from the source again."
+    return 0
+  fi
+
+  # CI_CACHE_URL is the bucket's path-style URL, <endpoint>/<bucket>, and the endpoint
+  # answers STS too. 900 seconds is the shortest lifetime STS grants, and outlasts the
+  # PUT's own bound. Nothing here may fail the job, which already has its file.
+  local endpoint="${CI_CACHE_URL%/}" err credentials access_key='' secret_key='' session_token=''
+  local cred_status=0 reason=''
+  endpoint="${endpoint%/*}"
+  err="$(mktemp "$dest_dir/.cached_fetch_sts.XXXXXX" 2>/dev/null)" || err=/dev/null
+  credentials="$(bash "$here/rustfs_credentials.sh" "$endpoint" 900 2>"$err")" || cred_status=$?
+  if [ "$err" != /dev/null ]; then
+    reason="$(head -n 1 "$err" 2>/dev/null)" || reason=''
+    rm -f "$err"
+  fi
+  if [ "$cred_status" -ne 0 ]; then
+    echo "::warning::Could not get credentials to write $name to the CI cache: ${reason:-rustfs_credentials.sh exited $cred_status.} The next job downloads it from the source again."
+    return 0
+  fi
+  {
+    read -r access_key
+    read -r secret_key
+    read -r session_token
+  } <<<"$credentials" || true
+
+  # The credentials reach curl as configuration on stdin, never on its command line, where
+  # any process on the host could read them; rustfs_credentials.sh allowed no character
+  # that could end a quoted value. The body's hash in x-amz-content-sha256 is signed, so
+  # the store refuses bytes that are not the verified file. us-east-1 is the region the
+  # store and the compiler cache sign with.
   local put_status=0 put_code
-  put_code="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 600 \
-    --write-out '%{http_code}' --output /dev/null --upload-file "$tmp" \
-    "${CI_CACHE_URL%/}/sha256/$sha256")" || put_status=$?
+  put_code="$(printf 'user = "%s:%s"\nheader = "x-amz-security-token: %s"\n' \
+    "$access_key" "$secret_key" "$session_token" |
+    curl --config - --fail --silent --show-error --connect-timeout 5 --max-time 600 \
+      --aws-sigv4 'aws:amz:us-east-1:s3' --header "x-amz-content-sha256: $sha256" \
+      --write-out '%{http_code}' --output /dev/null --upload-file "$tmp" \
+      "${CI_CACHE_URL%/}/sha256/$sha256")" || put_status=$?
   if [ "$put_status" -eq 0 ]; then
     echo "$name: written to the CI cache for the next job."
   else
@@ -199,6 +264,8 @@ for ((attempt = 1; ; attempt++)); do
     if transient "$status" "$code"; then
       retry_urls+=("$url")
       echo "::warning::Downloading $name from $url failed with a network or server error (curl exit $status, HTTP $code, attempt $attempt of $source_attempts)."
+    elif [ "$status" -eq 63 ]; then
+      echo "::warning::$url is larger than CI_FETCH_MAX_BYTES ($max_bytes bytes), so $name was not downloaded from it; a retry cannot fix that. If the pinned file is that large, raise CI_FETCH_MAX_BYTES."
     else
       echo "::warning::Downloading $name from $url failed (curl exit $status, HTTP $code), which a retry cannot fix."
     fi
