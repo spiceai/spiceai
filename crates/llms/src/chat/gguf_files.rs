@@ -132,6 +132,10 @@ pub enum ResolveError {
     AmbiguousQuantization {
         name: String,
         quantizations: Vec<String>,
+        /// Each one's first file, in the same order, which the error names from a listing of the
+        /// cache alone: a name read from the cache can name several quantizations once the Hub's
+        /// listing is read.
+        paths: Vec<String>,
     },
     /// A name that is neither a file nor a quantization of the repository.
     #[snafu(display(
@@ -142,6 +146,8 @@ pub enum ResolveError {
     UnknownQuantization {
         name: String,
         available: Vec<String>,
+        /// Each one's first file, in the same order, as [`ResolveError::AmbiguousQuantization`]'s.
+        paths: Vec<String>,
     },
     /// A name only importance matrices or drafters answer to, which are not the model's weights
     /// though their names carry its quantization's tag.
@@ -188,27 +194,21 @@ impl ResolveError {
                 printable(path),
                 listed(missing)
             ),
-            (
-                Self::AmbiguousQuantization {
-                    name,
-                    quantizations,
-                },
-                ListedFrom::Cache,
-            ) => format!(
+            (Self::AmbiguousQuantization { name, paths, .. }, ListedFrom::Cache) => format!(
                 "'{}' matches {} quantizations there, {}; name one of them",
                 printable(name),
-                quantizations.len(),
-                listed(quantizations)
+                paths.len(),
+                listed(paths)
             ),
-            (Self::UnknownQuantization { name, available }, ListedFrom::Cache) => format!(
+            (Self::UnknownQuantization { name, paths, .. }, ListedFrom::Cache) => format!(
                 "there is no file or quantization '{}'; the quantizations there are {}",
                 printable(name),
-                listed(available)
+                listed(paths)
             ),
-            (Self::SeveralWeights { weights, .. }, ListedFrom::Cache) => format!(
+            (Self::SeveralWeights { opening, .. }, ListedFrom::Cache) => format!(
                 "`files` names {} sets of model weights there, {}, and a model loads one; name one of them",
-                weights.len(),
-                listed(weights)
+                opening.len(),
+                listed(opening)
             ),
             _ => self.to_string(),
         }
@@ -283,6 +283,11 @@ fn first_shard<'a>(files: &[&'a str]) -> Option<&'a str> {
 #[must_use]
 pub fn opens_a_set(path: &str) -> bool {
     shard(path).is_none_or(|(_, index, _)| index == 1)
+}
+
+/// `quantization`'s first file, its shard 1 or its only file.
+fn first_file(quantization: &Quantization) -> String {
+    quantization.files.first().cloned().unwrap_or_default()
 }
 
 /// The file of `files` that an engine taking one file opens the model from. An MTP draft head
@@ -747,12 +752,14 @@ pub fn resolve_with_drafters(
                     return Err(ResolveError::UnknownQuantization {
                         name: name.to_string(),
                         available: quantizations.iter().map(|q| q.name.clone()).collect(),
+                        paths: quantizations.iter().map(first_file).collect(),
                     });
                 }
                 several => {
                     return Err(ResolveError::AmbiguousQuantization {
                         name: name.to_string(),
                         quantizations: several.iter().map(|q| q.name.clone()).collect(),
+                        paths: several.iter().copied().map(first_file).collect(),
                     });
                 }
             };
@@ -1589,7 +1596,7 @@ mod tests {
         assert_eq!(
             resolve(&cache, &["Q4_K_M"]).map_err(|e| e.clause(ListedFrom::Cache)),
             Err(
-                "'Q4_K_M' matches 2 quantizations there, big, Model-Q4_K_M; name one of them"
+                "'Q4_K_M' matches 2 quantizations there, big/Model-Q4_K_M-00001-of-00002.gguf, Model-Q4_K_M.gguf; name one of them"
                     .to_string()
             )
         );
@@ -1776,6 +1783,7 @@ mod tests {
             ResolveError::UnknownQuantization {
                 name: "Q99".to_string(),
                 available: names(43),
+                paths: Vec::new(),
             }
             .to_string(),
             format!(
@@ -1786,6 +1794,7 @@ mod tests {
             ResolveError::AmbiguousQuantization {
                 name: "Q".to_string(),
                 quantizations: names(41),
+                paths: Vec::new(),
             }
             .to_string(),
             format!(
@@ -1853,6 +1862,10 @@ mod tests {
             Err(ResolveError::AmbiguousQuantization {
                 name: "gguf".to_string(),
                 quantizations: vec!["Q8_0".to_string(), "Q4_K_M".to_string()],
+                paths: vec![
+                    "gguf/Model-Q8_0.gguf".to_string(),
+                    "gguf/Model-Q4_K_M.gguf".to_string()
+                ],
             })
         );
         let err = resolve(&one_folder(), &["gguf/"]).expect_err("the folder holds two");
@@ -2340,6 +2353,10 @@ mod tests {
             Err(ResolveError::AmbiguousQuantization {
                 name: "Q4_K_M".to_string(),
                 quantizations: vec!["Q8_0".to_string(), "Q5_K_M".to_string()],
+                paths: vec![
+                    "Q4_K_M/A-Q8_0.gguf".to_string(),
+                    "Q4_K_M/B-Q5_K_M.gguf".to_string()
+                ],
             })
         );
         // Without the slash the tag matches too, and a cache holding one of the folder's two
@@ -2353,6 +2370,11 @@ mod tests {
                     "Q8_0".to_string(),
                     "Q5_K_M".to_string(),
                     "Model-Q4_K_M".to_string()
+                ],
+                paths: vec![
+                    "Q4_K_M/A-Q8_0.gguf".to_string(),
+                    "Q4_K_M/B-Q5_K_M.gguf".to_string(),
+                    "Model-Q4_K_M.gguf".to_string()
                 ],
             })
         );

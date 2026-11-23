@@ -220,7 +220,7 @@ async fn what_the_cache_lacks_is_retried_and_says_how_to_fill_it() {
         (
             &["Q3_K_M"][..],
             Budget::Unmeasured,
-            "there is no file or quantization 'Q3_K_M'; the quantizations there are Q4_K_M",
+            "there is no file or quantization 'Q3_K_M'; the quantizations there are Model-Q4_K_M.gguf",
         ),
         // the repository may hold a Q8_0 of the model beside its drafter's
         (
@@ -291,7 +291,7 @@ async fn a_drafter_told_by_its_header_can_be_named_beside_the_weights() {
     assert_eq!(
         error.to_string(),
         format!(
-            "Failed to download model 'test' from Hugging Face repo '{REPO_ID}' (revision 'main'): `HF_HUB_OFFLINE` is set, so Spice read only the Hugging Face cache at '{}', where `files` names 2 sets of model weights there, Q4_K_M, Q8_0, and a model loads one; name one of them. Run `hf download {REPO_ID} --revision main` while online, or unset `HF_HUB_OFFLINE`. See: https://spiceai.org/docs/components/models/huggingface",
+            "Failed to download model 'test' from Hugging Face repo '{REPO_ID}' (revision 'main'): `HF_HUB_OFFLINE` is set, so Spice read only the Hugging Face cache at '{}', where `files` names 2 sets of model weights there, Model-Q4_K_M.gguf, Model-Q8_0.gguf, and a model loads one; name one of them. Run `hf download {REPO_ID} --revision main` while online, or unset `HF_HUB_OFFLINE`. See: https://spiceai.org/docs/components/models/huggingface",
             cache.path().display()
         )
     );
@@ -361,7 +361,7 @@ async fn a_name_several_quantizations_in_the_cache_answer_to_says_to_name_one() 
     assert_eq!(
         error.to_string(),
         format!(
-            "Failed to download model 'test' from Hugging Face repo '{REPO_ID}' (revision 'main'): `HF_HUB_OFFLINE` is set, so Spice read only the Hugging Face cache at '{}', where 'gguf' matches 2 quantizations there, Q4_K_M, Q8_0; name one of them. Run `hf download {REPO_ID} --revision main` while online, or unset `HF_HUB_OFFLINE`. See: https://spiceai.org/docs/components/models/huggingface",
+            "Failed to download model 'test' from Hugging Face repo '{REPO_ID}' (revision 'main'): `HF_HUB_OFFLINE` is set, so Spice read only the Hugging Face cache at '{}', where 'gguf' matches 2 quantizations there, gguf/Model-Q4_K_M.gguf, gguf/Model-Q8_0.gguf; name one of them. Run `hf download {REPO_ID} --revision main` while online, or unset `HF_HUB_OFFLINE`. See: https://spiceai.org/docs/components/models/huggingface",
             cache.path().display()
         )
     );
