@@ -7,7 +7,8 @@ name: Trunk tests
 # when its failures go unaddressed. Add a job here, and to `needs` of the
 # `Trunk tests` job at the end, to move a test out of the merge queue.
 #
-# It runs the model integration tests (integration_llms.yml) and spicescript
+# It runs the model integration tests (integration_llms.yml), the Cayenne
+# object-native set (cayenne_object_native.yml) and spicescript
 # (tools/spicescript):
 # - every script in test/spicescript, including those tagged `long`, which the
 #   merge queue skips;
@@ -438,13 +439,28 @@ jobs:
       id-token: write
     secrets: inherit
 
+  # The metastore model's `all` set with its controls, and the object-native
+  # data-path suites on every store at full depth (cayenne_object_native.yml).
+  # Pull requests and the merge queue run its quick set.
+  cayenne-object-native:
+    name: Cayenne object-native
+    needs: resolve
+    uses: ./.github/workflows/cayenne_object_native.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+      set: all
+    # The called jobs' own permissions: its path filter reads pull requests.
+    permissions:
+      contents: read
+      pull-requests: read
+
   # The run's one verdict, which Trunk Health reads: it succeeds only if every
   # job above succeeded or was skipped, and names the jobs that did not.
   summary:
     environment: secret-free
     name: Trunk tests
     if: ${{ !cancelled() }}
-    needs: [resolve, build, spicescript, models]
+    needs: [resolve, build, spicescript, models, cayenne-object-native]
     runs-on: spiceai-dev-runners
     timeout-minutes: 5
     permissions:
