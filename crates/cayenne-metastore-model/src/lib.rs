@@ -97,7 +97,7 @@ const CURRENT_DEFECTS: [&str; 1] = ["mem-tier-current-3-exhaust"];
 /// (including the data-file replay),
 /// and the runs `crates/cayenne`'s mem-tier replay names directly. A test keeps
 /// this list equal to the runs those files name.
-const REPLAYED_AGAINST_CODE: [&str; 33] = [
+const REPLAYED_AGAINST_CODE: [&str; 34] = [
     "commits-restart-no-persist-before-send",
     "commits-restart-turnover",
     "data-files",
@@ -129,7 +129,8 @@ const REPLAYED_AGAINST_CODE: [&str; 33] = [
     "transactions-txn-no-matching-0-exhaust",
     "transactions-txn-no-prepared-check-1-exhaust",
     "transactions-txn-no-reservation-0-exhaust",
-    "window-storage-6-exhaust",
+    "window-storage-7-exhaust",
+    "window-storage-gc-early-5-exhaust",
     "window-storage-no-exists-5-exhaust",
 ];
 
