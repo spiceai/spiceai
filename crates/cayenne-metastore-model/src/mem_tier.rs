@@ -790,8 +790,9 @@ impl Model for Protocol {
                 // table.rs::bake_seq_prefix_protected_snapshots_inner: T is the
                 // highest data sequence of the baked inputs. The clean-prefix gate
                 // is judged at T, and the prune is capped at both T and the delete
-                // fence: a tombstone above T may still hide a row the bake did not
-                // fold, such as an inline seal shadow.
+                // fence (and, in the engine, below cold-tier files, which this
+                // model does not have): a tombstone above T may still hide a row
+                // the bake did not fold, such as an inline seal shadow.
                 let prefix_cutoff = next.snapshots.iter().map(|s| s.sequence).max()?;
                 let cutoff = prefix_cutoff.min(fence);
                 let clean = next.current_min.is_none_or(|min| min > prefix_cutoff);

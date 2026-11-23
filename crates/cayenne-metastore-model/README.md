@@ -959,9 +959,11 @@ All four mutations are based on `mem-tier-seal-delete-only`. Three are negative
 controls: they keep requiring their named downstream failure even if exhaustive
 exploration finds none, and a missing failure is reported rather than relabeled
 safe or hidden. The fourth, `mem-tier-late-stamp`, expects to hold, because its
-mutation is unobservable rather than unexplored: the engine honors an insert
-stamp only on the current snapshot's scan, and only while no protected snapshot
-exists (`table.rs`, `InsertRecordHandling`), and every checkpoint that writes
+mutation is unobservable rather than unexplored: an insert stamp makes a row
+visible only on the current snapshot's scan, and only while no protected
+snapshot exists (`table.rs`, `InsertRecordHandling`; the key-delete pushdown
+also reads stamps, but only to skip keys before that filter), and every
+checkpoint that writes
 insert records also publishes a protected snapshot. A full rewrite removes that
 snapshot only together with every stamp at or below its cutoff. The run checks
 that a late stamp stays safe under that rule; the
@@ -1035,7 +1037,8 @@ holds during recovery. Unreferenced physical file reclamation is not modeled.
 The bake merges all protected snapshots using partial deletion filters, tags the
 output with the capped delete fence, and prunes only the RAM index, at or below
 the lower of that fence and the highest sequence among the snapshots it folds
-(`table.rs::bake_seq_prefix_protected_snapshots_inner`). A tombstone above the
+(`table.rs::bake_seq_prefix_protected_snapshots_inner`; the engine also caps it
+below its cold-tier files, which the model does not have). A tombstone above the
 folded snapshots may still hide an inline seal shadow, which the bake does not
 fold.
 It retains durable vectors and insert records. The replay configures the

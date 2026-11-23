@@ -98,8 +98,9 @@ pub fn runs() -> Vec<Run> {
             mode: "mem-tier-seal-delete-only-no-early-stamp",
             bound: 3,
             seed: None,
-            // A late stamp is never read while the snapshot it describes is
-            // live, so this mutation must hold (see the mem-tier README).
+            // A late stamp never makes a row visible while the snapshot it
+            // describes is live, so this mutation must hold (see the mem-tier
+            // README).
             failure: "",
         },
         Run {

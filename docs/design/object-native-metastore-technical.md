@@ -526,8 +526,9 @@ Per dataset, a **dataset entry** (name, partitions), and per table:
     read the key twice. The clear waits for the checkpoint that moves the shadow
     into a file. The mem-tier model met the same case in memory: after two
     seals, its bake dropped the in-memory delete at the delete fence and served
-    the shadow row beside its replacement. The engine's bake prunes at the lower
-    of that fence and the highest `seq` it folds, which keeps the delete.
+    the shadow row beside its replacement. The engine's bake prunes at the lowest
+    of that fence, the highest `seq` it folds and its cold-tier cap, which keeps
+    the delete.
   - *Clearing follows coverage, not one compaction.* A compaction that rewrites
     every file a delete could hide rows in clears it in its own record; otherwise
     a later record, such as a cold promotion, clears it once the rest are
