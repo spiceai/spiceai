@@ -92,8 +92,7 @@ fn write_delta_table(dir: &Path, value: &str) {
     .map(serde_json::Value::to_string)
     .collect::<Vec<_>>()
     .join("\n");
-    std::fs::write(dir.join("_delta_log/00000000000000000000.json"), commit)
-        .expect("write commit");
+    std::fs::write(dir.join("_delta_log/00000000000000000000.json"), commit).expect("write commit");
 }
 
 fn uc_table(name: &str, storage_location: &str) -> serde_json::Value {
@@ -165,9 +164,9 @@ async fn handle(State(state): State<Arc<MockState>>, request: Request) -> Respon
     let query = request.uri().query().unwrap_or_default().to_string();
     let method = request.method().clone();
     match (method.clone(), path.as_str()) {
-        (Method::GET, "/api/2.1/unity-catalog/schemas") => json_response(
-            &serde_json::json!({"schemas": [{"name": "sch", "catalog_name": "cat"}]}),
-        ),
+        (Method::GET, "/api/2.1/unity-catalog/schemas") => {
+            json_response(&serde_json::json!({"schemas": [{"name": "sch", "catalog_name": "cat"}]}))
+        }
         (Method::GET, "/api/2.1/unity-catalog/tables") => {
             json_response(&serde_json::json!({ "tables": state.tables }))
         }
@@ -257,27 +256,34 @@ fn get_object(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("bytes="))
         .and_then(|spec| spec.split_once('-'))
-        .map(|(start, end)| match (start.parse::<usize>(), end.parse::<usize>()) {
-            (Ok(start), Ok(end)) => (start, end.min(total - 1)),
-            (Ok(start), Err(_)) => (start, total - 1),
-            (Err(_), Ok(suffix)) => (total.saturating_sub(suffix), total - 1),
-            (Err(_), Err(_)) => (0, total - 1),
-        });
+        .map(
+            |(start, end)| match (start.parse::<usize>(), end.parse::<usize>()) {
+                (Ok(start), Ok(end)) => (start, end.min(total - 1)),
+                (Ok(start), Err(_)) => (start, total - 1),
+                (Err(_), Ok(suffix)) => (total.saturating_sub(suffix), total - 1),
+                (Err(_), Err(_)) => (0, total - 1),
+            },
+        );
     let mut response = Response::builder()
         .header(header::ETAG, "\"etag\"")
         .header(header::LAST_MODIFIED, "Mon, 01 Jan 2024 00:00:00 GMT");
     let body = match requested {
         Some((start, end)) => {
-            response = response
-                .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}"));
+            response = response.status(StatusCode::PARTIAL_CONTENT).header(
+                header::CONTENT_RANGE,
+                format!("bytes {start}-{end}/{total}"),
+            );
             bytes[start..=end].to_vec()
         }
         None => bytes,
     };
     response = response.header(header::CONTENT_LENGTH, body.len());
     response
-        .body(if head { Body::empty() } else { Body::from(body) })
+        .body(if head {
+            Body::empty()
+        } else {
+            Body::from(body)
+        })
         .expect("response builds")
 }
 

@@ -333,9 +333,7 @@ mod tests {
     /// which caused Delta Lake to fail with "Path does not exist".
     #[test]
     fn test_table_reference_creator_no_double_slash_when_location_ends_with_slash() {
-        let table = make_uc_table(Some(
-            "s3://bucket/unity/default/tables/marksheet/",
-        ));
+        let table = make_uc_table(Some("s3://bucket/unity/default/tables/marksheet/"));
         let reference = table_reference_creator(&table).expect("should return Some");
         match reference {
             TableReference::Bare { table } => {

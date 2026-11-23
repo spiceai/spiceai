@@ -696,8 +696,10 @@ mod tests {
         #[tokio::test]
         async fn test_supported_storage_schemes_are_vendable() {
             for scheme in crate::unity_catalog::SUPPORTED_STORAGE_SCHEMES {
-                let url = Url::parse(&format!("{scheme}://container@account.dfs.core.windows.net/path"))
-                    .expect("valid url");
+                let url = Url::parse(&format!(
+                    "{scheme}://container@account.dfs.core.windows.net/path"
+                ))
+                .expect("valid url");
                 let result =
                     vended_object_store(&url, dummy_credentials(), Some("us-west-2".to_string()))
                         .await;
