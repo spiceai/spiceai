@@ -128,14 +128,14 @@ slow-timeout = { period = "120s", terminate-after = 12 }
 # was never going to finish inside a smaller cap.
 #
 # Quiet-pool baselines (run 30833882620) against the 4.6x contention factor and
-# the 1.25x headroom, i.e. 5.75x: partition_chunking 247.9s needs 1425s and
-# layout_pruning_ab 170.1s needs 978s, so both land here.
+# the 1.25x headroom, i.e. 5.75x: partition_chunking 247.9s needs 1425s, so it
+# lands here.
 #
 # Spelled out as its own block rather than folded into the filter above so that
 # `retries = 0` stays visibly scoped to the three convergence test modules that
 # need it. These modules must NOT inherit it.
 [[profile.default.overrides]]
-filter = '(binary_id(=cayenne::integration) & test(/^partition_chunking_test::/)) | (binary_id(=cayenne::integration) & test(/^layout_pruning_ab_test::/))'
+filter = '(binary_id(=cayenne::integration) & test(/^partition_chunking_test::/))'
 slow-timeout = { period = "120s", terminate-after = 12 }
 
 # `mutation_model_test` is the same family but a third of the runtime: 107.1s
