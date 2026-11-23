@@ -45278,24 +45278,40 @@ impl CayenneTableProvider {
         // metastore. A misjudged clock only trades a catalog read for a footer
         // read, or the reverse.
         let written_since_open = part_file.object_meta.last_modified >= self.opened_at;
-        // Schema validation and catalog reads share evolution's publication fence.
-        // Footer I/O below remains outside this mutex.
-        let persisted = if written_since_open {
+        // The row is read without `table_statistics_persistence_lock`, whose
+        // holders write statistics through the metastore and would make this scan
+        // wait for their commits. A row is written only while the live schema is
+        // the one it was collected under, and evolution only widens the schema, so
+        // a row read while the live schema equals `table_schema` before and after
+        // the read was collected under it. Otherwise evolution raced the read, and
+        // the read is repeated under the lock evolution holds. Footer I/O below
+        // stays outside the lock.
+        let read_persisted = || async {
+            self.catalog
+                .get_snapshot_file_statistics(
+                    &self.table_metadata.table_id,
+                    request.snapshot_id,
+                    &file_path,
+                )
+                .await
+                .ok()
+                .flatten()
+        };
+        let persisted = if written_since_open
+            || table_schema.as_ref() != self.table_schema().as_ref()
+        {
             None
         } else {
-            let _guard = self.table_statistics_persistence_lock.lock().await;
+            let unlocked = read_persisted().await;
             if table_schema.as_ref() == self.table_schema().as_ref() {
-                self.catalog
-                    .get_snapshot_file_statistics(
-                        &self.table_metadata.table_id,
-                        request.snapshot_id,
-                        &file_path,
-                    )
-                    .await
-                    .ok()
-                    .flatten()
+                unlocked
             } else {
-                None
+                let _guard = self.table_statistics_persistence_lock.lock().await;
+                if table_schema.as_ref() == self.table_schema().as_ref() {
+                    read_persisted().await
+                } else {
+                    None
+                }
             }
         };
         if let Some(persisted) = persisted

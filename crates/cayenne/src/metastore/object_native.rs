@@ -77,6 +77,12 @@ struct Inner {
     /// Deletes the log's objects below its floor, off the commit path: at
     /// most one collection runs at a time, started after a checkpoint.
     collector: Arc<tokio::sync::Mutex<Collector>>,
+    /// The records applied to `reader.state` since it was last published for
+    /// reads ([`slot::StateSlot::published`]), oldest first.
+    unpublished: Vec<Record>,
+    /// `reader.state` was replaced rather than changed by records, so its next
+    /// publication copies it whole.
+    republish: bool,
 }
 
 /// Buffered changes for a set of tables. Actions on different tables commute,

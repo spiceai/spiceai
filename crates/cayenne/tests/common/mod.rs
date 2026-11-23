@@ -526,6 +526,22 @@ impl TestFixture {
         backend: BackendType,
         store: Option<Arc<dyn object_store::ObjectStore>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_location(backend, store, |store| store).await
+    }
+
+    /// An object-native fixture in the store `CAYENNE_TEST_DATA_STORE` names,
+    /// with every request to it going through `wrap`'s store.
+    pub async fn object_native_wrapped(
+        wrap: impl FnOnce(Arc<dyn object_store::ObjectStore>) -> Arc<dyn object_store::ObjectStore>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_location(BackendType::ObjectNative, None, wrap).await
+    }
+
+    async fn with_location(
+        backend: BackendType,
+        store: Option<Arc<dyn object_store::ObjectStore>>,
+        wrap: impl FnOnce(Arc<dyn object_store::ObjectStore>) -> Arc<dyn object_store::ObjectStore>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = Arc::new(TempDir::new()?);
         let data_path = temp_dir.path().join("data");
         std::fs::create_dir_all(&data_path)?;
@@ -539,10 +555,11 @@ impl TestFixture {
                 FixtureDataStore::local(&data_path),
             ),
             (BackendType::ObjectNative, store) => {
-                let location = match store {
+                let mut location = match store {
                     Some(store) => ObjectNativeLocation::new(store, "cayenne-test", ""),
                     None => FixtureDataStore::location_from_env(temp_dir.path())?,
                 };
+                location.store = wrap(location.store);
                 let catalog = location.open().await?;
                 let data_store = location.data_store(&catalog)?;
                 OBJECT_NATIVE_LOCATIONS

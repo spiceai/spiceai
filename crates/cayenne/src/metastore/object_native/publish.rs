@@ -194,6 +194,7 @@ impl Inner {
             actions: vec![action],
         };
         self.reader.state.apply(&record).map_err(invalid)?;
+        self.unpublished.push(record.clone());
         self.publish_buffers(vec![Pending {
             tables: std::collections::BTreeSet::new(),
             actions: record.actions,

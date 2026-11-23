@@ -37,6 +37,7 @@ use std::{collections::HashMap, sync::Arc};
 
 /// Metadata reads over one replayed [`DatasetState`].
 /// Data files remain in the locations recorded by the writer.
+#[derive(Clone)]
 pub(crate) struct DatasetStateReader {
     pub(crate) state: DatasetState,
     empty: TableState,

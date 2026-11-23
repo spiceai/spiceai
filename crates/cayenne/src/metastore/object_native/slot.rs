@@ -16,8 +16,8 @@ limitations under the License.
 
 //! State slots and transaction reservations.
 
-use super::{Domain, Inner, subject};
-use parking_lot::Mutex;
+use super::{super::state_reader::DatasetStateReader, Domain, Inner, Stop, subject};
+use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
@@ -30,6 +30,16 @@ pub(super) struct StateSlot {
     /// `Resolve`: every other caller waits, so nothing on this log is refused
     /// by the reservation.
     pub(super) reserved: std::sync::atomic::AtomicBool,
+    /// The state as of the last lease returned while the log served reads, or
+    /// `None` while it serves none. Reads use it without taking the state, so a
+    /// read never waits for a lease holder's storage I/O, and never sees a change
+    /// whose commit is still in flight: a commit applies its record to the
+    /// lease's state, which is published only when the lease is returned.
+    pub(super) published: RwLock<Option<Arc<DatasetStateReader>>>,
+}
+/// The state a read sees: see [`StateSlot::published`].
+pub(super) struct PublishedState {
+    pub(super) reader: Arc<DatasetStateReader>,
 }
 pub(super) struct StateLease<'a> {
     slot: &'a Arc<StateSlot>,
@@ -64,6 +74,56 @@ impl StateSlot {
             }
             notified.await;
         }
+    }
+
+    /// The published state, unless a transaction across datasets holds the
+    /// reservation: its tables are read after it resolves, as every other
+    /// caller waits for it.
+    pub(super) fn published(&self) -> Option<PublishedState> {
+        if self.reserved.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        self.published
+            .read()
+            .clone()
+            .map(|reader| PublishedState { reader })
+    }
+
+    /// Publish `inner`'s state for reads, or withdraw it while the log serves
+    /// none. The records applied since the last publication are applied again
+    /// to the published copy, which is cloned only when a read still holds it.
+    fn publish(&self, inner: &mut Inner) {
+        let mut published = self.published.write();
+        if !matches!(inner.stop, None | Some(Stop::Fenced { reloaded: true })) {
+            *published = None;
+            return;
+        }
+        let unpublished = std::mem::take(&mut inner.unpublished);
+        let replayed = match published.as_mut() {
+            Some(current) if !inner.republish => {
+                let state = &mut Arc::make_mut(current).state;
+                unpublished
+                    .iter()
+                    .all(|record| state.apply_in_place(record).is_ok())
+            }
+            _ => false,
+        };
+        // A record that applied to the lease's state applies to the same state
+        // here, so only a replaced state is copied whole.
+        debug_assert!(
+            replayed || inner.republish || published.is_none(),
+            "a record applied to the catalog state did not apply to its published copy"
+        );
+        if !replayed {
+            *published = Some(Arc::new(inner.reader.clone()));
+        }
+        inner.republish = false;
+        debug_assert!(
+            published
+                .as_ref()
+                .is_some_and(|reader| reader.state == inner.reader.state),
+            "the published catalog state differs from the state it publishes"
+        );
     }
 
     /// Wait for the reservation and hold it until the returned guard drops.
@@ -124,12 +184,14 @@ impl Drop for StateLease<'_> {
     fn drop(&mut self) {
         // A commit that did not finish, including one whose caller was cancelled,
         // leaves the log stopped; a background task brings it back.
-        if let Some(inner) = self.inner.as_mut()
-            && inner.needs_recovery()
-            && let Ok(runtime) = tokio::runtime::Handle::try_current()
-        {
-            inner.recovering = true;
-            runtime.spawn(recover_in_background(Arc::downgrade(self.slot)));
+        if let Some(inner) = self.inner.as_mut() {
+            self.slot.publish(inner);
+            if inner.needs_recovery()
+                && let Ok(runtime) = tokio::runtime::Handle::try_current()
+            {
+                inner.recovering = true;
+                runtime.spawn(recover_in_background(Arc::downgrade(self.slot)));
+            }
         }
         *self.slot.inner.lock() = self.inner.take();
         // Every waiter re-checks: one may wait on the reservation, not the state.

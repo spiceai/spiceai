@@ -2106,14 +2106,31 @@ enum ChangeStream {
 /// and re-upserts rows on a store whose every request takes 20 ms: each answer is
 /// a whole prefix of the keys acknowledged writes left, with every row once.
 async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
-    const READERS: usize = 8;
-    const RUN: Duration = Duration::from_secs(20);
     const DELAY: Duration = Duration::from_millis(20);
     let name = "latency_cdc";
     let (setup, catalog) = KeyedSetup::new(name).await;
     let store = setup.store(Some(DELAY));
     let catalog: Arc<dyn MetadataCatalog> = Arc::new(catalog);
-    let config = match stream {
+    let ctx = SessionContext::new();
+    let mut builder = setup.builder(&store, catalog, &ctx);
+    if stream == ChangeStream::RuntimeDefaults {
+        builder =
+            builder.with_scan_view_reuse(cayenne::ScanViewReuse::WithinLag(Duration::from_secs(1)));
+    }
+    let table = Arc::new(
+        builder
+            .create(change_stream_table(name, setup.data_url.clone(), stream))
+            .await
+            .expect("create the keyed table"),
+    );
+    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register");
+    read_during_change_stream(&table, &ctx, name, stream).await;
+}
+
+/// The keyed table [`read_during_change_stream`] writes, configured for `stream`.
+fn change_stream_table(name: &str, base_path: String, stream: ChangeStream) -> CreateTableOptions {
+    let vortex_config = match stream {
         ChangeStream::Durable => cdc_config(CdcDurability::File),
         ChangeStream::MemoryTier => cdc_config(CdcDurability::Memory),
         ChangeStream::RuntimeDefaults => VortexConfig {
@@ -2123,30 +2140,51 @@ async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
             ..VortexConfig::default()
         },
     };
-    let ctx = SessionContext::new();
-    let mut builder = setup.builder(&store, catalog, &ctx);
-    if stream == ChangeStream::RuntimeDefaults {
-        builder =
-            builder.with_scan_view_reuse(cayenne::ScanViewReuse::WithinLag(Duration::from_secs(1)));
+    CreateTableOptions {
+        table_name: name.to_string(),
+        schema: schema(),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+        base_path,
+        partition_column: None,
+        vortex_config,
     }
-    let table = Arc::new(
-        builder
-            .create(CreateTableOptions {
-                table_name: name.to_string(),
-                schema: schema(),
-                primary_key: vec!["id".to_string()],
-                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-                    "id".to_string(),
-                ]))),
-                base_path: setup.data_url.clone(),
-                partition_column: None,
-                vortex_config: config,
-            })
-            .await
-            .expect("create the keyed table"),
-    );
-    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
-        .expect("register");
+}
+
+/// How long each read and each apply of [`read_during_change_stream`] took.
+struct ChangeStreamTimings {
+    reads: Vec<Duration>,
+    applies: Vec<Duration>,
+}
+
+/// The `percentile` (0 to 100) of `samples`, nearest rank.
+fn percentile(samples: &[Duration], percentile: f64) -> Duration {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "a rank within a test's sample count"
+    )]
+    let rank = ((percentile / 100.0) * sorted.len() as f64).ceil() as usize;
+    sorted[rank.clamp(1, sorted.len()) - 1]
+}
+
+/// Runs `stream` into `table` for 20 s with 8 concurrent readers, and asserts
+/// that no read failed and that each answer is a whole prefix of the keys
+/// acknowledged writes left, with every row once. Then, quiesced, that the count
+/// answered from statistics equals a forced scan's.
+async fn read_during_change_stream(
+    table: &Arc<CayenneTableProvider>,
+    ctx: &SessionContext,
+    name: &'static str,
+    stream: ChangeStream,
+) -> ChangeStreamTimings {
+    const READERS: usize = 8;
+    const RUN: Duration = Duration::from_secs(20);
     let memory = stream != ChangeStream::Durable;
     if memory {
         table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
@@ -2169,13 +2207,14 @@ async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let writer = {
-        let table = Arc::clone(&table);
+        let table = Arc::clone(table);
         let acknowledged = Arc::clone(&acknowledged);
         let history = Arc::clone(&history);
         let stop = Arc::clone(&stop);
         tokio::spawn(async move {
             let mut next = 1_i64;
             let mut applies = 0_i64;
+            let mut timings = Vec::new();
             // 75 rows every 40 ms: about 1,900 rows a second, the rate the
             // object-store measurements of change streams use.
             let mut tick = tokio::time::interval(Duration::from_millis(40));
@@ -2183,7 +2222,9 @@ async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
             while !stop.load(Ordering::Acquire) {
                 tick.tick().await;
                 let rows: Vec<(i64, i64)> = (next..next + 50).map(|id| (id, id * 10)).collect();
+                let started = Instant::now();
                 cdc_upsert(&table, &rows).await;
+                timings.push(started.elapsed());
                 next += 50;
                 history.lock().push((Instant::now(), next - 1));
                 acknowledged.store(next - 1, Ordering::Release);
@@ -2197,7 +2238,9 @@ async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
                     .collect::<std::collections::BTreeMap<_, _>>()
                     .into_iter()
                     .collect();
+                let started = Instant::now();
                 cdc_upsert(&table, &again).await;
+                timings.push(started.elapsed());
                 applies += 1;
                 if stream != ChangeStream::MemoryTier {
                     continue;
@@ -2208,7 +2251,7 @@ async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
                     table.seal_mem_tier_durable().await.expect("seal");
                 }
             }
-            applies
+            (applies, timings)
         })
     };
 
@@ -2220,6 +2263,7 @@ async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
         let stop = Arc::clone(&stop);
         readers.push(tokio::spawn(async move {
             let (mut ok, mut failed, mut wrong) = (0_u64, Vec::new(), Vec::new());
+            let mut timings = Vec::new();
             while !stop.load(Ordering::Acquire) {
                 let floor = {
                     let asked = Instant::now();
@@ -2236,7 +2280,9 @@ async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
                 } else {
                     format!("SELECT count(*) FROM {name}")
                 };
+                let started = Instant::now();
                 let result = async { ctx.sql(&sql).await?.collect().await }.await;
+                timings.push(started.elapsed());
                 let ceiling = acknowledged.load(Ordering::Acquire) + 50;
                 match result {
                     Err(error) => failed.push(error.to_string()),
@@ -2255,26 +2301,32 @@ async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
                     }
                 }
             }
-            (ok, failed, wrong)
+            (ok, failed, wrong, timings)
         }));
     }
 
     tokio::time::sleep(RUN).await;
     stop.store(true, Ordering::Release);
-    let applies = writer.await.expect("writer");
+    let (applies, apply_timings) = writer.await.expect("writer");
     let (mut ok, mut failed, mut wrong) = (0_u64, Vec::new(), Vec::new());
+    let mut read_timings = Vec::new();
     for reader in readers {
-        let (o, f, w) = reader.await.expect("reader");
+        let (o, f, w, t) = reader.await.expect("reader");
         ok += o;
         failed.extend(f);
         wrong.extend(w);
+        read_timings.extend(t);
     }
     eprintln!(
-        "{applies} applies; {ok} reads exact, {} failed, {} wrong; first failure: {:?}; first wrong: {:?}",
+        "{applies} applies; {ok} reads exact, {} failed, {} wrong; first failure: {:?}; first wrong: {:?}; \
+         read P99 {:?}, P99.9 {:?} (n = {})",
         failed.len(),
         wrong.len(),
         failed.first(),
-        wrong.first()
+        wrong.first(),
+        percentile(&read_timings, 99.0),
+        percentile(&read_timings, 99.9),
+        read_timings.len()
     );
     assert!(ok > 0, "no read completed");
     assert!(
@@ -2297,9 +2349,13 @@ async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
     if stream == ChangeStream::RuntimeDefaults {
         tokio::time::sleep(Duration::from_millis(1_100)).await;
     }
-    let stats_count = count_and_sum(&ctx, name).await.0;
-    let exact = sorted_rows(&ctx, name).await.len();
+    let stats_count = count_and_sum(ctx, name).await.0;
+    let exact = sorted_rows(ctx, name).await.len();
     assert_eq!(usize::try_from(stats_count).expect("count"), exact);
+    ChangeStreamTimings {
+        reads: read_timings,
+        applies: apply_timings,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -2315,6 +2371,69 @@ async fn scans_under_store_latency_are_stable_during_a_file_durability_change_st
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn scans_under_store_latency_are_stable_with_runtime_change_stream_defaults() {
     scans_under_store_latency_are_stable(ChangeStream::RuntimeDefaults).await;
+}
+
+/// A scan reads the catalog's committed state without waiting for the commit in
+/// flight: with every conditional head write taking about 200 ms and nothing
+/// else delayed, a durable change stream keeps a head write in flight almost all
+/// the time and leaves its upserts' snapshots uncompacted, while readers count
+/// the table. No read fails or sees a torn state, and the read P99 stays below
+/// one head write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn scans_do_not_wait_for_a_slow_head_write() {
+    const HEAD_WRITE: Duration = Duration::from_millis(200);
+    let name = "slow_head_cdc";
+    let fixture = crate::common::TestFixture::object_native_wrapped(|store| {
+        Arc::new(LatencyStore::new(
+            store,
+            LatencyProfile::default().with(Op::Cas, Delay::new(HEAD_WRITE, Duration::from_millis(250))),
+            0x16132,
+        ))
+    })
+    .await
+    .expect("object-native fixture");
+    let ctx = SessionContext::new();
+    let store = fixture.data_store.config.clone().expect("an object-native data store");
+    // Every scan captures its view anew, so every read reads the catalog.
+    let table = Arc::new(
+        crate::common::table_builder_on_store(Arc::clone(&fixture.catalog), ctx.runtime_env(), store)
+            .with_scan_view_reuse(cayenne::ScanViewReuse::WithinLag(Duration::ZERO))
+            .create(change_stream_table(
+                name,
+                fixture.data_store.base_path(name),
+                ChangeStream::Durable,
+            ))
+            .await
+            .expect("create the keyed table"),
+    );
+    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register");
+    let timings = read_during_change_stream(&table, &ctx, name, ChangeStream::Durable).await;
+    // Each durable apply commits once, so it takes at least one delayed head write.
+    let fastest_apply = timings.applies.iter().min().copied().expect("applies");
+    assert!(
+        fastest_apply >= HEAD_WRITE / 2,
+        "the fastest apply took {fastest_apply:?}, so head writes were not delayed"
+    );
+    // `CAYENNE_TEST_READ_TIMINGS` names a file each read's time (µs) is appended
+    // to, so runs can be pooled for a tail with enough samples behind it.
+    if let Ok(path) = std::env::var("CAYENNE_TEST_READ_TIMINGS") {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open the read timings file");
+        for read in &timings.reads {
+            writeln!(file, "{}", read.as_micros()).expect("write a read timing");
+        }
+    }
+    let p99 = percentile(&timings.reads, 99.0);
+    assert!(
+        p99 < HEAD_WRITE,
+        "read P99 {p99:?} over {} reads is not below one head write ({HEAD_WRITE:?})",
+        timings.reads.len()
+    );
 }
 
 /// What one arm of [`sealed_rows_inline_against_data_files`] cost.

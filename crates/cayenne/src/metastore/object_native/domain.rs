@@ -23,7 +23,7 @@ use super::{
     },
     Domain, Inner, NativeCatalogConfig, OpenSummary, Stop, ValueChange, fenced_message, invalid,
     refused_change_message,
-    slot::{StateLease, StateSlot},
+    slot::{PublishedState, StateSlot},
     subject,
 };
 use crate::{
@@ -159,11 +159,21 @@ impl Domain {
             .collect()
     }
 
-    pub(super) async fn read(&self) -> CatalogResult<StateLease<'_>> {
-        let inner = self.inner.take().await;
-        match inner.stop {
-            None | Some(Stop::Fenced { reloaded: true }) => Ok(inner),
-            Some(stop) => Err(inner.stopped(stop)),
+    /// The state for a read: as of the last change that returned, without
+    /// waiting for one in progress ([`StateSlot::published`]). While nothing is
+    /// published it waits for the state, and fails as the stopped log does.
+    pub(super) async fn read(&self) -> CatalogResult<PublishedState> {
+        loop {
+            if let Some(published) = self.inner.published() {
+                return Ok(published);
+            }
+            let inner = self.inner.take().await;
+            if let Some(stop) = inner.stop
+                && stop != (Stop::Fenced { reloaded: true })
+            {
+                return Err(inner.stopped(stop));
+            }
+            // Returning the lease of a log that serves reads publishes its state.
         }
     }
 
@@ -214,6 +224,7 @@ impl Domain {
                 available: Notify::new(),
                 reserved: std::sync::atomic::AtomicBool::new(false),
                 inner: Mutex::new(Some(inner)),
+                published: parking_lot::RwLock::new(None),
             }),
         })
     }
@@ -389,6 +400,7 @@ impl Inner {
             tracing::error!("{message}");
             return Err(CatalogError::InvalidOperationNoSource { message });
         }
+        self.unpublished.push(record.clone());
         self.buffer(record).await
     }
 
@@ -885,6 +897,8 @@ impl Inner {
                 staged_checkpoint: 0,
                 pending: Vec::new(),
                 immediate,
+                unpublished: Vec::new(),
+                republish: true,
             },
             opened,
         ))
@@ -984,6 +998,7 @@ impl Inner {
             .map_err(invalid)?;
         let replayed = replay_state(opened)?;
         self.reader.state = replayed.state;
+        self.republish = true;
         self.floor_state = replayed.floor_state;
         self.since_floor = replayed.since_floor;
         self.pending.clear();
