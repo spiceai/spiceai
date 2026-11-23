@@ -740,6 +740,31 @@ impl Process {
         named
     }
 
+    /// The manifest rows of snapshots the table does not serve, as
+    /// `<snapshot>/<file>`: rows of neither the current snapshot nor a
+    /// protected one. A sweep reclaims the files of a snapshot only once a
+    /// commit takes it out of the live set, so a snapshot no commit made live
+    /// keeps its files for as long as its rows are named.
+    async fn rows_outside_live_snapshots(&self) -> Vec<String> {
+        let table_id = self.table.table_id().to_string();
+        let mut live: BTreeSet<String> = self
+            .catalog
+            .get_all_snapshot_sequences(&table_id)
+            .await
+            .expect("read the protected snapshots")
+            .into_keys()
+            .collect();
+        live.insert(self.table.current_snapshot_id());
+        self.catalog
+            .get_all_snapshot_files(&table_id)
+            .await
+            .expect("read the manifest")
+            .into_iter()
+            .filter(|file| !live.contains(&file.snapshot_id))
+            .map(|file| format!("{}/{}", file.snapshot_id, file.file_path))
+            .collect()
+    }
+
     /// Every file the committed state names is stored.
     async fn assert_named_files_stored(&self, location: &Location, when: &str) {
         let stored = location.probe.objects(&location.data_prefix).await;
@@ -1921,6 +1946,9 @@ async fn kill_at_every_request(step: Step) {
         }
     }
 
+    // The clean run's records, read before the kill runs replace the location.
+    let records = log_records_after(&log_store, "orders", before).await;
+
     let mut acknowledged = 0;
     let mut killed = 0;
     let mut unnamed_total = 0;
@@ -2014,6 +2042,17 @@ async fn kill_at_every_request(step: Step) {
         );
         next.assert_named_files_stored(&location, &format!("{what}, after the orphan sweep"))
             .await;
+        // An overwrite names its files in the record that makes its snapshot
+        // current. A merge and a keyed write name theirs a record before the
+        // one that makes the snapshot live, so a kill between the two strands
+        // them.
+        if matches!(step, Step::Overwrite) {
+            let stranded = next.rows_outside_live_snapshots().await;
+            assert!(
+                stranded.is_empty(),
+                "{what}: after every sweep the state still names files of snapshots the table does not serve: {stranded:?}"
+            );
+        }
         let mut swept = next.rows("orders").await;
         swept.sort_unstable();
         assert_eq!(swept, rows, "{what}: the orphan sweep changed the rows");
@@ -2023,6 +2062,25 @@ async fn kill_at_every_request(step: Step) {
         "{step:?}: {} kill points: {killed} killed mid-step, {acknowledged} acknowledged before the kill, {unnamed_total} data files no commit names left in all",
         steps.len()
     );
+    if matches!(step, Step::Overwrite) {
+        // An overwrite names its files and makes its snapshot current in one
+        // record, so no crash leaves a snapshot named that never became live.
+        let with_files: Vec<&Vec<String>> = records
+            .iter()
+            .filter(|record| record.iter().any(|action| action == "AddFiles"))
+            .collect();
+        assert_eq!(
+            with_files.len(),
+            1,
+            "{step:?}: one record names the new snapshot's files: {records:?}"
+        );
+        for kind in ["RemoveGroups", "SetCurrentSnapshot"] {
+            assert!(
+                with_files[0].iter().any(|action| action == kind),
+                "{step:?}: the record that names the files has no {kind}: {records:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

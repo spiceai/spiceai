@@ -4148,6 +4148,7 @@ impl MetadataCatalog for CayenneCatalog {
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
         delete_files: &[crate::metadata::DeleteFile],
+        files: &[SnapshotFile],
     ) -> CatalogResult<()> {
         // Same retry-on-conflict shape as commit_compaction; the only
         // additional work happens inside the transaction via
@@ -4169,10 +4170,22 @@ impl MetadataCatalog for CayenneCatalog {
                 }
             })?;
 
-            match self
-                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id, inlined, delete_files)
+            let applied = async {
+                if !files.is_empty() {
+                    self.replace_snapshot_files_in_txn(&mut *tx, table_id, new_snapshot_id, files)
+                        .await?;
+                }
+                self.commit_overwrite_in_txn(
+                    &mut *tx,
+                    table_id,
+                    new_snapshot_id,
+                    inlined,
+                    delete_files,
+                )
                 .await
-            {
+            }
+            .await;
+            match applied {
                 Ok(()) => match tx.commit().await {
                     Ok(()) => return Ok(()),
                     Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {

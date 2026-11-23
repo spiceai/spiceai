@@ -27921,6 +27921,28 @@ impl CayenneTableProvider {
         .await
     }
 
+    /// The manifest rows [`Self::author_uniform_snapshot_manifest`] would
+    /// record, without recording them: for a caller that commits them with the
+    /// record that makes the snapshot live.
+    pub(crate) async fn uniform_snapshot_manifest_rows(
+        &self,
+        snapshot_id: &str,
+        min_sequence: i64,
+        max_sequence: i64,
+    ) -> CatalogResult<Vec<SnapshotFile>> {
+        let (_, rows) = self
+            .snapshot_manifest_rows(
+                snapshot_id,
+                ManifestSequenceTag::Uniform {
+                    min: min_sequence,
+                    max: max_sequence,
+                },
+                Vec::new(),
+            )
+            .await?;
+        Ok(rows)
+    }
+
     /// Fold the manifest of every snapshot in `snapshot_ids` into one
     /// `[min over all min_sequence, max over all max_sequence]` — the true
     /// commit-seq range of a consolidating rewrite that merges those snapshots

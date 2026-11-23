@@ -641,11 +641,30 @@ impl MetadataCatalog for Domain {
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
         delete_files: &[crate::metadata::DeleteFile],
+        files: &[SnapshotFile],
     ) -> CatalogResult<()> {
         validate_uuid("table_id", table_id)?;
         validate_uuid("new_snapshot_id", new_snapshot_id)?;
+        if files
+            .iter()
+            .any(|f| f.table_id != table_id || f.snapshot_id != new_snapshot_id)
+        {
+            return Err(invalid(
+                "snapshot file identity does not match the overwrite",
+            ));
+        }
         let mut inner = self.inner.take().await;
         let mut batch = actions::overwrite_clear(table_id, new_snapshot_id);
+        if !files.is_empty() {
+            // After the flip, so the record checks the new snapshot's files
+            // against the files it retires.
+            batch.push(actions::remove_files(
+                table_id,
+                proto::Select::Listed,
+                &[new_snapshot_id.to_string()],
+            ));
+            batch.push(actions::add_files(table_id, new_snapshot_id, files, false));
+        }
         if let Some(data) = inlined {
             batch.push(actions::add_inlined(
                 table_id,

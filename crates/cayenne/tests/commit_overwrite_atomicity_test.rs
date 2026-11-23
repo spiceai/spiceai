@@ -295,7 +295,7 @@ async fn commit_overwrite_clears_all_per_snapshot_state() {
 
     let new_snapshot = uuid::Uuid::now_v7().to_string();
     catalog
-        .commit_overwrite(&table_id, &new_snapshot, None, &[])
+        .commit_overwrite(&table_id, &new_snapshot, None, &[], &[])
         .await
         .expect("commit_overwrite happy path");
 
@@ -368,7 +368,7 @@ async fn commit_overwrite_replaces_inlined_corpus_atomically() {
 
     let new_snapshot = uuid::Uuid::now_v7().to_string();
     catalog
-        .commit_overwrite(&table_id, &new_snapshot, Some(&replacement), &[])
+        .commit_overwrite(&table_id, &new_snapshot, Some(&replacement), &[], &[])
         .await
         .expect("commit_overwrite with inline payload");
 
@@ -411,7 +411,7 @@ async fn commit_overwrite_replaces_inlined_corpus_atomically() {
     };
     let third_snapshot = uuid::Uuid::now_v7().to_string();
     catalog
-        .commit_overwrite(&table_id, &third_snapshot, Some(&second), &[])
+        .commit_overwrite(&table_id, &third_snapshot, Some(&second), &[], &[])
         .await
         .expect("second inlined overwrite");
     let rows = catalog
@@ -524,7 +524,7 @@ async fn commit_overwrite_isolated_by_table_id() {
 
     let new_snap_a = uuid::Uuid::now_v7().to_string();
     catalog
-        .commit_overwrite(&table_a, &new_snap_a, None, &[])
+        .commit_overwrite(&table_a, &new_snap_a, None, &[], &[])
         .await
         .expect("commit_overwrite table_a");
 
@@ -559,7 +559,7 @@ async fn commit_overwrite_succeeds_on_empty_pre_state() {
     // No state planted — fresh table.
     let new_snapshot = uuid::Uuid::now_v7().to_string();
     catalog
-        .commit_overwrite(&table_id, &new_snapshot, None, &[])
+        .commit_overwrite(&table_id, &new_snapshot, None, &[], &[])
         .await
         .expect("commit_overwrite on empty pre-state");
 
@@ -614,7 +614,7 @@ async fn commit_overwrite_clears_inlined_state_unlike_commit_compaction() {
         .await
         .expect("commit_compaction");
     catalog
-        .commit_overwrite(&overwrite_id, &new_overwrite_snap, None, &[])
+        .commit_overwrite(&overwrite_id, &new_overwrite_snap, None, &[], &[])
         .await
         .expect("commit_overwrite");
 
