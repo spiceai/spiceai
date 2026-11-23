@@ -123,7 +123,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `81faaf2187185b097710b9ee589bf039efdd74de` | `jeadie/render-zip-upgrade` |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
-| [iceberg-rust](#iceberg-rust) | `8c0f5ac34df3f428dec4f0187601ce12af7fd951` | `phillip/rest-config-endpoint-check` (TEMPORARY: spiceai/iceberg-rust#63) |
+| [iceberg-rust](#iceberg-rust) | `9aaad84db93327729964c647345a91da0d1d5943` | `spiceai-0.11.0-df-55` |
 | [llama.cpp](#llamacpp) | `71e6732c2181497d90e46ca84dff61251477f7d8` | `spiceai-b12600` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `aaf0209ec2a5dd1f61c5dedde20726ff04ac35a0` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
