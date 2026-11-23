@@ -2310,10 +2310,12 @@ one safeguard removed, which the checker must reject.
   keeping the control above; the retention T with a reader on another instance;
   statistics that exist only for live or retired files; and dataset drop and
   the deletion-vector sweep.
-- **I16** is checked by engine tests and a spicescript scenario, and by the
-  mem-tier model's "recovered reads match the source", which reads a row twice
-  if it is in both the shadow and a snapshot. The model always commits the
-  shadow clear with the snapshot; no negative control separates them yet
+- **I16** is checked by engine tests and a spicescript scenario, not by the
+  model. The mem-tier model's "recovered reads match the source" catches a row
+  in both the shadow and a snapshot only while that row is visible: once a later
+  delete hides both copies, the reads still match. The model always commits the
+  shadow clear with the snapshot, and checking I16 itself needs a property over
+  the durable copies, with a control that separates the two
   ([The in-memory tier's seal and checkpoint](#the-in-memory-tiers-seal-and-checkpoint)).
 
 ## Appendix: the store contract
