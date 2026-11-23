@@ -63,7 +63,9 @@ steps:
         # its state is kept per table (each instance's tables are namespaced).
         lock = threading.Lock()
         state = {'injected': {}, 'redelivered': {}}
-        echo_iterators, cached = {}, {}  # iterator -> table; table -> first records
+        # iterator -> (table, shard); (table, shard) -> that shard's first records.
+        # Re-delivery stays within the shard that returned the records.
+        echo_iterators, cached = {}, {}
         def table_of(arn):
             return arn.split(':table/')[1].split('/')[0] if ':table/' in arn else ''
         def save():
@@ -107,7 +109,7 @@ steps:
                     status, rheaders, data = e.code, list(e.headers.items()), e.read()
                 if status == 200 and op == 'GetShardIterator' and table.startswith('echo_'):
                     with lock:
-                        echo_iterators[json.loads(data)['ShardIterator']] = table
+                        echo_iterators[json.loads(data)['ShardIterator']] = (table, req.get('ShardId', ''))
                 elif status == 200 and op == 'GetRecords' and req.get('ShardIterator') in echo_iterators:
                     doc = json.loads(data)
                     with lock:
@@ -118,7 +120,7 @@ steps:
                             cached[echo] = doc['Records']
                         elif not doc.get('Records') and echo in cached:
                             doc['Records'] = cached[echo]
-                            state['redelivered'][echo] = state['redelivered'].get(echo, 0) + 1
+                            state['redelivered'][echo[0]] = state['redelivered'].get(echo[0], 0) + 1
                             save()
                     data = json.dumps(doc).encode()
                 self.reply(status, data, rheaders)
