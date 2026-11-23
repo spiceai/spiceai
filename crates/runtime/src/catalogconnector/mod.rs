@@ -228,7 +228,8 @@ pub mod postgres_accelerated;
 #[cfg(feature = "snowflake")]
 pub mod snowflake;
 pub mod spice_cloud;
-#[cfg(all(test, feature = "delta_lake"))]
+#[cfg(test)]
+#[cfg(feature = "delta_lake")]
 mod storage_location_tests;
 #[cfg(feature = "delta_lake")]
 pub mod unity_catalog;
