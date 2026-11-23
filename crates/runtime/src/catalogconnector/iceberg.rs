@@ -1198,7 +1198,7 @@ fn vended_endpoint_rewritten_message(
     )
 }
 
-/// Refuses a catalog or OAuth2 token endpoint that a REST catalog's
+/// Refuses a catalog or `OAuth2` token endpoint that a REST catalog's
 /// `GET /v1/config` response substitutes for the configured one when it
 /// targets a private, loopback, or link-local host, so the catalog cannot send
 /// its requests and credentials there. An endpoint on the origin of a
@@ -1263,7 +1263,7 @@ impl EndpointOverrideCheck for ConfigEndpointGuard {
     }
 }
 
-/// The REST catalog property that sets the OAuth2 token endpoint.
+/// The REST catalog property that sets the `OAuth2` token endpoint.
 const REST_CATALOG_PROP_OAUTH2_SERVER_URI: &str = "oauth2-server-uri";
 
 /// Names the refused endpoint by its origin only: the rest of a URL the
@@ -1786,7 +1786,7 @@ mod tests {
 
         /// Serves an Iceberg REST catalog whose `GET /v1/config` answers with
         /// `overrides`. It lists namespace `db` at `/v1/namespaces` and
-        /// `sub_db` at `/sub/v1/namespaces`, and issues OAuth2 tokens.
+        /// `sub_db` at `/sub/v1/namespaces`, and issues `OAuth2` tokens.
         async fn start_rest_catalog(overrides: impl FnOnce(&str) -> Value) -> String {
             start_rest_catalog_with_config(
                 |uri| json!({"defaults": {}, "overrides": overrides(uri)}),
