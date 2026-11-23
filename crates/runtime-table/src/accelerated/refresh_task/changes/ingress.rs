@@ -581,8 +581,19 @@ impl RefreshTask {
     /// TEMPORARY diagnostics for #16625. Never merge.
     fn diag16625_envelope(&self, envelope: &cdc::ChangeEnvelope) {
         use std::collections::BTreeMap;
-        let Ok(batch) = envelope.change_batch() else {
-            return;
+        // Building here takes a deferred batch's source, so after a failed
+        // build the sink reports `DeferredBatchConsumed` instead of the cause.
+        // Log the cause, so the diagnostic run still shows it.
+        let batch = match envelope.change_batch() {
+            Ok(batch) => batch,
+            Err(e) => {
+                tracing::warn!(
+                    target: "diag16625",
+                    "DIAG16625 admit dataset={} build_failed={e}",
+                    self.dataset_name
+                );
+                return;
+            }
         };
         let data = batch.data_batch();
         let o_id = data

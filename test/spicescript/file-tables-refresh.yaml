@@ -1,4 +1,5 @@
 name: file-tables-refresh
+tags: [long]
 description: >
   A table of Parquet or CSV part files, on local disk or in an S3-compatible
   store, answers like the same rows in a database when accelerated by full refresh into Cayenne, after the first load, after a part file is

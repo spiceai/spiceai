@@ -1,4 +1,5 @@
 name: sql-predicate-precedence
+tags: [long]
 description: >
   Nested NOT and IS predicates preserve their operands when sent to a SQL
   source. PostgreSQL, MySQL and ClickHouse return the same identifiers as

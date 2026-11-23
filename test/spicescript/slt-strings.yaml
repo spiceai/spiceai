@@ -1,4 +1,5 @@
 name: slt-strings
+tags: [long]
 description: >
   String functions over non-ASCII text answer as recorded through Spice, over
   PostgreSQL and MySQL, federated and accelerated.

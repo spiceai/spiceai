@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CreateTableOptions, ObjectStoreConfig};
-use cayenne::metastore::object_native::{NativeCatalogConfig, ObjectNativeCatalog};
+use cayenne::metastore::object_native::{
+    NativeCatalogConfig, ObjectNativeCatalog, new_dataset_folder,
+};
 use cayenne::{CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -483,6 +485,21 @@ impl FixtureDataStore {
 /// metastore can never be paired with object-store data files: that pairing
 /// panics with [`UNSUPPORTED_PAIRING`]. `fixture_pairing_test` holds the suite
 /// to it.
+/// The catalog prefix of an object-native location at `s3://bucket/state/cayenne/v1`,
+/// so a dataset's data path in it has the `…/v1/datasets/<folder>/data` shape the
+/// object-native metastore requires.
+pub const LOCATION_CATALOG: &str = "state/cayenne/v1/catalog";
+
+/// The data path of a new dataset `name` in `catalog`'s object-native location.
+#[must_use]
+pub fn location_data_url(catalog: &ObjectNativeCatalog, name: &str) -> String {
+    format!(
+        "s3://bucket/{}/{}/data",
+        catalog.datasets_prefix(),
+        new_dataset_folder(name)
+    )
+}
+
 pub fn table_builder_on_store(
     catalog: Arc<dyn MetadataCatalog>,
     runtime_env: Arc<RuntimeEnv>,

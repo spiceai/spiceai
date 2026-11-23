@@ -696,22 +696,8 @@ impl MetadataCatalog for Domain {
     }
     async fn upsert_table_statistics(&self, stats: &TableStatistics) -> CatalogResult<()> {
         let mut inner = self.inner.take().await;
-        let blob = Some(inner.blob(&stats.statistics_blob).await?);
-        let ndv = match &stats.ndv_sketches {
-            Some(bytes) => Some(inner.blob(bytes).await?),
-            None => None,
-        };
-        inner
-            .commit(vec![Action::new(Kind::SetTableStats(
-                proto::SetTableStats {
-                    table_id: stats.table_id.clone(),
-                    blob,
-                    ndv,
-                    num_rows: stats.num_rows,
-                    exact: stats.num_rows_exact,
-                },
-            ))])
-            .await
+        let action = inner.table_stats_action(stats).await?;
+        inner.commit(vec![action]).await
     }
     async fn clear_table_statistics(&self, table_id: &str) -> CatalogResult<()> {
         self.inner
@@ -1129,6 +1115,10 @@ impl MetadataCatalog for Domain {
             snapshot_sequence,
             inline_data,
             clear_inlined,
+            insert_records,
+            table_statistics,
+            keep_file_statistics_of,
+            manifest_files,
         } = commit;
         if !insert_pk_bytes.is_empty()
             && !reinsert_delete_files
@@ -1154,6 +1144,10 @@ impl MetadataCatalog for Domain {
         pure_delete_files.append(&mut reinsert_delete_files);
         if pure_delete_files.iter().any(|f| f.table_id != table_id)
             || inline_data.iter().any(|d| d.table_id != table_id)
+            || table_statistics
+                .as_ref()
+                .is_some_and(|stats| stats.table_id != table_id)
+            || manifest_files.iter().any(|f| f.table_id != table_id)
         {
             return Err(invalid(format!(
                 "Mem-tier commit rows must belong to table '{table_id}'"
@@ -1173,6 +1167,19 @@ impl MetadataCatalog for Domain {
             .collect();
         let (_, deletes) = inner.delete_batch(&pure_delete_files)?;
         batch.extend(deletes);
+        let mut by_snapshot: Vec<(&str, Vec<SnapshotFile>)> = Vec::new();
+        for file in &manifest_files {
+            match by_snapshot
+                .iter_mut()
+                .find(|(snapshot, _)| *snapshot == file.snapshot_id)
+            {
+                Some((_, rows)) => rows.push(file.clone()),
+                None => by_snapshot.push((&file.snapshot_id, vec![file.clone()])),
+            }
+        }
+        for (snapshot, rows) in &by_snapshot {
+            batch.push(actions::add_files(&table_id, snapshot, rows, true));
+        }
         if let Some(snapshot) = snapshot_sequence {
             batch.push(actions::set_group(
                 &table_id,
@@ -1186,6 +1193,28 @@ impl MetadataCatalog for Domain {
                 &table_id,
                 proto::Select::All,
                 &[],
+            ));
+        }
+        if !insert_records.is_empty() {
+            batch.push(Action::new(Kind::AddInsertRecords(proto::AddKeys {
+                table_id: table_id.clone(),
+                keys: insert_records
+                    .into_iter()
+                    .map(|pk| proto::PkSeq {
+                        pk,
+                        seq: sequence_number,
+                    })
+                    .collect(),
+            })));
+        }
+        if let Some(stats) = &table_statistics {
+            batch.push(inner.table_stats_action(stats).await?);
+        }
+        if let Some(snapshot_id) = keep_file_statistics_of {
+            batch.push(actions::remove_file_stats(
+                &table_id,
+                proto::Select::AllExcept,
+                &[snapshot_id],
             ));
         }
         if batch.is_empty() {

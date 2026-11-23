@@ -137,6 +137,7 @@ readonly REQUIRED_CHECKS=(
   "Integration Tests (part 2)"
   "Integration Tests (part 3)"
   "ADBC Integration Tests"   # integration_adbc.yml
+  "Trunk Health"             # trunk_health.yml — blocks merging while a post-merge failure goes unaddressed
   # `Features Check` (features.yml) is deliberately absent. That workflow is
   # disabled, so no run reports the context, and a required check nothing
   # reports blocks every pull request rather than passing it — which is what
