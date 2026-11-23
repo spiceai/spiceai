@@ -2849,6 +2849,101 @@ mod tests {
         }
     }
 
+    /// A maintenance pass that took a write's queued statistics before an
+    /// `INSERT OVERWRITE` and persists them after it must not add the replaced
+    /// rows to the overwrite's count.
+    #[tokio::test(flavor = "current_thread")]
+    async fn overwrite_discards_statistics_taken_by_in_flight_maintenance() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let connection = format!(
+            "sqlite://{}",
+            temp_dir.path().join("overwrite.db").display()
+        );
+        let catalog = Arc::new(CayenneCatalog::new(connection.as_str()).expect("catalog"));
+        catalog.init().await.expect("init catalog");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, true),
+        ]));
+        let ctx = SessionContext::new();
+        let provider = CayenneTableProvider::create_table(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            CreateTableOptions {
+                table_name: "overwritten".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            },
+            ctx.runtime_env(),
+        )
+        .await
+        .expect("create table");
+        let table_id = catalog
+            .get_table("overwritten")
+            .await
+            .expect("metadata")
+            .table_id;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *provider.test_pre_maintenance_statistics_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+            })
+        }));
+        let replaced = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+                Arc::new(Int64Array::from(vec![10_i64, 20, 30])),
+            ],
+        )
+        .expect("batch");
+        insert_batch(&provider, replaced).await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx)
+            .await
+            .expect("maintenance must take the insert's statistics")
+            .expect("maintenance reports the take");
+
+        ctx.register_table("overwritten", Arc::new(provider.clone_for_write()))
+            .expect("register");
+        ctx.sql("INSERT OVERWRITE overwritten SELECT * FROM (VALUES (99, 990), (100, 1000))")
+            .await
+            .expect("plan overwrite")
+            .collect()
+            .await
+            .expect("overwrite");
+
+        release_tx.send(()).expect("release maintenance");
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain maintenance");
+
+        let stats = catalog
+            .get_table_statistics(&table_id)
+            .await
+            .expect("read stats")
+            .expect("stats exist");
+        assert_eq!((stats.num_rows, stats.num_rows_exact), (2, true));
+        assert_eq!(
+            provider
+                .optimizer_table_statistics()
+                .expect("optimizer statistics")
+                .num_rows
+                .get_value(),
+            Some(&2)
+        );
+        assert_eq!(
+            query_count(&ctx, "SELECT COUNT(*) FROM overwritten").await,
+            2
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn schema_evolution_queued_integer_statistics_remain_conservative_after_reopen() {
         let temp_dir = TempDir::new().expect("temp dir");

@@ -332,9 +332,50 @@ pub(crate) struct PostWriteMaintenance {
     /// lets a writer mark its delta outstanding before the commit that publishes
     /// its rows and release it again if that commit never happens.
     outstanding_live_rows_deltas: Arc<AtomicU64>,
+    /// Advanced, under the `state` lock, each time an overwrite discards the
+    /// queued statistics. A pass that took its state under an earlier value
+    /// holds statistics for rows the overwrite replaced.
+    statistics_epoch: AtomicU64,
 }
 
 impl PostWriteMaintenance {
+    /// Take the queued state, with the statistics epoch it was queued under.
+    pub(crate) fn take_state(&self) -> (PostWriteMaintenanceState, u64) {
+        let mut guard = self.state.lock();
+        let state = std::mem::take(&mut *guard);
+        (state, self.statistics_epoch.load(Ordering::Acquire))
+    }
+
+    /// Drop the queued statistics and live-row deltas, and make every pass that
+    /// already took its state drop them too ([`Self::statistics_epoch_is`]).
+    ///
+    /// For an overwrite re-baselining the table statistics: the writes behind
+    /// the queued deltas committed before it and their rows are gone, so a
+    /// delta applied on top of the new count would count them again. Their
+    /// claims are retired here because the overwrite's count describes the
+    /// table without them. Retention and listing requests stay queued.
+    pub(crate) fn discard_queued_statistics(&self) {
+        let discarded = {
+            let mut guard = self.state.lock();
+            guard.stats = None;
+            guard.live_rows_delta = 0;
+            self.statistics_epoch.fetch_add(1, Ordering::AcqRel);
+            std::mem::take(&mut guard.live_rows_delta_count)
+        };
+        self.retire_applied_live_rows_deltas(discarded);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn statistics_epoch(&self) -> u64 {
+        self.statistics_epoch.load(Ordering::Acquire)
+    }
+
+    /// Whether no overwrite has discarded the queued statistics since a state
+    /// was taken under `epoch`.
+    pub(crate) fn statistics_epoch_is(&self, epoch: u64) -> bool {
+        self.statistics_epoch.load(Ordering::Acquire) == epoch
+    }
+
     /// Whether a live-row delta has been queued that the persisted `num_rows`
     /// does not yet include.
     ///

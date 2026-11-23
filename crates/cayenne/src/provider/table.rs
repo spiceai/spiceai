@@ -26523,15 +26523,15 @@ impl CayenneTableProvider {
                 .retention_backoff
                 .lock()
                 .retry_owed();
-            let state = {
-                let mut guard = self.post_write_maintenance.state.lock();
-                let mut state = std::mem::take(&mut *guard);
-                state.retention_requested |= retention_owed;
-                state
-            };
+            let (mut state, statistics_epoch) = self.post_write_maintenance.take_state();
+            state.retention_requested |= retention_owed;
             if !state.is_empty() {
-                self.run_maintenance_state(state, RetentionFailureAction::ReturnError)
-                    .await?;
+                self.run_maintenance_state(
+                    state,
+                    statistics_epoch,
+                    RetentionFailureAction::ReturnError,
+                )
+                .await?;
                 continue;
             }
             if !self
@@ -26571,6 +26571,7 @@ impl CayenneTableProvider {
     async fn run_maintenance_state(
         &self,
         state: PostWriteMaintenanceState,
+        statistics_epoch: u64,
         retention_failure_action: RetentionFailureAction,
     ) -> CatalogResult<()> {
         let had_stats = state.stats.is_some();
@@ -26601,12 +26602,13 @@ impl CayenneTableProvider {
             let delta_is_exact =
                 self.table_metadata.on_conflict.is_none() && !state.retention_requested;
             let persisted = self
-                .persist_table_stats(
+                .persist_queued_table_stats(
                     &stats,
                     RowCountUpdate::Delta {
                         delta: state.live_rows_delta,
                         exact: delta_is_exact,
                     },
+                    statistics_epoch,
                 )
                 .await;
             if persisted {
@@ -26863,13 +26865,10 @@ impl CayenneTableProvider {
         loop {
             tokio::time::sleep(POST_WRITE_MAINTENANCE_DEBOUNCE).await;
 
-            let state = {
-                let mut guard = self.post_write_maintenance.state.lock();
-                std::mem::take(&mut *guard)
-            };
+            let (state, statistics_epoch) = self.post_write_maintenance.take_state();
 
             if let Err(e) = self
-                .run_maintenance_state(state, RetentionFailureAction::Requeue)
+                .run_maintenance_state(state, statistics_epoch, RetentionFailureAction::Requeue)
                 .await
             {
                 tracing::error!(
@@ -35712,15 +35711,42 @@ impl CayenneTableProvider {
             .await
     }
 
+    /// [`Self::persist_table_stats`] for statistics a maintenance pass took
+    /// from the queue under `statistics_epoch`. Returns `true` without
+    /// persisting when an overwrite has discarded the queue since: the rows
+    /// these statistics describe were replaced, and the overwrite's count
+    /// already describes the table without them.
+    async fn persist_queued_table_stats(
+        &self,
+        accumulator: &ColumnStatsAccumulator,
+        num_rows_update: RowCountUpdate,
+        statistics_epoch: u64,
+    ) -> bool {
+        let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
+        if !self
+            .post_write_maintenance
+            .statistics_epoch_is(statistics_epoch)
+        {
+            return true;
+        }
+        self.persist_table_stats_locked(accumulator, num_rows_update, false)
+            .await
+    }
+
     /// Replace the aggregate entirely with the overwrite's accumulator and reset
     /// the live count to the rewritten row count (the prior data is gone, so the
     /// old min/max/NDV must not survive — see [`RowCountUpdate`]).
+    ///
+    /// Statistics still queued for post-write maintenance describe writes the
+    /// overwrite replaced, so they are discarded under the same lock, before
+    /// the count is set.
     pub(crate) async fn reset_table_stats_after_overwrite(
         &self,
         accumulator: &ColumnStatsAccumulator,
         live_rows: Option<u64>,
     ) {
         let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
+        self.post_write_maintenance.discard_queued_statistics();
         self.clear_cached_table_statistics_unlocked();
         // The accumulator counts every row written; an overwrite that hid some of
         // them with position deletes passes the rows that stay live.
@@ -74509,7 +74535,11 @@ mod tests {
             ..PostWriteMaintenanceState::default()
         };
         provider
-            .run_maintenance_state(queued, RetentionFailureAction::Requeue)
+            .run_maintenance_state(
+                queued,
+                provider.post_write_maintenance.statistics_epoch(),
+                RetentionFailureAction::Requeue,
+            )
             .await
             .expect("a deferred background pass is not an error");
         assert!(
@@ -74534,7 +74564,11 @@ mod tests {
             ..PostWriteMaintenanceState::default()
         };
         provider
-            .run_maintenance_state(queued, RetentionFailureAction::ReturnError)
+            .run_maintenance_state(
+                queued,
+                provider.post_write_maintenance.statistics_epoch(),
+                RetentionFailureAction::ReturnError,
+            )
             .await
             .expect_err("a deferred synchronous drain must report, not spin");
 
@@ -74632,7 +74666,11 @@ mod tests {
             ..PostWriteMaintenanceState::default()
         };
         provider
-            .run_maintenance_state(requested(), RetentionFailureAction::Requeue)
+            .run_maintenance_state(
+                requested(),
+                provider.post_write_maintenance.statistics_epoch(),
+                RetentionFailureAction::Requeue,
+            )
             .await
             .expect("a failed background pass is logged, not returned");
         assert_eq!(backoff().consecutive_failures(), 1);
@@ -74649,7 +74687,11 @@ mod tests {
 
         // A write landing inside the window queues retention again; the pass skips it.
         provider
-            .run_maintenance_state(requested(), RetentionFailureAction::Requeue)
+            .run_maintenance_state(
+                requested(),
+                provider.post_write_maintenance.statistics_epoch(),
+                RetentionFailureAction::Requeue,
+            )
             .await
             .expect("a skipped pass is not an error");
         assert_eq!(

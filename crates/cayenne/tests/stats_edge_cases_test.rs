@@ -37,7 +37,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 // Column Statistics Edge Cases
 // ============================================================================
 
-test_with_backends!(test_stats_correct_after_overwrite);
+test_on_data_store!(test_stats_correct_after_overwrite);
 
 // ============================================================================
 // Data Inlining Edge Cases
@@ -140,36 +140,73 @@ async fn query_count(ctx: &SessionContext, table_name: &str) -> usize {
 // Stats Tests
 // ============================================================================
 
-/// After overwrite, stats should reflect only the new data.
+/// After overwrite, stats should reflect only the new data, including once the
+/// post-write maintenance queued by the replaced writes has drained. Covers an
+/// overwrite that lands in the inline tier and one written to data files.
 async fn test_stats_correct_after_overwrite(fixture: common::TestFixture) -> TestResult {
     let schema = simple_schema();
     let (table, ctx) = create_table_no_pk(&fixture, "stats_overwrite", Arc::clone(&schema)).await;
+    let handle = table.clone_for_write_operations();
     let table_id = fixture.catalog.get_table("stats_overwrite").await?.table_id;
 
     ctx.register_table("stats_overwrite", Arc::new(table))?;
 
-    // Insert 3 rows
-    ctx.sql("INSERT INTO stats_overwrite SELECT * FROM (VALUES (1,10),(2,20),(3,30))")
-        .await?
-        .collect()
-        .await?;
+    let overwrites = [
+        (
+            "INSERT OVERWRITE stats_overwrite SELECT * FROM (VALUES (99,990),(100,1000))",
+            2,
+        ),
+        // Above the inline row cap, so the replacement is written to data files.
+        (
+            "INSERT OVERWRITE stats_overwrite \
+             SELECT v AS id, v AS value FROM (SELECT UNNEST(range(0, 2000)) AS v)",
+            2000,
+        ),
+    ];
+    for (overwrite, expected_rows) in overwrites {
+        // Its statistics are queued for post-write maintenance when the
+        // overwrite starts.
+        ctx.sql("INSERT INTO stats_overwrite SELECT * FROM (VALUES (1,10),(2,20),(3,30))")
+            .await?
+            .collect()
+            .await?;
+        ctx.sql(overwrite).await?.collect().await?;
 
-    // Overwrite with just 2 rows
-    ctx.sql("INSERT OVERWRITE stats_overwrite SELECT * FROM (VALUES (99,990),(100,1000))")
-        .await?
-        .collect()
-        .await?;
+        let stats = fixture
+            .catalog
+            .get_table_statistics(&table_id)
+            .await?
+            .expect("stats after overwrite");
+        assert_eq!(
+            stats.num_rows, expected_rows,
+            "After overwrite, stats should reflect only the new {expected_rows}-row data"
+        );
 
-    let stats = fixture.catalog.get_table_statistics(&table_id).await?;
-    assert!(stats.is_some(), "Stats should exist after overwrite");
-    let stats = stats.expect("stats");
-    assert_eq!(
-        stats.num_rows, 2,
-        "After overwrite, stats should reflect only the new 2-row data"
-    );
+        handle.drain_in_flight_maintenance().await?;
+        let stats = fixture
+            .catalog
+            .get_table_statistics(&table_id)
+            .await?
+            .expect("stats after maintenance");
+        assert_eq!(
+            (stats.num_rows, stats.num_rows_exact),
+            (expected_rows, true),
+            "maintenance queued before the overwrite must not add the replaced rows"
+        );
+        let optimizer = handle
+            .optimizer_table_statistics()
+            .expect("optimizer statistics");
+        assert_eq!(
+            optimizer.num_rows.get_value(),
+            Some(&usize::try_from(expected_rows)?),
+            "the table statistics the planner reads count only the new rows"
+        );
 
-    // Verify scan also returns 2 rows
-    assert_eq!(query_count(&ctx, "stats_overwrite").await, 2);
+        assert_eq!(
+            query_count(&ctx, "stats_overwrite").await,
+            usize::try_from(expected_rows)?
+        );
+    }
 
     Ok(())
 }
