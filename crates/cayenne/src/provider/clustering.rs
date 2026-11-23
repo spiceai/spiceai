@@ -346,9 +346,22 @@ pub(crate) fn bound_key(scalar: &ScalarValue, column_type: &DataType) -> Option<
     column_order_keys(array.as_ref()).ok()?.first().copied()
 }
 
-/// Per-column constants for exact integer rescaling, including the resolution
-/// shift for 128-bit keys. The reciprocal estimates the quotient from below;
-/// one remainder comparison recovers the exact floor.
+/// Rescales a column's order-preserving keys onto the dense `0..=MAX_CODE`
+/// coordinate space spanned by `[lo, hi]`, computing
+/// `floor((clamp(key, lo, hi) - lo) * MAX_CODE / span)` exactly.
+///
+/// - Keys outside `[lo, hi]` clamp to its ends.
+/// - A constant or inverted range (`hi <= lo`) carries no information to
+///   spread, so every key maps to 0.
+/// - `x * MAX_CODE` must fit in `u128`, which needs `span < 2^CURVE_BITS`. For a
+///   wider span the low bits of both `x` and `span` are dropped together: they
+///   sit below the resolution a `CURVE_BITS`-wide coordinate can represent, and
+///   shifting both preserves the ratio.
+///
+/// `lo`, `hi` and `span` are fixed for a whole call, so the division is
+/// replaced by a per-column reciprocal: it estimates the quotient at most one
+/// below the exact floor (see [`multiply_high`]), and one remainder comparison
+/// recovers the exact value.
 struct Normalizer {
     lo: u128,
     hi: u128,
