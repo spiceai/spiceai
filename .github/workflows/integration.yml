@@ -1203,6 +1203,19 @@ jobs:
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
 
+      # The build job requested the cluster's start; a 7-minute start is longer than the
+      # Spark Connect tests wait. 12 minutes covers a start requested here instead.
+      - name: Wait for the Databricks Spark cluster
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.event.inputs.run_all_tests == 'true'
+        timeout-minutes: 14
+        env:
+          DATABRICKS_HOST: ${{ vars.CI_DATABRICKS_HOST }}
+          DATABRICKS_CLUSTER_ID: ${{ vars.CI_DATABRICKS_CLUSTER_ID }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
+          DATABRICKS_CLUSTER_WAIT_SECONDS: '720'
+        run: bash .github/scripts/databricks_cluster.sh wait
+
       - name: Get Databricks token
         id: databricks-token
         uses: ./.github/actions/databricks-oidc-token
@@ -1220,19 +1233,6 @@ jobs:
           aws-region: us-east-1
           output-env-credentials: false
           output-credentials: true
-
-      # The build job requested the cluster's start; a 7-minute start is longer than the
-      # Spark Connect tests wait. 12 minutes covers a start requested here instead.
-      - name: Wait for the Databricks Spark cluster
-        if: needs.check_changes.outputs.relevant_changes == 'true' && github.event.inputs.run_all_tests == 'true'
-        timeout-minutes: 14
-        env:
-          DATABRICKS_HOST: ${{ vars.CI_DATABRICKS_HOST }}
-          DATABRICKS_CLUSTER_ID: ${{ vars.CI_DATABRICKS_CLUSTER_ID }}
-          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
-          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
-          DATABRICKS_CLUSTER_WAIT_SECONDS: '720'
-        run: bash .github/scripts/databricks_cluster.sh wait
 
       - name: Run every Databricks connector integration test
         timeout-minutes: 20
