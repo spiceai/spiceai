@@ -266,6 +266,7 @@ async fn a_file_referenced_more_than_once_is_packaged_once() {
     let spicepod = "version: v1\nkind: Spicepod\nname: pkg\ndatasets:\n  - from: file:data/a.csv\n    name: one\n  - from: file://data/a.csv\n    name: two\n  - from: file:data\n    name: all\n";
     let store = store_with(spicepod, &[("data/a.csv", data.clone())]).await;
 
+    store.gets.store(0, Ordering::SeqCst);
     let zip = package::make_zip(&store, &Path::from("spicepod.yaml"))
         .await
         .expect("a file referenced more than once is packaged");
@@ -276,6 +277,11 @@ async fn a_file_referenced_more_than_once_is_packaged_once() {
             ("data/a.csv".to_string(), data),
             ("spicepod.yaml".to_string(), spicepod.as_bytes().to_vec()),
         ]
+    );
+    assert_eq!(
+        store.gets.load(Ordering::SeqCst),
+        2,
+        "spicepod.yaml and data/a.csv are each downloaded once"
     );
 }
 
