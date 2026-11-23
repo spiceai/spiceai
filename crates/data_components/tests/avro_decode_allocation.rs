@@ -239,6 +239,26 @@ fn declared_collection_sizes_do_not_drive_allocation() {
         "a one-byte body with a fixed schema past the budget grew the heap by {peak} bytes"
     );
 
+    // A big-decimal value holds the length of its digits, which is allocated
+    // before they are read, so it is checked against the body's budget too.
+    let inner_length = to_avro_datum(
+        &Schema::Long,
+        Value::Long(i64::try_from(CDC_BUDGET_BYTES + 1).expect("the length fits in a long")),
+    )
+    .expect("a long encodes");
+    let big_decimal = to_avro_datum(&Schema::Bytes, Value::Bytes(inner_length))
+        .expect("the value's bytes encode");
+    let (error, peak) = cdc_error_and_peak_heap(
+        &runtime,
+        r#"{"type": "bytes", "logicalType": "big-decimal"}"#,
+        &big_decimal,
+    );
+    assert_eq!(error, cdc_limit_error(&big_decimal));
+    assert!(
+        peak < MAX_HEAP_BYTES,
+        "a big-decimal value declaring digits past the budget grew the heap by {peak} bytes"
+    );
+
     // The cases below decode with apache-avro's per-datum limit.
 
     // A declared count that fits in the limit but has no items behind it fails

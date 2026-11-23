@@ -16,9 +16,9 @@ patch bounds that:
   block debits its declared count times the in-memory item size before any of its items decodes,
   and each record, union and enum debits the field list, box or symbol it builds. A debit that does
   not fit fails with the crate's `MemoryAllocation` error. Nested values share the budget.
-- The declared length of each bytes, string and fixed value is checked against the budget's
-  limit before its buffer is allocated. These values are not debited: each is kept only once the
-  input has filled it.
+- The declared length of each bytes, string, fixed and big-decimal value is checked against the
+  budget's limit before its buffer is allocated. These values are not debited: each is kept only
+  once the input has filled it.
 - A block reserves at most `MAX_PREALLOCATED_ITEMS` (1024) items before decoding, then, each time
   the reservation fills, up to `RESERVATION_GROWTH` (1024) times the items decoded so far, with
   `try_reserve`. An array's capacity never grows past the items debited across its blocks. A map's

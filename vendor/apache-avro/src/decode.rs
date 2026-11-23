@@ -233,7 +233,13 @@ fn decode_with_budget<R: Read, S: Borrow<Schema>>(
         },
         Schema::BigDecimal => {
             match decode_with_budget(&Schema::Bytes, names, enclosing_namespace, reader, budget)? {
-                Value::Bytes(bytes) => deserialize_big_decimal(&bytes).map(Value::BigDecimal),
+                Value::Bytes(bytes) => {
+                    // The value holds its own length, which is allocated before it is read.
+                    if let Ok(len) = decode_len(&mut bytes.as_slice()) {
+                        budget.check_len(len)?;
+                    }
+                    deserialize_big_decimal(&bytes).map(Value::BigDecimal)
+                }
                 value => Err(Details::BytesValue(value).into()),
             }
         }
