@@ -511,8 +511,10 @@ const fn spread_table<const K: usize>() -> [u64; 256] {
 /// output bit `j` of a row takes bit `CURVE_BITS - 1 - j / K` of axis `j % K`,
 /// so lexicographic byte order over the packed rows equals Hilbert index order.
 /// Each input byte of every axis covers `K` output bytes, which the spread
-/// table fills in one lookup per axis.
+/// table fills in one lookup per axis. A spread byte spans `8 * K` bits of a
+/// `u64`, so `K` is at most 8.
 fn interleave<const K: usize>(coords: &[Vec<u64>], flat: &mut [u8]) {
+    const { assert!(K >= 1 && K <= 8, "a spread byte must fit in a u64") };
     let table = spread_table::<K>();
     for (r, out) in flat.chunks_exact_mut(8 * K).enumerate() {
         for byte in 0..8 {
@@ -588,6 +590,9 @@ pub fn cluster_keys(columns: &[ArrayRef], bounds: &[ColumnBounds]) -> DFResult<B
         3 => interleave::<3>(&coords, &mut flat),
         4 => interleave::<4>(&coords, &mut flat),
         5 => interleave::<5>(&coords, &mut flat),
+        6 => interleave::<6>(&coords, &mut flat),
+        7 => interleave::<7>(&coords, &mut flat),
+        8 => interleave::<8>(&coords, &mut flat),
         _ => {
             for (r, out) in flat.chunks_mut(width).enumerate() {
                 let mut j = 0;
@@ -977,7 +982,9 @@ mod tests {
             // Rotate every supported type through every dimensionality and
             // exercise bounds independently for each dimension.
             for first in 0..arrays.len() {
-                for k in 1..=5 {
+                // 1..=8 cover the spread-table interleave; 9 takes the
+                // bitwise fallback.
+                for k in 1..=9 {
                     let columns: Vec<_> = (0..k)
                         .map(|d| Arc::clone(&arrays[(first + d) % arrays.len()]))
                         .collect();
