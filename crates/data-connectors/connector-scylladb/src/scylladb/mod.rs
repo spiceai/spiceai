@@ -280,9 +280,8 @@ mod tests {
     }
 
     /// One projected column plus the column `tpch_simple_q3` sorts on. `l_linenumber` is a
-    /// clustering column, which CQL never holds as NULL; a nullable sort column would be refused
-    /// by `SqlExec`'s NULL-order rule (CQL cannot write `NULLS FIRST`) before the opt-out is
-    /// reached.
+    /// clustering column, which CQL never holds as NULL; a nullable sort column is refused by
+    /// `SqlExec`'s NULL-order rule before the opt-out is reached.
     fn lineitem_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("l_comment", DataType::Utf8, true),
@@ -290,16 +289,20 @@ mod tests {
         ]))
     }
 
+    fn base_table() -> ScyllaDbSqlTable {
+        table_over(lineitem_schema())
+    }
+
     #[expect(
         clippy::disallowed_methods,
         reason = "test fixture over a mock pool, wrapped in `ScyllaDbTable`, whose own filter pushdown is what these tests exercise"
     )]
-    fn base_table() -> ScyllaDbSqlTable {
+    fn table_over(schema: Arc<Schema>) -> ScyllaDbSqlTable {
         let pool: Arc<ScyllaDbConnectionPool> = Arc::new(MockPool);
         SqlTable::new_with_schema(
             "scylladb",
             &pool,
-            lineitem_schema(),
+            schema,
             TableReference::partial("tpch", "lineitem"),
             None,
         )
@@ -374,6 +377,31 @@ mod tests {
                 .to_string()
                 .contains("ORDER BY"),
             "the absorbed sort should show up as ORDER BY in the pushed query"
+        );
+    }
+
+    /// CQL cannot write `NULLS FIRST/LAST`, so the database would choose where NULLs go: a sort
+    /// on a nullable column stays local even where sort pushdown is allowed.
+    /// `a_default_sql_table_absorbs_the_sort_into_its_query` is the control on the same table
+    /// with the column NOT NULL.
+    #[tokio::test]
+    async fn a_sort_on_a_nullable_column_stays_local_for_cql() {
+        let nullable_linenumber = Arc::new(Schema::new(vec![
+            Field::new("l_comment", DataType::Utf8, true),
+            Field::new("l_linenumber", DataType::Int32, true),
+        ]));
+        let table = scylladb_table(
+            table_over(nullable_linenumber).with_dialect(Arc::new(CqlDialect::new())),
+        );
+        let plan = scan(&table).await;
+
+        let pushdown = plan
+            .try_pushdown_sort(&order_by_linenumber_desc())
+            .expect("sort pushdown should be answered, not error");
+
+        assert!(
+            matches!(pushdown, SortOrderPushdownResult::Unsupported),
+            "a dialect without NULLS FIRST/LAST must leave a sort on a nullable column to DataFusion"
         );
     }
 
