@@ -225,7 +225,8 @@ impl PreparedOverwrite {
     ///
     /// Returns any error surfaced by the catalog's `commit_overwrite`.
     pub async fn apply_owned_txn(&self) -> CatalogResult<()> {
-        self.table
+        let committed = self
+            .table
             .catalog()
             .commit_overwrite(
                 self.table_id(),
@@ -234,12 +235,16 @@ impl PreparedOverwrite {
                 &self.delete_files,
                 self.manifest.as_deref(),
             )
-            .await?;
+            .await;
         if self.manifest.is_some() {
-            // Named by the commit, the files are no longer a write in flight.
+            // Once the commit returns, the files are no longer a write in flight
+            // on either outcome: the orphan sweep reclaims them only if no commit
+            // names them, so a commit accepted despite an error keeps them. A
+            // failed commit is never retried with this snapshot, and deleting its
+            // files here could remove the files of a commit that was accepted.
             self.table.uncommitted_files().forget(&self.new_snapshot_id);
         }
-        Ok(())
+        committed
     }
 
     /// Publish the new snapshot in memory after the caller's transaction has
