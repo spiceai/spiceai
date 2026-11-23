@@ -211,9 +211,13 @@ impl Model for Protocol {
             Action::Append(z) => format!("commit a record (variant {z}) into the head"),
             Action::Observe => "observe a stable cut of the inline window".into(),
             Action::Create(j) => format!("upload observed cut {j} as a batch (create if absent)"),
-            Action::Checkpoint(c) => format!("write a checkpoint root at {c}"),
-            Action::Gc => "collect batches below the floor".into(),
-            Action::Query => "start a query on the current head".into(),
+            Action::Checkpoint(c) => format!("write a checkpoint object at {c}"),
+            Action::Gc => {
+                "collector pass: stamp new floors, delete below floors a retention old".into()
+            }
+            Action::Query => "a reader reads the head (it fetches the objects later)".into(),
+            Action::Tick => "the store clock advances one retention".into(),
+            Action::Restart => "the collector restarts and forgets its stamps".into(),
         }
     }
     fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
@@ -226,8 +230,8 @@ impl Model for Protocol {
         Some(crate::explorer::summary(&[
             format!("serial history: {}", log.join(" ")),
             format!(
-                "checkpoint written: {}, collection ran: {}",
-                state.checkpoint, state.gc
+                "store clock {}; head written at {}; checkpoints {}, collector passes {}",
+                state.time, state.head_time, state.checkpoints, state.gcs
             ),
             crate::explorer::flags(&[
                 ("byte cut", state.store.byte_cut),
@@ -236,18 +240,56 @@ impl Model for Protocol {
                 ("count pressure", state.store.count_pressure),
                 ("batch re-created after collection", state.store.revived),
                 ("conflicting batch bytes", state.store.conflict),
+                ("collector restarted", state.restarted),
+                ("restart lost a stamp", state.restart_lost_stamp),
+                ("checkpoint object collected", state.root_collected),
+                ("collected after a restart", state.collected_after_restart),
+                ("collected while an older reader ran", state.gc_during_query),
             ]),
         ]))
     }
     fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{StoreView, Tone, stacked_with};
         let state = path.last_state();
-        let mut view = crate::explorer::StoreView::of(
-            "OBJECT STORE",
-            &state.store,
-            crate::explorer::record_id,
-        );
-        view.pin("running query", state.query.as_ref());
-        Some(crate::explorer::stacked(&[view]))
+        let mut view = StoreView::of("OBJECT STORE", &state.store, crate::explorer::record_id);
+        view.head.push(format!(
+            "store clock {}; head written at {}",
+            state.time, state.head_time
+        ));
+        let roots: Vec<String> = state.roots.iter().map(ToString::to_string).collect();
+        view.head.push(format!(
+            "checkpoint objects at commits: {}",
+            if roots.is_empty() {
+                "none".into()
+            } else {
+                roots.join(", ")
+            }
+        ));
+        if state.store.floor > 0 && !state.roots.contains(&state.store.floor) {
+            view.head.push(format!(
+                "checkpoint object at the floor ({}) is COLLECTED",
+                state.store.floor
+            ));
+        }
+        if let Some((query, read_at)) = &state.query {
+            view.pin(&format!("reader (read the head at {read_at})"), Some(query));
+        }
+        let retired: Vec<String> = state
+            .retired
+            .iter()
+            .map(|(floor, seen, stamp)| match stamp {
+                Some(t) => format!("floor {floor} (seen at commit {seen}, stamped {t})"),
+                None => format!("floor {floor} (seen at commit {seen}, not stamped)"),
+            })
+            .collect();
+        let mut lines = if retired.is_empty() {
+            vec!["no floors seen".to_string()]
+        } else {
+            retired
+        };
+        lines.push(format!("deleted below floor {}", state.collected));
+        let header = vec![("COLLECTOR".to_string(), lines, Tone::Actor)];
+        Some(stacked_with(&header, &[view]))
     }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
