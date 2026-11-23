@@ -7521,10 +7521,8 @@ impl CayenneTableProvider {
     /// state the rewrite materialized (see [`RewriteScope`]).
     ///
     /// Once the commit succeeds, the files of the delete-file rows it clears go
-    /// through [`super::delete::remove_dropped_deletion_vector_files`]: no row
-    /// names them afterwards. A dataset in the object-native location keeps them
-    /// for the retirement sweep, which deletes them after the retention. A scope
-    /// that clears every row excludes writers, so the rows read before the commit
+    /// to [`super::delete::remove_dropped_deletion_vector_files`]. A scope that
+    /// clears every row excludes writers, so the rows read before the commit
     /// are the rows it clears. A fenced scope clears the rows at or below its
     /// cutoff, and no write straddles that cutoff (see
     /// `rewrite_current_snapshot_for_compaction`), so every such row is committed
@@ -23602,9 +23600,7 @@ impl CayenneTableProvider {
     ///
     // Subset rewrite (P1 write-amp): when the picker selects a proper subset of
     // current-snapshot files, re-encode ONLY those and carry the un-picked
-    // settled files into the new snapshot: by naming them in place when the
-    // data is in the object-native location, otherwise by hard link (local) or
-    // `CopyObject` (S3) into the new dir — see
+    // settled files into the new snapshot — see
     // [`Self::rewrite_current_snapshot_small_file_subset`]. Falls back to full
     // rewrite when position deletes, protected snapshots to fold, or the
     // candidate covers every current file (no amp to save).
@@ -24136,9 +24132,9 @@ impl CayenneTableProvider {
 
     /// Re-encode only the picker's small-file subset and carry the remaining
     /// settled current-snapshot files into a fresh snapshot (named in place in
-    /// the object-native location, hard-linked or copied otherwise), then
-    /// flip the current pointer. Leaves deletion indexes intact (unpicked files
-    /// may still need merge-on-read filtering).
+    /// the object-native location, otherwise hard-linked locally or copied with
+    /// `CopyObject` on S3), then flip the current pointer. Leaves deletion
+    /// indexes intact (unpicked files may still need merge-on-read filtering).
     ///
     /// Callers must hold `compaction_lock` and satisfy
     /// [`Self::can_subset_rewrite_current_small_files`]. Returns `Ok(false)` when

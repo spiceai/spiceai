@@ -263,6 +263,14 @@ impl Instance {
     fn take_deletes(&self) -> Vec<Vec<String>> {
         std::mem::take(&mut *self.state.deletes.lock())
     }
+
+    /// The delete requests since the last call that carried a deletion vector.
+    fn take_deletion_vector_deletes(&self) -> Vec<Vec<String>> {
+        self.take_deletes()
+            .into_iter()
+            .filter(|paths| paths.iter().any(|path| has_extension(path, "arrow")))
+            .collect()
+    }
 }
 
 impl InstanceState {
@@ -691,6 +699,16 @@ impl Location {
             .collect()
     }
 
+    /// Every deletion vector stored under the dataset, by object key.
+    async fn arrow_objects(&self) -> BTreeSet<String> {
+        self.probe
+            .objects(&self.data_prefix)
+            .await
+            .into_keys()
+            .filter(|key| has_extension(key, "arrow"))
+            .collect()
+    }
+
     /// The stored data files of table `table_id` that `keys` (paths relative to
     /// the table) name, by object key.
     async fn files_of(&self, table_id: &str, keys: &[String]) -> BTreeSet<String> {
@@ -729,15 +747,19 @@ impl Process {
             .filter(|file| !retired.contains(&file.file_path))
             .map(|file| format!("{}/{table_id}/{}", location.data_prefix, file.file_path))
             .collect();
-        for dv in self
-            .catalog
-            .get_table_delete_files(&table_id)
+        named.extend(self.deletion_vector_keys().await);
+        named
+    }
+
+    /// The deletion vectors the committed state names, by object key.
+    async fn deletion_vector_keys(&self) -> BTreeSet<String> {
+        self.catalog
+            .get_table_delete_files(self.table.table_id())
             .await
             .expect("read the deletion vectors")
-        {
-            named.insert(dv.path.trim_start_matches("s3://bucket/").to_string());
-        }
-        named
+            .into_iter()
+            .map(|dv| dv.path.trim_start_matches("s3://bucket/").to_string())
+            .collect()
     }
 
     /// Every file the committed state names is stored.
@@ -771,6 +793,20 @@ impl Process {
             })
     }
 
+    /// The retired deletion vectors, by object key.
+    async fn retired_deletion_vectors(&self, location: &Location) -> BTreeSet<String> {
+        self.catalog
+            .retired_files(self.table.table_id())
+            .await
+            .expect("read the retired files")
+            .expect("the retired files are settled")
+            .into_iter()
+            // A retired key is `<snapshot>/deletions/<file>`, under the data prefix.
+            .filter(|key| key.contains("deletions/"))
+            .map(|key| format!("{}/{key}", location.data_prefix))
+            .collect()
+    }
+
     async fn rows(&self, name: &str) -> Vec<(i64, i64)> {
         collect_rows(
             self.ctx
@@ -782,11 +818,6 @@ impl Process {
                 .expect("scan"),
         )
     }
-}
-
-/// The last segment of the object key or path `key`.
-fn file_name(key: &str) -> String {
-    key.rsplit('/').next().unwrap_or(key).to_string()
 }
 
 /// Whether the object `key` has the file extension `extension`.
@@ -982,80 +1013,45 @@ async fn retired_files_are_deleted_in_batched_requests_after_the_retiring_commit
     // reclaim only commits their removal, which retires them: each stays
     // stored for the retention, like a data file, so a query that loaded them
     // before still finds them.
-    let arrow_objects = async || -> BTreeSet<String> {
-        location
-            .probe
-            .objects(&location.data_prefix)
-            .await
-            .into_keys()
-            .filter(|key| has_extension(key, "arrow"))
-            .collect()
-    };
-    let retired_dvs = async || -> Vec<String> {
-        process
-            .catalog
-            .retired_files(process.table.table_id())
-            .await
-            .expect("read the retired files")
-            .expect("the retired files are settled")
-            .into_iter()
-            .filter(|key| key.contains("deletions/"))
-            .collect()
-    };
-    let dvs_before = arrow_objects().await;
+    let dvs_before = location.arrow_objects().await;
     process.table.drain_orphan_dv_sweep(1).await;
-    let removed_dvs = retired_dvs().await;
+    let removed_dvs = process.retired_deletion_vectors(&location).await;
     assert!(
         removed_dvs.len() >= 2,
         "the orphaned deletion vectors are removed and retired: {removed_dvs:?}"
     );
-    let removed_objects: BTreeSet<String> = dvs_before
-        .iter()
-        .filter(|key| {
-            removed_dvs
-                .iter()
-                .any(|removed| key.ends_with(&format!("/{removed}")))
-        })
-        .cloned()
-        .collect();
-    assert_eq!(
-        removed_objects.len(),
-        removed_dvs.len(),
+    assert!(
+        removed_dvs.is_subset(&dvs_before),
         "each retired deletion vector is a stored object: {removed_dvs:?} in {dvs_before:?}"
     );
     process.table.sweep_retired_files_now().await;
     assert_eq!(
-        arrow_objects().await,
+        location.arrow_objects().await,
         dvs_before,
         "a removed deletion vector is kept until the retention has passed"
     );
-    assert!(
-        process
-            .instance
-            .take_deletes()
-            .iter()
-            .all(|paths| paths.iter().all(|path| !has_extension(path, "arrow"))),
+    assert_eq!(
+        process.instance.take_deletion_vector_deletes(),
+        Vec::<Vec<String>>::new(),
         "nothing deletes a deletion vector inside the retention"
     );
 
     process.table.elapse_data_file_retention();
     process.table.sweep_retired_files_now().await;
-    let dvs_after = arrow_objects().await;
     assert_eq!(
-        dvs_after,
+        location.arrow_objects().await,
         dvs_before
-            .difference(&removed_objects)
+            .difference(&removed_dvs)
             .cloned()
             .collect::<BTreeSet<String>>(),
         "the retired deletion vectors, and only they, are deleted once the retention has passed"
     );
-    assert_eq!(retired_dvs().await, Vec::<String>::new(), "and forgotten");
-    let dv_requests: Vec<Vec<String>> = process
-        .instance
-        .take_deletes()
-        .into_iter()
-        .filter(|paths| paths.iter().any(|path| has_extension(path, "arrow")))
-        .collect();
+    assert_eq!(
+        process.retired_deletion_vectors(&location).await,
+        BTreeSet::new(),
+        "and forgotten"
+    );
+    let dv_requests = process.instance.take_deletion_vector_deletes();
     assert_eq!(
         dv_requests.len(),
         1,
@@ -1341,37 +1337,8 @@ async fn a_retired_file_is_kept_until_the_retention_elapses() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cleared_deletion_vector_is_kept_until_the_retention_elapses() {
     let (location, process) = keyed_with_protected_snapshots("orders", UPSERTS).await;
-    let table_id = process.table.table_id().to_string();
-    let dv_objects = async || -> BTreeSet<String> {
-        location
-            .probe
-            .objects(&location.data_prefix)
-            .await
-            .into_keys()
-            .filter(|key| has_extension(key, "arrow"))
-            .collect()
-    };
-    let retired_dvs = async || -> BTreeSet<String> {
-        process
-            .catalog
-            .retired_files(&table_id)
-            .await
-            .expect("read the retired files")
-            .expect("the retired files are settled")
-            .into_iter()
-            .filter(|key| key.contains("deletions/"))
-            .map(|key| file_name(&key))
-            .collect()
-    };
-    let named_dvs: BTreeSet<String> = process
-        .catalog
-        .get_table_delete_files(&table_id)
-        .await
-        .expect("read the deletion vectors")
-        .into_iter()
-        .map(|dv| dv.path.trim_start_matches("s3://bucket/").to_string())
-        .collect();
-    let dvs_before = dv_objects().await;
+    let named_dvs = process.deletion_vector_keys().await;
+    let dvs_before = location.arrow_objects().await;
     assert!(
         named_dvs.len() >= 2 && named_dvs == dvs_before,
         "the upserts wrote key deletion vectors, each a stored object: {named_dvs:?} in {dvs_before:?}"
@@ -1388,18 +1355,13 @@ async fn a_cleared_deletion_vector_is_kept_until_the_retention_elapses() {
     );
     assert_eq!(process.rows("orders").await, upserted(UPSERTS));
     assert_eq!(
-        process
-            .catalog
-            .get_table_delete_files(&table_id)
-            .await
-            .expect("read the deletion vectors")
-            .len(),
-        0,
+        process.deletion_vector_keys().await,
+        BTreeSet::new(),
         "the rewrite cleared every deletion vector row"
     );
     assert_eq!(
-        retired_dvs().await,
-        named_dvs.iter().map(|key| file_name(key)).collect(),
+        process.retired_deletion_vectors(&location).await,
+        named_dvs,
         "the commit that cleared the deletion vectors retired them"
     );
 
@@ -1408,33 +1370,29 @@ async fn a_cleared_deletion_vector_is_kept_until_the_retention_elapses() {
     drop(process.table.hold_file_deletions().await);
     process.table.sweep_retired_files_now().await;
     assert_eq!(
-        dv_objects().await,
+        location.arrow_objects().await,
         dvs_before,
         "a cleared deletion vector is kept until the retention has passed"
     );
-    assert!(
-        process
-            .instance
-            .take_deletes()
-            .iter()
-            .all(|paths| paths.iter().all(|path| !has_extension(path, "arrow"))),
+    assert_eq!(
+        process.instance.take_deletion_vector_deletes(),
+        Vec::<Vec<String>>::new(),
         "nothing deletes a deletion vector inside the retention"
     );
 
     process.table.elapse_data_file_retention();
     process.table.sweep_retired_files_now().await;
     assert_eq!(
-        dv_objects().await,
+        location.arrow_objects().await,
         BTreeSet::new(),
         "the cleared deletion vectors are deleted once the retention has passed"
     );
-    assert_eq!(retired_dvs().await, BTreeSet::new(), "and forgotten");
-    let dv_requests: Vec<Vec<String>> = process
-        .instance
-        .take_deletes()
-        .into_iter()
-        .filter(|paths| paths.iter().any(|path| has_extension(path, "arrow")))
-        .collect();
+    assert_eq!(
+        process.retired_deletion_vectors(&location).await,
+        BTreeSet::new(),
+        "and forgotten"
+    );
+    let dv_requests = process.instance.take_deletion_vector_deletes();
     assert_eq!(
         dv_requests.len(),
         1,
@@ -1460,41 +1418,9 @@ async fn a_superseded_deletion_vector_is_kept_until_the_retention_elapses() {
     };
     let (location, process) =
         Location::create_with("events", false, SessionConfig::new(), &position).await;
-    let table_id = process.table.table_id().to_string();
     common::insert_batch(&process.table, batch(0..KEYS, |id| id))
         .await
         .expect("load");
-    let named_dvs = async || -> BTreeSet<String> {
-        process
-            .catalog
-            .get_table_delete_files(&table_id)
-            .await
-            .expect("read the deletion vectors")
-            .into_iter()
-            .map(|dv| dv.path.trim_start_matches("s3://bucket/").to_string())
-            .collect()
-    };
-    let dv_objects = async || -> BTreeSet<String> {
-        location
-            .probe
-            .objects(&location.data_prefix)
-            .await
-            .into_keys()
-            .filter(|key| has_extension(key, "arrow"))
-            .collect()
-    };
-    let retired_dvs = async || -> BTreeSet<String> {
-        process
-            .catalog
-            .retired_files(&table_id)
-            .await
-            .expect("read the retired files")
-            .expect("the retired files are settled")
-            .into_iter()
-            .filter(|key| key.contains("deletions/"))
-            .map(|key| file_name(&key))
-            .collect()
-    };
     let delete = async |sql: &str| {
         process
             .ctx
@@ -1507,18 +1433,18 @@ async fn a_superseded_deletion_vector_is_kept_until_the_retention_elapses() {
     };
 
     delete("DELETE FROM events WHERE id < 10").await;
-    let first = named_dvs().await;
+    let first = process.deletion_vector_keys().await;
     assert_eq!(first.len(), 1, "one position vector: {first:?}");
     delete("DELETE FROM events WHERE id < 20").await;
-    let second = named_dvs().await;
+    let second = process.deletion_vector_keys().await;
     assert_eq!(second.len(), 1, "one position vector: {second:?}");
     assert!(
         first.is_disjoint(&second),
         "the second delete replaced the vector"
     );
     assert_eq!(
-        retired_dvs().await,
-        first.iter().map(|key| file_name(key)).collect(),
+        process.retired_deletion_vectors(&location).await,
+        first,
         "the commit that dropped the earlier vector retired it"
     );
     let expected: Vec<(i64, i64)> = (20..KEYS).map(|id| (id, id)).collect();
@@ -1530,27 +1456,28 @@ async fn a_superseded_deletion_vector_is_kept_until_the_retention_elapses() {
     drop(process.table.hold_file_deletions().await);
     process.table.sweep_retired_files_now().await;
     assert_eq!(
-        dv_objects().await,
+        location.arrow_objects().await,
         first.union(&second).cloned().collect(),
         "a superseded deletion vector is kept until the retention has passed"
     );
-    assert!(
-        process
-            .instance
-            .take_deletes()
-            .iter()
-            .all(|paths| paths.iter().all(|path| !has_extension(path, "arrow"))),
+    assert_eq!(
+        process.instance.take_deletion_vector_deletes(),
+        Vec::<Vec<String>>::new(),
         "nothing deletes a deletion vector inside the retention"
     );
 
     process.table.elapse_data_file_retention();
     process.table.sweep_retired_files_now().await;
     assert_eq!(
-        dv_objects().await,
+        location.arrow_objects().await,
         second,
         "the superseded vector is deleted once the retention has passed, and the live one kept"
     );
-    assert_eq!(retired_dvs().await, BTreeSet::new(), "and forgotten");
+    assert_eq!(
+        process.retired_deletion_vectors(&location).await,
+        BTreeSet::new(),
+        "and forgotten"
+    );
     assert_eq!(process.rows("events").await, expected);
     process
         .assert_named_files_stored(&location, "after the sweep")

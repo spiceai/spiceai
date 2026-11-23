@@ -1392,19 +1392,18 @@ pub(crate) async fn cleanup_uncommitted_delete_paths(
 
 /// Remove the files of deletion-vector rows that a committed catalog change
 /// dropped: rows a newer vector for the same data file superseded, or rows a
-/// rewrite cleared after folding their deletes into its output. No row names
-/// these files once that change commits.
+/// rewrite cleared after folding their deletes into its output.
 ///
-/// A dataset in the object-native location keeps them: the commit that dropped
-/// their rows retired them, and the retirement sweep deletes them once the
-/// retention has passed, so a query planned against the state before that
-/// commit still reads them. Anywhere else nothing would ever remove them.
+/// A dataset in the object-native location keeps them: the committing record
+/// retired them, and the retirement sweep deletes them once the retention has
+/// passed.
 ///
-/// Otherwise it runs in the background. It first takes `file_deletion_fence`
-/// exclusively, which an acceleration-snapshot archive holds shared while it
-/// copies the table's files, and a caller holding the table's write lock must
-/// not wait for that. Rows with a relative path (`path_is_relative`) are
-/// left in place, as the orphaned-vector sweep leaves them.
+/// Elsewhere the removal runs in the background under `file_deletion_fence`,
+/// taken exclusively because an acceleration-snapshot archive holds it shared
+/// while it copies the table's files; a caller holding the table's write lock
+/// must not wait for that. The orphaned-vector sweep takes any file left in
+/// the store. Rows with a relative path (`path_is_relative`) are left in
+/// place, as that sweep leaves them.
 pub(crate) fn remove_dropped_deletion_vector_files(
     files: Vec<DeleteFile>,
     file_deletion_fence: Arc<tokio::sync::RwLock<()>>,
