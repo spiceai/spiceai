@@ -131,8 +131,9 @@ pub async fn read_shards(snapshot: &Snapshot) -> Result<Vec<String>, DownloadErr
             format!("'{SAFETENSORS_INDEX}' could not be read ({error})"),
         )
     })?;
-    let shards = safetensors_shards(&contents)
-        .map_err(|why| DownloadError::unusable(snapshot, format!("'{SAFETENSORS_INDEX}' {why}")))?;
+    let shards = safetensors_shards(&contents).map_err(|why| {
+        DownloadError::invalid_file(snapshot, format!("'{SAFETENSORS_INDEX}' {why}"))
+    })?;
     if let Some(missing) = shards.iter().find(|shard| snapshot.file(shard).is_none()) {
         return Err(DownloadError::missing(
             snapshot,

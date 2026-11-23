@@ -184,6 +184,43 @@ async fn a_model_with_no_files_keeps_its_safetensors_offline() {
     );
 }
 
+/// A file the cache holds is the repository's committed bytes, so a safetensors index whose
+/// content cannot be used fails as it does when the Hub is read: no retry or `hf download`
+/// changes those bytes, so the error is not retried and gives no advice to fill the cache.
+#[tokio::test]
+async fn a_safetensors_index_the_cache_holds_that_cannot_be_used_is_not_retried() {
+    crate::require_process_per_test(WHY);
+    let cache = tempfile::tempdir().expect("creates a cache directory");
+    let snapshot = offline_snapshot(cache.path());
+    std::fs::write(snapshot.join("config.json"), b"{}").expect("writes the config");
+    std::fs::write(snapshot.join("tokenizer.json"), b"{}").expect("writes the tokenizer");
+
+    for (index, why) in [
+        (&b"not json"[..], "is not valid JSON"),
+        (&b"{}"[..], "has no `weight_map`"),
+        (&br#"{"weight_map":{}}"#[..], "names no weight files"),
+    ] {
+        std::fs::write(snapshot.join("model.safetensors.index.json"), index)
+            .expect("writes the safetensors index");
+        let error = download_model(
+            REPO_ID,
+            &[],
+            Budget::Unmeasured,
+            HubParams::default(),
+            "test",
+        )
+        .await
+        .expect_err("the safetensors index cannot be used");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Failed to download model 'test' from Hugging Face repo '{REPO_ID}' (revision 'main'): 'model.safetensors.index.json' {why}. See: https://spiceai.org/docs/components/models/huggingface"
+            )
+        );
+        assert!(error.is_configuration_error(), "{why}");
+    }
+}
+
 /// With the Hub out of reach, what the cache lacks is a gap in the cache, not a mistake in the
 /// Spicepod: the error says only the cache was read and how to fill it, and Spice retries the
 /// load. A file `files` names that the cache lacks, and, for a model with no `files`, a cache

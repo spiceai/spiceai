@@ -1294,6 +1294,40 @@ async fn an_unusable_listing_read_from_the_cache_says_so_and_is_retried() {
     assert!(!error.is_configuration_error());
 }
 
+/// The content of a file the snapshot holds is what the repository committed, wherever the
+/// listing came from: the error reads the same online, offline and in an outage, says nothing of
+/// filling the cache, and is not retried.
+#[tokio::test]
+async fn a_file_whose_content_cannot_be_used_fails_the_same_from_the_cache() {
+    const WHY: &str = "'model.safetensors.index.json' has no `weight_map`";
+    const ERROR: &str = "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): 'model.safetensors.index.json' has no `weight_map`. See: https://spiceai.org/docs/components/models/huggingface";
+    let fixture = Fixture::new().await;
+    fixture.mock.commit(MODEL, C1, model_files());
+    fixture.mock.branch(MODEL, "main", C1);
+    let online = fixture.open(None, &[]).await;
+    online
+        .download(&["config.json"])
+        .await
+        .expect("the config downloads");
+    let offline = fixture.open(None, &[("HF_HUB_OFFLINE", "1")]).await;
+    fixture.mock.faults(|faults| faults.hub_down = true);
+    let outage = fixture.open(None, &[]).await;
+
+    for (snapshot, cache_only) in [
+        (&online, None),
+        (&offline, Some("`HF_HUB_OFFLINE` is set")),
+        (
+            &outage,
+            Some("the Hugging Face Hub could not be reached (HTTP 503)"),
+        ),
+    ] {
+        assert_eq!(snapshot.cache_only_reason().as_deref(), cache_only);
+        let error = huggingface_hub::DownloadError::invalid_file(snapshot, WHY);
+        assert_eq!(error.to_string(), ERROR, "{cache_only:?}");
+        assert!(error.is_configuration_error(), "{cache_only:?}");
+    }
+}
+
 /// What a response the client cannot read held prints as printable ASCII wherever the failure
 /// is quoted, so the endpoint cannot break a line: here a listing whose entry type carries a
 /// newline and an escape sequence, which the JSON error quotes as it came.

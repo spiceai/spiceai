@@ -107,6 +107,10 @@ pub(crate) enum Cause {
         message: String,
         source: Source,
     },
+    /// The content of a file the snapshot holds cannot be used: `message` says why.
+    InvalidFile {
+        message: String,
+    },
     /// The repository id is not one the Hub allows.
     InvalidRepo,
     /// The Hub listed a path that would leave the snapshot directory.
@@ -183,7 +187,8 @@ impl DownloadError {
     /// when the Hub refused the request, the fix for the token, the access conditions or the
     /// limit), and `message` reads after "where":
     /// it says what the cache's listing lacks, since the repository, which was not read, may
-    /// hold it.
+    /// hold it. A file the snapshot holds whose content cannot be used is
+    /// [`Self::invalid_file`].
     #[must_use]
     pub fn unusable(snapshot: &crate::snapshot::Snapshot, message: impl Into<String>) -> Self {
         snapshot.error(
@@ -195,8 +200,23 @@ impl DownloadError {
         )
     }
 
+    /// The content of a file the snapshot holds cannot be used; `message` says why, as the
+    /// clause after a colon. The error is the same whether or not the Hub was read: the cache
+    /// holds a file as the repository committed it, so neither a retry nor filling the cache
+    /// changes it.
+    #[must_use]
+    pub fn invalid_file(snapshot: &crate::snapshot::Snapshot, message: impl Into<String>) -> Self {
+        snapshot.error(
+            None,
+            Cause::InvalidFile {
+                message: message.into(),
+            },
+        )
+    }
+
     /// Whether the download cannot succeed until the Spicepod changes: a setting that is not
-    /// valid, or a repository that does not hold what the component loads. A refusal from the
+    /// valid, a repository that does not hold what the component loads, or a file of it whose
+    /// content the component cannot use, from the Hub or the cache alike. A refusal from the
     /// Hub is not one: a missing or private repository, a rejected token and a gated
     /// repository can all be fixed on the Hub's side, and a network failure, a full disk or a
     /// cache `hf download` can fill can clear while Spice runs. Nor is what a listing of the
@@ -204,7 +224,10 @@ impl DownloadError {
     #[must_use]
     pub fn is_configuration_error(&self) -> bool {
         match self.cause.as_ref() {
-            Cause::Settings(_) | Cause::InvalidPath | Cause::InvalidRepo => true,
+            Cause::Settings(_)
+            | Cause::InvalidFile { .. }
+            | Cause::InvalidPath
+            | Cause::InvalidRepo => true,
             Cause::Missing { source, .. } | Cause::Unusable { source, .. } => {
                 matches!(source, Source::Hub)
             }
@@ -332,7 +355,8 @@ impl DownloadError {
             Cause::Unusable {
                 message,
                 source: Source::Hub,
-            } => (message.clone(), None),
+            }
+            | Cause::InvalidFile { message } => (message.clone(), None),
             Cause::Unusable {
                 message,
                 source: Source::OfflineCache { by },
