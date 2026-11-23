@@ -116,7 +116,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `cf0ca3e1de55d985088b88650e02cc1c9324f281` | `spiceai-55` |
+| [datafusion](#datafusion) | `f406ecb57de54718f23338cde6496e5876e80eae` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `6e7a8775a6deb99c2ebf924f1ff5b3111d38e615` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `c5f1094e4f5aa7bc0cb5d3bf0f7753a33e5fc39d` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `b0464de933ba5e0cf5e8847f5b4341b75908667f` | `spiceai-55` |
@@ -248,8 +248,9 @@ merges upstream `55.3.0` (apache/datafusion@7941823cf077678fef337a29f8307e5d721d
 #286's large `AsyncFuncExec` input batches, and #303 decodes every member of a concatenated bzip2, xz or zstd
 stream. #311 backports upstream's correlated count-bug fixes for aggregates without `GROUP BY`, #310 gives
 the column of an `ANY`/`ALL` subquery a name of its own, #309 quotes the qualifier of a wildcard inside an
-expression, and #308 keeps a regex that matches a backslash from becoming `LIKE`; none of these changes a
-manifest, and the pin is #308's commit.
+expression, and #308 keeps a regex that matches a backslash from becoming `LIKE`. On top of #308, #312 has
+`ANY`/`ALL` over an aggregate without `GROUP BY` compare with that aggregate's one row; none of these changes a
+manifest, and the pin is #312's commit.
 Outside the six files #298 resolved by hand, every Spice patch's diff against `55.3.0` is line for line
 its diff against `55.2.0`. Of those six, #251 keeps its empty-file rule beside upstream's null-partition
 statistics (apache/datafusion#26310), and #277's ordered *partial* path is replaced by upstream's
@@ -401,7 +402,8 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | Optimizer: a regex that matches a backslash is not rewritten to `LIKE` (spiceai/datafusion#308) | The rewrite reads the backslash as a `LIKE` escape, so `regexp_like(name, '\\')` on a MySQL dataset returned no rows where six match | silent (wrong data) | `crates/runtime-datafusion/src/fork_backport_guards.rs::a_regex_that_matches_a_backslash_is_not_rewritten_to_like`; in the fork, the backslash cases in `regexp/regexp_like.slt` |
 | Unparser: the qualifier of a wildcard inside an expression is quoted, as in `coalesce(("a b".*))` (spiceai/datafusion#309) | A qualifier that needs quoting is written bare, so the remote engine rejects the SQL | query failure | `crates/runtime-datafusion/src/fork_backport_guards.rs::the_unparser_quotes_the_qualifier_of_a_wildcard`; in the fork, `unparser/expr.rs::qualified_wildcard_quotes_its_qualifier` |
 | Optimizer: `RewriteSetComparison` gives the column of an `ANY`/`ALL` subquery a name of its own (spiceai/datafusion#310) | When the subquery reads the outer query's table with no alias, the comparison resolves to the outer column: `name = ANY (SELECT name FROM t WHERE id < 3)` returns every row and `id > ANY (…)` none | silent (wrong data) | `crates/runtime-datafusion/src/fork_backport_guards.rs::an_any_or_all_subquery_over_the_outer_table_reads_its_own_rows`, and the accelerated `n > ALL (SELECT n FROM ev …)` check in `test/spicescript/surface.yaml`; in the fork, the `rewrite_set_comparison.rs` tests and the same-table cases in `subquery.slt` |
-| Optimizer: correlated count-bug compensation for an aggregate without `GROUP BY` under `EXISTS`, `ANY`/`ALL` and `IN` (backport of apache/datafusion#25391, #26544 and #26677; spiceai/datafusion#311) | An outer row with no inner row is dropped, so `0 = ANY (SELECT count(*) …)` and `EXISTS (SELECT count(*) …)` lose rows; the shapes the backport cannot compensate fail at planning instead | silent (wrong data) | `crates/runtime-datafusion/src/fork_backport_guards.rs::a_correlated_count_without_group_by_keeps_the_rows_with_no_match`; in the fork, `decorrelate_predicate_subquery.rs::exists_subquery_disjunction_with_count_bug` and the count-bug cases in `subquery.slt` and `not_in_correlated.slt` |
+| Optimizer: correlated count-bug compensation for an aggregate without `GROUP BY` under `EXISTS`, `ANY`/`ALL` and `IN` (backport of apache/datafusion#25391, #26544 and #26677; spiceai/datafusion#311) | An outer row with no inner row is dropped, so `EXISTS (SELECT count(*) …)` loses rows; the shapes the backport cannot compensate fail at planning instead | silent (wrong data) | `crates/runtime-datafusion/src/fork_backport_guards.rs::a_correlated_count_without_group_by_keeps_the_rows_with_no_match`; in the fork, `decorrelate_predicate_subquery.rs::exists_subquery_disjunction_with_count_bug` and the count-bug cases in `subquery.slt` and `not_in_correlated.slt` |
+| Optimizer: `RewriteSetComparison` writes `x op ANY (sub)` and `x op ALL (sub)` as the scalar comparison `x op (sub)` when the subquery is an aggregate without `GROUP BY` under projections and aliases, which returns exactly one row; correlated, only in a projection or filter; and keeps each rewritten expression's name, a backport of apache/datafusion#26657, which is upstream in `56.0.0` (`optimizer/src/rewrite_set_comparison.rs`; spiceai/datafusion#312) | An outer row with no inner row compares with no row instead of the aggregate's row (`max` NULL, `count` 0): `t.v > ALL (SELECT max(s.v) FROM s WHERE s.k = t.k)` keeps it, `t.v - 40 = ANY (SELECT count(*) …)` drops it, and the same comparison in a `SELECT` list fails to plan | silent (wrong data / query failure) | `crates/runtime-datafusion/src/fork_backport_guards.rs::any_all_over_an_aggregate_without_group_by_compares_with_its_row`; in the fork, the groupless-aggregate ANY/ALL cases in `subquery.slt` |
 
 ## arrow-rs
 
