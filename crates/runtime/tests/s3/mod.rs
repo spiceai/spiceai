@@ -396,7 +396,7 @@ async fn s3_schema_source_path_authenticated() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let mut parts_ds = get_s3_dataset(
-                "s3://databricks-workspace-stack-473ec-bucket/unity-catalog/8429759719709712/__unitystorage/catalogs/fa937541-ca24-4f62-a93b-088db0fb40af/tables/e0dcf887-3bef-4c85-8863-e786e74756de/",
+                "s3://spiceai-ci-s3-dataset-private/schema_source_path/parts/",
                 "parts",
             );
 
@@ -405,7 +405,7 @@ async fn s3_schema_source_path_authenticated() -> Result<(), anyhow::Error> {
                 params.data.insert(
                     "schema_source_path".to_string(),
                     ParamValue::String(
-                        "s3://databricks-workspace-stack-473ec-bucket/unity-catalog/8429759719709712/__unitystorage/catalogs/fa937541-ca24-4f62-a93b-088db0fb40af/tables/e0dcf887-3bef-4c85-8863-e786e74756de/part_key=0/part-00091-21d6926a-7a96-4159-afe6-25c9f574110e.c000.snappy.parquet"
+                        "s3://spiceai-ci-s3-dataset-private/schema_source_path/parts/part_key=0/part-00091-21d6926a-7a96-4159-afe6-25c9f574110e.c000.snappy.parquet"
                             .to_string(),
                     ),
                 );
@@ -429,7 +429,7 @@ async fn s3_schema_source_path_authenticated() -> Result<(), anyhow::Error> {
                 }
                 params.data.insert(
                     "s3_region".to_string(),
-                    ParamValue::String("us-east-1".to_string()),
+                    ParamValue::String("us-east-2".to_string()),
                 );
                 params.data.insert(
                     "hive_partitioning_enabled".to_string(),
