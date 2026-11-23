@@ -208,6 +208,18 @@ impl core::error::Error for ParserError {}
 // By default, allow expressions up to this deep before erroring
 const DEFAULT_REMAINING_DEPTH: usize = 50;
 
+/// Maximum depth of an expression or set-operation tree the parser builds.
+///
+/// The recursion limit counts nested calls only. A flat chain of binary
+/// operators (`1+1+…`) or set operations (`SELECT 1 UNION SELECT 1 …`) is
+/// parsed in a loop, so it builds a tree as deep as the chain with no nesting
+/// at all. Dropping, cloning, comparing or printing such a tree recurses once
+/// per level, and a chain of a few tens of thousands of terms overflows a
+/// 2 MiB thread stack. Parsing fails with
+/// [`ParserError::RecursionLimitExceeded`] once a tree would grow deeper than
+/// this, so such a tree is never built.
+const MAX_AST_DEPTH: usize = 2048;
+
 // A constant EOF token that can be referenced.
 const EOF_TOKEN: TokenWithSpan = TokenWithSpan {
     token: Token::EOF,
@@ -359,6 +371,10 @@ pub struct Parser<'a> {
     options: ParserOptions,
     /// Ensures the stack does not overflow by limiting recursion depth.
     recursion_counter: RecursionCounter,
+    /// Depth of the deepest expression or set-operation tree completed since
+    /// the innermost enclosing [`Parser::parse_subexpr`] or
+    /// [`Parser::parse_query_body`] began, bounded by [`MAX_AST_DEPTH`].
+    ast_depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -384,8 +400,22 @@ impl<'a> Parser<'a> {
             state: ParserState::Normal,
             dialect,
             recursion_counter: RecursionCounter::new(DEFAULT_REMAINING_DEPTH),
+            ast_depth: 0,
             options: ParserOptions::new().with_trailing_commas(dialect.supports_trailing_commas()),
         }
+    }
+
+    /// The depth of a tree node over children at most `child_depth` deep.
+    ///
+    /// Returns [`ParserError::RecursionLimitExceeded`] if it exceeds
+    /// [`MAX_AST_DEPTH`]. That error, unlike other parser errors, is not
+    /// swallowed by [`Parser::maybe_parse`], so the parse fails.
+    fn ast_depth_above(child_depth: usize) -> Result<usize, ParserError> {
+        let depth = child_depth + 1;
+        if depth > MAX_AST_DEPTH {
+            return Err(ParserError::RecursionLimitExceeded);
+        }
+        Ok(depth)
     }
 
     /// Specify the maximum recursion limit while parsing.
@@ -1392,6 +1422,7 @@ impl<'a> Parser<'a> {
     pub fn parse_subexpr(&mut self, precedence: u8) -> Result<Expr, ParserError> {
         let _guard = self.recursion_counter.try_decrease()?;
         debug!("parsing expr");
+        let outer_depth = core::mem::take(&mut self.ast_depth);
         let mut expr = self.parse_prefix()?;
 
         expr = self.parse_compound_expr(expr, vec![])?;
@@ -1405,6 +1436,7 @@ impl<'a> Parser<'a> {
                 collation: self.parse_object_name(false)?,
             };
         }
+        let mut depth = Self::ast_depth_above(self.ast_depth)?;
 
         debug!("prefix: {expr:?}");
         loop {
@@ -1421,8 +1453,11 @@ impl<'a> Parser<'a> {
                 break;
             }
 
+            self.ast_depth = 0;
             expr = self.parse_infix(expr, next_precedence)?;
+            depth = Self::ast_depth_above(depth.max(self.ast_depth))?;
         }
+        self.ast_depth = outer_depth.max(depth);
         Ok(expr)
     }
 
@@ -14572,6 +14607,7 @@ impl<'a> Parser<'a> {
     pub fn parse_query_body(&mut self, precedence: u8) -> Result<Box<SetExpr>, ParserError> {
         // We parse the expression using a Pratt parser, as in `parse_expr()`.
         // Start by parsing a restricted SELECT or a `(subquery)`:
+        let outer_depth = core::mem::take(&mut self.ast_depth);
         let expr = if self.peek_keyword(Keyword::SELECT)
             || (self.peek_keyword(Keyword::FROM) && self.dialect.supports_from_first_select())
         {
@@ -14596,7 +14632,9 @@ impl<'a> Parser<'a> {
             );
         };
 
-        self.parse_remaining_set_exprs(expr, precedence)
+        let body = self.parse_remaining_set_exprs(expr, precedence)?;
+        self.ast_depth = outer_depth.max(self.ast_depth);
+        Ok(body)
     }
 
     /// Parse any extra set expressions that may be present in a query body
@@ -14607,6 +14645,7 @@ impl<'a> Parser<'a> {
         mut expr: SetExpr,
         precedence: u8,
     ) -> Result<Box<SetExpr>, ParserError> {
+        let mut depth = self.ast_depth;
         loop {
             // The query can be optionally followed by a set operator:
             let op = self.parse_set_operator(&self.peek_token().token);
@@ -14625,13 +14664,17 @@ impl<'a> Parser<'a> {
             }
             self.next_token(); // skip past the set operator
             let set_quantifier = self.parse_set_quantifier(&op);
+            self.ast_depth = 0;
+            let right = self.parse_query_body(next_precedence)?;
+            depth = Self::ast_depth_above(depth.max(self.ast_depth))?;
             expr = SetExpr::SetOperation {
                 left: Box::new(expr),
                 op: op.unwrap(),
                 set_quantifier,
-                right: self.parse_query_body(next_precedence)?,
+                right,
             };
         }
+        self.ast_depth = depth;
 
         Ok(expr.into())
     }

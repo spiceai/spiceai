@@ -56,19 +56,34 @@ Three Spice changes that are not upstream:
   engine fails to parse the query or runs a different one. Federated queries send client filters
   to the source this way.
 
+One more Spice change, not upstream, that bounds the trees the parser builds:
+
+- `src/parser/mod.rs`, `Parser::parse_subexpr`, `Parser::parse_query_body` and
+  `Parser::parse_remaining_set_exprs`: the parser tracks the depth of each expression and
+  set-operation tree it builds and returns `ParserError::RecursionLimitExceeded` once a tree would
+  be deeper than `MAX_AST_DEPTH` (2048). Upstream (0.62.0 and 0.63.0) bounds only nested calls with
+  `recursion_limit`; a flat chain of binary operators (`1+1+…`) or set operations
+  (`SELECT 1 UNION SELECT 1 …`) is built in a loop with no nesting, so ~62 KiB of SQL makes a tree
+  31,000 levels deep. Dropping such a tree recurses once per level, and it overflowed the 2 MiB
+  worker stack and aborted the process even when Spice rejected the statement before planning it.
+  2048 is four times Spice's own expression depth limit (`MAX_SQL_EXPR_DEPTH`, 512), so every
+  statement that limit admits still parses and gets that limit's error instead.
+
 The rest of the crate is byte-for-byte the published 0.62.0 (`src/`, `Cargo.toml` apart from a
 header comment, `LICENSE.TXT`).
 
 To re-sync with a newer upstream release, drop this directory and the `[patch.crates-io]` entry
 once DataFusion depends on a sqlparser release that contains #2436 (0.63.0 or later) and writes
 every quote character of a quoted identifier and of a string literal twice and a space between
-two minus signs. These tests fail if a fix is lost:
+two minus signs, and that bounds the depth of the trees it builds. These tests fail if a fix is
+lost:
 `crates/runtime-datafusion/tests/is_distinct_from_precedence.rs`, the spicescript
 `test/spicescript/sql-is-distinct-from-precedence.yaml`,
 `crates/runtime-datafusion/tests/quoted_identifier_escaping.rs`,
 `crates/runtime-datafusion/tests/string_literal_escaping.rs`,
-`crates/runtime-datafusion/tests/unary_minus_spacing.rs` and the string values of
-`test/spicescript/postgres-literals.yaml`.
+`crates/runtime-datafusion/tests/unary_minus_spacing.rs`, the string values of
+`test/spicescript/postgres-literals.yaml`, and the parser-bound tests in
+`crates/runtime/src/datafusion/sql_depth_guard_tests.rs`.
 
 [`sqlparser`]: https://crates.io/crates/sqlparser
 [apache/datafusion-sqlparser-rs#2436]: https://github.com/apache/datafusion-sqlparser-rs/pull/2436

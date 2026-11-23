@@ -655,7 +655,8 @@ tantivy-query-grammar = { path = "vendor/tantivy-query-grammar" }
 # `a IS DISTINCT FROM b OR c` parsed as `a IS DISTINCT FROM (b OR c)` and
 # returned wrong rows. It also writes every quote character in a quoted
 # identifier and in a string literal twice and a space between two minus
-# signs, which upstream does not. See vendor/sqlparser/README.md before
+# signs, and bounds the depth of the expression and set-operation trees it
+# builds, which upstream does not. See vendor/sqlparser/README.md before
 # dropping it.
 sqlparser = { path = "vendor/sqlparser" }
 
