@@ -27,5 +27,6 @@ mod partitioned_keyed_writes;
 mod partitioned_lookup_index;
 mod snapshot_restore_over_leftovers;
 mod source_ack_cancellation;
+mod state_location_credentials;
 mod stored_data_files;
 mod stored_partitioning;

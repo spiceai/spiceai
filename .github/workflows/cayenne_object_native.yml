@@ -13,6 +13,8 @@ on:
       - 'crates/accelerators/accelerator-cayenne/**'
       - 'crates/object_store_occ/**'
       - 'crates/object_store_sim/**'
+      - 'crates/runtime-state-location/**'
+      - 'crates/aws-sdk-credential-bridge/**'
       - '.github/workflows/cayenne_object_native.yml'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -89,6 +91,8 @@ jobs:
               - 'crates/cayenne-metastore-actions/**'
               - 'crates/object_store_occ/**'
               - 'crates/object_store_sim/**'
+              - 'crates/runtime-state-location/**'
+              - 'crates/aws-sdk-credential-bridge/**'
               - '.github/workflows/cayenne_object_native.yml'
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -240,6 +244,11 @@ jobs:
       - name: Run the S3 store conformance test
         if: ${{ !cancelled() }}
         run: cargo nextest run --locked -p cayenne --test integration --retries 0 -E 'test(/^rustfs_store_conformance_test::/)'
+      # A dataset placed in an s3:// runtime.state.location, signing with session
+      # credentials that expire every 15 seconds, and its never-refreshed control.
+      - name: Run the state-location credential rotation test
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --locked -p accelerator-cayenne --test integration --retries 0 -E 'test(/^state_location_credentials::/)'
 
       - name: Stop RustFS
         if: always()
