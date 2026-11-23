@@ -262,7 +262,7 @@ pub fn is_model_weights(path: &str) -> bool {
 }
 
 /// The file of a model's draft files the engine drafts with: the first `-00001-of-` shard, else
-/// the first, as it opens a sharded drafter from its first shard ([`first_shard`]).
+/// the first, as it opens a sharded drafter from its first shard.
 #[must_use]
 pub fn drafting_file(draft: &[String]) -> Option<&str> {
     first_shard(&draft.iter().map(String::as_str).collect::<Vec<_>>())
@@ -288,7 +288,7 @@ pub fn opens_a_set(path: &str) -> bool {
 /// The file of `files` that an engine taking one file opens the model from. An MTP draft head
 /// is set aside first, as the engine sets it aside to draft with; of the rest, the first that
 /// holds the weights by name ([`is_model_weights`]), else the first shard 1 of the rest, as the
-/// engine opens it ([`first_shard`]), else the first of the rest, else the first.
+/// engine opens it, else the first of the rest, else the first.
 #[must_use]
 pub fn model_file(files: &[String]) -> Option<&str> {
     let trunk = || {
@@ -660,7 +660,8 @@ fn answers_to(quantization: &Quantization, entry: &str) -> bool {
 /// Resolves a model's `files` against the repository listing. An exact `.gguf` path is
 /// honoured, with the sibling shards of a shard, a draft head's included; any other entry names
 /// a quantization, by its name, the folder that holds only it, or its tag or path stem, which
-/// brings all its shards and, unless a draft head is named, the repository's draft head.
+/// brings all its shards and, unless a draft head or a drafter ([`resolve_with_drafters`]) is
+/// named, the repository's draft head.
 /// Another file the repository has is left to the engine, and so is every entry of a
 /// repository that offers no GGUF quantization. `Ok(None)` when `files` names no GGUF weights.
 ///

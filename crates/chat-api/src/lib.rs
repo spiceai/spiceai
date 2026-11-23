@@ -218,8 +218,8 @@ pub enum Error {
         quantization: String,
         pinned: String,
         reason: String,
-        /// Whether only a restart clears it: `HF_HUB_OFFLINE` is set. With the Hub out of reach
-        /// instead, a later load can read its listing.
+        /// Whether only a restart clears it: `HF_HUB_OFFLINE` or `TRANSFORMERS_OFFLINE` is set.
+        /// With the Hub out of reach instead, a later load can read its listing.
         configuration: bool,
     },
 }

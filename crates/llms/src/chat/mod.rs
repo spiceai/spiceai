@@ -372,7 +372,8 @@ use crate::hf::HubParams;
 ///    ([`gguf_files::resolve`]); with none, the quantization llama.cpp's `-hf` loads (`Q4_K_M`,
 ///    else `Q8_0`, else the first), or the largest that fits when the memory the engine reports
 ///    cannot hold it. A registered engine that serves the GGUF files gets them all,
-///    every shard and any draft head; mistral.rs loads the first.
+///    every shard and any drafter; mistral.rs loads the one that holds the weights
+///    ([`gguf_files::model_file`]).
 /// `hub` is the model's `hf_token` and `hf_endpoint`.
 /// `distributed` optionally runs the model tensor-parallel across multiple nodes.
 /// `reasoning` names the model and its `reasoning_effort` default for the load-time check.

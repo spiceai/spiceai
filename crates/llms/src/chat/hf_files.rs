@@ -70,8 +70,8 @@ pub struct ChosenFromCache {
     /// Why only the cache was read, as a clause ([`Snapshot::cache_only_reason`]).
     pub reason: String,
     /// Whether `HF_HUB_OFFLINE` or `TRANSFORMERS_OFFLINE` is set ([`Snapshot::is_offline`]),
-    /// which only a restart without
-    /// it clears; with the Hub out of reach instead, a later load can read the Hub's listing.
+    /// which only a restart without them clears; with the Hub out of reach instead, a later
+    /// load can read the Hub's listing.
     pub offline: bool,
 }
 
