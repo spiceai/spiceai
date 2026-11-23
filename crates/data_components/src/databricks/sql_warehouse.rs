@@ -308,10 +308,8 @@ pub enum Error {
     ArrowStreamReadFailed { source: arrow::error::ArrowError },
 
     #[snafu(display(
-        "Failed to download query results from Databricks SQL Warehouse: refused to connect to {destination}: {CHUNK_DESTINATION_REFUSED}. \
-        If the warehouse's result storage is reachable only through a private endpoint, set {}=true. \
-        See: https://spiceai.org/docs/components/data-connectors/databricks",
-        ssrf::ALLOW_PRIVATE_HOSTS_ENV
+        "Failed to download query results from Databricks SQL Warehouse: refused to connect to {destination}: {}",
+        chunk_destination_refused()
     ))]
     ChunkDestinationRefused { destination: String },
 
@@ -673,8 +671,23 @@ impl FromStr for ResponseStatus {
     }
 }
 
-/// Why a result chunk download is refused.
-const CHUNK_DESTINATION_REFUSED: &str = "Databricks SQL Warehouse result chunks are not downloaded from a private, loopback, or link-local address";
+/// Why a result chunk download is refused, and how to allow it.
+fn chunk_destination_refused() -> String {
+    format!(
+        "Databricks SQL Warehouse result chunks are not downloaded from a private, loopback, or link-local address. \
+        If the warehouse's result storage is reachable only through a private endpoint, set {}=true. \
+        See: https://spiceai.org/docs/components/data-connectors/databricks",
+        ssrf::ALLOW_PRIVATE_HOSTS_ENV
+    )
+}
+
+/// A failed result chunk download. A chunk URL can carry a storage signature, which
+/// `reqwest::Error`'s `Display` would otherwise include.
+fn chunk_request_failed(source: reqwest::Error) -> Error {
+    Error::HttpRequestFailed {
+        source: source.without_url(),
+    }
+}
 
 /// Redirects a result chunk download follows before it fails; `reqwest`'s default limit.
 const CHUNK_MAX_REDIRECTS: usize = 10;
@@ -695,7 +708,7 @@ impl ChunkDestinationGuard {
             hosts: RedirectHostResolver::new(DestinationGuard::new(
                 ssrf::is_internal_ip,
                 ssrf::redirect_target_is_internal,
-                CHUNK_DESTINATION_REFUSED,
+                chunk_destination_refused(),
             )),
         }
     }
@@ -709,8 +722,9 @@ impl ChunkDestinationGuard {
                 }
                 if ssrf::redirect_target_is_internal(attempt.url()) {
                     let refused = format!(
-                        "Refused to connect to {}: {CHUNK_DESTINATION_REFUSED}",
-                        attempt.url().origin().ascii_serialization()
+                        "Refused to connect to {}: {}",
+                        attempt.url().origin().ascii_serialization(),
+                        chunk_destination_refused()
                     );
                     return attempt.error(refused);
                 }
@@ -1408,15 +1422,15 @@ impl SqlWarehouseApi {
             &self.retry_config(),
         )
         .await
-        .context(HttpRequestFailedSnafu)?
+        .map_err(chunk_request_failed)?
         // Skip permanent-error detection for external chunk URLs (pre-signed
         // storage links). A 403/404 here typically means an expired link,
         // not broken credentials/warehouse configuration.
         .error_for_status()
-        .context(HttpRequestFailedSnafu)?
+        .map_err(chunk_request_failed)?
         .bytes()
         .await
-        .context(HttpRequestFailedSnafu);
+        .map_err(chunk_request_failed);
         drop(rate_controller_permit);
         if result.is_ok() {
             self.metrics
@@ -5624,7 +5638,7 @@ mod tests {
         let guard = ChunkDestinationGuard::new();
         SqlWarehouseApi {
             chunk_client: guard
-                .apply(ClientBuilder::new())
+                .apply(ClientBuilder::new().no_proxy())
                 .build()
                 .expect("should build client"),
             chunk_destinations: Some(guard),
@@ -5727,11 +5741,12 @@ mod tests {
                 panic!("the redirect to {target} must be refused");
             };
             let refused = format!(
-                "Refused to connect to {}: Databricks SQL Warehouse result chunks are not downloaded from a private, loopback, or link-local address",
+                "Refused to connect to {}: {}",
                 url::Url::parse(&target)
                     .expect("valid URL")
                     .origin()
-                    .ascii_serialization()
+                    .ascii_serialization(),
+                chunk_destination_refused()
             );
             assert!(
                 matches!(err, Error::HttpRequestFailed { .. })
@@ -5744,6 +5759,71 @@ mod tests {
                 "the link itself is requested once"
             );
         }
+        assert_eq!(
+            canary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the internal host must receive no request"
+        );
+    }
+
+    /// A chunk host that passes the name check is refused when it resolves to an internal
+    /// address, whether the link names it or a redirect does, and the refusal is not retried.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_result_chunk_host_resolving_to_an_internal_address_is_refused() {
+        let (canary, canary_requests) =
+            start_chunk_server(arrow_stream_bytes(&id_batch()).to_vec()).await;
+        let target = format!("http://localhost.:{canary}/canary.arrow?sig=SECRET");
+        let redirect = MockHttpResponse {
+            status_line: "302 Found",
+            headers: vec![("Location".to_string(), target.clone())],
+            body: String::new(),
+        };
+        let (origin, origin_requests) = start_mock_http_server(vec![], redirect).await;
+
+        for link in [
+            target.clone(),
+            format!("http://127.0.0.1:{origin}/chunk.arrow?sig=SECRET"),
+        ] {
+            let api = create_guarded_test_api(0);
+            let api = Arc::new(if link == target {
+                api
+            } else {
+                // The redirecting server stands in for a public storage host.
+                SqlWarehouseApi {
+                    chunk_destinations: None,
+                    ..api
+                }
+            });
+            let Err(err) = Arc::clone(&api)
+                .fetch_external_links(external_link_result(&link), None)
+                .await
+            else {
+                panic!("the chunk at {link} must be refused");
+            };
+            let message = err.to_string();
+            assert!(
+                matches!(err, Error::HttpRequestFailed { .. })
+                    && message.contains(&format!(
+                        "Refused to connect to localhost.: {}",
+                        chunk_destination_refused()
+                    )),
+                "unexpected error for {link}: {message}"
+            );
+            assert!(
+                !message.contains("SECRET"),
+                "the error must not name the chunk URL: {message}"
+            );
+            assert_eq!(
+                api.metrics.retries_total.load(Ordering::Relaxed),
+                0,
+                "a refused destination must not be retried"
+            );
+        }
+        assert_eq!(
+            origin_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the redirecting link is requested once"
+        );
         assert_eq!(
             canary_requests.load(std::sync::atomic::Ordering::SeqCst),
             0,
