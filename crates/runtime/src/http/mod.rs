@@ -498,8 +498,9 @@ mod tests {
             let client = client.clone();
             async move {
                 let response = client.get(format!("http://{addr}/")).send().await?;
+                let status = response.status();
                 let connection = response.headers().get(http::header::CONNECTION).cloned();
-                Ok::<_, reqwest::Error>((connection, response.text().await?))
+                Ok::<_, reqwest::Error>((status, connection, response.text().await?))
             }
         });
         timeout(Duration::from_secs(5), arrived.notified())
@@ -518,11 +519,12 @@ mod tests {
         );
 
         release.notify_one();
-        let (connection, body) = timeout(Duration::from_secs(5), request)
+        let (status, connection, body) = timeout(Duration::from_secs(5), request)
             .await
             .expect("the request should finish once its handler does")
             .expect("the request task should not panic")
             .expect("the request in flight should get its response");
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "finished");
         // hyper marks the response `connection: close` only when the shutdown reached the
         // connection while its request was in flight.
@@ -533,7 +535,12 @@ mod tests {
         );
         timeout(Duration::from_secs(5), shutdown_notify.closed())
             .await
-            .expect("the server should close the connection after its request in flight");
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the server should close the connection after its request in flight; {} connection(s) still open",
+                    shutdown_notify.receiver_count()
+                )
+            });
         drop(client);
     }
 
