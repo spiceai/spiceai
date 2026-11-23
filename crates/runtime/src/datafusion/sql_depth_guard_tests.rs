@@ -110,6 +110,33 @@ async fn over_deep_chains_are_parse_errors_on_the_worker_stack() {
     }
 }
 
+/// Regression test: each `[]` after a type wraps it in one more array type in
+/// a loop, so `INT[][]…` parsed into a type as deep as its dimension count, and
+/// dropping 100,000 of them overflowed the worker stack. The parser now refuses
+/// to build more than its tree-depth bound, and the planner refuses a type at
+/// the bound.
+#[tokio::test]
+async fn array_dimension_chains_are_bounded_on_the_worker_stack() {
+    let cast = |dimensions: usize| format!("SELECT CAST(NULL AS INT{})", "[]".repeat(dimensions));
+
+    let err = plan_on_default_worker_stack(cast(MAX_PARSED_TREE_DEPTH))
+        .await
+        .expect_err("a type at the parser bound does not plan");
+    assert_eq!(
+        err.strip_backtrace(),
+        "Error during planning: SQL data type nesting depth exceeds the maximum of 64"
+    );
+    for dimensions in [MAX_PARSED_TREE_DEPTH + 1, 100_000] {
+        let err = plan_on_default_worker_stack(cast(dimensions))
+            .await
+            .expect_err("a type past the parser bound does not parse");
+        assert!(
+            is_parser_depth_error(&err),
+            "{dimensions} dimensions: {err}"
+        );
+    }
+}
+
 /// The deepest expression the parser builds is refused by the guard, and
 /// dropped, on the worker stack, after the table-function placeholder check
 /// has walked it there too; one level deeper is a parse error.
@@ -258,7 +285,7 @@ async fn cte_chains_are_bounded_on_the_worker_stack() {
 /// Regression test: a view's SQL was planned at load without the depth guard,
 /// so a `WHERE` chain deeper than the planner handles overflowed the stack it
 /// was planned on, and a deeply nested data type overflowed the stack it was
-/// parsed on. Both views are now refused at load with the guard's error, and
+/// parsed or dropped on. Each view is now refused at load with an error, and
 /// the runtime keeps serving its datasets.
 #[tokio::test]
 async fn an_over_deep_view_is_refused_at_load() {
@@ -279,6 +306,12 @@ async fn an_over_deep_view_is_refused_at_load() {
         "ARRAY<".repeat(10_000),
         ">".repeat(10_000)
     ));
+    let mut dimension_view =
+        spicepod::component::view::View::new("deep_dimension_view".to_string());
+    dimension_view.sql = Some(format!(
+        "SELECT id FROM depth_source WHERE CAST(NULL AS INT{}) IS NULL",
+        "[]".repeat(100_000)
+    ));
     let app = app::AppBuilder::new("view_depth")
         .with_dataset(spicepod::component::dataset::Dataset::new(
             format!("file:{}", csv.display()),
@@ -286,6 +319,7 @@ async fn an_over_deep_view_is_refused_at_load() {
         ))
         .with_view(view)
         .with_view(type_view)
+        .with_view(dimension_view)
         .build();
     let rt = Arc::new(crate::Runtime::builder().with_app(app).build().await);
     tokio::time::timeout(
@@ -317,6 +351,10 @@ async fn an_over_deep_view_is_refused_at_load() {
                 "Error during planning: Query rejected: a data type is nested more than \
                  {MAX_SQL_DATA_TYPE_DEPTH} levels deep. Simplify the type."
             ),
+        ),
+        (
+            "deep_dimension_view",
+            "SQL error: RecursionLimitExceeded (current limit: 50)".to_string(),
         ),
     ] {
         let mut status = view_status(view);

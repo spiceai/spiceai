@@ -208,12 +208,13 @@ impl core::error::Error for ParserError {}
 // By default, allow expressions up to this deep before erroring
 const DEFAULT_REMAINING_DEPTH: usize = 50;
 
-/// Maximum depth of an expression or set-operation tree the parser builds.
+/// Maximum depth of an expression or set-operation tree the parser builds, and
+/// of the array dimensions that follow a data type.
 ///
 /// The recursion limit counts nested calls only. A flat chain of binary
-/// operators (`1+1+…`) or set operations (`SELECT 1 UNION SELECT 1 …`) is
-/// parsed in a loop, so it builds a tree as deep as the chain with no nesting
-/// at all. Dropping, cloning, comparing or printing such a tree recurses once
+/// operators (`1+1+…`), set operations (`SELECT 1 UNION SELECT 1 …`) or array
+/// dimensions (`INT[][]…`) is parsed in a loop, so it builds a tree as deep as
+/// the chain with no nesting at all. Dropping, cloning, comparing or printing such a tree recurses once
 /// per level, and a chain of a few tens of thousands of terms overflows a
 /// 2 MiB thread stack. Parsing fails with
 /// [`ParserError::RecursionLimitExceeded`] once a tree would grow deeper than
@@ -416,6 +417,21 @@ impl<'a> Parser<'a> {
             return Err(ParserError::RecursionLimitExceeded);
         }
         Ok(depth)
+    }
+
+    /// `ast_depth` once a tree that began at `outer_depth` has been parsed:
+    /// the deeper of the two if it parsed, or `outer_depth` if it failed, so a
+    /// failed attempt that [`Parser::maybe_parse`] rolls back counts nothing.
+    fn ast_depth_after<T>(
+        outer_depth: usize,
+        tree_depth: usize,
+        tree: &Result<T, ParserError>,
+    ) -> usize {
+        if tree.is_ok() {
+            outer_depth.max(tree_depth)
+        } else {
+            outer_depth
+        }
     }
 
     /// Specify the maximum recursion limit while parsing.
@@ -1423,6 +1439,14 @@ impl<'a> Parser<'a> {
         let _guard = self.recursion_counter.try_decrease()?;
         debug!("parsing expr");
         let outer_depth = core::mem::take(&mut self.ast_depth);
+        let expr = self.parse_subexpr_tree(precedence);
+        self.ast_depth = Self::ast_depth_after(outer_depth, self.ast_depth, &expr);
+        expr
+    }
+
+    /// The tree [`Parser::parse_subexpr`] parses, leaving its depth in
+    /// `ast_depth`.
+    fn parse_subexpr_tree(&mut self, precedence: u8) -> Result<Expr, ParserError> {
         let mut expr = self.parse_prefix()?;
 
         expr = self.parse_compound_expr(expr, vec![])?;
@@ -1457,7 +1481,7 @@ impl<'a> Parser<'a> {
             expr = self.parse_infix(expr, next_precedence)?;
             depth = Self::ast_depth_above(depth.max(self.ast_depth))?;
         }
-        self.ast_depth = outer_depth.max(depth);
+        self.ast_depth = depth;
         Ok(expr)
     }
 
@@ -12770,7 +12794,10 @@ impl<'a> Parser<'a> {
         }?;
 
         if self.dialect.supports_array_typedef_with_brackets() {
+            let mut dimensions = 0;
             while self.consume_token(&Token::LBracket) {
+                // Each `[]` wraps the type once more, in a loop with no nesting.
+                dimensions = Self::ast_depth_above(dimensions)?;
                 // Parse optional array data type size
                 let size = self.maybe_parse(|p| p.parse_literal_uint())?;
                 self.expect_token(&Token::RBracket)?;
@@ -14605,9 +14632,17 @@ impl<'a> Parser<'a> {
     ///   set_operation ::= query_body { 'UNION' | 'EXCEPT' | 'INTERSECT' } [ 'ALL' ] query_body
     /// ```
     pub fn parse_query_body(&mut self, precedence: u8) -> Result<Box<SetExpr>, ParserError> {
+        let outer_depth = core::mem::take(&mut self.ast_depth);
+        let body = self.parse_query_body_tree(precedence);
+        self.ast_depth = Self::ast_depth_after(outer_depth, self.ast_depth, &body);
+        body
+    }
+
+    /// The tree [`Parser::parse_query_body`] parses, leaving its depth in
+    /// `ast_depth`.
+    fn parse_query_body_tree(&mut self, precedence: u8) -> Result<Box<SetExpr>, ParserError> {
         // We parse the expression using a Pratt parser, as in `parse_expr()`.
         // Start by parsing a restricted SELECT or a `(subquery)`:
-        let outer_depth = core::mem::take(&mut self.ast_depth);
         let expr = if self.peek_keyword(Keyword::SELECT)
             || (self.peek_keyword(Keyword::FROM) && self.dialect.supports_from_first_select())
         {
@@ -14632,9 +14667,7 @@ impl<'a> Parser<'a> {
             );
         };
 
-        let body = self.parse_remaining_set_exprs(expr, precedence)?;
-        self.ast_depth = outer_depth.max(self.ast_depth);
-        Ok(body)
+        self.parse_remaining_set_exprs(expr, precedence)
     }
 
     /// Parse any extra set expressions that may be present in a query body
@@ -20670,6 +20703,35 @@ mod tests {
             assert_eq!(parser.next_token(), Token::EOF);
             parser.prev_token();
         });
+    }
+
+    #[test]
+    fn test_ast_depth_bound() {
+        let dialect = crate::dialect::PostgreSqlDialect {};
+        let operators = |n: usize| format!("SELECT 1{}", "+1".repeat(n - 1));
+        let set_operations = |n: usize| vec!["SELECT 1"; n].join(" UNION ALL ");
+        let dimensions = |n: usize| format!("SELECT CAST(NULL AS INT{})", "[]".repeat(n));
+        for chain in [operators, set_operations, dimensions] {
+            assert!(Parser::parse_sql(&dialect, &chain(MAX_AST_DEPTH)).is_ok());
+            assert_eq!(
+                Parser::parse_sql(&dialect, &chain(MAX_AST_DEPTH + 1)),
+                Err(ParserError::RecursionLimitExceeded)
+            );
+        }
+    }
+
+    #[test]
+    fn test_failed_parse_restores_ast_depth() {
+        let dialect = GenericDialect {};
+        let mut parser = Parser::new(&dialect).try_with_sql("1 + + )").unwrap();
+        parser.ast_depth = 7;
+        assert!(parser.parse_subexpr(0).is_err());
+        assert_eq!(parser.ast_depth, 7);
+
+        let mut parser = Parser::new(&dialect).try_with_sql("SELECT 1 UNION )").unwrap();
+        parser.ast_depth = 7;
+        assert!(parser.parse_query_body(0).is_err());
+        assert_eq!(parser.ast_depth, 7);
     }
 
     #[test]
