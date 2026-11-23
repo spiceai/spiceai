@@ -98,7 +98,8 @@ steps:
     eventually: 60s
   - heal-source: src
 
-  # Only a resumed change stream brings `busy` level with the source.
+  # Only a resumed change stream brings either table level with the source.
+  - source-exec: { src: "UPDATE quiet SET v = v + 100 WHERE id = 2" }
   - stop-background: busy-writer
   - query: SELECT id, v FROM busy
     eventually: 60s
