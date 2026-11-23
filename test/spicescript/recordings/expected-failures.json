@@ -875,7 +875,7 @@
     },
     {
       "run": "mysql-cdc-parity",
-      "who": "object-native-local",
+      "who": "object-native",
       "key": "restart: {}",
       "kind": "error",
       "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"from\":\"mysql:orders\",\"name\":\"orders\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Ready\"},{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.co",
