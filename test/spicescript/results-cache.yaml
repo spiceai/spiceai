@@ -144,8 +144,10 @@ steps:
     expect: { status: 200, headers: { results-cache-status: HIT }, body-contains: '"n":1990' }
   - stop-source: src
   - refresh: { dataset: customer, wait: false }
+  # The refresh reports the error once its connection attempt times out,
+  # about 30s after the source stopped answering.
   - assert-status: { dataset: customer, status: Error }
-    eventually: 30s
+    eventually: 90s
   - http: { path: /v1/sql, body: SELECT count(*) AS n FROM customer }
     expect: { status: 200, headers: { results-cache-status: MISS }, body-contains: '"n":1990' }
     eventually: 30s

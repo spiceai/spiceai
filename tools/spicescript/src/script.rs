@@ -56,6 +56,12 @@ pub struct Script {
     pub tags: Vec<Tag>,
     #[serde(default)]
     pub description: Option<String>,
+    /// Environment variables the script needs, such as a provider's
+    /// credentials. When any is unset or empty the script is not run, and the
+    /// run lists it as not run rather than counting it as passed or failed;
+    /// `--require-all-env` makes that a failure.
+    #[serde(default)]
+    pub requires_env: Vec<String>,
     #[serde(default)]
     pub sources: IndexMap<String, SourceSpec>,
     /// Every combination of these values is a separate run, exposed to the
@@ -1029,6 +1035,15 @@ impl Script {
         Ok(script)
     }
 
+    /// The `requires-env` variables that are unset or empty here.
+    pub fn missing_env(&self) -> Vec<String> {
+        self.requires_env
+            .iter()
+            .filter(|name| std::env::var_os(name).is_none_or(|value| value.is_empty()))
+            .cloned()
+            .collect()
+    }
+
     /// Records how long the scripts in `dir` took, by file name, in
     /// `dir/recordings/durations.json`, keeping the entries of the others.
     pub fn record_durations(dir: &Path, took: &[(String, Duration)]) -> Result<()> {
@@ -1147,6 +1162,12 @@ impl Script {
                 "Duplicate tag `{}`; list each tag only once",
                 tag.to_possible_value()
                     .map_or_else(String::new, |value| value.get_name().to_string())
+            );
+        }
+        for name in &script.requires_env {
+            ensure!(
+                !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "`requires-env` names environment variables, not `{name}`"
             );
         }
         if script.tags.contains(&Tag::MacosSmoke) {
@@ -3015,7 +3036,32 @@ mod tests {
     fn tags_reject_unknown_tag() {
         let error = Script::parse("name: s\ntags: [slow]\nspicepod: {}\nsteps: []")
             .expect_err("unknown tag");
-        assert_eq!(error.to_string(), "unknown variant `slow`, expected `long`");
+        assert_eq!(
+            error.to_string(),
+            "unknown variant `slow`, expected `long` or `macos-smoke`"
+        );
+    }
+
+    #[test]
+    fn macos_smoke_refuses_a_source_that_runs_in_docker() {
+        let parse = |kind: &str| {
+            Script::parse(&format!(
+                "name: s\ntags: [macos-smoke]\nsources:\n  src: {{ kind: {kind} }}\nspicepod: {{}}\nsteps: []"
+            ))
+            .map(|s| s.tags)
+            .map_err(|e| e.to_string())
+        };
+        assert_eq!(parse("files"), Ok(vec![Tag::MacosSmoke]));
+        assert_eq!(parse("mock-http"), Ok(vec![Tag::MacosSmoke]));
+        assert_eq!(
+            parse("postgres"),
+            Err(
+                "Source `src` is `postgres`, which runs in Docker, but the script is tagged \
+                 `macos-smoke` and the macOS runners have no Docker; use a `files` or \
+                 `mock-http` source, or drop the tag"
+                    .to_string()
+            )
+        );
     }
 
     #[test]

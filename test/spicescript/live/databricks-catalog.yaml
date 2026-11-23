@@ -1,4 +1,13 @@
 name: databricks-catalog
+requires-env:
+  - DATABRICKS_HOST
+  - DATABRICKS_OIDC_CLIENT_ID
+  - DATABRICKS_OIDC_AUDIENCE
+  - AWS_DATABRICKS_DELTA_ACCESS_KEY_ID
+  - AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY
+  - AWS_DATABRICKS_DELTA_SESSION_TOKEN
+  - ACTIONS_ID_TOKEN_REQUEST_URL
+  - ACTIONS_ID_TOKEN_REQUEST_TOKEN
 description: >
   A Databricks Unity Catalog (mode: delta_lake) registers the tables its
   `include` patterns name and no others, authenticating by workload identity
@@ -6,7 +15,8 @@ description: >
   token), and its TPC-H and TPC-DS tables answer with the spec's rows at scale
   factor 1. Needs DATABRICKS_HOST, DATABRICKS_OIDC_CLIENT_ID,
   DATABRICKS_OIDC_AUDIENCE, the AWS_DATABRICKS_DELTA_* credentials of the
-  catalog's storage, and a GitHub Actions job with `id-token: write`.
+  catalog's storage, and a GitHub Actions job with `id-token: write` (its
+  `ACTIONS_ID_TOKEN_REQUEST_*` variables).
 
 spicepod:
   version: v1

@@ -4,6 +4,7 @@
 """Exercise negative and positive answer checks through the real runner and spiced."""
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -85,7 +86,27 @@ def main():
                 raise SystemExit(f"{name}: equivalent answers were rejected\n{result.stdout}")
             else:
                 print(f"{name}: accepted equivalent answers")
-    print(f"{len(fixtures)} real-engine harness checks passed")
+        # A script whose `requires-env` names an unset variable is not run (its
+        # wrong answer would fail it), is listed as not run, and fails the run
+        # only under --require-all-env.
+        name = "requires-env"
+        fixture = Path(directory) / f"{name}.yaml"
+        fixture.write_text(json.dumps({
+            "name": name, "requires-env": ["SPICESCRIPT_HARNESS_UNSET"],
+            "spicepod": {"version": "v1", "kind": "Spicepod", "name": name},
+            "steps": [{"start": {}}, {"query": "SELECT 1 AS value", "expect": {"rows": [["2"]]}}]}))
+        for flags, code, text in [([], 0, "not run: requires-env"),
+                                  (["--require-all-env"], 1, "FAILED not run: requires-env")]:
+            result = subprocess.run([str(args.runner.resolve()), "--record-durations", *flags, "--spiced",
+                str(args.spiced.resolve()), "--work-dir", str(args.work_dir.resolve() / name), str(fixture)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
+                env={k: v for k, v in os.environ.items() if k != "SPICESCRIPT_HARNESS_UNSET"})
+            (args.work_dir / f"{name}{''.join(flags)}.log").write_text(result.stdout)
+            if result.returncode != code or text not in result.stdout or "SPICESCRIPT_HARNESS_UNSET unset" not in result.stdout:
+                raise SystemExit(f"{name} {flags}: expected exit {code} and {text!r} naming the variable; "
+                                 f"exit={result.returncode}\n{result.stdout}")
+            print(f"{name} {flags}: not run, exit {code}, as it should")
+    print(f"{len(fixtures) + 2} real-engine harness checks passed")
 
 
 if __name__ == "__main__":

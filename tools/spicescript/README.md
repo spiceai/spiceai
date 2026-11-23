@@ -106,6 +106,7 @@ this run's other combinations have reserved does not count toward that.
 | `--spice-cli PATH` | The `spice` CLI that `spice` steps run. |
 | `--record-failures` | Rewrite each run script's entries in its directory's `recordings/expected-failures.json` with the failures this run saw (see [Expected failures](#expected-failures)). |
 | `--duckdb-version VERSION` | The DuckDB release `duckdb` and `ducklake` sources use when their spec names no `version` (also `SPICESCRIPT_DUCKDB_VERSION`); defaults to the newest in `test/duckdb_versions.json`. `--record-failures` refuses any other, since the ledger is recorded at the default. |
+| `--require-all-env` | Fail the run when a selected script is not run because a variable its `requires-env` names is unset. Without it such a script is listed as not run (in the output and under `not_run` in `--results`), never counted as passed, and does not change the exit status. For CI jobs meant to hold every credential. |
 | `--check` | Parse every script, including its corpora, and stop. Also fails on an `avoid:` whose defect no longer fails anywhere. |
 
 **Logs and cleanup.** Each failure prints the step, what was expected and what
@@ -165,6 +166,15 @@ steps:
   - query: SELECT * FROM orders
     eventually: 60s
 ```
+
+`requires-env:` lists the environment variables a script needs, such as a
+provider's credentials (`requires-env: [SPICE_OPENAI_API_KEY]`). When any is
+unset or empty the script is not run: the run prints `not run: <script>
+(<file>): <VARIABLES> unset` before it starts and again beside the totals, and
+`--results` lists it under `not_run`, apart from the scripts that ran. A
+developer can run `live/` with one provider's key and see the rest listed;
+`--require-all-env` turns any not-run script into a failure, as the trunk
+`spicescript: live` job runs.
 
 `tags:` is optional. `long` means the script is too slow for the
 run before every merge, for what it catches there, so the merge queue skips it

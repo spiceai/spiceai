@@ -55,8 +55,8 @@ steps:
   - query: SELECT count(*) AS n, sum(id) AS s, min(id) AS lo, max(id) AS hi FROM orders
     expect: { rows: [['1000', '500500', '1', '1000']] }
   # Served from the Cayenne acceleration, not read from the file per query.
-  - explain: SELECT count(*) FROM orders
-    contains: [Cayenne]
+  - explain: SELECT sum(qty) FROM orders
+    contains: [CayenneAccelerationExec]
 
   # The flags, against the running app; a restart loads the spicepod they wrote.
   - spice:

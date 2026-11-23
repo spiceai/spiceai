@@ -1,18 +1,16 @@
 name: huggingface
 description: >
   Public Hugging Face Hub datasets read through `hf://` answer as DuckDB's own
-  `hf://` reader answers them, federated and accelerated into Cayenne: Parquet
-  (a single file, a glob, a folder whose format is inferred, and the Hub's
-  `refs/convert/parquet` branch through `@~parquet`), CSV through the Hub's
-  `resolve-cache`, newline-delimited JSON, and a TSV glob. Each dataset is
-  pinned to a commit, so its recorded answer cannot drift; the converted
-  branch, which no pin survives, is compared with DuckDB reading it live, as
-  are the full rows of the two tables small enough to compare. Uses `HF_TOKEN`
-  when it is set: anonymous Hub requests share a per-IP quota.
-
-sources:
-  # The oracle: the DuckDB CLI's `hf://` reader, which shares no code with Spice.
-  duck: { kind: duckdb }
+  `hf://` reader answered them, federated and accelerated into Cayenne:
+  Parquet (a single file, a glob, a folder whose format is inferred, and the
+  Hub's `refs/convert/parquet` branch through `@~parquet`), CSV through the
+  Hub's `resolve-cache`, newline-delimited JSON, and a TSV glob. Each dataset
+  is pinned to a commit, so the answers recorded with DuckDB (v1.5.6) cannot
+  drift; the two tables small enough are compared row for row, by an MD5 of
+  every row in order. The converted branch has no pin: its answer holds while
+  stanfordnlp/imdb's `main` is the commit pinned here, and a mismatch on it
+  alone means `main` moved and the answer needs recording again. Uses
+  `HF_TOKEN` when it is set: anonymous Hub requests share a per-IP quota.
 
 variants:
   federated: {}
@@ -64,14 +62,17 @@ steps:
   - query: SELECT count(*) AS n, sum("Id") AS s, CAST(round(sum("SepalLengthCm") * 10) AS BIGINT) AS c FROM iris
     expect: { rows: [['150', '11325', '8765']] }
 
-  # Compared with DuckDB reading the Hub now: the converted branch, and every row
-  # of the small tables.
+  # Recorded from the converted branch while `main` is the commit pinned above.
   - query: SELECT count(*) AS n, sum(label) AS s, sum(character_length(text)) AS c FROM imdb_converted
-    oracle-sql: SELECT count(*) AS n, sum(label) AS s, sum(length(text)) AS c FROM 'hf://datasets/stanfordnlp/imdb@~parquet/plain_text/test/*.parquet'
-    expect: { oracle: duck }
-  - query: SELECT "Id", "SepalLengthCm", "SepalWidthCm", "PetalLengthCm", "PetalWidthCm", "Species" FROM iris
-    oracle-sql: SELECT Id, SepalLengthCm, SepalWidthCm, PetalLengthCm, PetalWidthCm, Species FROM read_csv('hf://datasets/scikit-learn/iris@0bda0ce801be0fa2f464ff845a9d5ceae99aad7d/Iris.csv', header=true)
-    expect: { oracle: duck }
-  - query: SELECT question, answer FROM gsm8k_test
-    oracle-sql: SELECT question, answer FROM 'hf://datasets/openai/gsm8k@740312add88f781978c0658806c59bc2815b9866/main/test-00000-of-00001.parquet'
-    expect: { oracle: duck }
+    expect: { rows: [['25000', '12500', '32344810']] }
+
+  # Every row, in order, as one MD5 recorded with DuckDB from the same query:
+  #   SELECT md5(string_agg(concat_ws('|', <columns>), ';' ORDER BY <key>)) FROM <file>
+  - query: >
+      SELECT md5(string_agg(concat_ws('|', "Id", "SepalLengthCm", "SepalWidthCm", "PetalLengthCm",
+        "PetalWidthCm", "Species"), ';' ORDER BY "Id")) AS h, count(*) AS n FROM iris
+    expect: { rows: [[c5bcfdbbc6e17ef680f71a774ab2ae6c, '150']] }
+  - query: >
+      SELECT md5(string_agg(concat_ws('|', question, answer), ';' ORDER BY question, answer)) AS h,
+        count(*) AS n FROM gsm8k_test
+    expect: { rows: [[e86a9cbebee14acae7585c5029b15055, '1319']] }
