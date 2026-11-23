@@ -19,8 +19,9 @@ exhaust memory. CDC ingest decodes a request body against the schema in its `X-A
 header, so any client with write access to a `cdc:` dataset could do this. Iceberg manifests are
 decoded by the same code.
 
-Capping the reserve alone is not enough. Items that encode in zero bytes, such as `null`, take no
-input, so an array of them grows by the declared count with nothing behind it.
+Capping the reserve alone is not enough. Items that encode in zero bytes, such as `null` or a
+record of `null` fields, take no input, so an array of them grows by the declared count with
+nothing behind it, and each record item also builds a field list and clones every field name.
 
 0.23.0 adds a similar per-datum budget, but it still reserves up to the whole budget before it
 decodes an item, and moving to it needs a matching `iceberg` release, so the fix is carried here.
@@ -35,11 +36,18 @@ decodes an item, and moving to it needs a matching `iceberg` release, so the fix
   `size_of::<Value>()`, and each map block its count times `size_of::<(String, Value)>()`, before
   any of its items is decoded. A block that does not fit fails with the crate's existing
   `MemoryAllocation` error. Nested collections share the budget, so they cannot multiply it.
+- The other values the decoder builds without copying them from the input debit the same budget:
+  each record its field list (`size_of::<(String, Value)>()` per field) plus its field-name bytes,
+  each union its boxed `Value`, and each enum its symbol bytes. Strings, bytes and fixed values are
+  copies of input bytes, so the input length already bounds them.
 - The array and map arms reserve at most `MAX_PREALLOCATED_ITEMS` (1024) items before decoding.
   Past that, the collection grows as items actually decode, so a declared count with no items
   behind it costs a bounded allocation.
 
-A datum whose collections hold more than 512 MiB of decoded values now fails to decode; with a 56-byte `Value`, that is about 9.6 million array items in one datum.
+A datum holding more than 512 MiB of these decoded values now fails to decode; with a 56-byte
+`Value`, that is about 9.6 million array items in one datum. The budget counts values, not
+allocator overhead or the spare capacity of a growing `Vec`, so the heap one datum can claim is a
+small multiple of the budget rather than the budget itself.
 The callers of `decode_internal` (`decode`, `from_avro_datum`, the file
 reader and the single-object reader) are unchanged.
 

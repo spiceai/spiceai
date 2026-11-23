@@ -17,11 +17,14 @@ limitations under the License.
 //! Decoding a CDC Avro body against a client-supplied schema allocates in
 //! proportion to the body, not to the item counts its array and map block
 //! headers declare. An Avro block header states its item count before the
-//! items, so a five-byte body can declare 536,870,912 of them.
+//! items, so a five-byte body can declare 536,870,912 of them, and items such
+//! as a record of `null` fields decode from zero bytes.
 //!
 //! Measures the heap with a counting `#[global_allocator]`, so it is its own
 //! test binary, and runs every case from one test so no other test's
-//! allocations land in the measurement.
+//! allocations land in the measurement. The allocator refuses to grow the heap
+//! past [`HEAP_CEILING_BYTES`], so an unbounded decode aborts the test instead
+//! of exhausting the machine.
 
 #![cfg(feature = "debezium")]
 #![expect(clippy::expect_used, reason = "integration-test helpers")]
@@ -37,13 +40,23 @@ struct PeakAllocator;
 static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+/// Live heap the allocator refuses to exceed.
+const HEAP_CEILING_BYTES: usize = 1024 * 1024 * 1024;
+
 fn grow(bytes: usize) {
     let live = LIVE_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
     PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
 }
 
+fn exceeds_ceiling(bytes: usize) -> bool {
+    LIVE_BYTES.load(Ordering::Relaxed).saturating_add(bytes) > HEAP_CEILING_BYTES
+}
+
 unsafe impl GlobalAlloc for PeakAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if exceeds_ceiling(layout.size()) {
+            return std::ptr::null_mut();
+        }
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
             grow(layout.size());
@@ -52,6 +65,9 @@ unsafe impl GlobalAlloc for PeakAllocator {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        if exceeds_ceiling(layout.size()) {
+            return std::ptr::null_mut();
+        }
         let ptr = unsafe { System.alloc_zeroed(layout) };
         if !ptr.is_null() {
             grow(layout.size());
@@ -65,6 +81,9 @@ unsafe impl GlobalAlloc for PeakAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if exceeds_ceiling(new_size) {
+            return std::ptr::null_mut();
+        }
         let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
         if !new_ptr.is_null() {
             grow(new_size);
@@ -138,7 +157,11 @@ fn declared_collection_sizes_do_not_drive_allocation() {
     // A declared count whose items would not fit in the allocation limit is
     // refused before anything is reserved. Items of `null` encode in zero bytes,
     // so for them the declared count is all that bounds the collection.
-    for (schema, item_bytes) in [(map, map_entry), (array, array_item), (null_array, array_item)] {
+    for (schema, item_bytes) in [
+        (map, map_entry),
+        (array, array_item),
+        (null_array, array_item),
+    ] {
         let (error, peak) = decode_error_and_peak_heap(&runtime, schema, &HUGE_BLOCK_COUNT);
         assert_eq!(
             error,
@@ -164,6 +187,39 @@ fn declared_collection_sizes_do_not_drive_allocation() {
         assert!(
             peak < MAX_HEAP_BYTES,
             "{schema}: a block declaring 1,000,000 items with none behind it grew the heap by {peak} bytes"
+        );
+    }
+
+    // Items that decode from zero bytes but still build heap values: a record
+    // of `null` fields allocates its field list and names, and a union read at
+    // the end of the input defaults to a boxed `null`. The array's slots take
+    // 504,000,000 of the 536,870,912-byte budget, and the items' own values
+    // spend the remaining 32,870,912 bytes until one does not fit.
+    let block_of_9m = block_count(9_000_000);
+    let fields: Vec<String> = (0..64)
+        .map(|i| format!(r#"{{"name": "field_{i:02}", "type": "null"}}"#))
+        .collect();
+    let record_array = format!(
+        r#"{{"type": "array", "items": {{"type": "record", "name": "nulls", "fields": [{}]}}}}"#,
+        fields.join(", ")
+    );
+    let union_array = r#"{"type": "array", "items": ["null", "long"]}"#.to_string();
+    let record_fields_bytes = 64 * map_entry;
+    for (schema, refused_bytes, max_peak) in [
+        (record_array, record_fields_bytes, 48 * 1024 * 1024),
+        (union_array, array_item, 160 * 1024 * 1024),
+    ] {
+        let (error, peak) = decode_error_and_peak_heap(&runtime, &schema, &block_of_9m);
+        assert_eq!(
+            error,
+            format!(
+                "Failed to decode Avro datum: Unable to allocate {refused_bytes} bytes (maximum allowed: {MAX_ALLOCATION_BYTES})"
+            ),
+            "{schema}"
+        );
+        assert!(
+            peak < max_peak,
+            "{schema}: a block of zero-byte items grew the heap by {peak} bytes"
         );
     }
 }

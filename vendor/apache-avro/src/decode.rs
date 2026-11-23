@@ -82,11 +82,12 @@ pub fn decode<R: Read>(schema: &Schema, reader: &mut R) -> AvroResult<Value> {
 /// grows as items actually decode.
 const MAX_PREALLOCATED_ITEMS: usize = 1024;
 
-/// Decode one datum. Every array and map block in it debits its declared item
-/// count, at the in-memory size of an item, from one budget of
-/// [`max_allocation_bytes`] bytes, so the input cannot make the decoder build
-/// collections larger than that. Items that encode in zero bytes, such as
-/// `null`, take no input, so the declared counts are all that bounds them.
+/// Decode one datum. Every heap allocation the decoder makes that is not a copy
+/// of input bytes debits one budget of [`max_allocation_bytes`] bytes: array and
+/// map blocks their declared item count at the in-memory size of an item, and
+/// records, unions and enums the field list, box or symbol they build. Values
+/// such as `null`, or a record of them, encode in zero bytes, so the budget, not
+/// the input length, is what bounds how many of them one datum can hold.
 pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
     schema: &Schema,
     names: &HashMap<Name, S>,
@@ -101,6 +102,10 @@ fn debit_items<T>(budget: &mut usize, items: usize) -> AvroResult<()> {
     let desired = items
         .checked_mul(std::mem::size_of::<T>())
         .ok_or(Details::IntegerOverflow)?;
+    debit_bytes(budget, desired)
+}
+
+fn debit_bytes(budget: &mut usize, desired: usize) -> AvroResult<()> {
     *budget = budget
         .checked_sub(desired)
         .ok_or(Details::MemoryAllocation {
@@ -301,12 +306,14 @@ fn decode_with_budget<R: Read, S: Borrow<Schema>>(
                         index,
                         num_variants: variants.len(),
                     })?;
+                debit_items::<Value>(budget, 1)?;
                 let value =
                     decode_with_budget(variant, names, enclosing_namespace, reader, budget)?;
                 Ok(Value::Union(index as u32, Box::new(value)))
             }
             Err(Details::ReadVariableIntegerBytes(io_err)) => {
                 if let ErrorKind::UnexpectedEof = io_err.kind() {
+                    debit_items::<Value>(budget, 1)?;
                     Ok(Value::Union(0, Box::new(Value::Null)))
                 } else {
                     Err(Details::ReadVariableIntegerBytes(io_err).into())
@@ -320,6 +327,8 @@ fn decode_with_budget<R: Read, S: Borrow<Schema>>(
             ..
         }) => {
             let fully_qualified_name = name.fully_qualified_name(enclosing_namespace);
+            debit_items::<(String, Value)>(budget, fields.len())?;
+            debit_bytes(budget, fields.iter().map(|field| field.name.len()).sum())?;
             // Benchmarks indicate ~10% improvement using this method.
             let mut items = Vec::with_capacity(fields.len());
             for field in fields {
@@ -342,6 +351,7 @@ fn decode_with_budget<R: Read, S: Borrow<Schema>>(
                 let index = usize::try_from(raw_index)
                     .map_err(|e| Details::ConvertI32ToUsize(e, raw_index))?;
                 if (0..symbols.len()).contains(&index) {
+                    debit_bytes(budget, symbols[index].len())?;
                     let symbol = symbols[index].clone();
                     Value::Enum(raw_index as u32, symbol)
                 } else {
