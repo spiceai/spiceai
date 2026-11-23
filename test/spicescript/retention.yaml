@@ -215,11 +215,15 @@ steps:
     oracle-sql: SELECT * FROM widgets WHERE NOT deleted
     eventually: 30s
 
-  # Object-native data: each acceleration's log is in the state location, and
-  # nothing is at a local `s3:` path.
+  # Object-native data: each acceleration's log and data files are in the state
+  # location, and nothing is at a local `s3:` path.
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/by_time-, contains: /head, min: 1 }
     only: object-native-s3
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/by_time-, contains: /data/, min: 1 }
+    only: object-native-s3
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/iso_window-, contains: /head, min: 1 }
+    only: object-native-s3
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/iso_window-, contains: /data/, min: 1 }
     only: object-native-s3
   - assert-files: { lacks: '(^|/)s3:' }
     only: object-native-s3
