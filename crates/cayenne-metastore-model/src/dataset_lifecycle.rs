@@ -97,6 +97,270 @@ impl Data {
         }
     }
 }
+/// Explorer drawings of a dataset's file set, shared by the lifecycle models.
+impl Data {
+    fn hidden(&self, f: &File) -> bool {
+        self.deletes
+            .iter()
+            .any(|&(t, k, d)| t == f.table && k == f.key && d >= f.seq)
+    }
+    /// Draws the head and the files it references at `(x, y)`, and the stored
+    /// objects outside the head when `present` lists them; returns the bottom.
+    fn draw(
+        &self,
+        svg: &mut crate::explorer::Svg,
+        x: usize,
+        y: usize,
+        title: &str,
+        head: &[String],
+        present: Option<&[usize]>,
+    ) -> usize {
+        use crate::explorer::Tone;
+        svg.heading(x, y, title);
+        let y = y + 22;
+        let mut lines = head.to_vec();
+        lines.push(format!(
+            "high seq: t0 {}, t1 {}",
+            self.high[0], self.high[1]
+        ));
+        let files_at = lines.len();
+        let warm = self.files.iter().filter(|f| !f.cold).count();
+        lines.push(format!(
+            "files: {warm} warm, {} cold",
+            self.files.len() - warm
+        ));
+        let deletes_at = lines.len();
+        for &(t, k, d) in &self.deletes {
+            lines.push(format!("delete t{t}.k{k} at or below seq {d}"));
+        }
+        if let Some(page) = self.page {
+            lines.push(format!("checkpoint key page: object #{page}"));
+        }
+        for o in &self.prepared {
+            lines.push(format!(
+                "prepared: t{}.k{} = {} (seq {})",
+                o.table,
+                o.key,
+                o.value.map_or("delete".into(), |v| format!("v{v}")),
+                o.insert
+            ));
+        }
+        let node = svg.node(x, y, 0, "HEAD", &lines, Tone::Live);
+        let col = node.right() + 70;
+        let mut cy = y;
+        let mut placed = vec![];
+        for (cold, tier) in [(false, "WARM"), (true, "COLD")] {
+            let files: Vec<&File> = self.files.iter().filter(|f| f.cold == cold).collect();
+            if files.is_empty() {
+                continue;
+            }
+            svg.text(col, cy + 11, tier, "cm-small");
+            cy += 16;
+            for f in files {
+                let duplicate = !self.hidden(f)
+                    && self.files.iter().any(|g| {
+                        g.id != f.id && g.table == f.table && g.key == f.key && !self.hidden(g)
+                    });
+                let tone = if self.hidden(f) {
+                    Tone::Gone
+                } else if duplicate {
+                    Tone::Bad
+                } else {
+                    Tone::Live
+                };
+                let applied = f.applied.map_or("-".into(), |a| a.to_string());
+                let file = svg.node(
+                    col,
+                    cy,
+                    0,
+                    &format!("file #{} t{}.k{} = v{}", f.id, f.table, f.key, f.value),
+                    &[format!(
+                        "seq {} min {} deletes applied to {applied}",
+                        f.seq, f.min
+                    )],
+                    tone,
+                );
+                svg.arrow(
+                    (node.right(), node.line_y(files_at)),
+                    (file.x, file.mid_y()),
+                    Tone::Live,
+                    None,
+                );
+                cy = file.bottom() + 8;
+                placed.push((f, file));
+            }
+        }
+        for (i, &(t, k, d)) in self.deletes.iter().enumerate() {
+            for (f, file) in &placed {
+                if f.table == t && f.key == k && d >= f.seq {
+                    svg.arrow(
+                        (node.right(), node.line_y(deletes_at + i)),
+                        (file.x, file.mid_y() + 5),
+                        Tone::Gone,
+                        Some("hides"),
+                    );
+                }
+            }
+        }
+        let mut bottom = node.bottom().max(cy);
+        if let Some(present) = present {
+            let refs = self.refs();
+            let extra: Vec<String> = present
+                .iter()
+                .filter(|id| !refs.contains(id))
+                .map(|id| format!("#{id}"))
+                .collect();
+            let missing: Vec<String> = refs
+                .iter()
+                .filter(|id| !present.contains(id))
+                .map(|id| format!("#{id}"))
+                .collect();
+            let ox = placed.iter().map(|(_, n)| n.right()).max().unwrap_or(col) + 40;
+            let mut oy = y;
+            if !extra.is_empty() {
+                let n = svg.node(
+                    ox,
+                    oy,
+                    0,
+                    "STORED, NOT IN HEAD",
+                    &[extra.join(" ")],
+                    Tone::Staged,
+                );
+                oy = n.bottom() + 8;
+            }
+            if !missing.is_empty() {
+                let n = svg.node(
+                    ox,
+                    oy,
+                    0,
+                    "IN HEAD, NOT STORED",
+                    &[missing.join(" ")],
+                    Tone::Bad,
+                );
+                oy = n.bottom();
+            }
+            bottom = bottom.max(oy);
+        }
+        bottom
+    }
+}
+/// Draws a dataset's head, files, stored objects and checkpoint; returns the bottom.
+fn draw_dataset(state: &State, svg: &mut crate::explorer::Svg) -> usize {
+    use crate::explorer::Tone;
+    let mut head = vec![format!(
+        "commit {} lease {} floor {}",
+        state.head.pos, state.head.lease, state.head.floor
+    )];
+    if let Some(id) = state.upload {
+        head.push(format!("upload in flight: #{id}"));
+    }
+    if let Some((base, id)) = state.staged {
+        head.push(format!("staged page #{id} on commit {}", base.pos));
+    }
+    if let Some(ids) = &state.selected {
+        head.push(format!("selected for deletion: {ids:?}"));
+    }
+    let bottom = state.data.draw(
+        svg,
+        0,
+        0,
+        "DATASET HEAD AND FILES",
+        &head,
+        Some(&state.present),
+    );
+    let Some((base, data, keys)) = &state.checkpoint else {
+        return bottom;
+    };
+    let tone = if *base <= state.head.floor {
+        Tone::Live
+    } else {
+        Tone::Staged
+    };
+    svg.node(
+        0,
+        bottom + 20,
+        0,
+        &format!("CHECKPOINT at commit {base}"),
+        &[
+            format!("rows {}", rows_text(&data.rows())),
+            format!("key index {}", keys_text(*keys)),
+        ],
+        tone,
+    )
+    .bottom()
+}
+/// What a commit record changes, one line per kind of change.
+fn record_lines(r: &Record) -> Vec<String> {
+    let mut lines = vec![];
+    let ids = |ids: &mut dyn Iterator<Item = usize>| {
+        ids.map(|id| format!("#{id}")).collect::<Vec<_>>().join(" ")
+    };
+    if !r.remove.is_empty() {
+        lines.push(format!(
+            "remove files {}",
+            ids(&mut r.remove.iter().copied())
+        ));
+    }
+    if !r.add.is_empty() {
+        let added: Vec<String> = r
+            .add
+            .iter()
+            .map(|f| {
+                format!(
+                    "#{} t{}.k{}=v{}{}",
+                    f.id,
+                    f.table,
+                    f.key,
+                    f.value,
+                    if f.cold { " cold" } else { "" }
+                )
+            })
+            .collect();
+        lines.push(format!("add {}", added.join(", ")));
+    }
+    for &(t, k, d) in &r.deletes {
+        lines.push(format!("delete t{t}.k{k} at or below seq {d}"));
+    }
+    for &(t, k, d) in &r.clear {
+        lines.push(format!("clear delete t{t}.k{k}@{d}"));
+    }
+    if r.prepare.is_some() {
+        lines.push("prepare buffered operations".into());
+    }
+    if let Some(decision) = r.decision {
+        lines.push(format!(
+            "resolve: {}",
+            if decision { "commit" } else { "abort" }
+        ));
+    }
+    if lines.is_empty() {
+        lines.push("no change (head move only)".into());
+    }
+    lines
+}
+fn rows_text(rows: &Rows) -> String {
+    let mut parts = vec![];
+    for (t, table) in rows.iter().enumerate() {
+        for (k, value) in table.iter().enumerate() {
+            parts.push(format!(
+                "t{t}.k{k}={}",
+                value.map_or("-".into(), |v| format!("v{v}"))
+            ));
+        }
+    }
+    parts.join(" ")
+}
+fn keys_text(keys: Keys) -> String {
+    let mut parts = vec![];
+    for (t, table) in keys.iter().enumerate() {
+        for (k, present) in table.iter().enumerate() {
+            if *present {
+                parts.push(format!("t{t}.k{k}"));
+            }
+        }
+    }
+    format!("[{}]", parts.join(" "))
+}
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Op {
     table: usize,
@@ -641,6 +905,75 @@ impl Model for Protocol {
         }
         (next != *state).then_some(next)
     }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Buffer(t, k, true) => format!("buffer an upsert of t{t}.k{k}"),
+            Action::Buffer(t, k, false) => format!("buffer a delete of t{t}.k{k}"),
+            Action::Acknowledge => "commit the buffer and acknowledge the source".into(),
+            Action::Compact(mask) => format!("compact warm files (selection {mask:b})"),
+            Action::Promote => "rewrite every cold file in the cold tier".into(),
+            Action::Clear => "clear delete vectors every file has applied".into(),
+            Action::Checkpoint => "write a checkpoint of the current state".into(),
+            Action::Floor => "move the floor to the checkpoint".into(),
+            Action::CollectLog => "collect log records below the retained floor".into(),
+            Action::Recover => "recover from checkpoint plus log tail".into(),
+            Action::Choose => "start a query on the current head".into(),
+            Action::SecondQuery => "start a second query".into(),
+            Action::StagePage => "stage a checkpoint key page".into(),
+            Action::PublishPage => "publish the staged key page".into(),
+            Action::RemovePage => "remove the key page from the head".into(),
+            Action::StartUpload => "start uploading an object under a fresh name".into(),
+            Action::FinishUpload => "the upload lands".into(),
+            Action::Takeover => "a new writer takes over the lease".into(),
+            Action::Age(id) => format!("upload #{id} passes the age limit"),
+            Action::Sweep => "orphan sweep selects aged unreferenced uploads".into(),
+            Action::SelectRemoved => "collection selects removed objects".into(),
+            Action::Delete => "delete the selected objects".into(),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let state = self.next_state(last_state, action)?;
+        let buffer: Vec<String> = state
+            .buffer
+            .iter()
+            .map(|o| {
+                format!(
+                    "t{}.k{}={}",
+                    o.table,
+                    o.key,
+                    o.value.map_or("delete".into(), |v| format!("v{v}"))
+                )
+            })
+            .collect();
+        let mut lines = vec![
+            format!("reader sees:  {}", rows_text(&state.data.rows())),
+            format!("source says:  {}", rows_text(&state.oracle)),
+            format!("buffered, not acknowledged: [{}]", buffer.join(", ")),
+            format!(
+                "log: commits {}..{} kept, {} collected",
+                state.collected, state.head.pos, state.collected
+            ),
+            format!("queries started at commits: {:?}", state.queries),
+        ];
+        if let Some((data, keys)) = &state.recovered {
+            lines.push(format!(
+                "recovered: {}  keys {}",
+                rows_text(&data.rows()),
+                keys_text(*keys)
+            ));
+        }
+        lines.push(crate::explorer::flags(&[
+            ("acknowledge refused", state.refused),
+            ("swept", state.swept),
+            ("late upload after sweep", state.late),
+        ]));
+        Some(crate::explorer::summary(&lines))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        let mut svg = crate::explorer::Svg::new();
+        draw_dataset(path.last_state(), &mut svg);
+        Some(svg.finish())
+    }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
             Property::always("at most one live row per table key", |_, s: &State| {
@@ -720,5 +1053,59 @@ impl Model for Protocol {
                 s.log.iter().any(|r| r.deletes.len() == 2)
             }),
         ]
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::{Data, Op};
+
+    /// `Promote` rewrites the files already in the cold tier (warm ones are
+    /// left alone), and its label says that.
+    #[test]
+    fn promote_rewrites_cold_files_and_says_so() {
+        use super::{Action, Protocol};
+        use stateright::Model;
+        let model = Protocol::new("dataset-lifecycle", 2);
+        let init = model.init_states().remove(0);
+        let warm = |d: &Data| {
+            let mut ids: Vec<usize> = d.files.iter().filter(|f| !f.cold).map(|f| f.id).collect();
+            ids.sort_unstable();
+            ids
+        };
+        let next = model
+            .next_state(&init, Action::Promote)
+            .expect("promote is enabled");
+        assert_eq!(warm(&next.data), warm(&init.data));
+        assert!(init.data.files.iter().any(|f| f.cold));
+        assert_ne!(next.data.files, init.data.files);
+        assert_eq!(
+            model.format_action(&Action::Promote),
+            "rewrite every cold file in the cold tier"
+        );
+    }
+
+    /// A prepared operation's object (`1000 + value`) is stored and can go
+    /// missing; the drawing must show it like any other missing reference.
+    #[test]
+    fn missing_prepared_object_is_drawn_missing() {
+        let data = Data {
+            high: [0, 0],
+            files: vec![],
+            deletes: vec![],
+            page: None,
+            prepared: vec![Op {
+                table: 0,
+                key: 0,
+                value: Some(5),
+                delete: 1,
+                insert: 2,
+            }],
+        };
+        let mut svg = crate::explorer::Svg::new();
+        data.draw(&mut svg, 0, 0, "T", &[], Some(&[]));
+        let svg = svg.finish();
+        assert!(svg.contains("IN HEAD, NOT STORED"), "{svg}");
+        assert!(svg.contains(">#1005<"), "{svg}");
     }
 }

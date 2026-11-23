@@ -67,7 +67,9 @@ crates and runs, in order:
 1. `make lint-rust PACKAGES="…" FEATURES="…"` — lint the crates you touched
 2. `make nextest-packages PACKAGES="…" FEATURES="…"` — their unit tests
 3. `make lint-rust` — the full workspace lint
-4. `make nextest verify-cli` — all unit tests, then assert the `spice` binary exists
+4. `make nextest verify-cli` — all unit tests, then assert the `spice` binary exists.
+   The slowest tests are left to `trunk_tests.yml` (see *Trunk Health*); run them
+   with `make nextest-post-merge`.
 
 Steps 1-2 exist to fail fast: a lint or test failure in the crate you edited is
 the likeliest outcome, and step 3 is by far the longest, so covering your own
@@ -761,7 +763,9 @@ merge queue is still the real gate.
 ## Trunk Health
 
 Some tests run after merge rather than in the merge queue: `trunk_tests.yml`
-runs the comprehensive set on `trunk` every 12 hours. A failure it finds is
+runs the comprehensive set on `trunk` every 12 hours. That includes the nextest
+tests the gate leaves out (`NEXTEST_POST_MERGE_FILTER` in the `Makefile`, run by
+`make nextest-post-merge`), which neither `make signoff` nor the merge queue runs. A failure it finds is
 tracked as an open issue labeled `trunk-broken`, or as an open PR labeled
 `fixes-trunk` that fixes or reverts it. The required **Trunk Health** check
 (`trunk_health.yml`) keeps those from being ignored.

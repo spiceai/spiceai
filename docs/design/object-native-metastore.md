@@ -6,7 +6,9 @@ alternatives, and the order of the work. It is not a specification. The
 [technical design](object-native-metastore-technical.md) holds the components,
 code changes, protocol details and the roadmap's exit proofs. The
 [protocol model](../../crates/cayenne-metastore-model/README.md) holds the
-model checks, cited here by run name.
+model checks, cited here by run name; any cited run can be stepped through in the
+[Stateright Explorer](../../crates/cayenne-metastore-model/README.md#exploring-runs-in-the-stateright-explorer)
+with `cayenne-metastore-model serve <run>`.
 [Enhancement #16245](https://github.com/spiceai/spiceai/issues/16245) holds the
 user-facing surface. All of them evolve together as implementation proceeds and unknowns are worked out.
 

@@ -486,6 +486,11 @@ impl DynamoDBTableProvider {
         }
     }
 
+    /// The `DynamoDB` table this provider reads.
+    pub(crate) fn table_name(&self) -> &str {
+        self.table_schema.table_name()
+    }
+
     /// Fetches the latest global checkpoint (current shard positions) for the stream.
     ///
     /// # Errors
