@@ -670,6 +670,17 @@ impl UCTable {
     /// [`UCTable::object_storage_location`], or `None` when the location is accepted or absent.
     #[must_use]
     pub fn unsupported_storage_location_warning(&self) -> Option<String> {
+        let reason = self.unsupported_storage_location_reason()?;
+        Some(format!(
+            "Table '{}' is not registered, so queries against it will not resolve: {reason}. See: https://spiceai.org/docs/components/catalogs",
+            self.full_name(),
+        ))
+    }
+
+    /// Why the table's storage location is refused, worded as a cause clause, or `None` when the
+    /// location is accepted or absent.
+    #[must_use]
+    pub fn unsupported_storage_location_reason(&self) -> Option<String> {
         let location = self.storage_location.as_deref()?;
         let reason = match Url::parse(location) {
             Ok(url) if SUPPORTED_STORAGE_SCHEMES.contains(&url.scheme()) => return None,
@@ -677,8 +688,7 @@ impl UCTable {
             Err(_) => "its storage location is not a URL".to_string(),
         };
         Some(format!(
-            "Table '{}' is not registered, so queries against it will not resolve: {reason}, and catalog tables are only read from object storage ({}). See: https://spiceai.org/docs/components/catalogs",
-            self.full_name(),
+            "{reason}, and catalog tables are only read from object storage ({})",
             SUPPORTED_STORAGE_SCHEMES.join(", ")
         ))
     }
