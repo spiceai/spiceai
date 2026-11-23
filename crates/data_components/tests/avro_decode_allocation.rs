@@ -149,6 +149,14 @@ fn cdc_error_and_peak_heap(
     }
 }
 
+/// The error a CDC body gets when decoding it would pass its budget.
+fn cdc_limit_error(body: &[u8]) -> String {
+    format!(
+        "Failed to decode Avro datum: a {}-byte datum can decode to at most {CDC_BUDGET_BYTES} bytes, and this one declares more. Check that its array, map, bytes, string and fixed lengths match the data it carries. For details, visit: https://spiceai.org/docs/features/cdc",
+        body.len()
+    )
+}
+
 /// Decodes `body` against `schema_json` with apache-avro's per-datum limit, as
 /// an Iceberg manifest read does, returning the error text and the peak heap
 /// growth during the decode.
@@ -176,27 +184,15 @@ fn declared_collection_sizes_do_not_drive_allocation() {
     let map = r#"{"type": "map", "values": "long"}"#;
     let array = r#"{"type": "array", "items": "long"}"#;
     let null_array = r#"{"type": "array", "items": "null"}"#;
-    let declared: usize = 536_870_912;
     let map_entry = size_of::<(String, Value)>();
     let array_item = size_of::<Value>();
 
     // A declared count whose items would not fit in a CDC body's budget is
     // refused before anything is reserved. Items of `null` encode in zero bytes,
     // so for them the declared count is all that bounds the collection.
-    for (schema, item_bytes) in [
-        (map, map_entry),
-        (array, array_item),
-        (null_array, array_item),
-    ] {
+    for schema in [map, array, null_array] {
         let (error, peak) = cdc_error_and_peak_heap(&runtime, schema, &HUGE_BLOCK_COUNT);
-        assert_eq!(
-            error,
-            format!(
-                "Failed to decode Avro datum: Unable to allocate {} bytes (maximum allowed: {CDC_BUDGET_BYTES})",
-                declared * item_bytes
-            ),
-            "{schema}"
-        );
+        assert_eq!(error, cdc_limit_error(&HUGE_BLOCK_COUNT), "{schema}");
         assert!(
             peak < MAX_HEAP_BYTES,
             "{schema}: decoding a 5-byte body grew the heap by {peak} bytes"
@@ -223,13 +219,7 @@ fn declared_collection_sizes_do_not_drive_allocation() {
     let mut body = block_count(i64::try_from(fitting + 1).expect("the count fits in a long"));
     body.push(0);
     let (error, peak) = cdc_error_and_peak_heap(&runtime, null_field, &body);
-    assert_eq!(
-        error,
-        format!(
-            "Failed to decode Avro datum: Unable to allocate {} bytes (maximum allowed: {CDC_BUDGET_BYTES})",
-            (fitting + 1) * array_item
-        )
-    );
+    assert_eq!(error, cdc_limit_error(&body));
     assert!(
         peak < MAX_HEAP_BYTES,
         "{} null items grew the heap by {peak} bytes",
@@ -243,13 +233,7 @@ fn declared_collection_sizes_do_not_drive_allocation() {
         CDC_BUDGET_BYTES + 1
     );
     let (error, peak) = cdc_error_and_peak_heap(&runtime, &fixed, b"x");
-    assert_eq!(
-        error,
-        format!(
-            "Failed to decode Avro datum: Unable to allocate {} bytes (maximum allowed: {CDC_BUDGET_BYTES})",
-            CDC_BUDGET_BYTES + 1
-        )
-    );
+    assert_eq!(error, cdc_limit_error(b"x"));
     assert!(
         peak < MAX_HEAP_BYTES,
         "a one-byte body with a fixed schema past the budget grew the heap by {peak} bytes"

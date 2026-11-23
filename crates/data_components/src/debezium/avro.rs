@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use apache_avro::error::Details;
 use apache_avro::util::{DEFAULT_MAX_ALLOCATION_BYTES, max_allocation_bytes};
 use apache_avro::{
     Schema as AvroSchema, decode_with_max_allocation, schema::Name, types::Value as AvroValue,
@@ -64,6 +65,11 @@ pub enum Error {
 
     #[snafu(display("Failed to decode Avro datum: {source}"))]
     DecodeDatum { source: Box<apache_avro::Error> },
+
+    #[snafu(display(
+        "Failed to decode Avro datum: a {datum_bytes}-byte datum can decode to at most {limit} bytes, and this one declares more. Check that its array, map, bytes, string and fixed lengths match the data it carries. For details, visit: https://spiceai.org/docs/features/cdc"
+    ))]
+    DecodeLimit { datum_bytes: usize, limit: usize },
 
     #[snafu(display("Failed to fetch schema id {schema_id} from registry {url}: {message}"))]
     RegistryFetch {
@@ -169,14 +175,18 @@ pub async fn parse_avro_change_events(
         return MissingSchemaSnafu.fail();
     };
 
-    let value = decode_with_max_allocation(
-        schema.as_ref(),
-        &mut std::io::Cursor::new(datum),
-        decode_budget(datum.len()),
-    )
-    .map_err(|e| Error::DecodeDatum {
-        source: Box::new(e),
-    })?;
+    let limit = decode_budget(datum.len());
+    let value =
+        decode_with_max_allocation(schema.as_ref(), &mut std::io::Cursor::new(datum), limit)
+            .map_err(|e| match e.details() {
+                Details::MemoryAllocation { .. } => Error::DecodeLimit {
+                    datum_bytes: datum.len(),
+                    limit,
+                },
+                _ => Error::DecodeDatum {
+                    source: Box::new(e),
+                },
+            })?;
     let event = avro_value_to_change_event(&value)?;
     Ok(vec![event])
 }
