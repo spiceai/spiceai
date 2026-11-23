@@ -2408,14 +2408,18 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
     }
 
     // Safely access the first error with bounds checking
-    // Prefer the first entry that is definitely permanent over an earlier bare
-    // message, so one transient-looking entry cannot hide a failure no retry clears.
+    // Prefer a named permanent diagnostic (refusal, validation code, NOT_FOUND)
+    // over a location-only query error, and either over an earlier bare
+    // message, so one transient-looking entry cannot hide a failure no retry
+    // clears. GitHub's internal-error message can carry a location and still
+    // be a timeout.
     let graphql_error = response
         .get("errors")
         .and_then(|e| e.as_array())
         .and_then(|arr| {
             arr.iter()
-                .find(|entry| is_permanent_entry(entry))
+                .find(|entry| is_named_permanent_entry(entry))
+                .or_else(|| arr.iter().find(|entry| is_permanent_entry(entry)))
                 .or_else(|| arr.first())
         })
         .unwrap_or(&Value::Null);
@@ -5406,6 +5410,33 @@ mod graphql_errors_classification_tests {
             "{err:?}"
         );
         assert!(is_retriable_error(&err), "{err:?}");
+    }
+
+    /// A later named refusal is not hidden by GitHub's ambiguous internal-error
+    /// message, including when that message carries a source location.
+    #[test]
+    fn github_internal_error_message_with_locations_does_not_hide_a_later_type_refusal() {
+        let err = classify(&json!({
+            "errors": [
+                {
+                    "message": "Something went wrong while executing your query.",
+                    "locations": [{"line": 1, "column": 1}]
+                },
+                {"message": "access denied", "type": "FORBIDDEN"}
+            ]
+        }));
+        assert!(
+            matches!(
+                err,
+                Error::InvalidCredentialsOrPermissions {
+                    kind: crate::graphql::RefusalKind::Explicit,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(!is_retriable_error(&err), "{err:?}");
+        assert!(err.to_string().contains("access denied"), "{err}");
     }
 
     /// A later named refusal is not hidden by GitHub's ambiguous internal-error
