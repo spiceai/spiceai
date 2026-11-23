@@ -77,39 +77,40 @@ async fn send(routes: &Router, method: Method, path: &str, body: &Value) -> (Sta
     (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// The ids in the dataset's acceleration, in order.
-async fn accelerated_ids(rt: &Runtime) -> Vec<i64> {
+/// The ids in the dataset's acceleration, in order; an error until its first
+/// load completes.
+async fn accelerated_ids(rt: &Runtime) -> datafusion::error::Result<Vec<i64>> {
     let batches = rt
         .df
         .ctx
         .sql(&format!("SELECT id FROM {DATASET} ORDER BY id"))
-        .await
-        .expect("query plans")
+        .await?
         .collect()
-        .await
-        .expect("query runs");
+        .await?;
     let columns: Vec<&dyn Array> = batches.iter().map(|b| b.column(0).as_ref()).collect();
     if columns.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let ids = concat(&columns).expect("columns concatenate");
-    ids.as_any()
+    let ids = concat(&columns)?;
+    Ok(ids
+        .as_any()
         .downcast_ref::<Int64Array>()
         .expect("id is Int64")
         .values()
-        .to_vec()
+        .to_vec())
 }
 
 async fn wait_for_ids(rt: &Runtime, expected: &[i64]) {
-    let mut last = Vec::new();
+    let mut last = String::new();
     for _ in 0..600 {
-        last = accelerated_ids(rt).await;
-        if last == expected {
-            return;
+        match accelerated_ids(rt).await {
+            Ok(ids) if ids == expected => return,
+            Ok(ids) => last = format!("{ids:?}"),
+            Err(e) => last = e.to_string(),
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("the acceleration holds {last:?}, expected {expected:?}");
+    panic!("the acceleration holds {last}, expected {expected:?}");
 }
 
 /// Regression test: an override whose `WHERE` chain exceeds the planner's
