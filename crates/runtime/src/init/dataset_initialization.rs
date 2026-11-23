@@ -291,14 +291,67 @@ impl DatasetInitialization {
                     // registry — stays valid right up until the swap
                     // succeeds. If `register_loaded_dataset` fails, the
                     // placeholder remains in place and a retry can run.
-                    Box::pin(Arc::clone(&runtime).register_loaded_dataset(
+                    //
+                    // An earlier attempt that got as far as building the
+                    // acceleration consumed its storage generation, so this
+                    // one starts from a fresh one, as `load_dataset`'s retry
+                    // does.
+                    let bootstrap_status = if bootstrap_status.needs_reinitialization() {
+                        match runtime
+                            .initialize_datasets_accelerators(std::slice::from_ref(&dataset))
+                            .await
+                            .remove(&dataset.name)
+                        {
+                            Some(Ok(bootstrap)) => bootstrap.restore_once().await,
+                            Some(Err(err)) => {
+                                if !is_permanent_load_failure(&err) {
+                                    *retry = Some(Box::new(Self {
+                                        dataset: Arc::clone(&dataset),
+                                        runtime: Arc::clone(&runtime),
+                                        connector_source: ConnectorSource::Lazy(builder),
+                                        schema_source: SchemaSource::Known { schema },
+                                        bootstrap_status,
+                                        load_semaphore,
+                                        preloaded_accelerated_table,
+                                    }));
+                                }
+                                return Err(err);
+                            }
+                            None => {
+                                return Err(RuntimeError::UnableToInitializeDataConnector {
+                                    source: "Missing accelerator bootstrap result".into(),
+                                });
+                            }
+                        }
+                    } else {
+                        bootstrap_status
+                    };
+
+                    // `register_loaded_dataset` reports its own failure (the
+                    // status, `LOAD_ERROR` and the log line), so it does not
+                    // pass through `report_deferred_failure`.
+                    if let Err(err) = Box::pin(Arc::clone(&runtime).register_loaded_dataset(
                         Arc::clone(&dataset),
                         Arc::clone(&connector),
                         None,
-                        bootstrap_status,
-                        load_semaphore,
+                        bootstrap_status.clone(),
+                        load_semaphore.clone(),
                     ))
-                    .await?;
+                    .await
+                    {
+                        if !is_permanent_load_failure(&err) {
+                            *retry = Some(Box::new(Self {
+                                dataset: Arc::clone(&dataset),
+                                runtime: Arc::clone(&runtime),
+                                connector_source: ConnectorSource::Lazy(builder),
+                                schema_source: SchemaSource::Known { schema },
+                                bootstrap_status,
+                                load_semaphore,
+                                preloaded_accelerated_table,
+                            }));
+                        }
+                        return Err(err);
+                    }
 
                     runtime
                         .df
@@ -427,6 +480,13 @@ fn report_deferred_failure(
         "Error initializing deferred dataset on first reference. {err}"
     );
     err
+}
+
+/// Whether a failure of the accelerated hand-off is one no retry clears.
+/// `register_loaded_dataset` raises such a failure as `PermanentDatasetFailure`,
+/// which is also the one failure `load_dataset`'s retry loop stops on.
+fn is_permanent_load_failure(err: &RuntimeError) -> bool {
+    matches!(err, RuntimeError::PermanentDatasetFailure { .. }) || is_permanent_dataset_failure(err)
 }
 
 fn arrow_schemas_equal(a: &SchemaRef, b: &SchemaRef) -> bool {
