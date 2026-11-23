@@ -641,11 +641,15 @@ delete's. Only the files in no file group read a reinsert `seq`, and only while
 the table has no file group, as today only the current snapshot does, and only
 while no protected snapshot exists. A re-inserted row is read from the newer
 file that holds it, so honoring the re-insert over an older file's version of
-the key would serve both. That rule is also why a checkpoint's insert records
-need not be stamped at the checkpoint's own `seq`: no read uses a stamp while
-the snapshot it describes is live (`mem-tier-late-stamp` finds no failure). A
-design that let group files read a reinsert `seq` would make that stamp's order
-load-bearing. Cross-key cutoffs within a table equal commit order: the seq-prefix
+the key would serve both. The shared key-delete pushdown also reads reinsert
+`seq`s, for every file, but only to decide which keys it may skip before the
+per-file filter; a key it keeps is still hidden or shown by that filter. That
+rule is also why a checkpoint's insert records need not be stamped at the
+checkpoint's own `seq`: no per-file filter honors a stamp while the snapshot it
+describes is live, and `mem-tier-late-stamp` finds no failure within its bounds.
+Leaving the insert records out altogether does fail (`mem-tier-no-insert-records`).
+A design that let group files honor a reinsert `seq` would make that stamp's
+order load-bearing. Cross-key cutoffs within a table equal commit order: the seq-prefix
 bake's cutoff, compaction's "clear deletes at or below the cutoff", the orphan
 deletion-vector sweep's floor, file-group fences, and the transaction begin
 token `sequence_high_water()`.

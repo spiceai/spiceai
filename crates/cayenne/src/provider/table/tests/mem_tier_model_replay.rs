@@ -996,8 +996,8 @@ async fn mem_tier_model_replay_control_capture_reservation() {
 
 /// After two seals and a restart, a bake must leave the key with one visible
 /// row: the second seal's tombstone hides the first seal's inline shadow, and
-/// that tombstone is above every snapshot the bake folds. The engine and the
-/// model must agree on this trace.
+/// that tombstone is above every snapshot the bake folds, so the bake must not
+/// prune it. The engine and the model must agree on this trace.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mem_tier_model_replay_bake_after_two_seals() {
     let actions: Vec<String> = [
@@ -1040,6 +1040,13 @@ async fn mem_tier_model_replay_bake_after_two_seals() {
         assert_eq!(
             counts.bakes_committed, 1,
             "{backend:?}: the bake must commit"
+        );
+        // The only delete is key 0's, from the second seal, above every snapshot
+        // the bake folds: pruning it would leave the first seal's shadow
+        // unhidden.
+        assert_eq!(
+            counts.bake_pruned_entries, 0,
+            "{backend:?}: the bake must keep the delete above the snapshots it folds"
         );
         assert!(
             failures.is_empty(),
