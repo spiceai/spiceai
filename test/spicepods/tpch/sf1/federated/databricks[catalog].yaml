@@ -2,7 +2,7 @@ version: v1
 kind: Spicepod
 name: databricks[catalog]-federated
 catalogs:
-  - from: databricks:spiceai_sandbox
+  - from: databricks:spiceai_ci
     name: tpch
     include:
       - "tpch.*"
