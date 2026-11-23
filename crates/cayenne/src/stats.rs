@@ -35,6 +35,7 @@ use vortex::error::VortexResult;
 use vortex::expr::stats::{Precision as VortexPrecision, Stat};
 use vortex::file::FileStatistics;
 use vortex::flatbuffers::WriteFlatBufferExt;
+use vortex::layout::layouts::file_stats::{AggregateStat, AggregateStats};
 use vortex::scalar::{DecimalValue, Scalar};
 
 /// Convert a `DataFusion` [`ScalarValue`] to a Vortex [`vortex::scalar::ScalarValue`].
@@ -550,12 +551,15 @@ pub(crate) fn stats_set_to_column_stats(
             .and_then(|size| usize::try_from(size).ok()),
     );
 
+    let distinct_count =
+        vortex_datafusion::singleton_distinct_count(&min_value, &max_value, &null_count)
+            .unwrap_or(Precision::Absent);
     ColumnStatistics {
         null_count,
         max_value,
         min_value,
         sum_value,
-        distinct_count: Precision::Absent,
+        distinct_count,
         byte_size,
     }
 }
@@ -578,12 +582,20 @@ pub fn file_statistics_to_df(
     schema: &Schema,
     num_rows: i64,
 ) -> Statistics {
-    let column_statistics: Vec<ColumnStatistics> = file_stats
-        .into_iter()
-        .enumerate()
-        .map(|(idx, (stats, dtype))| {
-            let arrow_type = schema.fields().get(idx).map(|field| field.data_type());
-            stats_set_to_column_stats(stats, dtype, arrow_type)
+    column_stats_sets_to_df(&column_stats_sets(file_stats, schema), schema, num_rows)
+}
+
+/// [`file_statistics_to_df`] over columns already looked up with [`column_stats_sets`].
+fn column_stats_sets_to_df(
+    columns: &[(StatsSet, DType)],
+    schema: &Schema,
+    num_rows: i64,
+) -> Statistics {
+    let column_statistics: Vec<ColumnStatistics> = columns
+        .iter()
+        .zip(schema.fields())
+        .map(|((stats, dtype), field)| {
+            stats_set_to_column_stats(stats, dtype, Some(field.data_type()))
         })
         .collect();
 
@@ -632,7 +644,7 @@ pub fn statistics_to_persisted_blob(stats: &Statistics, schema: &Schema) -> Opti
             column_stats_to_stats_set(&align_column_stats_to_schema(cs, field.data_type()))
         })
         .collect();
-    let file_stats = build_file_statistics(column_stats, schema).ok()?;
+    let file_stats = build_file_statistics(&column_stats, schema).ok()?;
     serialize_file_statistics(&file_stats).ok()
 }
 
@@ -709,14 +721,15 @@ pub(crate) fn restore_persisted_statistics(
     num_rows: i64,
 ) -> Option<RestoredStatistics> {
     let file_stats = deserialize_file_statistics(blob, schema).ok()?;
-    let accounts_for_nan = file_stats.into_iter().all(|(stats, dtype)| {
+    let columns = column_stats_sets(&file_stats, schema);
+    let accounts_for_nan = columns.iter().all(|(stats, dtype)| {
         let bounded = stats
             .iter()
             .any(|(stat, _)| matches!(stat, Stat::Min | Stat::Max | Stat::Sum));
         !bounded || vortex_datafusion::bounds_account_for_nan(stats, dtype)
     });
     Some(RestoredStatistics {
-        statistics: Arc::new(file_statistics_to_df(&file_stats, schema, num_rows)),
+        statistics: Arc::new(column_stats_sets_to_df(&columns, schema, num_rows)),
         accounts_for_nan,
     })
 }
@@ -742,7 +755,11 @@ pub(crate) fn blob_carries_per_column_byte_sizes(statistics: &Statistics) -> boo
 }
 
 /// Serialize a Vortex [`FileStatistics`] to bytes.
-pub(crate) fn serialize_file_statistics(stats: &FileStatistics) -> VortexResult<Vec<u8>> {
+///
+/// # Errors
+///
+/// Returns an error when a statistic cannot be encoded as a flatbuffer.
+pub fn serialize_file_statistics(stats: &FileStatistics) -> VortexResult<Vec<u8>> {
     let fb = stats.write_flatbuffer_bytes()?;
     Ok(fb.as_slice().to_vec())
 }
@@ -757,7 +774,7 @@ pub(crate) fn serialize_file_statistics(stats: &FileStatistics) -> VortexResult<
 /// expected schema.
 pub fn deserialize_file_statistics(bytes: &[u8], schema: &Schema) -> VortexResult<FileStatistics> {
     let struct_dtype = vortex_struct_dtype_from_schema(schema)?;
-    let fb_stats = flatbuffers::root::<vortex::flatbuffers::footer::FileStatistics>(bytes)?;
+    let fb_stats = flatbuffers::root::<vortex::file::flatbuffers::footer::FileStatistics>(bytes)?;
     FileStatistics::from_flatbuffer(&fb_stats, &struct_dtype, &STATISTICS_SESSION)
 }
 
@@ -787,15 +804,75 @@ pub(crate) fn vortex_struct_dtype_from_schema(schema: &Schema) -> VortexResult<D
 /// # Errors
 ///
 /// Returns an error for an Arrow type Vortex cannot represent.
-pub(crate) fn build_file_statistics(
-    column_stats: Vec<StatsSet>,
+pub fn build_file_statistics(
+    column_stats: &[StatsSet],
     schema: &Schema,
 ) -> VortexResult<FileStatistics> {
     let struct_dtype = vortex_struct_dtype_from_schema(schema)?;
-    Ok(FileStatistics::new_with_dtype(
-        Arc::from(column_stats.into_boxed_slice()),
-        &struct_dtype,
-    ))
+    let Some(fields) = struct_dtype.as_struct_fields_opt() else {
+        vortex::error::vortex_bail!("a table schema converts to a struct dtype");
+    };
+    vortex::error::vortex_ensure!(
+        column_stats.len() == fields.nfields(),
+        "{} column statistics for {} columns",
+        column_stats.len(),
+        fields.nfields()
+    );
+    let aggregates: Arc<[AggregateStats]> = column_stats
+        .iter()
+        .zip(fields.fields())
+        .map(|(stats, dtype)| aggregate_stats_from_stats_set(stats, &dtype))
+        .collect();
+    // Only the top-level layout the footer has always carried, so a build that predates
+    // nested file statistics reads a blob this one writes.
+    Ok(FileStatistics::new_legacy_only(aggregates, &struct_dtype))
+}
+
+/// Each column's statistics as a [`StatsSet`], with its Vortex type, in `schema`'s order.
+///
+/// Columns are looked up by name: a blob or footer that carries nested statistics stores
+/// them in post-order over every field, so a position is not a top-level column. A column
+/// with no entry gets no statistics.
+#[must_use]
+pub fn column_stats_sets(file_stats: &FileStatistics, schema: &Schema) -> Vec<(StatsSet, DType)> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| {
+            vortex_datafusion::column_stats(file_stats, field.name()).unwrap_or_else(|| {
+                (
+                    StatsSet::default(),
+                    ARROW_SESSION.from_arrow_field(field).unwrap_or(DType::Null),
+                )
+            })
+        })
+        .collect()
+}
+
+/// The aggregates a [`StatsSet`] over a column of `dtype` records, for statistics the
+/// footer stores as aggregates. A statistic with no aggregate function, or whose value
+/// is not a valid scalar of its type, is left out.
+fn aggregate_stats_from_stats_set(stats: &StatsSet, dtype: &DType) -> AggregateStats {
+    AggregateStats::new(
+        stats
+            .iter()
+            .filter_map(|(stat, value)| {
+                let aggregate_fn = stat.aggregate_fn()?;
+                let stat_dtype = stat.dtype(dtype)?;
+                let value = value
+                    .clone()
+                    .map(|value| Scalar::try_new(stat_dtype.clone(), Some(value)).ok());
+                let value = match value {
+                    VortexPrecision::Exact(Some(value)) => VortexPrecision::Exact(value),
+                    VortexPrecision::Inexact(Some(value)) => VortexPrecision::Inexact(value),
+                    VortexPrecision::Exact(None)
+                    | VortexPrecision::Inexact(None)
+                    | VortexPrecision::Absent => return None,
+                };
+                Some(AggregateStat::from_value(aggregate_fn, value))
+            })
+            .collect(),
+    )
 }
 
 /// Merge an existing serialized [`FileStatistics`] blob with new per-column
@@ -835,7 +912,10 @@ pub(crate) fn merge_serialized_stats(
         }
     };
 
-    let existing_sets: Vec<StatsSet> = existing.into_iter().map(|(set, _)| set.clone()).collect();
+    let existing_sets: Vec<StatsSet> = column_stats_sets(&existing, schema)
+        .into_iter()
+        .map(|(set, _)| set)
+        .collect();
 
     if existing_sets.len() != new_column_stats.len() {
         tracing::warn!(
@@ -854,7 +934,7 @@ pub(crate) fn merge_serialized_stats(
         .map(|((existing, new), dtype)| existing.merge_unordered(new, dtype))
         .collect();
 
-    match build_file_statistics(merged, schema)
+    match build_file_statistics(&merged, schema)
         .and_then(|file_stats| serialize_file_statistics(&file_stats))
     {
         Ok(bytes) => Some(bytes),
@@ -1087,8 +1167,7 @@ mod tests {
             "max present in StatsSet"
         );
 
-        let file_stats =
-            build_file_statistics(vec![set], &schema).expect("statistics types convert");
+        let file_stats = build_file_statistics(&[set], &schema).expect("statistics types convert");
         let bytes = serialize_file_statistics(&file_stats).expect("serialize ok");
         let rt = deserialize_file_statistics(&bytes, &schema).expect("deserialize ok");
 
@@ -1131,11 +1210,9 @@ mod tests {
             byte_size: DfPrecision::Absent,
         };
         let blob = |float_set: StatsSet| {
-            let file_stats = build_file_statistics(
-                vec![float_set, column_stats_to_stats_set(&int_stats)],
-                &schema,
-            )
-            .expect("statistics types convert");
+            let file_stats =
+                build_file_statistics(&[float_set, column_stats_to_stats_set(&int_stats)], &schema)
+                    .expect("statistics types convert");
             serialize_file_statistics(&file_stats).expect("serialize ok")
         };
 
@@ -1194,7 +1271,7 @@ mod tests {
         let first_set = column_stats_to_stats_set(&first_stats);
         let second_set = column_stats_to_stats_set(&second_stats);
         let first_file_stats =
-            build_file_statistics(vec![first_set], &schema).expect("statistics types convert");
+            build_file_statistics(&[first_set], &schema).expect("statistics types convert");
         let first_blob = serialize_file_statistics(&first_file_stats).expect("serialize ok");
         let dtypes = vec![
             ARROW_SESSION
@@ -1540,8 +1617,7 @@ mod tests {
             "sum present in StatsSet"
         );
 
-        let file_stats =
-            build_file_statistics(vec![set], &schema).expect("statistics types convert");
+        let file_stats = build_file_statistics(&[set], &schema).expect("statistics types convert");
         let bytes = serialize_file_statistics(&file_stats).expect("serialize ok");
         let rt = deserialize_file_statistics(&bytes, &schema).expect("deserialize ok");
 
@@ -1567,7 +1643,7 @@ mod tests {
         let first_set = column_stats_to_stats_set(&mk_sum(60));
         let second_set = column_stats_to_stats_set(&mk_sum(30));
         let first_blob = serialize_file_statistics(
-            &build_file_statistics(vec![first_set], &schema).expect("statistics types convert"),
+            &build_file_statistics(&[first_set], &schema).expect("statistics types convert"),
         )
         .expect("serialize ok");
         let dtypes = vec![

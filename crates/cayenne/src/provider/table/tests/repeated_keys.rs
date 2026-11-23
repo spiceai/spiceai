@@ -697,6 +697,11 @@ async fn an_overwrite_repeating_keys_publishes_one_snapshot() {
 /// A superseded copy's values never reach an aggregate, whether it reads the
 /// rows or the table's statistics. A key-deletion table keeps its statistics
 /// exact, since its superseded copies leave its files.
+///
+/// The string `MIN`/`MAX` are answered from statistics once the table is
+/// reopened, from the statistics Cayenne persisted. Right after the write the
+/// table's statistics come from the files' Vortex footers, which record a
+/// string column's bounds byte-bounded and so inexact, and the query scans.
 #[tokio::test(flavor = "multi_thread")]
 async fn aggregates_after_an_overwrite_repeating_keys_ignore_superseded_copies() {
     let mut failures = Vec::new();
@@ -734,7 +739,7 @@ async fn aggregates_after_an_overwrite_repeating_keys_ignore_superseded_copies()
             .expect("format")
             .to_string();
             let from_statistics = plan.contains("PlaceholderRowExec");
-            if mode == DeletionMode::Key && !from_statistics {
+            if mode == DeletionMode::Key && stage == "after reopen" && !from_statistics {
                 failures.push(format!(
                     "{mode:?} {stage}: scanned instead of using statistics"
                 ));

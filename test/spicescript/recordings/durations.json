@@ -12,6 +12,7 @@
   "case-mixed-widths": 16,
   "cayenne-delete-signed-zero": 14,
   "cayenne-file-create-reload": 27,
+  "cayenne-scan-pushdown": 5,
   "cayenne-transactions": 35,
   "cayenne-upgrade": 8,
   "cayenne-vnext": 13,
