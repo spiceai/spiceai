@@ -182,8 +182,10 @@ enum Body {
 /// request's own headers. Once it leaves that origin, a hop carries none of them and no body:
 /// any header name can carry a credential (an OAuth token under a custom name, an API key in
 /// `http_headers`), so none is judged safe to forward. A `303`, or a `301`/`302` answering a
-/// `POST`, becomes a `GET` as `reqwest` would make it, and a `307`/`308` that would resend a
-/// body to another origin is refused. Headers the client sets on every request
+/// `POST`, becomes a `GET` as `reqwest` would make it, and drops the body and the headers that
+/// describe it (`Content-Type`, `Content-Length`, `Content-Encoding`, `Transfer-Encoding`) on
+/// that hop and every later one. A `307`/`308` keeps the method, the body and those headers, as
+/// `reqwest` does, and one that would resend a body to another origin is refused. Headers the client sets on every request
 /// (`ClientBuilder::default_headers`, the user agent) are sent on every hop, so a credential
 /// belongs on the request, never on the client.
 ///
@@ -197,7 +199,7 @@ pub async fn send(
     egress: &Egress,
     on_origin_change: OnOriginChange,
 ) -> Result<Response, SendError> {
-    let headers = request.headers().clone();
+    let mut headers = request.headers().clone();
     let timeout = request.timeout().copied();
     let version = request.version();
     let mut method = request.method().clone();
@@ -232,16 +234,21 @@ pub async fn send(
         let hop =
             follow_redirect(egress, &chain, &next, on_origin_change).context(RedirectSnafu)?;
 
-        let resends_body = matches!(
-            status,
-            StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
-        );
-        if !resends_body
-            && ((status == StatusCode::SEE_OTHER && method != Method::HEAD)
-                || method == Method::POST)
-        {
-            method = Method::GET;
+        // As `reqwest` follows redirects: a `303`, or a `301`/`302` answering a `POST`, drops the
+        // body and the headers that describe it. They are removed from `headers`, which every
+        // later hop starts from, so they stay dropped. A request sent without a body keeps any
+        // `Content-Type` it set until a redirect drops it.
+        let drops_body = status == StatusCode::SEE_OTHER
+            || (matches!(status, StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND)
+                && method == Method::POST);
+        if drops_body {
+            if method != Method::HEAD {
+                method = Method::GET;
+            }
             body = Body::None;
+            for name in &BODY_HEADERS {
+                headers.remove(name);
+            }
         }
 
         let mut next_headers = if hop.left_origin() {
@@ -260,11 +267,7 @@ pub async fn send(
 
         let mut next_request = Request::new(method.clone(), next.clone());
         match &body {
-            Body::None => {
-                for name in &BODY_HEADERS {
-                    next_headers.remove(name);
-                }
-            }
+            Body::None => {}
             Body::Buffered(bytes) => *next_request.body_mut() = Some(bytes.clone().into()),
             Body::Streaming => {
                 return BodyNotReplayableSnafu {

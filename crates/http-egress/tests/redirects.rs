@@ -313,6 +313,137 @@ async fn a_303_is_followed_as_a_get_without_the_body() {
     assert_eq!(seen[1].headers.get("content-type"), None);
 }
 
+/// The headers that describe a body, as each request on a chain within one origin carried them.
+fn body_headers(seen: &[Seen]) -> Vec<(String, Method, Option<String>, Option<String>)> {
+    seen.iter()
+        .map(|request| {
+            let header = |name: &str| {
+                request
+                    .headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+            };
+            (
+                request.path.clone(),
+                request.method.clone(),
+                header("content-type"),
+                header("content-encoding"),
+            )
+        })
+        .collect()
+}
+
+/// Follows `request` through `send` and, on a second server with the same routes, through
+/// `reqwest`'s own redirect handling, and returns what each server saw.
+async fn sent_and_followed_by_reqwest(
+    routes: fn(&Seen) -> Response,
+    request: impl Fn(&reqwest::Client, &str) -> reqwest::Request,
+) -> (Vec<Seen>, Vec<Seen>) {
+    let through_send = Server::start(routes).await;
+    let egress = Egress::default();
+    let client = client(&egress);
+    send(
+        &client,
+        request(&client, &through_send.url),
+        &egress,
+        OnOriginChange::Follow,
+    )
+    .await
+    .expect("send follows the redirects");
+
+    let through_reqwest = Server::start(routes).await;
+    let following = reqwest::Client::new();
+    following
+        .execute(request(&following, &through_reqwest.url))
+        .await
+        .expect("reqwest follows the redirects");
+
+    (through_send.seen(), through_reqwest.seen())
+}
+
+/// A `307`/`308` within the origin resends the request as it was sent: a request without a
+/// body keeps the `Content-Type` and `Content-Encoding` it set, as `reqwest` keeps them when it
+/// follows the redirect itself.
+#[tokio::test]
+async fn a_307_or_308_within_the_origin_keeps_a_bodyless_requests_content_headers() {
+    fn temporary(request: &Seen) -> Response {
+        match request.path.as_str() {
+            "/data" => (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, "/moved")]).into_response(),
+            _ => "[]".into_response(),
+        }
+    }
+    fn permanent(request: &Seen) -> Response {
+        match request.path.as_str() {
+            "/data" => (StatusCode::PERMANENT_REDIRECT, [(LOCATION, "/moved")]).into_response(),
+            _ => "[]".into_response(),
+        }
+    }
+    let get = |client: &reqwest::Client, url: &str| {
+        client
+            .get(format!("{url}/data"))
+            .header("content-type", "application/vnd.api+json")
+            .header("content-encoding", "identity")
+            .build()
+            .expect("the request builds")
+    };
+    let kept = (
+        Some("application/vnd.api+json".to_string()),
+        Some("identity".to_string()),
+    );
+
+    for (status, routes) in [(307, temporary as fn(&Seen) -> Response), (308, permanent)] {
+        let (sent, followed) = sent_and_followed_by_reqwest(routes, get).await;
+        assert_eq!(
+            body_headers(&sent),
+            [
+                ("/data".to_string(), Method::GET, kept.0.clone(), kept.1.clone()),
+                ("/moved".to_string(), Method::GET, kept.0.clone(), kept.1.clone()),
+            ],
+            "{status}"
+        );
+        assert_eq!(body_headers(&sent), body_headers(&followed), "{status}");
+    }
+}
+
+/// Once a redirect drops the body, the headers that described it stay dropped: a `303` that
+/// turns a `POST` into a `GET`, then a `307` within the origin, reaches the last hop without the
+/// `POST`'s `Content-Type`, as `reqwest` reaches it.
+#[tokio::test]
+async fn body_headers_a_redirect_drops_stay_dropped_on_later_hops() {
+    fn routes(request: &Seen) -> Response {
+        match request.path.as_str() {
+            "/submit" => (StatusCode::SEE_OTHER, [(LOCATION, "/step")]).into_response(),
+            "/step" => (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, "/result")]).into_response(),
+            _ => "done".into_response(),
+        }
+    }
+    let post = |client: &reqwest::Client, url: &str| {
+        client
+            .post(format!("{url}/submit"))
+            .header("content-type", "application/json")
+            .body("{\"a\":1}")
+            .build()
+            .expect("the request builds")
+    };
+
+    let (sent, followed) = sent_and_followed_by_reqwest(routes, post).await;
+    assert_eq!(
+        body_headers(&sent),
+        [
+            (
+                "/submit".to_string(),
+                Method::POST,
+                Some("application/json".to_string()),
+                None
+            ),
+            ("/step".to_string(), Method::GET, None, None),
+            ("/result".to_string(), Method::GET, None, None),
+        ]
+    );
+    assert_eq!(body_headers(&sent), body_headers(&followed));
+}
+
 /// A token request carries its secret in the body; `OnOriginChange::Refuse` keeps any redirect
 /// from taking it to another origin, even one `reqwest` would follow with a `307`.
 #[tokio::test]
