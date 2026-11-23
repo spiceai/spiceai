@@ -57,6 +57,19 @@ pub enum StreamError {
     ))]
     FailedToStartInitialScan { table_name: String, source: Error },
 
+    #[snafu(display(
+        "Failed to record that DynamoDB table '{table_name}' is being reloaded, so the dataset is not reloaded and receives no changes until Spice restarts. Check that the acceleration's files are writable; see https://spiceai.org/docs/components/data-connectors/dynamodb. Cause: {source}"
+    ))]
+    FailedToMarkReload {
+        table_name: String,
+        source: runtime_checkpoint_api::CheckpointError,
+    },
+
+    #[snafu(display(
+        "Failed to resume the DynamoDB Stream of table '{table_name}' because its last reload was interrupted, so the accelerated table may be missing rows and receives no changes. Set `dynamodb_replication_initial_snapshot` to `auto` to reload the table; see https://spiceai.org/docs/components/data-connectors/dynamodb"
+    ))]
+    ReloadInterrupted { table_name: String },
+
     #[snafu(display("Unable to downcast ArrayBuilder"))]
     DowncastBuilder,
 

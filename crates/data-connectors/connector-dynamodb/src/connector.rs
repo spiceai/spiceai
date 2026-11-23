@@ -55,6 +55,13 @@ const CHECKPOINT_EXPIRATION_HOURS: u64 = 18;
 /// serialized stream checkpoint.
 const CHECKPOINT_TABLE: &str = "spice_sys_dynamodb_streams";
 
+/// What a reload stores in place of the checkpoint while it runs. The reload's
+/// stream begins with a truncate, so a start that finds this knows the accelerated
+/// table may hold only part of the table, whatever checkpoint an earlier run saved.
+/// The post-snapshot barrier replaces it with the new checkpoint. It is not a valid
+/// [`Checkpoint`], so a build that predates it reads it as unreadable and reloads.
+const RELOAD_IN_PROGRESS: &str = r#"{"reload_in_progress":true}"#;
+
 pub struct DynamoDB {
     params: Parameters,
     metrics_collector: Arc<MetricsCollector>,
@@ -518,21 +525,27 @@ impl DataConnector for DynamoDB {
                         .map(|checkpoint| (true, checkpoint, None)),
                     // `disabled`: never scan — resume from the saved checkpoint
                     // when present, otherwise begin at the current stream tip.
-                    InitialSnapshotMode::Disabled => load_or_initialize_checkpoint(
+                    // An interrupted reload may have left the table partly
+                    // loaded, which only a scan repairs, so it is refused.
+                    InitialSnapshotMode::Disabled => match load_or_initialize_checkpoint(
                         &dynamodb,
                         dynamodb_sys.as_ref(),
                         &dataset_name,
                     )
                     .await
-                    .map(|(_, checkpoint, updated_at)| (false, checkpoint, updated_at)),
-                    InitialSnapshotMode::Auto => {
-                        load_or_initialize_checkpoint(
-                            &dynamodb,
-                            dynamodb_sys.as_ref(),
-                            &dataset_name,
-                        )
-                        .await
-                    }
+                    {
+                        Ok(SavedStart::Fresh {
+                            interrupted: true, ..
+                        }) => return Some(reload_interrupted(dynamodb.table_name())),
+                        start => start.map(SavedStart::without_scan),
+                    },
+                    InitialSnapshotMode::Auto => load_or_initialize_checkpoint(
+                        &dynamodb,
+                        dynamodb_sys.as_ref(),
+                        &dataset_name,
+                    )
+                    .await
+                    .map(SavedStart::into_start),
                 };
                 let (should_bootstrap, checkpoint, checkpoint_updated_at) = match start {
                     Ok(start) => start,
@@ -566,26 +579,77 @@ impl DataConnector for DynamoDB {
     }
 }
 
+/// Where a start that reads the saved checkpoint begins.
+enum SavedStart {
+    /// Resume from the saved checkpoint.
+    Resume {
+        checkpoint: Checkpoint,
+        updated_at: Option<SystemTime>,
+    },
+    /// Nothing to resume from: `checkpoint` is the current stream tip. `interrupted`
+    /// is set when an earlier reload stopped partway, so the accelerated table may
+    /// be missing rows.
+    Fresh {
+        checkpoint: Checkpoint,
+        interrupted: bool,
+    },
+}
+
+impl SavedStart {
+    /// (`should_bootstrap`, checkpoint, `checkpoint_updated_at`) for `auto`: scan
+    /// when there is nothing to resume from.
+    fn into_start(self) -> (bool, Checkpoint, Option<SystemTime>) {
+        match self {
+            Self::Resume {
+                checkpoint,
+                updated_at,
+            } => (false, checkpoint, updated_at),
+            Self::Fresh { checkpoint, .. } => (true, checkpoint, None),
+        }
+    }
+
+    /// The same for `disabled`, which never scans.
+    fn without_scan(self) -> (bool, Checkpoint, Option<SystemTime>) {
+        let (_, checkpoint, updated_at) = self.into_start();
+        (false, checkpoint, updated_at)
+    }
+}
+
 /// Loads the checkpoint from the sidecar [`BlobCheckpointStore`]. Falls back to
 /// re-initialization (a fresh scan) when there is no store, no persisted checkpoint,
 /// the persisted value can't be deserialized, *or* the store read fails — a store-read
-/// failure is logged and treated as an at-least-once re-bootstrap.
-/// Returns (`should_bootstrap`, checkpoint, `checkpoint_updated_at`), or the error
-/// that stopped a fresh checkpoint from being read after retrying.
+/// failure is logged and treated as an at-least-once re-bootstrap. A stored
+/// [`RELOAD_IN_PROGRESS`] reports an interrupted reload.
+/// Returns where to start, or the error that stopped a fresh checkpoint from being
+/// read after retrying.
 async fn load_or_initialize_checkpoint(
     dynamodb: &Arc<DynamoDBTableProvider>,
     dynamodb_sys: Option<&Arc<dyn BlobCheckpointStore>>,
     dataset_name: &TableReference,
-) -> Result<(bool, Checkpoint, Option<SystemTime>), Error> {
+) -> Result<SavedStart, Error> {
+    let fresh = |interrupted: bool| {
+        move |checkpoint: Checkpoint| SavedStart::Fresh {
+            checkpoint,
+            interrupted,
+        }
+    };
     let Some(dynamodb_sys) = dynamodb_sys else {
         return get_latest_checkpoint(dynamodb, dataset_name)
             .await
-            .map(|cp| (true, cp, None));
+            .map(fresh(false));
     };
 
     match dynamodb_sys.get().await {
+        Ok(Some(metadata)) if metadata.data == RELOAD_IN_PROGRESS => {
+            get_latest_checkpoint(dynamodb, dataset_name)
+                .await
+                .map(fresh(true))
+        }
         Ok(Some(metadata)) => match serde_json::from_str::<Checkpoint>(&metadata.data) {
-            Ok(checkpoint) => Ok((false, checkpoint, metadata.updated_at)),
+            Ok(checkpoint) => Ok(SavedStart::Resume {
+                checkpoint,
+                updated_at: metadata.updated_at,
+            }),
             Err(err) => {
                 tracing::warn!(
                     dataset = %dataset_name,
@@ -594,12 +658,12 @@ async fn load_or_initialize_checkpoint(
                 );
                 get_latest_checkpoint(dynamodb, dataset_name)
                     .await
-                    .map(|cp| (true, cp, None))
+                    .map(fresh(false))
             }
         },
         Ok(None) => get_latest_checkpoint(dynamodb, dataset_name)
             .await
-            .map(|cp| (true, cp, None)),
+            .map(fresh(false)),
         Err(err) => {
             // Surface the store-read failure (instead of silently treating it as
             // "no checkpoint"), then fall back to a full re-bootstrap — the same
@@ -611,7 +675,7 @@ async fn load_or_initialize_checkpoint(
             );
             get_latest_checkpoint(dynamodb, dataset_name)
                 .await
-                .map(|cp| (true, cp, None))
+                .map(fresh(false))
         }
     }
 }
@@ -724,6 +788,14 @@ fn stream_start_failed(table_name: &str, error: Error) -> ChangesStream {
     .boxed()
 }
 
+/// The stream a `disabled` start yields after an interrupted reload: it reports
+/// that the table needs a reload rather than serving it partly loaded.
+fn reload_interrupted(table_name: &str) -> ChangesStream {
+    let table_name = table_name.to_string();
+    stream::once(async move { Err(DynamoDBStreamError::ReloadInterrupted { table_name }.into()) })
+        .boxed()
+}
+
 /// Initializes the accelerator from a full `DynamoDB` table scan, then transitions to
 /// the changes stream from the checkpoint captured before the scan started.
 async fn create_bootstrap_stream(
@@ -760,13 +832,20 @@ async fn create_bootstrap_stream(
 /// ([`DynamoDBTableProvider::overwrite_bootstrap_stream`]), then a zero-row
 /// envelope whose committer persists `checkpoint` (the position captured
 /// *before* the scan) once the snapshot is durably applied, then the live
-/// changes from `checkpoint`. Committing on the post-snapshot envelope — not up
-/// front — means a crash mid-bootstrap leaves no checkpoint, so the next start
+/// changes from `checkpoint`.
+///
+/// A crash mid-bootstrap must leave nothing to resume from, so the next start
 /// re-bootstraps from scratch (the same at-least-once contract as the
-/// `MySQL`/Postgres snapshots). This replaces the old direct `TableSink` overwrite,
-/// so the connector needs no runtime accelerator-write internals. Readiness
-/// continues to be driven by the live stream's watermark, preserving prior
-/// behavior.
+/// `MySQL`/Postgres snapshots). Committing on the post-snapshot envelope — not up
+/// front — keeps this bootstrap from saving its checkpoint early, and before the
+/// stream is returned [`RELOAD_IN_PROGRESS`] replaces any checkpoint an earlier
+/// run saved: the truncate leads the stream, so that checkpoint would let the next
+/// start resume over a partly reloaded table and never load the rest. When the
+/// marker cannot be stored, no bootstrap starts.
+///
+/// This replaces the old direct `TableSink` overwrite, so the connector needs no
+/// runtime accelerator-write internals. Readiness continues to be driven by the
+/// live stream's watermark, preserving prior behavior.
 ///
 /// When the stream cannot be set up, `Err` carries the stream to hand on instead:
 /// one that reports the failure, so the dataset shows it rather than loading
@@ -780,6 +859,7 @@ async fn emit_overwrite_then_live(
 ) -> Result<ChangesStream, ChangesStream> {
     let table_schema = dynamodb.schema();
     let table_name = dynamodb.table_name().to_string();
+    let checkpoint_store = dynamodb_sys.clone();
 
     let snapshot = match Arc::clone(&dynamodb).overwrite_bootstrap_stream().await {
         Ok(stream) => stream
@@ -842,6 +922,17 @@ async fn emit_overwrite_then_live(
             return Err(stream_start_failed(&table_name, e));
         }
     };
+
+    // Last, once nothing else can fail: a failed setup keeps the checkpoint, and
+    // the accelerated table, as they were.
+    if let Some(store) = checkpoint_store
+        && let Err(source) = store.upsert(RELOAD_IN_PROGRESS).await
+    {
+        return Err(stream::once(async move {
+            Err(DynamoDBStreamError::FailedToMarkReload { table_name, source }.into())
+        })
+        .boxed());
+    }
 
     Ok(snapshot
         .chain(stream::once(async move { Ok(checkpoint_envelope) }))

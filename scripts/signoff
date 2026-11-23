@@ -3027,9 +3027,21 @@ cmd_remote() {
   info "Dispatching GitHub Actions Remote Sign-off for ${branch} on ${repo}…"
   # --repo so non-colocated JJ workspaces (no .git) still resolve the remote;
   # --raw-field avoids shell re-quoting pitfalls; the branch was validated above.
-  gh workflow run signoff.yml --repo "$repo" --ref "${branch}" --raw-field "branch=${branch}" \
-    || fail "failed to dispatch signoff.yml"
-  echo "${OK} Dispatched. Watch with: gh run watch --repo ${repo} --workflow signoff.yml"
+  local dispatched run_id
+  if ! dispatched=$(gh workflow run signoff.yml --repo "$repo" --ref "${branch}" --raw-field "branch=${branch}" 2>&1); then
+    printf '%s\n' "$dispatched" >&2
+    fail "failed to dispatch signoff.yml"
+  fi
+  [[ -z "$dispatched" ]] || printf '%s\n' "$dispatched"
+  # `gh run watch` takes a run ID, not a workflow. `gh workflow run` prints the
+  # created run's URL when GitHub returns it; otherwise find the newest run by
+  # the title `signoff.yml` gives a branch dispatch.
+  run_id=$(grep -oE '/actions/runs/[0-9]+' <<<"$dispatched" | head -n 1 | grep -oE '[0-9]+$' || true)
+  if [[ -n "$run_id" ]]; then
+    echo "${OK} Dispatched. Watch with: gh run watch --repo ${repo} ${run_id}"
+  else
+    echo "${OK} Dispatched. Watch with: gh run watch --repo ${repo} \"\$(gh run list --repo ${repo} --workflow signoff.yml --limit 50 --json databaseId,displayTitle --jq '[.[] | select(.displayTitle == \"Remote Sign-off (${branch})\")][0].databaseId')\""
+  fi
 }
 
 cmd_help() {
