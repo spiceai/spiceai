@@ -7,7 +7,7 @@ expression: json
   "connection": {
     "state": "enrolled",
     "directory": "/srv/edge-analytics",
-    "identity_path": "/srv/edge-analytics/.spice/identity.json",
+    "identity_path": "/srv/edge-analytics/.spice/cloud-connect/identity.json",
     "endpoint": "https://api.spice.ai",
     "identifier": "inst_0123456789",
     "org_name": "acme",
@@ -42,7 +42,7 @@ expression: json
   },
   "deployment": {
     "state": "deployed",
-    "spicepod_path": "/srv/edge-analytics/.spice/spicepod-cloud-managed.yml",
+    "spicepod_path": "/srv/edge-analytics/.spice/cloud-connect/spicepod-cloud-managed.yml",
     "secrets": "delivered",
     "secret_names": [
       "pg_password",
