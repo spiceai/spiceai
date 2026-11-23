@@ -2333,6 +2333,27 @@ fn is_refusal_code(code: Option<&str>) -> bool {
     })
 }
 
+fn error_code_and_type(entry: &Value) -> (Option<&str>, Option<&str>) {
+    let code = entry
+        .get("extensions")
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_str());
+    let error_type = entry.get("type").and_then(|t| t.as_str());
+    (code, error_type)
+}
+
+/// A failure the API named: a validation-style `extensions.code`, a refusal
+/// named by `code` or `type`, or a `NOT_FOUND` type. Locations alone do not
+/// count — GitHub's ambiguous internal-error message can carry a location and
+/// still be a timeout.
+fn is_named_permanent_entry(entry: &Value) -> bool {
+    let (code, error_type) = error_code_and_type(entry);
+    is_query_error(false, code)
+        || is_refusal_code(code)
+        || is_refusal_code(error_type)
+        || error_type.is_some_and(|t| t.eq_ignore_ascii_case("not_found"))
+}
+
 /// Whether a GraphQL `errors` entry is a failure no retry clears, as
 /// `handle_graphql_query_error` classifies it: a problem with the query, an
 /// explicit credential refusal named by `extensions.code` or by the top-level
@@ -2342,15 +2363,8 @@ fn is_permanent_entry(entry: &Value) -> bool {
         .get("locations")
         .and_then(|l| l.as_array())
         .is_some_and(|l| !l.is_empty());
-    let code = entry
-        .get("extensions")
-        .and_then(|e| e.get("code"))
-        .and_then(|c| c.as_str());
-    let error_type = entry.get("type").and_then(|t| t.as_str());
-    is_query_error(has_location, code)
-        || is_refusal_code(code)
-        || is_refusal_code(error_type)
-        || error_type.is_some_and(|t| t.eq_ignore_ascii_case("not_found"))
+    let (code, _) = error_code_and_type(entry);
+    is_named_permanent_entry(entry) || is_query_error(has_location, code)
 }
 
 fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
@@ -2367,19 +2381,23 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
             // defect where missing Projects v2 access gives an internal error
             // instead of an authorization error. The timeout is the common case,
             // so the error is not an explicit deny: the caller retries it with a
-            // smaller page. Check for this before processing other GraphQL errors.
-            for error in errors_array {
-                if let Some(message) = error.get("message").and_then(|m| m.as_str())
-                    && message.contains("Something went wrong while executing your query")
-                {
-                    tracing::debug!(
-                        "Detected GitHub 'Something went wrong' error, treating it as a transient backend failure: {}",
-                        message
-                    );
-                    return Err(Error::InvalidCredentialsOrPermissions {
-                        message: "GitHub returned an internal error. The query is usually too expensive for the GitHub backend to complete in time; the request will be retried with a smaller page. If the error persists, verify the GitHub App has permission to access the requested resource.".to_string(),
-                        kind: RefusalKind::Inferred,
-                    });
+            // smaller page. A named permanent diagnostic on the same body still
+            // wins — the message must not hide a FORBIDDEN, NOT_FOUND, or
+            // validation code, even when it appears on an earlier entry.
+            if !errors_array.iter().any(is_named_permanent_entry) {
+                for error in errors_array {
+                    if let Some(message) = error.get("message").and_then(|m| m.as_str())
+                        && message.contains("Something went wrong while executing your query")
+                    {
+                        tracing::debug!(
+                            "Detected GitHub 'Something went wrong' error, treating it as a transient backend failure: {}",
+                            message
+                        );
+                        return Err(Error::InvalidCredentialsOrPermissions {
+                            message: "GitHub returned an internal error. The query is usually too expensive for the GitHub backend to complete in time; the request will be retried with a smaller page. If the error persists, verify the GitHub App has permission to access the requested resource.".to_string(),
+                            kind: RefusalKind::Inferred,
+                        });
+                    }
                 }
             }
         } else if errors.is_null() {
@@ -5365,5 +5383,89 @@ mod graphql_errors_classification_tests {
         assert!(is_query_error(true, None));
         assert!(!is_query_error(true, Some("INTERNAL_SERVER_ERROR")));
         assert!(is_query_error(false, Some("graphql_validation_failed")));
+    }
+
+    /// An ambiguous GitHub backend message is retriable even when it carries a
+    /// source location, because the same wording is used for a timeout.
+    #[test]
+    fn github_internal_error_message_with_locations_stays_retriable() {
+        let err = classify(&json!({
+            "errors": [{
+                "message": "Something went wrong while executing your query.",
+                "locations": [{"line": 1, "column": 1}]
+            }]
+        }));
+        assert!(
+            matches!(
+                err,
+                Error::InvalidCredentialsOrPermissions {
+                    kind: crate::graphql::RefusalKind::Inferred,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(is_retriable_error(&err), "{err:?}");
+    }
+
+    /// A later named refusal is not hidden by GitHub's ambiguous internal-error
+    /// message.
+    #[test]
+    fn github_internal_error_message_does_not_hide_a_later_type_refusal() {
+        let err = classify(&json!({
+            "errors": [
+                {"message": "Something went wrong while executing your query."},
+                {"message": "access denied", "type": "FORBIDDEN"}
+            ]
+        }));
+        assert!(
+            matches!(
+                err,
+                Error::InvalidCredentialsOrPermissions {
+                    kind: crate::graphql::RefusalKind::Explicit,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(!is_retriable_error(&err), "{err:?}");
+        assert!(err.to_string().contains("access denied"), "{err}");
+    }
+
+    /// A later validation code is not hidden by the same GitHub message.
+    #[test]
+    fn github_internal_error_message_does_not_hide_a_later_validation_code() {
+        let err = classify(&json!({
+            "errors": [
+                {"message": "Something went wrong while executing your query."},
+                {"message": "bad field", "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}}
+            ]
+        }));
+        assert!(matches!(err, Error::InvalidGraphQLQuery { .. }), "{err:?}");
+        assert!(!is_retriable_error(&err), "{err:?}");
+        assert!(err.to_string().contains("bad field"), "{err}");
+    }
+
+    /// A refusal code on the same entry as the GitHub message is still an
+    /// explicit refusal, not an inferred timeout.
+    #[test]
+    fn github_internal_error_message_with_a_refusal_code_on_the_same_entry_is_permanent() {
+        let err = classify(&json!({
+            "errors": [{
+                "message": "Something went wrong while executing your query.",
+                "extensions": {"code": "FORBIDDEN"}
+            }]
+        }));
+        assert!(
+            matches!(
+                err,
+                Error::InvalidCredentialsOrPermissions {
+                    kind: crate::graphql::RefusalKind::Explicit,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(!is_retriable_error(&err), "{err:?}");
     }
 }
