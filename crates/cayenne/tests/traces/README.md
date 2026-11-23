@@ -101,9 +101,10 @@ The control tests take the FAIL witness's schedule but require the candidate
 model's rows. Split-model `*StageRest` actions are omitted only for those control
 schedules because the guarded engine stages once, and `SealReserve` because the
 engine reserves the seal's sequence inside its capture. Moving that reservation
-after the seal's `SealCapture` boundary makes
-`mem_tier_model_replay_control_capture_reservation` report a duplicate key in
-the recovered rows. Positive traces refuse those
+after the seal's `SealCapture` boundary fails
+`mem_tier_model_replay_control_capture_reservation`: the durable probe meets a
+sequence the candidate model never reserved and panics as unmapped. With that
+sequence mapped, the recovered rows hold the key twice. Positive traces refuse those
 actions. No production safeguard is disabled in the checked-in replay.
 
 The replay sets `compaction_trigger_protected_snapshots: 2`, giving the real
