@@ -39,6 +39,13 @@ limitations under the License.
 //!
 //! Deterministic (seeded); the reported ratio is a layout property, so it holds
 //! as the table grows — only the absolute file counts scale.
+//!
+//! The payoff is checked against what clustering guarantees rather than a ratio:
+//! after the rewrite, each output file's footer `l_shipdate` range must follow
+//! the one before it, and the probe must read exactly the files whose range
+//! meets the window. The primary-key arm must read every file. Row counts are
+//! checked against an answer computed from the generated rows, not from either
+//! arm.
 
 #![allow(clippy::expect_used)]
 
@@ -61,14 +68,12 @@ use datafusion::datasource::TableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::{SessionContext, col, lit};
 
-const ROWS: usize = 1_000_000;
-/// Target Vortex file size for the rewrite. Deliberately small so the table
-/// spans MANY files: pruning is a per-file zone-map property, so a table that
-/// fits in one file has no pruning to measure at all (the first run of this test
-/// reported `files_scanned=1` in both arms for exactly that reason). Production
-/// uses 256 MB with tables far larger than one file; a small target with fewer
-/// rows is the scale-invariant proxy for that ratio.
-const TARGET_FILE_BYTES: usize = 512 * 1024;
+/// Rows loaded per arm. With the smallest configurable target file size (1 MB,
+/// set in [`build_table`]) this spans several files: pruning is a per-file
+/// zone-map property, so a table that fits in one file has no pruning to
+/// measure at all. Production uses 256 MB with tables far larger than one file;
+/// a small target with fewer rows is the scale-invariant proxy for that ratio.
+const ROWS: usize = 250_000;
 /// ~7 years of ship dates, as days-since-epoch offsets — the TPC-H window.
 const DATE_SPAN_DAYS: i32 = 2557;
 /// Selective probe window, ~1.2% of the span — the TPC-H q14 shape (one month).
@@ -124,7 +129,9 @@ async fn build_table(
     )
 }
 
-async fn insert_lineitem(provider: &Arc<CayenneTableProvider>, table_name: &str) {
+/// Load the generated rows and return how many of them fall in the probe
+/// window — the oracle the probe's answer is checked against.
+async fn insert_lineitem(provider: &Arc<CayenneTableProvider>, table_name: &str) -> i64 {
     let ctx = SessionContext::new();
     ctx.register_table(table_name, Arc::clone(provider) as Arc<dyn TableProvider>)
         .expect("register");
@@ -149,6 +156,11 @@ async fn insert_lineitem(provider: &Arc<CayenneTableProvider>, table_name: &str)
         sd.push(d);
         qty.push(row % 50);
     }
+    let probe_hi = PROBE_LO + PROBE_WINDOW_DAYS;
+    let in_window = sd
+        .iter()
+        .filter(|&&d| (PROBE_LO..probe_hi).contains(&d))
+        .count();
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
@@ -167,6 +179,7 @@ async fn insert_lineitem(provider: &Arc<CayenneTableProvider>, table_name: &str)
         .collect()
         .await
         .expect("insert");
+    i64::try_from(in_window).expect("count fits i64")
 }
 
 /// Run the selective probe through the real scan path and return
@@ -254,14 +267,77 @@ async fn total_files(provider: &Arc<CayenneTableProvider>, table_name: &str) -> 
         .sum()
 }
 
+/// The `[min, max]` of `l_shipdate` each data file of the current snapshot
+/// records in its footer — the statistics listing-time pruning reads — in file
+/// name order, which is the order the rewrite's single writer emitted them.
+async fn file_shipdate_ranges(
+    fixture: &common::TestFixture,
+    provider: &Arc<CayenneTableProvider>,
+) -> Vec<(String, i32, i32)> {
+    use vortex::VortexSessionDefault;
+    use vortex::expr::stats::Stat;
+    use vortex::file::OpenOptionsSessionExt;
+    use vortex_session::VortexSession;
+
+    let dir = fixture
+        .data_path
+        .join(provider.table_id())
+        .join(provider.current_snapshot_id());
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .expect("read snapshot dir")
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "vortex"))
+        .collect();
+    paths.sort();
+    let column = lineitem_schema()
+        .index_of("l_shipdate")
+        .expect("l_shipdate in schema");
+    let mut ranges = Vec::with_capacity(paths.len());
+    for path in paths {
+        let session = VortexSession::default();
+        let file = session
+            .open_options()
+            .open_path(&path)
+            .await
+            .expect("open data file");
+        let stats = file.file_stats().expect("data file has footer statistics");
+        let (set, dtype) = stats.get(column);
+        let min = set
+            .get_as::<i32>(Stat::Min, dtype)
+            .into_inner()
+            .expect("footer min of l_shipdate");
+        let max = set
+            .get_as::<i32>(Stat::Max, dtype)
+            .into_inner()
+            .expect("footer max of l_shipdate");
+        let name = path
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .into_owned();
+        ranges.push((name, min, max));
+    }
+    ranges
+}
+
+/// What one arm observed after its rewrite.
+struct ArmResult {
+    files_scanned: usize,
+    total_files: usize,
+    matching_rows: i64,
+    expected_rows: i64,
+    sort_key: Vec<String>,
+    file_ranges: Vec<(String, i32, i32)>,
+}
+
 /// Drive one arm end to end: build → load → observe → rewrite → probe.
-async fn run_arm(origin: SortColumnsOrigin, table_name: &str) -> (usize, i64, Vec<String>) {
+async fn run_arm(origin: SortColumnsOrigin, table_name: &str) -> ArmResult {
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
         .expect("fixture");
     let runtime_env = Arc::new(RuntimeEnv::default());
     let provider = build_table(&fixture, table_name, origin, runtime_env).await;
-    insert_lineitem(&provider, table_name).await;
+    let expected_rows = insert_lineitem(&provider, table_name).await;
 
     // Recurring selective workload: the engine observes `l_shipdate` on every scan.
     let ctx = SessionContext::new();
@@ -275,32 +351,44 @@ async fn run_arm(origin: SortColumnsOrigin, table_name: &str) -> (usize, i64, Ve
 
     let chosen = provider.effective_sort_columns_for_rewrite();
 
-    // Force the sorted rewrite directly. Under sustained query load the background
+    // Run the full compaction now. Under sustained query load the background
     // compactor never reaches the full-rewrite path (protected snapshots keep the
-    // protected-subset path winning), so calling it here is what makes the layout
+    // protected-subset path winning), so forcing it here is what makes the layout
     // observable at all — see the bench recipe.
-    provider
-        .sort_and_rewrite_data(TARGET_FILE_BYTES)
-        .await
-        .expect("sort_and_rewrite");
+    assert!(
+        provider
+            .force_full_compaction()
+            .await
+            .expect("full compaction"),
+        "the full compaction must commit"
+    );
 
-    let (files, matching) = probe(&provider, table_name).await;
+    let file_ranges = file_shipdate_ranges(&fixture, &provider).await;
+    let (files_scanned, matching_rows) = probe(&provider, table_name).await;
     let total = total_files(&provider, table_name).await;
     println!("    [{table_name}] total files in snapshot = {total}");
-    (files, matching, chosen)
+    for (name, min, max) in &file_ranges {
+        println!("    [{table_name}] {name}: l_shipdate {min}..={max}");
+    }
+    ArmResult {
+        files_scanned,
+        total_files: total,
+        matching_rows,
+        expected_rows,
+        sort_key: chosen,
+        file_ranges,
+    }
 }
 
 #[tokio::test]
 async fn pruning_ab_inferred_vs_authoritative_sort() {
     // BEFORE: pre-fix semantics — the inference-set PK sort is treated as
     // authoritative, so observations are ignored and the rewrite clusters by PK.
-    let (before_files, before_rows, before_key) =
-        run_arm(SortColumnsOrigin::User, "lineitem_before").await;
+    let before = run_arm(SortColumnsOrigin::User, "lineitem_before").await;
 
     // AFTER: post-fix semantics — the same PK sort is a guess, so the observed
     // `l_shipdate` outranks it and the rewrite clusters by date.
-    let (after_files, after_rows, after_key) =
-        run_arm(SortColumnsOrigin::Inferred, "lineitem_after").await;
+    let after = run_arm(SortColumnsOrigin::Inferred, "lineitem_after").await;
 
     println!(
         "\n=== layout pruning A/B ({ROWS} rows, TPC-H lineitem shape, \
@@ -308,54 +396,92 @@ async fn pruning_ab_inferred_vs_authoritative_sort() {
         f64::from(PROBE_WINDOW_DAYS) * 100.0 / f64::from(DATE_SPAN_DAYS)
     );
     println!(
-        "  BEFORE (origin=User,     pre-fix): sort_key={before_key:?} files_scanned={before_files} rows={before_rows}"
+        "  BEFORE (origin=User,     pre-fix): sort_key={:?} files_scanned={} of {} rows={}",
+        before.sort_key, before.files_scanned, before.total_files, before.matching_rows
     );
     println!(
-        "  AFTER  (origin=Inferred, post-fix): sort_key={after_key:?} files_scanned={after_files} rows={after_rows}"
+        "  AFTER  (origin=Inferred, post-fix): sort_key={:?} files_scanned={} of {} rows={}",
+        after.sort_key, after.files_scanned, after.total_files, after.matching_rows
     );
-    if after_files > 0 {
-        #[expect(clippy::cast_precision_loss, reason = "file counts are small")]
-        let ratio = before_files as f64 / after_files as f64;
-        println!("  prune ratio (before ÷ after) = {ratio:.1}x");
-    }
 
-    // Correctness gate FIRST: both arms must return the same answer. A layout
-    // change that alters results is a data-correctness bug, not a speedup.
-    assert_eq!(
-        before_rows, after_rows,
-        "both layouts must return identical results for the same predicate"
-    );
+    // Correctness gate FIRST: each arm must return the answer computed from the
+    // generated rows. A layout change that alters results is a data-correctness
+    // bug, not a speedup.
     assert!(
-        before_rows > 0,
+        before.expected_rows > 0,
         "probe must match some rows to be meaningful"
     );
-
-    // PRECONDITION GATE. Pruning is a per-file property, so a table that lands in
-    // a single file has no pruning to measure and both arms would trivially read
-    // 1 file — which is what the first version of this test actually did. Fail
-    // loudly rather than report a meaningless 1.0x ratio.
-    assert!(
-        before_files > 1,
-        "fixture must span multiple files for the pruning measurement to mean \
-         anything (got {before_files}); lower TARGET_FILE_BYTES or raise ROWS"
+    assert_eq!(
+        before.matching_rows, before.expected_rows,
+        "the primary-key layout must return every row in the window"
+    );
+    assert_eq!(
+        after.matching_rows, after.expected_rows,
+        "the l_shipdate layout must return every row in the window"
     );
 
     // The mechanism: the chosen clustering key differs between the two arms.
     assert_eq!(
-        before_key,
+        before.sort_key,
         vec!["l_orderkey".to_string(), "l_linenumber".to_string()],
         "pre-fix semantics must cluster by the (inference-set) primary key"
     );
     assert_eq!(
-        after_key,
+        after.sort_key,
         vec!["l_shipdate".to_string()],
         "post-fix semantics must cluster by the observed hot filter column"
     );
 
-    // The payoff: clustering by the filtered column must not read MORE files.
+    // PRECONDITION. Pruning is a per-file property, so a table that lands in a
+    // single file has no pruning to measure.
     assert!(
-        after_files <= before_files,
-        "clustering by the observed filter column must not increase files scanned \
-         (before={before_files} after={after_files})"
+        before.total_files > 1 && after.total_files > 1,
+        "fixture must span multiple files for the pruning measurement to mean \
+         anything (before={} after={}); raise ROWS",
+        before.total_files,
+        after.total_files
+    );
+    assert_eq!(after.file_ranges.len(), after.total_files);
+
+    // Ship dates are independent of the primary key, so every PK-ordered file
+    // spans the date range and no file can be pruned.
+    assert_eq!(
+        before.files_scanned, before.total_files,
+        "a primary-key layout carries no date locality, so the probe reads every file"
+    );
+
+    // The sorted rewrite's guarantee: its files, in the order it wrote them,
+    // hold consecutive l_shipdate ranges (adjacent files may share the one
+    // boundary value).
+    for pair in after.file_ranges.windows(2) {
+        let ((prev_name, _, prev_max), (next_name, next_min, _)) = (&pair[0], &pair[1]);
+        assert!(
+            prev_max <= next_min,
+            "the rewrite sorted by l_shipdate, so {prev_name} (max {prev_max}) must end \
+             at or before {next_name} (min {next_min}) begins: {:?}",
+            after.file_ranges
+        );
+    }
+
+    // So the probe reads exactly the files whose range meets the window, and
+    // that is fewer than the primary-key layout reads.
+    let probe_last = PROBE_LO + PROBE_WINDOW_DAYS - 1;
+    let overlapping = after
+        .file_ranges
+        .iter()
+        .filter(|(_, min, max)| *min <= probe_last && *max >= PROBE_LO)
+        .count();
+    assert_eq!(
+        after.files_scanned, overlapping,
+        "the probe must read exactly the files whose l_shipdate range meets \
+         {PROBE_LO}..={probe_last}: {:?}",
+        after.file_ranges
+    );
+    assert!(
+        after.files_scanned < before.files_scanned,
+        "clustering by the observed filter column must read fewer files than the \
+         primary-key layout (before={} after={})",
+        before.files_scanned,
+        after.files_scanned
     );
 }

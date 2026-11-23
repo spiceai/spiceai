@@ -19,7 +19,16 @@
 //!
 //! A read has no side effect, so a lost response is indistinguishable from a
 //! failed request; listings report the error as their first item.
-use std::{collections::BTreeMap, fmt, sync::Arc};
+//!
+//! Two more controls serve protocol replays: a read gate that holds plain GETs
+//! of chosen paths, so a reader can read a head and fetch what it lists later,
+//! and a store clock that runs ahead, stamping each object's `LastModified`
+//! when it is written, as a real store does.
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt, future::BoxFuture, stream::BoxStream};
@@ -88,6 +97,24 @@ struct State {
     next: u64,
     log: Vec<Applied>,
     blocked: Vec<(Path, PutPayload, PutOptions)>,
+    /// Plain GETs of matching paths wait here until the gate opens.
+    read_gate: Option<Predicate>,
+    /// GETs waiting at the gate now.
+    gated: usize,
+    /// How far the store's clock runs ahead of the inner store's, in
+    /// milliseconds. Each write takes the offset current when it lands.
+    clock_offset_ms: i64,
+    /// The clock offset each object was last written at, which every GET, HEAD
+    /// and LIST adds to its `LastModified`, so an object's time stays fixed
+    /// until it is written again, as in a real store.
+    written_offset_ms: HashMap<Path, i64>,
+}
+
+impl State {
+    /// The clock offset `path` was last written at.
+    fn offset_of(&self, path: &Path) -> chrono::TimeDelta {
+        chrono::TimeDelta::milliseconds(self.written_offset_ms.get(path).copied().unwrap_or(0))
+    }
 }
 
 /// State shared by the store and the multipart uploads it hands out.
@@ -96,6 +123,7 @@ struct Shared {
     state: Mutex<State>,
     applied: AsyncMutex<()>,
     captured: Notify,
+    reads_opened: Notify,
 }
 
 impl Shared {
@@ -292,8 +320,69 @@ impl FaultStore {
         let op = put_op(&options.mode);
         let mode = format!("{:?}", options.mode);
         let result = self.inner.put_opts(path, payload.clone(), options).await;
+        if result.is_ok() {
+            let mut state = self.shared.state.lock();
+            let offset = state.clock_offset_ms;
+            state.written_offset_ms.insert(path.clone(), offset);
+        }
         self.shared.record(path, op, &mode, Some(payload), &result);
         result
+    }
+
+    /// Hold plain GETs of matching paths before I/O until [`Self::open_reads`],
+    /// so a reader can read a head and fetch what it lists later.
+    pub fn gate_reads(&self, predicate: impl Fn(&Path) -> bool + Send + Sync + 'static) {
+        self.shared.state.lock().read_gate = Some(Arc::new(predicate));
+    }
+
+    /// Release every GET held at the gate, and stop holding new ones.
+    pub fn open_reads(&self) {
+        self.shared.state.lock().read_gate = None;
+        self.shared.reads_opened.notify_waiters();
+    }
+
+    /// Wait until at least `count` GETs are held at the gate.
+    pub async fn wait_gated(&self, count: usize) {
+        loop {
+            let notified = self.shared.captured.notified();
+            if self.shared.state.lock().gated >= count {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Run the store's clock ahead by `by`: an object written from now on
+    /// carries a `LastModified` that much later than the inner store gives
+    /// it. An object already written keeps its time until it is written again.
+    pub fn advance_clock(&self, by: std::time::Duration) {
+        let by = i64::try_from(by.as_millis()).unwrap_or(i64::MAX);
+        let mut state = self.shared.state.lock();
+        state.clock_offset_ms = state.clock_offset_ms.saturating_add(by);
+    }
+
+    /// Wait at the read gate while it holds `path`.
+    async fn wait_at_gate(&self, path: &Path) {
+        let mut counted = false;
+        loop {
+            let notified = self.shared.reads_opened.notified();
+            {
+                let mut state = self.shared.state.lock();
+                let held = state.read_gate.as_ref().is_some_and(|gate| gate(path));
+                if !held {
+                    if counted {
+                        state.gated -= 1;
+                    }
+                    return;
+                }
+                if !counted {
+                    state.gated += 1;
+                    counted = true;
+                }
+            }
+            self.shared.captured.notify_waiters();
+            notified.await;
+        }
     }
 
     /// Apply the exact original request, even if already delivered: the same
@@ -382,7 +471,15 @@ impl FaultStore {
             let answer = list(inner.as_ref()).try_collect::<Vec<_>>().await;
             shared.record(&prefix, Op::List, &mode, None, &answer);
             match answer {
-                Ok(objects) => futures::stream::iter(objects.into_iter().map(Ok)).boxed(),
+                Ok(mut objects) => {
+                    {
+                        let state = shared.state.lock();
+                        for meta in &mut objects {
+                            meta.last_modified += state.offset_of(&meta.location);
+                        }
+                    }
+                    futures::stream::iter(objects.into_iter().map(Ok)).boxed()
+                }
                 Err(error) => futures::stream::iter([Err(error)]).boxed(),
             }
         })
@@ -451,12 +548,18 @@ impl ObjectStore for FaultStore {
         } else {
             Op::Get
         };
+        if op == Op::Get {
+            self.wait_at_gate(path).await;
+        }
         if self.shared.fault(op, path).is_some() {
             return Err(injected("get failed before I/O"));
         }
         let _guard = self.shared.applied.lock().await;
         let mode = format!("{options:?}");
-        let result = self.inner.get_opts(path, options).await;
+        let mut result = self.inner.get_opts(path, options).await;
+        if let Ok(answer) = &mut result {
+            answer.meta.last_modified += self.shared.state.lock().offset_of(path);
+        }
         self.shared.record(path, op, &mode, None, &result);
         result
     }
@@ -542,7 +645,13 @@ impl ObjectStore for FaultStore {
             return Err(refused(Op::List));
         }
         let _guard = self.shared.applied.lock().await;
-        let answer = self.inner.list_with_delimiter(prefix).await;
+        let mut answer = self.inner.list_with_delimiter(prefix).await;
+        if let Ok(listed) = &mut answer {
+            let state = self.shared.state.lock();
+            for meta in &mut listed.objects {
+                meta.last_modified += state.offset_of(&meta.location);
+            }
+        }
         self.shared
             .record(&at, Op::List, "delimiter", None, &answer);
         answer

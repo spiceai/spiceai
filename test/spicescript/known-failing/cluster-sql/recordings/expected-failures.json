@@ -3,31 +3,10 @@
     {
       "run": "cluster-limit-offset[backend=postgres]",
       "who": "cayenne",
-      "key": "start: {}",
-      "kind": "status",
-      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:t\",\"name\":\"t\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"},{\"acceleration_enabled\":true,\"from\":\"postgres:u\",\"name\":\"u\",\"properti",
-      "group": "cluster-sql"
-    }
-  ],
-  "cluster-literals": [
-    {
-      "run": "cluster-literals",
-      "who": "default",
-      "key": "start: {}",
-      "kind": "status",
-      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:public.e\",\"name\":\"e\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
-      "varies": true,
-      "group": "cluster-sql",
-      "may-pass": true
-    }
-  ],
-  "cluster-nan-literal": [
-    {
-      "run": "cluster-nan-literal",
-      "who": "default",
-      "key": "start: {}",
-      "kind": "status",
-      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:public.e\",\"name\":\"e\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
+      "key": "query: SELECT * FROM (SELECT c3372 AS c3376, c3373 AS c3377, c3374 AS c3378 FROM (SELECT c3366 AS c3372, c3369 AS c3373, coalesce(c3368, c3367) AS c3374 FROM (SELECT c3356 AS c3366, c3357 AS c3367, c3358 AS c3368, c3360 AS c3369, c3361 AS c3370 FROM (SELECT id AS c3356, i AS c3357, big AS c3358, d AS c3359, f AS c3360, s AS c3361, dt AS c3362, ts AS c3363, b AS c3364 FROM t) AS r3355 WHERE (c3363 >= TIMESTAMP '2024-04-14 09:00:00')) AS r3365 WHERE (coalesce(c3369, 41.2) <= 43.8)) AS r3371 ORDER BY c3372 ASC NULLS LAST LIMIT 16 OFFSET 2) AS r3375",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Plan: [\"GlobalLimitExec: skip=0, fetch=18\",\"  ProjectionExec: expr=[c3366@0 as c3372, c3369@3 as c3373, CASE WHEN c3368@2 IS NOT NULL THEN c3368@2 ELSE CAST(c3367@1 AS Int64) END as c3374]\",\"    RepartitionExec: partitioning=RoundRobinBatch(32), inpu",
+      "pattern": "does not satisfy distribution requirements: SinglePartition",
       "group": "cluster-sql"
     }
   ],
@@ -35,9 +14,9 @@
     {
       "run": "cluster-text-search",
       "who": "default",
-      "key": "start: {}",
-      "kind": "status",
-      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:public.docs\",\"name\":\"docs\",\"properties\":{\"search\":\"supported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
+      "key": "query: SELECT id FROM text_search(docs, 'fox') ORDER BY id",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 10",
       "group": "cluster-sql"
     }
   ],
@@ -45,9 +24,9 @@
     {
       "run": "cluster-timestamp-boundary",
       "who": "default",
-      "key": "start: {}",
-      "kind": "status",
-      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"dynamodb:t_i0_default\",\"name\":\"t\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
+      "key": "query: SELECT id FROM t WHERE col_timestamp_tz > '2018-12-31 19:00:00.456Z'",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
       "group": "cluster-sql"
     }
   ],
@@ -55,9 +34,25 @@
     {
       "run": "cluster-tpch-joins[backend=postgres]",
       "who": "cayenne",
-      "key": "start: {}",
-      "kind": "status",
-      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:region\",\"name\":\"region\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"},{\"acceleration_enabled\":true,\"from\":\"postgres:nation\",\"name",
+      "key": "query: select l_shipmode, sum(case when o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH' then 1 else 0 end) as high_line_count, sum(case when o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH' then 1 else 0 end) as low_line_count from lineitem join orders on l_orderkey = o_orderkey where l_shipmode in ('MAIL', 'SHIP') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1994-01-01' and l_receiptdate < date '1995-01-01' group by l_shipmode order by l_shipmode",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Tonic error: code: 'Client specified an invalid argument', message: \\\"executor_table: table 'orders' must be catalog-qualified\\\"\": code: 'Client specified an invalid argument', message: \"Tonic error: code:",
+      "group": "cluster-sql"
+    },
+    {
+      "run": "cluster-tpch-joins[backend=postgres]",
+      "who": "cayenne",
+      "key": "query: select 100.00 * sum(case when p_type like 'PROMO%' then l_extendedprice * (1 - l_discount) else 0 end) / sum(l_extendedprice * (1 - l_discount)) as promo_revenue from lineitem, part where l_partkey = p_partkey and l_shipdate >= date '1995-09-01' and l_shipdate < date '1995-10-01'",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Tonic error: code: 'Client specified an invalid argument', message: \\\"executor_table: table 'part' must be catalog-qualified\\\"\": code: 'Client specified an invalid argument', message: \"Tonic error: code: '",
+      "group": "cluster-sql"
+    },
+    {
+      "run": "cluster-tpch-joins[backend=postgres]",
+      "who": "cayenne",
+      "key": "query: select l_orderkey, sum(l_extendedprice * (1 - l_discount)) as revenue, o_orderdate, o_shippriority from customer, orders, lineitem where c_mktsegment = 'BUILDING' and c_custkey = o_custkey and l_orderkey = o_orderkey and o_orderdate < date '1995-03-15' and l_shipdate > date '1995-03-15' group by l_orderkey, o_orderdate, o_shippriority order by revenue desc, o_orderdate limit 10",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Tonic error: code: 'Client specified an invalid argument', message: \\\"executor_table: table 'customer' must be catalog-qualified\\\"\": code: 'Client specified an invalid argument', message: \"Tonic error: cod",
       "group": "cluster-sql"
     }
   ]

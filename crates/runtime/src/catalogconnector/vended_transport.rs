@@ -36,6 +36,7 @@ use opendal::{Buffer, Error, ErrorKind, HttpBody, HttpTransport, HttpTransporter
 use opendal_http_transport_reqwest::ReqwestTransport;
 use runtime_object_store::ssrf::{
     ALLOW_PRIVATE_HOSTS_ENV, is_blocked_internal_hostname, is_internal_ip,
+    redirect_continues_off_origin,
 };
 
 const DNS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -117,27 +118,42 @@ impl FileWrite for ScopedFileWrite {
     }
 }
 
+/// Why the guarded client does not dial a target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reason {
+    Internal,
+    Unresolved,
+    /// A redirect chain that continues on a host it moved to. Every request this client sends
+    /// is signed, so it carries credentials.
+    RedirectChain,
+}
+
 /// A connection or redirect target that the guarded client does not dial.
 #[derive(Debug)]
 struct Refused {
     target: String,
-    unresolved: bool,
+    reason: Reason,
 }
 
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.unresolved {
-            write!(
-                f,
-                "{:?} could not be resolved to a public address",
-                self.target
-            )
-        } else {
-            write!(
+        match self.reason {
+            Reason::Internal => write!(
                 f,
                 "{:?} is or resolves to a private, loopback, or link-local address",
                 self.target
-            )
+            ),
+            Reason::Unresolved => write!(
+                f,
+                "{:?} could not be resolved to a public address",
+                self.target
+            ),
+            Reason::RedirectChain => write!(
+                f,
+                "{:?} continues a redirect chain on another host, which a signed storage request \
+                 does not follow",
+                self.target
+            ),
         }
     }
 }
@@ -146,13 +162,21 @@ impl std::error::Error for Refused {}
 
 /// User-facing error for a storage request the guarded client refused.
 #[must_use]
-pub(super) fn vended_storage_refused_message(component: &str, refused: &impl ToString) -> String {
+fn vended_storage_refused_message(component: &str, refused: &Refused) -> String {
+    if refused.reason == Reason::RedirectChain {
+        return format!(
+            "The Iceberg catalog for {component} directs storage requests through a redirect that \
+             is not followed: {refused}, so the request is not sent and the table cannot be read. \
+             Configure the redirect target as the storage endpoint in the Spicepod. \
+             See: https://spiceai.org/docs/components/data-connectors/iceberg"
+        );
+    }
     format!(
         "The Iceberg catalog for {component} directs storage requests to a host that is not \
-         allowed: {}, so the request is not sent and the table cannot be read. If this endpoint \
-         is trusted, set the `s3_endpoint` parameter to it, or set `{ALLOW_PRIVATE_HOSTS_ENV}=true`. \
-         See: https://spiceai.org/docs/components/data-connectors/iceberg",
-        refused.to_string()
+         allowed: {refused}, so the request is not sent and the table cannot be read. If this \
+         endpoint is trusted, set the `s3_endpoint` parameter to it, or set \
+         `{ALLOW_PRIVATE_HOSTS_ENV}=true`. \
+         See: https://spiceai.org/docs/components/data-connectors/iceberg"
     )
 }
 
@@ -169,12 +193,19 @@ fn redirect_policy(attempt: reqwest::redirect::Attempt<'_>) -> reqwest::redirect
         let target = attempt.url().to_string();
         return attempt.error(Refused {
             target,
-            unresolved: false,
+            reason: Reason::Internal,
         });
     }
     // `reqwest`'s default policy allows ten redirects, then errors.
     if attempt.previous().len() >= 10 {
         return attempt.error("too many redirects");
+    }
+    if redirect_continues_off_origin(attempt.previous(), attempt.url()) {
+        let target = attempt.url().to_string();
+        return attempt.error(Refused {
+            target,
+            reason: Reason::RedirectChain,
+        });
     }
     attempt.follow()
 }
@@ -197,7 +228,7 @@ async fn public_addrs(host: String) -> std::result::Result<Vec<SocketAddr>, Refu
     if is_blocked_internal_hostname(&host) {
         return Err(Refused {
             target: host,
-            unresolved: false,
+            reason: Reason::Internal,
         });
     }
     #[cfg(test)]
@@ -225,13 +256,13 @@ fn classify(host: String, addrs: Vec<SocketAddr>) -> std::result::Result<Vec<Soc
     if addrs.is_empty() {
         return Err(Refused {
             target: host,
-            unresolved: true,
+            reason: Reason::Unresolved,
         });
     }
     if addrs.iter().any(|addr| is_internal_ip(addr.ip())) {
         return Err(Refused {
             target: host,
-            unresolved: false,
+            reason: Reason::Internal,
         });
     }
     Ok(addrs)

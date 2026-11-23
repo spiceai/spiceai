@@ -136,9 +136,10 @@ struct Cli {
     #[arg(long, value_enum, value_name = "TAG")]
     exclude_tag: Vec<script::Tag>,
 
-    /// Cap every wait for a condition (`eventually`, readiness, a refresh)
-    /// at this long, such as `20s`: for scripts expected to fail, which
-    /// otherwise wait out every limit in full.
+    /// Cap every check's wait (`eventually`, a refresh) at this long, such
+    /// as `20s`: for scripts expected to fail, which otherwise wait out every
+    /// limit in full. Readiness after start, restart and upgrade keeps its
+    /// own limit (`ready-timeout`, default 3 min).
     #[arg(long = "max-wait", value_name = "DURATION", value_parser = humantime::parse_duration)]
     max_wait: Option<std::time::Duration>,
 
