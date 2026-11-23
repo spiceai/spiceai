@@ -27,7 +27,8 @@
 # response that announces a larger size before writing any of it, and from curl 8.4 also
 # stops one that grows past the bound without announcing its size; a CI_CACHE_DIR copy is
 # measured before it is read. A cached copy over the bound is a miss like any other wrong
-# copy. A source copy over it fails, since the pin then needs a larger bound.
+# copy. A source copy over it fails with exit status 4, since the pin then needs a larger
+# bound: a caller must not fetch the same file some other way that has no bound.
 #
 # The bucket fills itself. When it answered that it lacks the file (404), or held the wrong
 # bytes, the verified download from the source is written back to it so the next job reads
@@ -44,6 +45,8 @@
 # Usage: bash .github/scripts/cached_fetch.sh SHA256 DEST URL [URL...]
 # CI_SOURCE_DELAY_SECONDS (default 5, doubled after each failed attempt) and
 # CI_CACHE_DELAY_SECONDS (default 2) set the waits between attempts.
+# Exit status: 0 DEST holds the verified file; 1 it could not be downloaded; 2 the
+# arguments or settings are wrong; 4 a source offered more than CI_FETCH_MAX_BYTES.
 set -euo pipefail
 
 if [ "$#" -lt 3 ]; then
@@ -92,7 +95,8 @@ file_sha256() {
 dest_dir="$(dirname "$dest")"
 mkdir -p "$dest_dir"
 tmp="$(mktemp "$dest_dir/.cached_fetch.XXXXXX")"
-trap 'rm -f "$tmp"' EXIT
+fetch_err="$(mktemp "$dest_dir/.cached_fetch_err.XXXXXX")"
+trap 'rm -f "$tmp" "$fetch_err"' EXIT
 
 # Moves the verified download to DEST, and keeps a copy in CI_CACHE_DIR. The copy is
 # written under a temporary name and renamed, so a job reading the directory at the same
@@ -112,6 +116,7 @@ finish() {
     fi
   fi
   mv -f "$tmp" "$dest"
+  rm -f "$fetch_err"
   trap - EXIT
   echo "$name: verified from ${origin} (sha256 $sha256)."
 }
@@ -142,11 +147,20 @@ transient() {
 }
 
 # Fetches $1 into $tmp; sets `status` (curl's exit) and `code` (the HTTP status). A body
-# larger than max_bytes ends the transfer with curl exit 63.
+# larger than max_bytes ends the transfer with status 63. curl says so with exit 63, except
+# that the curl macOS ships reports it over HTTP/2 as exit 56 (a receive failure, which
+# would be retried) with the same message, so the message decides too.
 fetch() {
   status=0
   code="$(curl --fail --silent --show-error --location --connect-timeout "$2" --max-time "$3" \
-    --max-filesize "$max_bytes" --write-out '%{http_code}' --output "$tmp" "$1")" || status=$?
+    --max-filesize "$max_bytes" --write-out '%{http_code}' --output "$tmp" "$1" 2>"$fetch_err")" ||
+    status=$?
+  if [ -s "$fetch_err" ]; then
+    cat "$fetch_err" >&2
+    if [ "$status" -ne 0 ] && grep -qiE 'maximum (allowed )?file size' "$fetch_err"; then
+      status=63
+    fi
+  fi
 }
 
 # 2. The CI object store. cache_state records why the read ended without a verified copy:
@@ -245,8 +259,10 @@ write_back() {
   fi
 }
 
-# 3. The source.
+# 3. The source. `oversized` records that a source offered more than the bound, which
+# fails the fetch with exit 4 when no other source delivers the file.
 delay="$source_delay"
+oversized=false
 for ((attempt = 1; ; attempt++)); do
   retry_urls=()
   for url in "${sources[@]}"; do
@@ -265,11 +281,18 @@ for ((attempt = 1; ; attempt++)); do
       retry_urls+=("$url")
       echo "::warning::Downloading $name from $url failed with a network or server error (curl exit $status, HTTP $code, attempt $attempt of $source_attempts)."
     elif [ "$status" -eq 63 ]; then
+      oversized=true
       echo "::warning::$url is larger than CI_FETCH_MAX_BYTES ($max_bytes bytes), so $name was not downloaded from it; a retry cannot fix that. If the pinned file is that large, raise CI_FETCH_MAX_BYTES."
     else
       echo "::warning::Downloading $name from $url failed (curl exit $status, HTTP $code), which a retry cannot fix."
     fi
   done
+  if [ "${#retry_urls[@]}" -eq 0 ] || [ "$attempt" -ge "$source_attempts" ]; then
+    if [ "$oversized" = true ]; then
+      echo "::error::Could not download $name: a source offered more than CI_FETCH_MAX_BYTES ($max_bytes bytes). If the pinned file is that large, raise CI_FETCH_MAX_BYTES."
+      exit 4
+    fi
+  fi
   if [ "${#retry_urls[@]}" -eq 0 ]; then
     echo "::error::Could not download $name: no source URL answered with the file, and none failed in a way a retry could fix."
     exit 1

@@ -116,6 +116,7 @@ class Server:
         self.sts_requests = []
         self.sts_status = 200
         self.sts_error_message = "No policy for this repository"
+        self.sts_script = []
         self.sts_credentials = (ACCESS_KEY, SECRET_KEY, SESSION_TOKEN)
         server = self
 
@@ -139,7 +140,9 @@ class Server:
                 body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 form = {k: v[0] for k, v in urllib.parse.parse_qs(body.decode()).items()}
                 server.sts_requests.append(form)
-                if server.sts_status != 200:
+                if server.sts_script:
+                    status, reply = server.sts_script.pop(0)
+                elif server.sts_status != 200:
                     status, reply = server.sts_status, (
                         "<ErrorResponse><Error><Code>AccessDenied</Code>"
                         f"<Message>{server.sts_error_message}</Message></Error></ErrorResponse>"
@@ -197,11 +200,13 @@ class Server:
 
 class Github:
     """GitHub's OIDC token endpoint: a GET with the job's request token as its bearer
-    returns OIDC_TOKEN for the audience asked for, which `audiences` records."""
+    returns OIDC_TOKEN for the audience asked for, which `audiences` records. `script`
+    holds (status, body) answers to give first, one per request."""
 
     def __init__(self):
         self.audiences = []
         self.status = 200
+        self.script = []
         github = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -210,6 +215,8 @@ class Github:
                 github.audiences.append(query.get("audience", [None])[0])
                 if self.headers.get("Authorization") != f"Bearer {OIDC_REQUEST_TOKEN}":
                     status, reply = 401, b"{}"
+                elif github.script:
+                    status, reply = github.script.pop(0)
                 else:
                     status, reply = github.status, json.dumps({"count": 1, "value": OIDC_TOKEN}).encode()
                 self.send_response(status)
@@ -301,10 +308,28 @@ class CachedFetchTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(self.dest.read_bytes(), CONTENT)
 
-    def assert_failed(self, proc):
-        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+    def assert_failed(self, proc, status=1):
+        self.assertEqual(proc.returncode, status, proc.stdout + proc.stderr)
         self.assertFalse(self.dest.exists())
-        self.assertEqual(list(self.dest.parent.glob(".cached_fetch.*")), [])
+        self.assertEqual(list(self.dest.parent.glob(".cached_fetch*")), [])
+
+    def curl_reporting_size_as_56(self):
+        """A directory whose `curl` reports a size refusal as macOS's curl does over HTTP/2:
+        exit 56 with curl's size message, rather than exit 63."""
+        real = shutil.which("curl")
+        bin_dir = self.dir / "curl-56"
+        bin_dir.mkdir()
+        fake = bin_dir / "curl"
+        fake.write_text(
+            "#!/usr/bin/env bash\n"
+            'err="$(mktemp)"; status=0\n'
+            f'"{real}" "$@" 2>"$err" || status=$?\n'
+            'if [ "$status" -eq 63 ]; then echo "curl: (56) Maximum file size exceeded" >&2; status=56\n'
+            'else cat "$err" >&2; fi\n'
+            'rm -f "$err"; exit "$status"\n'
+        )
+        fake.chmod(0o755)
+        return bin_dir
 
     # --- the cache ---------------------------------------------------------------------
 
@@ -559,18 +584,49 @@ class CachedFetchTest(unittest.TestCase):
         self.assertEqual(self.cache.stored[CACHE_PATH], CONTENT)
         self.assertEqual(list(self.dest.parent.glob(".cached_fetch.*")), [])
 
-    def test_an_oversized_source_download_is_refused_and_not_retried(self):
+    def test_an_oversized_source_download_fails_with_exit_4_and_is_not_retried(self):
         self.source.script[SOURCE_PATH] = [b"x" * 4096]
         proc = self.run_fetch(cache=False, max_bytes=1024)
-        self.assert_failed(proc)
+        self.assert_failed(proc, status=4)
         self.assertEqual(self.source.count(SOURCE_PATH), 1)
         self.assertIn("larger than CI_FETCH_MAX_BYTES (1024 bytes)", proc.stdout)
+        self.assertIn("a source offered more than CI_FETCH_MAX_BYTES (1024 bytes)", proc.stdout)
+
+    def test_a_size_refusal_reported_as_exit_56_is_still_a_size_refusal(self):
+        # macOS's curl over HTTP/2: without the message check this is a receive failure,
+        # retried four times and reported as a network error with exit 1.
+        self.source.script[SOURCE_PATH] = [b"x" * 4096]
+        proc = self.run_fetch(cache=False, max_bytes=1024, path=self.curl_reporting_size_as_56())
+        self.assert_failed(proc, status=4)
+        self.assertIn("curl: (56) Maximum file size exceeded", proc.stderr)
+        self.assertEqual(self.source.count(SOURCE_PATH), 1)
+
+    def test_a_cache_copy_refused_as_exit_56_is_a_miss_and_not_retried(self):
+        self.cache.script[CACHE_PATH] = [b"x" * 4096]
+        self.source.script[SOURCE_PATH] = [CONTENT]
+        proc = self.run_fetch(max_bytes=1024, path=self.curl_reporting_size_as_56())
+        self.assert_fetched(proc)
+        self.assertEqual(self.cache.count(CACHE_PATH), 1)
+        self.assertIn("The CI cache's copy of tool.tar.gz is larger than CI_FETCH_MAX_BYTES", proc.stdout)
+
+    def test_an_oversized_source_fails_with_exit_4_when_the_other_source_lacks_the_file(self):
+        self.source.script[SOURCE_PATH] = [404]
+        self.source.script[MIRROR_PATH] = [b"x" * 4096]
+        sources = [f"{self.source.url}{SOURCE_PATH}", f"{self.source.url}{MIRROR_PATH}"]
+        proc = self.run_fetch(cache=False, max_bytes=1024, sources=sources)
+        self.assert_failed(proc, status=4)
+
+    def test_another_source_still_serves_when_one_is_oversized(self):
+        self.source.script[SOURCE_PATH] = [b"x" * 4096]
+        self.source.script[MIRROR_PATH] = [CONTENT]
+        sources = [f"{self.source.url}{SOURCE_PATH}", f"{self.source.url}{MIRROR_PATH}"]
+        self.assert_fetched(self.run_fetch(cache=False, max_bytes=1024, sources=sources))
 
     @unittest.skipIf(curl_version() < (8, 4), "curl bounds a body of unannounced size from 8.4")
     def test_a_body_without_a_length_is_cut_at_the_bound(self):
         self.source.script[SOURCE_PATH] = [Unsized(b"x" * (1 << 20))]
         proc = self.run_fetch(cache=False, max_bytes=64 * 1024)
-        self.assert_failed(proc)
+        self.assert_failed(proc, status=4)
         self.assertEqual(self.source.count(SOURCE_PATH), 1)
         self.assertIn("larger than CI_FETCH_MAX_BYTES (65536 bytes)", proc.stdout)
 

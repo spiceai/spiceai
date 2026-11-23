@@ -26,6 +26,8 @@ file pinned today, the rustc archive for x86_64 Linux, is 80 MiB. curl refuses a
 that announces a larger size before writing any of it, and from curl 8.4 also stops one
 that grows past the bound without announcing its size. A cached copy over the bound is a
 miss; a source copy over it fails the job, and the bound must be raised for that pin.
+`setup-rust` then fails too, rather than installing the toolchain with rustup, which would
+download the same file with no bound.
 
 ## What is pinned
 
@@ -59,11 +61,14 @@ curl 7.87 or later; with an older curl the write is skipped with a warning.
 
 A job has an OIDC token only with `permissions: id-token: write`. A job without one, which
 includes every pull request from a fork, still reads the cache and logs one line saying it
-did not write. Grant the permission only to jobs that never run unreviewed code, that is,
-jobs that do not run on `pull_request`: the token gets the repository's credentials for the
-CI object store, which reach more than this bucket. A reader never trusts the writer either
-way: no reader uses bytes that do not match its pin, and one that finds wrong bytes
-replaces them with the verified download.
+did not write. The token gets the repository's credentials for the CI object store, which
+reach more than this bucket, so grant the permission only to a job in the `ci` environment
+that does not run on `pull_request`: never to a job in `secret-free`, which holds no
+credential and can be dispatched on any branch, and never to one that runs pull request
+code. The store takes a write only from a run on `trunk`; a run elsewhere that holds a
+token reads the cache and warns that its write was refused. A reader never trusts the
+writer either way: no reader uses bytes that do not match its pin, and one that finds wrong
+bytes replaces them with the verified download.
 
 ## Adding a file
 

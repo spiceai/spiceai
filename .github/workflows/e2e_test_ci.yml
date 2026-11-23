@@ -199,8 +199,8 @@ jobs:
       contents: read
       # Writes a pinned download the CI cache lacked back to it, which the CI object
       # store accepts only with this job's OIDC credentials (.github/ci-cache/README.md).
-      # The job never runs on a pull request (check_changes is skipped there), so no
-      # unreviewed code holds the token.
+      # The job runs in `ci`, like the other jobs that hold store credentials, and never
+      # on a pull request (check_changes is skipped there).
       id-token: write
     environment: ci
     needs: [setup-matrix, check_changes]

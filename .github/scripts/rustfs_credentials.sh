@@ -50,9 +50,12 @@ fi
 # never answers holds curl, and with it the calling job, until the job's own bound cancels
 # it, which for a build is hours. `--retry` treats a timeout as transient, so a stall costs
 # at most four 30-second attempts per call.
+#
+# `--retry` writes every attempt's body to stdout, so without `--fail` a retried error page
+# would come out ahead of the token and no JSON parser could read the two together.
 status=0
 response="$(printf 'Authorization: Bearer %s\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" |
-  curl --silent --retry 3 --connect-timeout 10 --max-time 30 -H @- --get \
+  curl --silent --fail --retry 3 --connect-timeout 10 --max-time 30 -H @- --get \
     --data-urlencode "audience=$audience" --write-out '\n%{http_code}' \
     "$ACTIONS_ID_TOKEN_REQUEST_URL")" || status=$?
 code="${response##*$'\n'}"
@@ -65,6 +68,8 @@ if [ -z "$oidc_token" ]; then
   fail "GitHub returned no OIDC token."
 fi
 
+# No `--fail` here: a refusal's body names the reason. A retried error page can precede the
+# answer, but each value below is read from its own tag, which only the answer carries.
 status=0
 response="$(printf '%s' "$oidc_token" |
   curl --silent --retry 3 --connect-timeout 10 --max-time 30 -X POST "$endpoint/" \

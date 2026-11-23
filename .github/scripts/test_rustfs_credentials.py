@@ -204,6 +204,43 @@ class RustfsCredentialsScriptTest(unittest.TestCase):
         self.assertEqual(proc.stderr, "")
         self.assertEqual(self.store.sts_requests[0]["DurationSeconds"], "3600")
 
+    def test_a_retried_token_error_page_does_not_spoil_the_token(self):
+        # curl --retry writes each failed attempt's body to stdout ahead of the good one
+        # unless --fail drops it, and jq cannot read "<html>…</html>{…}".
+        self.github.script = [(503, b"<html>Service unavailable</html>")]
+        proc = self.run_script(self.store.url, "900")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.github.audiences), 2)
+        self.assertEqual(proc.stdout.splitlines()[:3], [ACCESS_KEY, SECRET_KEY, SESSION_TOKEN])
+        self.assertEqual(self.store.sts_requests[0]["WebIdentityToken"], OIDC_TOKEN)
+
+    def test_a_retried_sts_error_page_does_not_spoil_the_credentials(self):
+        self.store.sts_script = [(503, b"<html><title>503</title>Slow Down</html>")]
+        proc = self.run_script(self.store.url, "900")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.store.sts_requests), 2)
+        self.assertEqual(proc.stdout.splitlines(), [ACCESS_KEY, SECRET_KEY, SESSION_TOKEN, EXPIRATION])
+
+    def test_an_sts_endpoint_that_keeps_failing_reports_the_last_answer(self):
+        self.store.sts_status = 503
+        self.store.sts_error_message = "Slow down"
+        proc = self.run_script(self.store.url, "900")
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(
+            proc.stderr.strip(), "RustFS refused the OIDC token (HTTP 503): AccessDenied: Slow down"
+        )
+        self.assertEqual(len(self.store.sts_requests), 4)
+
+    def test_a_token_endpoint_that_keeps_failing_reports_its_status(self):
+        self.github.status = 503
+        proc = self.run_script(self.store.url, "900")
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(proc.stderr.strip(), "GitHub did not issue an OIDC token (curl exit 22, HTTP 503).")
+        self.assertEqual(len(self.github.audiences), 4)
+        self.assertEqual(self.store.sts_requests, [])
+
     def test_a_failure_prints_one_line_on_stderr_and_nothing_on_stdout(self):
         self.store.sts_status = 403
         proc = self.run_script(self.store.url, "900")

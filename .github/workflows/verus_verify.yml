@@ -117,12 +117,6 @@ jobs:
     # is what reports this required context there. See the header.
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
-    permissions:
-      contents: read
-      # Writes a pinned download the CI cache lacked back to it, which the CI object
-      # store accepts only with this job's OIDC credentials (.github/ci-cache/README.md).
-      # The job never runs on a pull request, so no unreviewed code holds the token.
-      id-token: write
     # Bounded because this is a required `merge_group` check: an unbounded job
     # leaves the queue candidate `AWAITING_CHECKS` for GitHub's six-hour default
     # and stalls every entry behind it (#12717). hash-index alone is ~7 minutes
