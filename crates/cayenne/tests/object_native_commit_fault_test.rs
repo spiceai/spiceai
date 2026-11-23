@@ -130,6 +130,104 @@ async fn a_failed_send_is_retried_with_the_same_attempt() {
     assert_eq!(head_commit(&store).await, before + 1);
 }
 
+/// A read during a commit whose head write is held answers the state before
+/// the commit without waiting for it. When the write lands but its outcome
+/// cannot be confirmed, reads answer that state or the stopped log's error,
+/// never the unconfirmed change, until the log is reopened from storage; then
+/// they answer the reopened state, which holds the change that landed.
+#[tokio::test]
+async fn reads_never_see_a_commit_before_it_returns() {
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let store: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
+    let catalog = Arc::new(
+        ObjectNativeCatalog::create_with_config(
+            Arc::clone(&store),
+            Path::from("catalog"),
+            cayenne::metastore::object_native::NativeCatalogConfig {
+                publish_attempts: 2,
+                retry_delay: std::time::Duration::from_millis(10),
+                ..cayenne::metastore::object_native::NativeCatalogConfig::default()
+            },
+        )
+        .await
+        .expect("create the catalog"),
+    );
+    catalog
+        .set_sidecar_value("position", Some(b"1".to_vec()))
+        .await
+        .expect("first commit");
+
+    faults.arm(Op::Cas, is_head, Fault::Hold);
+    let commit = tokio::spawn({
+        let catalog = Arc::clone(&catalog);
+        async move {
+            catalog
+                .set_sidecar_value("position", Some(b"2".to_vec()))
+                .await
+        }
+    });
+    let held = faults.wait_held(None).await;
+    let during = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        catalog.sidecar_value("position"),
+    )
+    .await
+    .expect("a read does not wait for the held head write")
+    .expect("read during the commit");
+    assert_eq!(during, Some(b"1".to_vec()));
+
+    // The write lands, its response is lost, and every head read fails: the
+    // commit's outcome stays unknown and the log stops.
+    faults.fail_while(Op::Get, is_head);
+    faults
+        .deliver(held)
+        .await
+        .expect("the held head write lands");
+    faults.drop_response(held).expect("lose its response");
+    let outcome = commit.await.expect("the commit task");
+    assert!(
+        outcome
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains(
+                "The outcome of this change to the Cayenne object-native metastore is unknown"
+            )),
+        "the commit's outcome is unknown: {outcome:?}"
+    );
+    for _ in 0..20 {
+        match catalog.sidecar_value("position").await {
+            Ok(value) => assert_eq!(
+                value,
+                Some(b"1".to_vec()),
+                "a read saw the unconfirmed change"
+            ),
+            Err(error) => assert!(
+                error
+                    .to_string()
+                    .contains("is reading its state back after a change whose outcome is unknown"),
+                "a stopped log's read fails with its own error: {error}"
+            ),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    faults.clear_rules();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let reopened = loop {
+        if let Ok(value) = catalog.sidecar_value("position").await
+            && value == Some(b"2".to_vec())
+        {
+            break value;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the log was not reopened with the landed change; last read: {:?}",
+            catalog.sidecar_value("position").await
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert_eq!(reopened, Some(b"2".to_vec()));
+}
+
 /// Another writer took the log over: the old catalog's commit is fenced, it
 /// refuses further work, and its change is not in the log.
 #[tokio::test]

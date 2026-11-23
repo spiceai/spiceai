@@ -2159,20 +2159,6 @@ struct ChangeStreamTimings {
     applies: Vec<Duration>,
 }
 
-/// The `percentile` (0 to 100) of `samples`, nearest rank.
-fn percentile(samples: &[Duration], percentile: f64) -> Duration {
-    let mut sorted = samples.to_vec();
-    sorted.sort_unstable();
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss,
-        reason = "a rank within a test's sample count"
-    )]
-    let rank = ((percentile / 100.0) * sorted.len() as f64).ceil() as usize;
-    sorted[rank.clamp(1, sorted.len()) - 1]
-}
-
 /// Runs `stream` into `table` for 20 s with 8 concurrent readers, and asserts
 /// that no read failed and that each answer is a whole prefix of the keys
 /// acknowledged writes left, with every row once. Then, quiesced, that the count
@@ -2324,8 +2310,8 @@ async fn read_during_change_stream(
         wrong.len(),
         failed.first(),
         wrong.first(),
-        percentile(&read_timings, 99.0),
-        percentile(&read_timings, 99.9),
+        crate::common::percentile(&read_timings, 99.0),
+        crate::common::percentile(&read_timings, 99.9),
         read_timings.len()
     );
     assert!(ok > 0, "no read completed");
@@ -2386,25 +2372,34 @@ async fn scans_do_not_wait_for_a_slow_head_write() {
     let fixture = crate::common::TestFixture::object_native_wrapped(|store| {
         Arc::new(LatencyStore::new(
             store,
-            LatencyProfile::default().with(Op::Cas, Delay::new(HEAD_WRITE, Duration::from_millis(250))),
+            LatencyProfile::default()
+                .with(Op::Cas, Delay::new(HEAD_WRITE, Duration::from_millis(250))),
             0x16132,
         ))
     })
     .await
     .expect("object-native fixture");
     let ctx = SessionContext::new();
-    let store = fixture.data_store.config.clone().expect("an object-native data store");
+    let store = fixture
+        .data_store
+        .config
+        .clone()
+        .expect("an object-native data store");
     // Every scan captures its view anew, so every read reads the catalog.
     let table = Arc::new(
-        crate::common::table_builder_on_store(Arc::clone(&fixture.catalog), ctx.runtime_env(), store)
-            .with_scan_view_reuse(cayenne::ScanViewReuse::WithinLag(Duration::ZERO))
-            .create(change_stream_table(
-                name,
-                fixture.data_store.base_path(name),
-                ChangeStream::Durable,
-            ))
-            .await
-            .expect("create the keyed table"),
+        crate::common::table_builder_on_store(
+            Arc::clone(&fixture.catalog),
+            ctx.runtime_env(),
+            store,
+        )
+        .with_scan_view_reuse(cayenne::ScanViewReuse::WithinLag(Duration::ZERO))
+        .create(change_stream_table(
+            name,
+            fixture.data_store.base_path(name),
+            ChangeStream::Durable,
+        ))
+        .await
+        .expect("create the keyed table"),
     );
     ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
         .expect("register");
@@ -2415,20 +2410,7 @@ async fn scans_do_not_wait_for_a_slow_head_write() {
         fastest_apply >= HEAD_WRITE / 2,
         "the fastest apply took {fastest_apply:?}, so head writes were not delayed"
     );
-    // `CAYENNE_TEST_READ_TIMINGS` names a file each read's time (µs) is appended
-    // to, so runs can be pooled for a tail with enough samples behind it.
-    if let Ok(path) = std::env::var("CAYENNE_TEST_READ_TIMINGS") {
-        use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .expect("open the read timings file");
-        for read in &timings.reads {
-            writeln!(file, "{}", read.as_micros()).expect("write a read timing");
-        }
-    }
-    let p99 = percentile(&timings.reads, 99.0);
+    let p99 = crate::common::percentile(&timings.reads, 99.0);
     assert!(
         p99 < HEAD_WRITE,
         "read P99 {p99:?} over {} reads is not below one head write ({HEAD_WRITE:?})",
