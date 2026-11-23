@@ -292,6 +292,14 @@ fn next_backoff(
 }
 
 fn retry_reason_from_error(error: &reqwest::Error) -> Option<RetryReason> {
+    // A refused destination surfaces as a connect error, but refusing it again cannot succeed.
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        if current.is::<object_store_spawn::DestinationRefused>() {
+            return None;
+        }
+        source = current.source();
+    }
     if error.is_connect() || error.is_timeout() {
         return Some(RetryReason::Network);
     }
