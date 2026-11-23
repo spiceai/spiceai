@@ -47192,6 +47192,17 @@ impl CayenneTableProvider {
         // own files.
         let protected_lookup_selection = lookup_selection.clone();
         let protected_pinned_lookup_index = pinned_lookup_index.clone();
+        // The file and protected-snapshot branches are wrapped in a key-deletion
+        // filter built from this scan's captured deletions, which include CDC
+        // deletes still held in the in-memory tier. A limit handed to those
+        // branches would cap the raw rows read (the Vortex scan limit, and the
+        // listing's truncation by file row counts) before the filter removes
+        // deleted ones, so the scan could return fewer rows than `limit` while more
+        // live rows exist. The branch builder's own guard reads only the durable
+        // deletion state, which does not see the in-memory tier. Keep the limit
+        // out of both branches whenever this scan applies a key-deletion filter;
+        // the `GlobalLimitExec` below still applies it over live rows.
+        let branch_limit = if need_pk_deletion { None } else { limit };
         let listing_scan_start = Instant::now();
         let main_plan_result = self
             .create_snapshot_scan_plan_with_config(
@@ -47199,7 +47210,7 @@ impl CayenneTableProvider {
                 &current_snapshot_id,
                 effective_projection.as_ref(),
                 scan_filters,
-                limit,
+                branch_limit,
                 scan_listing_config,
                 allow_sorted_ordering,
                 Some(Arc::clone(&read_schema)),
@@ -47230,7 +47241,7 @@ impl CayenneTableProvider {
                 state,
                 projection: effective_projection.as_ref(),
                 filters: scan_filters,
-                limit,
+                limit: branch_limit,
                 pk_indices_in_projection: &pk_indices_in_projection,
                 protected_snapshots: protected_map,
                 protected_files,
