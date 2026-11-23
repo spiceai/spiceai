@@ -284,7 +284,7 @@
   "cayenne-transactions": [
     {
       "run": "cayenne-transactions",
-      "who": "object-native-local",
+      "who": "object-native",
       "key": "spice-exec: BEGIN; SELECT assert((SELECT balance FROM accounts WHERE id = 1) >= 10); UPDATE accounts SET balance = balance - 10 WHERE id = 1; INSERT INTO ledger VALUES (6, 1, -10); COMMIT;",
       "kind": "error",
       "signature": "table 'spice\\.public\\.(accounts|ledger)' not found|answer differs from the expected one",
@@ -304,7 +304,7 @@
     },
     {
       "run": "cayenne-transactions",
-      "who": "object-native-local",
+      "who": "object-native",
       "key": "query: SELECT id, balance FROM accounts #10",
       "kind": "error",
       "signature": "table 'spice\\.public\\.(accounts|ledger)' not found|answer differs from the expected one",
@@ -324,7 +324,7 @@
     },
     {
       "run": "cayenne-transactions",
-      "who": "object-native-local",
+      "who": "object-native",
       "key": "query: SELECT id, account, amount FROM ledger #10",
       "kind": "wrong-answer",
       "signature": "table 'spice\\.public\\.(accounts|ledger)' not found|answer differs from the expected one",
@@ -804,7 +804,7 @@
   "mysql-cdc-parity": [
     {
       "run": "mysql-cdc-parity",
-      "who": "object-native-local",
+      "who": "object-native",
       "key": "query: SELECT * FROM orders #8",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
@@ -828,7 +828,7 @@
     },
     {
       "run": "mysql-cdc-parity",
-      "who": "object-native-local",
+      "who": "object-native",
       "key": "query: SELECT * FROM customers #8",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
@@ -852,7 +852,7 @@
     },
     {
       "run": "mysql-cdc-parity",
-      "who": "object-native-local",
+      "who": "object-native",
       "key": "query: SELECT * FROM customers #9",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for customers: Acceleration not ready; loading initial data for customers",
@@ -1451,7 +1451,7 @@
     },
     {
       "run": "postgres-cdc-parity",
-      "who": "object-native-local",
+      "who": "object-native",
       "key": "query: SELECT * FROM orders #9",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
@@ -1475,7 +1475,7 @@
     },
     {
       "run": "postgres-cdc-parity",
-      "who": "object-native-local",
+      "who": "object-native",
       "key": "query: SELECT * FROM customers #7",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
@@ -1508,7 +1508,7 @@
     },
     {
       "run": "postgres-cdc-parity",
-      "who": "object-native-local",
+      "who": "object-native",
       "key": "query: SELECT * FROM customers #8",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
