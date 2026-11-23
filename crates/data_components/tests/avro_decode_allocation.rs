@@ -247,6 +247,35 @@ fn declared_collection_sizes_do_not_drive_allocation() {
         "an array of enum items grew the heap by {peak} bytes"
     );
 
+    // A block whose first items are present and whose input then stops has
+    // reserved at most 1024 times the items it supplied: here 1,100 items, so
+    // 1,024 then 1,048,576 more, against declared counts that would reserve
+    // the whole budget. A map's hash table rounds its capacity up to a power of
+    // two of at least 8/7 of the request, plus one control byte per bucket.
+    let reserved_items: usize = 1024 + 1024 * 1024;
+    let map_buckets = (reserved_items * 8 / 7).next_power_of_two();
+    for (schema, count, max_peak) in [
+        (array, 9_000_000, reserved_items * array_item),
+        (map, 6_000_000, map_buckets * (map_entry + 1)),
+    ] {
+        let mut body = block_count(count);
+        for i in 0..1_100 {
+            if schema == map {
+                body.extend(
+                    to_avro_datum(&Schema::String, Value::String(format!("k{i}")))
+                        .expect("a key encodes"),
+                );
+            }
+            body.extend(to_avro_datum(&Schema::Long, Value::Long(i)).expect("a long encodes"));
+        }
+        let (error, peak) = decode_error_and_peak_heap(&runtime, schema, &body);
+        assert_eq!(error, truncated, "{schema}");
+        assert!(
+            peak < max_peak + MAX_HEAP_BYTES,
+            "{schema}: a block declaring {count} items with 1,100 behind it grew the heap by {peak} bytes"
+        );
+    }
+
     // A fixed value's size comes from the schema, and its buffer is allocated
     // before the input is read.
     let fixed_size: usize = 1 << 40;

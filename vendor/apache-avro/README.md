@@ -47,16 +47,22 @@ decodes an item, and moving to it needs a matching `iceberg` release, so the fix
   declared length, at most 512 MiB, and survives the decode only once the input has filled it, so
   what a datum keeps of them is bounded by the input length.
 - The array and map arms reserve at most `MAX_PREALLOCATED_ITEMS` (1024) items before decoding,
-  so a declared count with no items behind it costs a bounded allocation. Once that many items
-  have decoded, the block reserves the rest of its declared count in one step, as 0.21.0 does up
-  front, so a long collection is not regrown and rehashed as it fills. That reservation is at
-  most what the budget was already debited for, and it is a `try_reserve`: if it fails, the
-  collection grows item by item.
+  so a declared count with nothing behind it costs a bounded allocation. Each time the
+  reservation fills, the block reserves up to `RESERVATION_GROWTH` (1024) times the items decoded
+  so far, capped at its declared count, with `try_reserve`: if that fails, the collection grows
+  item by item. A collection of up to about a million items is therefore reserved in one step
+  after its first 1024, as 0.21.0 does up front, and is not regrown and rehashed as it fills,
+  while input that stops early has reserved at most 1024 times the items it supplied. In the
+  allocation test, a body with 1,100 real items of a 9,000,000-item array peaks at 59 MB, and one
+  with 1,100 real entries of a 6,000,000-entry map at 170 MB, where reserving the rest in one step
+  reached 504 MB and 680 MB. A map's hash table rounds its capacity up to
+  a power of two of at least 8/7 of the request, so its reservation can exceed the bytes debited
+  for it by up to about 2.3 times.
 
 A datum holding more than 512 MiB of these decoded values now fails to decode; with a 56-byte
-`Value`, that is about 9.6 million array items in one datum. The heap one datum claims stays at
-about the budget: in the allocation test, arrays of zero-byte records, unions and enums each peak
-within 40 KB of 512 MiB before they are refused.
+`Value`, that is about 9.6 million array items in one datum. In the allocation test, arrays of
+zero-byte records, unions and enums each stay within 1 MiB of the 512 MiB budget before they are
+refused.
 
 Decode time against upstream 0.21.0, in the same process with the arms interleaved, is within
 run-to-run noise for a 100,000-item `long` array, a 100,000-entry map, 50,000 eight-field records

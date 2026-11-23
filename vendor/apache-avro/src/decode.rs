@@ -77,11 +77,16 @@ pub fn decode<R: Read>(schema: &Schema, reader: &mut R) -> AvroResult<Value> {
 }
 
 /// Array or map items reserved before any of them is decoded. A block header
-/// declares its item count before the items, so a block reserves the rest of
-/// its declared count, which the budget has already been debited for, only once
-/// this many items have decoded: input that stops short of them costs a bounded
-/// allocation, and a long collection is still reserved in one step.
+/// declares its item count before the items, so a block reserves its count in
+/// steps as items actually decode: this many first, then, each time the
+/// reservation fills, up to [`RESERVATION_GROWTH`] times the items decoded so
+/// far. Input that stops short has reserved at most that multiple of the items
+/// it supplied, and a collection of up to about a million items is reserved in
+/// one step after its first 1024.
 const MAX_PREALLOCATED_ITEMS: usize = 1024;
+
+/// How many times the items decoded so far a block may reserve next.
+const RESERVATION_GROWTH: usize = 1024;
 
 /// Decode one datum. Every heap allocation the decoder makes that is not a copy
 /// of input bytes debits one budget of [`max_allocation_bytes`] bytes: array and
@@ -262,11 +267,14 @@ fn decode_with_budget<R: Read, S: Borrow<Schema>>(
                 }
 
                 debit_items::<Value>(budget, len)?;
-                items.reserve(len.min(MAX_PREALLOCATED_ITEMS));
+                let mut reserved_through = len.min(MAX_PREALLOCATED_ITEMS);
+                items.reserve(reserved_through);
                 for decoded in 0..len {
-                    if decoded == MAX_PREALLOCATED_ITEMS {
+                    if decoded == reserved_through {
+                        let more = (len - decoded).min(decoded.saturating_mul(RESERVATION_GROWTH));
                         // Best effort: if it fails, the collection grows item by item.
-                        let _ = items.try_reserve(len - decoded);
+                        let _ = items.try_reserve(more);
+                        reserved_through = decoded + more;
                     }
                     items.push(decode_with_budget(
                         &inner.items,
@@ -290,11 +298,14 @@ fn decode_with_budget<R: Read, S: Borrow<Schema>>(
                 }
 
                 debit_items::<(String, Value)>(budget, len)?;
-                items.reserve(len.min(MAX_PREALLOCATED_ITEMS));
+                let mut reserved_through = len.min(MAX_PREALLOCATED_ITEMS);
+                items.reserve(reserved_through);
                 for decoded in 0..len {
-                    if decoded == MAX_PREALLOCATED_ITEMS {
+                    if decoded == reserved_through {
+                        let more = (len - decoded).min(decoded.saturating_mul(RESERVATION_GROWTH));
                         // Best effort: if it fails, the collection grows item by item.
-                        let _ = items.try_reserve(len - decoded);
+                        let _ = items.try_reserve(more);
+                        reserved_through = decoded + more;
                     }
                     match decode_with_budget(
                         &Schema::String,
