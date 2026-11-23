@@ -161,7 +161,7 @@ steps:
     oracle-sql: SELECT * FROM t WHERE id <= 10
 
   # Object-native data: each acceleration's log and data files are in the state
-  # location, and nothing is at a local `s3:` path.
+  # location, and no data file is in the instance's directory.
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/t-, contains: /head, min: 1 }
     only: object-native-s3
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/t-, contains: /data/, min: 1 }
@@ -170,5 +170,5 @@ steps:
     only: object-native-s3
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/acct-, contains: /data/, min: 1 }
     only: object-native-s3
-  - assert-files: { lacks: '(^|/)s3:' }
+  - assert-files: { lacks: ['(^|/)s3:', '\.vortex$', '\.arrow$'] }
     only: object-native-s3

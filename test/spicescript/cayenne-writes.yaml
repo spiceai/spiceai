@@ -229,17 +229,15 @@ steps:
   # Memory mode keeps nothing on disk.
   - assert-files: { lacks: '^\.spice/data/' }
     when: { mode: memory }
-  # Object-native data: a file acceleration's log and data files are in the
-  # state location and nothing is at a local `s3:` path; a memory one keeps
-  # nothing there.
+  # Object-native data: a file acceleration's log is in the state location, and
+  # no data file is in the instance's directory; a memory one keeps nothing in
+  # the location. These few rows stay inline in the log, so there is no
+  # `data/` file to require.
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/ev-, contains: /head, min: 1 }
     only: &s3-variants [upsert-object-native-s3, drop-object-native-s3, keep-object-native-s3, none-object-native-s3]
-    when: { mode: file }
-  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/ev-, contains: /data/, min: 1 }
-    only: *s3-variants
     when: { mode: file }
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/, max: 0 }
     only: *s3-variants
     when: { mode: memory }
-  - assert-files: { lacks: '(^|/)s3:' }
+  - assert-files: { lacks: ['(^|/)s3:', '\.vortex$', '\.arrow$'] }
     only: *s3-variants

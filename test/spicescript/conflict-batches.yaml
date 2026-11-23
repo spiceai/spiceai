@@ -192,15 +192,14 @@ steps:
   - query: SELECT CAST(id AS VARCHAR) || ':' || v AS r FROM tp
     expect: { rows: [['1:a1'], ['3:a3'], ['1:b1'], ['3:b3'], ['1:c1'], ['3:c3'], ['1:d1'], ['3:d3'], ['1:e1'], ['3:e3'], ['1:z1'], ['2:z2']] }
 
-  # Object-native data: the logs and data files of the file accelerations are in
-  # the state location, and nothing is at a local `s3:` path.
+  # Object-native data: the file accelerations' logs, and `lp`'s data files, are
+  # in the state location, and no data file is in the instance's directory.
+  # `tp`'s few rows stay inline in its log, so it has no `data/` file.
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/lp-, contains: /head, min: 1 }
     only: &s3-variants [upsert-object-native-s3, drop-object-native-s3, none-object-native-s3]
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/lp-, contains: /data/, min: 1 }
     only: *s3-variants
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/tp-, contains: /head, min: 1 }
     only: *s3-variants
-  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/tp-, contains: /data/, min: 1 }
-    only: *s3-variants
-  - assert-files: { lacks: '(^|/)s3:' }
+  - assert-files: { lacks: ['(^|/)s3:', '\.vortex$', '\.arrow$'] }
     only: *s3-variants

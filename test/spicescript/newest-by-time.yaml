@@ -206,12 +206,12 @@ steps:
     eventually: 30s
 
   # Object-native data: in file mode the accelerations' data files are in the
-  # state location, and nothing is at a local `s3:` path.
+  # state location, and no data file is in the instance's directory.
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/e_full-, contains: /data/, min: 1 }
     only: object-native-s3
     when: { mode: file }
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/, max: 0 }
     only: object-native-s3
     when: { mode: memory }
-  - assert-files: { lacks: '(^|/)s3:' }
+  - assert-files: { lacks: ['(^|/)s3:', '\.vortex$', '\.arrow$'] }
     only: object-native-s3
