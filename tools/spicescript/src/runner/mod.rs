@@ -830,7 +830,7 @@ async fn run_combination(
         // them.
         for (name, spec, _, _) in &resolved {
             if spec.shared {
-                sources.shared.insert(name.to_string());
+                sources.shared.insert(String::clone(name));
             }
         }
         let work = options.work_dir.join(run_id).join("sources");

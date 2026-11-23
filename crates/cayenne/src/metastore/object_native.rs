@@ -65,7 +65,7 @@ struct OpenSummary {
 /// How this instance holds a log's head.
 enum Head {
     /// It took the head over, and commits under its lease generation.
-    Writer(Writer),
+    Writer(Box<Writer>),
     /// It reads the head another instance writes, and follows its commits.
     Replica(Reader),
 }

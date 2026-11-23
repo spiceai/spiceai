@@ -133,7 +133,7 @@ impl Domain {
         match (&inner.head, role) {
             (Head::Replica(_), LeaseRole::Holder) => match inner.become_writer().await {
                 Ok(()) => {
-                    tracing::info!("{}", super::took_over_message(&dataset, &inner.location()))
+                    tracing::info!("{}", super::took_over_message(&dataset, &inner.location()));
                 }
                 Err(error) => tracing::warn!(
                     "{} holds its writer lease but could not take the dataset over, so it keeps serving queries as a replica and retries. Cause: {error}",
@@ -359,9 +359,10 @@ impl Domain {
             anchor,
             Arc::from(dataset),
             None,
-            data_writes.clone(),
         )
         .await?;
+        let mut inner = inner;
+        inner.data_writes = data_writes.clone();
         Ok(Self {
             opened,
             folder: String::new(),
@@ -981,27 +982,23 @@ impl Inner {
         anchor: Option<Arc<str>>,
         dataset: Arc<str>,
         held: Option<u64>,
-        data_writes: crate::catalog::DataWriteGate,
     ) -> CatalogResult<(Self, OpenSummary)> {
         let (reader, opened) = Reader::open(Arc::clone(&store), prefix.clone())
             .await
             .map_err(invalid)?;
-        let replayed = replay_state(opened)?;
+        let mut replayed = replay_state(opened)?;
         if config.access == Access::Replica {
-            data_writes.set(false);
-            return Ok(Self::replica(
+            let lease = reader.state().head.lease;
+            return Ok(Self::assemble(
                 store,
                 prefix,
                 config,
                 immediate,
                 anchor,
                 dataset,
-                reader,
-                replayed,
-                data_writes,
+                (Head::Replica(reader), lease, replayed),
             ));
         }
-        let mut replayed = replayed;
         if let Some(held) = held
             && reader.state().head.lease > held
         {
@@ -1037,36 +1034,14 @@ impl Inner {
             }
             replayed = replay_state(opened)?;
         }
-        let Replayed {
-            state,
-            floor_state,
-            since_floor,
-        } = replayed;
-        let opened = OpenSummary {
-            replayed: since_floor.len(),
-            lease: generation,
-        };
-        Ok((
-            Self {
-                collector: Arc::new(tokio::sync::Mutex::new(Collector::new(
-                    Arc::clone(&store),
-                    prefix.clone(),
-                    config.retain_below_floor,
-                ))),
-                reader: DatasetStateReader::from_state(state, store, prefix).with_anchor(anchor),
-                head: Head::Writer(writer),
-                data_writes,
-                stop: None,
-                recovering: false,
-                dataset,
-                config,
-                floor_state,
-                since_floor,
-                staged_checkpoint: 0,
-                pending: Vec::new(),
-                immediate,
-            },
-            opened,
+        Ok(Self::assemble(
+            store,
+            prefix,
+            config,
+            immediate,
+            anchor,
+            dataset,
+            (Head::Writer(Box::new(writer)), generation, replayed),
         ))
     }
     /// Whether a background task has to bring this log back.
@@ -1091,11 +1066,11 @@ impl Inner {
                     self.reader.anchor.clone(),
                     Arc::clone(&self.dataset),
                     Some(held),
-                    self.data_writes.clone(),
                 )
                 .await;
                 match reopened {
-                    Ok((reopened, _)) => {
+                    Ok((mut reopened, _)) => {
+                        reopened.data_writes = self.data_writes.clone();
                         // Changes buffered but never committed were never
                         // acknowledged; the reopened state is what committed.
                         *self = reopened;
@@ -1192,9 +1167,10 @@ impl Inner {
             self.reader.anchor.clone(),
             Arc::clone(&self.dataset),
             None,
-            self.data_writes.clone(),
         )
         .await?;
+        let mut writer = writer;
+        writer.data_writes = self.data_writes.clone();
         *self = writer;
         self.resolve_decided_transactions().await?;
         // Data writes are allowed only once the head is this instance's.
@@ -1227,18 +1203,17 @@ impl Inner {
 const FENCED_ON_REOPEN: &str = "another instance holds the log's newer lease";
 
 impl Inner {
-    /// A log opened as a replica, from what `reader` replayed.
-    #[expect(clippy::too_many_arguments, reason = "the fields of an opened log")]
-    fn replica(
+    /// The log `head` holds, from what it `replayed`: a writer at lease
+    /// generation `lease`, or a replica of the log at it. Its gate is set by the
+    /// caller, which owns the log's shared one.
+    fn assemble(
         store: Arc<dyn ObjectStore>,
         prefix: Path,
         config: NativeCatalogConfig,
         immediate: bool,
         anchor: Option<Arc<str>>,
         dataset: Arc<str>,
-        reader: Reader,
-        replayed: Replayed,
-        data_writes: crate::catalog::DataWriteGate,
+        (head, lease, replayed): (Head, u64, Replayed),
     ) -> (Self, OpenSummary) {
         let Replayed {
             state,
@@ -1247,7 +1222,11 @@ impl Inner {
         } = replayed;
         let opened = OpenSummary {
             replayed: since_floor.len(),
-            lease: reader.state().head.lease,
+            lease,
+        };
+        let stop = match head {
+            Head::Writer(_) => None,
+            Head::Replica(_) => Some(Stop::Replica),
         };
         (
             Self {
@@ -1257,9 +1236,9 @@ impl Inner {
                     config.retain_below_floor,
                 ))),
                 reader: DatasetStateReader::from_state(state, store, prefix).with_anchor(anchor),
-                head: Head::Replica(reader),
-                data_writes,
-                stop: Some(Stop::Replica),
+                head,
+                data_writes: crate::catalog::DataWriteGate::closed(),
+                stop,
                 recovering: false,
                 dataset,
                 config,
