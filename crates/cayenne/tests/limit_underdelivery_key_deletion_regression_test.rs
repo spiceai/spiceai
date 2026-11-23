@@ -63,6 +63,7 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::prelude::*;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::on_conflict::OnConflict;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -427,6 +428,12 @@ async fn limit_with_in_memory_cdc_deletes(
             assert!(
                 got.iter().all(|id| live.contains(id)),
                 "{durable_rows:?}: `{sql}` returned a deleted key: {got:?}"
+            );
+            let distinct: BTreeSet<i64> = got.iter().copied().collect();
+            assert_eq!(
+                distinct.len(),
+                got.len(),
+                "{durable_rows:?}: `{sql}` returned a key more than once: {got:?}"
             );
         }
     }
