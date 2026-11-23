@@ -958,9 +958,11 @@ durability effect; the object-native run also accepts an empty `Flush`.
 All four negative controls are based on `mem-tier-seal-delete-only`. They keep
 requiring their named downstream failure even if exhaustive exploration finds
 none; a missing failure is reported rather than relabeled safe or hidden. Bounds
-are three source applies, one seal, two explicit checkpoints, one bake attempt,
+are three source applies, two seals, two explicit checkpoints, one bake attempt,
 one full-rewrite attempt and one crash/recovery, with budgets retained across
-restart. Six threads and the shared 540-second watchdog apply.
+restart. The second seal is what lets a later seal acknowledge an apply that
+landed while an earlier seal was in flight; with one seal, the source redelivers
+that apply after a restart and `no-capture-reservation` has nothing to break. Six threads and the shared 540-second watchdog apply.
 
 ```sh
 nice -n 10 cargo build --release -p cayenne-metastore-model
@@ -1021,7 +1023,11 @@ records are stored separately in the symbolic catalog so this distinction also
 holds during recovery. Unreferenced physical file reclamation is not modeled.
 
 The bake merges all protected snapshots using partial deletion filters, tags the
-output with the capped delete fence, and prunes only the RAM index at that fence.
+output with the capped delete fence, and prunes only the RAM index, at or below
+the lower of that fence and the highest sequence among the snapshots it folds
+(`table.rs::bake_seq_prefix_protected_snapshots_inner`). A tombstone above the
+folded snapshots may still hide an inline seal shadow, which the bake does not
+fold.
 It retains durable vectors and insert records. The replay configures the
 existing `compaction_trigger_protected_snapshots` threshold to 2, so the engine
 keeps zero recent snapshots. The model enables `Bake` only with at least two
