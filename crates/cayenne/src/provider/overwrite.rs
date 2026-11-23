@@ -339,7 +339,9 @@ impl PreparedOverwrite {
                 false,
                 true,
                 0,
-                self.table.reserve_live_rows_delta().published(),
+                self.table
+                    .reserve_live_rows_delta()
+                    .published(self.table.statistics_epoch()),
             );
         }
 

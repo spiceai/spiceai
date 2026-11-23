@@ -647,7 +647,9 @@ impl CayenneCdcWrite {
             // that so we can re-arm the recovery flags after `finish()` clears
             // them (see the re-arm after `finish()` below).
             let mut staging_wal_removal_failed = false;
-            let superseded_rows = if let Some(prepared_on_conflict) = self.prepared_on_conflict {
+            let (superseded_rows, statistics_epoch) = if let Some(prepared_on_conflict) =
+                self.prepared_on_conflict
+            {
                 // Authoritative superseded-row count, captured at validation time.
                 // Do NOT recompute from `deleted_pk_i64`/`deleted_row_keys`: for an
                 // `Int64Pk` table those hold the SAME deletions in two encodings, so
@@ -769,17 +771,18 @@ impl CayenneCdcWrite {
                     "publish_deletion_apply",
                     deletion_apply_start,
                 );
-                superseded
+                (superseded, self.table.statistics_epoch())
             } else {
-                prepared_append.apply_under_barrier().await?;
-                0
+                (0, prepared_append.apply_under_barrier().await?)
             };
             // Both branches above have made this commit's rows visible. From
             // here the claim survives a cancellation or a failure — `finish()`
             // and `sequence_high_water()` below are both suspension points, and
             // a commit that dies at one has published rows it will never queue a
             // delta for.
-            let published_live_rows_delta = reserved_live_rows_delta.published();
+            let published_live_rows_delta = reserved_live_rows_delta.published(statistics_epoch);
+            #[cfg(test)]
+            self.table.run_test_post_staged_publish_hook().await;
             let rows = prepared_append.finish().await?;
             if staging_wal_removal_failed {
                 // `finish()` -> `mark_inflight_complete()` just cleared
@@ -1094,7 +1097,7 @@ impl OneRecordPublish {
                 "publish_deletion_apply",
                 deletion_apply_start,
             );
-            reserved_live_rows_delta.published()
+            reserved_live_rows_delta.published(table.statistics_epoch())
         };
         let rows = prepared_append.row_count();
         if let Err(error) = prepared_append.finish().await {
@@ -2977,6 +2980,10 @@ pub struct CayenneTableProvider {
     /// in that window. Consumed on first fire.
     #[cfg(test)]
     test_post_inline_publish_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired by a pipelined staged append after it publishes its
+    /// rows and before it queues their live-row delta. Consumed on first fire.
+    #[cfg(test)]
+    test_post_staged_publish_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Test-only seam fired by the inline write after it commits its rows to the
     /// metastore and before it publishes them, so a test can land a checkpoint in
     /// that window. Consumed on first fire.
@@ -7717,6 +7724,17 @@ impl CayenneTableProvider {
             // The overwrite's catalog commit deleted every inline row of this table,
             // any seal shadow included, so no bake has a shadow left to clear.
             self.mem_tier_shadow_present.store(false, Ordering::Release);
+            {
+                // The statistics of the replaced rows go with them, in the same
+                // flip: a write that published before it stamped the old epoch
+                // and its delta is dropped, and a persist in progress finishes
+                // before the cached aggregate is cleared. Fence, then persistence
+                // lock: the order schema evolution and checkpoints take.
+                let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
+                self.post_write_maintenance
+                    .start_statistics_epoch_after_overwrite();
+                self.clear_cached_table_statistics_unlocked();
+            }
             self.publish_overwrite_snapshot_fenced(
                 new_snapshot_id,
                 new_listing_table,
@@ -12378,6 +12396,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_post_inline_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_post_staged_publish_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_pre_inline_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_prepare_hook: Arc::new(ParkingMutex::new(None)),
@@ -14946,6 +14966,8 @@ impl CayenneTableProvider {
             test_post_keyset_capture_hook: Arc::clone(&self.test_post_keyset_capture_hook),
             #[cfg(test)]
             test_post_inline_publish_hook: Arc::clone(&self.test_post_inline_publish_hook),
+            #[cfg(test)]
+            test_post_staged_publish_hook: Arc::clone(&self.test_post_staged_publish_hook),
             #[cfg(test)]
             test_pre_inline_publish_hook: Arc::clone(&self.test_pre_inline_publish_hook),
             #[cfg(test)]
@@ -26365,6 +26387,11 @@ impl CayenneTableProvider {
         self.post_write_maintenance.reserve_live_rows_delta()
     }
 
+    /// See [`PostWriteMaintenance::statistics_epoch`].
+    pub(crate) fn statistics_epoch(&self) -> u64 {
+        self.post_write_maintenance.statistics_epoch()
+    }
+
     /// Queue post-write maintenance for a commit.
     ///
     /// `published` is the claim the caller staked with
@@ -26389,6 +26416,14 @@ impl CayenneTableProvider {
 
         {
             let mut maintenance_state = self.post_write_maintenance.state.lock();
+            // Published before an overwrite that has since replaced its rows:
+            // the overwrite's count already describes the table without them.
+            let (stats, live_rows_delta) =
+                if published.statistics_epoch() == self.post_write_maintenance.statistics_epoch() {
+                    (stats, live_rows_delta)
+                } else {
+                    (None, 0)
+                };
             if let Some(stats) = stats {
                 if let Some(existing) = &maintenance_state.stats {
                     existing.merge_from(&stats);
@@ -35033,6 +35068,16 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Fire (and consume) the test-only post-staged-publish hook, if one is
+    /// installed. See [`Self::test_post_staged_publish_hook`].
+    #[cfg(test)]
+    async fn run_test_post_staged_publish_hook(&self) {
+        let hook = self.test_post_staged_publish_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
     /// Fire (and consume) the test-only pre-inline-publish hook, if one is
     /// installed. See [`Self::test_pre_inline_publish_hook`].
     #[cfg(test)]
@@ -35713,7 +35758,7 @@ impl CayenneTableProvider {
 
     /// [`Self::persist_table_stats`] for statistics a maintenance pass took
     /// from the queue under `statistics_epoch`. Returns `true` without
-    /// persisting when an overwrite has discarded the queue since: the rows
+    /// persisting when an overwrite has started a new epoch since: the rows
     /// these statistics describe were replaced, and the overwrite's count
     /// already describes the table without them.
     async fn persist_queued_table_stats(
@@ -35723,10 +35768,7 @@ impl CayenneTableProvider {
         statistics_epoch: u64,
     ) -> bool {
         let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
-        if !self
-            .post_write_maintenance
-            .statistics_epoch_is(statistics_epoch)
-        {
+        if self.post_write_maintenance.statistics_epoch() != statistics_epoch {
             return true;
         }
         self.persist_table_stats_locked(accumulator, num_rows_update, false)
@@ -35735,19 +35777,15 @@ impl CayenneTableProvider {
 
     /// Replace the aggregate entirely with the overwrite's accumulator and reset
     /// the live count to the rewritten row count (the prior data is gone, so the
-    /// old min/max/NDV must not survive — see [`RowCountUpdate`]).
-    ///
-    /// Statistics still queued for post-write maintenance describe writes the
-    /// overwrite replaced, so they are discarded under the same lock, before
-    /// the count is set.
+    /// old min/max/NDV must not survive — see [`RowCountUpdate`]). The flip in
+    /// [`Self::publish_overwrite_snapshot`] has already dropped the statistics
+    /// queued for the replaced rows and the cached aggregate.
     pub(crate) async fn reset_table_stats_after_overwrite(
         &self,
         accumulator: &ColumnStatsAccumulator,
         live_rows: Option<u64>,
     ) {
         let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
-        self.post_write_maintenance.discard_queued_statistics();
-        self.clear_cached_table_statistics_unlocked();
         // The accumulator counts every row written; an overwrite that hid some of
         // them with position deletes passes the rows that stay live.
         let new_rows = live_rows.map_or_else(
@@ -40971,7 +41009,8 @@ impl CayenneTableProvider {
                 false,
                 true,
                 0,
-                self.reserve_live_rows_delta().published(),
+                self.reserve_live_rows_delta()
+                    .published(self.statistics_epoch()),
             );
         }
     }
@@ -47990,17 +48029,21 @@ impl InlinedWritePublish {
     /// visible (generation bump) and hiding the superseded file-backed row
     /// (deletion cache) under one `.write()` closes the duplicate-key window.
     /// Only synchronous in-memory work runs under the guard.
-    pub(crate) async fn run(self) {
+    ///
+    /// Returns the statistics epoch the rows were published under.
+    pub(crate) async fn run(self) -> u64 {
         if self.total_rows == 0 {
-            return;
+            return self.table.statistics_epoch();
         }
         let table = &self.table;
         #[cfg(test)]
         table.run_test_pre_inline_publish_hook().await;
+        let statistics_epoch;
         let maintained_aggregate_insert = {
             let _visibility = table.visibility_lock_arc().lock_owned().await;
             let _fence = table.lock_listing_fence_write_owned().await;
             let _view_guard = table.scan_state_lock.write().await;
+            statistics_epoch = table.statistics_epoch();
             table.release_replaced_inlined_entries(&self.awaiting_publish);
             if let Some(commit) = self.commit {
                 // `inlined_row_count` must reflect the actual number of rows
@@ -48045,6 +48088,7 @@ impl InlinedWritePublish {
             file_pk_deletions = self.file_deleted_pk_i64.len() + self.file_deleted_row_keys.len(),
             "Inlined write"
         );
+        statistics_epoch
     }
 }
 
@@ -73909,7 +73953,9 @@ mod tests {
             false,
             false,
             QUEUED_DELTA,
-            provider.reserve_live_rows_delta().published(),
+            provider
+                .reserve_live_rows_delta()
+                .published(provider.statistics_epoch()),
         );
 
         let stats = provider
@@ -73973,6 +74019,126 @@ mod tests {
                 stats.num_rows,
             );
         }
+    }
+
+    /// A hook that reports it was reached, then waits to be released.
+    fn parking_hook() -> (
+        TestPostCaptureHook,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let hook: TestPostCaptureHook = Box::new(move || {
+            Box::pin(async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+            })
+        });
+        (hook, entered_rx, release_tx)
+    }
+
+    /// Replace the table's rows with ids `100..100 + rows`.
+    async fn overwrite_with_rows(provider: &CayenneTableProvider, rows: i64) {
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let prepared = provider
+            .begin_overwrite(
+                single_batch_stream(id_value_batch_for_range(schema, 100, rows)),
+                1,
+            )
+            .await
+            .expect("begin the overwrite");
+        prepared
+            .apply_owned_txn()
+            .await
+            .expect("commit the overwrite");
+        prepared.finish().await.expect("publish the overwrite");
+    }
+
+    /// The persisted and the served row count, once maintenance has drained.
+    async fn drained_row_counts(
+        provider: &CayenneTableProvider,
+        catalog: &Arc<dyn MetadataCatalog>,
+    ) -> ((i64, bool), DFPrecision<usize>) {
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+        let persisted = catalog
+            .get_table_statistics(&provider.table_metadata.table_id)
+            .await
+            .expect("read table statistics")
+            .expect("table statistics exist");
+        let served = provider
+            .optimizer_table_statistics()
+            .expect("optimizer statistics")
+            .num_rows;
+        ((persisted.num_rows, persisted.num_rows_exact), served)
+    }
+
+    /// A maintenance pass that took a write's queued statistics before an
+    /// overwrite and persists them after it must not add the replaced rows to
+    /// the overwrite's count.
+    #[tokio::test]
+    async fn overwrite_discards_statistics_taken_by_in_flight_maintenance() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_append_only_table("overwrite_in_flight_maintenance", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let (hook, entered, release) = parking_hook();
+        *provider.test_pre_maintenance_statistics_hook.lock() = Some(hook);
+        insert_batch(&provider, id_value_batch_for_range(schema, 0, 3)).await;
+        tokio::time::timeout(Duration::from_secs(30), entered)
+            .await
+            .expect("maintenance takes the insert's statistics")
+            .expect("maintenance reports the take");
+
+        overwrite_with_rows(&provider, 2).await;
+        release.send(()).expect("release maintenance");
+
+        assert_eq!(
+            drained_row_counts(&provider, &catalog).await,
+            ((2, true), DFPrecision::Exact(2))
+        );
+    }
+
+    /// A pipelined staged append that published its rows before an overwrite
+    /// and queues its delta after it must not add the replaced rows to the
+    /// overwrite's count.
+    #[tokio::test]
+    async fn overwrite_discards_the_delta_of_a_staged_append_published_before_it() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_append_only_table("overwrite_staged_append", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let staged = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch_for_range(schema, 0, 3)),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("staged CDC append prepares");
+        assert!(staged.has_pending_finalize(), "the append owes a publish");
+
+        let (hook, entered, release) = parking_hook();
+        *provider.test_post_staged_publish_hook.lock() = Some(hook);
+        let race = async {
+            tokio::time::timeout(Duration::from_secs(30), entered)
+                .await
+                .expect("the append publishes its rows")
+                .expect("the append reports its publish");
+            overwrite_with_rows(&provider, 2).await;
+            release.send(()).expect("release the append");
+        };
+        let (finished, ()) = tokio::join!(staged.finish(), race);
+        assert_eq!(finished.expect("the append finishes"), 3);
+
+        assert_eq!(
+            drained_row_counts(&provider, &catalog).await,
+            ((2, true), DFPrecision::Exact(2))
+        );
     }
 
     /// A commit must claim its live-row delta *before* it publishes the rows
@@ -74210,7 +74376,9 @@ mod tests {
             false,
             false,
             0,
-            provider.reserve_live_rows_delta().published(),
+            provider
+                .reserve_live_rows_delta()
+                .published(provider.statistics_epoch()),
         );
         // ...and the in-lock exit: there is maintenance to do, just no row-count
         // delta behind it.
@@ -74219,7 +74387,9 @@ mod tests {
             true,
             false,
             0,
-            provider.reserve_live_rows_delta().published(),
+            provider
+                .reserve_live_rows_delta()
+                .published(provider.statistics_epoch()),
         );
 
         provider
@@ -74537,7 +74707,7 @@ mod tests {
         provider
             .run_maintenance_state(
                 queued,
-                provider.post_write_maintenance.statistics_epoch(),
+                provider.statistics_epoch(),
                 RetentionFailureAction::Requeue,
             )
             .await
@@ -74566,7 +74736,7 @@ mod tests {
         provider
             .run_maintenance_state(
                 queued,
-                provider.post_write_maintenance.statistics_epoch(),
+                provider.statistics_epoch(),
                 RetentionFailureAction::ReturnError,
             )
             .await
@@ -74668,7 +74838,7 @@ mod tests {
         provider
             .run_maintenance_state(
                 requested(),
-                provider.post_write_maintenance.statistics_epoch(),
+                provider.statistics_epoch(),
                 RetentionFailureAction::Requeue,
             )
             .await
@@ -74689,7 +74859,7 @@ mod tests {
         provider
             .run_maintenance_state(
                 requested(),
-                provider.post_write_maintenance.statistics_epoch(),
+                provider.statistics_epoch(),
                 RetentionFailureAction::Requeue,
             )
             .await

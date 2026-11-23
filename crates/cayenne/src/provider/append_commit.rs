@@ -152,7 +152,7 @@ impl PreparedResolvedAppend {
         let cas_start = Instant::now();
         self.table.publish_prepared_on_conflict_deletions(prepared);
         self.table.feed_staged_ivm_under_fence(None);
-        let published_delta = reserved_delta.published();
+        let published_delta = reserved_delta.published(self.table.statistics_epoch());
         let retention = self.table.has_retention_delete_filters();
         let delta = i64::try_from(self.rows)
             .unwrap_or(i64::MAX)

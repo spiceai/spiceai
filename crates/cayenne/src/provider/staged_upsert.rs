@@ -433,7 +433,8 @@ impl PreparedTxnCommit {
         // retraction+insert deltas for incremental maintenance is a follow-up.
         self.table.feed_staged_ivm_under_fence(None);
         // The rows are visible now, so the claim survives from here.
-        let published_live_rows_delta = reserved_live_rows_delta.published();
+        let published_live_rows_delta =
+            reserved_live_rows_delta.published(self.table.statistics_epoch());
         let retention_requested = self.table.has_retention_delete_filters();
         let live_rows_delta = i64::try_from(self.row_count)
             .unwrap_or(i64::MAX)

@@ -28,6 +28,7 @@ use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::metadata::CreateTableOptions;
 use cayenne::{CayenneTableProvider, MetadataCatalog};
+use datafusion::common::stats::Precision;
 use datafusion::prelude::*;
 use std::sync::Arc;
 
@@ -143,6 +144,11 @@ async fn query_count(ctx: &SessionContext, table_name: &str) -> usize {
 /// After overwrite, stats should reflect only the new data, including once the
 /// post-write maintenance queued by the replaced writes has drained. Covers an
 /// overwrite that lands in the inline tier and one written to data files.
+///
+/// The insert's statistics reach the metastore on a debounced maintenance pass,
+/// so whether that pass runs before, during or after the overwrite depends on
+/// timing; on a fast run it usually comes after. The crate's unit tests
+/// `overwrite_discards_*` hold the pass and the publish at fixed points.
 async fn test_stats_correct_after_overwrite(fixture: common::TestFixture) -> TestResult {
     let schema = simple_schema();
     let (table, ctx) = create_table_no_pk(&fixture, "stats_overwrite", Arc::clone(&schema)).await;
@@ -151,21 +157,22 @@ async fn test_stats_correct_after_overwrite(fixture: common::TestFixture) -> Tes
 
     ctx.register_table("stats_overwrite", Arc::new(table))?;
 
+    // Rows resident in the inline tier keep the served count inexact.
     let overwrites = [
         (
             "INSERT OVERWRITE stats_overwrite SELECT * FROM (VALUES (99,990),(100,1000))",
             2,
+            Precision::Inexact(2),
         ),
         // Above the inline row cap, so the replacement is written to data files.
         (
             "INSERT OVERWRITE stats_overwrite \
              SELECT v AS id, v AS value FROM (SELECT UNNEST(range(0, 2000)) AS v)",
             2000,
+            Precision::Exact(2000),
         ),
     ];
-    for (overwrite, expected_rows) in overwrites {
-        // Its statistics are queued for post-write maintenance when the
-        // overwrite starts.
+    for (overwrite, expected_rows, expected_served) in overwrites {
         ctx.sql("INSERT INTO stats_overwrite SELECT * FROM (VALUES (1,10),(2,20),(3,30))")
             .await?
             .collect()
@@ -197,8 +204,7 @@ async fn test_stats_correct_after_overwrite(fixture: common::TestFixture) -> Tes
             .optimizer_table_statistics()
             .expect("optimizer statistics");
         assert_eq!(
-            optimizer.num_rows.get_value(),
-            Some(&usize::try_from(expected_rows)?),
+            optimizer.num_rows, expected_served,
             "the table statistics the planner reads count only the new rows"
         );
 
