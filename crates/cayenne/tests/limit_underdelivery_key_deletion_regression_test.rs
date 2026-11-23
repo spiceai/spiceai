@@ -275,10 +275,11 @@ async fn count_star(ctx: &SessionContext) -> TestResult<i64> {
 /// How the durable rows reach the table before the in-memory deletes.
 #[derive(Clone, Copy, Debug)]
 enum DurableRows {
-    /// A whole-table overwrite writes them to the current snapshot.
+    /// A whole-table overwrite of the first quarter, then three appends, write
+    /// them to the current snapshot as four or more files.
     Overwrite,
-    /// The same overwrite, then the table is reopened, so the in-memory deletes
-    /// and the queries run on a provider that has not served a scan yet.
+    /// The same writes, then the table is reopened, so the in-memory deletes and
+    /// the queries run on a provider that has not served a scan yet.
     OverwriteThenReopen,
     /// CDC upserts land in the in-memory tier; a checkpoint after each of four
     /// batches writes them to files.
@@ -307,6 +308,11 @@ async fn limit_with_in_memory_cdc_deletes(
             cdc_mem_tier_seal_age_ms: 0,
             compaction_background_interval_ms: 3_600_000,
             inline_max_rows: 0,
+            // One encoder per write, whatever the host's cores, so each write
+            // below lands in its own file on every machine; and no small-file
+            // compaction to merge those files back together.
+            write_concurrency: Some(1),
+            compaction_trigger_files: usize::MAX,
             ..VortexConfig::default()
         },
     };
@@ -321,12 +327,19 @@ async fn limit_with_in_memory_cdc_deletes(
 
     match durable_rows {
         DurableRows::Overwrite | DurableRows::OverwriteThenReopen => {
-            let rows = id_value_rows(1..=MEM_TIER_ROWS)?;
-            let input = MemorySourceConfig::try_new_exec(&[vec![rows]], pk_schema(), None)?;
-            let plan = table
-                .insert_into(&ctx.state(), input, InsertOp::Overwrite)
-                .await?;
-            datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
+            let per_write = MEM_TIER_ROWS / 4;
+            for write in 0..4 {
+                let first = write * per_write + 1;
+                let rows = id_value_rows(first..=first + per_write - 1)?;
+                let input = MemorySourceConfig::try_new_exec(&[vec![rows]], pk_schema(), None)?;
+                let op = if write == 0 {
+                    InsertOp::Overwrite
+                } else {
+                    InsertOp::Append
+                };
+                let plan = table.insert_into(&ctx.state(), input, op).await?;
+                datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
+            }
         }
         DurableRows::CdcCheckpoints => {
             let per_batch = MEM_TIER_ROWS / 4;
