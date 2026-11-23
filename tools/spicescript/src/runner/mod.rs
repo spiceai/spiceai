@@ -967,7 +967,7 @@ async fn run_combination(
     .await;
 
     if let Some(root) = &options.log_capture
-        && (result.is_err() || !report.failures.is_empty())
+        && (result.is_err() || !report.failures.is_empty() || script.name == "diag-16625")
     {
         let dir = combination_capture_dir(&capture_dir(root, script), script, run_label);
         capture_combination(&sources, run_id, &options.work_dir.join(run_id), &dir).await;

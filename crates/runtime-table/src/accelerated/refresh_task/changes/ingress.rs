@@ -643,6 +643,24 @@ impl RefreshTask {
             ),
             Err(e) => tracing::warn!(target: "diag16625", "DIAG16625 count {tag} failed: {e}"),
         }
+        // The o_id % 55 = 0 rows with their o_weight: a doubled weight (o_id * 0.25) came
+        // from the replayed UPDATE, o_id * 0.125 from the rebuild or a staged write.
+        let sql = "SELECT o_id, o_weight FROM diag_t WHERE o_id % 55 = 0 ORDER BY o_id LIMIT 40";
+        let weights = match ctx.sql(sql).await {
+            Ok(df) => df.collect().await,
+            Err(e) => Err(e),
+        };
+        match weights {
+            Ok(rows) => tracing::warn!(
+                target: "diag16625",
+                "DIAG16625 weights {tag} dataset={} {}",
+                self.dataset_name,
+                arrow::util::pretty::pretty_format_batches(&rows)
+                    .map(|t| t.to_string().replace('\n', " "))
+                    .unwrap_or_default()
+            ),
+            Err(e) => tracing::warn!(target: "diag16625", "DIAG16625 weights {tag} failed: {e}"),
+        }
     }
 
     async fn source_error(&self, context: &ApplyContext<'_>, error: &DataFusionError) {
