@@ -54,5 +54,28 @@ class Medians(unittest.TestCase):
             self.assertEqual(update_durations.medians(files), {SCRIPT: 201})
 
 
+class WriteDurations(unittest.TestCase):
+    def test_each_script_is_rewritten_in_its_own_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            durations = Path(d) / "test/spicescript/recordings/durations"
+            durations.mkdir(parents=True)
+            (durations / "full-refresh-chaos").write_text("100\n")
+            (durations / "auth").write_text("4\n")
+            changed = update_durations.write_durations(Path(d), {
+                SCRIPT: 458,
+                "test/spicescript/auth.yaml": 4,
+            })
+            self.assertEqual(changed, 1)
+            self.assertEqual((durations / "full-refresh-chaos").read_text(), "458\n")
+            self.assertEqual((durations / "auth").read_text(), "4\n")
+
+    def test_a_script_without_a_recorded_duration_gets_none(self):
+        with tempfile.TemporaryDirectory() as d:
+            durations = Path(d) / "test/spicescript/recordings/durations"
+            durations.mkdir(parents=True)
+            self.assertEqual(update_durations.write_durations(Path(d), {SCRIPT: 458}), 0)
+            self.assertEqual(list(durations.iterdir()), [])
+
+
 if __name__ == "__main__":
     unittest.main()

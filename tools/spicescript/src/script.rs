@@ -75,11 +75,11 @@ pub struct Script {
     #[serde(skip)]
     pub steps: Vec<Step>,
     /// How long the script takes to run, every matrix combination included,
-    /// as recorded in `recordings/durations.json` beside it (see
+    /// as recorded in its file under `recordings/durations/` beside it (see
     /// [`Script::load`]). `--jobs` starts the longest scripts first.
     #[serde(skip)]
     pub duration: Option<Duration>,
-    /// The script file's name without `.yaml`: its key in the durations file.
+    /// The script file's name without `.yaml`: the name of its duration file.
     #[serde(skip)]
     pub file_stem: String,
     /// The directory the script is in; `corpus` and `slt` files are relative to it.
@@ -994,7 +994,7 @@ pub enum Timing {
 
 impl Script {
     /// Loads a script file. Its run time must be recorded in
-    /// `recordings/durations.json` beside it, unless `duration_optional` (a
+    /// `recordings/durations/<script>` beside it, unless `duration_optional` (a
     /// run that records durations, which is how a new script gets one).
     pub fn load(path: &Path, duration_optional: bool) -> Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -1008,34 +1008,29 @@ impl Script {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        script.duration = read_durations(base)?
-            .get(&script.file_stem)
-            .map(|s| Duration::from_secs(*s));
+        script.duration = read_duration(base, &script.file_stem)?;
         ensure!(
             duration_optional || script.duration.is_some(),
             "Script {} has no recorded duration in {}. Run it with --record-durations to record one.",
             path.display(),
-            base.join(DURATIONS_FILE).display()
+            duration_file(base, &script.file_stem).display()
         );
         Ok(script)
     }
 
-    /// Records how long the scripts in `dir` took, by file name, in
-    /// `dir/recordings/durations.json`, keeping the entries of the others.
+    /// Records how long the scripts in `dir` took, in whole seconds rounded
+    /// up, each in its own file under `dir/recordings/durations/`.
     pub fn record_durations(dir: &Path, took: &[(String, Duration)]) -> Result<()> {
-        let mut all = read_durations(dir)?;
+        let durations = dir.join(DURATIONS_DIR);
+        std::fs::create_dir_all(&durations)
+            .with_context(|| format!("Failed to create {}", durations.display()))?;
         for (stem, duration) in took {
-            all.insert(
-                stem.clone(),
-                duration.as_secs() + u64::from(duration.subsec_nanos() > 0),
-            );
+            let seconds = duration.as_secs() + u64::from(duration.subsec_nanos() > 0);
+            let path = duration_file(dir, stem);
+            std::fs::write(&path, format!("{seconds}\n"))
+                .with_context(|| format!("Failed to write {}", path.display()))?;
         }
-        let path = dir.join(DURATIONS_FILE);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, serde_json::to_string_pretty(&all)? + "\n")
-            .with_context(|| format!("Failed to write {}", path.display()))
+        Ok(())
     }
 
     /// Keeps only the matrix values and variants `selection` names, and
@@ -2961,18 +2956,31 @@ mod opt_duration {
     }
 }
 
-/// Where a directory's scripts record their run times, in whole seconds by
-/// file name.
-pub const DURATIONS_FILE: &str = "recordings/durations.json";
+/// Where a directory's scripts record their run times: one file per script,
+/// named for the script and holding its whole seconds. Branches that add or
+/// re-record different scripts then change different files, and merge.
+pub const DURATIONS_DIR: &str = "recordings/durations";
 
-/// The recorded run times of the scripts in `dir`; none if it has no file.
-fn read_durations(dir: &Path) -> Result<std::collections::BTreeMap<String, u64>> {
-    let path = dir.join(DURATIONS_FILE);
+/// The file that holds the recorded run time of the script `stem` in `dir`.
+fn duration_file(dir: &Path, stem: &str) -> std::path::PathBuf {
+    dir.join(DURATIONS_DIR).join(stem)
+}
+
+/// The recorded run time of the script `stem` in `dir`; none if it has no file.
+fn read_duration(dir: &Path, stem: &str) -> Result<Option<Duration>> {
+    let path = duration_file(dir, stem);
     match std::fs::read_to_string(&path) {
-        Ok(text) => {
-            serde_json::from_str(&text).with_context(|| format!("Invalid {}", path.display()))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(std::collections::BTreeMap::new()),
+        Ok(text) => text
+            .trim()
+            .parse()
+            .map(|seconds| Some(Duration::from_secs(seconds)))
+            .with_context(|| {
+                format!(
+                    "Invalid {}: expected a whole number of seconds",
+                    path.display()
+                )
+            }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("Failed to read {}", path.display())),
     }
 }
@@ -2980,6 +2988,82 @@ fn read_durations(dir: &Path) -> Result<std::collections::BTreeMap<String, u64>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty directory holding the scripts `names`, for one test.
+    fn script_dir(test: &str, names: &[&str]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "spicescript-durations-{test}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the script directory");
+        for name in names {
+            std::fs::write(
+                dir.join(format!("{name}.yaml")),
+                format!("name: {name}\nspicepod: {{}}\nsteps: []"),
+            )
+            .expect("write the script");
+        }
+        dir
+    }
+
+    #[test]
+    fn a_duration_is_recorded_in_the_scripts_own_file_and_loaded_from_it() {
+        let dir = script_dir("round-trip", &["first", "second"]);
+        let recorded = |name: &str| {
+            std::fs::read_to_string(dir.join(DURATIONS_DIR).join(name))
+                .expect("read the duration file")
+        };
+        Script::record_durations(&dir, &[("first".to_string(), Duration::from_millis(1200))])
+            .expect("record first");
+        Script::record_durations(&dir, &[("second".to_string(), Duration::from_secs(7))])
+            .expect("record second");
+        // A part of a second rounds up, and recording one script leaves the other's file alone.
+        assert_eq!(recorded("first"), "2\n");
+        assert_eq!(recorded("second"), "7\n");
+        for (name, seconds) in [("first", 2), ("second", 7)] {
+            let script = Script::load(&dir.join(format!("{name}.yaml")), false).expect("load");
+            assert_eq!(script.duration, Some(Duration::from_secs(seconds)));
+        }
+        std::fs::remove_dir_all(&dir).expect("remove the script directory");
+    }
+
+    #[test]
+    fn a_script_without_a_duration_file_is_refused_unless_recording() {
+        let dir = script_dir("missing", &["first", "second"]);
+        Script::record_durations(&dir, &[("first".to_string(), Duration::from_secs(3))])
+            .expect("record first");
+        let path = dir.join("second.yaml");
+        let error = Script::load(&path, false).expect_err("second has no duration");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Script {} has no recorded duration in {}. Run it with --record-durations to record one.",
+                path.display(),
+                dir.join("recordings/durations/second").display()
+            )
+        );
+        let script = Script::load(&path, true).expect("load while recording");
+        assert_eq!(script.duration, None);
+        std::fs::remove_dir_all(&dir).expect("remove the script directory");
+    }
+
+    #[test]
+    fn a_duration_file_must_hold_whole_seconds() {
+        let dir = script_dir("invalid", &["first"]);
+        let file = dir.join(DURATIONS_DIR).join("first");
+        std::fs::create_dir_all(dir.join(DURATIONS_DIR)).expect("create the durations directory");
+        std::fs::write(&file, "1.5\n").expect("write the duration file");
+        let error = Script::load(&dir.join("first.yaml"), false).expect_err("1.5 is not whole");
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "Invalid {}: expected a whole number of seconds: invalid digit found in string",
+                file.display()
+            )
+        );
+        std::fs::remove_dir_all(&dir).expect("remove the script directory");
+    }
 
     #[test]
     fn tags_parse() {

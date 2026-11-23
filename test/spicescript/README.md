@@ -31,4 +31,4 @@ the script between runs without changing what it does.
 | `corpus/` | SQL corpora that `corpus` steps run, and the Python scripts that generate the literal matrices. |
 | `seed/` | Source fixtures loaded by `source-exec: { file }`. |
 | `slt/`, `slt-sqlite/` | sqllogictest files. |
-| `recordings/` | Run times per script (`durations.json`), in every directory with scripts, and the expected failures (`expected-failures.json`). `update_durations.py` rewrites the run times from recent CI runs, which `--partition` balances the CI shards by. |
+| `recordings/` | Each script's run time in whole seconds (`durations/<script>`, one file per script), in every directory with scripts, and the expected failures (`expected-failures.json`). `update_durations.py` rewrites the run times from recent CI runs, which `--partition` balances the CI shards by. |

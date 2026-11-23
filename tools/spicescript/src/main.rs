@@ -509,7 +509,7 @@ async fn run(cli: Cli) -> Result<bool> {
         );
     }
     if cli.record_durations {
-        // By directory, each into its own durations file.
+        // By directory: each script's duration goes in a file beside it.
         let mut by_dir: std::collections::BTreeMap<
             std::path::PathBuf,
             Vec<(String, std::time::Duration)>,
