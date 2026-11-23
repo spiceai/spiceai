@@ -29,6 +29,7 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::{common::TableReference, sql::sqlparser};
 use datafusion_expr::sqlparser::ast::LimitClause;
 use itertools::Itertools;
+use runtime_query_engine::sql_depth_guard::ensure_statement_within_depth_limits;
 use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
 
@@ -187,6 +188,12 @@ pub enum Error {
     UnableToParseSql { source: DataFusionError },
 
     #[snafu(display(
+        "The provided Refresh SQL is too complex to run. {}",
+        format_datafusion_error(source)
+    ))]
+    TooComplex { source: DataFusionError },
+
+    #[snafu(display(
         "Expected a single SQL statement for the refresh SQL, found {num_statements}. Rewrite the SQL to only contain a single SELECT statement."
     ))]
     ExpectedSingleSqlStatement { num_statements: usize },
@@ -242,7 +249,8 @@ macro_rules! ensure_no_expr {
 ///
 /// # Errors
 ///
-/// Returns an error if `refresh_sql` is not a single `SELECT` statement, selects
+/// Returns an error if `refresh_sql` is not a single `SELECT` statement, exceeds
+/// the query engine's SQL depth limits (as a query over `/v1/sql` would), selects
 /// from a table other than `expected_table`, projects a column absent from
 /// `source_schema`, or uses a construct the refresh path cannot honor (`GROUP BY`,
 /// a non-column projection, or an unsupported `LIMIT` clause).
@@ -261,6 +269,7 @@ pub fn parse_refresh_sql(
     }
 
     let statement = statements.pop_front().context(MissingStatementSnafu)?;
+    ensure_statement_within_depth_limits(&statement).context(TooComplexSnafu)?;
     match statement {
         Statement::Statement(statement) => match statement.as_ref() {
             SQLStatement::Query(query) => {

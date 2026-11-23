@@ -564,6 +564,12 @@ pub(crate) async fn refresh(
     ),
     responses(
         (status = 200, description = "The refresh SQL was updated successfully."),
+        (status = 400, description = "The refresh SQL is invalid for the dataset; its refresh SQL is unchanged", content((
+            MessageResponse = "application/json",
+            example = json!({
+                "message": "Request failed. The provided Refresh SQL could not be parsed. Check the SQL for syntax errors."
+            })
+        ))),
         (status = 404, description = "The specified dataset was not found", content((
             MessageResponse = "application/json",
             example = json!({
@@ -622,6 +628,13 @@ pub(crate) async fn acceleration(
         .await
     {
         Ok(()) => (status::StatusCode::OK).into_response(),
+        Err(e @ crate::datafusion::Error::RefreshSql { .. }) => (
+            status::StatusCode::BAD_REQUEST,
+            Json(MessageResponse {
+                message: format!("Request failed. {e}"),
+            }),
+        )
+            .into_response(),
         Err(e) => (
             status::StatusCode::INTERNAL_SERVER_ERROR,
             Json(MessageResponse {

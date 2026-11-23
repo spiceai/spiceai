@@ -49,6 +49,8 @@ mod model_capability_tests;
 mod mtls;
 pub(crate) mod optional_json;
 mod response_outcome;
+#[cfg(test)]
+mod refresh_sql_depth_tests;
 mod routes;
 mod server_timing;
 #[cfg(test)]

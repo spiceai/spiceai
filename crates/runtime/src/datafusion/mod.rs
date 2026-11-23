@@ -6599,6 +6599,11 @@ impl DataFusion {
             }
             .fail();
         }
+        sql_depth_guard::ensure_statement_within_depth_limits(&statements[0]).map_err(|e| {
+            Error::UnableToCreateView {
+                reason: format_datafusion_error(&e),
+            }
+        })?;
 
         let ctx = Arc::clone(&self.ctx);
         let df_ref = Arc::clone(self);

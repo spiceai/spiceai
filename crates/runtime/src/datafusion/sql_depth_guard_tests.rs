@@ -241,3 +241,77 @@ async fn cte_chains_are_bounded_on_the_worker_stack() {
         "unexpected error: {err}"
     );
 }
+
+/// Regression test: a view's SQL was planned at load without the depth guard,
+/// so a `WHERE` chain deeper than the planner handles overflowed the stack it
+/// was planned on. The view is now refused at load with the guard's error, and
+/// the runtime keeps serving its datasets.
+#[tokio::test]
+async fn an_over_deep_view_is_refused_at_load() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let csv = dir.path().join("events.csv");
+    tokio::fs::write(&csv, "id\n1\n2\n3\n")
+        .await
+        .expect("source file is written");
+
+    let mut view = spicepod::component::view::View::new("deep_view".to_string());
+    view.sql = Some(format!(
+        "SELECT id FROM depth_source WHERE {}",
+        vec!["id > 0"; 2000].join(" AND ")
+    ));
+    let app = app::AppBuilder::new("view_depth")
+        .with_dataset(spicepod::component::dataset::Dataset::new(
+            format!("file:{}", csv.display()),
+            "depth_source",
+        ))
+        .with_view(view)
+        .build();
+    let rt = Arc::new(crate::Runtime::builder().with_app(app).build().await);
+    tokio::time::timeout(
+        std::time::Duration::from_mins(1),
+        Arc::clone(&rt).load_components(),
+    )
+    .await
+    .expect("components load");
+
+    let view_status = || {
+        rt.status()
+            .get_view_statuses()
+            .into_iter()
+            .find_map(|(name, status)| (name.table() == "deep_view").then_some(status))
+    };
+    let mut status = view_status();
+    for _ in 0..600 {
+        if status.as_ref().is_some_and(|s| s.error_message().is_some()) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        status = view_status();
+    }
+    assert_eq!(
+        status,
+        Some(crate::status::ComponentStatus::error_with_message(format!(
+            "Failed to attach view: Unable to create view: Error during planning: Query \
+             rejected: an expression is nested more than {MAX_SQL_EXPR_DEPTH} levels deep. \
+             Simplify the query (for example, replace a long chain of OR/AND conditions with an \
+             IN list or a join)."
+        )))
+    );
+
+    assert!(rt.status().is_ready_allowing_unhealthy());
+    let rows = rt
+        .df
+        .ctx
+        .sql("SELECT count(*) FROM depth_source")
+        .await
+        .expect("query plans")
+        .collect()
+        .await
+        .expect("query runs");
+    assert_eq!(
+        datafusion::arrow::util::pretty::pretty_format_batches(&rows)
+            .expect("batches format")
+            .to_string(),
+        "+----------+\n| count(*) |\n+----------+\n| 3        |\n+----------+"
+    );
+}
