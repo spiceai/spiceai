@@ -90,6 +90,7 @@ use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::projection::ProjectionExpr;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::projection::ProjectionExec;
+use range_rescale::Rescaler;
 
 /// Width, in bits, of the normalized coordinate each clustering column
 /// contributes to the curve. 64 bits captures the full precision of every
@@ -99,6 +100,7 @@ use datafusion_physical_plan::projection::ProjectionExec;
 const CURVE_BITS: u32 = u64::BITS;
 
 /// Largest normalized coordinate; the dense code range is `0..=MAX_CODE`.
+#[cfg(test)]
 const MAX_CODE: u64 = u64::MAX;
 
 /// Key bytes contributed per clustering column — the byte width of one
@@ -346,81 +348,9 @@ pub(crate) fn bound_key(scalar: &ScalarValue, column_type: &DataType) -> Option<
     column_order_keys(array.as_ref()).ok()?.first().copied()
 }
 
-/// Rescales a column's order-preserving keys onto the dense `0..=MAX_CODE`
-/// coordinate space spanned by `[lo, hi]`. With `x = clamp(key, lo, hi) - lo`
-/// and `shift = max(0, bit_width(span) - CURVE_BITS)`, it computes
-/// `floor((x >> shift) * MAX_CODE / (span >> shift))` exactly.
-///
-/// - Keys outside `[lo, hi]` clamp to its ends.
-/// - A constant or inverted range (`hi <= lo`) carries no information to
-///   spread, so every key maps to 0.
-/// - `x * MAX_CODE` must fit in `u128`, which needs `span < 2^CURVE_BITS`, so
-///   `shift` is 0 for those spans. For a wider span the low `shift` bits of
-///   both `x` and `span` are dropped first. The result can then differ slightly
-///   from `floor(x * MAX_CODE / span)`, but it stays monotonic in `key`, which
-///   is all clustering needs.
-///
-/// `lo`, `hi` and `span` are fixed for a whole call, so the division is
-/// replaced by a per-column reciprocal of the shifted span: it estimates the
-/// shifted quotient at most one below its exact floor (see [`multiply_high`]),
-/// and one remainder comparison recovers the exact value.
-struct Normalizer {
-    lo: u128,
-    hi: u128,
-    shift: u32,
-    span: u128,
-    reciprocal: u128,
-}
-
-impl Normalizer {
-    fn new(lo: u128, hi: u128) -> Self {
-        let span = hi.saturating_sub(lo);
-        let shift = span.bit_width().saturating_sub(CURVE_BITS);
-        let span = span >> shift;
-        Self {
-            lo,
-            hi,
-            shift,
-            span,
-            reciprocal: if span > 1 { u128::MAX / span } else { 0 },
-        }
-    }
-
-    #[inline]
-    fn normalize(&self, key: u128) -> u64 {
-        if self.span == 0 {
-            return 0;
-        }
-        let x = (key.clamp(self.lo, self.hi) - self.lo) >> self.shift;
-        let numerator = x * u128::from(MAX_CODE);
-        let quotient = if self.span == 1 {
-            numerator
-        } else {
-            let estimate = multiply_high(numerator, self.reciprocal);
-            estimate + u128::from(numerator - estimate * self.span >= self.span)
-        };
-        // x <= span, so the exact quotient cannot exceed MAX_CODE.
-        u64::try_from(quotient).unwrap_or(MAX_CODE)
-    }
-}
-
-/// Upper half of the full 256-bit product using four 64-bit limb products.
-/// With m = floor((2^128 - 1) / d), the estimate floor(n*m / 2^128)
-/// is at most one below floor(n/d): the reciprocal error is <= 1 and
-/// n < 2^128. This includes power-of-two divisors.
-#[inline]
-fn multiply_high(a: u128, b: u128) -> u128 {
-    let mask = u128::from(u64::MAX);
-    let low = (a & mask) * (b & mask);
-    let left = (a >> 64) * (b & mask);
-    let right = (a & mask) * (b >> 64);
-    let middle = (low >> 64) + (left & mask) + (right & mask);
-    (a >> 64) * (b >> 64) + (left >> 64) + (right >> 64) + (middle >> 64)
-}
-
 #[cfg(test)]
 fn normalize(key: u128, lo: u128, hi: u128) -> u64 {
-    Normalizer::new(lo, hi).normalize(key)
+    Rescaler::new(lo, hi).rescale(key)
 }
 
 /// Rows [`hilbert_transpose`] processes per block: small enough that one
@@ -576,8 +506,11 @@ pub fn cluster_keys(columns: &[ArrayRef], bounds: &[ColumnBounds]) -> DFResult<B
             .copied()
             .flatten()
             .unwrap_or((0, key_domain_max(c.data_type())));
-        let normalizer = Normalizer::new(lo, hi);
-        coords.push(keys.iter().map(|&key| normalizer.normalize(key)).collect());
+        // Rescales onto the dense `0..=u64::MAX` coordinate space; see
+        // `Rescaler` for the exact formula, including how ranges wider than
+        // `2^CURVE_BITS` drop their low bits.
+        let rescaler = Rescaler::new(lo, hi);
+        coords.push(keys.iter().map(|&key| rescaler.rescale(key)).collect());
     }
 
     let width = BYTES_PER_COLUMN * k;

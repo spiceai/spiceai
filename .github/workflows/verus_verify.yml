@@ -29,6 +29,13 @@ name: Verus Verification
 # reached by an ordinary cache lookup. Each bound is a Verus postcondition
 # discharged for every key, which is what a test can only sample.
 #
+# `crates/range-rescale/src/lib.rs`: Cayenne rescales every clustering-key
+# column onto the curve's coordinate space with a reciprocal multiply instead of
+# a `u128` division. That the estimate plus one remainder correction equals the
+# exact quotient, that no intermediate overflows, and that the result is
+# monotonic in the key are Verus postconditions discharged for every key and
+# range; a wrong coordinate silently mis-clusters files rather than failing.
+#
 # That is also why the verifier runs in the merge queue rather than on the pull
 # request. A proof is a claim about the tree it was checked against; two
 # individually green changes can combine into one the verifier would reject, and
@@ -118,7 +125,8 @@ jobs:
     # and stalls every entry behind it (#12717). hash-index alone is ~7 minutes
     # including a cold archive download; cache also compiles its DataFusion
     # graph through the driver, so the bound sits above that combined cost.
-    # sharded-cache adds little: one dependency, and its proofs are arithmetic.
+    # sharded-cache and range-rescale add little: each depends only on vstd
+    # (sharded-cache also on parking_lot), and their proofs are arithmetic.
     timeout-minutes: 40
     env:
       # `cargo verus` runs the verifier as the rustc driver, so no compiler
