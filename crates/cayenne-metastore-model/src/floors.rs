@@ -232,6 +232,7 @@ impl Model for Protocol {
                     polled.floor, state.store.floor
                 ),
                 vec![],
+                true,
             )),
             polled => view.pin("reader's polled head", polled),
         }

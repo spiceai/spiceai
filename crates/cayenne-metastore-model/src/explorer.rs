@@ -254,6 +254,10 @@ fn escape(text: &str) -> String {
     out
 }
 
+/// A captured head pinned on a store drawing: its name, the batch ranges it
+/// needs, and whether a missing one is a violation.
+pub(crate) type Pinned = (String, Vec<(usize, usize)>, bool);
+
 /// A storage layout in the shape every head-log model shares: an authoritative
 /// head holding an inline window and a batch index, immutable batch objects
 /// the index points to, a checkpoint root below the floor, and objects that are
@@ -281,7 +285,9 @@ pub(crate) struct StoreView {
     pub(crate) deleted: Vec<usize>,
     /// Captured heads (a running query, a reader's poll): name and the batch
     /// ranges it still needs.
-    pub(crate) snapshots: Vec<(String, Vec<(usize, usize)>)>,
+    /// Whether a missing batch it needs is a violation is the third field: a
+    /// query past its retention may find one gone.
+    pub(crate) snapshots: Vec<Pinned>,
 }
 
 /// Records as short labels: `r<id>`, or the record kind where a model gives one.
@@ -334,7 +340,21 @@ impl StoreView {
             self.snapshots.push((
                 format!("{name} (floor {}, inline from {})", s.floor, s.first),
                 s.index.clone(),
+                true,
             ));
+        }
+    }
+    /// Like [`Self::pin`], for a reader whose missing batches are a violation
+    /// only while `protected` (as the model's own property says).
+    pub(crate) fn pin_reader(
+        &mut self,
+        name: &str,
+        snapshot: &crate::core::Store,
+        protected: bool,
+    ) {
+        self.pin(name, Some(snapshot));
+        if let Some(last) = self.snapshots.last_mut() {
+            last.2 = protected;
         }
     }
 
@@ -365,7 +385,7 @@ impl StoreView {
         // Snapshots stack under the head and point at the batches they pin.
         let mut left_bottom = head.bottom();
         let mut snapshot_nodes = vec![];
-        for (name, index) in &self.snapshots {
+        for (name, index, protected) in &self.snapshots {
             let rows: Vec<String> = if index.is_empty() {
                 vec!["index: none".into()]
             } else {
@@ -376,15 +396,18 @@ impl StoreView {
             };
             let node = svg.node(x, left_bottom + 14, 0, name, &rows, Tone::Actor);
             left_bottom = node.bottom();
-            snapshot_nodes.push((node, index));
+            snapshot_nodes.push((node, index, *protected));
         }
 
-        let col = x
-            + head
-                .w
-                .max(snapshot_nodes.iter().map(|(n, _)| n.w).max().unwrap_or(0))
-            + GAP
-            + 20;
+        let col =
+            x + head.w.max(
+                snapshot_nodes
+                    .iter()
+                    .map(|(n, _, _)| n.w)
+                    .max()
+                    .unwrap_or(0),
+            ) + GAP
+                + 20;
         let mut cy = y;
         // The published root.
         if self.floor > 0 || !self.root.is_empty() {
@@ -426,7 +449,7 @@ impl StoreView {
             .chain(
                 self.snapshots
                     .iter()
-                    .flat_map(|(_, i)| i.iter().map(|(a, _)| *a)),
+                    .flat_map(|(_, i, _)| i.iter().map(|(a, _)| *a)),
             )
             .collect();
         starts.sort_unstable();
@@ -487,13 +510,15 @@ impl StoreView {
                 );
             }
         }
-        for (node, index) in &snapshot_nodes {
+        for (node, index, protected) in &snapshot_nodes {
             for (i, (a, _)) in index.iter().enumerate() {
                 if let Some((_, target)) = placed.iter().find(|(s, _)| s == a) {
                     let tone = if self.batches.iter().any(|(s, _)| s == a) {
                         Tone::Actor
-                    } else {
+                    } else if *protected {
                         Tone::Bad
+                    } else {
+                        Tone::Gone
                     };
                     svg.arrow(
                         (node.right(), node.line_y(i)),

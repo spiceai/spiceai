@@ -810,6 +810,7 @@ impl Model for Protocol {
                     .filter(|b| b * k < s.query_target.min(first) && (b + 1) * k > s.query_base)
                     .map(|b| (b * k, (b + 1) * k))
                     .collect(),
+                true,
             ));
         }
         let header: Vec<(String, Vec<String>, Tone)> = s

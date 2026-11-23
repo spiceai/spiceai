@@ -272,7 +272,19 @@ impl Model for Protocol {
             ));
         }
         if let Some((query, read_at)) = &state.query {
-            view.pin(&format!("reader (read the head at {read_at})"), Some(query));
+            // Past its retention a reader may find a batch gone; only the
+            // model's property for a reader within its retention makes that a
+            // violation.
+            let protected = !crate::explorer::holds(
+                self,
+                state,
+                "I7 query within retention reads its snapshot",
+            );
+            view.pin_reader(
+                &format!("reader (read the head at {read_at})"),
+                query,
+                protected,
+            );
         }
         let retired: Vec<String> = state
             .retired
@@ -473,4 +485,50 @@ pub fn outcome_after(mode: &str, bound: usize, actions: &[String]) -> Option<Out
             .collect(),
         checkpoint_objects: state.roots.clone(),
     })
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::Protocol;
+    use stateright::Model;
+
+    /// A reader past its retention may find a batch collected, which the model
+    /// allows, so the drawing does not mark that missing batch red.
+    #[test]
+    fn expired_reader_missing_batch_is_not_a_violation() {
+        use super::Action::{Append, Checkpoint, Create, Gc, Observe, Query, Tick};
+        use stateright::Path;
+        let model = Protocol::new("storage", 7);
+        let actions = [
+            Append(0),
+            Append(0),
+            Append(0),
+            Observe,
+            Create(0),
+            Append(0),
+            Checkpoint(3),
+            Query,
+            Append(0),
+            Gc,
+            Append(0),
+            Observe,
+            Create(1),
+            Gc,
+            Tick,
+            Append(0),
+            Gc,
+        ];
+        let init = model.init_states().remove(0);
+        let path = Path::from_actions(&model, init, &actions).expect("enabled trace");
+        let state = path.last_state();
+        let (_, read_at) = state.query.as_ref().expect("a reader");
+        assert!(state.time > *read_at, "the reader is past its retention");
+        assert!(
+            state.read_query().is_none(),
+            "the reader finds an object missing"
+        );
+        let svg = model.as_svg(path).expect("window draws");
+        assert!(!svg.contains("cm-arrow cm-bad"), "{svg}");
+        assert!(svg.contains("cm-arrow cm-gone"), "{svg}");
+    }
 }
