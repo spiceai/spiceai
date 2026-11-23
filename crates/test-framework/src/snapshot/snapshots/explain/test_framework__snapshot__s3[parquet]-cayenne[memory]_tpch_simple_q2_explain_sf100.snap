@@ -1,0 +1,27 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q2"
+---
++---------------+------------------------------------------------------------------------------+
+| plan_type     | plan                                                                         |
++---------------+------------------------------------------------------------------------------+
+| logical_plan  | Filter: lineitem.l_linenumber = (<subquery>)                                 |
+|               |   Subquery:                                                                  |
+|               |     Aggregate: groupBy=[[]], aggr=[[max(lineitem.l_linenumber)]]             |
+|               |       TableScan: lineitem projection=[l_linenumber]                          |
+|               |   TableScan: lineitem projection=[l_linenumber]                              |
+| physical_plan | ScalarSubqueryExec: subqueries=1                                             |
+|               |   FilterExec: l_linenumber@0 = scalar_subquery(<pending>)                    |
+|               |     SchemaCastScanExec                                                       |
+|               |       CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>      |
+|               |         BytesProcessedExec                                                   |
+|               |           DataSourceExec: partitions=16, partition_sizes=[<redacted>]        |
+|               |   AggregateExec: mode=Final, gby=[], aggr=[max(lineitem.l_linenumber)]       |
+|               |     CoalescePartitionsExec                                                   |
+|               |       AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.l_linenumber)] |
+|               |         SchemaCastScanExec                                                   |
+|               |           CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>  |
+|               |             BytesProcessedExec                                               |
+|               |               DataSourceExec: partitions=16, partition_sizes=[<redacted>]    |
+|               |                                                                              |
++---------------+------------------------------------------------------------------------------+

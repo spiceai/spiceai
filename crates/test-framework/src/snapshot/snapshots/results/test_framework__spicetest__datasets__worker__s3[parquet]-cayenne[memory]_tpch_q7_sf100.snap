@@ -1,0 +1,12 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpch_q7"
+---
++-------------+-------------+--------+-----------------+
+| supp_nation | cust_nation | l_year | revenue         |
++-------------+-------------+--------+-----------------+
+| FRANCE      | GERMANY     | 1995   | 1062897261.6168 |
+| FRANCE      | GERMANY     | 1996   | 1052033798.6691 |
+| GERMANY     | FRANCE      | 1995   | 1054734640.9984 |
+| GERMANY     | FRANCE      | 1996   | 1062381070.4545 |
++-------------+-------------+--------+-----------------+
