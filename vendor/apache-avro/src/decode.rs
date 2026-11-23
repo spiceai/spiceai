@@ -135,6 +135,19 @@ fn budget_exceeded(desired: usize) -> Error {
     .into()
 }
 
+/// Reserve room for `more` items, growing geometrically as `Vec::reserve` does,
+/// but never past the `debited` items the budget was charged for, which a later
+/// block of the same array would otherwise double. Best effort: if it fails,
+/// the array grows item by item.
+fn reserve_within<T>(items: &mut Vec<T>, more: usize, debited: usize) {
+    let required = items.len() + more;
+    if required <= items.capacity() {
+        return;
+    }
+    let target = required.max(items.capacity().saturating_mul(2).min(debited));
+    let _ = items.try_reserve_exact(target - items.len());
+}
+
 fn decode_with_budget<R: Read, S: Borrow<Schema>>(
     schema: &Schema,
     names: &HashMap<Name, S>,
@@ -259,6 +272,7 @@ fn decode_with_budget<R: Read, S: Borrow<Schema>>(
         }
         Schema::Array(ref inner) => {
             let mut items = Vec::new();
+            let mut debited = 0;
 
             loop {
                 let len = decode_seq_len(reader)?;
@@ -267,13 +281,13 @@ fn decode_with_budget<R: Read, S: Borrow<Schema>>(
                 }
 
                 debit_items::<Value>(budget, len)?;
+                debited += len;
                 let mut reserved_through = len.min(MAX_PREALLOCATED_ITEMS);
-                items.reserve(reserved_through);
+                reserve_within(&mut items, reserved_through, debited);
                 for decoded in 0..len {
                     if decoded == reserved_through {
                         let more = (len - decoded).min(decoded.saturating_mul(RESERVATION_GROWTH));
-                        // Best effort: if it fails, the collection grows item by item.
-                        let _ = items.try_reserve(more);
+                        reserve_within(&mut items, more, debited);
                         reserved_through = decoded + more;
                     }
                     items.push(decode_with_budget(

@@ -58,6 +58,10 @@ decodes an item, and moving to it needs a matching `iceberg` release, so the fix
   reached 504 MB and 680 MB. A map's hash table rounds its capacity up to
   a power of two of at least 8/7 of the request, so its reservation can exceed the bytes debited
   for it by up to about 2.3 times.
+- An array's geometric growth is capped at the items debited across all of its blocks, so a later
+  block cannot double its capacity past what the budget was charged for. Growing still briefly
+  holds the old and the new buffer: two blocks of `null` items totalling 9,500,000 peak at about
+  812 MB, the first block's 5,000,000 slots plus 9,500,000, where uncapped doubling reached 840 MB.
 
 A datum holding more than 512 MiB of these decoded values now fails to decode; with a 56-byte
 `Value`, that is about 9.6 million array items in one datum. In the allocation test, arrays of

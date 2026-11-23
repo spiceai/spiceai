@@ -276,6 +276,24 @@ fn declared_collection_sizes_do_not_drive_allocation() {
         );
     }
 
+    // An array split over blocks grows to the items debited for all of them
+    // and no further, though growing briefly holds the old and the new buffer:
+    // two blocks of `null` items totalling 9,500,000 peak at the first block's
+    // 5,000,000 slots plus 9,500,000, not at a doubled 10,000,000.
+    let two_blocks = r#"{"type": "record", "name": "r", "fields": [{"name": "a", "type": {"type": "array", "items": "null"}}]}"#;
+    let mut body = block_count(5_000_000);
+    body.extend(block_count(4_500_000));
+    body.push(0);
+    let (error, peak) = decode_error_and_peak_heap(&runtime, two_blocks, &body);
+    assert_eq!(
+        error,
+        "Failed to map Avro Debezium payload: missing or invalid op field: None"
+    );
+    assert!(
+        peak < (5_000_000 + 9_500_000) * array_item + MAX_HEAP_BYTES,
+        "an array of two blocks grew the heap by {peak} bytes"
+    );
+
     // A fixed value's size comes from the schema, and its buffer is allocated
     // before the input is read.
     let fixed_size: usize = 1 << 40;
