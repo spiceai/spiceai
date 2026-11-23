@@ -3774,3 +3774,166 @@ async fn a_kill_at_any_storage_write_of_a_periodic_checkpoint_loses_no_change() 
         failures.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------------
+// #16625: a kill, a rebuild from the post-DELETE source, and the source's replay
+// ---------------------------------------------------------------------------
+
+/// Keys the UPDATE of #16625 touches.
+fn updated_key(id: i64) -> bool {
+    id % 5 == 0
+}
+
+/// Keys the DELETE of #16625 removes while the process is down.
+fn deleted_key(id: i64) -> bool {
+    id % 11 == 0
+}
+
+fn seed_ids() -> Vec<i64> {
+    FILE_KEYS.chain(INLINE_KEYS).collect()
+}
+
+/// The source after the UPDATE (round 1) and the DELETE.
+fn source_after_delete() -> Vec<(i64, i64)> {
+    seed_ids()
+        .into_iter()
+        .filter(|id| !deleted_key(*id))
+        .map(|id| (id, value(id, i64::from(updated_key(id)))))
+        .collect()
+}
+
+fn op_rows(op: &'static str, pred: fn(i64) -> bool) -> Vec<(&'static str, i64)> {
+    seed_ids()
+        .into_iter()
+        .filter(|id| pred(*id))
+        .map(|id| (op, id))
+        .collect()
+}
+
+async fn overwrite_process(process: &Process, rows: &[(i64, i64)]) {
+    let batch = RecordBatch::try_new(
+        schema(),
+        vec![
+            Arc::new(Int64Array::from(rows.iter().map(|r| r.0).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(rows.iter().map(|r| r.1).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("rows");
+    let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema(), None).expect("input");
+    let plan = process
+        .table
+        .insert_into(&process.ctx.state(), input, InsertOp::Overwrite)
+        .await
+        .expect("plan the overwrite");
+    collect(plan, process.ctx.task_ctx())
+        .await
+        .expect("overwrite");
+}
+
+/// Submit `batches` (round, ops) through one change sink as the source would,
+/// optionally running the periodic tick after each.
+async fn submit_rounds(
+    process: &Process,
+    source: &Arc<SourceModel>,
+    batches: Vec<(i64, Vec<(&'static str, i64)>)>,
+    tick: bool,
+) {
+    let backend = CayenneChangeSinkBackend::try_new(ChangeSinkContext::new(
+        TableReference::bare(NAME),
+        Arc::clone(&process.table) as Arc<dyn TableProvider>,
+    ))
+    .expect("native backend");
+    let sink = ChangeSink::new(backend, SessionContext::new(), &Handle::current(), 2);
+    sink.set_durability_observer(Arc::clone(source) as Arc<dyn DurabilityObserver>);
+    let options = WriteOptions {
+        recovery: Recovery::Replayable,
+        ..WriteOptions::default()
+    };
+    for (round, ops) in batches {
+        let receipt = sink
+            .reserve()
+            .await
+            .expect("reserve")
+            .submit_with_position(
+                mixed_changes(&ops, round),
+                options,
+                Some(save_position(&process.catalog, round)),
+            )
+            .expect("submit")
+            .wait()
+            .await
+            .expect("wait");
+        receipt.published().await.expect("publish");
+        if let StorageDurability::Deferred(fence) = receipt.durability {
+            source.enqueue(fence, round).await;
+        }
+        if tick {
+            process.table.run_mem_tier_checkpoint_tick_now().await;
+        }
+    }
+    sink.flush().await.expect("flush");
+    sink.begin_close().wait().await.expect("close");
+}
+
+async fn issue_16625_scenario(label: &str, tick_before_kill: bool, folded: bool) {
+    let (location, process) = tick_location().await;
+    let source = SourceModel::new(&process.catalog);
+    // Before the kill: the UPDATE is applied (kept in the tier), then the
+    // tick may or may not have made it durable before the process dies.
+    submit_rounds(
+        &process,
+        &source,
+        vec![(1, op_rows("c", updated_key))],
+        tick_before_kill,
+    )
+    .await;
+    drop(process);
+    // Restart; the rebuild overwrites from the source, which already lacks the
+    // deleted keys; then the source replays from its acknowledged position.
+    let process = location.open_with(&tick_config()).await;
+    let source = SourceModel::new(&process.catalog);
+    overwrite_process(&process, &source_after_delete()).await;
+    let replay: Vec<(i64, Vec<(&'static str, i64)>)> = if folded {
+        let mut ops = op_rows("c", updated_key);
+        ops.extend(op_rows("d", deleted_key));
+        vec![(2, ops)]
+    } else {
+        vec![(2, op_rows("c", updated_key)), (3, op_rows("d", deleted_key))]
+    };
+    submit_rounds(&process, &source, replay, true).await;
+    let expected = source_after_delete();
+    let rows = process.rows().await;
+    eprintln!(
+        "PROBE16625 {label}: rows {} expected {}, extra {:?}",
+        rows.len(),
+        expected.len(),
+        rows.iter().filter(|r| !expected.contains(r)).collect::<Vec<_>>()
+    );
+    process.table.quiesce().await;
+    drop(process);
+    let reopened = location.open_with(&tick_config()).await;
+    let after_reopen = reopened.rows().await;
+    reopened.table.quiesce().await;
+    assert_eq!(rows, expected, "{label}: rows after the replay");
+    assert_eq!(after_reopen, expected, "{label}: rows after a reopen");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn issue_16625_backend_update_then_delete_separate_batches_after_tick() {
+    issue_16625_scenario("separate/tick", true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn issue_16625_backend_update_then_delete_separate_batches_no_tick() {
+    issue_16625_scenario("separate/notick", false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn issue_16625_backend_update_then_delete_folded_batch_after_tick() {
+    issue_16625_scenario("folded/tick", true, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn issue_16625_backend_update_then_delete_folded_batch_no_tick() {
+    issue_16625_scenario("folded/notick", false, true).await;
+}
