@@ -1390,7 +1390,10 @@ impl Builder {
 
         let (refresh_handle, refresh_trigger) = if self.replica {
             // The instance that writes the acceleration refreshes it; this one
-            // serves what it committed, so its rows are ready to query now.
+            // serves what it committed, so its rows are ready to query now:
+            // scans read the accelerator instead of waiting on a load that
+            // only the writer performs.
+            refresher.set_initial_load_completed(true);
             refresh_completion.close();
             self.runtime_status
                 .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);

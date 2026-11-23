@@ -44,7 +44,6 @@ spicepod:
         mode: file
         refresh_mode: changes
         primary_key: o_id
-        on_conflict: { o_id: upsert }
         params:
           # Commit the in-memory CDC tier on every tick, so the replica sees
           # each change soon after the writer applies it.
