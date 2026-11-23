@@ -1238,12 +1238,20 @@ impl EndpointOverrideCheck for ConfigEndpointGuard {
         {
             return Ok(());
         }
-        let reason = if endpoint_targets_internal_host(endpoint) {
-            Some("it is a private, loopback, or link-local address".to_string())
-        } else if let Some(url::Host::Domain(domain)) = url.as_ref().and_then(Url::host) {
-            vended_transport::refused_host_reason(domain).await
-        } else {
-            None
+        let reason = match url.as_ref() {
+            Some(url) if matches!(url.scheme(), "http" | "https") && url.host().is_some() => {
+                if endpoint_targets_internal_host(endpoint) {
+                    Some("it is a private, loopback, or link-local address".to_string())
+                } else if let Some(url::Host::Domain(domain)) = url.host() {
+                    vended_transport::refused_host_reason(domain).await
+                } else {
+                    None
+                }
+            }
+            _ => Some(
+                "catalog requests and credentials are only sent to http and https endpoints"
+                    .to_string(),
+            ),
         };
         match reason {
             Some(reason) => Err(iceberg::Error::new(
@@ -1271,7 +1279,7 @@ fn config_endpoint_refused_message(
         .map(Url::origin)
         .filter(url::Origin::is_tuple)
         .map_or_else(
-            || "an endpoint that is not a valid URL".to_string(),
+            || "a value that is not an http or https URL".to_string(),
             |origin| format!("an endpoint on {:?}", origin.ascii_serialization()),
         );
     let param_hint = if key == REST_CATALOG_PROP_OAUTH2_SERVER_URI {
@@ -1962,6 +1970,21 @@ mod tests {
                 assert!(!err.message().contains("secret"), "{host}");
             }
             assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn a_catalog_uri_override_that_is_not_an_http_url_is_refused() {
+            for endpoint in ["not a url", "file:///etc/passwd", "data:text/plain,secret"] {
+                let catalog_uri = start_rest_catalog(move |_| json!({ "uri": endpoint })).await;
+                let err = list_namespaces(catalog_uri, token_props())
+                    .await
+                    .expect_err("a catalog URI override that is not an http URL must be refused");
+                assert_eq!(
+                    err.message(),
+                    "The Iceberg catalog for catalog 'ice' answered `GET /v1/config` with `uri` set to a value that is not an http or https URL, but catalog requests and credentials are only sent to http and https endpoints, so no catalog request or credential is sent to it and the catalog cannot be read. If this endpoint is trusted, use it as the catalog URL in the Spicepod, or set `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
+                    "{endpoint}"
+                );
+            }
         }
 
         #[tokio::test]
