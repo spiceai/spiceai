@@ -307,8 +307,7 @@ mod tests {
             let error = delta
                 .table_provider(TableReference::parse_str("cat.sch.local"))
                 .await
-                .err()
-                .expect("a table stored on the Spice host must not be read");
+                .expect_err("a table stored on the Spice host must not be read");
             assert_eq!(error.to_string(), refusal("local", "file"));
             let error = delta
                 .resolve_table_uri(TableReference::parse_str("cat.sch.local"))

@@ -24,6 +24,7 @@ limitations under the License.
 
 use std::{
     collections::HashMap,
+    fmt::Write as _,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -223,14 +224,14 @@ fn list_objects(root: &Path, query: &str) -> Response<Body> {
     bucket_keys(root, root, &mut keys);
     keys.retain(|(key, _)| key.starts_with(prefix) && key.as_str() > start_after);
     keys.sort();
-    let contents: String = keys
-        .iter()
-        .map(|(key, size)| {
-            format!(
-                "<Contents><Key>{key}</Key><LastModified>2024-01-01T00:00:00.000Z</LastModified><ETag>\"etag\"</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Contents>"
-            )
-        })
-        .collect();
+    let mut contents = String::new();
+    for (key, size) in &keys {
+        write!(
+            contents,
+            "<Contents><Key>{key}</Key><LastModified>2024-01-01T00:00:00.000Z</LastModified><ETag>\"etag\"</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Contents>"
+        )
+        .expect("writing to a String succeeds");
+    }
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>bucket</Name><Prefix>{prefix}</Prefix><KeyCount>{}</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>",
         keys.len()
