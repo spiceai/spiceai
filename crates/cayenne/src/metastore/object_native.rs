@@ -67,7 +67,7 @@ enum Head {
     /// It took the head over, and commits under its lease generation.
     Writer(Box<Writer>),
     /// It reads the head another instance writes, and follows its commits.
-    Replica(Reader),
+    Replica(Box<Reader>),
 }
 
 /// How a catalog opens its logs. Internal; which instance writes a dataset is

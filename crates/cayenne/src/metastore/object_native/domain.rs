@@ -996,7 +996,7 @@ impl Inner {
                 immediate,
                 anchor,
                 dataset,
-                (Head::Replica(reader), lease, replayed),
+                (Head::Replica(Box::new(reader)), lease, replayed),
             ));
         }
         if let Some(held) = held
@@ -1147,7 +1147,7 @@ impl Inner {
         self.floor_state = replayed.floor_state;
         self.since_floor = replayed.since_floor;
         self.pending.clear();
-        self.head = Head::Replica(reader);
+        self.head = Head::Replica(Box::new(reader));
         self.stop = Some(Stop::Replica);
         self.config.access = Access::Replica;
         Ok(())
@@ -1308,7 +1308,7 @@ impl Inner {
                 self.reader.state = replayed.state;
                 self.floor_state = replayed.floor_state;
                 self.since_floor = replayed.since_floor;
-                self.head = Head::Replica(reader);
+                self.head = Head::Replica(Box::new(reader));
                 Ok(true)
             }
         }
