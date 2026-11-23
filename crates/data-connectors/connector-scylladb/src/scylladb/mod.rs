@@ -279,11 +279,14 @@ mod tests {
         }
     }
 
-    /// One projected column plus the column `tpch_simple_q3` sorts on.
+    /// One projected column plus the column `tpch_simple_q3` sorts on. `l_linenumber` is a
+    /// clustering column, which CQL never holds as NULL; a nullable sort column would be refused
+    /// by `SqlExec`'s NULL-order rule (CQL cannot write `NULLS FIRST`) before the opt-out is
+    /// reached.
     fn lineitem_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("l_comment", DataType::Utf8, true),
-            Field::new("l_linenumber", DataType::Int32, true),
+            Field::new("l_linenumber", DataType::Int32, false),
         ]))
     }
 
