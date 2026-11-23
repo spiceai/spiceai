@@ -116,8 +116,8 @@ async fn wait_for_ids(rt: &Runtime, expected: &[i64]) {
 /// Regression test: an override whose `WHERE` chain exceeds the planner's
 /// depth limit was accepted with `201 Created`, and the refresh it queued
 /// overflowed the refresh worker's stack and aborted the process; an override
-/// with a deeply nested data type overflowed the stack it was parsed on. `POST`
-/// refresh and `PATCH` acceleration now refuse both with `400 Bad Request`,
+/// with a deeply nested data type overflowed the stack it was parsed or dropped
+/// on. `POST` refresh and `PATCH` acceleration now refuse each with an error,
 /// and the dataset keeps refreshing with its own refresh SQL.
 #[tokio::test]
 async fn an_over_deep_refresh_sql_override_is_refused() {
@@ -148,7 +148,10 @@ async fn an_over_deep_refresh_sql_override_is_refused() {
                 "SELECT id FROM {DATASET} WHERE {}",
                 vec!["id > 0"; 1200].join(" AND ")
             ),
-            format!("an expression is nested more than {MAX_SQL_EXPR_DEPTH} levels deep"),
+            format!(
+                "The provided Refresh SQL is too complex to run. Error during planning: Query \
+                 rejected: an expression is nested more than {MAX_SQL_EXPR_DEPTH} levels deep"
+            ),
         ),
         (
             format!(
@@ -156,19 +159,33 @@ async fn an_over_deep_refresh_sql_override_is_refused() {
                 "ARRAY<".repeat(10_000),
                 ">".repeat(10_000)
             ),
-            format!("a data type is nested more than {MAX_SQL_DATA_TYPE_DEPTH} levels deep"),
+            format!(
+                "The provided Refresh SQL is too complex to run. Error during planning: Query \
+                 rejected: a data type is nested more than {MAX_SQL_DATA_TYPE_DEPTH} levels deep"
+            ),
+        ),
+        (
+            format!(
+                "SELECT id FROM {DATASET} WHERE CAST(NULL AS INT{}) IS NULL",
+                "[]".repeat(10_000)
+            ),
+            "The provided Refresh SQL could not be parsed. SQL error: RecursionLimitExceeded"
+                .to_string(),
         ),
     ];
     for (refresh_sql, rejection) in &deep_overrides {
         let deep = json!({ "refresh_sql": refresh_sql });
-        for (method, path) in [
+        // `PATCH` reports every invalid refresh SQL as `500 Internal Server Error`.
+        for (method, path, expected_status) in [
             (
                 Method::POST,
                 format!("/v1/datasets/{DATASET}/acceleration/refresh"),
+                StatusCode::BAD_REQUEST,
             ),
             (
                 Method::PATCH,
                 format!("/v1/datasets/{DATASET}/acceleration"),
+                StatusCode::INTERNAL_SERVER_ERROR,
             ),
         ] {
             let (status, body) = send(&routes, method.clone(), &path, &deep).await;
@@ -176,10 +193,9 @@ async fn an_over_deep_refresh_sql_override_is_refused() {
                 .as_str()
                 .map(ToString::to_string)
                 .unwrap_or_default();
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}: {body}");
+            assert_eq!(status, expected_status, "{method} {path}: {body}");
             assert!(
-                message.contains("The provided Refresh SQL is too complex to run.")
-                    && message.contains(rejection.as_str()),
+                message.contains(rejection.as_str()),
                 "{method} {path}: {message}"
             );
         }
