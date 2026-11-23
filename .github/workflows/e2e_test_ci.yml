@@ -274,43 +274,25 @@ jobs:
           # builds (~600 MiB) stored for a month.
           artifact_retention_days: '3'
 
-  # Also runs the OpenAI and Hugging Face model tests on the binaries it just built. As
-  # jobs of their own they each waited for another `spiceai-macos-large` runner after this
-  # build finished, 45-51 min at p90 for a 4-minute test (merge_group, 2026-11-11..18),
-  # which made them the last E2E jobs to finish.
   build_macos:
-    name: Build and model-test macOS aarch64 (Apple Silicon)
+    name: Build macOS aarch64 (Apple Silicon) binaries
     # `spiceai-macos-large` on every event, trunk pushes included. A three-hour build on a
     # `spiceai-macos` mini runs past its 180-minute step bound where the host is shared
     # (#14557), and starves the short macOS test jobs that sit on that pool to avoid
-    # exactly this neighbour (#13761). The model tests need a self-hosted Mac as well:
-    # Metal, and the Hugging Face cache in `$HOME`.
+    # exactly this neighbour (#13761).
     runs-on: spiceai-macos-large
-    # Holds the OpenAI workload identity federation IDs (`OPENAI_*` secrets).
     environment: ci
     needs: check_changes
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
-    # A backstop above the compile step's own 180-minute bound below plus the model tests'
-    # bounds (36 minutes: six 5-minute step bounds and the two readiness timeouts), leaving
-    # room for setup, the artifact upload and the post steps, so that a wedged step is cut
-    # by its own bound and named, not by this one.
-    timeout-minutes: 230
-    permissions:
-      contents: read
-      actions: read
-      # The model tests' Spicepods read this repository's issues with `GITHUB_TOKEN`.
-      issues: read
-      pull-requests: read
-      # Exchanged for OpenAI access tokens: workload identity federation.
-      id-token: write
+    # A backstop above the compile step's own 180-minute bound below, leaving room for the
+    # artifact upload and the post steps, so that a wedged compile is cut by its own bound
+    # while the `always()` diagnostics after it can still run.
+    timeout-minutes: 200
+    # No `permissions:` block, so the workflow's `contents: read`: this job runs every
+    # dependency's build script, so it holds no OIDC token (`id-token: write`). The macOS
+    # model tests, which exchange one for OpenAI access, run in `test_models_macos`.
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
-      # Workload identity federation: spiced and the OpenAI model tests exchange this job's
-      # GitHub OIDC token for provider access tokens with these IDs, and exchange again
-      # before each expires. Identifiers, not credentials: the credential is the OIDC
-      # token, which `id-token: write` already makes available to every step.
-      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
-      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -392,7 +374,279 @@ jobs:
           path: ${{ runner.temp }}/spiceio.log
           if-no-files-found: ignore
 
-      # The model tests: `spiced` from this build against one Spicepod each, driven
+  test-bigquery:
+    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
+    environment: ci
+    name: BigQuery Regression Tests
+    needs: build_linux
+    if: ${{ inputs.run_all_tests }}
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      # Exchanged for Google Cloud access tokens for the BigQuery tests: workload identity federation.
+      id-token: write
+    env:
+      SPICED_BIN: ${{ github.workspace }}/build/spiced
+      ADBC_BIGQUERY_DRIVER_PATH: /etc/adbc/drivers/libadbc_driver_bigquery.so
+      # The workload identity federation credential names no project.
+      BIGQUERY_PROJECT_ID: spiceai-testing
+      BIGQUERY_TEST_CLEANUP: always
+      BIGQUERY_EXPECT: single
+    steps:
+      - name: Set test output paths
+        id: test_env
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'BIGQUERY_GATE_OUTPUT=%s/bigquery-regression-%s-%s\n' \
+            "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          printf 'BIGQUERY_GATE_VENV=%s/bigquery-regression-venv-%s-%s\n' \
+            "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up BigQuery credentials (workload identity federation)
+        uses: $/.github/actions/bigquery-credentials
+        with:
+          workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
+          service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
+
+      - name: Download Linux runtime artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: build_linux_x86_64
+          path: ./build
+
+      - name: Prepare runtime artifact
+        run: |
+          chmod +x "$SPICED_BIN"
+          "$SPICED_BIN" --version
+
+      - name: Set up ADBC BigQuery driver
+        uses: $/.github/actions/setup-adbc-bigquery
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Install BigQuery test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "$BIGQUERY_GATE_VENV"
+          "$BIGQUERY_GATE_VENV/bin/python" -m pip install google-cloud-bigquery==3.38.0
+
+      - name: Validate the BigQuery corpus harness
+        run: '"$BIGQUERY_GATE_VENV/bin/python" test/scripts/bigquery_corpus.py --self-test'
+
+      - name: Run BigQuery regression tests
+        timeout-minutes: 60
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$BIGQUERY_GATE_OUTPUT"
+          failed=0
+          for suite in corpus federation pushdown json_pushdown; do
+            if ! BIGQUERY_TEST_OUTPUT="$BIGQUERY_GATE_OUTPUT/$suite" \
+              "$BIGQUERY_GATE_VENV/bin/python" "test/scripts/bigquery_${suite}.py"; then
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+      - name: Upload BigQuery test evidence
+        if: ${{ always() && steps.test_env.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bigquery-regression-evidence
+          path: ${{ env.BIGQUERY_GATE_OUTPUT }}
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove the test Python environment
+        if: ${{ always() && steps.test_env.outcome == 'success' }}
+        shell: bash
+        run: rm -rf -- "$BIGQUERY_GATE_VENV"
+
+  setup-model-matrix:
+    environment: secret-free
+    name: Setup model strategy matrix
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.setup-matrix.outputs.result }}
+    steps:
+      - name: Set up matrix
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        id: setup-matrix
+        with:
+          script: |
+            const matrix = [
+              {
+                name: "Linux x64",
+                runner: "spiceai-dev-runners",
+                target_os: "linux",
+                target_arch: "x86_64"
+              }
+              // No macOS leg: `test_models_macos` runs both macOS model tests in one
+              // job, which waits for one `spiceai-macos-large` runner rather than one
+              // per model.
+            ];
+
+            const isPrEvent = context.eventName === 'pull_request';
+            return isPrEvent ? matrix.slice(0, 1) : matrix;
+
+  test_openai_model:
+    name: 'openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+    # A backstop for the whole job, so it has to clear this job's own setup — artifact
+    # download and CLI install on the self-hosted pool — before the steps' bounded waits
+    # (60s readiness, then 30s/30s/60s inside the expect scripts) can report anything
+    # (#12644).
+    timeout-minutes: 10
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build_linux
+      - setup-model-matrix
+      - check_changes
+    if: ${{ needs.setup-model-matrix.outputs.matrix != '[]' && needs.check_changes.outputs.merge_queue_passed != 'true' }}
+    # Holds the OpenAI workload identity federation IDs (`OPENAI_*` secrets).
+    environment: ci
+    permissions:
+      contents: read
+      actions: read
+      # The Spicepod's `github:` dataset reads this repository's issues with `GITHUB_TOKEN`.
+      issues: read
+      pull-requests: read
+      # Exchanged for OpenAI access tokens: workload identity federation.
+      id-token: write
+    env:
+      # Workload identity federation: spiced and the tests exchange this job's GitHub OIDC token
+      # for provider access tokens with these IDs, and exchange again before each expires.
+      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.setup-model-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        uses: $/.github/actions/install-spice
+        with:
+          build-path: ./build
+          install-scope: job
+
+      - name: Init spice app
+        run: |
+          cp ./test/models/spicepod_openai.yml ./spicepod.yaml
+          cat ./spicepod.yaml
+
+      # This job runs on the self-hosted pool, where several runner instances
+      # share one host and therefore one network namespace, so spiced's default
+      # 8090/50051 cannot be assumed free (#12419).
+      - name: Allocate Spice runtime ports
+        uses: $/.github/actions/allocate-spice-ports
+
+      - name: Start spice runtime
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
+
+      - name: Wait for Spice runtime is ready
+        uses: $/.github/actions/wait-for-spice-ready
+        with:
+          url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
+          timeout: '60'
+
+      - name: Configure apt mirrors (Linux)
+        if: matrix.target.target_os == 'linux'
+        uses: $/.github/actions/configure-apt
+
+      - name: Install expect (linux)
+        if: matrix.target.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y expect
+
+      - name: Test the expect scripts driving the REPLs
+        run: |
+          ./test/models/expect_test.sh
+
+      - name: Test vector search
+        run: |
+          ./test/models/search_01.exp
+
+      - name: Test chat
+        run: |
+          ./test/models/chat_01.exp
+
+      - name: Stop spice and check logs
+        if: always()
+        uses: $/.github/actions/stop-spice
+
+  # Both macOS model tests, in one job on the binaries `build_macos` uploaded. As a job
+  # each, both waited for a `spiceai-macos-large` runner after the build (45-51 min at p90
+  # for a 4-minute test, merge_group, 2026-11-11..18); one job waits once. They are not
+  # steps of `build_macos`: they need `id-token: write` to exchange this job's GitHub OIDC
+  # token for OpenAI access, and that job runs every dependency's build script.
+  test_models_macos:
+    name: 'openai and huggingface models (darwin-aarch64)'
+    # A self-hosted Mac for Metal and for the Hugging Face cache in `$HOME`.
+    runs-on: spiceai-macos-large
+    # Holds the OpenAI workload identity federation IDs (`OPENAI_*` secrets).
+    environment: ci
+    needs:
+      - build_macos
+      - check_changes
+    if: ${{ needs.check_changes.outputs.merge_queue_passed != 'true' }}
+    # A backstop above the steps' own bounds (36 minutes: six 5-minute step bounds and the
+    # 60 s and 300 s readiness waits), leaving room for the checkout, the artifact download
+    # and the CLI install, so that a wedged step is cut by its own bound and named.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+      # The model tests' Spicepods read this repository's issues with `GITHUB_TOKEN`.
+      issues: read
+      pull-requests: read
+      # Exchanged for OpenAI access tokens: workload identity federation.
+      id-token: write
+    env:
+      # Workload identity federation: spiced and the OpenAI model tests exchange this job's
+      # GitHub OIDC token for provider access tokens with these IDs, and exchange again
+      # before each expires.
+      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+
+      - name: download artifacts - build_darwin_aarch64
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: build_darwin_aarch64
+          path: ./build
+
+      # The model tests: `spiced` from `build_macos` against one Spicepod each, driven
       # through the REPL expect scripts. Every wait inside them is bounded (readiness, then
       # the scripts' idle timeouts), so a host starved by a neighbouring job fails a step
       # rather than slowing it (#13761). The step bounds stand in for the 10-minute bound
@@ -403,11 +657,12 @@ jobs:
         id: install-spice
         uses: $/.github/actions/install-spice
         with:
-          build-path: ${{ github.workspace }}
+          build-path: ./build
+          install-scope: job
 
       # Once for both models: it drives stand-in processes rather than `spiced`, so it needs
       # no runtime and its result is the same whichever model is configured. Run once per
-      # model it added 2m41s to this job, and every macOS test waits for this job to end.
+      # model it took 2m41s each time.
       - name: 'model tests: test the expect scripts driving the REPLs'
         timeout-minutes: 5
         run: |
@@ -432,10 +687,7 @@ jobs:
         if: ${{ !cancelled() && steps.openai-ports.outcome == 'success' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # `Set up spiceio` exported the compiler cache's `AWS_ENDPOINT_URL` for the rest of
-        # this job; spiced would send every `s3://` request there (#12624).
         run: |
-          unset AWS_ENDPOINT_URL
           spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
 
       - name: 'openai model: wait for Spice runtime to be ready'
@@ -572,10 +824,7 @@ jobs:
         if: ${{ !cancelled() && steps.hf-ports.outcome == 'success' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # `Set up spiceio` exported the compiler cache's `AWS_ENDPOINT_URL` for the rest of
-        # this job; spiced would send every `s3://` request there (#12624).
         run: |
-          unset AWS_ENDPOINT_URL
           spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
 
       - name: 'huggingface model: wait for Spice runtime to be ready'
@@ -607,233 +856,6 @@ jobs:
 
       - name: 'huggingface model: stop spice and check logs'
         if: always() && steps.hf-start.outcome != 'skipped'
-        uses: $/.github/actions/stop-spice
-
-  test-bigquery:
-    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
-    environment: ci
-    name: BigQuery Regression Tests
-    needs: build_linux
-    if: ${{ inputs.run_all_tests }}
-    runs-on: spiceai-dev-runners
-    timeout-minutes: 90
-    permissions:
-      contents: read
-      # Exchanged for Google Cloud access tokens for the BigQuery tests: workload identity federation.
-      id-token: write
-    env:
-      SPICED_BIN: ${{ github.workspace }}/build/spiced
-      ADBC_BIGQUERY_DRIVER_PATH: /etc/adbc/drivers/libadbc_driver_bigquery.so
-      # The workload identity federation credential names no project.
-      BIGQUERY_PROJECT_ID: spiceai-testing
-      BIGQUERY_TEST_CLEANUP: always
-      BIGQUERY_EXPECT: single
-    steps:
-      - name: Set test output paths
-        id: test_env
-        shell: bash
-        run: |
-          set -euo pipefail
-          printf 'BIGQUERY_GATE_OUTPUT=%s/bigquery-regression-%s-%s\n' \
-            "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
-          printf 'BIGQUERY_GATE_VENV=%s/bigquery-regression-venv-%s-%s\n' \
-            "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 1
-
-      - name: Set up BigQuery credentials (workload identity federation)
-        uses: $/.github/actions/bigquery-credentials
-        with:
-          workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
-          service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
-
-      - name: Download Linux runtime artifact
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: build_linux_x86_64
-          path: ./build
-
-      - name: Prepare runtime artifact
-        run: |
-          chmod +x "$SPICED_BIN"
-          "$SPICED_BIN" --version
-
-      - name: Set up ADBC BigQuery driver
-        uses: $/.github/actions/setup-adbc-bigquery
-
-      - name: Set up Python
-        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: '3.12'
-
-      - name: Install BigQuery test dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m venv "$BIGQUERY_GATE_VENV"
-          "$BIGQUERY_GATE_VENV/bin/python" -m pip install google-cloud-bigquery==3.38.0
-
-      - name: Validate the BigQuery corpus harness
-        run: '"$BIGQUERY_GATE_VENV/bin/python" test/scripts/bigquery_corpus.py --self-test'
-
-      - name: Run BigQuery regression tests
-        timeout-minutes: 60
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$BIGQUERY_GATE_OUTPUT"
-          failed=0
-          for suite in corpus federation pushdown json_pushdown; do
-            if ! BIGQUERY_TEST_OUTPUT="$BIGQUERY_GATE_OUTPUT/$suite" \
-              "$BIGQUERY_GATE_VENV/bin/python" "test/scripts/bigquery_${suite}.py"; then
-              failed=1
-            fi
-          done
-          exit "$failed"
-
-      - name: Upload BigQuery test evidence
-        if: ${{ always() && steps.test_env.outcome == 'success' }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: bigquery-regression-evidence
-          path: ${{ env.BIGQUERY_GATE_OUTPUT }}
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Remove the test Python environment
-        if: ${{ always() && steps.test_env.outcome == 'success' }}
-        shell: bash
-        run: rm -rf -- "$BIGQUERY_GATE_VENV"
-
-  setup-model-matrix:
-    environment: secret-free
-    name: Setup model strategy matrix
-    if: ${{ github.event_name != 'pull_request' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    outputs:
-      matrix: ${{ steps.setup-matrix.outputs.result }}
-    steps:
-      - name: Set up matrix
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        id: setup-matrix
-        with:
-          script: |
-            const matrix = [
-              {
-                name: "Linux x64",
-                runner: "spiceai-dev-runners",
-                target_os: "linux",
-                target_arch: "x86_64"
-              }
-              // No macOS leg: `build_macos` runs the macOS model tests on the binaries
-              // it builds, rather than handing them to a job that waits for another
-              // `spiceai-macos-large` runner.
-            ];
-
-            const isPrEvent = context.eventName === 'pull_request';
-            return isPrEvent ? matrix.slice(0, 1) : matrix;
-
-  test_openai_model:
-    name: 'openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
-    # A backstop for the whole job, so it has to clear this job's own setup — artifact
-    # download and CLI install on the self-hosted pool — before the steps' bounded waits
-    # (60s readiness, then 30s/30s/60s inside the expect scripts) can report anything
-    # (#12644).
-    timeout-minutes: 10
-    runs-on: ${{ matrix.target.runner }}
-    needs:
-      - build_linux
-      - setup-model-matrix
-      - check_changes
-    if: ${{ needs.setup-model-matrix.outputs.matrix != '[]' && needs.check_changes.outputs.merge_queue_passed != 'true' }}
-    # Holds the OpenAI workload identity federation IDs (`OPENAI_*` secrets).
-    environment: ci
-    permissions:
-      contents: read
-      actions: read
-      # The Spicepod's `github:` dataset reads this repository's issues with `GITHUB_TOKEN`.
-      issues: read
-      pull-requests: read
-      # Exchanged for OpenAI access tokens: workload identity federation.
-      id-token: write
-    env:
-      # Workload identity federation: spiced and the tests exchange this job's GitHub OIDC token
-      # for provider access tokens with these IDs, and exchange again before each expires.
-      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
-      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
-    strategy:
-      fail-fast: false
-      matrix:
-        target: ${{ fromJson(needs.setup-model-matrix.outputs.matrix) }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          fetch-depth: 1
-
-      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          path: ./build
-
-      - name: Install spice
-        uses: $/.github/actions/install-spice
-        with:
-          build-path: ./build
-          install-scope: job
-
-      - name: Init spice app
-        run: |
-          cp ./test/models/spicepod_openai.yml ./spicepod.yaml
-          cat ./spicepod.yaml
-
-      # This job runs on the self-hosted pool, where several runner instances
-      # share one host and therefore one network namespace, so spiced's default
-      # 8090/50051 cannot be assumed free (#12419).
-      - name: Allocate Spice runtime ports
-        uses: $/.github/actions/allocate-spice-ports
-
-      - name: Start spice runtime
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
-
-      - name: Wait for Spice runtime is ready
-        uses: $/.github/actions/wait-for-spice-ready
-        with:
-          url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
-          timeout: '60'
-
-      - name: Configure apt mirrors (Linux)
-        if: matrix.target.target_os == 'linux'
-        uses: $/.github/actions/configure-apt
-
-      - name: Install expect (linux)
-        if: matrix.target.target_os == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y expect
-
-      - name: Test the expect scripts driving the REPLs
-        run: |
-          ./test/models/expect_test.sh
-
-      - name: Test vector search
-        run: |
-          ./test/models/search_01.exp
-
-      - name: Test chat
-        run: |
-          ./test/models/chat_01.exp
-
-      - name: Stop spice and check logs
-        if: always()
         uses: $/.github/actions/stop-spice
 
   test_quickstart_dremio:
@@ -3363,6 +3385,7 @@ jobs:
       - setup-model-matrix
       - test-bigquery
       - test_openai_model
+      - test_models_macos
       - test_quickstart_dremio
       - test_quickstart_spiceai
       - test_quickstart_s3
