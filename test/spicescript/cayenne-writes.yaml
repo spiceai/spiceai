@@ -15,6 +15,8 @@ description: >
 
 sources:
   src: { kind: postgres }
+  # The state location of the object-native-s3 variants.
+  lake: { kind: rustfs }
 
 matrix:
   policy: [upsert, drop, keep, none]
@@ -35,6 +37,25 @@ variants:
   drop-object-native: { when: { policy: drop, layout: plain }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } }, datasets: { ev: { acceleration: { primary_key: id, on_conflict: { id: drop } } } } }
   keep-object-native: { when: { policy: keep, layout: plain }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } }, datasets: { ev: { acceleration: { primary_key: id } } } }
   none-object-native: { when: { policy: none, layout: plain }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
+  # The same with the data in an S3 state location (`object-native-s3` in variants.yaml).
+  upsert-object-native-s3:
+    when: { policy: upsert, layout: plain }
+    spicepod: &s3
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state:
+          location: s3://${sources.lake.bucket}/state/
+          params:
+            s3_endpoint: ${sources.lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.lake.key}
+            s3_secret: ${sources.lake.secret}
+            allow_http: 'true'
+    datasets: { ev: { acceleration: { primary_key: id, on_conflict: { id: upsert } } } }
+  drop-object-native-s3: { when: { policy: drop, layout: plain }, spicepod: *s3, datasets: { ev: { acceleration: { primary_key: id, on_conflict: { id: drop } } } } }
+  keep-object-native-s3: { when: { policy: keep, layout: plain }, spicepod: *s3, datasets: { ev: { acceleration: { primary_key: id } } } }
+  none-object-native-s3: { when: { policy: none, layout: plain }, spicepod: *s3 }
 
 spicepod:
   version: v1
@@ -208,3 +229,13 @@ steps:
   # Memory mode keeps nothing on disk.
   - assert-files: { lacks: '^\.spice/data/' }
     when: { mode: memory }
+  # Object-native data: a file acceleration's log is in the state location and
+  # nothing is at a local `s3:` path; a memory one keeps nothing there.
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/ev-, contains: /head, min: 1 }
+    only: &s3-variants [upsert-object-native-s3, drop-object-native-s3, keep-object-native-s3, none-object-native-s3]
+    when: { mode: file }
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/, max: 0 }
+    only: *s3-variants
+    when: { mode: memory }
+  - assert-files: { lacks: '(^|/)s3:' }
+    only: *s3-variants
