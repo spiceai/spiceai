@@ -2333,6 +2333,18 @@ fn is_refusal_code(code: Option<&str>) -> bool {
     })
 }
 
+/// The identifier that classified the entry as a refusal, for the operator
+/// message. Prefer `extensions.code` when it is a refusal; otherwise `type`.
+fn refusal_label<'a>(error_code: Option<&'a str>, error_type: Option<&'a str>) -> Option<&'a str> {
+    if is_refusal_code(error_code) {
+        error_code
+    } else if is_refusal_code(error_type) {
+        error_type
+    } else {
+        None
+    }
+}
+
 fn error_code_and_type(entry: &Value) -> (Option<&str>, Option<&str>) {
     let code = entry
         .get("extensions")
@@ -2462,11 +2474,10 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
             .and_then(|e| e.get("code"))
             .and_then(|c| c.as_str());
 
-        if is_refusal_code(error_code) || is_refusal_code(error_type) {
+        if let Some(label) = refusal_label(error_code, error_type) {
             return Err(Error::InvalidCredentialsOrPermissions {
                 message: format!(
-                    "The API refused the request ({}). Verify the credentials have the necessary permissions. {message}",
-                    error_code.or(error_type).unwrap_or_default()
+                    "The API refused the request ({label}). Verify the credentials have the necessary permissions. {message}"
                 ),
                 kind: RefusalKind::Explicit,
             });
@@ -5498,5 +5509,32 @@ mod graphql_errors_classification_tests {
             "{err:?}"
         );
         assert!(!is_retriable_error(&err), "{err:?}");
+    }
+
+    /// A refusal named by `type` is the label the operator sees, even when
+    /// `extensions.code` names a transient failure on the same entry.
+    #[test]
+    fn refusal_message_uses_the_type_when_the_code_is_not_a_refusal() {
+        let err = classify(&json!({
+            "errors": [{
+                "message": "access denied",
+                "type": "FORBIDDEN",
+                "extensions": {"code": "INTERNAL_SERVER_ERROR"}
+            }]
+        }));
+        assert!(
+            matches!(
+                err,
+                Error::InvalidCredentialsOrPermissions {
+                    kind: crate::graphql::RefusalKind::Explicit,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(!is_retriable_error(&err), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("FORBIDDEN"), "{text}");
+        assert!(!text.contains("INTERNAL_SERVER_ERROR"), "{text}");
     }
 }
