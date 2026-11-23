@@ -91,8 +91,9 @@ package defaults; the full workspace gate still runs.
 
 Nextest's test build also builds the CLI. `verify-cli` checks cargo's emitted
 artifacts and executes the CLI, using the same selection, features, and profile.
-The merge queue's required `Build (release profile)` job separately builds the
-CLI, `spiced`, and the release install.
+The merge queue's required `E2E Test CI` separately builds the CLI and `spiced`
+in the release profile, on Linux x86_64 and macOS aarch64, and runs its tests
+against those binaries.
 
 Sign-off clears inherited Make flags and nextest filters, profile, retry, and
 empty-suite overrides before invoking the gate. A focused `make nextest` remains
@@ -858,7 +859,6 @@ Required checks in the merge queue (the `trunk` ruleset):
 - `enforce-pull-with-spice`
 - `Rust Lint`
 - `Build and Test`
-- `Build (release profile)`
 - `Integration Tests (part 1/2/3)`
 - `ADBC Integration Tests`
 - `Check Rust Licenses`

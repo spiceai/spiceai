@@ -132,7 +132,6 @@ readonly REQUIRED_CHECKS=(
   "enforce-pull-with-spice"  # PR hygiene (enforce-pulls-with-spice.yml)
   "Rust Lint"                # pr.yml
   "Build and Test"           # pr.yml
-  "Build (release profile)"  # pr.yml
   "Integration Tests (part 1)"
   "Integration Tests (part 2)"
   "Integration Tests (part 3)"
@@ -2080,9 +2079,10 @@ run_checks() {
   # the graph at a selection no other phase shares, to relink a binary that was
   # already there. `verify-cli` asserts it exists and runs, so the day cargo stops
   # producing it the gate says so instead of quietly dropping CLI coverage.
-  # The merge queue's required `Build (release profile)` job builds the CLI,
-  # spiced, and the release install for real, so release-only breakage — and the
-  # `-p spice` resolution this no longer exercises — is still caught before trunk.
+  # The merge queue's required `E2E Test CI` builds the CLI and spiced in the
+  # release profile for real (`build_linux` and `build_macos`), so release-only
+  # breakage — and the `-p spice` resolution this no longer exercises — is still
+  # caught before trunk.
   info "Running unit tests and verifying the CLI (make nextest verify-cli)…"
   # Lighter Cayenne fuzz/race depth for the PR gate (see
   # crates/cayenne/tests/mutation_property_test.rs and common::env_scale); both

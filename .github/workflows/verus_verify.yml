@@ -51,8 +51,8 @@ name: Verus Verification
 # commit, so a context that no pull-request run reports blocks the PR rather
 # than passing it. The job's `if` skips it on a pull request, which reports
 # `Verify Verus proofs` as skipped and satisfies the required check without
-# running the verifier — the same arrangement `Rust Lint`, `Build and Test`, and
-# `Build (release profile)` use in pr.yml.
+# running the verifier — the same arrangement `Rust Lint` and `Build and Test`
+# use in pr.yml.
 #
 # The workflow carries NO `paths` filter for that same reason: a workflow that
 # never triggers reports nothing at all. The change filter inside the job skips
