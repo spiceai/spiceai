@@ -262,14 +262,20 @@ pub fn is_model_weights(path: &str) -> bool {
 }
 
 /// The file of a model's draft files the engine drafts with: the first `-00001-of-` shard, else
-/// the first, as it opens a sharded drafter from its first shard.
+/// the first, as it opens a sharded drafter from its first shard ([`first_shard`]).
 #[must_use]
 pub fn drafting_file(draft: &[String]) -> Option<&str> {
-    draft
+    first_shard(&draft.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// The first of `files` whose file name holds `-00001-of-`, else the first, as llama.cpp's
+/// engine opens a sharded model or drafter: by the file's name, not the folders above it.
+fn first_shard<'a>(files: &[&'a str]) -> Option<&'a str> {
+    files
         .iter()
-        .find(|d| d.contains("-00001-of-"))
-        .or_else(|| draft.first())
-        .map(String::as_str)
+        .find(|f| file_name(f).contains("-00001-of-"))
+        .or_else(|| files.first())
+        .copied()
 }
 
 /// Whether the GGUF file at `path` is the one its set of weights opens from: a lone file, or the
@@ -281,15 +287,20 @@ pub fn opens_a_set(path: &str) -> bool {
 
 /// The file of `files` that an engine taking one file opens the model from. An MTP draft head
 /// is set aside first, as the engine sets it aside to draft with; of the rest, the first that
-/// holds the weights by name ([`is_model_weights`]), else the first of the rest, else the first.
+/// holds the weights by name ([`is_model_weights`]), else the first shard 1 of the rest, as the
+/// engine opens it ([`first_shard`]), else the first of the rest, else the first.
 #[must_use]
 pub fn model_file(files: &[String]) -> Option<&str> {
-    let trunk = || files.iter().filter(|f| !is_draft_head(f));
+    let trunk = || {
+        files
+            .iter()
+            .map(String::as_str)
+            .filter(|f| !is_draft_head(f))
+    };
     trunk()
         .find(|f| is_model_weights(f))
-        .or_else(|| trunk().next())
-        .or_else(|| files.first())
-        .map(String::as_str)
+        .or_else(|| first_shard(&trunk().collect::<Vec<_>>()))
+        .or_else(|| files.first().map(String::as_str))
 }
 
 /// A file that is not the model's weights though it is a GGUF file: an importance matrix, or a
@@ -1470,6 +1481,14 @@ mod tests {
             drafting_file(&files(&["mtp-A-Q8_0.gguf", "mtp-B-Q8_0.gguf"])),
             Some("mtp-A-Q8_0.gguf")
         );
+        // a folder named like a shard does not make its files shards, as the engine reads names
+        assert_eq!(
+            drafting_file(&files(&[
+                "mtp-Model-Q8_0.gguf",
+                "d-00001-of-2/dspark-Model-Q8_0.gguf"
+            ])),
+            Some("mtp-Model-Q8_0.gguf")
+        );
         assert_eq!(drafting_file(&[]), None);
     }
 
@@ -1531,6 +1550,15 @@ mod tests {
         assert_eq!(
             model_file(&files(&["mtp-Model-Q8_0.gguf", "Model-Q4_K_M.gguf"])),
             Some("Model-Q4_K_M.gguf")
+        );
+        // with no weights by name, the first shard 1, as the engine opens it
+        assert_eq!(
+            model_file(&files(&[
+                "mmproj-F16.gguf",
+                "dspark-M-00001-of-00002.gguf",
+                "dspark-M-00002-of-00002.gguf",
+            ])),
+            Some("dspark-M-00001-of-00002.gguf")
         );
         assert_eq!(model_file(&[]), None);
     }
