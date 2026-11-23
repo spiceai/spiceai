@@ -60,6 +60,8 @@ pub(super) fn describe(action: &Action) -> String {
         Action::StopSource(s) => format!("stop-source {s}"),
         Action::PauseSource(s) => format!("pause-source {s}"),
         Action::UnpauseSource(s) => format!("unpause-source {s}"),
+        Action::PartitionSource(s) => format!("partition-source {s}"),
+        Action::HealSource(s) => format!("heal-source {s}"),
         Action::Write { source, sql, .. } => {
             format!("write {source}: {}", one_line(&sql.join("; "), 70))
         }
@@ -239,6 +241,8 @@ pub(super) async fn run_source_step(action: &Action, sources: &mut Sources) -> R
         }
         Action::StopSource(name) => sources.set(name, SourceState::Stopped).await,
         Action::PauseSource(name) => sources.set(name, SourceState::Paused).await,
+        Action::PartitionSource(name) => sources.set_partitioned(name, true),
+        Action::HealSource(name) => sources.set_partitioned(name, false),
         Action::Sleep(d) => {
             tokio::time::sleep(*d).await;
             Ok(())
@@ -919,6 +923,8 @@ async fn run_step(
         | Action::StopSource(_)
         | Action::PauseSource(_)
         | Action::UnpauseSource(_)
+        | Action::PartitionSource(_)
+        | Action::HealSource(_)
         | Action::Sleep(_) => unreachable!("source steps run once, not per instance"),
     }
     Ok(format!(" ({:.1}s)", started.elapsed().as_secs_f64()))

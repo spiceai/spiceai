@@ -1,0 +1,100 @@
+name: mysql-cdc-partition
+description: >
+  MySQL CDC reconnects after a packet-dropping network partition hides the
+  source closing both the binlog stream and its side connections; a busy and
+  a quiet dataset both remain exactly equal to their source tables.
+
+sources:
+  src: { kind: mysql, partitionable: true }
+
+matrix:
+  engine: [cayenne]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mysql-cdc-partition
+  datasets:
+    - from: mysql:busy
+      name: busy
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file, refresh_mode: changes, primary_key: id }
+    - from: mysql:quiet
+      name: quiet
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file, refresh_mode: changes, primary_key: id }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE busy (id int PRIMARY KEY, v int);
+        CREATE TABLE quiet (id int PRIMARY KEY, v int);
+        INSERT INTO busy VALUES (1, 0), (2, 20), (3, 30);
+        INSERT INTO quiet VALUES (1, 10), (2, 20), (3, 30);
+  - start: {}
+  - query: SELECT id, v FROM busy
+    eventually: 60s
+  - query: SELECT id, v FROM quiet
+    eventually: 60s
+
+  - background:
+      id: busy-writer
+      source-exec: { src: "UPDATE busy SET v = ${round} WHERE id = 1" }
+      every: 200ms
+  - source-query: { src: "SELECT count(*) AS recent FROM busy WHERE id = 1 AND v >= 5" }
+    expect: { rows: [['1']] }
+    eventually: 60s
+  - query: SELECT count(*) AS recent FROM busy WHERE id = 1 AND v >= 5
+    eventually: 60s
+
+  - partition-source: src
+  - source-exec:
+      src: |
+        DROP PROCEDURE IF EXISTS kill_spiced_connections;
+        DELIMITER //
+        CREATE PROCEDURE kill_spiced_connections()
+        BEGIN
+          DECLARE done boolean DEFAULT false;
+          DECLARE victim_id bigint unsigned;
+          DECLARE victims CURSOR FOR
+            SELECT id
+            FROM information_schema.processlist
+            WHERE id <> CONNECTION_ID()
+              AND host NOT LIKE '127.0.0.1:%'
+              AND host NOT LIKE 'localhost%';
+          DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = true;
+          OPEN victims;
+          kill_loop: LOOP
+            FETCH victims INTO victim_id;
+            IF done THEN
+              LEAVE kill_loop;
+            END IF;
+            SET @kill_sql = CONCAT('KILL ', victim_id);
+            PREPARE kill_statement FROM @kill_sql;
+            EXECUTE kill_statement;
+            DEALLOCATE PREPARE kill_statement;
+          END LOOP;
+          CLOSE victims;
+        END //
+        DELIMITER ;
+        CALL kill_spiced_connections();
+        DROP PROCEDURE kill_spiced_connections;
+  # Time is the fault under test: MySQL's closes stay lost while writes keep
+  # entering the binlog and the client-side sockets remain half-open.
+  - sleep: 20s
+  - source-query: { src: "SELECT count(*) AS recent FROM busy WHERE id = 1 AND v >= 20" }
+    expect: { rows: [['1']] }
+    eventually: 60s
+  - heal-source: src
+
+  # Only a resumed change stream brings `busy` level with the source.
+  - stop-background: busy-writer
+  - query: SELECT id, v FROM busy
+    eventually: 60s
+  - query: SELECT id, v FROM quiet
+    eventually: 60s
+  - assert-log:
+      contains: ['binlog connection lost; reconnecting']

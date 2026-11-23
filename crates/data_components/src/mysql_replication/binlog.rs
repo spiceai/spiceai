@@ -119,6 +119,27 @@ fn net_write_timeout_left_alone_warning(connection: &str, reason: &str) -> Strin
     )
 }
 
+/// How often the source is asked to send a heartbeat event while the dump has
+/// nothing else to send. Half the checkpoint interval (min 500ms) keeps idle
+/// persists within ~1.5× the interval.
+fn dump_heartbeat_period(checkpoint_interval: Duration) -> Duration {
+    (checkpoint_interval / 2).max(Duration::from_millis(500))
+}
+
+/// How long a dump may deliver nothing, neither an event nor a heartbeat,
+/// before the source is asked whether the dump is still running.
+///
+/// A dump client never writes, so a connection the source closed while the
+/// network dropped its packets stays open on the client forever: no error and
+/// no end of stream ever arrives. The source sends a heartbeat at least every
+/// [`dump_heartbeat_period`] while it has nothing else to send, so three missed
+/// heartbeats (at least 10 s) make the dump suspect. Silence alone is not
+/// proof: an event arrives only once it is complete, so a large event on a slow
+/// link is silent for as long as it takes to transfer.
+pub(super) fn dump_silence_limit(checkpoint_interval: Duration) -> Duration {
+    (dump_heartbeat_period(checkpoint_interval) * 3).max(Duration::from_secs(10))
+}
+
 /// One statement issued on the dump connection before `COM_BINLOG_DUMP`.
 struct PreDumpStatement {
     sql: String,
@@ -142,14 +163,10 @@ fn pre_dump_session_statements(
     checkpoint_interval: Duration,
     inherited_net_write_timeout: Option<u32>,
 ) -> Vec<PreDumpStatement> {
-    // Ask the source to send heartbeat events while idle so the stream can
-    // detect dead connections and advance its checkpoint. Half the
-    // checkpoint interval (min 500ms) keeps idle persists within ~1.5×
-    // the interval. The session variable is in nanoseconds; MySQL 8.4
-    // renamed the replica-facing vocabulary, so set both spellings (unknown
-    // user variables are inert).
-    let heartbeat_nanos = (checkpoint_interval / 2)
-        .max(Duration::from_millis(500))
+    // The session variable is in nanoseconds; MySQL 8.4 renamed the
+    // replica-facing vocabulary, so set both spellings (unknown user variables
+    // are inert).
+    let heartbeat_nanos = dump_heartbeat_period(checkpoint_interval)
         .as_nanos()
         .min(u128::from(u64::MAX));
     // Two separate statements: if a server rejects one spelling, the other
@@ -222,6 +239,14 @@ pub(super) async fn inherited_net_write_timeout(
     )
 }
 
+/// A dump opened by [`open_binlog_stream`].
+pub(super) struct OpenedDump {
+    pub stream: BinlogStream,
+    /// The source's id for the dump's connection, which names the dump's
+    /// thread in the source's process list.
+    pub thread_id: u32,
+}
+
 /// `connection` is the shared source's `host:port` label, not a dataset: one dump
 /// serves every `refresh_mode: changes` dataset on the source, so anything this
 /// function reports is about the connection they share.
@@ -231,8 +256,9 @@ pub(super) async fn open_binlog_stream(
     connection: &str,
     use_gtid: bool,
     gtid: &GtidSet,
-) -> std::result::Result<BinlogStream, mysql_async::Error> {
+) -> std::result::Result<OpenedDump, mysql_async::Error> {
     let mut conn = Conn::new(params.opts.clone()).await?;
+    let thread_id = conn.id();
 
     let inherited_timeout = match inherited_net_write_timeout(&mut conn).await {
         Ok(Some(inherited)) => Some(inherited),
@@ -272,7 +298,7 @@ pub(super) async fn open_binlog_stream(
         }
     }
 
-    if use_gtid {
+    let stream = if use_gtid {
         // GTID auto-positioning: the server computes the start point from the
         // executed set (everything NOT in it is sent), so no filename/offset is
         // needed. This is what survives a failover — the set is
@@ -295,7 +321,8 @@ pub(super) async fn open_binlog_stream(
                 .with_pos(u64::from(pos_u32)),
         )
         .await
-    }
+    }?;
+    Ok(OpenedDump { stream, thread_id })
 }
 
 /// Decode a rows event for the subscribed table into the transaction buffer.

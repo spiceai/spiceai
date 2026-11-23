@@ -322,6 +322,8 @@ fn schedule(script: &Script, steps: &[Step]) -> Schedule {
                     | Action::StopSource(_)
                     | Action::PauseSource(_)
                     | Action::UnpauseSource(_)
+                    | Action::PartitionSource(_)
+                    | Action::HealSource(_)
             )
         })
     {
@@ -649,6 +651,14 @@ impl Sources {
             _ => unreachable!("every pair of states is handled"),
         }
         self.state.insert(name.to_string(), target);
+        Ok(())
+    }
+
+    fn set_partitioned(&self, name: &str, partitioned: bool) -> Result<()> {
+        ensure!(
+            self.get(name)?.set_partitioned(partitioned),
+            "source '{name}' is not partitionable"
+        );
         Ok(())
     }
 }
@@ -1484,6 +1494,8 @@ fn is_source_step(action: &Action) -> bool {
             | Action::StopSource(_)
             | Action::PauseSource(_)
             | Action::UnpauseSource(_)
+            | Action::PartitionSource(_)
+            | Action::HealSource(_)
             | Action::Sleep(_)
     )
 }

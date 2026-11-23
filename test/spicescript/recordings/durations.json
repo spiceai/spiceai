@@ -109,6 +109,7 @@
   "mongodb-types-acceleration": 19,
   "mysql-cdc-gtid-failover": 207,
   "mysql-cdc-kill-during-compaction": 161,
+  "mysql-cdc-partition": 34,
   "mysql-cdc-parity": 370,
   "mysql-cdc-shared-binlog": 56,
   "mysql-cdc-shutdown-mid-delivery": 64,

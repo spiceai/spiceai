@@ -175,6 +175,9 @@ pub struct SourceSpec {
     /// requests (buckets, `assert-objects`) go to the store directly.
     #[serde(default, with = "opt_duration")]
     pub latency: Option<Duration>,
+    /// `mysql` sources: route the connector through the partition proxy.
+    #[serde(default)]
+    pub partitionable: bool,
 }
 
 /// `sidecar:`: the application sidecar each instance runs beside it.
@@ -475,6 +478,8 @@ pub enum Action {
     StopSource(String),
     PauseSource(String),
     UnpauseSource(String),
+    PartitionSource(String),
+    HealSource(String),
     /// Run statements on a source, in this instance's database.
     SourceExec {
         source: String,
@@ -1611,6 +1616,8 @@ const ACTIONS: &[&str] = &[
     "stop-source",
     "pause-source",
     "unpause-source",
+    "partition-source",
+    "heal-source",
     "source-exec",
     "write",
     "refresh",
@@ -1647,6 +1654,8 @@ const REACH_NO_SPICED: &[&str] = &[
     "stop-source",
     "pause-source",
     "unpause-source",
+    "partition-source",
+    "heal-source",
     "source-exec",
     "write",
     "generate",
@@ -1847,6 +1856,8 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
         "stop-source" => Action::StopSource(string_arg(&arg, name)?),
         "pause-source" => Action::PauseSource(string_arg(&arg, name)?),
         "unpause-source" => Action::UnpauseSource(string_arg(&arg, name)?),
+        "partition-source" => Action::PartitionSource(string_arg(&arg, name)?),
+        "heal-source" => Action::HealSource(string_arg(&arg, name)?),
         "write" => {
             let Value::Object(m) = arg else {
                 bail!("`write` takes a mapping of source name to SQL");

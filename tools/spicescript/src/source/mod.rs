@@ -39,6 +39,7 @@ pub mod iceberg;
 pub mod mock_http;
 pub mod mysql;
 pub mod object_store;
+mod partition_proxy;
 pub mod postgres;
 pub mod write;
 
@@ -67,6 +68,12 @@ pub struct TextResult {
 pub trait Source: Send + Sync {
     /// The source's container; `None` for a source with no server (files).
     fn container(&self) -> Option<&Container>;
+
+    /// Changes the harness-owned connector path between connected and
+    /// black-holed. Returns false for sources without that path.
+    fn set_partitioned(&self, _partitioned: bool) -> bool {
+        false
+    }
 
     /// Every container the source runs, for saving their logs. A source
     /// running more than its one `container` lists the rest too.
@@ -192,13 +199,17 @@ pub async fn start(
         spec.latency.is_none() || kind == "rustfs",
         "source '{name}': `latency` is for `rustfs` sources, not '{kind}'"
     );
+    anyhow::ensure!(
+        !spec.partitionable || kind == "mysql",
+        "source '{name}': `partitionable` is for `mysql` sources, not '{kind}'"
+    );
     let source: Box<dyn Source> = match kind {
         "kafka" | "mongodb" | "dynamodb" => {
             Box::new(document::Document::start(name, run_id, kind, version).await?)
         }
         "docker" => Box::new(generic::Generic::start(name, run_id, spec).await?),
         "postgres" => Box::new(postgres::Postgres::start(name, run_id, version).await?),
-        "mysql" => Box::new(mysql::Mysql::start(name, run_id, version).await?),
+        "mysql" => Box::new(mysql::Mysql::start(name, run_id, version, spec.partitionable).await?),
         "files" => Box::new(files::Files::new(dir)?),
         "rustfs" => {
             Box::new(object_store::ObjectStore::start(name, run_id, dir, spec.latency).await?)
@@ -303,7 +314,10 @@ fn take_field(field: &mut String, quoted: &mut bool) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_csv;
+    use std::path::Path;
+
+    use super::{parse_csv, start};
+    use crate::script::Script;
 
     #[test]
     fn csv_keeps_null_apart_from_empty_and_quoted_text_intact() {
@@ -320,6 +334,30 @@ mod tests {
                 vec![s("4"), s("line\nbreak \"quoted\"")],
                 vec![s("5"), s("plain")],
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn partitionable_names_a_non_mysql_source_kind() {
+        let script = Script::parse(
+            "name: p\nsources: { db: { kind: postgres, partitionable: true } }\nspicepod: {}\nsteps: [{ start: {} }]\n",
+        )
+        .expect("source option parses before its resolved kind is checked");
+        let result = start(
+            "db",
+            "test",
+            "postgres",
+            None,
+            Path::new("unused"),
+            &script.sources["db"],
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("postgres must reject `partitionable`");
+        };
+        assert_eq!(
+            error.to_string(),
+            "source 'db': `partitionable` is for `mysql` sources, not 'postgres'"
         );
     }
 }
