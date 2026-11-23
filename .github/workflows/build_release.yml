@@ -74,12 +74,21 @@ on:
           - 'release'
           - 'release-lto'
         default: 'release'
+      unhealthy_reason:
+        description: 'Release build only: why to build a commit whose trunk tests did not pass (a known flake, an infrastructure fault). Empty requires a green trunk-tests status on the commit.'
+        required: false
+        type: string
+        default: ''
 
 # Jobs that need more ask for it; setup-matrix reads only the event payload.
 permissions:
   contents: read
 
 env:
+  # The CI cache's anonymous read URL (.github/ci-cache/README.md). setup-rust and
+  # install-cargo-deny read pinned downloads from it, falling back to the source; empty
+  # where the repository has no CI object store, which turns the cache off.
+  CI_CACHE_URL: ${{ vars.TEST_MINIO_ENDPOINT && format('{0}/ci-cache', vars.TEST_MINIO_ENDPOINT) || '' }}
   # Checked against version.txt by get_release_version.py; empty except on a release build.
   RELEASE_VERSION: ${{ inputs.release_version }}
   # CI performance optimizations
@@ -97,9 +106,75 @@ concurrency:
   cancel-in-progress: ${{ inputs.release_version && true || false }}
 
 jobs:
+  # A release is built only from a commit that passed the full post-merge
+  # suite: trunk_tests.yml posts a `trunk-tests` commit status on the exact
+  # commit it tested, for trunk and for each changed release branch head. The
+  # merge queue runs only the quick set, so a release branch commit can be
+  # green there and still fail the rest. Checked before any build, so a
+  # failure costs seconds, not hours. Test builds (no release_version) skip it.
+  release-health:
+    environment: secret-free
+    name: Release health
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read   # whether the commit has trunk_tests.yml
+      statuses: read   # its trunk-tests status
+    steps:
+      - name: Require a green trunk-tests status on the release commit
+        if: ${{ inputs.release_version != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref_name }}
+          REASON: ${{ inputs.unhealthy_reason }}
+        run: |
+          set -euo pipefail
+          # A commit without trunk_tests.yml predates the post-merge split: its
+          # own merge queue ran the full suite, so it needs no post-merge verdict.
+          # Absence counts only from a listing that succeeded; a lookup that
+          # fails must not exempt a release.
+          if ! workflows=$(gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows?ref=$SHA" -q '.[].name'); then
+            echo "::error::Could not list the workflows of commit $SHA, so cannot tell whether it needs a trunk-tests result. Re-run this job."
+            exit 1
+          fi
+          if ! grep -qx trunk_tests.yml <<<"$workflows"; then
+            echo "::notice::Commit $SHA predates trunk_tests.yml; its merge queue ran the full suite, so no trunk-tests result is required."
+            exit 0
+          fi
+          # The newest trunk-tests status posted by this repository's Actions,
+          # chosen by its own timestamp and id rather than the list's order.
+          status=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/statuses?per_page=100" \
+            -q '[.[] | select(.context == "trunk-tests" and .creator.login == "github-actions[bot]")] | sort_by(.created_at, .id) | last // empty | "\(.state) \(.target_url)"')
+          state=${status%% *}
+          url=${status#* }
+          if [ "$state" = success ]; then
+            echo "Commit $SHA passed trunk tests: $url"
+            exit 0
+          fi
+          if [ -z "$status" ]; then
+            problem="Commit $SHA has no trunk-tests result, so it has not been through the full post-merge suite. Run it with: gh workflow run trunk_tests.yml -f branch=$REF, then build again once it passes."
+          else
+            problem="Commit $SHA failed trunk tests ($state): $url. Fix the failure on $REF, or, if it is a known flake or infrastructure fault, build again with unhealthy_reason set."
+          fi
+          if [ -n "$REASON" ]; then
+            echo "::warning::Building release $RELEASE_VERSION anyway. $problem Reason given: $REASON"
+            {
+              echo "### Release built without a green trunk-tests result"
+              echo
+              echo "$problem"
+              echo
+              echo "**Reason given:** $REASON"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "::error::$problem"
+          exit 1
+
   setup-matrix:
     environment: secret-free
     name: Setup strategy matrix
+    needs: release-health
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}

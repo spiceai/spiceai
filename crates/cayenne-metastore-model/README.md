@@ -7,7 +7,8 @@ It is a finite protocol abstraction, not the Spice engine or an object-store imp
 Lifecycle and coverage start with one live row per key, with two valid tier
 placements preserving warm-subset and cold-file witnesses. Live-row counts are
 checked independently of value selection and count identical physical rows.
-No model check runs through `cargo test`.
+No model check runs through `cargo test`; it runs the Explorer render test and
+the mem-tier trace replays.
 The `seq-order-two-writers-*` runs are the concurrent-ingest scenarios of
 Milestone 3.
 
@@ -33,6 +34,73 @@ cargo run --release -p cayenne-metastore-model -- cite-check docs/design/object-
 Retirement graphs have a 30-minute watchdog for the combined scan, restore-point
 and retention-clock interleavings; other graphs keep the 9-minute watchdog.
 A watchdog timeout is incomplete, never an exhaustive safety result.
+
+## Exploring runs in the Stateright Explorer
+
+`serve <run> [address]` checks a run as `run` does, then serves the
+[Stateright Explorer](https://docs.rs/stateright/0.31.0/stateright/struct.CheckerBuilder.html#method.serve)
+on `address` (default `127.0.0.1:3000`) until stopped. Use it to walk someone
+through a counterexample or a witness, or to step a model by hand.
+
+```sh
+cargo build --release -p cayenne-metastore-model
+target/release/cayenne-metastore-model serve mem-tier-current-3-exhaust
+target/release/cayenne-metastore-model serve standby 127.0.0.1:3001
+```
+
+For each failed or reached property the run prints an `EXPLORE` line whose link
+opens the minimized trace in the Explorer:
+
+```text
+EXPLORE FAIL recovered reads match the source http://127.0.0.1:3000/#/steps/0/6/6/3/1/7/6/6/2/2/2/2/2/2
+```
+
+From any step the Explorer lists the enabled actions, so a trace can be extended
+by hand. Controls do not need `EXHAUST=1` when served, since their counterexample
+is usually what is worth showing. The Explorer's own "Run to completion"
+re-explores the graph without the run's symmetry reduction or early stop, so on
+large runs prefer the printed links.
+
+**What the Explorer shows.** Every model names its actions in plain language
+(the path and the next-action list) and, under "Current State", summarizes the
+facts its drawing leaves out: the serial history or source, what a reader sees
+next to what the source says, and the witness and violation flags that are set.
+"Complete State?" still shows the raw `Debug` state. Most models also draw their
+state; the drawings live in `src/explorer.rs` and come in three kinds: Action labels describe the protocol's own step. Where a control changes what a
+step visibly publishes (a split staging call, a late stamp, a takeover without a
+head generation, an A record with no intent, data and position in two commits),
+the label says so; where a control only removes a guard inside the step, the label
+is the protocol's, and the control's run and its row in the controls tables below
+say what it removes. Red never depends on a label: it comes from the model's own
+properties.
+
+| Drawing | What it shows | Families |
+|---|---|---|
+| Object store | The head (floor, batch index, inline window) with arrows to the batch objects it indexes and the checkpoint root; staged roots, observed cuts and unreferenced or collected batches; a running query's or reader's captured head and the batches it still needs | `window`, `floors`, `commits`, `transactions`, `concurrent`, the byte window of `lifecycle-composed` |
+| Table layout | The dataset head (sequence highs, delete vectors, key page, prepared operations) with arrows to each file by tier, the files each delete vector hides, and stored objects the head does not reference (or references but are missing); in-flight maintenance plans, checkpoints and queries | `dataset-lifecycle`, `remote-maintenance`, `cold-promotion`, `lifecycle-composed`; `mem-tier` draws its durable catalog, memory tier and restart result the same way |
+| Trace timeline | One lane per actor (instances, writers, the lease object, heads, GC, replication, readers) and one row per step, with the current state in boxes above | `standby`, `intent-roll-forward` (with each intent in A pointing at the record that applies it in B), `reads`, `retention`, `replicas`, `source-positions`, `seq-order`, `read-programs`, `mem-tier`; `object-names` draws head references pointing at named objects, and `data-files` draws the head's live and retired files pointing at the stored files (orphans, deletes in flight, and missing files in red) above a timeline of writers, the store, readers and the sweep |
+
+Colors: white is committed (referenced by the authoritative head), dashed yellow
+is written but not referenced or in flight, grey is collected or superseded, red
+is missing or violated (a duplicate live key, a reference to a missing object, a
+restart that disagrees with the source) or a crash or pause in a timeline, and
+green is an actor. Red follows the properties: an outcome a property allows, such
+as a query error once its retention has passed or live rows that lag the source
+while recovery redelivers it, is not drawn red, and a red read says which property
+it breaks (a failure within the window, or wrong rows from a missing object read
+as empty). In every timeline, a step after which one of the model's `always`
+properties no longer holds is drawn red with `BREAKS <property>`, evaluated by the
+model's own property, not by the drawing. `position-deletes`,
+`state-rules`, `read-delivery`, `predicate-progress` and `action-compatibility`
+show text only.
+
+The drawings read state fields and call the model's own functions (`visible`,
+`recovered_rows`, `reference`); they never re-derive the protocol, and the
+checker never calls them, so they cannot change what is checked.
+`cargo test -p cayenne-metastore-model` walks every run along seeded random
+paths and renders each step as the Explorer does (every enabled action's label
+and text, and the drawing), failing on a panic, an empty label, malformed SVG,
+or a family that stops drawing.
 
 Checkers use 6 threads by default; set `MODEL_THREADS` to change it. Results do not depend on the thread count, and the binary uses mimalloc, because cloning states dominates checking. Models list candidate actions and reject disabled ones in `next_state`, so each successor is computed once; simulation runs, whose checker cannot replay a rejected pick, list only enabled actions. Controls require `EXHAUST=1`. A control stops once it has found its expected failure and every witness it must reach; its other safety properties print `NOT_FOUND`, not `HOLDS`, because the rest of its graph is not explored. A wrong outcome, missing
 required control failure, invalid witness, or checker timeout makes the command fail.
@@ -109,7 +177,7 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 | `transactions-txn` | Two datasets, one transaction, competing ordinary writes, reservations, commit/abort create race, helper Resolve, uncertain CAS, checkpoint/GC; one participant writes other keys while prepared so the Prepare can reach a checkpoint; I3–I6, I8 | Exhaustive 1 (two lease generations), controls 0 except owner restriction 1; samples 2, 3 (two outstanding handles per dataset) |
 | `intent-roll-forward*` (single writer) | Proposed single-writer alternative to two-phase commit: one writer holding both datasets' leases commits A's actions, the source position and a pending intent for B in one A record, applies the intent to B under the transaction id, optionally marks it done in A; the next lease holder rolls pending intents forward. Maintenance on either head, delayed/duplicate CAS, lost responses resolved by attempt id, crash, pause and fencing; atomicity, at-most-once B apply, acknowledged/positioned transactions in both datasets at quiescence, I2, no retraction, B values in commit-point order, I5 | 1 or 2 source transactions on one key; one maintenance commit per dataset; one turnover and one crash (`two-takeovers`: two each); 2 copies per request; `disjoint-writer` adds one keyed write to another key of B |
 | `intent-roll-forward-partitioned*` | Optional capability: the same fast path with one exclusive writer per source partition over shared A and B heads. Each head records every partition's writer generation, so a partition turnover is a head commit on A and then on B; each transaction writes only its partition's key in both datasets; each partition writer commits its intent with its partition's source position in A, then applies it to B by transaction id; a lost CAS on either head is rebased after a footprint check of the winners against the intent's keys. Crash, pause, turnover and handoff are per partition; the partition's next owner rolls only that partition's intents forward before ingesting it, while the other partition keeps committing. Delayed/duplicate CAS and lost responses resolved by attempt id; atomicity, at-most-once B apply, acknowledged and per-partition positioned transactions in both datasets at quiescence, I2 per partition, per-key B values in commit-point order, no stale-generation commit accepted per partition (an older generation of a partition commits on either dataset after its next owner recorded its generation in both heads), I5 | Partitions p0 and p1; 1 source transaction per partition, or 2 in p0 (`without-done`: no done markers, so recovery always checks B by transaction id); one turnover and one crash in total, in either partition (`handoff`: the turnover may be a handoff by a live owner at any point between its protocol steps); 2 copies per request; no maintenance commits. `each-partition` samples one turnover and one crash per partition with 2 transactions in p0 |
-| `window-storage` | Canonical inline bytes, byte/count pressure, copy rule, cold replay, a running query, checkpoint/GC; I4, I7, I8 | Exhaustive 6 records; controls 5; samples 7, 9 |
+| `window-storage` | Canonical inline bytes, byte/count pressure, copy rule, cold replay, checkpoint objects, and deletion below the floor as the head log's collector does it: each new floor stamped with the head's store time at a later collection that sees a higher commit than the one it was first seen at (the collector's clock is the time of the last head write, which stays put while nothing writes the head), its batches and older checkpoints deleted once the store clock is a retention past the stamp, a collector restart that forgets its stamps (a required witness has it discard a stamp and still delete afterwards), and a reader that reads a head and fetches what it lists later. I4, I8, and I7 for that reader: within its retention it reads exactly its snapshot, after it its snapshot or a missing object, never other rows | Exhaustive 7 records, 2 checkpoints, 5 collections, 2 retention ticks, 1 restart; controls 5; samples 7, 9 |
 | `retention` / `retention-readers` | Readers never write and GC has no generations: removed objects deleted a fixed retention after GC observes the removal, which stays in durable state until the delete (timers restarted at takeover); never-committed uploads deleted once the head's store time is T_O past theirs; GC's empty commit on an idle head; fresh object names; a writer references only base-live objects or its own never-published uploads, while its base's store time is less than T_O minus a margin past the upload's; object timestamps that lag the writer's lower bound; deletes and commits that land arbitrarily late. `retention-readers` adds one query whose head GET responds late, and stops once the query settles. No dangling reference, rows or an error, and a query within the retention never fails | Exhaustive: 2 object names, 9 clock ticks, 6 head versions, retention 3, staleness 1, upload age 4, timestamp error 1, two sweeps, one takeover; the writer graph adds timestamp skew, the reader graph one query |
 | `retention-remote-gc` / `retention-readers-remote-gc` | GC on another node under its own lease: its empty commit is a CAS on the head version it read that can lose to the writer's commits (and they to it) and is retried; a second GC node takes the lease over, rebuilds the pending removals and restarts every timer, while the first node's issued deletes (removal deletes and selected orphan deletes) land later; the writer's takeover leaves GC's timers alone. Same properties as `retention` / `retention-readers` | As `retention` / `retention-readers`, with one GC lease takeover in place of the writer takeover; the reader graph stops at clock 7 |
 | `retention-readers-checkpoint` / `retention-readers-remote-gc-checkpoint` | Removals durable only as records after the floor and as the checkpoint root's pending-removals list: one checkpoint moves the floor, writes every removal not yet deleted into the root and drops the records below the floor; a takeover (the writer's with GC in process, or the GC lease takeover) rebuilds the pending set from the root with the later records applied and restarts every timer. Same properties as `retention-readers` | As `retention-readers` with one checkpoint; clock 7, or 6 with remote GC |
@@ -263,6 +331,7 @@ as a separate maintenance process does.
 | `storage-no-stable-cut` | Head-dependent cut: I4/I8 exact bytes |
 | `storage-no-final` | Seal a non-final batch: I4/I8 exact bytes |
 | `storage-no-range` | Index a different range from the dropped records: I4/I8 exact bytes |
+| `storage-gc-early` | Delete below a floor as soon as the collector stamps it, without waiting a retention: a reader of an older head, still within its retention, finds its batch or checkpoint gone (I7) |
 | `storage-no-published` | GC uses an unpublished checkpoint: I7 |
 | `storage-no-missing` | Skip missing history instead of reopening: I8 |
 | `txn-no-reservation` / `txn-overlap-no-reservation` | Allow conflicting records or other transaction ids through reservations: visible replay divergence (I6/I8) |
@@ -954,12 +1023,26 @@ write their usual reinsert vector stamps and precomputed insert records.
 publication of every staged catalog call. Its `Flush` is idempotent and has no
 durability effect; the object-native run also accepts an empty `Flush`.
 
-All four negative controls are based on `mem-tier-seal-delete-only`. They keep
-requiring their named downstream failure even if exhaustive exploration finds
-none; a missing failure is reported rather than relabeled safe or hidden. Bounds
-are three source applies, one seal, two explicit checkpoints, one bake attempt,
+All four mutations are based on `mem-tier-seal-delete-only`. Three are negative
+controls: they keep requiring their named downstream failure even if exhaustive
+exploration finds none, and a missing failure is reported rather than relabeled
+safe or hidden. The fourth, `mem-tier-late-stamp`, expects to hold, because its
+mutation is unobservable rather than unexplored: an insert stamp makes a row
+visible only on the current snapshot's scan, and only while no protected
+snapshot exists (`table.rs`, `InsertRecordHandling`; the key-delete pushdown
+also reads stamps, but only to skip keys before that filter), and every
+checkpoint that writes
+insert records also publishes a protected snapshot. A full rewrite removes that
+snapshot only together with every stamp at or below its cutoff. The run checks
+that a late stamp stays safe under that rule; the
+[object-native design](../../docs/design/object-native-metastore-technical.md#commit-numbers-and-sequence-numbers)
+records why a design that read the stamp elsewhere would make it required
+again. Bounds
+are three source applies, two seals, two explicit checkpoints, one bake attempt,
 one full-rewrite attempt and one crash/recovery, with budgets retained across
-restart. Six threads and the shared 540-second watchdog apply.
+restart. The second seal is what lets a later seal acknowledge an apply that
+landed while an earlier seal was in flight; with one seal, the source redelivers
+that apply after a restart and `no-capture-reservation` has nothing to break. Six threads and the shared 540-second watchdog apply.
 
 ```sh
 nice -n 10 cargo build --release -p cayenne-metastore-model
@@ -1020,7 +1103,12 @@ records are stored separately in the symbolic catalog so this distinction also
 holds during recovery. Unreferenced physical file reclamation is not modeled.
 
 The bake merges all protected snapshots using partial deletion filters, tags the
-output with the capped delete fence, and prunes only the RAM index at that fence.
+output with the capped delete fence, and prunes only the RAM index, at or below
+the lower of that fence and the highest sequence among the snapshots it folds
+(`table.rs::bake_seq_prefix_protected_snapshots_inner`; the engine also caps it
+below its cold-tier files, which the model does not have). A tombstone above the
+folded snapshots may still hide an inline seal shadow, which the bake does not
+fold.
 It retains durable vectors and insert records. The replay configures the
 existing `compaction_trigger_protected_snapshots` threshold to 2, so the engine
 keeps zero recent snapshots. The model enables `Bake` only with at least two
@@ -1054,7 +1142,7 @@ The optional `protected survivor excluded by pushdown` diagnostic is hypothesis 
 | `mem-tier-no-one-call` | Stage seal shadow before pure vectors; stage checkpoint insert records after snapshot/vectors/clear, allowing flush/crash between | `recovered reads match the source` |
 | `mem-tier-no-insert-records` | Omit checkpoint insert records and hidden-key RAM upgrade, retaining checkpoint vector stamps | `recovered reads match the source` |
 | `mem-tier-no-capture-reservation` | Reserve the pure-delete seal's shadow sequence after releasing capture | `recovered reads match the source` |
-| `mem-tier-late-stamp` | Reserve a fresh insert-record stamp at checkpoint staging after a post-capture apply | `recovered reads match the source` |
+| `mem-tier-late-stamp` | Reserve a fresh insert-record stamp at checkpoint staging after a post-capture apply | none: holds (see above) |
 
 Control names retain their original API; their modes have the
 `mem-tier-seal-delete-only-no-` prefix (`no-early-stamp` for late stamping).

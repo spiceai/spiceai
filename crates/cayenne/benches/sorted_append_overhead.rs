@@ -19,8 +19,8 @@ limitations under the License.
 //! Guards the sort-on-compact write path: a single append on a table with
 //! `cayenne_sort_columns` set should stay proportional to the incoming append
 //! size, not to the preloaded table size. Sort work is intentionally deferred
-//! to compaction; the append path should not call
-//! `CayenneTableProvider::sort_and_rewrite_data` after every write.
+//! to compaction; the append path should not rewrite the whole table after
+//! every write.
 //!
 //! For comparison the bench also measures the same append on an otherwise
 //! identical table without `sort_columns`. That lane stays roughly constant
@@ -167,8 +167,8 @@ async fn setup_table(table_name: &str, sorted: bool) -> BenchTable {
 
 /// Preload `rows` rows into the table, chunked so no single insert
 /// dominates the preload time and so that the sorted-table preload itself
-/// is representative of steady-state apply (each chunk triggers
-/// `sort_and_rewrite_data` exactly the way a CDC burst would).
+/// is representative of steady-state apply (each chunk is appended exactly
+/// the way a CDC burst would be).
 async fn preload(bench: &BenchTable, rows: usize) {
     const CHUNK: usize = 4_096;
     let mut written: usize = 0;
