@@ -189,7 +189,9 @@ steps:
   - assert-status:
       dataset: broken
       status: Error
-      message-contains: "Failed to start reading the DynamoDB Stream, so the dataset receives no changes until Spice restarts"
+      # The table name carries the run's namespace, which this field does not
+      # substitute, so the message is matched up to the name's fixed prefix.
+      message-contains: "Failed to start reading the DynamoDB Stream of table 'broken_"
     eventually: 240s
 
   # Every fault fired: the flaky table's first requests failed, and the echo

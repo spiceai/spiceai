@@ -48,14 +48,14 @@ pub enum StreamError {
     StreamBeyondRetention { source: dynamodb_streams::Error },
 
     #[snafu(display(
-        "Failed to start reading the DynamoDB Stream, so the dataset receives no changes until Spice restarts. Check that the table's stream is enabled and reachable: {source}"
+        "Failed to start reading the DynamoDB Stream of table '{table_name}', so the dataset receives no changes until Spice restarts. Check that the table's stream is enabled and reachable; see https://spiceai.org/docs/components/data-connectors/dynamodb. Cause: {source}"
     ))]
-    FailedToStartStream { source: Error },
+    FailedToStartStream { table_name: String, source: Error },
 
     #[snafu(display(
-        "Failed to start the initial scan of the DynamoDB table, so the dataset has no data until Spice restarts: {source}"
+        "Failed to start the initial scan of DynamoDB table '{table_name}', so the dataset has no data until Spice restarts. See https://spiceai.org/docs/components/data-connectors/dynamodb. Cause: {source}"
     ))]
-    FailedToStartInitialScan { source: Error },
+    FailedToStartInitialScan { table_name: String, source: Error },
 
     #[snafu(display("Unable to downcast ArrayBuilder"))]
     DowncastBuilder,

@@ -536,7 +536,7 @@ impl DataConnector for DynamoDB {
                 };
                 let (should_bootstrap, checkpoint, checkpoint_updated_at) = match start {
                     Ok(start) => start,
-                    Err(error) => return Some(stream_start_failed(error)),
+                    Err(error) => return Some(stream_start_failed(dynamodb.table_name(), error)),
                 };
 
                 if should_bootstrap {
@@ -712,10 +712,15 @@ where
 
 /// A change stream whose only item is the error that stopped it from starting,
 /// so the dataset reports that error instead of loading forever.
-fn stream_start_failed(error: Error) -> ChangesStream {
-    stream::once(
-        async move { Err(DynamoDBStreamError::FailedToStartStream { source: error }.into()) },
-    )
+fn stream_start_failed(table_name: &str, error: Error) -> ChangesStream {
+    let table_name = table_name.to_string();
+    stream::once(async move {
+        Err(DynamoDBStreamError::FailedToStartStream {
+            table_name,
+            source: error,
+        }
+        .into())
+    })
     .boxed()
 }
 
@@ -774,6 +779,7 @@ async fn emit_overwrite_then_live(
     dataset_name: TableReference,
 ) -> Result<ChangesStream, ChangesStream> {
     let table_schema = dynamodb.schema();
+    let table_name = dynamodb.table_name().to_string();
 
     let snapshot = match Arc::clone(&dynamodb).overwrite_bootstrap_stream().await {
         Ok(stream) => stream
@@ -785,7 +791,11 @@ async fn emit_overwrite_then_live(
                 "Failed to start DynamoDB overwrite bootstrap stream"
             );
             return Err(stream::once(async move {
-                Err(DynamoDBStreamError::FailedToStartInitialScan { source: e }.into())
+                Err(DynamoDBStreamError::FailedToStartInitialScan {
+                    table_name,
+                    source: e,
+                }
+                .into())
             })
             .boxed());
         }
@@ -829,7 +839,7 @@ async fn emit_overwrite_then_live(
                 error = %e,
                 "Failed to start DynamoDB changes stream after initialization"
             );
-            return Err(stream_start_failed(e));
+            return Err(stream_start_failed(&table_name, e));
         }
     };
 
@@ -974,7 +984,7 @@ fn resume_from_checkpoint_stream(
                         error = %err,
                         "Failed to get stream from lag"
                     );
-                    Some(stream_start_failed(err))
+                    Some(stream_start_failed(dynamodb.table_name(), err))
                 }
             }
         })
@@ -1098,7 +1108,7 @@ async fn do_rebootstrap(
                 error = ?e,
                 "Failed to get new checkpoint for re-initialization"
             );
-            return Some(stream_start_failed(e));
+            return Some(stream_start_failed(dynamodb.table_name(), e));
         }
     };
 
@@ -1409,14 +1419,30 @@ mod stream_start_tests {
         .expect_err("gives up");
         assert_eq!(calls.load(Ordering::SeqCst), STREAM_START_MAX_RETRIES + 1);
 
-        let items: Vec<_> = stream_start_failed(error).collect().await;
+        let items: Vec<_> = stream_start_failed("orders", error).collect().await;
         assert_eq!(items.len(), 1);
         let Some(Err(item)) = items.into_iter().next() else {
             panic!("expected one error item");
         };
         assert_eq!(
             item.to_string(),
-            "DynamoDB error: Failed to start reading the DynamoDB Stream, so the dataset receives no changes until Spice restarts. Check that the table's stream is enabled and reachable: Failed to initialize DynamoDB Stream checkpoint: Request has been throttled. Try again later"
+            "DynamoDB error: Failed to start reading the DynamoDB Stream of table 'orders', so the dataset receives no changes until Spice restarts. Check that the table's stream is enabled and reachable; see https://spiceai.org/docs/components/data-connectors/dynamodb. Cause: Failed to initialize DynamoDB Stream checkpoint: Request has been throttled. Try again later"
+        );
+    }
+
+    /// A failure to start the initial table scan names the table and says what
+    /// the dataset is missing, rather than blaming the stream.
+    #[test]
+    fn an_initial_scan_failure_names_the_table() {
+        let error: data_components::cdc::StreamError =
+            DynamoDBStreamError::FailedToStartInitialScan {
+                table_name: "orders".to_string(),
+                source: Error::TableStatusIsNotActive,
+            }
+            .into();
+        assert_eq!(
+            error.to_string(),
+            "DynamoDB error: Failed to start the initial scan of DynamoDB table 'orders', so the dataset has no data until Spice restarts. See https://spiceai.org/docs/components/data-connectors/dynamodb. Cause: DynamoDB table is not in 'ACTIVE' status. Verify the table status and try again."
         );
     }
 }
