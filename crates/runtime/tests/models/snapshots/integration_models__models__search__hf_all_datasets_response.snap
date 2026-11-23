@@ -6,30 +6,6 @@ expression: "normalize_search_response(resp, round_scores)"
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.87",
-      "dataset": "spice.public.item",
-      "matches": {
-        "i_item_desc": [
-          "Patient"
-        ]
-      },
-      "primary_key": {
-        "i_item_sk": 19
-      }
-    },
-    {
-      "_score": "0.76",
-      "dataset": "spice.public.item",
-      "matches": {
-        "i_item_desc": [
-          "New"
-        ]
-      },
-      "primary_key": {
-        "i_item_sk": 7
-      }
-    },
-    {
       "_score": "0.63",
       "dataset": "spice.public.catalog_page_with_chunking",
       "matches": {
@@ -69,6 +45,30 @@ expression: "normalize_search_response(resp, round_scores)"
         "cp_description": [
           "Heavily direct problems try eventually on a nurses. Courses may make a"
         ]
+      }
+    },
+    {
+      "_score": "0.58",
+      "dataset": "spice.public.item",
+      "matches": {
+        "i_item_desc": [
+          "Twin, particular aspects will accept only on"
+        ]
+      },
+      "primary_key": {
+        "i_item_sk": 18
+      }
+    },
+    {
+      "_score": "0.58",
+      "dataset": "spice.public.item",
+      "matches": {
+        "i_item_desc": [
+          "F"
+        ]
+      },
+      "primary_key": {
+        "i_item_sk": 8
       }
     }
   ]
