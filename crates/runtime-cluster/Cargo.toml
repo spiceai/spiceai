@@ -51,6 +51,7 @@ snafu.workspace = true
 spicepod = { path = "../spicepod" }
 telemetry = { path = "../telemetry" }
 tokio = { workspace = true, features = ["full"] }
+tokio-rustls = "0.26.0"
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
@@ -65,6 +66,7 @@ x509-certificate.workspace = true
 opentelemetry-prometheus.workspace = true
 opentelemetry_sdk = { workspace = true }
 prometheus.workspace = true
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

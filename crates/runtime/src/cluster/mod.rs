@@ -83,6 +83,9 @@ use url::Url;
 use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 use util::session_state::builder_from_existing;
 const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+/// How long an executor waits for the TLS handshake with a scheduler address
+/// when it reads the certificate the scheduler presents there.
+const OBSERVE_SCHEDULER_TIMEOUT: Duration = Duration::from_secs(5);
 const SCHEDULER_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// Upper bound on retries when the scheduler returns `Unavailable` to
@@ -299,6 +302,26 @@ type SchedulerEndpointOverride = Arc<
 struct SchedulerPollHandle {
     cancel: CancellationToken,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// The addresses an executor knows the scheduler by: the configured scheduler
+/// address and each scheduler's advertise address from the membership.
+fn scheduler_addresses_with(scheduler_url: &Url, members: &[String]) -> Vec<String> {
+    let mut addresses = Vec::with_capacity(members.len() + 1);
+    addresses.push(scheduler_url.to_string());
+    for member in members {
+        if !addresses.contains(member) {
+            addresses.push(member.clone());
+        }
+    }
+    addresses
+}
+
+/// The host and port of a scheduler address given as a URL or as `host:port`,
+/// as an executor connects to it.
+fn scheduler_host_and_port(address: &str) -> Option<(String, u16)> {
+    let url = Url::parse(&normalize_scheduler_endpoint(address, true)).ok()?;
+    Some((url.host_str()?.to_string(), url.port_or_known_default()?))
 }
 
 fn normalize_scheduler_endpoint(address: &str, tls_enabled: bool) -> String {
@@ -628,7 +651,9 @@ mod composite_flight_service;
 pub mod datafusion;
 mod heartbeat;
 pub mod partition;
+pub(crate) mod peer;
 mod reaper;
+mod scheduler_grpc;
 pub(crate) mod scheduler_registry;
 mod servers;
 mod service;
@@ -641,6 +666,7 @@ pub use partition::{PartitionMetadata, PartitionStore, TablePartitionMetadata};
 pub use reaper::{Reaper, ReaperOutcome};
 pub use runtime_cluster::ControlStreamManager;
 pub use runtime_cluster::ExecutorOutboundBroadcaster;
+use runtime_cluster::peer::SchedulerIdentities;
 use runtime_cluster::store::{AccelerationsPartitions, CatalogPartitions};
 pub use runtime_cluster::{ExecutorRegistry, FederatedPartitionProvider, TablePartitions};
 // Moved to `runtime-cluster`; re-exported so `runtime::cluster::{metrics_collector, pki}` still resolve.
@@ -699,6 +725,9 @@ struct ClusterTlsConfigInner {
     /// `ClientTlsConfig`). All three rotate together via a single
     /// `ArcSwap` swap inside the bundle.
     bundle: Arc<pki::ClusterPkiBundle>,
+    /// On an executor, the identities the scheduler presents, observed by
+    /// connecting to the scheduler's addresses. Empty on a scheduler.
+    schedulers: Arc<SchedulerIdentities>,
     /// Drop-guard for the watcher. In the centralized path the binary
     /// owns the [`runtime_tls::TlsControl`] for the whole process; this
     /// `Arc` is purely a safety net so the watcher dispatcher outlives
@@ -760,9 +789,70 @@ impl ClusterTlsConfig {
                 key_path: key_path_buf,
                 server_config,
                 bundle,
+                schedulers: Arc::new(SchedulerIdentities::new()),
                 watcher_keepalive: Arc::clone(control.watcher()),
             }),
         })
+    }
+
+    /// The identities the scheduler presents, as this executor last observed
+    /// them at the scheduler's addresses.
+    #[must_use]
+    pub fn scheduler_identities(&self) -> &Arc<SchedulerIdentities> {
+        &self.inner.schedulers
+    }
+
+    /// Whether this node's own certificate is valid for `host` — the host it
+    /// advertises to its peers. A node advertises only an address its
+    /// certificate names.
+    #[must_use]
+    pub fn self_certificate_names_host(&self, host: &str) -> bool {
+        self.inner.bundle.self_certificate_names_host(host)
+    }
+
+    /// The subject of this node's own certificate, for messages.
+    #[must_use]
+    pub fn self_subject(&self) -> String {
+        self.inner.bundle.self_subject()
+    }
+
+    /// Records how this node is reached by its peers, so a later certificate
+    /// reload that drops the advertise host is rejected (see
+    /// [`pki::ClusterPkiBundle::set_advertise_identity`]).
+    pub fn set_advertise_identity(&self, node_kind: &str, node_id: &str, host: &str) {
+        self.inner
+            .bundle
+            .set_advertise_identity(node_kind, node_id, host);
+    }
+
+    /// Connects to each of the scheduler addresses `addresses` (URLs or
+    /// `host:port`) and records the identity the scheduler presents at each, so
+    /// requests this executor serves can be told to come from the scheduler.
+    /// An address that cannot be reached keeps the identity last observed there.
+    pub async fn observe_schedulers(&self, addresses: &[String]) {
+        let observations = addresses.iter().map(|address| async move {
+            let (host, port) = scheduler_host_and_port(address)?;
+            match self
+                .inner
+                .bundle
+                .observe_peer_identity(&host, port, OBSERVE_SCHEDULER_TIMEOUT)
+                .await
+            {
+                Ok(identity) => Some((address.clone(), identity)),
+                Err(err) => {
+                    tracing::debug!(
+                        "Failed to read the certificate of the scheduler at '{address}': {err}"
+                    );
+                    None
+                }
+            }
+        });
+        let observed = futures::future::join_all(observations)
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+        self.inner.schedulers.record(addresses, observed);
     }
 
     /// Reloadable `rustls::ServerConfig` for accepting inbound mTLS
@@ -1134,7 +1224,50 @@ impl ResolvedClusterConfig {
 }
 
 /// Creates & binds a Ballista scheduler to the Runtime handle, then updates status
+/// Checks that this node's own cluster certificate names `advertise_host`, the
+/// address other cluster nodes connect to it at, and arms the same check for
+/// later certificate reloads, which keep the current certificate on a mismatch
+/// (spiceai/spiceai#16481). On a mismatch, logs and returns the startup message.
+fn ensure_certificate_names_advertise_address(
+    tls: &ClusterTlsConfig,
+    node_kind: &str,
+    node_id: &str,
+    advertise_host: &str,
+) -> Result<(), String> {
+    tls.set_advertise_identity(node_kind, node_id, advertise_host);
+    if tls.self_certificate_names_host(advertise_host) {
+        return Ok(());
+    }
+    let message = runtime_cluster::peer::advertise_address_mismatch_message(
+        runtime_cluster::peer::MismatchSite::Startup,
+        node_kind,
+        node_id,
+        &tls.self_subject(),
+        advertise_host,
+    );
+    tracing::error!("{message}");
+    Err(message)
+}
+
 pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()> {
+    // Executors connect to a scheduler at the address it advertises, so a
+    // scheduler whose certificate does not name that address is unreachable:
+    // refuse to start rather than serve a cluster no executor can join.
+    if let (Some(tls), Some(advertise_host)) = (
+        rt.df.cluster_config.tls_config(),
+        rt.df.cluster_config.node_advertise_address(),
+    ) {
+        ensure_certificate_names_advertise_address(
+            tls,
+            "scheduler",
+            rt.df.cluster_config.instance_id(),
+            advertise_host,
+        )
+        .map_err(|message| crate::Error::FailedToStartClusterScheduler {
+            source: message.into(),
+        })?;
+    }
+
     let (scheduler, executor_stream_registry) = create_scheduler_server(rt).await?;
 
     rt.df
@@ -1383,6 +1516,17 @@ pub async fn initialize_cluster_executor(
     // id. A UUIDv7 sorts by creation time, so a later run's id compares greater.
     let process_id = uuid::Uuid::now_v7().to_string();
 
+    // Before this executor registers, check its own certificate names the
+    // address it advertises. The scheduler would otherwise refuse the
+    // registration; failing here puts the error in this executor's own log, where
+    // the operator who just deployed it is looking.
+    if let Some(tls) = rt.df.cluster_config.tls_config() {
+        ensure_certificate_names_advertise_address(tls, "executor", &executor_id, &advertise_host)
+            .map_err(|message| FailedToStartClusterExecutor {
+                source: message.into(),
+            })?;
+    }
+
     // Fetch the app definition from the scheduler to get temp_directory for the work_dir.
     // This ensures shuffle files are written to the configured directory.
     //
@@ -1411,6 +1555,17 @@ pub async fn initialize_cluster_executor(
                 Vec::new()
             }
         };
+
+    // Read the certificate the scheduler presents at each of its addresses before
+    // this executor registers, so its Flight server tells the scheduler's requests
+    // from other nodes' from the first one.
+    if let Some(tls) = rt.df.cluster_config.tls_config() {
+        tls.observe_schedulers(&scheduler_addresses_with(
+            scheduler_url,
+            &initial_scheduler_addresses,
+        ))
+        .await;
+    }
 
     let app_definition_request = GetAppDefinitionRequest {
         executor_id: executor_id.clone(),
@@ -1640,6 +1795,7 @@ pub async fn initialize_cluster_executor(
     let executor_for_manager = Arc::clone(&executor);
     let codec_for_manager = codec;
     let initial_scheduler_addresses_for_manager = initial_scheduler_addresses.clone();
+    let cluster_tls_for_manager = rt.df.cluster_config.tls_config().cloned();
     let available_task_slots_for_manager = Arc::clone(&available_task_slots);
 
     let control_stream_executor_id = executor_id.clone();
@@ -1778,6 +1934,15 @@ pub async fn initialize_cluster_executor(
                                 "Scheduler membership refresh returned empty list; keeping existing schedulers"
                             );
                             continue;
+                        }
+                        // Before a new scheduler learns this executor's endpoint,
+                        // so its first request is recognized as the scheduler's.
+                        if let Some(tls) = cluster_tls_for_manager.as_ref() {
+                            tls.observe_schedulers(&scheduler_addresses_with(
+                                &scheduler_url_for_manager,
+                                &addresses,
+                            ))
+                            .await;
                         }
                         // Update control streams with new scheduler membership
                         control_stream_manager.update_schedulers(addresses.clone());
@@ -2304,7 +2469,10 @@ async fn create_scheduler_server(
                 .context(FailedToStartClusterSchedulerSnafu)?,
         ),
 
-        grpc_server_max_decoding_message_size: u32::MAX,
+        grpc_server_max_decoding_message_size: u32::try_from(
+            servers::SCHEDULER_MAX_DECODING_MESSAGE_SIZE,
+        )
+        .unwrap_or(u32::MAX),
         grpc_server_max_encoding_message_size: u32::MAX,
 
         override_create_grpc_client_endpoint,

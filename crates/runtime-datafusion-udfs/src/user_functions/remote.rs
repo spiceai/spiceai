@@ -193,7 +193,7 @@ pub fn build_scalar_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
     }
 
     let endpoint_policy = endpoint_access_policy(decl)?;
-    let endpoint = parse_endpoint(&decl.from, &endpoint_policy)?;
+    let endpoint = RemoteEndpoint(parse_endpoint(&decl.from, &endpoint_policy)?);
 
     let arg_names: Vec<String> = decl.signature.args.iter().map(|a| a.name.clone()).collect();
     let arg_types: Vec<DataType> = decl
@@ -246,7 +246,7 @@ pub fn build_scalar_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
 
 fn build_scalar_table_arg_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
     let endpoint_policy = endpoint_access_policy(decl)?;
-    let endpoint = parse_endpoint(&decl.from, &endpoint_policy)?;
+    let endpoint = RemoteEndpoint(parse_endpoint(&decl.from, &endpoint_policy)?);
     let arg_schema = function_arg_schema(&decl.signature.args)?;
     let table_args = table_arg_specs(&decl.signature.tables)?;
     let (return_type, output_schema) = scalar_return_schema(decl)?;
@@ -299,7 +299,7 @@ fn build_scalar_table_arg_udf(decl: &Function) -> Result<Arc<ScalarUDF>> {
 /// client cannot be constructed.
 pub fn build_table_udtf(decl: &Function) -> Result<Arc<dyn TableFunctionImpl>> {
     let endpoint_policy = endpoint_access_policy(decl)?;
-    let endpoint = parse_endpoint(&decl.from, &endpoint_policy)?;
+    let endpoint = RemoteEndpoint(parse_endpoint(&decl.from, &endpoint_policy)?);
     let arg_schema = function_arg_schema(&decl.signature.args)?;
     let table_args = table_arg_specs(&decl.signature.tables)?;
     let output_schema = table_return_schema(decl)?;
@@ -331,13 +331,27 @@ pub fn build_table_udtf(decl: &Function) -> Result<Arc<dyn TableFunctionImpl>> {
     }))
 }
 
+/// A remote function's endpoint, as the request is sent to it.
+///
+/// `Debug` shows only the origin. The URL can carry a credential (`user:password@`, a
+/// `?token=` or `?sig=` parameter), and a function's implementation is rendered with
+/// `Debug` wherever a plan or expression that calls it is.
+#[derive(Clone)]
+struct RemoteEndpoint(Url);
+
+impl Debug for RemoteEndpoint {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.origin().ascii_serialization())
+    }
+}
+
 #[derive(Clone)]
 struct RemoteTableFunc {
     name: String,
     arg_schema: SchemaRef,
     table_args: Vec<TableArgSpec>,
     output_schema: SchemaRef,
-    endpoint: Url,
+    endpoint: RemoteEndpoint,
     client: reqwest::Client,
     response_kind: RemoteResponseKind,
     max_response_bytes: usize,
@@ -413,7 +427,7 @@ struct RemoteTableProvider {
     name: String,
     arg_schema: SchemaRef,
     schema: SchemaRef,
-    endpoint: Url,
+    endpoint: RemoteEndpoint,
     client: reqwest::Client,
     args: Vec<ScalarValue>,
     table_args: Vec<TableArgValue>,
@@ -495,14 +509,15 @@ impl RemoteTableProvider {
         let body = table_request_body(args, tables, limit);
         let resp = self
             .client
-            .post(self.endpoint.clone())
+            .post(self.endpoint.0.clone())
             .json(&body)
             .send()
             .await
             .map_err(|e| {
                 DataFusionError::Execution(format!(
-                    "remote table function '{}' request failed: {e}",
-                    self.name
+                    "remote table function '{}' request failed: {}",
+                    self.name,
+                    without_endpoint(e)
                 ))
             })?;
 
@@ -525,14 +540,15 @@ impl RemoteTableProvider {
         let body = table_request_body(args, tables, limit);
         let resp = self
             .client
-            .post(self.endpoint.clone())
+            .post(self.endpoint.0.clone())
             .json(&body)
             .send()
             .await
             .map_err(|e| {
                 DataFusionError::Execution(format!(
-                    "remote function '{}' request failed: {e}",
-                    self.name
+                    "remote function '{}' request failed: {}",
+                    self.name,
+                    without_endpoint(e)
                 ))
             })?;
 
@@ -644,7 +660,7 @@ struct RemoteScalarUdf {
     return_type: DataType,
     arg_names: Vec<String>,
     arg_types: Vec<DataType>,
-    endpoint: Url,
+    endpoint: RemoteEndpoint,
     client: reqwest::Client,
     batch_size: usize,
     batch_concurrency: usize,
@@ -821,14 +837,15 @@ impl RemoteScalarUdf {
         let body = serde_json::json!({ "rows": rows });
         let resp = self
             .client
-            .post(self.endpoint.clone())
+            .post(self.endpoint.0.clone())
             .json(&body)
             .send()
             .await
             .map_err(|e| {
                 DataFusionError::Execution(format!(
-                    "remote function '{}' request failed: {e}",
-                    self.name
+                    "remote function '{}' request failed: {}",
+                    self.name,
+                    without_endpoint(e)
                 ))
             })?;
 
@@ -878,6 +895,15 @@ struct RemoteTableResponse {
     rows: Vec<Value>,
 }
 
+/// `error` without the endpoint URL `reqwest` attaches to it, for a message that
+/// reaches the SQL caller. A function's `from` can carry a credential in its query
+/// string (`?token=`, `?sig=`), and the caller need not be allowed to see it; the
+/// message names the function, which identifies the endpoint to whoever can read the
+/// Spicepod.
+fn without_endpoint(error: reqwest::Error) -> reqwest::Error {
+    error.without_url()
+}
+
 async fn decode_json_response<T: DeserializeOwned>(
     resp: reqwest::Response,
     function_name: &str,
@@ -922,7 +948,8 @@ async fn read_response_body_limited(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| {
             DataFusionError::Execution(format!(
-                "{function_kind} '{function_name}' failed to read response body: {e}"
+                "{function_kind} '{function_name}' failed to read response body: {}",
+                without_endpoint(e)
             ))
         })?;
         if body.len().saturating_add(chunk.len()) > max_response_bytes {
@@ -942,7 +969,7 @@ async fn error_response_snippet(resp: reqwest::Response) -> String {
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(chunk) => chunk,
-            Err(e) => return format!("failed to read response body: {e}"),
+            Err(e) => return format!("failed to read response body: {}", without_endpoint(e)),
         };
         let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(body.len());
         if remaining == 0 {
@@ -1981,6 +2008,7 @@ mod tests {
             depends_on: vec![],
             metrics: None,
             as_tool: true,
+            build: None,
         }
     }
 
@@ -2019,6 +2047,7 @@ mod tests {
             depends_on: vec![],
             metrics: None,
             as_tool: false,
+            build: None,
         }
     }
 
@@ -2499,7 +2528,7 @@ mod tests {
             return_type: list_type.clone(),
             arg_names: vec!["x".to_string()],
             arg_types: vec![list_type.clone()],
-            endpoint: Url::parse("http://example.com/udf").expect("valid URL"),
+            endpoint: RemoteEndpoint(Url::parse("http://example.com/udf").expect("valid URL")),
             client: reqwest::Client::new(),
             batch_size: DEFAULT_BATCH_SIZE,
             batch_concurrency: DEFAULT_BATCH_CONCURRENCY,
@@ -2680,7 +2709,9 @@ mod tests {
             return_type: DataType::Int64,
             arg_names: vec!["x".to_string()],
             arg_types: vec![DataType::Int64],
-            endpoint: Url::parse(&format!("http://{addr}/scalar")).expect("valid URL"),
+            endpoint: RemoteEndpoint(
+                Url::parse(&format!("http://{addr}/scalar")).expect("valid URL"),
+            ),
             client: reqwest::Client::new(),
             batch_size: DEFAULT_BATCH_SIZE,
             batch_concurrency: DEFAULT_BATCH_CONCURRENCY,
@@ -2694,6 +2725,54 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("[truncated]"));
         assert!(message.len() < 512);
+    }
+
+    /// A request that never reaches the endpoint fails with a message the SQL caller
+    /// sees, so it names the function and not the URL, whose query string can carry a
+    /// credential. `Debug`, which renders the function wherever a plan calling it is,
+    /// shows only the origin.
+    #[tokio::test]
+    async fn remote_scalar_request_error_omits_endpoint_url() {
+        // A port nothing listens on: bound, then released.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr");
+        let remote = RemoteScalarUdf {
+            id: 0,
+            name: "remote_fn".to_string(),
+            signature: Signature::exact(vec![DataType::Int64], DfVolatility::Volatile),
+            return_type: DataType::Int64,
+            arg_names: vec!["x".to_string()],
+            arg_types: vec![DataType::Int64],
+            endpoint: RemoteEndpoint(
+                Url::parse(&format!("http://alice:PASS-1@{addr}/scalar?token=TOKEN-2"))
+                    .expect("valid URL"),
+            ),
+            client: reqwest::Client::new(),
+            batch_size: DEFAULT_BATCH_SIZE,
+            batch_concurrency: DEFAULT_BATCH_CONCURRENCY,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+        };
+
+        let message = remote
+            .post_batch(vec![serde_json::json!({"x": 1})])
+            .await
+            .expect_err("nothing listens on the port")
+            .to_string();
+        assert_eq!(
+            message,
+            "Execution error: remote function 'remote_fn' request failed: error sending request"
+        );
+
+        let debug = format!("{remote:?}");
+        assert!(
+            debug.contains(&format!("endpoint: http://{addr},")),
+            "names the origin: {debug}"
+        );
+        for secret in ["PASS-1", "TOKEN-2", "/scalar"] {
+            assert!(!debug.contains(secret), "Debug shows {secret}: {debug}");
+        }
     }
 
     #[tokio::test]

@@ -56,7 +56,7 @@ The existing `mongodb_unnest_depth` parameter also applies to Change Stream docu
 
 ## Resumability across restarts
 
-For file-accelerated datasets (acceleration `mode: file` / `file_create` / `file_update`, or `engine: postgres`), Spice persists the most recent Change Stream resume token in a sidecar table called `spice_sys_mongodb`, stored alongside the accelerator data. The schema is one row per dataset:
+For file-accelerated datasets (acceleration `mode: file` / `file_create` / `file_update`), Spice persists the most recent Change Stream resume token in a sidecar table called `spice_sys_mongodb`, stored alongside the accelerator data. The schema is one row per dataset:
 
 | column              | type      | description                                                                                      |
 | ------------------- | --------- | ------------------------------------------------------------------------------------------------ |

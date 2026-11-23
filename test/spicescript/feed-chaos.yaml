@@ -1,4 +1,5 @@
 name: feed-chaos
+tags: [long]
 description: >
   One mutation history follows Kafka append, MongoDB change streams, DynamoDB
   Streams and PostgreSQL through Debezium's direct HTTP sink. Writes made

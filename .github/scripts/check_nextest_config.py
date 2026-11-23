@@ -62,7 +62,6 @@ from pathlib import Path
 QUIET_BASELINE_SECONDS = {
     "cayenne::integration::mutation_property_test": 239.5,  # prop_concurrent_mixed_position
     "cayenne::integration::partition_chunking_test": 247.9,  # ..._timestamp_partition_with_date_part_impl_sqlite
-    "cayenne::integration::layout_pruning_ab_test": 170.1,  # pruning_ab_inferred_vs_authoritative_sort
     "cayenne::integration::mutation_model_test": 107.1,  # test_exhaustive_composite_single_row_sequences_impl_on_data_store
     # tpcds_and_clickbench_parity_vs_duckdb, measured with fixtures already on
     # disk. CI regenerates them with `dsdgen` on every fresh runner, so the

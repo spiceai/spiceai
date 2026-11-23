@@ -658,7 +658,7 @@ impl McpToolCatalog {
                     tracing::warn!(
                         "MCP HTTPS client using unencrypted HTTP connection to non-localhost host '{}': {}. This is insecure.",
                         host,
-                        url
+                        redact::redact_url_credentials(url.as_str())
                     );
                 }
 

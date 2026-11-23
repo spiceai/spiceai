@@ -114,6 +114,20 @@ pub fn sniff_body_format(body: &str) -> ResponseBodyFormat {
     ResponseBodyFormat::Text
 }
 
+/// [`sniff_body_format`] of `body` read as [`String::from_utf8_lossy`] reads it, without
+/// making that copy of the body: only its first character that is not whitespace counts.
+fn sniff_body_bytes(body: &[u8]) -> ResponseBodyFormat {
+    for chunk in body.utf8_chunks() {
+        if let Some(first) = chunk.valid().chars().find(|c| !c.is_whitespace()) {
+            return sniff_body_format(first.encode_utf8(&mut [0; 4]));
+        }
+        if !chunk.invalid().is_empty() {
+            return sniff_body_format("\u{FFFD}");
+        }
+    }
+    ResponseBodyFormat::Empty
+}
+
 /// Classify the HTTP body from `Content-Type` and, when needed, the payload.
 #[must_use]
 pub fn classify_response_body(
@@ -130,8 +144,7 @@ pub fn classify_response_body(
         return ResponseBodyFormat::Empty;
     }
 
-    let text = String::from_utf8_lossy(body);
-    let sniffed = sniff_body_format(&text);
+    let sniffed = sniff_body_bytes(body);
 
     match content_type {
         Some(ct) if is_json_media_type(ct) => {
@@ -448,6 +461,35 @@ pub fn unexpected_response_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The classifier reads only the first character that is not whitespace, and gets
+    /// the answer it got from a lossy copy of the whole body.
+    #[test]
+    fn sniffing_the_bytes_matches_sniffing_their_lossy_text() {
+        let bodies: [&[u8]; 14] = [
+            b"",
+            b"   \n\t ",
+            b"  {\"data\": 1}",
+            b"\n[1, 2]",
+            b"  <html>",
+            b"plain text",
+            b"\xff{\"data\": 1}",
+            b"   \xff",
+            b"\xc2\xa0\xc2\xa0{",
+            b"\xe3\x80\x80<p>",
+            b"\xc2\xa0\xc2",
+            b"\xe2\x80\x8b{",
+            b"\xf0\x9f\x98",
+            b"\x00{",
+        ];
+        for body in bodies {
+            assert_eq!(
+                sniff_body_bytes(body),
+                sniff_body_format(&String::from_utf8_lossy(body)),
+                "{body:x?}"
+            );
+        }
+    }
 
     #[test]
     fn json_media_types() {

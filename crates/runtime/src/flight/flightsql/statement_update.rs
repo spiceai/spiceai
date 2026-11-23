@@ -30,7 +30,6 @@ use prost::Message;
 use tonic::{Response, Status};
 
 use crate::{
-    config::ClusterRole,
     datafusion::{query::QueryBuilder, request_context_extension::get_current_datafusion},
     flight::{
         Service, handle_datafusion_error, handle_query_error, metrics, to_tonic_err,
@@ -68,9 +67,9 @@ pub(crate) async fn do_put(
             }
         }
         None => {
-            if allow_scheduler_trusted_executor_write(&datafusion) {
+            if crate::cluster::peer::is_from_scheduler(&context) {
                 tracing::debug!(
-                    "Allowing unauthenticated statement DoPut on executor in mTLS scheduler-trusted mode"
+                    "Accepting a statement update the scheduler forwarded to this executor"
                 );
             } else {
                 // No principal: a request without credentials, which a listener beyond
@@ -131,11 +130,6 @@ pub(crate) async fn do_put(
     })]);
 
     Ok(Response::new(Box::pin(output)))
-}
-
-fn allow_scheduler_trusted_executor_write(datafusion: &crate::datafusion::DataFusion) -> bool {
-    datafusion.cluster_config.effective_role() == Some(ClusterRole::Executor)
-        && datafusion.cluster_config.tls_config().is_some()
 }
 
 /// Extract affected row count from execution results.

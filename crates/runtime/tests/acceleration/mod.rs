@@ -31,8 +31,6 @@ mod cayenne_append_timestamptz;
 mod cayenne_maintained_aggregates;
 mod cayenne_memory;
 mod cayenne_on_conflict_batches;
-#[cfg(feature = "postgres-accel")]
-mod checkpoint_postgres;
 #[cfg(feature = "sqlite")]
 mod checkpoint_sqlite;
 mod cron;
@@ -40,12 +38,9 @@ mod cron;
 mod decimal_division;
 #[cfg(feature = "sqlite")]
 mod empty_projection_scan;
-#[cfg(feature = "sqlite")]
 mod file_watcher;
 mod hash_index;
 mod localpod_sync;
-#[cfg(all(feature = "postgres-accel", feature = "sqlite"))]
-mod on_conflict;
 mod pk_insert_semantics;
 #[cfg(feature = "sqlite")]
 mod sqlite_builtin_pushdown;
@@ -61,8 +56,6 @@ mod on_zero_results_retention;
 mod on_zero_results_subqueries;
 mod partition_by_arrow;
 mod partition_by_cayenne;
-#[cfg(feature = "postgres-accel")]
-mod query_push_down;
 mod refresh;
 mod reload_file_accelerated;
 mod retention_arrow;

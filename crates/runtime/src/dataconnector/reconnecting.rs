@@ -387,6 +387,10 @@ impl DataConnector for ReconnectingConnector {
                 inner.initialization_for_dataset(dataset)
             })
     }
+
+    fn user_token_client_id(&self) -> Option<&str> {
+        self.built().and_then(|inner| inner.user_token_client_id())
+    }
 }
 
 #[cfg(test)]

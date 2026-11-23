@@ -400,7 +400,6 @@ pub(crate) fn test_tls_acceptor() -> TlsAcceptor {
 mod tests {
     use super::*;
     use axum::{Router, routing::get};
-    use futures::future;
     use http::StatusCode;
     use std::time::Duration;
     use tokio::{io::AsyncReadExt, net::TcpListener, sync::watch, time::timeout};
@@ -408,17 +407,6 @@ mod tests {
     // Router that immediately responds with "ok"
     fn ok_router() -> Router {
         Router::new().route("/", get(|| async { "ok" }))
-    }
-
-    // Router that never responds (simulate a hanging request)
-    fn pending_router() -> Router {
-        Router::new().route(
-            "/",
-            get(|| async {
-                future::pending::<()>().await;
-                "pending"
-            }),
-        )
     }
 
     #[tokio::test]
@@ -470,6 +458,11 @@ mod tests {
             .expect("should complete shutdown notification");
     }
 
+    /// Shutdown is graceful: a request already being handled when the signal
+    /// arrives still gets its whole response, and the connection closes after
+    /// it. The handler reports when it has started, so the signal is sent while
+    /// the request is in flight on every run, rather than only when the server
+    /// happens to see the signal before it reads the request.
     #[tokio::test]
     async fn test_process_tcp_stream_graceful_shutdown() {
         // Bind a listener on a system assigned available port
@@ -479,35 +472,67 @@ mod tests {
         let addr = listener.local_addr().expect("to get local addr");
         let (shutdown_notify, shutdown_rx) = watch::channel(());
 
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let router = Router::new().route(
+            "/",
+            get({
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                move || {
+                    let started = Arc::clone(&started);
+                    let release = Arc::clone(&release);
+                    async move {
+                        started.notify_one();
+                        release.notified().await;
+                        "finished"
+                    }
+                }
+            }),
+        );
+
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("to accept connection");
-            process_tcp_stream(stream, pending_router(), shutdown_rx);
+            process_tcp_stream(stream, router, shutdown_rx);
+        });
+        let request = tokio::spawn(async move {
+            let response = build_test_http_client()
+                .get(format!("http://{addr}/"))
+                .send()
+                .await?;
+            let status = response.status();
+            Ok::<_, reqwest::Error>((status, response.text().await?))
         });
 
-        // the request handler will hang until the connection is closed
-        let request_completion_handle = tokio::spawn(async move {
-            let client = build_test_http_client();
-            client.get(format!("http://{addr}/")).send().await
-        });
-
-        assert_eq!(
-            shutdown_notify.receiver_count(),
-            1,
-            "Must be one active connection"
-        );
-        assert!(
-            !request_completion_handle.is_finished(),
-            "Request should not be completed"
-        );
-
-        // Verify that the shutdown will close the active request and drop all receivers
+        timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("the handler should start before shutdown is signalled");
         shutdown_notify.send(()).ok();
-        let _ = timeout(Duration::from_secs(5), request_completion_handle)
+        // Let the connection task see the signal while the handler is still
+        // waiting, so graceful shutdown begins with the request in flight.
+        tokio::task::yield_now().await;
+        assert!(
+            !request.is_finished(),
+            "shutdown must not cut off the request in flight"
+        );
+
+        release.notify_one();
+        let (status, body) = timeout(Duration::from_secs(5), request)
             .await
-            .expect("should complete request after shutdown");
-        timeout(Duration::from_secs(1), shutdown_notify.closed())
+            .expect("the request in flight should finish after shutdown")
+            .expect("the request task should not panic")
+            .expect("the request in flight should get its response");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "finished");
+
+        timeout(Duration::from_secs(5), shutdown_notify.closed())
             .await
-            .expect("should complete shutdown notification");
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the connection should close after its last response once shutdown is signalled; {} connection(s) still open",
+                    shutdown_notify.receiver_count()
+                )
+            });
     }
 
     /// A small `/v1/sql` result leaves the server as several short writes (the

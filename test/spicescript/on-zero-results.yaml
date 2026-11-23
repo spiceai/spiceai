@@ -1,4 +1,5 @@
 name: on-zero-results
+tags: [long]
 description: >
   Subqueries over accelerations with on_zero_results answer as the source
   does: populated, empty (with use_source the source answers, with

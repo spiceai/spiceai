@@ -27,6 +27,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use object_store_spawn::DestinationGuard;
+pub use object_store_spawn::{
+    DestinationRefused, REDIRECT_CHAIN_REFUSED, redirect_continues_off_origin,
+};
 use url::Url;
 
 /// Environment variable that, when set to a truthy value (`1`/`true`/`yes`/`on`),
@@ -222,11 +225,34 @@ impl reqwest::dns::Resolve for RedirectHostResolver {
 /// Why [`guard_redirects`] refuses a redirect.
 const OFF_HOST_REDIRECT_REFUSED: &str = "a redirect off the request's host to a private, loopback, or link-local address is not followed";
 
+/// Why [`guard_redirects`] refuses a redirect under [`RedirectScope::RequestOrigin`].
+const OFF_ORIGIN_REDIRECT_REFUSED: &str = "a request that carries a custom credential header follows a redirect only to its own scheme, host, and port. Configure the endpoint URL as the redirect target directly.";
+
+/// Which redirects [`guard_redirects`] follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RedirectScope {
+    /// A redirect within the request's own host, or to another host that is not private,
+    /// loopback, or link-local.
+    PublicHosts,
+    /// Only a redirect to the request's own scheme, host, and port, for a request that carries a
+    /// credential in a header reqwest does not remove when a redirect leaves that origin.
+    RequestOrigin,
+    /// [`RedirectScope::PublicHosts`] for a request that carries credentials: a redirect chain
+    /// that has left the request's host and port does not continue on the host it moved to.
+    PublicHostsWithCredentials,
+}
+
 /// What [`guard_redirects`] does with one redirect.
 #[derive(Debug, PartialEq, Eq)]
 enum RedirectCheck {
     /// The redirect stays on the request's own host, which is not checked.
     OwnHost,
+    /// The redirect leaves the request's scheme, host, or port under
+    /// [`RedirectScope::RequestOrigin`].
+    OffOrigin,
+    /// The redirect continues a chain on a host it moved to under
+    /// [`RedirectScope::PublicHostsWithCredentials`].
+    ContinuesOffOrigin,
     /// The redirect leaves for an internal IP literal or a well-known internal name.
     Internal,
     /// The redirect leaves for another host, whose addresses are checked when it resolves.
@@ -235,7 +261,19 @@ enum RedirectCheck {
 
 /// Classifies a redirect to `target` from a request whose URLs so far are `previous`, the
 /// request's own URL first.
-fn check_redirect(previous: &[Url], target: &Url) -> RedirectCheck {
+fn check_redirect(scope: RedirectScope, previous: &[Url], target: &Url) -> RedirectCheck {
+    if scope == RedirectScope::RequestOrigin
+        && previous
+            .first()
+            .is_none_or(|own| own.origin() != target.origin())
+    {
+        return RedirectCheck::OffOrigin;
+    }
+    if scope == RedirectScope::PublicHostsWithCredentials
+        && redirect_continues_off_origin(previous, target)
+    {
+        return RedirectCheck::ContinuesOffOrigin;
+    }
     let own_host = previous
         .first()
         .and_then(Url::host_str)
@@ -249,13 +287,14 @@ fn check_redirect(previous: &[Url], target: &Url) -> RedirectCheck {
     }
 }
 
-/// Makes `builder` follow at most `max_redirects` redirects and refuse one that leaves the
-/// request's own host for a private, loopback, or link-local destination: an internal IP literal,
-/// a well-known internal name, or a host that resolves to an internal address. A redirect within
-/// the request's own host is followed, whatever that host resolves to.
+/// Makes `builder` follow at most `max_redirects` redirects within `scope`, and refuse one that
+/// leaves the request's own host for a private, loopback, or link-local destination: an internal
+/// IP literal, a well-known internal name, or a host that resolves to an internal address. A
+/// redirect within the request's own host is followed, whatever that host resolves to.
 pub fn guard_redirects(
     builder: reqwest::ClientBuilder,
     max_redirects: usize,
+    scope: RedirectScope,
 ) -> reqwest::ClientBuilder {
     let resolver = RedirectHostResolver::new(DestinationGuard::new(
         is_internal_ip,
@@ -268,8 +307,22 @@ pub fn guard_redirects(
             if attempt.previous().len() >= max_redirects {
                 return attempt.error("too many redirects");
             }
-            match check_redirect(attempt.previous(), attempt.url()) {
+            match check_redirect(scope, attempt.previous(), attempt.url()) {
                 RedirectCheck::OwnHost => attempt.follow(),
+                RedirectCheck::OffOrigin => {
+                    let refused = format!(
+                        "Refused to follow the redirect to {}: {OFF_ORIGIN_REDIRECT_REFUSED}",
+                        attempt.url()
+                    );
+                    attempt.error(refused)
+                }
+                RedirectCheck::ContinuesOffOrigin => {
+                    let refused = format!(
+                        "Refused to follow the redirect to {}: {REDIRECT_CHAIN_REFUSED}",
+                        attempt.url()
+                    );
+                    attempt.error(refused)
+                }
                 RedirectCheck::Internal => {
                     let refused = format!(
                         "Refused to connect to {}: {OFF_HOST_REDIRECT_REFUSED}",
@@ -431,7 +484,7 @@ mod tests {
         ] {
             let target = Url::parse(target).expect("valid URL");
             assert_eq!(
-                check_redirect(&previous, &target),
+                check_redirect(RedirectScope::PublicHosts, &previous, &target),
                 RedirectCheck::Internal,
                 "{target} must be refused"
             );
@@ -442,7 +495,7 @@ mod tests {
         ] {
             let target = Url::parse(target).expect("valid URL");
             assert_eq!(
-                check_redirect(&previous, &target),
+                check_redirect(RedirectScope::PublicHosts, &previous, &target),
                 RedirectCheck::OtherHost,
                 "{target} must be followed"
             );
@@ -451,9 +504,87 @@ mod tests {
         let previous = [Url::parse("http://127.0.0.1:4000/graphql").expect("valid URL")];
         let target = Url::parse("http://127.0.0.1:4000/graphql/").expect("valid URL");
         assert_eq!(
-            check_redirect(&previous, &target),
+            check_redirect(RedirectScope::PublicHosts, &previous, &target),
             RedirectCheck::OwnHost,
             "a redirect within the request's own host is followed"
+        );
+    }
+
+    #[test]
+    fn check_redirect_in_the_request_origin_scope_refuses_every_target_off_the_origin() {
+        let previous = [Url::parse("http://api.example.com/graphql").expect("valid URL")];
+        for target in [
+            "https://93.184.216.34/graphql",
+            "https://api.example.org/graphql",
+        ] {
+            let target = Url::parse(target).expect("valid URL");
+            assert_eq!(
+                check_redirect(RedirectScope::PublicHosts, &previous, &target),
+                RedirectCheck::OtherHost,
+                "{target} must be followed in the public-hosts scope"
+            );
+            assert_eq!(
+                check_redirect(RedirectScope::RequestOrigin, &previous, &target),
+                RedirectCheck::OffOrigin,
+                "{target} must be refused in the request-origin scope"
+            );
+        }
+        for target in [
+            "https://api.example.com/graphql",
+            "http://api.example.com:8080/graphql",
+        ] {
+            let target = Url::parse(target).expect("valid URL");
+            assert_eq!(
+                check_redirect(RedirectScope::RequestOrigin, &previous, &target),
+                RedirectCheck::OffOrigin,
+                "{target} changes the scheme or port, so it must be refused"
+            );
+        }
+
+        let target = Url::parse("http://api.example.com:80/graphql/").expect("valid URL");
+        assert_eq!(
+            check_redirect(RedirectScope::RequestOrigin, &previous, &target),
+            RedirectCheck::OwnHost,
+            "a redirect within the request's origin is followed"
+        );
+    }
+
+    #[test]
+    fn check_redirect_with_credentials_refuses_a_chain_that_continues_on_another_host() {
+        let url = |value: &str| Url::parse(value).expect("valid URL");
+        let endpoint = url("https://api.example.com/graphql");
+        let moved = [endpoint.clone(), url("https://cdn.example.net/a")];
+        let next = url("https://cdn.example.net/b");
+        assert_eq!(
+            check_redirect(RedirectScope::PublicHostsWithCredentials, &moved, &next),
+            RedirectCheck::ContinuesOffOrigin
+        );
+        assert_eq!(
+            check_redirect(RedirectScope::PublicHosts, &moved, &next),
+            RedirectCheck::OtherHost,
+            "a request without credentials follows the chain"
+        );
+        for (previous, next) in [
+            (&[endpoint][..], "https://cdn.example.net/a"),
+            (&moved[..], "https://edge.example.org/x"),
+        ] {
+            assert_eq!(
+                check_redirect(
+                    RedirectScope::PublicHostsWithCredentials,
+                    previous,
+                    &url(next)
+                ),
+                RedirectCheck::OtherHost,
+                "{next} must be followed"
+            );
+        }
+        assert_eq!(
+            check_redirect(
+                RedirectScope::PublicHostsWithCredentials,
+                &moved,
+                &url("https://api.example.com/back")
+            ),
+            RedirectCheck::OwnHost
         );
     }
 }

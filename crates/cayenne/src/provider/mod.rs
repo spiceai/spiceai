@@ -862,13 +862,16 @@ mod tests {
             .await
             .expect("Failed to insert data");
 
-        // Ordinary writes are intentionally unsorted for throughput.
-        // Compaction (sort_and_rewrite_data) sorts the data and flushes inline
-        // rows to Vortex files with tight zone-map bounds.
-        table
-            .sort_and_rewrite_data(128 * 1024 * 1024)
-            .await
-            .expect("Failed to sort and rewrite data");
+        // Ordinary writes are intentionally unsorted for throughput. The full
+        // compaction sorts the data and flushes inline rows to Vortex files with
+        // tight zone-map bounds.
+        assert!(
+            table
+                .force_full_compaction()
+                .await
+                .expect("Failed to run the full compaction"),
+            "the full compaction must commit"
+        );
 
         // Verify data is sorted by timestamp, then by id
         let ctx = SessionContext::new();

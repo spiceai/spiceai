@@ -109,7 +109,7 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 | `transactions-txn` | Two datasets, one transaction, competing ordinary writes, reservations, commit/abort create race, helper Resolve, uncertain CAS, checkpoint/GC; one participant writes other keys while prepared so the Prepare can reach a checkpoint; I3–I6, I8 | Exhaustive 1 (two lease generations), controls 0 except owner restriction 1; samples 2, 3 (two outstanding handles per dataset) |
 | `intent-roll-forward*` (single writer) | Proposed single-writer alternative to two-phase commit: one writer holding both datasets' leases commits A's actions, the source position and a pending intent for B in one A record, applies the intent to B under the transaction id, optionally marks it done in A; the next lease holder rolls pending intents forward. Maintenance on either head, delayed/duplicate CAS, lost responses resolved by attempt id, crash, pause and fencing; atomicity, at-most-once B apply, acknowledged/positioned transactions in both datasets at quiescence, I2, no retraction, B values in commit-point order, I5 | 1 or 2 source transactions on one key; one maintenance commit per dataset; one turnover and one crash (`two-takeovers`: two each); 2 copies per request; `disjoint-writer` adds one keyed write to another key of B |
 | `intent-roll-forward-partitioned*` | Optional capability: the same fast path with one exclusive writer per source partition over shared A and B heads. Each head records every partition's writer generation, so a partition turnover is a head commit on A and then on B; each transaction writes only its partition's key in both datasets; each partition writer commits its intent with its partition's source position in A, then applies it to B by transaction id; a lost CAS on either head is rebased after a footprint check of the winners against the intent's keys. Crash, pause, turnover and handoff are per partition; the partition's next owner rolls only that partition's intents forward before ingesting it, while the other partition keeps committing. Delayed/duplicate CAS and lost responses resolved by attempt id; atomicity, at-most-once B apply, acknowledged and per-partition positioned transactions in both datasets at quiescence, I2 per partition, per-key B values in commit-point order, no stale-generation commit accepted per partition (an older generation of a partition commits on either dataset after its next owner recorded its generation in both heads), I5 | Partitions p0 and p1; 1 source transaction per partition, or 2 in p0 (`without-done`: no done markers, so recovery always checks B by transaction id); one turnover and one crash in total, in either partition (`handoff`: the turnover may be a handoff by a live owner at any point between its protocol steps); 2 copies per request; no maintenance commits. `each-partition` samples one turnover and one crash per partition with 2 transactions in p0 |
-| `window-storage` | Canonical inline bytes, byte/count pressure, copy rule, cold replay, a running query, checkpoint/GC; I4, I7, I8 | Exhaustive 6 records; controls 5; samples 7, 9 |
+| `window-storage` | Canonical inline bytes, byte/count pressure, copy rule, cold replay, checkpoint objects, and deletion below the floor as the head log's collector does it: each new floor stamped with the head's store time at a later collection that sees a higher commit than the one it was first seen at (the collector's clock is the time of the last head write, which stays put while nothing writes the head), its batches and older checkpoints deleted once the store clock is a retention past the stamp, a collector restart that forgets its stamps (a required witness has it discard a stamp and still delete afterwards), and a reader that reads a head and fetches what it lists later. I4, I8, and I7 for that reader: within its retention it reads exactly its snapshot, after it its snapshot or a missing object, never other rows | Exhaustive 7 records, 2 checkpoints, 5 collections, 2 retention ticks, 1 restart; controls 5; samples 7, 9 |
 | `retention` / `retention-readers` | Readers never write and GC has no generations: removed objects deleted a fixed retention after GC observes the removal, which stays in durable state until the delete (timers restarted at takeover); never-committed uploads deleted once the head's store time is T_O past theirs; GC's empty commit on an idle head; fresh object names; a writer references only base-live objects or its own never-published uploads, while its base's store time is less than T_O minus a margin past the upload's; object timestamps that lag the writer's lower bound; deletes and commits that land arbitrarily late. `retention-readers` adds one query whose head GET responds late, and stops once the query settles. No dangling reference, rows or an error, and a query within the retention never fails | Exhaustive: 2 object names, 9 clock ticks, 6 head versions, retention 3, staleness 1, upload age 4, timestamp error 1, two sweeps, one takeover; the writer graph adds timestamp skew, the reader graph one query |
 | `retention-remote-gc` / `retention-readers-remote-gc` | GC on another node under its own lease: its empty commit is a CAS on the head version it read that can lose to the writer's commits (and they to it) and is retried; a second GC node takes the lease over, rebuilds the pending removals and restarts every timer, while the first node's issued deletes (removal deletes and selected orphan deletes) land later; the writer's takeover leaves GC's timers alone. Same properties as `retention` / `retention-readers` | As `retention` / `retention-readers`, with one GC lease takeover in place of the writer takeover; the reader graph stops at clock 7 |
 | `retention-readers-checkpoint` / `retention-readers-remote-gc-checkpoint` | Removals durable only as records after the floor and as the checkpoint root's pending-removals list: one checkpoint moves the floor, writes every removal not yet deleted into the root and drops the records below the floor; a takeover (the writer's with GC in process, or the GC lease takeover) rebuilds the pending set from the root with the later records applied and restarts every timer. Same properties as `retention-readers` | As `retention-readers` with one checkpoint; clock 7, or 6 with remote GC |
@@ -263,6 +263,7 @@ as a separate maintenance process does.
 | `storage-no-stable-cut` | Head-dependent cut: I4/I8 exact bytes |
 | `storage-no-final` | Seal a non-final batch: I4/I8 exact bytes |
 | `storage-no-range` | Index a different range from the dropped records: I4/I8 exact bytes |
+| `storage-gc-early` | Delete below a floor as soon as the collector stamps it, without waiting a retention: a reader of an older head, still within its retention, finds its batch or checkpoint gone (I7) |
 | `storage-no-published` | GC uses an unpublished checkpoint: I7 |
 | `storage-no-missing` | Skip missing history instead of reopening: I8 |
 | `txn-no-reservation` / `txn-overlap-no-reservation` | Allow conflicting records or other transaction ids through reservations: visible replay divergence (I6/I8) |
@@ -939,3 +940,203 @@ operation then completes as a no-op. Missing/expired mappings
 are not modeled and cannot be treated as proof of deletion. Retain mapping evidence
 until outstanding operations can resolve or re-plan. The graph covers one rewrite,
 not chains, multiple output files, keyed replacements or mapping reclamation.
+
+## Mem-tier seal, checkpoint, full rewrite, and recovery
+
+The initial durable write is ONE protected snapshot at S=1, containing keys 0
+and 1 (values 1 and 2), with an empty current snapshot and durable high-water 1.
+`mem-tier-current-3-exhaust` documents the current seal's known duplicate-key
+failure: `failure = "recovered reads match the source"`. It requires `EXHAUST=1`.
+`mem-tier-seal-delete-only` is the candidate positive, expecting `holds`, and is
+included in `quick`. Its seal writes only pure delete vectors, because its shadow
+rows live inline and their visibility ignores insert sequences. Checkpoints still
+write their usual reinsert vector stamps and precomputed insert records.
+`mem-tier-seal-delete-only-sqlite` uses the same protocol with immediate
+publication of every staged catalog call. Its `Flush` is idempotent and has no
+durability effect; the object-native run also accepts an empty `Flush`.
+
+All four negative controls are based on `mem-tier-seal-delete-only`. They keep
+requiring their named downstream failure even if exhaustive exploration finds
+none; a missing failure is reported rather than relabeled safe or hidden. Bounds
+are three source applies, one seal, two explicit checkpoints, one bake attempt,
+one full-rewrite attempt and one crash/recovery, with budgets retained across
+restart. Six threads and the shared 540-second watchdog apply.
+
+```sh
+nice -n 10 cargo build --release -p cayenne-metastore-model
+EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-current-3-exhaust
+nice -n 10 target/release/cayenne-metastore-model run mem-tier-seal-delete-only
+EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-no-one-call
+EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-no-insert-records
+EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-no-capture-reservation
+EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-late-stamp
+nice -n 10 cargo clippy -p cayenne-metastore-model --release --tests --no-deps -- -D warnings
+nice -n 10 cargo test -p cayenne-metastore-model --release --test mem_tier_steps -- --nocapture
+```
+
+The logical oracle replays source key/value assignments without physical
+sequences. State identity includes the live catalog, a separately materialized
+durable catalog, the pending actions and all protocol/visibility/witness state.
+Historical record grouping is audit-only: histories with identical state in all
+those fields have identical successors and property verdicts, so their old record
+boundaries are excluded from equality/hashing. The trace API keeps the actual
+path's records and folds them independently to check the materialized durable
+catalog on every replayed step. Every scan keeps physical multiplicity, including identical copies.
+The safety properties are unchanged: live rows equal the source outside recovery;
+crash/recover/replay equals the complete source at every state; acknowledged keys
+without a later source mutation are durable, including their absence/multiplicity.
+The last predicate permits newer durable writes to supersede older acknowledged
+values. Recovery rebuilds only committed actions and redelivers the unacknowledged
+source suffix through ordinary applies before permitting new source operations.
+The committed source position also bounds redelivery.
+
+`FullRewriteCapture` pins the current and protected rows with their deletion view,
+records their exact folded set and the allocator high-water cutoff, and releases
+the capture lock. `FullRewrite` commits the output as current and atomically
+publishes its RAM view. Applies and seal/checkpoint steps can interleave between
+these actions; later protected snapshots remain registered. This matters because
+post-capture mutations must survive the cutoff prune and a concurrent seal can
+become durable before the rewrite removes the last protected snapshot. Bake and
+another full rewrite are serialized by the maintenance path.
+
+The engine first drains the mem tier and published inline corpus before capturing
+a full rewrite. The model requires an empty tier, empty published inline corpus,
+and no seal shadow at `FullRewriteCapture`; explicit checkpoints supply that
+prerequisite within their two-checkpoint budget. This omits the engine's implicit
+drain scheduling, not its data effects. Empty rewrite output models the reclaim
+arm; ordinary compaction with zero output returns without publication. No cold
+tier, replacement writer or append-to-current writer is modeled, so the cold cap,
+current-directory generation guard and replacement CAS cannot change in flight.
+
+The full rewrite scan skips query-only tombstone pushdown. Its durable fenced
+commit removes delete-vector catalog entries with DELETE sequence <= cutoff
+(including each removed vector's reinsert stamp), removes standalone insert
+records with INSERT sequence <= cutoff, unregisters exactly the folded protected
+snapshots and switches the current snapshot. RAM prunes the two index sides
+independently when the index has a delete side, and removes exactly that folded
+set. `prune_deletion_index_at_or_below` returns early for an insert-only index
+(`table.rs:31338`); the model preserves that detail even though insert-only entries
+do not hide rows. Vectors and standalone insert
+records are stored separately in the symbolic catalog so this distinction also
+holds during recovery. Unreferenced physical file reclamation is not modeled.
+
+The bake merges all protected snapshots using partial deletion filters, tags the
+output with the capped delete fence, and prunes only the RAM index at that fence.
+It retains durable vectors and insert records. The replay configures the
+existing `compaction_trigger_protected_snapshots` threshold to 2, so the engine
+keeps zero recent snapshots. The model enables `Bake` only with at least two
+eligible inputs and a clean physical current-file prefix. The all-protected
+scope still excludes partial-prefix and pass-budget selection. Current files start empty, making prune/reinsert schedules
+reachable; a later full rewrite can leave physical old ranges that block baking.
+Snapshot file minimum sequences are modeled separately from their read cutoffs.
+
+`mem_tier_steps` / `MemTierStep` accept the shared Debug/JSON action grammar,
+including both full-rewrite actions. They expose live rows, availability, logical
+reference, acknowledgement, committed action lists, hypothetical recovery/replay
+rows, and the durable current/protected rows, vectors and standalone insert
+records. `pending_changes` exposes the staged changes; `durable` and
+`durable_plus_pending` expose modeled data-content projections (physical
+current/protected/inline row multisets, vector entries, and standalone insert
+stamps), with a recovery result for each. The replay compares one coherent
+projection and recovery result, never independent per-field alternatives. An
+observed whole-buffer early flush becomes a `Flush` in subsequent model prefixes,
+so its durability survives a later crash. Parsing and enablement follow
+`transaction_steps`. The shared
+`TRACE_JSON`/`WALK` driver remains usable. Trace API tests run finite schedules,
+not exhaustive checks during `cargo test`.
+
+Mandatory positive witnesses cover checkpoint stage/flush, stage/crash before
+publish, recovered seal shadow, bake/prune/reinsert/checkpoint, full rewrite,
+an apply overlapping rewrite, and a later protected snapshot retained by rewrite.
+The optional `protected survivor excluded by pushdown` diagnostic is hypothesis B.
+
+| Control | Mutation | Required failure |
+|---|---|---|
+| `mem-tier-no-one-call` | Stage seal shadow before pure vectors; stage checkpoint insert records after snapshot/vectors/clear, allowing flush/crash between | `recovered reads match the source` |
+| `mem-tier-no-insert-records` | Omit checkpoint insert records and hidden-key RAM upgrade, retaining checkpoint vector stamps | `recovered reads match the source` |
+| `mem-tier-no-capture-reservation` | Reserve the pure-delete seal's shadow sequence after releasing capture | `recovered reads match the source` |
+| `mem-tier-late-stamp` | Reserve a fresh insert-record stamp at checkpoint staging after a post-capture apply | `recovered reads match the source` |
+
+Control names retain their original API; their modes have the
+`mem-tier-seal-delete-only-no-` prefix (`no-early-stamp` for late stamping).
+A failure must actually exercise the mutation to establish necessity. In
+particular, split staging needs a flush/crash between stages, and late reservation
+needs an intervening apply. Source replay remains enabled in all controls: an
+unacknowledged partial publication may be repaired by redelivery. Trace tests
+compare the known-defect and candidate seal schedule, check fenced durable cleanup
+and later-write retention, exercise every mutation, and compare the candidate and
+no-insert-records prune/reinsert/checkpoint schedule. Run results and counterexample
+artifacts belong in the report/PR, not the repository.
+
+The replay models the reserve-ahead allocator's logical handouts without forcing
+an unrelated pending catalog buffer to flush at each apply. Physical allocator
+gaps are normalized by the replay from observed reservation boundaries, rather
+than equating a persisted block high-water with the model's next logical sequence.
+The PK existence cache is separate from visible rows: it filters durable inputs
+by the file deletion view, includes all tier keys, retains keys across absorbed
+deletes and bake, and is discarded by full rewrite and recovery. A retained key
+can produce a redundant supersede tombstone. The logical source oracle remains
+independent of these physical bookkeeping rules.
+
+Split staging and omitted insert records are checked as catalog-content
+properties in replay even when reinsert vectors or source redelivery preserve the
+logical rows. A trace that preserves rows is not a data-loss reproduction. The
+control runs retain their original required row-failure predicates; missing
+failures must be reported, never relabeled or hidden. Historical control JSONL
+schedules remain useful for driving partial-publication interleavings, but their
+old FAIL labels are not a verdict of a revised model.
+
+Rules checked against the source at `43bee9dd8bb653926ce8bc836cb48a7d3cb6ba35`
+plus the existing worktree changes (locations relative to `crates/cayenne/src/`):
+
+| Modeled rule | Code |
+|---|---|
+| One allocator; reserve before handing out; pairs for applies | `provider/table.rs:1413` (`reserve_sequences_in`), `:13114`, `:35480`, `:35537`, `:36027` |
+| Upsert existing-key or delete-side probe; delete always; tier has no inserts | `provider/table.rs:16901`, `:17147`, `:35344`, `:35537`, `:36027` |
+| Independent delete/insert max, delete-side-only tombstone probe | `provider/deletion_index.rs:253` (`merged_entry`), `:1528`; `provider/delete/filter_exec.rs:193` |
+| Main applies reinserts only without protected plans; protected cutoff ignores reinserts | `provider/table.rs:43328`, `:41553`; `provider/delete/filter_exec.rs:156` |
+| Sequence-blind pushdown shared by file scans, separate memory filters | `provider/table.rs:42327`, `:43025`; `provider/file_pruning.rs:128`; `provider/table.rs:33630`, `:34869`, `:34935` |
+| Merge tier tombstones by delete max into file-side scan index | `provider/table.rs:33868` (`merged_deletions_for_build`) |
+| Seal capture/reservation, shadow and grouped vectors, mark/ack | `provider/table.rs:37249`–`:37434`; `metastore/object_native.rs:1891` |
+| Checkpoint capture, empty/data arms, precomputed insert records, atomic visibility publish | `provider/table.rs:36381`, `:36481`, `:36682`, `:36923`, `:37001`; `:18294` and `:18348` |
+| Buffered catalog-live state, table flush, position commit before ack | `metastore/object_native.rs:595`, `:642`, `:712`; `provider/table.rs:37878` |
+| Bake fence, clean-prefix gate, partial-filter scan without query pushdown, per-side RAM prune | `provider/table.rs:30780`, `:28799`, `:29210`, `:29430`, `:31338`; `provider/deletion_index.rs:843` |
+| Recovery merges vector and record inserts; inline watermark; protected reload | `provider/table.rs:39454`, `:39571`, `:39709`; `provider/delete/vector_io.rs:657`; `provider/table.rs:33190` |
+| Full rewrite capture, drain and fenced publication | `provider/table.rs:25608`, `:25912`, `:25950`, `:26325`, `:26401` |
+| Rewrite scan skips tombstone pushdown | `provider/table.rs:26546`, `:26561` |
+| Fenced catalog commit removes vectors/records by separate cutoffs and only folded snapshots | `provider/table.rs:6795`, `:6832`; `metastore/object_native.rs:1433`; `../cayenne-metastore-actions/src/state.rs:478`, `:615` |
+| RAM full-rewrite prune and folded-set removal | `provider/table.rs:30962`, `:31338`; `provider/deletion_index.rs:843` |
+
+The allocator reserves ahead in physical blocks. Logical handouts from an
+already claimed block do not call the metastore and therefore do not publish an
+unrelated checkpoint buffer. The model records logical high-water with the next
+publication; reopening resumes from that logical committed high-water. Replay
+maps actual handout boundaries to logical sequences, preserving their order while
+abstracting unused physical block tails. `CatalogView` is the modeled data-content
+projection: it excludes allocator block high-water, source-position records,
+manifest min/max ranges and optimizer statistics. Acknowledgement and recovered
+rows are checked separately. The bake scope requires all protected inputs eligible;
+partial-prefix bakes retaining an above-fence suffix are outside this model.
+The requested protected S=1 genesis supersedes the original brief's current-file
+genesis. Bake scans and rewrite scans skip query-only tombstone pushdown; using the
+query visibility helper for either would misrepresent their materialized rows.
+The engine's full rewrite drains memory before capture, and its fenced catalog
+commit does remove old durable vectors and insert records; bake retains them.
+Source acknowledgement also includes a committed source-position action in the
+existing object-native worktree implementation, rather than only an external ack.
+
+Other abstractions: files are symbolic immutable rows; successful per-table
+publication is atomic. No torn object I/O, uncertain CAS, source transport failure,
+multishard torn capture, NULL/schema changes, overflow, cold storage, statistics
+correctness or resource accounting is modeled. Statistics/file-stat cleanup do
+not affect row visibility and are omitted. Inline tombstone state is empty here:
+seals append unpublished shadow rows, and checkpoints clear all inline state.
+Protected rows use only their registered read cutoff; seal shadows receive their
+seal sequence. Insert records use maxima, as the original brief permits. Source
+position stage/flush/ack is one end action, with earlier flush/crash opportunities.
+The full rewrite's current-pointer/catalog commit and RAM swap form one action;
+crash between them has the same durable recovery state as crash just after it.
+The mem-tier family uses DFS, including controls, so a control with no failure can
+exhaust without retaining a breadth-first frontier. All safety predicates remain
+unchanged. These are bounded symbolic protocol checks, not additional engine
+reproductions.

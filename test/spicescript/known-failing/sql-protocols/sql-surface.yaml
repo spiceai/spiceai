@@ -1,4 +1,5 @@
 name: sql-surface-known
+tags: [long]
 description: >
   Generated documented-SQL cases with reproduced errors or schema mismatches.
   These cases remain executable until their tracked failures are resolved.

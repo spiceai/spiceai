@@ -174,10 +174,8 @@ pub(crate) async fn handle(
             }
         }
         None => {
-            if allow_scheduler_trusted_executor_write(&datafusion) {
-                tracing::debug!(
-                    "Allowing unauthenticated DoPut on executor in mTLS scheduler-trusted mode"
-                );
+            if crate::cluster::peer::is_from_scheduler(&context) {
+                tracing::debug!("Accepting a DoPut the scheduler forwarded to this executor");
             } else {
                 // No principal: a request without credentials, which a listener beyond
                 // loopback serves read-only (`runtime.auth` refuses one before it gets here).
@@ -331,11 +329,6 @@ pub(crate) async fn handle(
     let timed_stream = TimedStream::new(response_stream, move || start);
 
     Ok(Response::new(Box::pin(timed_stream)))
-}
-
-fn allow_scheduler_trusted_executor_write(datafusion: &DataFusion) -> bool {
-    datafusion.cluster_config.effective_role() == Some(ClusterRole::Executor)
-        && datafusion.cluster_config.tls_config().is_some()
 }
 
 /// What draining the inbound stream after an early write completion found.
