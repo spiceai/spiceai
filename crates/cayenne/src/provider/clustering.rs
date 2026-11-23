@@ -347,21 +347,23 @@ pub(crate) fn bound_key(scalar: &ScalarValue, column_type: &DataType) -> Option<
 }
 
 /// Rescales a column's order-preserving keys onto the dense `0..=MAX_CODE`
-/// coordinate space spanned by `[lo, hi]`, computing
-/// `floor((clamp(key, lo, hi) - lo) * MAX_CODE / span)` exactly.
+/// coordinate space spanned by `[lo, hi]`. With `x = clamp(key, lo, hi) - lo`
+/// and `shift = max(0, bit_width(span) - CURVE_BITS)`, it computes
+/// `floor((x >> shift) * MAX_CODE / (span >> shift))` exactly.
 ///
 /// - Keys outside `[lo, hi]` clamp to its ends.
 /// - A constant or inverted range (`hi <= lo`) carries no information to
 ///   spread, so every key maps to 0.
-/// - `x * MAX_CODE` must fit in `u128`, which needs `span < 2^CURVE_BITS`. For a
-///   wider span the low bits of both `x` and `span` are dropped together: they
-///   sit below the resolution a `CURVE_BITS`-wide coordinate can represent, and
-///   shifting both preserves the ratio.
+/// - `x * MAX_CODE` must fit in `u128`, which needs `span < 2^CURVE_BITS`, so
+///   `shift` is 0 for those spans. For a wider span the low `shift` bits of
+///   both `x` and `span` are dropped first. The result can then differ slightly
+///   from `floor(x * MAX_CODE / span)`, but it stays monotonic in `key`, which
+///   is all clustering needs.
 ///
 /// `lo`, `hi` and `span` are fixed for a whole call, so the division is
-/// replaced by a per-column reciprocal: it estimates the quotient at most one
-/// below the exact floor (see [`multiply_high`]), and one remainder comparison
-/// recovers the exact value.
+/// replaced by a per-column reciprocal of the shifted span: it estimates the
+/// shifted quotient at most one below its exact floor (see [`multiply_high`]),
+/// and one remainder comparison recovers the exact value.
 struct Normalizer {
     lo: u128,
     hi: u128,
