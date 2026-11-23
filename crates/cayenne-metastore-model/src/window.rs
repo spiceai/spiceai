@@ -206,6 +206,103 @@ impl Model for Protocol {
         }
         if next == *state { None } else { Some(next) }
     }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Append(z) => format!("commit a record (variant {z}) into the head"),
+            Action::Observe => "observe a stable cut of the inline window".into(),
+            Action::Create(j) => format!("upload observed cut {j} as a batch (create if absent)"),
+            Action::Checkpoint(c) => format!("write a checkpoint object at {c}"),
+            Action::Gc => {
+                "collector pass: stamp new floors, delete below floors a retention old".into()
+            }
+            Action::Query => "a reader reads the head (it fetches the objects later)".into(),
+            Action::Tick => "the store clock advances one retention".into(),
+            Action::Restart => "the collector restarts and forgets its stamps".into(),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let state = self.next_state(last_state, action)?;
+        let log: Vec<String> = state
+            .log
+            .iter()
+            .map(|r| crate::explorer::record_id(*r))
+            .collect();
+        Some(crate::explorer::summary(&[
+            format!("serial history: {}", log.join(" ")),
+            format!(
+                "store clock {}; head written at {}; checkpoints {}, collector passes {}",
+                state.time, state.head_time, state.checkpoints, state.gcs
+            ),
+            crate::explorer::flags(&[
+                ("byte cut", state.store.byte_cut),
+                ("count cut", state.store.count_cut),
+                ("byte pressure", state.store.byte_pressure),
+                ("count pressure", state.store.count_pressure),
+                ("batch re-created after collection", state.store.revived),
+                ("conflicting batch bytes", state.store.conflict),
+                ("collector restarted", state.restarted),
+                ("restart lost a stamp", state.restart_lost_stamp),
+                ("checkpoint object collected", state.root_collected),
+                ("collected after a restart", state.collected_after_restart),
+                ("collected while an older reader ran", state.gc_during_query),
+            ]),
+        ]))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{StoreView, Tone, stacked_with};
+        let state = path.last_state();
+        let mut view = StoreView::of("OBJECT STORE", &state.store, crate::explorer::record_id);
+        view.head.push(format!(
+            "store clock {}; head written at {}",
+            state.time, state.head_time
+        ));
+        let roots: Vec<String> = state.roots.iter().map(ToString::to_string).collect();
+        view.head.push(format!(
+            "checkpoint objects at commits: {}",
+            if roots.is_empty() {
+                "none".into()
+            } else {
+                roots.join(", ")
+            }
+        ));
+        if state.store.floor > 0 && !state.roots.contains(&state.store.floor) {
+            view.head.push(format!(
+                "checkpoint object at the floor ({}) is COLLECTED",
+                state.store.floor
+            ));
+        }
+        if let Some((query, read_at)) = &state.query {
+            // Past its retention a reader may find a batch gone; only the
+            // model's property for a reader within its retention makes that a
+            // violation.
+            let protected = !crate::explorer::holds(
+                self,
+                state,
+                "I7 query within retention reads its snapshot",
+            );
+            view.pin_reader(
+                &format!("reader (read the head at {read_at})"),
+                query,
+                protected,
+            );
+        }
+        let retired: Vec<String> = state
+            .retired
+            .iter()
+            .map(|(floor, seen, stamp)| match stamp {
+                Some(t) => format!("floor {floor} (seen at commit {seen}, stamped {t})"),
+                None => format!("floor {floor} (seen at commit {seen}, not stamped)"),
+            })
+            .collect();
+        let mut lines = if retired.is_empty() {
+            vec!["no floors seen".to_string()]
+        } else {
+            retired
+        };
+        lines.push(format!("deleted below floor {}", state.collected));
+        let header = vec![("COLLECTOR".to_string(), lines, Tone::Actor)];
+        Some(stacked_with(&header, &[view]))
+    }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
             Property::always(
@@ -388,4 +485,50 @@ pub fn outcome_after(mode: &str, bound: usize, actions: &[String]) -> Option<Out
             .collect(),
         checkpoint_objects: state.roots.clone(),
     })
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::Protocol;
+    use stateright::Model;
+
+    /// A reader past its retention may find a batch collected, which the model
+    /// allows, so the drawing does not mark that missing batch red.
+    #[test]
+    fn expired_reader_missing_batch_is_not_a_violation() {
+        use super::Action::{Append, Checkpoint, Create, Gc, Observe, Query, Tick};
+        use stateright::Path;
+        let model = Protocol::new("storage", 7);
+        let actions = [
+            Append(0),
+            Append(0),
+            Append(0),
+            Observe,
+            Create(0),
+            Append(0),
+            Checkpoint(3),
+            Query,
+            Append(0),
+            Gc,
+            Append(0),
+            Observe,
+            Create(1),
+            Gc,
+            Tick,
+            Append(0),
+            Gc,
+        ];
+        let init = model.init_states().remove(0);
+        let path = Path::from_actions(&model, init, &actions).expect("enabled trace");
+        let state = path.last_state();
+        let (_, read_at) = state.query.as_ref().expect("a reader");
+        assert!(state.time > *read_at, "the reader is past its retention");
+        assert!(
+            state.read_query().is_none(),
+            "the reader finds an object missing"
+        );
+        let svg = model.as_svg(path).expect("window draws");
+        assert!(!svg.contains("cm-arrow cm-bad"), "{svg}");
+        assert!(svg.contains("cm-arrow cm-gone"), "{svg}");
+    }
 }
