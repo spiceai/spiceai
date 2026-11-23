@@ -1,4 +1,5 @@
 name: mysql-string-length
+tags: [long]
 description: >
   String length counts Unicode characters, including through aliases and
   filters. Binary length counts bytes. Federated results agree with MySQL's

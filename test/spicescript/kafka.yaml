@@ -1,4 +1,5 @@
 name: kafka
+tags: [long]
 description: >
   The Kafka connector against Redpanda: JSON messages on a topic are
   appended into a Cayenne acceleration and answer the corpus as PostgreSQL

@@ -473,7 +473,6 @@ check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features --features flightsql
 	cargo check $(CARGO_PROFILE) --no-default-features --features http-functions
 	cargo check $(CARGO_PROFILE) --no-default-features --features wasm-functions
-	cargo check $(CARGO_PROFILE) --no-default-features --features wasm-functions-compile
 	cargo check $(CARGO_PROFILE) --no-default-features --features aws-secrets-manager
 	cargo check $(CARGO_PROFILE) --no-default-features --features databricks
 	cargo check $(CARGO_PROFILE) --no-default-features --features delta_lake
@@ -541,9 +540,7 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # accelerator and acceleration snapshots, which `default` does not. Recompute the difference
 # before relying on it rather than trusting a comment, from this list and the
 # `default = [...]` array in bin/spiced/Cargo.toml.
-#
-# Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
-SPICED_DATA_FEATURES := adbc,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb
+SPICED_DATA_FEATURES := adbc,postgres,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb
 
 .PHONY: install
 install: build

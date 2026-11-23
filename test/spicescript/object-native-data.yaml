@@ -1,4 +1,5 @@
 name: object-native-data
+tags: [long]
 description: >
   A dataset whose data files are in `runtime.state.location` (#16131), appended
   from PostgreSQL without a primary key: every acknowledged append is counted

@@ -262,7 +262,7 @@ async fn try_get_watch_paths(app_path: impl Into<PathBuf>) -> spicepod::Result<V
     let spicepod = spicepod::Spicepod::load_definition(&root_dir).await?;
 
     for dep in spicepod.dependencies {
-        let dep_path = root_dir.join("spicepods").join(dep);
+        let dep_path = root_dir.join("spicepods").join(dep.from());
         dirs.push(dep_path);
     }
 
