@@ -408,6 +408,10 @@ fn normalize(key: u128, lo: u128, hi: u128) -> u64 {
     Normalizer::new(lo, hi).normalize(key)
 }
 
+/// Rows [`hilbert_transpose`] processes per block: small enough that one
+/// block of every axis stays in L1 while the 63 bit-plane passes run over it.
+const TRANSPOSE_BLOCK_ROWS: usize = 256;
+
 /// Skilling's in-place axes-to-transpose transform for the Hilbert curve
 /// (*Programming the Hilbert curve*, AIP Conf. Proc. 707, 2004).
 ///
@@ -422,9 +426,9 @@ fn hilbert_transpose(coords: &mut [Vec<u64>]) {
     let Some((head, tail)) = coords.split_first_mut() else {
         return;
     };
-    let mut last = vec![0; 256];
-    for start in (0..head.len()).step_by(256) {
-        let end = (start + 256).min(head.len());
+    let mut last = vec![0; TRANSPOSE_BLOCK_ROWS];
+    for start in (0..head.len()).step_by(TRANSPOSE_BLOCK_ROWS) {
+        let end = (start + TRANSPOSE_BLOCK_ROWS).min(head.len());
         let head = &mut head[start..end];
         let mut q = 1u64 << (CURVE_BITS - 1);
         while q > 1 {
