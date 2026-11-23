@@ -294,6 +294,27 @@ async fn create_table(
     pk_keyset_cache_mb: Option<usize>,
     cold: bool,
 ) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
+    create_table_with_retention(
+        fixture,
+        name,
+        mode,
+        durability,
+        pk_keyset_cache_mb,
+        cold,
+        Vec::new(),
+    )
+    .await
+}
+
+async fn create_table_with_retention(
+    fixture: &TestFixture,
+    name: &str,
+    mode: Mode,
+    durability: Durability,
+    pk_keyset_cache_mb: Option<usize>,
+    cold: bool,
+    retention: Vec<Expr>,
+) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
     // Local `file://` cold store per table (no object-store config needed —
     // the default local store resolves it).
     let cold_url = if cold {
@@ -324,7 +345,7 @@ async fn create_table(
     let table = Arc::new(
         fixture
             .data_store
-            .create(catalog, ctx.runtime_env(), opts)
+            .create_with_retention(catalog, ctx.runtime_env(), opts, retention)
             .await?,
     );
     if durability == Durability::Memory {
@@ -1801,19 +1822,39 @@ async fn reupsert_after_overwrite_delete_is_visible_impl(f: TestFixture) -> Test
 }
 test_on_data_store!(reupsert_after_overwrite_delete_is_visible_impl);
 
-// --- Focused regression: a re-upsert survives a bake, a merge and a reopen ---
+// --- Focused regression: a re-upsert survives a bake, a merge and a reload ---
 //
 // A key is deleted and upserted again, so two key deletion vectors name it: the
 // delete, and the upsert's supersede carrying the re-insert sequence. The
 // seq-prefix bake folds both into its output and prunes them from the in-memory
 // index, but they stay durable until the orphaned-vector sweep reclaims them. The
 // protected-snapshot merge that follows runs with an empty index, and must still
-// tag its output above those vectors: reopening the table reloads them, and a
-// protected snapshot applies every deletion above its tag to its rows, re-insert
-// or not. The concurrent walks reach this only by timing; here each maintenance
-// pass runs at a fixed point.
-async fn reupsert_survives_bake_merge_and_reopen_impl(f: TestFixture) -> TestResult<()> {
-    async fn upsert_and_settle(
+// tag its output at or above those vectors: a protected snapshot applies every
+// deletion above its tag to its rows, ignoring re-inserts, and both a reopen and
+// a retention pass reload the vectors from the catalog. The concurrent walks
+// reach this only by timing; here each maintenance pass runs at a fixed point.
+#[derive(Clone, Copy, Debug)]
+enum DeletionReload {
+    /// Open the table again from the catalog.
+    Reopen,
+    /// A retention pass that deletes a row reloads the index in place.
+    RetentionPass,
+}
+
+/// The retention filter of the [`DeletionReload::RetentionPass`] table: no row
+/// the test writes matches it except [`RETENTION_ROW`].
+fn negative_values() -> Expr {
+    col("value").lt(lit(0_i64))
+}
+const RETENTION_ROW: (i64, i64) = (1_000, -1);
+
+async fn reupsert_survives_bake_merge_and_reload(
+    f: TestFixture,
+    reload: DeletionReload,
+) -> TestResult<()> {
+    // Not `settle`: that also runs the test-only full current-snapshot rewrite,
+    // which would fold the protected snapshots this sequence depends on.
+    async fn upsert_and_drain(
         table: &Arc<CayenneTableProvider>,
         row: (i64, i64),
     ) -> TestResult<()> {
@@ -1823,15 +1864,28 @@ async fn reupsert_survives_bake_merge_and_reopen_impl(f: TestFixture) -> TestRes
         Ok(())
     }
 
-    let name = "reupsert_bake_merge_reopen";
-    let (table, ctx) = create_table(&f, name, Mode::Key, Durability::File, None, false).await?;
+    let name = format!("reupsert_bake_merge_{reload:?}");
+    let retention = match reload {
+        DeletionReload::Reopen => Vec::new(),
+        DeletionReload::RetentionPass => vec![negative_values()],
+    };
+    let (table, ctx) = create_table_with_retention(
+        &f,
+        &name,
+        Mode::Key,
+        Durability::File,
+        None,
+        false,
+        retention,
+    )
+    .await?;
     let table_id = table.metadata().table_id.clone();
 
-    upsert_and_settle(&table, (1, 100)).await?;
+    upsert_and_drain(&table, (1, 100)).await?;
     delete_key(&table, 1, Durability::File).await?;
-    upsert_and_settle(&table, (1, 200)).await?;
+    upsert_and_drain(&table, (1, 200)).await?;
     for key in 2..6 {
-        upsert_and_settle(&table, (key, key * 10)).await?;
+        upsert_and_drain(&table, (key, key * 10)).await?;
     }
     assert!(
         table.bake_seq_prefix_protected_snapshots().await?,
@@ -1842,35 +1896,85 @@ async fn reupsert_survives_bake_merge_and_reopen_impl(f: TestFixture) -> TestRes
         0,
         "the bake must prune both deletion vectors naming key 1 from the in-memory index"
     );
-    // The eighth protected snapshot triggers the size-tier merge.
-    for key in 6..10 {
-        upsert_and_settle(&table, (key, key * 10)).await?;
-    }
+    let key_1_vectors: Vec<i64> = f
+        .catalog
+        .get_table_delete_files(&table_id)
+        .await?
+        .iter()
+        .map(|file| file.sequence_number)
+        .collect();
     assert_eq!(
-        f.catalog.get_all_snapshot_sequences(&table_id).await?.len(),
+        key_1_vectors.len(),
+        2,
+        "both deletion vectors naming key 1 stay durable after the bake"
+    );
+
+    // Write until the size-tier merge folds every protected snapshot into one.
+    let merge_trigger = VortexConfig::default().compaction_trigger_protected_snapshots;
+    let protected = f.catalog.get_all_snapshot_sequences(&table_id).await?.len();
+    let mut model: Model = std::iter::once((1, 200))
+        .chain((2..6).map(|key| (key, key * 10)))
+        .collect();
+    for key in 6..6 + i64::try_from(merge_trigger - protected)? {
+        upsert_and_drain(&table, (key, key * 10)).await?;
+        model.insert(key, key * 10);
+    }
+    let thresholds = f.catalog.get_all_snapshot_sequences(&table_id).await?;
+    assert_eq!(
+        thresholds.len(),
         1,
         "the size-tier merge must fold every protected snapshot into one"
     );
     assert_eq!(
-        f.catalog.get_table_delete_files(&table_id).await?.len(),
-        2,
-        "both deletion vectors naming key 1 must still be durable, for the reopen to reload"
+        table.deletion_index_len(),
+        0,
+        "the merge must run on an index the bake emptied"
     );
+    let merged_threshold = *thresholds.values().next().expect("one protected snapshot");
+    let newest_vector = *key_1_vectors.iter().max().expect("two vectors");
+    assert!(
+        merged_threshold >= newest_vector,
+        "the merged snapshot is tagged {merged_threshold}, below the deletion vector at \
+         {newest_vector} its rows already reflect"
+    );
+    assert_converged(&read_rows(&ctx, &name).await?, &model, "before the reload");
 
-    let model: Model = (1..10)
-        .map(|key| (key, if key == 1 { 200 } else { key * 10 }))
-        .collect();
-    assert_converged(&read_rows(&ctx, name).await?, &model, "before reopen");
-    let (reopened, reopened_ctx) = reopen_table(&f, name).await?;
-    assert_converged(
-        &read_rows(&reopened_ctx, name).await?,
-        &model,
-        "after reopen",
-    );
-    reopened.drain_in_flight_maintenance().await?;
+    match reload {
+        DeletionReload::Reopen => {
+            let (reopened, reopened_ctx) = reopen_table(&f, &name).await?;
+            assert_converged(
+                &read_rows(&reopened_ctx, &name).await?,
+                &model,
+                "after reopen",
+            );
+            reopened.drain_in_flight_maintenance().await?;
+        }
+        DeletionReload::RetentionPass => {
+            upsert_and_drain(&table, RETENTION_ROW).await?;
+            assert_eq!(
+                f.catalog.get_table_delete_files(&table_id).await?.len(),
+                3,
+                "the retention pass must delete its row, which reloads the deletion index"
+            );
+            assert_converged(
+                &read_rows(&ctx, &name).await?,
+                &model,
+                "after a retention pass",
+            );
+        }
+    }
     Ok(())
 }
+
+async fn reupsert_survives_bake_merge_and_reopen_impl(f: TestFixture) -> TestResult<()> {
+    reupsert_survives_bake_merge_and_reload(f, DeletionReload::Reopen).await
+}
 test_on_data_store!(reupsert_survives_bake_merge_and_reopen_impl);
+
+async fn reupsert_survives_bake_merge_and_retention_pass_impl(f: TestFixture) -> TestResult<()> {
+    reupsert_survives_bake_merge_and_reload(f, DeletionReload::RetentionPass).await
+}
+test_on_data_store!(reupsert_survives_bake_merge_and_retention_pass_impl);
 
 // --- Concurrent pure-upsert convergence (GREEN control: loss needs deletes) ---
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -34120,13 +34120,24 @@ impl CayenneTableProvider {
             .max(self.pruned_delete_sequence.load(Ordering::Acquire))
     }
 
-    /// Record that the tombstones at or below `cutoff` are leaving the in-memory
-    /// deletion index. Raising it before the prune publishes is safe: until then
-    /// those tombstones are still in the index, so a merge applies them.
-    fn record_pruned_deletes(&self, cutoff: i64) {
-        if let Some(newest) = self.deletion_index_max_sequence() {
+    /// The newest delete sequence a prune at `cutoff` drops from the index, read
+    /// before the prune.
+    fn pruned_through(&self, cutoff: i64) -> Option<i64> {
+        // Clamped to a tombstone that exists: a prune at a cutoff above every
+        // sequence (`i64::MAX`) would otherwise lift every later merge's tag above
+        // deletions not yet written, and those would never apply to its rows.
+        self.deletion_index_max_sequence()
+            .map(|newest| cutoff.min(newest))
+    }
+
+    /// Raise the floor of [`Self::protected_merge_delete_fence`] once a prune
+    /// has published.
+    fn raise_pruned_delete_floor(&self, pruned_through: Option<i64>) {
+        // Delete sequences only increase, so the floor only rises and is never
+        // reset: a later deletion is above it and still applies.
+        if let Some(pruned_through) = pruned_through {
             self.pruned_delete_sequence
-                .fetch_max(cutoff.min(newest), Ordering::AcqRel);
+                .fetch_max(pruned_through, Ordering::AcqRel);
         }
     }
 
@@ -34477,7 +34488,9 @@ impl CayenneTableProvider {
         merged_snapshot_id: &str,
         input_ids: &[String],
     ) -> Result<()> {
-        self.record_pruned_deletes(cutoff);
+        // This off-fence publish bypasses `prune_deletion_index_at_or_below`, so it
+        // raises the floor itself.
+        let pruned_through = self.pruned_through(cutoff);
         let bake = BakeOutput {
             snapshot_at_capture,
             merged_snapshot_id,
@@ -34541,9 +34554,11 @@ impl CayenneTableProvider {
             PkDeletionStrategyWithCache::PositionBased { .. } => return Ok(()),
         };
         match outcome {
-            OffFencePrune::Published
-            | OffFencePrune::NothingToPrune
-            | OffFencePrune::OutputNotLive => return Ok(()),
+            OffFencePrune::Published => {
+                self.raise_pruned_delete_floor(pruned_through);
+                return Ok(());
+            }
+            OffFencePrune::NothingToPrune | OffFencePrune::OutputNotLive => return Ok(()),
             OffFencePrune::LostRace => {}
         }
         let _fence = self.listing_fence.write().await;
@@ -34755,7 +34770,7 @@ impl CayenneTableProvider {
     /// public surface.
     #[doc(hidden)]
     pub fn prune_deletion_index_at_or_below(&self, cutoff: i64) {
-        self.record_pruned_deletes(cutoff);
+        let pruned_through = self.pruned_through(cutoff);
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk {
                 deletion_snapshot, ..
@@ -34787,6 +34802,8 @@ impl CayenneTableProvider {
                 // path, so there is nothing to prune by sequence here.
             }
         }
+
+        self.raise_pruned_delete_floor(pruned_through);
 
         tracing::debug!(
             cutoff,
