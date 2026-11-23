@@ -59,8 +59,10 @@ steps:
         BEGIN
           DECLARE done boolean DEFAULT false;
           DECLARE victim_id bigint unsigned;
+          DECLARE victim_command varchar(64);
+          DECLARE dumps_killed int DEFAULT 0;
           DECLARE victims CURSOR FOR
-            SELECT id
+            SELECT id, command
             FROM information_schema.processlist
             WHERE id <> CONNECTION_ID()
               AND host NOT LIKE '127.0.0.1:%'
@@ -68,7 +70,7 @@ steps:
           DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = true;
           OPEN victims;
           kill_loop: LOOP
-            FETCH victims INTO victim_id;
+            FETCH victims INTO victim_id, victim_command;
             IF done THEN
               LEAVE kill_loop;
             END IF;
@@ -76,8 +78,14 @@ steps:
             PREPARE kill_statement FROM @kill_sql;
             EXECUTE kill_statement;
             DEALLOCATE PREPARE kill_statement;
+            IF victim_command LIKE 'Binlog Dump%' THEN
+              SET dumps_killed = dumps_killed + 1;
+            END IF;
           END LOOP;
           CLOSE victims;
+          IF dumps_killed = 0 THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'no binlog dump from spiced to kill';
+          END IF;
         END //
         DELIMITER ;
         CALL kill_spiced_connections();
@@ -97,4 +105,4 @@ steps:
   - query: SELECT id, v FROM quiet
     eventually: 60s
   - assert-log:
-      contains: ['binlog connection lost; reconnecting']
+      contains: ['binlog connection lost; reconnecting.*the source no longer runs this binlog dump']

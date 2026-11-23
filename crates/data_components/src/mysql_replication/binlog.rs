@@ -137,7 +137,9 @@ fn dump_heartbeat_period(checkpoint_interval: Duration) -> Duration {
 /// proof: an event arrives only once it is complete, so a large event on a slow
 /// link is silent for as long as it takes to transfer.
 pub(super) fn dump_silence_limit(checkpoint_interval: Duration) -> Duration {
-    (dump_heartbeat_period(checkpoint_interval) * 3).max(Duration::from_secs(10))
+    dump_heartbeat_period(checkpoint_interval)
+        .saturating_mul(3)
+        .max(Duration::from_secs(10))
 }
 
 /// One statement issued on the dump connection before `COM_BINLOG_DUMP`.
@@ -244,7 +246,7 @@ pub(super) struct OpenedDump {
     pub stream: BinlogStream,
     /// The source's id for the dump's connection, which names the dump's
     /// thread in the source's process list.
-    pub thread_id: u32,
+    pub thread_id: u64,
 }
 
 /// `connection` is the shared source's `host:port` label, not a dataset: one dump
@@ -258,7 +260,11 @@ pub(super) async fn open_binlog_stream(
     gtid: &GtidSet,
 ) -> std::result::Result<OpenedDump, mysql_async::Error> {
     let mut conn = Conn::new(params.opts.clone()).await?;
-    let thread_id = conn.id();
+    // The handshake carries only 32 bits of the id, and MariaDB's are 64.
+    let thread_id =
+        mysql_async::prelude::Queryable::query_first::<u64, _>(&mut conn, "SELECT CONNECTION_ID()")
+            .await?
+            .unwrap_or_else(|| u64::from(conn.id()));
 
     let inherited_timeout = match inherited_net_write_timeout(&mut conn).await {
         Ok(Some(inherited)) => Some(inherited),

@@ -148,11 +148,14 @@ const IDLE_TICK_CAP: Duration = Duration::from_secs(1);
 /// raised `net_write_timeout` keeps the source from dropping the connection.
 const MEMBER_SEND_STALL_WARN: Duration = Duration::from_secs(5);
 
-/// Upper bound on one exchange over the side connection. It runs on the pump,
-/// so a side connection hung on an unreachable source must not hold the pump
-/// past the point where it would check a silent dump (see
+/// Upper bound on the source head poll, which runs on the pump: a side
+/// connection hung on an unreachable source must not hold the pump for good,
+/// while a source slow to answer under load must still be polled.
+const HEAD_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upper bound on asking the source whether a silent dump still runs (see
 /// [`super::binlog::dump_silence_limit`]).
-const SIDE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const DUMP_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `(database, table)` of a member's source table — the routing key.
 type MemberKey = (String, String);
@@ -1958,8 +1961,11 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                 }
                 Err(_idle) => {
                     if silent_since.elapsed() >= silence_limit {
-                        if dump_thread_gone(&source, &mut side_conn, &params, dump_thread_id).await
-                        {
+                        let gone = tokio::select! {
+                            gone = dump_thread_gone(&source, &mut side_conn, &params, dump_thread_id) => gone,
+                            () = crate::cdc::shutdown_signalled(shutdown_epoch) => continue 'recv,
+                        };
+                        if gone == Some(true) {
                             note_connection_lost(
                                 &source,
                                 &mut reconnect_attempts,
@@ -1972,13 +1978,20 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                             );
                             break 'recv;
                         }
-                        silent_since = Instant::now();
+                        // A source that could not be asked is asked again on
+                        // the next tick.
+                        if gone == Some(false) {
+                            silent_since = Instant::now();
+                        }
                     }
                     if last_persist_at.elapsed() >= params.checkpoint_interval {
                         persist_all(&source, &mut last_persisted).await;
                         last_persist_at = Instant::now();
                     }
-                    poll_head_and_heartbeat(&source, &mut side_conn, &params).await;
+                    tokio::select! {
+                        () = poll_head_and_heartbeat(&source, &mut side_conn, &params) => {}
+                        () = crate::cdc::shutdown_signalled(shutdown_epoch) => continue 'recv,
+                    }
                     last_heartbeat_at = Instant::now();
                     continue 'recv;
                 }
@@ -2348,7 +2361,10 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
             // publish head/lag metrics and fan a readiness heartbeat here too,
             // throttled to the idle-tick cadence.
             if last_heartbeat_at.elapsed() >= idle_tick {
-                poll_head_and_heartbeat(&source, &mut side_conn, &params).await;
+                tokio::select! {
+                    () = poll_head_and_heartbeat(&source, &mut side_conn, &params) => {}
+                    () = crate::cdc::shutdown_signalled(shutdown_epoch) => continue 'recv,
+                }
                 last_heartbeat_at = Instant::now();
             }
         } // 'recv
@@ -2969,13 +2985,14 @@ fn note_connection_lost(
 }
 
 /// Run `query` on the side connection, opening it if there is none, within
-/// [`SIDE_QUERY_TIMEOUT`]. On any failure the connection is dropped so the next
-/// call starts on a fresh one, and `None` is returned.
+/// `timeout`. On any failure the connection is dropped so the next call starts
+/// on a fresh one, and `None` is returned.
 async fn side_query<T, E: std::fmt::Display>(
     source: &SharedSource,
     side_conn: &mut Option<Conn>,
     params: &ReplicationParams,
     what: &str,
+    timeout: Duration,
     query: impl AsyncFnOnce(&mut Conn) -> std::result::Result<T, E>,
 ) -> Option<T> {
     let attempt = async {
@@ -2989,42 +3006,45 @@ async fn side_query<T, E: std::fmt::Display>(
         };
         query(conn).await.map_err(|e| e.to_string())
     };
-    let error = match tokio::time::timeout(SIDE_QUERY_TIMEOUT, attempt).await {
+    let error = match tokio::time::timeout(timeout, attempt).await {
         Ok(Ok(value)) => return Some(value),
         Ok(Err(e)) => e,
-        Err(_) => format!("no answer within {}s", SIDE_QUERY_TIMEOUT.as_secs()),
+        Err(_) => format!("no answer within {}s", timeout.as_secs()),
     };
     tracing::debug!(connection = %source.key.label(), error = %error, "shared {what} failed");
     *side_conn = None;
     None
 }
 
-/// Whether the source confirms the dump on connection `dump_thread_id` is no
-/// longer running. A dump the source still runs, or a source that cannot be
-/// asked, is not reported gone: reopening the dump could not succeed or help
-/// in either case.
+/// Whether the source no longer runs the dump on connection `dump_thread_id`,
+/// or `None` when the source could not be asked.
+///
+/// The thread must still be a binlog dump: after a source restart or failover
+/// the id can belong to an unrelated connection.
 async fn dump_thread_gone(
     source: &SharedSource,
     side_conn: &mut Option<Conn>,
     params: &ReplicationParams,
-    dump_thread_id: u32,
-) -> bool {
+    dump_thread_id: u64,
+) -> Option<bool> {
     // A user always sees their own threads, so no `PROCESS` grant is needed.
     let running = side_query(
         source,
         side_conn,
         params,
         "dump liveness query",
+        DUMP_LIVENESS_TIMEOUT,
         async |conn| {
             conn.exec_first::<u64, _, _>(
-                "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE ID = ?",
+                "SELECT COUNT(*) FROM information_schema.PROCESSLIST \
+                 WHERE ID = ? AND COMMAND LIKE 'Binlog Dump%'",
                 (dump_thread_id,),
             )
             .await
         },
     )
     .await;
-    matches!(running, Some(Some(0)))
+    running.map(|count| count == Some(0))
 }
 
 /// Poll the source head over a lazily-maintained side connection, publish the
@@ -3038,9 +3058,14 @@ async fn poll_head_and_heartbeat(
     let Some(resume) = source.ack.flush_position() else {
         return;
     };
-    let Some(head) = side_query(source, side_conn, params, "head poll", async |conn| {
-        super::setup::fetch_head_position(conn).await
-    })
+    let Some(head) = side_query(
+        source,
+        side_conn,
+        params,
+        "head poll",
+        HEAD_POLL_TIMEOUT,
+        async |conn| super::setup::fetch_head_position(conn).await,
+    )
     .await
     else {
         return;
@@ -3061,6 +3086,7 @@ async fn poll_head_and_heartbeat(
         side_conn,
         params,
         "source-clock query",
+        HEAD_POLL_TIMEOUT,
         async |conn| super::setup::fetch_source_now_ms(conn).await,
     )
     .await

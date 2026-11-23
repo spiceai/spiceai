@@ -109,8 +109,12 @@ async fn accept_connections(
     loop {
         tokio::select! {
             accepted = listener.accept() => {
+                // A client that gives up before it is accepted fails only its
+                // own accept; the pause keeps a persistent error (too many open
+                // files) from spinning.
                 let Ok((client, _)) = accepted else {
-                    return;
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
                 };
                 connections.spawn(Connection {
                     client,
