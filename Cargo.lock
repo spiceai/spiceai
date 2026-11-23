@@ -6399,6 +6399,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.4",
  "runtime-checkpoint-api",
+ "runtime-object-store",
  "runtime-rate-control",
  "runtime-request-context",
  "runtime-udfs-api",

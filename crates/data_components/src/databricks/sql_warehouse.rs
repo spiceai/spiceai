@@ -33,7 +33,9 @@ use datafusion_table_providers::sql::{
     sql_provider_datafusion::SqlTable,
 };
 use futures::{Stream, StreamExt, TryStreamExt, stream};
+use object_store_spawn::DestinationGuard;
 use reqwest::{Client, ClientBuilder};
+use runtime_object_store::ssrf::{self, RedirectHostResolver};
 use runtime_rate_control::RateController;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -304,6 +306,13 @@ pub enum Error {
 
     #[snafu(display("Failed to read Arrow data from Databricks SQL Warehouse: {source}"))]
     ArrowStreamReadFailed { source: arrow::error::ArrowError },
+
+    #[snafu(display(
+        "Failed to download query results from Databricks SQL Warehouse: refused to connect to {destination}: {CHUNK_DESTINATION_REFUSED}. \
+        If the warehouse's result storage is reachable only through a private endpoint, set {}=true",
+        ssrf::ALLOW_PRIVATE_HOSTS_ENV
+    ))]
+    ChunkDestinationRefused { destination: String },
 
     #[snafu(display(
         "Failed to read query results from Databricks SQL Warehouse ({source}), so the query cannot return rows. \
@@ -663,12 +672,83 @@ impl FromStr for ResponseStatus {
     }
 }
 
+/// Why a result chunk download is refused.
+const CHUNK_DESTINATION_REFUSED: &str = "Databricks SQL Warehouse result chunks are not downloaded from a private, loopback, or link-local address";
+
+/// Redirects a result chunk download follows before it fails; `reqwest`'s default limit.
+const CHUNK_MAX_REDIRECTS: usize = 10;
+
+/// Refuses result chunk downloads from internal destinations.
+///
+/// The warehouse's response names each chunk's URL, so the URL is checked before the download,
+/// as is every redirect target and every address a chunk or redirect host resolves to. A proxy
+/// host resolves unchecked.
+#[derive(Clone, Debug)]
+struct ChunkDestinationGuard {
+    hosts: RedirectHostResolver,
+}
+
+impl ChunkDestinationGuard {
+    fn new() -> Self {
+        Self {
+            hosts: RedirectHostResolver::new(DestinationGuard::new(
+                ssrf::is_internal_ip,
+                ssrf::redirect_target_is_internal,
+                CHUNK_DESTINATION_REFUSED,
+            )),
+        }
+    }
+
+    fn apply(&self, builder: ClientBuilder) -> ClientBuilder {
+        let hosts = self.hosts.clone();
+        builder
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                if attempt.previous().len() >= CHUNK_MAX_REDIRECTS {
+                    return attempt.error("too many redirects");
+                }
+                if ssrf::redirect_target_is_internal(attempt.url()) {
+                    let refused = format!(
+                        "Refused to connect to {}: {CHUNK_DESTINATION_REFUSED}",
+                        attempt.url().origin().ascii_serialization()
+                    );
+                    return attempt.error(refused);
+                }
+                if let Some(url::Host::Domain(host)) = attempt.url().host() {
+                    hosts.check_host(host);
+                }
+                attempt.follow()
+            }))
+            .dns_resolver(Arc::new(self.hosts.clone()))
+    }
+
+    /// Refuses `url` when its host is an internal IP literal or a well-known internal name, and
+    /// has the addresses its host resolves to checked when the download connects.
+    fn check(&self, url: &str) -> Result<(), Error> {
+        let Ok(parsed) = url::Url::parse(url) else {
+            // `reqwest` parses the URL the same way and fails the request.
+            return Ok(());
+        };
+        ensure!(
+            !ssrf::redirect_target_is_internal(&parsed),
+            ChunkDestinationRefusedSnafu {
+                destination: parsed.origin().ascii_serialization(),
+            }
+        );
+        if let Some(url::Host::Domain(host)) = parsed.host() {
+            self.hosts.check_host(host);
+        }
+        Ok(())
+    }
+}
+
 struct SqlWarehouseApi {
     /// For the statement and metadata API, whose JSON bodies are read through
     /// `read_json`.
     client: Client,
     /// For result chunks, which are bulk data and decompress transparently.
     chunk_client: Client,
+    /// `None` when [`ssrf::ALLOW_PRIVATE_HOSTS_ENV`] lets chunks come from internal addresses.
+    chunk_destinations: Option<ChunkDestinationGuard>,
     base_url: String,
     request_semaphore: Arc<Semaphore>,
     http_max_retries: usize,
@@ -703,11 +783,18 @@ impl SqlWarehouseApi {
         let client = http_body_limit::decode_manually(builder())
             .build()
             .context(ClientBuildFailedSnafu)?;
-        let chunk_client = builder().build().context(ClientBuildFailedSnafu)?;
+        let chunk_destinations = (!ssrf::allow_private_hosts()).then(ChunkDestinationGuard::new);
+        let chunk_client = match &chunk_destinations {
+            Some(guard) => guard.apply(builder()),
+            None => builder(),
+        }
+        .build()
+        .context(ClientBuildFailedSnafu)?;
 
         Ok(Self {
             client,
             chunk_client,
+            chunk_destinations,
             base_url: format!("https://{host}"),
             request_semaphore,
             http_max_retries: config.http_max_retries,
@@ -1308,6 +1395,9 @@ impl SqlWarehouseApi {
 
     async fn fetch_chunk_data(&self, url: &str) -> Result<bytes::Bytes, Error> {
         self.check_permanently_disabled()?;
+        if let Some(guard) = &self.chunk_destinations {
+            guard.check(url)?;
+        }
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let rate_controller_permit = self.acquire_rate_controller_permit().await?;
         let result = send_request_with_retry_and_concurrency_limit(
@@ -2991,6 +3081,7 @@ mod tests {
         let client = ClientBuilder::new().build().expect("should build client");
         SqlWarehouseApi {
             chunk_client: client.clone(),
+            chunk_destinations: None,
             client,
             base_url: format!("http://127.0.0.1:{port}"),
             request_semaphore: Arc::new(Semaphore::new(max_in_flight_requests)),
@@ -5283,6 +5374,7 @@ mod tests {
         let api_a = Arc::new(SqlWarehouseApi {
             client: client.clone(),
             chunk_client: client.clone(),
+            chunk_destinations: None,
             base_url: format!("http://127.0.0.1:{port}"),
             request_semaphore: Arc::clone(&shared_semaphore),
             http_max_retries: SQL_WAREHOUSE_DEFAULT_HTTP_MAX_RETRIES,
@@ -5296,6 +5388,7 @@ mod tests {
         });
         let api_b = Arc::new(SqlWarehouseApi {
             chunk_client: client.clone(),
+            chunk_destinations: None,
             client,
             base_url: format!("http://127.0.0.1:{port}"),
             request_semaphore: Arc::clone(&shared_semaphore),
@@ -5475,6 +5568,257 @@ mod tests {
         assert!(
             !is_access_denied_error(&err),
             "HTTP 403 in a QueryFailure should not be treated as SQL access denied"
+        );
+    }
+
+    /// Serves `body` as a result chunk to every request, counting the requests.
+    async fn start_chunk_server(body: Vec<u8>) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind to a port");
+        let port = listener
+            .local_addr()
+            .expect("should have an address")
+            .port();
+        let body = Arc::new(body);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_server = Arc::clone(&requests);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let body = Arc::clone(&body);
+                let requests = Arc::clone(&requests_for_server);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apache.arrow.stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        (port, requests)
+    }
+
+    /// A statement result whose only chunk is at `external_link`.
+    fn external_link_result(external_link: &str) -> Value {
+        json!({
+            "external_links": [{
+                "chunk_index": 0,
+                "external_link": external_link,
+                "next_chunk_internal_link": null,
+            }]
+        })
+    }
+
+    /// A test API whose result chunk downloads are guarded as in production.
+    fn create_guarded_test_api(port: u16) -> SqlWarehouseApi {
+        let guard = ChunkDestinationGuard::new();
+        SqlWarehouseApi {
+            chunk_client: guard
+                .apply(ClientBuilder::new())
+                .build()
+                .expect("should build client"),
+            chunk_destinations: Some(guard),
+            ..create_test_api(port)
+        }
+    }
+
+    fn id_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3])) as arrow::array::ArrayRef],
+        )
+        .expect("batch")
+    }
+
+    /// A result chunk link on a private, loopback, or link-local host is refused before any
+    /// request is sent, so a response naming an internal service cannot have its body read
+    /// back as rows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_result_chunk_link_to_an_internal_host_is_refused_without_a_request() {
+        let (canary, canary_requests) =
+            start_chunk_server(arrow_stream_bytes(&id_batch()).to_vec()).await;
+        let api = Arc::new(create_guarded_test_api(0));
+
+        for (link, destination) in [
+            (
+                format!("http://127.0.0.1:{canary}/canary.arrow"),
+                format!("http://127.0.0.1:{canary}"),
+            ),
+            (
+                format!("http://localhost:{canary}/canary.arrow"),
+                format!("http://localhost:{canary}"),
+            ),
+            (
+                format!("http://[::ffff:127.0.0.1]:{canary}/canary.arrow"),
+                format!("http://[::ffff:7f00:1]:{canary}"),
+            ),
+            (
+                "http://169.254.169.254/latest/meta-data/".to_string(),
+                "http://169.254.169.254".to_string(),
+            ),
+        ] {
+            let Err(err) = Arc::clone(&api)
+                .fetch_external_links(external_link_result(&link), None)
+                .await
+            else {
+                panic!("the chunk at {link} must be refused");
+            };
+            assert!(
+                matches!(&err, Error::ChunkDestinationRefused { destination: refused } if *refused == destination),
+                "unexpected error for {link}: {err}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "Failed to download query results from Databricks SQL Warehouse: refused to connect to {destination}: \
+                     Databricks SQL Warehouse result chunks are not downloaded from a private, loopback, or link-local address. \
+                     If the warehouse's result storage is reachable only through a private endpoint, set SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true"
+                )
+            );
+        }
+        assert_eq!(
+            canary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the internal host must receive no request"
+        );
+    }
+
+    /// A chunk download that redirects to an internal address is refused at the redirect.
+    /// The redirecting server stands in for a public storage host, so the link itself is not
+    /// checked here; only the chunk client's redirect policy is in force.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_result_chunk_redirect_to_an_internal_host_is_refused() {
+        let (canary, canary_requests) =
+            start_chunk_server(arrow_stream_bytes(&id_batch()).to_vec()).await;
+
+        for target in [
+            format!("http://127.0.0.1:{canary}/canary.arrow"),
+            format!("http://localhost:{canary}/canary.arrow"),
+        ] {
+            let redirect = MockHttpResponse {
+                status_line: "302 Found",
+                headers: vec![("Location".to_string(), target.clone())],
+                body: String::new(),
+            };
+            let (origin, origin_requests) =
+                start_mock_http_server(vec![], redirect.clone()).await;
+            let api = Arc::new(SqlWarehouseApi {
+                chunk_destinations: None,
+                ..create_guarded_test_api(0)
+            });
+
+            let Err(err) = api
+                .fetch_external_links(
+                    external_link_result(&format!("http://127.0.0.1:{origin}/chunk.arrow")),
+                    None,
+                )
+                .await
+            else {
+                panic!("the redirect to {target} must be refused");
+            };
+            let refused = format!(
+                "Refused to connect to {}: Databricks SQL Warehouse result chunks are not downloaded from a private, loopback, or link-local address",
+                url::Url::parse(&target)
+                    .expect("valid URL")
+                    .origin()
+                    .ascii_serialization()
+            );
+            assert!(
+                matches!(err, Error::HttpRequestFailed { .. }) && err.to_string().contains(&refused),
+                "unexpected error for the redirect to {target}: {err}"
+            );
+            assert_eq!(
+                origin_requests.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the link itself is requested once"
+            );
+        }
+        assert_eq!(
+            canary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the internal host must receive no request"
+        );
+    }
+
+    /// A result chunk is decoded into the rows it holds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_result_chunk_from_an_external_link_is_decoded() {
+        let batch = id_batch();
+        let (chunk, chunk_requests) = start_chunk_server(arrow_stream_bytes(&batch).to_vec()).await;
+        let api = Arc::new(create_test_api(0));
+
+        let batches: Vec<RecordBatch> = api
+            .fetch_external_links(
+                external_link_result(&format!("http://127.0.0.1:{chunk}/chunk.arrow")),
+                None,
+            )
+            .await
+            .expect("the chunk downloads")
+            .try_collect()
+            .await
+            .expect("the chunk decodes");
+
+        assert_eq!(batches, vec![batch]);
+        assert_eq!(chunk_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A result chunk whose record batch message declares a petabyte body fails the query
+    /// instead of aborting the process on the allocation the decode would make for it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_result_chunk_declaring_a_body_longer_than_the_chunk_fails_the_query() {
+        let mut bytes = arrow_stream_bytes(&id_batch()).to_vec();
+        let framed_len = |bytes: &[u8], at: usize| {
+            usize::try_from(u32::from_le_bytes(
+                bytes[at + 4..at + 8].try_into().expect("length"),
+            ))
+            .expect("length fits")
+        };
+        // The schema message has no body, so the record batch message follows its metadata.
+        let batch_at = 8 + framed_len(&bytes, 0);
+        let metadata_at = batch_at + 8;
+        let metadata_end = metadata_at + framed_len(&bytes, batch_at);
+        let message =
+            arrow::ipc::root_as_message(&bytes[metadata_at..metadata_end]).expect("a message");
+        let slot = message
+            ._tab
+            .vtable()
+            .get(arrow::ipc::Message::VT_BODYLENGTH);
+        assert_ne!(slot, 0, "the writer stores a non-zero body length");
+        let body_len_at = metadata_at + message._tab.loc() + usize::from(slot);
+        let following = bytes.len() - metadata_end;
+        bytes[body_len_at..body_len_at + 8].copy_from_slice(&(1_i64 << 50).to_le_bytes());
+
+        let (chunk, _) = start_chunk_server(bytes).await;
+        let api = Arc::new(create_test_api(0));
+        let Err(err) = api
+            .fetch_external_links(
+                external_link_result(&format!("http://127.0.0.1:{chunk}/chunk.arrow")),
+                None,
+            )
+            .await
+        else {
+            panic!("the chunk must not decode");
+        };
+
+        assert!(
+            matches!(err, Error::ArrowStreamReadFailed { .. }),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Failed to read Arrow data from Databricks SQL Warehouse: Ipc error: an Arrow IPC message \
+                 declares a 1125899906842624 byte body, but only {following} bytes follow"
+            )
         );
     }
 }
