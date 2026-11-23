@@ -1801,6 +1801,77 @@ async fn reupsert_after_overwrite_delete_is_visible_impl(f: TestFixture) -> Test
 }
 test_on_data_store!(reupsert_after_overwrite_delete_is_visible_impl);
 
+// --- Focused regression: a re-upsert survives a bake, a merge and a reopen ---
+//
+// A key is deleted and upserted again, so two key deletion vectors name it: the
+// delete, and the upsert's supersede carrying the re-insert sequence. The
+// seq-prefix bake folds both into its output and prunes them from the in-memory
+// index, but they stay durable until the orphaned-vector sweep reclaims them. The
+// protected-snapshot merge that follows runs with an empty index, and must still
+// tag its output above those vectors: reopening the table reloads them, and a
+// protected snapshot applies every deletion above its tag to its rows, re-insert
+// or not. The concurrent walks reach this only by timing; here each maintenance
+// pass runs at a fixed point.
+async fn reupsert_survives_bake_merge_and_reopen_impl(f: TestFixture) -> TestResult<()> {
+    async fn upsert_and_settle(
+        table: &Arc<CayenneTableProvider>,
+        row: (i64, i64),
+    ) -> TestResult<()> {
+        upsert(table, &[row], Durability::File).await?;
+        table.flush_pending_maintenance().await?;
+        table.drain_in_flight_maintenance().await?;
+        Ok(())
+    }
+
+    let name = "reupsert_bake_merge_reopen";
+    let (table, ctx) = create_table(&f, name, Mode::Key, Durability::File, None, false).await?;
+    let table_id = table.metadata().table_id.clone();
+
+    upsert_and_settle(&table, (1, 100)).await?;
+    delete_key(&table, 1, Durability::File).await?;
+    upsert_and_settle(&table, (1, 200)).await?;
+    for key in 2..6 {
+        upsert_and_settle(&table, (key, key * 10)).await?;
+    }
+    assert!(
+        table.bake_seq_prefix_protected_snapshots().await?,
+        "the seq-prefix bake must commit"
+    );
+    assert_eq!(
+        table.deletion_index_len(),
+        0,
+        "the bake must prune both deletion vectors naming key 1 from the in-memory index"
+    );
+    // The eighth protected snapshot triggers the size-tier merge.
+    for key in 6..10 {
+        upsert_and_settle(&table, (key, key * 10)).await?;
+    }
+    assert_eq!(
+        f.catalog.get_all_snapshot_sequences(&table_id).await?.len(),
+        1,
+        "the size-tier merge must fold every protected snapshot into one"
+    );
+    assert_eq!(
+        f.catalog.get_table_delete_files(&table_id).await?.len(),
+        2,
+        "both deletion vectors naming key 1 must still be durable, for the reopen to reload"
+    );
+
+    let model: Model = (1..10)
+        .map(|key| (key, if key == 1 { 200 } else { key * 10 }))
+        .collect();
+    assert_converged(&read_rows(&ctx, name).await?, &model, "before reopen");
+    let (reopened, reopened_ctx) = reopen_table(&f, name).await?;
+    assert_converged(
+        &read_rows(&reopened_ctx, name).await?,
+        &model,
+        "after reopen",
+    );
+    reopened.drain_in_flight_maintenance().await?;
+    Ok(())
+}
+test_on_data_store!(reupsert_survives_bake_merge_and_reopen_impl);
+
 // --- Concurrent pure-upsert convergence (GREEN control: loss needs deletes) ---
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_upsert_only_key() -> TestResult<()> {

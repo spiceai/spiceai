@@ -3053,6 +3053,9 @@ pub struct CayenneTableProvider {
     /// `ArcSwap`: scan paths take `Arc::clone` instead of cloning the
     /// `HashMap`; writes use `rcu` to publish a copy-on-write update.
     protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
+    /// Highest delete sequence a prune has dropped from the in-memory deletion
+    /// index, or 0. See [`Self::protected_merge_delete_fence`].
+    pruned_delete_sequence: Arc<AtomicI64>,
     /// Table-scoped warning dedupe for protected snapshot ids that cannot
     /// provide a `UUIDv7` timestamp for age-triggered maintenance.
     protected_snapshot_age_warning_keys: Arc<ParkingMutex<BoundedFifoSet>>,
@@ -12456,6 +12459,7 @@ impl CayenneTableProvider {
                 object_store_registered_runtime_envs,
             )),
             protected_snapshots: Arc::new(ArcSwap::from_pointee(protected_snapshots)),
+            pruned_delete_sequence: Arc::new(AtomicI64::new(0)),
             protected_snapshot_age_warning_keys: Arc::new(ParkingMutex::new(
                 BoundedFifoSet::with_capacity(PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT),
             )),
@@ -14979,6 +14983,7 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_rewrite_post_capture_hook: Arc::clone(&self.test_rewrite_post_capture_hook),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
+            pruned_delete_sequence: Arc::clone(&self.pruned_delete_sequence),
             protected_snapshot_age_warning_keys: Arc::clone(
                 &self.protected_snapshot_age_warning_keys,
             ),
@@ -31365,7 +31370,7 @@ impl CayenneTableProvider {
             // the eligibility filter below.
             let (fence_max_delete_seq, pending_floor) = self
                 .protected_snapshot_merge_fence_and_floor(
-                    deletion_snapshot.max_sequence_number().unwrap_or(0),
+                    self.protected_merge_delete_fence(&deletion_snapshot),
                 );
 
             // While a pending mem-tier delete exists, fold only inputs with
@@ -32317,7 +32322,7 @@ impl CayenneTableProvider {
             // floor also gates the prefix eligibility stop below.
             let (fence_max_delete_seq, pending_floor) = self
                 .protected_snapshot_merge_fence_and_floor(
-                    deletion_snapshot.max_sequence_number().unwrap_or(0),
+                    self.protected_merge_delete_fence(&deletion_snapshot),
                 );
             (
                 ids,
@@ -32738,11 +32743,11 @@ impl CayenneTableProvider {
             });
         }
         if clean_prefix_holds {
-            // Capped at the delete fence: every tombstone at or below it was in the
-            // index the merge applied, so it hides no row of the merged output, while
-            // one published after the capture with a sequence between the fence and
-            // the prefix cutoff may still hide one (the output applies deletions
-            // above the fence).
+            // Capped at the delete fence: every tombstone at or below it was applied,
+            // by this merge or by an earlier prune, so it hides no row of the merged
+            // output, while one published after the capture with a sequence between
+            // the fence and the prefix cutoff may still hide one (the output applies
+            // deletions above the fence).
             let off_fence_cutoff = prune_cutoff.min(fence_max_delete_seq);
             // A writer recording a tombstone meanwhile only shrinks the difference,
             // which overstates the yield: the error is toward baking as before.
@@ -34098,6 +34103,33 @@ impl CayenneTableProvider {
             .min()
     }
 
+    /// The delete sequence a protected-snapshot merge tags its output with: the
+    /// newest tombstone in `deletion_snapshot`, and never below the newest one a
+    /// prune has dropped from the index.
+    ///
+    /// A scan applies to a protected snapshot only the deletions above its tag,
+    /// and ignores re-inserts there. The seq-prefix bake drops tombstones from the
+    /// index while their deletion vectors stay in the catalog until the
+    /// orphaned-vector sweep reclaims them. A tag below those vectors lets a
+    /// reopen reload them and hide the merged rows written after them, including
+    /// a key upserted again after its delete.
+    fn protected_merge_delete_fence(&self, deletion_snapshot: &PkDeletionSnapshot) -> i64 {
+        deletion_snapshot
+            .max_sequence_number()
+            .unwrap_or(0)
+            .max(self.pruned_delete_sequence.load(Ordering::Acquire))
+    }
+
+    /// Record that the tombstones at or below `cutoff` are leaving the in-memory
+    /// deletion index. Raising it before the prune publishes is safe: until then
+    /// those tombstones are still in the index, so a merge applies them.
+    fn record_pruned_deletes(&self, cutoff: i64) {
+        if let Some(newest) = self.deletion_index_max_sequence() {
+            self.pruned_delete_sequence
+                .fetch_max(cutoff.min(newest), Ordering::AcqRel);
+        }
+    }
+
     /// The deletion fence to tag a freshly-merged protected snapshot with — the
     /// just-loaded durable deletion-index max, CAPPED strictly below the smallest
     /// still-pending mem-tier delete — plus that pending floor itself, so ONE
@@ -34445,6 +34477,7 @@ impl CayenneTableProvider {
         merged_snapshot_id: &str,
         input_ids: &[String],
     ) -> Result<()> {
+        self.record_pruned_deletes(cutoff);
         let bake = BakeOutput {
             snapshot_at_capture,
             merged_snapshot_id,
@@ -34722,6 +34755,7 @@ impl CayenneTableProvider {
     /// public surface.
     #[doc(hidden)]
     pub fn prune_deletion_index_at_or_below(&self, cutoff: i64) {
+        self.record_pruned_deletes(cutoff);
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk {
                 deletion_snapshot, ..
