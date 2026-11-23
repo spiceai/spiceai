@@ -1393,24 +1393,30 @@ pub(crate) async fn cleanup_uncommitted_delete_paths(
 /// Remove the files of deletion-vector rows that a committed catalog change
 /// dropped: rows a newer vector for the same data file superseded, or rows a
 /// rewrite cleared after folding their deletes into its output. No row names
-/// these files once that change commits, so nothing else would ever remove them.
+/// these files once that change commits.
 ///
-/// Runs in the background. It first takes `file_deletion_fence` exclusively,
-/// which an acceleration-snapshot archive holds shared while it copies the
-/// table's files, and a caller holding the table's write lock must not wait for
-/// that. Object-store keys (`path_is_relative`) are left in place, as the
-/// orphaned-vector sweep leaves them.
+/// A dataset in the object-native location keeps them: the commit that dropped
+/// their rows retired them, and the retirement sweep deletes them once the
+/// retention has passed, so a query planned against the state before that
+/// commit still reads them. Anywhere else nothing would ever remove them.
+///
+/// Otherwise it runs in the background. It first takes `file_deletion_fence`
+/// exclusively, which an acceleration-snapshot archive holds shared while it
+/// copies the table's files, and a caller holding the table's write lock must
+/// not wait for that. Rows with a relative path (`path_is_relative`) are
+/// left in place, as the orphaned-vector sweep leaves them.
 pub(crate) fn remove_dropped_deletion_vector_files(
     files: Vec<DeleteFile>,
     file_deletion_fence: Arc<tokio::sync::RwLock<()>>,
     storage: Option<Arc<DatasetStorage>>,
 ) {
-    // No commit names these files any more: the orphan sweep takes any of them
-    // left in the store.
     release_deletion_files(
         storage.as_deref(),
         files.iter().map(|file| Path::new(file.path.as_str())),
     );
+    if storage.as_deref().is_some_and(DatasetStorage::in_location) {
+        return;
+    }
     let paths: Vec<PathBuf> = files
         .into_iter()
         .filter(|file| !file.path_is_relative)

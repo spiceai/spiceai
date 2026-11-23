@@ -7520,8 +7520,10 @@ impl CayenneTableProvider {
     /// Atomically commit a snapshot rewrite to the catalog, clearing exactly the
     /// state the rewrite materialized (see [`RewriteScope`]).
     ///
-    /// The commit also removes the files of the delete-file rows it clears, once
-    /// it succeeds: no row names them afterwards, and nothing else would. A scope
+    /// Once the commit succeeds, the files of the delete-file rows it clears go
+    /// through [`super::delete::remove_dropped_deletion_vector_files`]: no row
+    /// names them afterwards. A dataset in the object-native location keeps them
+    /// for the retirement sweep, which deletes them after the retention. A scope
     /// that clears every row excludes writers, so the rows read before the commit
     /// are the rows it clears. A fenced scope clears the rows at or below its
     /// cutoff, and no write straddles that cutoff (see
@@ -23599,8 +23601,10 @@ impl CayenneTableProvider {
     /// acquires it blockingly, and it is not reentrant.
     ///
     // Subset rewrite (P1 write-amp): when the picker selects a proper subset of
-    // current-snapshot files, re-encode ONLY those and hard-link (local) /
-    // `CopyObject` (S3) the un-picked settled files into the new dir — see
+    // current-snapshot files, re-encode ONLY those and carry the un-picked
+    // settled files into the new snapshot: by naming them in place when the
+    // data is in the object-native location, otherwise by hard link (local) or
+    // `CopyObject` (S3) into the new dir — see
     // [`Self::rewrite_current_snapshot_small_file_subset`]. Falls back to full
     // rewrite when position deletes, protected snapshots to fold, or the
     // candidate covers every current file (no amp to save).
@@ -24130,8 +24134,9 @@ impl CayenneTableProvider {
         )
     }
 
-    /// Re-encode only the picker's small-file subset and hard-link/copy the
-    /// remaining settled current-snapshot files into a fresh snapshot, then
+    /// Re-encode only the picker's small-file subset and carry the remaining
+    /// settled current-snapshot files into a fresh snapshot (named in place in
+    /// the object-native location, hard-linked or copied otherwise), then
     /// flip the current pointer. Leaves deletion indexes intact (unpicked files
     /// may still need merge-on-read filtering).
     ///

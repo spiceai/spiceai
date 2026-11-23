@@ -2618,7 +2618,10 @@ async fn deletion_vector_objects(bucket: &InMemory, prefix: &str) -> usize {
 /// deletion vector, and the updates hit the same keys again and again, so the
 /// deletion index stays as small as the table and its own triggers never fire; one
 /// vector a commit would pile up unless the vectors themselves bring on the rewrite
-/// that applies them, and that rewrite deletes their objects.
+/// that applies them. That rewrite retires them, and the retirement sweep deletes
+/// their objects once the retention has passed; each cycle ends the retention of
+/// what is retired so far, so the objects counted are the live vectors and those
+/// retired within the cycle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deletion_vectors_stay_bounded_under_a_steady_change_stream() {
     const KEYS: i64 = 4_000;
@@ -2687,6 +2690,10 @@ async fn deletion_vectors_stay_bounded_under_a_steady_change_stream() {
         }
         table.checkpoint_mem_tier().await.expect("checkpoint");
         tokio::time::sleep(Duration::from_millis(20)).await;
+        // The first sweep observes what is retired so far, the second deletes it.
+        table.sweep_retired_files_now().await;
+        table.elapse_data_file_retention();
+        table.sweep_retired_files_now().await;
         samples.push(deletion_vector_objects(&setup.bucket, &setup.data_prefix).await);
     }
     table.drain_in_flight_maintenance().await.expect("drain");
