@@ -57895,6 +57895,334 @@ mod tests {
         assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3, 4, 5]);
     }
 
+    /// Rows the source deleted while the process was down must not come back
+    /// after the restart rebuilds the table from the source (#16625).
+    ///
+    /// Before the kill, an UPDATE of keys `id % 5 == 0` is applied and then made
+    /// durable by `how` (a seal or a checkpoint), which advances the slot past it.
+    /// While the process is down the source deletes `id % 11 == 0`. The restart
+    /// rebuilds the table from the source (an overwrite of the surviving rows) and
+    /// the slot replays the delete. The keys both the UPDATE and the DELETE touch
+    /// (`id % 55 == 0`) must stay gone.
+    async fn rebuild_after_kill_keeps_source_deletes(table: &'static str, seal: bool) {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_sharded_cdc_upsert_table(table, Arc::clone(&runtime_env), 1).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let all: Vec<i64> = (0..20_000).collect();
+        let ids_values = |ids: &[i64], tag: i64| -> RecordBatch {
+            let values: Vec<i64> = ids.iter().map(|id| id * 10 + tag).collect();
+            id_value_batch(Arc::clone(&schema), ids, &values)
+        };
+
+        // Baseline, then the UPDATE, as the process applied them before the kill.
+        let base = ids_values(&all, 0);
+        overwrite_with(&ctx, &provider, base).await;
+        let updated: Vec<i64> = all.iter().copied().filter(|id| id % 5 == 0).collect();
+        apply_upsert_burst(
+            &ctx,
+            &provider,
+            Arc::clone(&schema),
+            &updated.iter().map(|id| (*id, id * 10 + 1)).collect::<Vec<_>>(),
+        )
+        .await;
+        if seal {
+            provider.seal_mem_tier_durable().await.expect("seal");
+        } else {
+            provider.checkpoint_mem_tier().await.expect("checkpoint");
+        }
+
+        // Kill, restart.
+        drop(provider);
+        let provider =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open(table)
+                .await
+                .expect("restart");
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        // The source deleted `id % 11 == 0` while the process was down. The rebuild
+        // reads that state; the replay then delivers the delete.
+        let surviving: Vec<i64> = all.iter().copied().filter(|id| id % 11 != 0).collect();
+        overwrite_with(&ctx, &provider, ids_values(&surviving, 1)).await;
+        let deleted: Vec<i64> = all.iter().copied().filter(|id| id % 11 == 0).collect();
+        provider
+            .write_cdc_delete_keys_in_memory(&int64_id_batch(&deleted))
+            .await
+            .expect("replayed delete");
+
+        let got: Vec<i64> = collect_id_value_pairs(&ctx, &provider, table)
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            got, surviving,
+            "rows deleted at the source while the process was down must stay gone"
+        );
+    }
+
+    async fn overwrite_with(
+        ctx: &SessionContext,
+        provider: &CayenneTableProvider,
+        batch: RecordBatch,
+    ) {
+        let plan = provider
+            .insert_into(
+                &ctx.state(),
+                MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], batch.schema(), None)
+                    .expect("overwrite source"),
+                InsertOp::Overwrite,
+            )
+            .await
+            .expect("overwrite plan");
+        collect(plan, ctx.task_ctx())
+            .await
+            .expect("overwrite completes");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue_16625_rebuild_after_seal_keeps_source_deletes() {
+        rebuild_after_kill_keeps_source_deletes("i16625_seal", true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue_16625_rebuild_after_checkpoint_keeps_source_deletes() {
+        rebuild_after_kill_keeps_source_deletes("i16625_ckpt", false).await;
+    }
+
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue_16625_rebuild_after_kill_inside_checkpoint_keeps_source_deletes() {
+        let table: &'static str = "i16625_inflight";
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_sharded_cdc_upsert_table(table, Arc::clone(&runtime_env), 1).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let all: Vec<i64> = (0..20_000).collect();
+        let ids_values = |ids: &[i64], tag: i64| -> RecordBatch {
+            let values: Vec<i64> = ids.iter().map(|id| id * 10 + tag).collect();
+            id_value_batch(Arc::clone(&schema), ids, &values)
+        };
+        overwrite_with(&ctx, &provider, ids_values(&all, 0)).await;
+        let updated: Vec<i64> = all.iter().copied().filter(|id| id % 5 == 0).collect();
+        apply_upsert_burst(
+            &ctx,
+            &provider,
+            Arc::clone(&schema),
+            &updated.iter().map(|id| (*id, id * 10 + 1)).collect::<Vec<_>>(),
+        )
+        .await;
+
+        let seen: Arc<ParkingMutex<Option<Vec<i64>>>> = Arc::default();
+        {
+            let catalog = Arc::clone(&catalog);
+            let runtime_env = Arc::clone(&runtime_env);
+            let seen = Arc::clone(&seen);
+            let all = all.clone();
+            let schema = Arc::clone(&schema);
+            *provider.test_pre_checkpoint_deletion_publish_hook.lock() = Some(Box::new(move || {
+                let catalog = Arc::clone(&catalog);
+                let runtime_env = Arc::clone(&runtime_env);
+                let seen = Arc::clone(&seen);
+                let all = all.clone();
+                let schema = Arc::clone(&schema);
+                Box::pin(async move {
+                    let ctx = SessionContext::new();
+                    let restarted = CayenneTableProviderBuilder::new(catalog, runtime_env)
+                        .open(table)
+                        .await
+                        .expect("restart inside the checkpoint");
+                    restarted.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+                    let surviving: Vec<i64> =
+                        all.iter().copied().filter(|id| id % 11 != 0).collect();
+                    let values: Vec<i64> = surviving.iter().map(|id| id * 10 + 1).collect();
+                    overwrite_with(
+                        &ctx,
+                        &restarted,
+                        id_value_batch(Arc::clone(&schema), &surviving, &values),
+                    )
+                    .await;
+                    let deleted: Vec<i64> = all.iter().copied().filter(|id| id % 11 == 0).collect();
+                    restarted
+                        .write_cdc_delete_keys_in_memory(&int64_id_batch(&deleted))
+                        .await
+                        .expect("replayed delete");
+                    let got: Vec<i64> = collect_id_value_pairs(&ctx, &restarted, table)
+                        .await
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect();
+                    *seen.lock() = Some(got);
+                })
+            }));
+        }
+        provider.checkpoint_mem_tier().await.expect("checkpoint");
+        let surviving: Vec<i64> = all.iter().copied().filter(|id| id % 11 != 0).collect();
+        assert_eq!(
+            seen.lock().take(),
+            Some(surviving),
+            "rows deleted at the source while the process was down must stay gone"
+        );
+    }
+
+
+    /// Kill (reopen on the same directory) at a mem-tier checkpoint step, then
+    /// rebuild from the post-DELETE source, replay the DELETE and scan (#16625).
+    async fn kill_at_step_rebuild_keeps_source_deletes(table: &'static str, step: &'static str) {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_sharded_cdc_upsert_table(table, Arc::clone(&runtime_env), 1).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let all: Vec<i64> = (0..20_000).collect();
+        let ids_values = |ids: &[i64], tag: i64| -> RecordBatch {
+            let values: Vec<i64> = ids.iter().map(|id| id * 10 + tag).collect();
+            id_value_batch(Arc::clone(&schema), ids, &values)
+        };
+        overwrite_with(&ctx, &provider, ids_values(&all, 0)).await;
+        let updated: Vec<i64> = all.iter().copied().filter(|id| id % 5 == 0).collect();
+        apply_upsert_burst(
+            &ctx,
+            &provider,
+            Arc::clone(&schema),
+            &updated.iter().map(|id| (*id, id * 10 + 1)).collect::<Vec<_>>(),
+        )
+        .await;
+
+        let seen: Arc<ParkingMutex<Vec<(&'static str, Vec<i64>)>>> = Arc::default();
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let catalog = Arc::clone(&catalog);
+            let runtime_env = Arc::clone(&runtime_env);
+            let seen = Arc::clone(&seen);
+            let all = all.clone();
+            let schema = Arc::clone(&schema);
+            *provider.test_mem_tier_step_hook.lock() = Some(Arc::new(move |name| {
+                let catalog = Arc::clone(&catalog);
+                let runtime_env = Arc::clone(&runtime_env);
+                let seen = Arc::clone(&seen);
+                let all = all.clone();
+                let schema = Arc::clone(&schema);
+                let fired = Arc::clone(&fired);
+                Box::pin(async move {
+                    if name != step || fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    let ctx = SessionContext::new();
+                    let restarted = CayenneTableProviderBuilder::new(catalog, runtime_env)
+                        .open(table)
+                        .await
+                        .expect("restart");
+                    restarted.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+                    let ids = |v: Vec<(i64, i64)>| v.into_iter().map(|(id, _)| id).collect();
+                    seen.lock().push((
+                        "after_open",
+                        ids(collect_id_value_pairs(&ctx, &restarted, table).await),
+                    ));
+                    let surviving: Vec<i64> =
+                        all.iter().copied().filter(|id| id % 11 != 0).collect();
+                    let values: Vec<i64> = surviving.iter().map(|id| id * 10 + 1).collect();
+                    overwrite_with(
+                        &ctx,
+                        &restarted,
+                        id_value_batch(Arc::clone(&schema), &surviving, &values),
+                    )
+                    .await;
+                    seen.lock().push((
+                        "after_overwrite",
+                        ids(collect_id_value_pairs(&ctx, &restarted, table).await),
+                    ));
+                    let deleted: Vec<i64> = all.iter().copied().filter(|id| id % 11 == 0).collect();
+                    restarted
+                        .write_cdc_delete_keys_in_memory(&int64_id_batch(&deleted))
+                        .await
+                        .expect("replayed delete");
+                    seen.lock().push((
+                        "after_delete",
+                        ids(collect_id_value_pairs(&ctx, &restarted, table).await),
+                    ));
+                    // Lazy recovery: a later scan, after the work above, must agree.
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    seen.lock().push((
+                        "later",
+                        ids(collect_id_value_pairs(&ctx, &restarted, table).await),
+                    ));
+                })
+            }));
+        }
+        let _ = provider.checkpoint_mem_tier().await;
+        let surviving: Vec<i64> = all.iter().copied().filter(|id| id % 11 != 0).collect();
+        let seen = seen.lock().clone();
+        assert!(!seen.is_empty(), "step {step} never fired");
+        for (phase, got) in &seen {
+            eprintln!("PROBE16625 step={step} phase={phase} rows={}", got.len());
+        }
+        let (phase, got) = seen.last().expect("phases");
+        assert_eq!(got, &surviving, "step {step} phase {phase}: deleted rows must stay gone");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue_16625_kill_at_ck_capture() {
+        kill_at_step_rebuild_keeps_source_deletes("i16625_s0", "CkCapture").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue_16625_kill_at_ck_precompute() {
+        kill_at_step_rebuild_keeps_source_deletes("i16625_s1", "CkPrecompute").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue_16625_kill_at_ck_stage() {
+        kill_at_step_rebuild_keeps_source_deletes("i16625_s2", "CkStage").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue_16625_kill_at_ck_publish() {
+        kill_at_step_rebuild_keeps_source_deletes("i16625_s3", "CkPublish").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue_16625_replayed_update_then_delete_after_rebuild_keeps_deletes() {
+        let table: &'static str = "i16625_replay";
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_sharded_cdc_upsert_table(table, ctx.runtime_env(), 1).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let all: Vec<i64> = (0..20_000).collect();
+        let surviving: Vec<i64> = all.iter().copied().filter(|id| id % 11 != 0).collect();
+        let values: Vec<i64> = surviving.iter().map(|id| id * 10).collect();
+        overwrite_with(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &surviving, &values),
+        )
+        .await;
+        // The replay: the UPDATE of `id % 5 == 0` (every key, including those the
+        // source has since deleted), then the DELETE of `id % 11 == 0`.
+        let updated: Vec<i64> = all.iter().copied().filter(|id| id % 5 == 0).collect();
+        apply_upsert_burst(
+            &ctx,
+            &provider,
+            Arc::clone(&schema),
+            &updated.iter().map(|id| (*id, id * 10 + 1)).collect::<Vec<_>>(),
+        )
+        .await;
+        let deleted: Vec<i64> = all.iter().copied().filter(|id| id % 11 == 0).collect();
+        provider
+            .write_cdc_delete_keys_in_memory(&int64_id_batch(&deleted))
+            .await
+            .expect("replayed delete");
+        let got: Vec<i64> = collect_id_value_pairs(&ctx, &provider, table)
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(got, surviving);
+    }
+
     /// NO LOSS: once a seal has advanced the slot, the sealed rows MUST survive a
     /// crash (recovered from the durable shadow) — the opposite of
     /// `mem_tier_crash_before_checkpoint_loses_ram_then_reapply_converges`, where a
