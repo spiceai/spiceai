@@ -333,9 +333,11 @@ fn schedule(script: &Script, steps: &[Step]) -> Schedule {
 
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_mins(3);
 
-/// `--max-wait`: the longest any wait for a condition may take, whatever the
-/// script asks for. Scripts that are expected to fail pay every wait in full,
-/// so a run of them is bounded by this instead.
+/// `--max-wait`: the longest a check's wait for a condition (`eventually`, a
+/// refresh) may take, whatever the script asks for. Scripts that are expected
+/// to fail pay every such wait in full, so a run of them is bounded by this
+/// instead. Readiness waits after `start`, `restart` and `upgrade` keep their
+/// own limits: they are setup, not checks.
 static MAX_WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
 
 /// Sets `--max-wait` for this run.

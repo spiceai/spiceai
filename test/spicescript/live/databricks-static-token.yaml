@@ -12,7 +12,7 @@ spicepod:
   kind: Spicepod
   name: databricks-static-token
   datasets:
-    - from: databricks:spiceai_sandbox.integration.delta_all_types_table
+    - from: databricks:spiceai_ci.integration.delta_all_types_table
       name: datatypes
       params:
         mode: delta_lake

@@ -772,6 +772,184 @@ pub fn snapshot_regular_file_create_new(
     }
 }
 
+/// Create a new owner-only state file that did not exist before, without
+/// following a link at its name.
+///
+/// The parent is reached through verified directory descriptors and the leaf
+/// is created with `O_CREAT | O_EXCL | O_NOFOLLOW`, so an entry already at the
+/// name (a planted link included) makes the call fail instead of being opened.
+/// The returned descriptor is the new inode, which a caller can keep to prove a
+/// later rename moved this file and no other.
+///
+/// # Errors
+///
+/// Returns an error when the name already exists, the parent is unsafe, or the
+/// file cannot be created.
+pub fn create_state_file_new(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        create_regular_file_new_unix(path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    }
+}
+
+/// Read a state file that only this service account may have written, or
+/// `None` when it does not exist.
+///
+/// Stricter than [`read_regular_file_optional_bounded`] in one respect: the
+/// file must also be owned by the effective user or by the owner of the
+/// directory it is in. In a directory other accounts can add entries to, a file
+/// they created at an absent name would otherwise be read as this service's
+/// own state. Like it, the leaf is never followed, a FIFO cannot block the
+/// read, and a hard-linked or oversized file is refused.
+///
+/// # Errors
+///
+/// Returns an [`std::io::ErrorKind::InvalidData`] error when the file is a
+/// link, not a regular file, hard-linked, owned by another account, or larger
+/// than `max_bytes`, and the underlying error when it cannot be read.
+pub fn read_owned_state_file_optional(
+    path: &Path,
+    max_bytes: u64,
+) -> std::io::Result<Option<Vec<u8>>> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::io::Read as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let (directory, file_name) = match open_verified_state_parent_unix(path, || {}) {
+            Ok(opened) => opened,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(source),
+        };
+        let file_name = CString::new(file_name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the state path contains a NUL byte",
+            )
+        })?;
+        // SAFETY: `file_name` is NUL-terminated, the directory descriptor is
+        // live for this call, and no pointer is retained. The leaf cannot be
+        // followed and a FIFO cannot block the open.
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                file_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            let source = std::io::Error::last_os_error();
+            if source.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            if source.raw_os_error() == Some(libc::ELOOP) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "it is a symbolic link",
+                ));
+            }
+            return Err(source);
+        }
+        // SAFETY: `openat` returned a new owned descriptor on success.
+        let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "it is not a regular file",
+            ));
+        }
+        if metadata.nlink() != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "it is hard-linked",
+            ));
+        }
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let effective_uid = unsafe { libc::geteuid() };
+        let directory_uid = directory.metadata()?.uid();
+        if metadata.uid() != effective_uid && metadata.uid() != directory_uid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "it is owned by user id {}, not by this process (user id {effective_uid}) or the directory's owner (user id {directory_uid})",
+                    metadata.uid()
+                ),
+            ));
+        }
+        if metadata.len() > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("it is larger than {}", describe_size_limit(max_bytes)),
+            ));
+        }
+
+        let mut contents = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut contents)?;
+        if u64::try_from(contents.len()).unwrap_or(u64::MAX) > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("it is larger than {}", describe_size_limit(max_bytes)),
+            ));
+        }
+        Ok(Some(contents))
+    }
+
+    #[cfg(not(unix))]
+    {
+        use std::io::Read as _;
+
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(source),
+        };
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "it is not a regular file",
+            ));
+        }
+        let mut contents = Vec::new();
+        std::fs::File::open(path)?
+            .take(max_bytes.saturating_add(1))
+            .read_to_end(&mut contents)?;
+        if u64::try_from(contents.len()).unwrap_or(u64::MAX) > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("it is larger than {}", describe_size_limit(max_bytes)),
+            ));
+        }
+        Ok(Some(contents))
+    }
+}
+
+/// A size limit as a user reads it: `16 MiB` where it is a whole number of
+/// MiB or KiB, bytes otherwise.
+fn describe_size_limit(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= MIB && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else if bytes >= 1024 && bytes.is_multiple_of(1024) {
+        format!("{} KiB", bytes / 1024)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 /// Read a security-sensitive state file without following symlinks or opening
 /// a FIFO/device in blocking mode.
 ///
