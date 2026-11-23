@@ -40,7 +40,7 @@ use crate::client::{self, EntryKind, Hub, HubConfig, TreeEntry};
 use crate::download::{self, Checksum, FetchError, Progress};
 use crate::error::{Cause, DownloadContext, DownloadError};
 use crate::location::RepoId;
-use crate::settings::Settings;
+use crate::settings::{Offline, Settings};
 
 /// Files of one repository downloaded at once, as `hf download` does.
 const MAX_CONCURRENT_FILES: usize = 8;
@@ -108,10 +108,24 @@ impl From<TreeEntry> for RepoFile {
 pub(crate) enum Source {
     /// The Hub's listing of the commit.
     Hub,
-    /// The cache, read alone because `HF_HUB_OFFLINE` is set.
-    OfflineCache,
-    /// The cache, read alone because the Hub failed (`reason`).
-    CacheInOutage { reason: String },
+    /// The cache, read alone because `HF_HUB_OFFLINE` or `TRANSFORMERS_OFFLINE` is set (`by`).
+    OfflineCache { by: Offline },
+    /// The cache, read alone because the Hub's listing failed with `error`: the Hub could not
+    /// be reached, or it refused the request.
+    CacheInOutage { error: Arc<client::Error> },
+}
+
+impl Source {
+    /// Why only the cache was read, as a clause: "`HF_HUB_OFFLINE` is set", "the Hugging Face
+    /// Hub could not be reached (HTTP 503)", "the Hugging Face Hub refused the request (token
+    /// rejected, HTTP 401)". `None` for the Hub's listing.
+    pub(crate) fn cache_only_reason(&self) -> Option<String> {
+        match self {
+            Source::Hub => None,
+            Source::OfflineCache { by } => Some(by.is_set()),
+            Source::CacheInOutage { error } => Some(crate::error::fallback_clause(error)),
+        }
+    }
 }
 
 /// A repository at one commit.
@@ -198,11 +212,11 @@ impl Snapshot {
         let hub = Arc::new(hub);
         let cache = HubCache::new(settings.cache_dir.clone());
 
-        let (commit, files, source) = if settings.offline {
+        let (commit, files, source) = if let Some(by) = settings.offline {
             let (commit, files) = from_cache(&cache, &repo, &revision)
                 .await
-                .ok_or_else(|| context.error(None, Cause::OfflineNoSnapshot))?;
-            (commit, files, Source::OfflineCache)
+                .ok_or_else(|| context.error(None, Cause::OfflineNoSnapshot { by }))?;
+            (commit, files, Source::OfflineCache { by })
         } else {
             let listed = match paths {
                 None => from_hub(&hub, &cache, &repo, &revision).await,
@@ -214,13 +228,23 @@ impl Snapshot {
                     let Some((commit, files)) = from_cache(&cache, &repo, &revision).await else {
                         return Err(context.error(None, Cause::Hub(error)));
                     };
-                    let reason = crate::error::unreachable_reason(&error);
                     tracing::warn!(
-                        "{} could not reach the Hugging Face Hub ({reason}), so it loads revision '{revision}' of '{repo}' from the cache at commit {}. Changes to '{revision}' are not seen until the Hub is reachable.",
-                        requester.capitalized(),
-                        short(&commit)
+                        "{}",
+                        crate::error::fallback_warning(
+                            &requester.capitalized(),
+                            &error,
+                            &revision,
+                            &repo,
+                            short(&commit)
+                        )
                     );
-                    (commit, files, Source::CacheInOutage { reason })
+                    (
+                        commit,
+                        files,
+                        Source::CacheInOutage {
+                            error: Arc::new(error),
+                        },
+                    )
                 }
                 Err(error) => return Err(context.error(None, Cause::Hub(error))),
             }
@@ -360,6 +384,24 @@ impl Snapshot {
     /// Where the snapshot's files came from.
     pub(crate) fn source(&self) -> &Source {
         &self.source
+    }
+
+    /// Why the snapshot lists only the files the cache holds, as a clause: "`HF_HUB_OFFLINE`
+    /// is set", "the Hugging Face Hub could not be reached (HTTP 503)". `None` when it lists the
+    /// repository's files, from the Hub. A component that chooses among the listed files names
+    /// it, since a load that reads the Hub may choose otherwise.
+    #[must_use]
+    pub fn cache_only_reason(&self) -> Option<String> {
+        self.source.cache_only_reason()
+    }
+
+    /// Whether the snapshot lists only the files the cache holds because `HF_HUB_OFFLINE` or
+    /// `TRANSFORMERS_OFFLINE` is set, which lasts until the process restarts without them.
+    /// With the Hub out of reach instead, a later snapshot can list the repository's files
+    /// again.
+    #[must_use]
+    pub fn is_offline(&self) -> bool {
+        matches!(self.source, Source::OfflineCache { .. })
     }
 
     /// The component the snapshot is for.
