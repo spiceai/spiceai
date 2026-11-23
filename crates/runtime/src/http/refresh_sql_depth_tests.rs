@@ -30,8 +30,8 @@ use http_body_util::BodyExt;
 use runtime_query_engine::sql_depth_guard::MAX_SQL_EXPR_DEPTH;
 use runtime_search::search_engine::{SearchEngine, parse_explicit_primary_keys};
 use serde_json::{Value, json};
-use spicepod::{acceleration::Acceleration, component::dataset::Dataset};
 use spicepod::component::runtime::CorsConfig;
+use spicepod::{acceleration::Acceleration, component::dataset::Dataset};
 use tower::ServiceExt;
 
 use crate::{Runtime, config::Config};
@@ -148,8 +148,14 @@ async fn an_over_deep_refresh_sql_override_is_refused() {
     });
     let rejection = format!("an expression is nested more than {MAX_SQL_EXPR_DEPTH} levels deep");
     for (method, path) in [
-        (Method::POST, format!("/v1/datasets/{DATASET}/acceleration/refresh")),
-        (Method::PATCH, format!("/v1/datasets/{DATASET}/acceleration")),
+        (
+            Method::POST,
+            format!("/v1/datasets/{DATASET}/acceleration/refresh"),
+        ),
+        (
+            Method::PATCH,
+            format!("/v1/datasets/{DATASET}/acceleration"),
+        ),
     ] {
         let (status, body) = send(&routes, method.clone(), &path, &deep).await;
         let message = serde_json::from_str::<Value>(&body).expect("JSON body")["message"]
