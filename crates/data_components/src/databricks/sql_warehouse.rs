@@ -309,7 +309,8 @@ pub enum Error {
 
     #[snafu(display(
         "Failed to download query results from Databricks SQL Warehouse: refused to connect to {destination}: {CHUNK_DESTINATION_REFUSED}. \
-        If the warehouse's result storage is reachable only through a private endpoint, set {}=true",
+        If the warehouse's result storage is reachable only through a private endpoint, set {}=true. \
+        See: https://spiceai.org/docs/components/data-connectors/databricks",
         ssrf::ALLOW_PRIVATE_HOSTS_ENV
     ))]
     ChunkDestinationRefused { destination: String },
@@ -5681,7 +5682,8 @@ mod tests {
                 format!(
                     "Failed to download query results from Databricks SQL Warehouse: refused to connect to {destination}: \
                      Databricks SQL Warehouse result chunks are not downloaded from a private, loopback, or link-local address. \
-                     If the warehouse's result storage is reachable only through a private endpoint, set SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true"
+                     If the warehouse's result storage is reachable only through a private endpoint, set SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true. \
+                     See: https://spiceai.org/docs/components/data-connectors/databricks"
                 )
             );
         }
@@ -5709,8 +5711,7 @@ mod tests {
                 headers: vec![("Location".to_string(), target.clone())],
                 body: String::new(),
             };
-            let (origin, origin_requests) =
-                start_mock_http_server(vec![], redirect.clone()).await;
+            let (origin, origin_requests) = start_mock_http_server(vec![], redirect.clone()).await;
             let api = Arc::new(SqlWarehouseApi {
                 chunk_destinations: None,
                 ..create_guarded_test_api(0)
@@ -5733,7 +5734,8 @@ mod tests {
                     .ascii_serialization()
             );
             assert!(
-                matches!(err, Error::HttpRequestFailed { .. }) && err.to_string().contains(&refused),
+                matches!(err, Error::HttpRequestFailed { .. })
+                    && err.to_string().contains(&refused),
                 "unexpected error for the redirect to {target}: {err}"
             );
             assert_eq!(
