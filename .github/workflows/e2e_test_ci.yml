@@ -195,13 +195,6 @@ jobs:
   build_linux:
     name: Build Linux x64 binaries
     runs-on: spiceai-dev-runners
-    permissions:
-      contents: read
-      # Writes a pinned download the CI cache lacked back to it, which the CI object
-      # store accepts only with this job's OIDC credentials (.github/ci-cache/README.md).
-      # The job runs in `ci`, like the other jobs that hold store credentials, and never
-      # on a pull request (check_changes is skipped there).
-      id-token: write
     environment: ci
     needs: check_changes
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
@@ -288,13 +281,6 @@ jobs:
     # (#14557), and starves the short macOS test jobs that sit on that pool to avoid
     # exactly this neighbour (#13761).
     runs-on: spiceai-macos-large
-    permissions:
-      contents: read
-      # Writes a pinned download the CI cache lacked back to it, which the CI object
-      # store accepts only with this job's OIDC credentials (.github/ci-cache/README.md).
-      # The job runs in `ci`, like the other jobs that hold store credentials, and never
-      # on a pull request (check_changes is skipped there).
-      id-token: write
     environment: ci
     needs: check_changes
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}

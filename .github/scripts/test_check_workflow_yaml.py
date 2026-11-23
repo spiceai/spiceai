@@ -233,9 +233,13 @@ class CheckUntrustedExpansionsTest(unittest.TestCase):
         return [p for p in check_workflow_yaml.check_workflow(document.format(steps=steps)) if "expands" in p]
 
     def test_a_dispatch_input_in_a_script_is_reported(self):
-        problems = self.problems("      - name: Run\n        run: testoperator -p ${{ github.event.inputs.spicepod_path }}")
+        problems = self.problems(
+            "      - name: Run\n        run: testoperator -p ${{ github.event.inputs.spicepod_path }}"
+        )
         self.assertEqual(len(problems), 1)
-        self.assertIn("job `bench` step `Run` expands `${{ github.event.inputs.spicepod_path }}`", problems[0])
+        self.assertIn(
+            "job `bench` step `Run` expands `${{ github.event.inputs.spicepod_path }}`", problems[0]
+        )
 
     def test_every_untrusted_context_is_reported(self):
         for expression in (
@@ -271,7 +275,8 @@ class CheckUntrustedExpansionsTest(unittest.TestCase):
             "        with:\n"
             "          path: ${{ inputs.spicepod_path }}\n"
             "        uses: ./.github/actions/x\n"
-            "      - run: echo ${{ github.sha }} ${{ runner.temp }} ${{ secrets.TOKEN }} ${{ steps.a.outputs.b }}"
+            "      - run: echo ${{ github.sha }} ${{ runner.temp }} ${{ secrets.TOKEN }}"
+            " ${{ steps.a.outputs.b }}"
         )
         self.assertEqual(self.problems(steps), [])
 
@@ -285,6 +290,61 @@ class CheckUntrustedExpansionsTest(unittest.TestCase):
         ).replace("jobs:\n", "permissions: write-all\njobs:\n")
         self.assertEqual(len(self.problems("      - run: echo ${{ inputs.spicepod_path }}", document)), 1)
 
+    def test_a_step_output_built_from_an_input_is_followed(self):
+        # The step reads the input from env as $X, so only its output carries it on.
+        steps = (
+            "      - id: path\n"
+            "        env:\n"
+            "          RAW: ${{ inputs.spicepod_path }}\n"
+            "        run: echo \"p=./test/$RAW\" >> \"$GITHUB_OUTPUT\"\n"
+            "      - run: test -f \"${{ steps.path.outputs.p }}\""
+        )
+        problems = self.problems(steps)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("`${{ steps.path.outputs.p }}`", problems[0])
+
+    def test_a_job_env_holding_an_input_is_followed_through_shell_and_env_reads(self):
+        document = CREDENTIALED.replace(
+            "    steps:\n", "    env:\n      CB_PATH: ${{{{ inputs.spicepod_path }}}}\n    steps:\n"
+        )
+        steps = (
+            "      - id: set\n"
+            "        run: echo \"p=$CB_PATH\" >> \"$GITHUB_OUTPUT\"\n"
+            "      - run: echo \"${{ steps.set.outputs.p }}\" \"${{ env.CB_PATH }}\""
+        )
+        self.assertEqual(len(self.problems(steps, document)), 2)
+
+    def test_a_job_output_and_a_matrix_built_from_an_input_are_followed(self):
+        document = CREDENTIALED + (
+            "    outputs:\n"
+            "      p: ${{{{ inputs.spicepod_path }}}}\n"
+            "  use:\n"
+            "    needs: bench\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    strategy:\n"
+            "      matrix:\n"
+            "        p: ${{{{ fromJson(needs.bench.outputs.p) }}}}\n"
+            "    steps:\n"
+            "      - run: echo ${{{{ needs.bench.outputs.p }}}} ${{{{ matrix.p }}}}\n"
+        )
+        self.assertEqual(len(self.problems("      - run: echo ok", document)), 2)
+
+    def test_bracket_syntax_and_json_dumps_are_reported(self):
+        expressions = ("inputs['spicepod_path']", "github['head_ref']", "toJSON(github.event)", "github.ref")
+        for expression in expressions:
+            with self.subTest(expression=expression):
+                self.assertEqual(len(self.problems(f"      - run: echo '${{{{ {expression} }}}}'")), 1)
+
+    def test_a_github_script_step_output_is_not_followed(self):
+        steps = (
+            "      - id: m\n"
+            "        uses: actions/github-script@v7\n"
+            "        with:\n"
+            "          script: return context.payload.inputs.x === 'a' ? 'one' : 'two'\n"
+            "      - run: echo ${{ steps.m.outputs.result }}"
+        )
+        self.assertEqual(self.problems(steps), [])
+
     def test_a_job_without_the_token_in_a_credentialed_workflow_is_checked(self):
         document = CREDENTIALED + (
             "  setup:\n"
@@ -296,6 +356,45 @@ class CheckUntrustedExpansionsTest(unittest.TestCase):
         problems = self.problems("      - run: echo ok", document)
         self.assertEqual(len(problems), 1)
         self.assertIn("job `setup`", problems[0])
+
+
+class CheckActionExpansionsTest(unittest.TestCase):
+    ACTION = """\
+name: Setup
+description: Sets up a thing
+inputs:
+  ref:
+    description: The ref
+runs:
+  using: composite
+  steps:
+{steps}
+"""
+
+    def problems(self, steps):
+        problems = check_workflow_yaml.check_action(self.ACTION.format(steps=steps))
+        return [p for p in problems if "expands" in p]
+
+    def test_an_input_in_an_action_script_is_reported(self):
+        problems = self.problems("    - shell: bash\n      run: git fetch origin ${{ inputs.ref }}")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("a caller's value", problems[0])
+
+    def test_an_input_through_env_is_accepted(self):
+        steps = (
+            "    - shell: bash\n"
+            "      env:\n"
+            "        REF: ${{ inputs.ref }}\n"
+            "      run: git fetch origin \"$REF\""
+        )
+        self.assertEqual(self.problems(steps), [])
+
+    def test_the_repository_actions_are_clean(self):
+        github_dir = Path(__file__).resolve().parent.parent
+        for action in check_workflow_yaml.action_files(github_dir):
+            with self.subTest(action=action.name):
+                problems = [p for p in check_workflow_yaml.check_action(action.read_text()) if "expands" in p]
+                self.assertEqual(problems, [])
 
 
 class CheckSuiteVisibilityTest(unittest.TestCase):

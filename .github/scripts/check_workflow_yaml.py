@@ -155,13 +155,16 @@ SNAPSHOT_ACTION = "push-snap-changes"
 # better default — a cancelled run should stop.
 SURVIVES_FAILURE = re.compile(r"(?:!\s*cancelled|always)\s*\(\s*\)")
 
-# Values whoever starts the run chooses: dispatch and call inputs, the branch name,
-# and an event's free text. Inside `${{ }}` in a script they become code; through a
-# step's `env:` they stay values.
+# Values whoever starts the run chooses: dispatch and call inputs, the branch and
+# ref names, and an event's free text, in dot or bracket syntax or as a whole JSON
+# dump. Inside `${{ }}` in a script they become code; through a step's `env:` they
+# stay values.
 UNTRUSTED_CONTEXT = re.compile(
-    r"(?<![\w.-])(?:inputs\.|github\.event\.inputs\b|github\.head_ref\b|github\.ref_name\b"
-    r"|github\.event\.(?:pull_request|issue|comment|review|review_comment|head_commit|commits|pages"
-    r"|workflow_run|discussion|client_payload)\b)"
+    r"(?<![\w.-])(?:inputs\s*[.\[]|github\s*\[|toJSON\(\s*github\b|github\.event\.inputs\b"
+    r"|github\.(?:head_ref|ref_name|ref|base_ref)\b"
+    r"|github\.event\.(?:ref|release|merge_group|pull_request|issue|comment|review|review_comment"
+    r"|head_commit|commits|pages|workflow_run|discussion|client_payload)\b)",
+    re.IGNORECASE,
 )
 EXPANSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
 
@@ -442,6 +445,86 @@ def _holds_id_token(permissions: object) -> bool:
     )
 
 
+def _ref(term: str) -> str:
+    return rf"(?<![\w.-]){term}"
+
+
+def _tainted_references(document: dict, jobs: dict) -> dict[str, re.Pattern]:
+    """Per job, the references whose value carries something the dispatcher chose.
+
+    Starts from UNTRUSTED_CONTEXT and follows the value, to a fixpoint, into an `env`
+    entry (read later as `${{ env.X }}`), into a step's outputs when the step reads
+    such a value (as `${{ }}` or as `$X` from its environment), into a job's outputs
+    and so `needs.<job>.outputs`, and into a job's `matrix`. A github-script step's
+    outputs are not followed: its script decides what it outputs, and the matrices
+    built that way here hold only literals.
+    """
+    global_terms: set[str] = set()
+    job_terms: dict[str, set[str]] = {name: set() for name in jobs}
+
+    def pattern(job_name: str, extra: tuple = ()) -> re.Pattern:
+        terms = [
+            UNTRUSTED_CONTEXT.pattern,
+            *sorted(global_terms),
+            *sorted(job_terms.get(job_name, ())),
+            *extra,
+        ]
+        return re.compile("|".join(terms), re.IGNORECASE)
+
+    workflow_env = document.get("env") if isinstance(document.get("env"), dict) else {}
+    for _ in range(12):
+        before = (len(global_terms), sum(len(t) for t in job_terms.values()))
+        anywhere = pattern("")
+        tainted_workflow_env = {key for key, value in workflow_env.items() if anywhere.search(str(value))}
+        global_terms.update(_ref(rf"env\.{re.escape(key)}\b") for key in tainted_workflow_env)
+        for name, job in jobs.items():
+            if not isinstance(job, dict):
+                continue
+            here = pattern(name)
+            job_env = job.get("env") if isinstance(job.get("env"), dict) else {}
+            tainted_env = tainted_workflow_env | {k for k, v in job_env.items() if here.search(str(v))}
+            job_terms[name].update(_ref(rf"env\.{re.escape(key)}\b") for key in tainted_env)
+            strategy = job.get("strategy")
+            if isinstance(strategy, dict) and here.search(str(strategy.get("matrix", ""))):
+                job_terms[name].add(_ref(r"matrix\."))
+            for step in job.get("steps") or []:
+                if not isinstance(step, dict) or not step.get("id"):
+                    continue
+                if "github-script" in str(step.get("uses", "")):
+                    continue
+                step_env = step.get("env") if isinstance(step.get("env"), dict) else {}
+                names = tainted_env | {k for k, v in step_env.items() if here.search(str(v))}
+                run = str(step.get("run", ""))
+                reads = any(re.search(rf"\$\{{?{re.escape(n)}\b", run) for n in names)
+                if reads or here.search(" ".join(str(step.get(k, "")) for k in ("run", "env", "with"))):
+                    job_terms[name].add(_ref(rf"steps\.{re.escape(str(step['id']))}\.outputs\b"))
+            outputs = job.get("outputs") if isinstance(job.get("outputs"), dict) else {}
+            here = pattern(name)
+            for key, value in outputs.items():
+                if here.search(str(value)):
+                    global_terms.add(_ref(rf"needs\.{re.escape(name)}\.outputs\.{re.escape(key)}\b"))
+        if before == (len(global_terms), sum(len(t) for t in job_terms.values())):
+            break
+    return {name: pattern(name) for name in jobs}
+
+
+def _script_expansions(step: dict, tainted: re.Pattern) -> list[tuple[str, str]]:
+    """(key, expansion) for each tainted `${{ }}` in a step's `run:` or github-script `script:`."""
+    scripts = [("run", step.get("run"))]
+    if "github-script" in str(step.get("uses", "")) and isinstance(step.get("with"), dict):
+        scripts.append(("script", step["with"].get("script")))
+    step_env = step.get("env") if isinstance(step.get("env"), dict) else {}
+    local = [_ref(rf"env\.{re.escape(k)}\b") for k, v in step_env.items() if tainted.search(str(v))]
+    if local:
+        tainted = re.compile("|".join([tainted.pattern, *local]), re.IGNORECASE)
+    found = []
+    for key, script in scripts:
+        for match in EXPANSION.finditer(str(script or "")):
+            if tainted.search(match.group(1)):
+                found.append((key, match.group(0).strip()))
+    return found
+
+
 def check_untrusted_expansions(document: dict, jobs: dict) -> list[str]:
     """Report scripts that expand a dispatcher's or a branch's value in place.
 
@@ -451,9 +534,10 @@ def check_untrusted_expansions(document: dict, jobs: dict) -> list[str]:
     github-script `script:` are code; `name:`, `if:`, `with:` and `env:` are not, and
     `env:` is the fix: `NAME: ${{ inputs.x }}` there, `"$NAME"` in the script.
 
-    What this does not follow: a step output or `env` value derived from such a
-    value and expanded later as `${{ steps.… }}` or `${{ env.… }}`. Those were moved
-    by hand when this rule was added; the rule catches the direct form.
+    The value is followed through `env`, step and job outputs and the matrix
+    (`_tainted_references`). What this does not follow: a github-script step's
+    outputs, and a value a third-party action passes through. Composite actions in
+    this repository are checked by `check_action_expansions`.
     """
     workflow_permissions = document.get("permissions")
     if not (
@@ -461,6 +545,7 @@ def check_untrusted_expansions(document: dict, jobs: dict) -> list[str]:
         or any(isinstance(job, dict) and _holds_id_token(job.get("permissions")) for job in jobs.values())
     ):
         return []
+    tainted = _tainted_references(document, jobs)
     problems = []
     for name, job in jobs.items():
         if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
@@ -468,18 +553,37 @@ def check_untrusted_expansions(document: dict, jobs: dict) -> list[str]:
         for position, step in enumerate(job["steps"], start=1):
             if not isinstance(step, dict):
                 continue
-            scripts = [("run", step.get("run"))]
-            if "github-script" in str(step.get("uses", "")) and isinstance(step.get("with"), dict):
-                scripts.append(("script", step["with"].get("script")))
-            for key, script in scripts:
-                for match in EXPANSION.finditer(str(script or "")):
-                    if UNTRUSTED_CONTEXT.search(match.group(1)):
-                        label = step.get("name") or f"step {position}"
-                        problems.append(
-                            f"job `{name}` step `{label}` expands `{match.group(0).strip()}` inside its "
-                            f"`{key}:`, where a value with `$(…)` runs as code in a workflow that holds "
-                            f"`id-token: write` — pass it through the step's `env:` and read the variable"
-                        )
+            for key, expansion in _script_expansions(step, tainted[name]):
+                label = step.get("name") or f"step {position}"
+                problems.append(
+                    f"job `{name}` step `{label}` expands `{expansion}` inside its `{key}:`, where a "
+                    f"value with `$(…)` runs as code in a workflow that holds `id-token: write` — pass "
+                    f"it through the step's `env:` and read the variable"
+                )
+    return problems
+
+
+def check_action_expansions(document: dict) -> list[str]:
+    """Report a composite action script that expands one of its inputs in place.
+
+    A caller decides an action's inputs, and the workflows that hold `id-token: write`
+    pass dispatch inputs to these actions, so an action reads its inputs through
+    `env:` as a workflow step does.
+    """
+    runs = document.get("runs")
+    if not isinstance(runs, dict) or not isinstance(runs.get("steps"), list):
+        return []
+    tainted = _tainted_references({}, {"action": {"steps": runs["steps"]}})["action"]
+    problems = []
+    for position, step in enumerate(runs["steps"], start=1):
+        if not isinstance(step, dict):
+            continue
+        for key, expansion in _script_expansions(step, tainted):
+            label = step.get("name") or f"step {position}"
+            problems.append(
+                f"step `{label}` expands `{expansion}` inside its `{key}:`, where a caller's value "
+                f"with `$(…)` runs as code — pass it through the step's `env:` and read the variable"
+            )
     return problems
 
 
@@ -574,7 +678,11 @@ def check_action(text: str) -> list[str]:
     if "runs" not in document:
         return ["has no `runs:` block"]
 
-    return check_action_descriptions(document) + check_action_conditions(document["runs"])
+    return (
+        check_action_descriptions(document)
+        + check_action_conditions(document["runs"])
+        + check_action_expansions(document)
+    )
 
 
 def _format_yaml_error(error: yaml.YAMLError) -> str:
