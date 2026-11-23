@@ -1,4 +1,5 @@
 name: cayenne-vnext
+tags: [long]
 description: >
   `runtime.params.cayenne_vnext: enabled` puts new Cayenne datasets on the
   object-native metastore and never moves one already on SQLite: that dataset

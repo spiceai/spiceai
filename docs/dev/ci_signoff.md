@@ -67,7 +67,9 @@ crates and runs, in order:
 1. `make lint-rust PACKAGES="…" FEATURES="…"` — lint the crates you touched
 2. `make nextest-packages PACKAGES="…" FEATURES="…"` — their unit tests
 3. `make lint-rust` — the full workspace lint
-4. `make nextest verify-cli` — all unit tests, then assert the `spice` binary exists
+4. `make nextest verify-cli` — all unit tests, then assert the `spice` binary exists.
+   The slowest tests are left to `trunk_tests.yml` (see *Trunk Health*); run them
+   with `make nextest-post-merge`.
 
 Steps 1-2 exist to fail fast: a lint or test failure in the crate you edited is
 the likeliest outcome, and step 3 is by far the longest, so covering your own
@@ -757,6 +759,84 @@ reviews the change and signs off on your behalf (or pushes a small follow-up and
 signs off). This mirrors the trusted-committer model — the full suite in the
 merge queue is still the real gate.
 
+## Trunk Health
+
+Some tests run after merge rather than in the merge queue: `trunk_tests.yml`
+runs the comprehensive set on `trunk` every 12 hours. That includes the nextest
+tests the gate leaves out (`NEXTEST_POST_MERGE_FILTER` in the `Makefile`, run by
+`make nextest-post-merge`), which neither `make signoff` nor the merge queue runs. A failure it finds is
+tracked as an open issue labeled `trunk-broken`, or as an open PR labeled
+`fixes-trunk` that fixes or reverts it. The required **Trunk Health** check
+(`trunk_health.yml`) keeps those from being ignored.
+
+**It blocks merging when either holds:**
+
+- **Overdue:** an open `trunk-broken` issue or `fixes-trunk` PR has carried its
+  label for more than 24 hours. The age counts from the most recent time the
+  label was added. The 24 hours are for triage: a flake or an infrastructure
+  fault should not stop all merging before anyone has looked at it.
+- **Untriaged:** the last four completed scheduled `trunk_tests.yml` runs on `trunk`
+  failed (cancelled runs are skipped), nothing is labeled, and nobody has
+  triaged a trunk failure since the older of those runs started. Triage is
+  adding or removing a `trunk-broken` or `fixes-trunk` label, or closing an
+  item that carries one. Filing the failure as a `trunk-broken` issue clears
+  this and starts that issue's 24 hours; dismissing an item or merging its fix
+  clears it until four more runs fail. Four is high on purpose: the labeled
+  items are the gate, and this only catches a failure nobody filed.
+
+**A PR may merge anyway when any holds:**
+
+- it is labeled `fixes-trunk`;
+- it closes, by a closing keyword such as `Fixes #N`, an issue labeled
+  `trunk-broken` (a plain mention does not count, nor does closing an
+  unlabeled issue);
+- it is a pure revert from a branch of this repository, by the same rule as
+  [Reverts are fast-tracked](#reverts-are-fast-tracked)
+  (`.github/scripts/pure_revert.mjs`). The rule reads the revert footers and
+  does not prove the changes undo the commits, so a fork's revert needs the
+  `fixes-trunk` label instead.
+
+The merge queue merges up to three entries together once the last one's checks
+pass, so the entries queued ahead of a PR merge on its run as well. In the
+merge queue the gate therefore judges every PR the group would merge: its own
+and those ahead of it not yet on `trunk`. A fix can't carry an unrelated PR
+past the block by being queued behind it.
+
+**Removing the label is the only override.** If an item should not block
+merging (a flake, an infrastructure fault, a failure in a test that is being
+retired), a maintainer removes its label. That is visible in the issue's
+history and needs no admin bypass. It also counts as triage, so the failed runs
+before it do not trip the untriaged condition; a failure that keeps happening
+trips it again after four more failed runs.
+
+**Where it runs.** It reports on the same branches as the other required checks, and guards only `trunk`: for a PR into a release or feature branch it passes at once, so a broken trunk never blocks a release fix. The merge-queue run is the one that blocks. The run on a
+pull request is advisory: it always passes, and when merging is blocked it
+posts one comment listing the blocking items and how to unblock. The run
+repeats only on the PR's own events (a push, a label, an edit), so the comment
+shows trunk's state as of the PR's last event: it can say blocked after the
+block cleared, and a PR that sees no events gets no warning when an item
+becomes overdue. The merge-queue run always reads the current state. A fork's
+token cannot comment, so on a fork PR the report is in the job summary. The
+gate reads labels, label events, workflow runs and the PR's closing issues
+with the job's token, and runs `.github/scripts/trunk_health.mjs` from the
+base commit, never the PR's. The workflow file that runs it still comes from
+the PR, as for every check here, so a change to `trunk_health.yml` or to the
+gate's script is a change to the gate and gets the same review as any other
+`.github/` change (CODEOWNERS). When it cannot read that state in the merge
+queue, it fails closed; re-run the check. Only closing links to this
+repository's issues count toward the exemption.
+
+Anyone with triage permission can add or remove the labels, so they can block
+or unblock merging: the same trust level as approving or enqueueing a PR.
+
+**Rollout.** Once `trunk_health.yml` is on `trunk`, a maintainer creates the
+two labels (`gh label create trunk-broken`, `gh label create fixes-trunk`) and
+runs `scripts/signoff install --yes`, which adds `Trunk Health` to the required
+checks (see [Configure the ruleset](#configure-the-ruleset)). Until then the
+check runs but does not block. It is safe to require before
+`trunk_tests.yml` exists: with no such workflow, the untriaged condition
+stays off.
+
 ## For maintainers
 
 ### What runs where
@@ -798,8 +878,10 @@ and a required check nothing reports blocks every pull request instead of
 passing it. Re-enable the workflow before adding it back to `REQUIRED_CHECKS`.
 
 Advisory checks that also run on `merge_group` but don't block (they can be
-promoted to required with a gate job later): `integration tests (llms)`,
-`Elasticsearch Integration Tests`, `Helm Lint`.
+promoted to required with a gate job later): `Elasticsearch Integration Tests`,
+`Helm Lint`. The model integration tests (`integration tests (llms)`) run after
+merge instead: on a push that touches the model crates, and in every
+`trunk_tests.yml` run, where a failure counts toward Trunk Health.
 
 GitHub uses one required-checks list both before queue entry and on the merge
 queue commit. Therefore every required workflow triggers on both `pull_request`

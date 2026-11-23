@@ -333,9 +333,11 @@ fn schedule(script: &Script, steps: &[Step]) -> Schedule {
 
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_mins(3);
 
-/// `--max-wait`: the longest any wait for a condition may take, whatever the
-/// script asks for. Scripts that are expected to fail pay every wait in full,
-/// so a run of them is bounded by this instead.
+/// `--max-wait`: the longest a check's wait for a condition (`eventually`, a
+/// refresh) may take, whatever the script asks for. Scripts that are expected
+/// to fail pay every such wait in full, so a run of them is bounded by this
+/// instead. Readiness waits after `start`, `restart` and `upgrade` keep their
+/// own limits: they are setup, not checks.
 static MAX_WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
 
 /// Sets `--max-wait` for this run.
@@ -369,7 +371,9 @@ pub struct Target {
     pub binary: PathBuf,
 }
 
+#[derive(Clone)]
 pub struct Options {
+    pub repetition: Option<u32>,
     pub targets: Vec<Target>,
     /// `--from`: the binary every instance starts on, in place of any
     /// script's `from:`; an `upgrade` step moves it to its target's.
@@ -658,8 +662,12 @@ pub async fn run_script(script: &Script, options: &Options, slots: &Slots) -> Re
             let script_busy = Arc::clone(&script_busy);
             async move {
                 let run_label = script.run_label(&combo);
+                let repetition = options
+                    .repetition
+                    .map(|index| format!("-repetition-{index}"))
+                    .unwrap_or_default();
                 let run_id = format!(
-                    "{}-{combo_index}-{}",
+                    "{}-{combo_index}{repetition}-{}",
                     sanitize(&script.name),
                     std::process::id()
                 );

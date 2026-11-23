@@ -82,7 +82,7 @@ async fn spark_integration_test() -> Result<(), anyhow::Error> {
             let token = databricks_token().await?;
             let app = AppBuilder::new("spark_connector")
                 .with_dataset(make_spark_dataset(
-                    "spiceai_sandbox.tpch.lineitem",
+                    "spiceai_ci.tpch.lineitem",
                     "lineitem",
                     &token,
                 ))

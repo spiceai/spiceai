@@ -110,6 +110,11 @@ pub enum Error {
     #[snafu(display("The grammar cannot be passed to llama.cpp: {source}"))]
     GrammarNul { source: std::ffi::NulError },
 
+    #[snafu(display(
+        "llama.cpp has no next token to pick: the grammar the reply is held to allows none of the model's tokens here"
+    ))]
+    NothingToPick,
+
     #[snafu(display("llama.cpp could not turn the JSON schema into a grammar: {reason}"))]
     JsonSchema { reason: String },
 }

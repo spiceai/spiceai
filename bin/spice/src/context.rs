@@ -725,12 +725,26 @@ impl RuntimeContext {
         args: &[String],
         http_endpoint_override: Option<&str>,
     ) -> Result<Command> {
-        let mut cmd = Command::new(&spiced.path);
-        cmd.arg("--pods-watcher-enabled");
-        cmd.args(args);
+        Ok(self.runtime_command(spiced, self.run_args(args, http_endpoint_override)?))
+    }
+
+    /// The arguments [`Self::get_run_cmd`] starts the runtime with, after the
+    /// program name: `args`, with the HTTP endpoint and the defaults this
+    /// context supplies.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::get_run_cmd`].
+    pub fn run_args(
+        &self,
+        args: &[String],
+        http_endpoint_override: Option<&str>,
+    ) -> Result<Vec<OsString>> {
+        let mut run_args: Vec<OsString> = vec!["--pods-watcher-enabled".into()];
+        run_args.extend(args.iter().map(OsString::from));
 
         // Add HTTP endpoint (use override if provided, otherwise use context default)
-        cmd.arg("--http");
+        run_args.push("--http".into());
         let http_addr = http_endpoint_override.map_or_else(
             || self.http_socket_address(),
             |ep| {
@@ -739,12 +753,7 @@ impl RuntimeContext {
                     .to_string()
             },
         );
-        cmd.arg(http_addr);
-
-        // Add API key if present. Use the environment so the key is not exposed in process args.
-        if let Some(api_key) = &self.api_key {
-            cmd.env("SPICE_API_KEY", api_key);
-        }
+        run_args.push(http_addr.into());
 
         // Add TLS root certificate file if present
         if let Some(tls_cert) = &self.tls_root_certificate_file {
@@ -758,19 +767,34 @@ impl RuntimeContext {
                     .context(RuntimeExecutionSnafu)?
                     .join(tls_cert)
             };
-            cmd.arg("--tls-root-certificate-file");
-            cmd.arg(tls_cert);
+            run_args.push("--tls-root-certificate-file".into());
+            run_args.push(tls_cert.into_os_string());
         }
 
         // Add user agent
-        cmd.arg("--user-agent");
-        cmd.arg(&self.user_agent);
+        run_args.push("--user-agent".into());
+        run_args.push(OsString::from(&self.user_agent));
 
         // Set default captured output for task history (for spice trace)
-        cmd.arg("--set-runtime");
-        cmd.arg("task_history.captured_output=truncated");
+        run_args.push("--set-runtime".into());
+        run_args.push("task_history.captured_output=truncated".into());
 
-        Ok(cmd)
+        Ok(run_args)
+    }
+
+    /// A command that starts `spiced` with `run_args`, the arguments
+    /// [`Self::run_args`] returns.
+    #[must_use]
+    pub fn runtime_command(&self, spiced: &ResolvedSpiced, run_args: Vec<OsString>) -> Command {
+        let mut cmd = Command::new(&spiced.path);
+        cmd.args(run_args);
+
+        // Add API key if present. Use the environment so the key is not exposed in process args.
+        if let Some(api_key) = &self.api_key {
+            cmd.env("SPICE_API_KEY", api_key);
+        }
+
+        cmd
     }
 
     /// Get the HTTP socket address (without http:// prefix).

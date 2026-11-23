@@ -1,0 +1,107 @@
+name: http-request-bound
+description: >
+  A query against an HTTP dataset sends at most `max_request_partitions`
+  distinct requests, one for each combination of its request filter values,
+  and 1,000 by default. A query at the bound sends exactly that many; one
+  combination more fails before any request is sent, with an error that gives
+  the value to set; a dataset that raises the bound runs it; and values a
+  subquery supplies are held to the same bound. A `max_request_partitions` or
+  `pagination_max_pages` that is not a positive integer fails to register the
+  dataset, naming the parameter.
+
+sources:
+  api: { kind: mock-http }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: http-request-bound
+  datasets:
+    - from: ${sources.api.url}/v1
+      name: api
+      params: { file_format: json, request_query_filters: enabled, request_body_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0', max_concurrent_requests: '16' }
+    - from: ${sources.api.url}/v2
+      name: api_raised
+      params: { file_format: json, request_query_filters: enabled, request_body_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0', max_concurrent_requests: '16', max_request_partitions: '2000' }
+    - from: ${sources.api.url}/v3
+      name: bad_zero
+      params: { file_format: json, request_query_filters: enabled, request_body_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0', max_concurrent_requests: '16', max_request_partitions: '0' }
+    - from: ${sources.api.url}/v3
+      name: bad_word
+      params: { file_format: json, request_query_filters: enabled, request_body_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0', max_concurrent_requests: '16', max_request_partitions: 1k }
+    - from: ${sources.api.url}/v3
+      name: bad_pages
+      params: { file_format: json, request_query_filters: enabled, request_body_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0', max_concurrent_requests: '16', pagination: enabled, pagination_max_pages: 1k }
+
+steps:
+  - source-exec:
+      api:
+        - "{ path: /v1, headers: { content-type: application/json }, body: '[{\"x\": 1}]' }"
+        - "{ path: /v2, headers: { content-type: application/json }, body: '[{\"x\": 1}]' }"
+  - start: { ready: false }
+
+  # Exactly the default bound: 10 x 100 = 1,000 requests.
+  - query: SELECT count(*) FROM api WHERE request_query IN ('q=0', 'q=1', 'q=2', 'q=3', 'q=4', 'q=5', 'q=6', 'q=7', 'q=8', 'q=9') AND request_body IN ('b0', 'b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'b8', 'b9', 'b10', 'b11', 'b12', 'b13', 'b14', 'b15', 'b16', 'b17', 'b18', 'b19', 'b20', 'b21', 'b22', 'b23', 'b24', 'b25', 'b26', 'b27', 'b28', 'b29', 'b30', 'b31', 'b32', 'b33', 'b34', 'b35', 'b36', 'b37', 'b38', 'b39', 'b40', 'b41', 'b42', 'b43', 'b44', 'b45', 'b46', 'b47', 'b48', 'b49', 'b50', 'b51', 'b52', 'b53', 'b54', 'b55', 'b56', 'b57', 'b58', 'b59', 'b60', 'b61', 'b62', 'b63', 'b64', 'b65', 'b66', 'b67', 'b68', 'b69', 'b70', 'b71', 'b72', 'b73', 'b74', 'b75', 'b76', 'b77', 'b78', 'b79', 'b80', 'b81', 'b82', 'b83', 'b84', 'b85', 'b86', 'b87', 'b88', 'b89', 'b90', 'b91', 'b92', 'b93', 'b94', 'b95', 'b96', 'b97', 'b98', 'b99')
+    expect: { rows: [['1000']] }
+    eventually: 60s
+  - source-query: { api: count /v1 }
+    expect: { rows: [['1000']] }
+
+  # One combination more (7 x 143 = 1,001) fails before any request is sent.
+  - query: SELECT count(*) FROM api WHERE request_query IN ('q=0', 'q=1', 'q=2', 'q=3', 'q=4', 'q=5', 'q=6') AND request_body IN ('b0', 'b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'b8', 'b9', 'b10', 'b11', 'b12', 'b13', 'b14', 'b15', 'b16', 'b17', 'b18', 'b19', 'b20', 'b21', 'b22', 'b23', 'b24', 'b25', 'b26', 'b27', 'b28', 'b29', 'b30', 'b31', 'b32', 'b33', 'b34', 'b35', 'b36', 'b37', 'b38', 'b39', 'b40', 'b41', 'b42', 'b43', 'b44', 'b45', 'b46', 'b47', 'b48', 'b49', 'b50', 'b51', 'b52', 'b53', 'b54', 'b55', 'b56', 'b57', 'b58', 'b59', 'b60', 'b61', 'b62', 'b63', 'b64', 'b65', 'b66', 'b67', 'b68', 'b69', 'b70', 'b71', 'b72', 'b73', 'b74', 'b75', 'b76', 'b77', 'b78', 'b79', 'b80', 'b81', 'b82', 'b83', 'b84', 'b85', 'b86', 'b87', 'b88', 'b89', 'b90', 'b91', 'b92', 'b93', 'b94', 'b95', 'b96', 'b97', 'b98', 'b99', 'b100', 'b101', 'b102', 'b103', 'b104', 'b105', 'b106', 'b107', 'b108', 'b109', 'b110', 'b111', 'b112', 'b113', 'b114', 'b115', 'b116', 'b117', 'b118', 'b119', 'b120', 'b121', 'b122', 'b123', 'b124', 'b125', 'b126', 'b127', 'b128', 'b129', 'b130', 'b131', 'b132', 'b133', 'b134', 'b135', 'b136', 'b137', 'b138', 'b139', 'b140', 'b141', 'b142')
+    expect-error: "Failed to plan the query on dataset 'api' (https): its request filters combine into 1,001 requests, more than the 1,000 allowed. Use fewer request_path, request_query, request_body or request_headers values, or set `max_request_partitions: 1001` on the dataset. See: https://spiceai.org/docs/components/data-connectors/https"
+  - source-query: { api: count /v1 }
+    expect: { rows: [['1000']] }
+  - http:
+      path: /v1/sql
+      method: POST
+      headers: { content-type: text/plain }
+      body: SELECT count(*) FROM api WHERE request_query IN ('q=0', 'q=1', 'q=2', 'q=3', 'q=4', 'q=5', 'q=6') AND request_body IN ('b0', 'b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'b8', 'b9', 'b10', 'b11', 'b12', 'b13', 'b14', 'b15', 'b16', 'b17', 'b18', 'b19', 'b20', 'b21', 'b22', 'b23', 'b24', 'b25', 'b26', 'b27', 'b28', 'b29', 'b30', 'b31', 'b32', 'b33', 'b34', 'b35', 'b36', 'b37', 'b38', 'b39', 'b40', 'b41', 'b42', 'b43', 'b44', 'b45', 'b46', 'b47', 'b48', 'b49', 'b50', 'b51', 'b52', 'b53', 'b54', 'b55', 'b56', 'b57', 'b58', 'b59', 'b60', 'b61', 'b62', 'b63', 'b64', 'b65', 'b66', 'b67', 'b68', 'b69', 'b70', 'b71', 'b72', 'b73', 'b74', 'b75', 'b76', 'b77', 'b78', 'b79', 'b80', 'b81', 'b82', 'b83', 'b84', 'b85', 'b86', 'b87', 'b88', 'b89', 'b90', 'b91', 'b92', 'b93', 'b94', 'b95', 'b96', 'b97', 'b98', 'b99', 'b100', 'b101', 'b102', 'b103', 'b104', 'b105', 'b106', 'b107', 'b108', 'b109', 'b110', 'b111', 'b112', 'b113', 'b114', 'b115', 'b116', 'b117', 'b118', 'b119', 'b120', 'b121', 'b122', 'b123', 'b124', 'b125', 'b126', 'b127', 'b128', 'b129', 'b130', 'b131', 'b132', 'b133', 'b134', 'b135', 'b136', 'b137', 'b138', 'b139', 'b140', 'b141', 'b142')
+    expect:
+      status: 400
+      json:
+        - { pointer: /error, matches: "its request filters combine into 1,001 requests, more than the 1,000 allowed\\. .*set `max_request_partitions: 1001` on the dataset" }
+  - source-query: { api: count /v1 }
+    expect: { rows: [['1000']] }
+
+  # A dataset that raises the bound runs it.
+  - query: SELECT count(*) FROM api_raised WHERE request_query IN ('q=0', 'q=1', 'q=2', 'q=3', 'q=4', 'q=5', 'q=6') AND request_body IN ('b0', 'b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'b8', 'b9', 'b10', 'b11', 'b12', 'b13', 'b14', 'b15', 'b16', 'b17', 'b18', 'b19', 'b20', 'b21', 'b22', 'b23', 'b24', 'b25', 'b26', 'b27', 'b28', 'b29', 'b30', 'b31', 'b32', 'b33', 'b34', 'b35', 'b36', 'b37', 'b38', 'b39', 'b40', 'b41', 'b42', 'b43', 'b44', 'b45', 'b46', 'b47', 'b48', 'b49', 'b50', 'b51', 'b52', 'b53', 'b54', 'b55', 'b56', 'b57', 'b58', 'b59', 'b60', 'b61', 'b62', 'b63', 'b64', 'b65', 'b66', 'b67', 'b68', 'b69', 'b70', 'b71', 'b72', 'b73', 'b74', 'b75', 'b76', 'b77', 'b78', 'b79', 'b80', 'b81', 'b82', 'b83', 'b84', 'b85', 'b86', 'b87', 'b88', 'b89', 'b90', 'b91', 'b92', 'b93', 'b94', 'b95', 'b96', 'b97', 'b98', 'b99', 'b100', 'b101', 'b102', 'b103', 'b104', 'b105', 'b106', 'b107', 'b108', 'b109', 'b110', 'b111', 'b112', 'b113', 'b114', 'b115', 'b116', 'b117', 'b118', 'b119', 'b120', 'b121', 'b122', 'b123', 'b124', 'b125', 'b126', 'b127', 'b128', 'b129', 'b130', 'b131', 'b132', 'b133', 'b134', 'b135', 'b136', 'b137', 'b138', 'b139', 'b140', 'b141', 'b142')
+    expect: { rows: [['1001']] }
+  - source-query: { api: count /v2 }
+    expect: { rows: [['1001']] }
+
+  # Values a subquery supplies are held to the same bound. The values are cast to the
+  # column's own type so the join key is the column itself, which is what lets the
+  # subquery's values become requests.
+  - query: SELECT count(*) FROM api WHERE request_query IN (SELECT arrow_cast('q=' || CAST(value AS VARCHAR), 'Utf8') FROM generate_series(1, 1001))
+    expect-error: "the values a subquery supplied for request_query combine into 1,001 requests, more than the 1,000 allowed. Filter the subquery, or set `max_request_partitions` on the dataset."
+  - source-query: { api: count /v1 }
+    expect: { rows: [['1000']] }
+  - http:
+      path: /v1/sql
+      method: POST
+      headers: { content-type: text/plain }
+      body: SELECT count(*) FROM api WHERE request_query IN (SELECT arrow_cast('q=' || CAST(value AS VARCHAR), 'Utf8') FROM generate_series(1, 1001))
+    expect:
+      status: 400
+      json:
+        - { pointer: /error, matches: "the values a subquery supplied for request_query combine into 1,001 requests, more than the 1,000 allowed\\. Filter the subquery" }
+  - source-query: { api: count /v1 }
+    expect: { rows: [['1000']] }
+
+  # A limit that is not a positive integer fails to register the dataset.
+  - assert-status:
+      dataset: bad_zero
+      status: Error
+      message-contains: "`max_request_partitions` must be a positive integer, got '0'. Set it to the most requests one query may send, or remove it to use the default of 1000."
+    eventually: 30s
+  - assert-status:
+      dataset: bad_word
+      status: Error
+      message-contains: "`max_request_partitions` must be a positive integer, got '1k'."
+    eventually: 30s
+  - assert-status:
+      dataset: bad_pages
+      status: Error
+      message-contains: "`pagination_max_pages` must be a positive integer or 'nolimit', got '1k'. Set it to the most pages one request may fetch, or remove it to use the default of 100."
+    eventually: 30s

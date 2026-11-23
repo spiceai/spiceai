@@ -1,4 +1,5 @@
 name: append-embeddings
+tags: [long]
 description: >
   Append refresh on a day-granular time column re-reads the rows on the latest
   stored date and keeps only the ones not already stored. A dataset with column

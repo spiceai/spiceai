@@ -39,10 +39,12 @@ use spec::{SpicepodDefinition, SpicepodVersion};
 
 pub mod acceleration;
 pub mod component;
+pub mod dependency;
 pub mod drasi;
 pub mod extension;
 mod field_path;
 pub mod fts;
+pub mod host_program;
 mod keywords;
 mod metadata;
 pub mod metric;
@@ -187,7 +189,7 @@ pub struct Spicepod {
 
     pub models: Vec<Model>,
 
-    pub dependencies: Vec<String>,
+    pub dependencies: Vec<dependency::Dependency>,
 
     pub embeddings: Vec<Embeddings>,
 
@@ -444,6 +446,24 @@ impl Spicepod {
             .context(UnableToOpenSpicepodSnafu { path: path.clone() })?;
 
         Self::load_from_rdr(&fs, spicepod_rdr, path).await
+    }
+
+    /// Parse a manifest that has already been read into memory, resolving
+    /// component references relative to `base_path`.
+    ///
+    /// For a caller that has verified the bytes it read: parsing them, rather
+    /// than reopening the file by name, means the manifest that is built is the
+    /// one that was checked, whatever happens to the name afterwards.
+    pub async fn load_from_bytes(
+        bytes: Vec<u8>,
+        base_path: impl Into<PathBuf>,
+    ) -> Result<Spicepod> {
+        Self::load_from_rdr(
+            &reader::StdFileSystem,
+            Box::new(std::io::Cursor::new(bytes)),
+            base_path,
+        )
+        .await
     }
 
     pub async fn load_from(
