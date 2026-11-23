@@ -1275,20 +1275,23 @@ fn config_endpoint_refused_message(
     endpoint: Option<&Url>,
     reason: &str,
 ) -> String {
-    let endpoint = endpoint
+    let http_origin = endpoint
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
         .map(Url::origin)
-        .filter(url::Origin::is_tuple)
-        .map_or_else(
-            || "a value that is not an http or https URL".to_string(),
-            |origin| format!("an endpoint on {:?}", origin.ascii_serialization()),
+        .filter(url::Origin::is_tuple);
+    let Some(origin) = http_origin else {
+        return format!(
+            "The Iceberg catalog for {component} answered `GET /v1/config` with `{key}` set to a value that is not an http or https URL, but {reason}, so no catalog request or credential is sent to it and the catalog cannot be read. Correct `{key}` in the catalog server's configuration. See: https://spiceai.org/docs/components/data-connectors/iceberg"
         );
+    };
     let param_hint = if key == REST_CATALOG_PROP_OAUTH2_SERVER_URI {
-        "set the `iceberg_oauth2_server_url` parameter to it"
+        "set the `iceberg_oauth2_server_url` parameter to its full token endpoint URL"
     } else {
-        "use it as the catalog URL in the Spicepod"
+        "use its full URL as the catalog URL in the Spicepod"
     };
     format!(
-        "The Iceberg catalog for {component} answered `GET /v1/config` with `{key}` set to {endpoint}, but {reason}, so no catalog request or credential is sent to it and the catalog cannot be read. If this endpoint is trusted, {param_hint}, or set `{}=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
+        "The Iceberg catalog for {component} answered `GET /v1/config` with `{key}` set to an endpoint on {:?}, but {reason}, so no catalog request or credential is sent to it and the catalog cannot be read. If this endpoint is trusted, {param_hint}, or set `{}=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
+        origin.ascii_serialization(),
         url_table::ALLOW_PRIVATE_HOSTS_ENV
     )
 }
@@ -1844,9 +1847,9 @@ mod tests {
 
         fn refusal(key: &str, origin: &str, reason: &str) -> String {
             let hint = if key == "uri" {
-                "use it as the catalog URL in the Spicepod"
+                "use its full URL as the catalog URL in the Spicepod"
             } else {
-                "set the `iceberg_oauth2_server_url` parameter to it"
+                "set the `iceberg_oauth2_server_url` parameter to its full token endpoint URL"
             };
             format!(
                 "The Iceberg catalog for catalog 'ice' answered `GET /v1/config` with `{key}` set to an endpoint on {origin:?}, but {reason}, so no catalog request or credential is sent to it and the catalog cannot be read. If this endpoint is trusted, {hint}, or set `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg"
@@ -1981,7 +1984,7 @@ mod tests {
                     .expect_err("a catalog URI override that is not an http URL must be refused");
                 assert_eq!(
                     err.message(),
-                    "The Iceberg catalog for catalog 'ice' answered `GET /v1/config` with `uri` set to a value that is not an http or https URL, but catalog requests and credentials are only sent to http and https endpoints, so no catalog request or credential is sent to it and the catalog cannot be read. If this endpoint is trusted, use it as the catalog URL in the Spicepod, or set `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
+                    "The Iceberg catalog for catalog 'ice' answered `GET /v1/config` with `uri` set to a value that is not an http or https URL, but catalog requests and credentials are only sent to http and https endpoints, so no catalog request or credential is sent to it and the catalog cannot be read. Correct `uri` in the catalog server's configuration. See: https://spiceai.org/docs/components/data-connectors/iceberg",
                     "{endpoint}"
                 );
             }
