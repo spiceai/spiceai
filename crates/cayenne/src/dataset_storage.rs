@@ -491,6 +491,39 @@ pub(crate) async fn delete_in_batches(
     outcome
 }
 
+/// A multipart upload of a dataset's store that sends no further part, and
+/// does not complete, once the instance stops writing the dataset: the upload
+/// then never becomes visible, and its parts are an unfinished upload the
+/// writer's orphan handling reclaims. A part already sent is not recalled.
+#[derive(Debug)]
+struct GatedUpload {
+    inner: Box<dyn MultipartUpload>,
+    writes: crate::catalog::DataWriteGate,
+    dataset: Arc<str>,
+}
+
+#[async_trait]
+impl MultipartUpload for GatedUpload {
+    fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
+        if !self.writes.allows() {
+            let refused = replica_write(&self.dataset);
+            return Box::pin(async move { Err(refused) });
+        }
+        self.inner.put_part(data)
+    }
+
+    async fn complete(&mut self) -> Result<PutResult, ObjectStoreError> {
+        if !self.writes.allows() {
+            return Err(replica_write(&self.dataset));
+        }
+        self.inner.complete().await
+    }
+
+    async fn abort(&mut self) -> Result<(), ObjectStoreError> {
+        self.inner.abort().await
+    }
+}
+
 /// The refusal of a data write on an instance that does not write `dataset`.
 fn replica_write(dataset: &str) -> ObjectStoreError {
     ObjectStoreError::Generic {
@@ -650,7 +683,12 @@ impl ObjectStore for DatasetScopedStore {
     ) -> Result<Box<dyn MultipartUpload>, ObjectStoreError> {
         self.check(location)?;
         self.check_writes()?;
-        self.inner.put_multipart_opts(location, opts).await
+        let upload = self.inner.put_multipart_opts(location, opts).await?;
+        Ok(Box::new(GatedUpload {
+            inner: upload,
+            writes: self.writes.clone(),
+            dataset: Arc::clone(&self.dataset),
+        }))
     }
 
     async fn get_opts(
@@ -944,6 +982,61 @@ mod tests {
         assert!(
             matches!(listed.as_slice(), [Err(_)]),
             "listing the whole store is refused: {listed:?}"
+        );
+    }
+
+    /// An upload that started while this instance wrote the dataset sends no
+    /// further part and never completes once another instance writes it, so
+    /// the object never becomes visible.
+    #[tokio::test]
+    async fn an_upload_stops_when_the_instance_stops_writing() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let gate = crate::catalog::DataWriteGate::open();
+        let storage = DatasetStorage::new(
+            "orders",
+            "s3://bucket/p/a",
+            "0193aaaa-bbbb-7ccc-8ddd-eeeeffff0000",
+            Arc::clone(&inner),
+            gate.for_table(),
+        )
+        .expect("storage");
+        let path = Path::from("p/a/file.vortex");
+        let mut upload = storage
+            .store()
+            .put_multipart(&path)
+            .await
+            .expect("an upload starts while this instance writes");
+        upload
+            .put_part(PutPayload::from_static(b"first"))
+            .await
+            .expect("a part goes while this instance writes");
+
+        gate.set(false);
+        let part = upload
+            .put_part(PutPayload::from_static(b"second"))
+            .await
+            .expect_err("no part goes once another instance writes");
+        assert!(
+            part.to_string()
+                .contains("accepts no change from this table"),
+            "{part}"
+        );
+        let complete = upload
+            .complete()
+            .await
+            .expect_err("the upload does not complete");
+        assert!(
+            complete
+                .to_string()
+                .contains("accepts no change from this table"),
+            "{complete}"
+        );
+        assert!(
+            matches!(
+                inner.head(&path).await,
+                Err(object_store::Error::NotFound { .. })
+            ),
+            "the object never becomes visible"
         );
     }
 
