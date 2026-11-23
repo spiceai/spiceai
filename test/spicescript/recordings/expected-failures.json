@@ -1,14 +1,4 @@
 {
-  "append-kill": [
-    {
-      "run": "append-kill",
-      "who": "object-native-local",
-      "key": "assert-files: {\"contains\":\"^state/cayenne/v1/datasets/events-[^/]+/data/\"}",
-      "kind": "other",
-      "signature": "no file matches /^state/cayenne/v1/datasets/events-[^/]+/data//",
-      "group": "cayenne"
-    }
-  ],
   "builtins": [
     {
       "run": "builtins",

@@ -112,11 +112,11 @@ steps:
     eventually: 30s
   - query: SELECT count(*) AS n, count(DISTINCT id) AS ids FROM events
 
-  # Object-native data (#16131): the dataset's folder is in the state location,
-  # and nothing is at a local `s3:` path. Appended rows sit in the memory tier
-  # and its seals, which are in the dataset's log there, until a checkpoint
-  # writes data files; the wipe below shows they are served from the location.
-  - assert-files: { contains: '^state/cayenne/v1/datasets/events-[^/]+/data/' }
+  # Object-native data (#16131): the dataset's log is in the state location,
+  # and nothing is at a local `s3:` path. With inline storage on (all but
+  # object-native-s3), appends this small are held in the log rather than in
+  # data files; the wipe below shows they are served from the location.
+  - assert-files: { contains: '^state/cayenne/v1/datasets/events-[^/]+/head$' }
     only: object-native-local
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/events-, contains: /head, min: 1 }
     only: object-native-s3

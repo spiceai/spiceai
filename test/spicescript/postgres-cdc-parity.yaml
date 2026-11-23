@@ -30,9 +30,11 @@ variants:
   object-native-position:
     spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
     datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: position, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
-  # The object-native metastore in an S3-compatible store: its head log is kept
-  # under `runtime.state.location`, in the location's `cayenne/v1/` folder, while
-  # data files stay on local disk.
+  # `object-native-key` in an S3-compatible store: the head log and the data
+  # files are both in the location's `cayenne/v1/` folder. It differs from
+  # `object-native-s3` only in flushing the in-memory CDC tier on every tick,
+  # which is its point: the log commits, seals and checkpoints many times
+  # against a real object store within a short run.
   object-native-rustfs:
     spicepod:
       runtime:
@@ -195,7 +197,8 @@ steps:
 
   # The rustfs variant's metastore is in its bucket, under the state location's
   # cayenne/v1/ folder: the name registry's head, and each dataset's own log
-  # (datasets/<name>-<id>/) with its head, sealed batches and checkpoints.
+  # (datasets/<name>-<id>/) with its head, sealed batches, checkpoints and
+  # data files.
   - assert-objects: { source: lake, prefix: state/cayenne/v1/catalog/head, min: 1 }
     only: object-native-rustfs
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: /head, min: 1 }
@@ -203,6 +206,8 @@ steps:
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: /wal/, min: 1 }
     only: object-native-rustfs
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: /checkpoints/, min: 1 }
+    only: object-native-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: /data/, min: 1 }
     only: object-native-rustfs
 
   # Changes made while spiced is stopped arrive after it starts again.
@@ -294,10 +299,7 @@ steps:
   # Expected failures (ledger): a `refresh_mode: changes` dataset is not
   # registered while its source cannot be reached, so its copy in the location
   # is not served until the source is back ("table … not found" on every
-  # object-native-data variant). On object-native-local the data files are
-  # under `.spice/data`, which the wipe removes, so `orders` then refuses to
-  # load with "Deletion vector file is missing…" even with the source back
-  # (local data is not in the location yet).
+  # object-native-data variant).
   - query: SELECT * FROM orders
     id: orders-before-wipe
     only: *object-native-data
@@ -338,8 +340,7 @@ steps:
 
   # Readers while the change stream writes (#16132): with the data in an
   # object-store location, with or without 20 ms of latency, no query fails,
-  # and the table still matches the source afterwards. (A local location does
-  # not hold data files yet, so it is not run there.)
+  # and the table still matches the source afterwards.
   - background:
       id: cdc-writes
       source-exec: { src: "UPDATE orders SET o_total = o_total + 1 WHERE o_id % 13 = ${round} % 13" }
