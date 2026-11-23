@@ -232,7 +232,7 @@ impl CatalogConnector for UnityCatalog {
 }
 
 fn table_reference_creator(uc_table: &UCTable) -> Option<TableReference> {
-    let storage_location = uc_table.storage_location.as_deref()?;
+    let storage_location = uc_table.object_storage_location()?;
     // Don't append a trailing slash here — `DeltaTable::from` calls
     // `ensure_folder_location` which already adds one when needed.
     // Unconditionally appending caused double-slash paths (e.g.
@@ -329,12 +329,12 @@ mod tests {
     /// Regression test for <https://github.com/spiceai/spiceai/issues/7904>
     /// Unity Catalog API returns `storage_location` with a trailing slash.
     /// Previously, `table_reference_creator` unconditionally appended another
-    /// slash, creating a double-slash path like `file:///path/to/table//`
+    /// slash, creating a double-slash path like `s3://bucket/path/to/table//`
     /// which caused Delta Lake to fail with "Path does not exist".
     #[test]
     fn test_table_reference_creator_no_double_slash_when_location_ends_with_slash() {
         let table = make_uc_table(Some(
-            "file:///home/unitycatalog/etc/data/managed/unity/default/tables/marksheet/",
+            "s3://bucket/unity/default/tables/marksheet/",
         ));
         let reference = table_reference_creator(&table).expect("should return Some");
         match reference {
@@ -346,7 +346,7 @@ mod tests {
                 );
                 assert_eq!(
                     table.as_ref(),
-                    "file:///home/unitycatalog/etc/data/managed/unity/default/tables/marksheet/"
+                    "s3://bucket/unity/default/tables/marksheet/"
                 );
             }
             _ => panic!("Expected Bare table reference"),
@@ -366,20 +366,20 @@ mod tests {
         }
     }
 
-    /// Edge case: `storage_location` with `file://` scheme for local paths.
+    /// A storage location on the Spice host's own filesystem is refused, so the
+    /// catalog cannot make Spice serve local files as table rows.
     #[test]
-    fn test_table_reference_creator_file_scheme() {
-        let table = make_uc_table(Some("file:///tmp/marksheet_uniform/"));
-        let reference = table_reference_creator(&table).expect("should return Some");
-        match reference {
-            TableReference::Bare { table } => {
-                assert_eq!(table.as_ref(), "file:///tmp/marksheet_uniform/");
-                assert!(
-                    !table.as_ref().ends_with("//"),
-                    "must not produce double trailing slash"
-                );
-            }
-            _ => panic!("Expected Bare table reference"),
+    fn test_table_reference_creator_refuses_local_locations() {
+        for location in [
+            "file:///tmp/marksheet_uniform/",
+            "/tmp/marksheet_uniform/",
+            "http://127.0.0.1/table",
+        ] {
+            assert_eq!(
+                table_reference_creator(&make_uc_table(Some(location))),
+                None,
+                "{location} must not be registered"
+            );
         }
     }
 

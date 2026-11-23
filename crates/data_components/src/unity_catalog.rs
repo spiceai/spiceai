@@ -603,6 +603,12 @@ pub struct UCTableEnvelope {
     pub tables: Vec<UCTable>,
 }
 
+/// URL schemes a catalog table's storage location may use when Spice reads the table directly
+/// from storage: the object stores [`credential_vending::vended_object_store`] can build.
+pub const SUPPORTED_STORAGE_SCHEMES: &[&str] = &[
+    "s3", "s3a", "abfss", "abfs", "az", "azure", "wasbs", "wasb", "gs",
+];
+
 /// Response from `/api/2.1/unity-catalog/tables/{table_name}`
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct UCTable {
@@ -643,6 +649,38 @@ impl UCTable {
             "Table '{}' is a catalog-managed Delta table and is not registered, so queries against it will not resolve. Databricks does not allow reading it directly from storage; use a catalog `mode` other than `delta_lake`. See: https://spiceai.org/docs/components/catalogs/databricks",
             self.full_name()
         )
+    }
+
+    /// The table's storage location, when Spice can read it directly from object storage.
+    ///
+    /// Returns `None` when the table has no storage location, and refuses (with a warning) a
+    /// location whose scheme is not in [`SUPPORTED_STORAGE_SCHEMES`]. The location comes from the
+    /// catalog, not from the Spicepod, so it must not reach the host filesystem or arbitrary URLs.
+    #[must_use]
+    pub fn object_storage_location(&self) -> Option<&str> {
+        let location = self.storage_location.as_deref()?;
+        if let Some(warning) = self.unsupported_storage_location_warning() {
+            tracing::warn!("{warning}");
+            return None;
+        }
+        Some(location)
+    }
+
+    /// Warning for a table whose storage location is refused by
+    /// [`UCTable::object_storage_location`], or `None` when the location is accepted or absent.
+    #[must_use]
+    pub fn unsupported_storage_location_warning(&self) -> Option<String> {
+        let location = self.storage_location.as_deref()?;
+        let reason = match Url::parse(location) {
+            Ok(url) if SUPPORTED_STORAGE_SCHEMES.contains(&url.scheme()) => return None,
+            Ok(url) => format!("its storage location uses the '{}' scheme", url.scheme()),
+            Err(_) => "its storage location is not a URL".to_string(),
+        };
+        Some(format!(
+            "Table '{}' is not registered, so queries against it will not resolve: {reason}, and catalog tables are only read from object storage ({}). See: https://spiceai.org/docs/components/catalogs",
+            self.full_name(),
+            SUPPORTED_STORAGE_SCHEMES.join(", ")
+        ))
     }
 
     /// Returns the fully qualified name of the table: `catalog.schema.table`.
@@ -923,8 +961,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        TableOperation, TemporaryTableCredentials, UCColumn, UCPermissionsEnvelope, UCPrivilege,
-        UCPrivilegeAssignment, UCTable, UCTableType,
+        SUPPORTED_STORAGE_SCHEMES, TableOperation, TemporaryTableCredentials, UCColumn,
+        UCPermissionsEnvelope, UCPrivilege, UCPrivilegeAssignment, UCTable, UCTableType,
     };
 
     fn make_table(table_type: &str) -> UCTable {
@@ -964,6 +1002,57 @@ mod tests {
             make_table("MANAGED").catalog_managed_skip_warning(),
             "Table 'catalog.schema.table' is a catalog-managed Delta table and is not registered, so queries against it will not resolve. Databricks does not allow reading it directly from storage; use a catalog `mode` other than `delta_lake`. See: https://spiceai.org/docs/components/catalogs/databricks"
         );
+    }
+
+    fn table_at(location: Option<&str>) -> UCTable {
+        UCTable {
+            storage_location: location.map(ToString::to_string),
+            ..make_table("EXTERNAL")
+        }
+    }
+
+    #[test]
+    fn object_storage_location_accepts_only_object_store_schemes() {
+        for scheme in SUPPORTED_STORAGE_SCHEMES {
+            let location = format!("{scheme}://container/path/to/table/");
+            let table = table_at(Some(&location));
+            assert_eq!(table.object_storage_location(), Some(location.as_str()));
+            assert_eq!(table.unsupported_storage_location_warning(), None);
+        }
+        let table = table_at(None);
+        assert_eq!(table.object_storage_location(), None);
+        assert_eq!(table.unsupported_storage_location_warning(), None);
+
+        for (location, reason) in [
+            (
+                "file:///tmp/table/",
+                "its storage location uses the 'file' scheme",
+            ),
+            (
+                "FILE:///tmp/table/",
+                "its storage location uses the 'file' scheme",
+            ),
+            (
+                "https://example.com/table/",
+                "its storage location uses the 'https' scheme",
+            ),
+            (
+                "memory:///table/",
+                "its storage location uses the 'memory' scheme",
+            ),
+            ("/tmp/table/", "its storage location is not a URL"),
+            ("", "its storage location is not a URL"),
+        ] {
+            let table = table_at(Some(location));
+            assert_eq!(table.object_storage_location(), None, "{location}");
+            assert_eq!(
+                table.unsupported_storage_location_warning().as_deref(),
+                Some(format!(
+                    "Table 'catalog.schema.table' is not registered, so queries against it will not resolve: {reason}, and catalog tables are only read from object storage (s3, s3a, abfss, abfs, az, azure, wasbs, wasb, gs). See: https://spiceai.org/docs/components/catalogs"
+                ).as_str()),
+                "{location}"
+            );
+        }
     }
 
     fn make_permissions(privileges: &[&str]) -> UCPermissionsEnvelope {
