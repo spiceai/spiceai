@@ -11,8 +11,8 @@ sources:
   api: { kind: mock-http }
 
 variants:
-  cayenne: {}
-  cayenne-memory: { datasets: { '*': { acceleration: { mode: memory } } } }
+  cayenne: cayenne-file
+  cayenne-memory: cayenne-memory
 
 spicepod:
   version: v1
