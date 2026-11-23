@@ -1,0 +1,79 @@
+name: location-space
+description: >
+  A Cayenne file acceleration with its data files in `runtime.state.location`
+  (#16131), where the location's path has a space in it, against the same
+  location with no space: in an S3-compatible store and in a local directory,
+  the dataset loads, takes an append and serves it after a restart, and its
+  objects are under the location's path as written (`state dir/`), never under
+  a percent-encoded copy of it (`state%20dir/`, `state%2520dir/`).
+
+sources:
+  src: { kind: postgres }
+  # The state location of the s3 variants.
+  lake: { kind: rustfs }
+
+variants:
+  s3-plain: object-native-s3
+  s3-space:
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state:
+          location: s3://${sources.lake.bucket}/state dir/
+          params:
+            s3_endpoint: ${sources.lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.lake.key}
+            s3_secret: ${sources.lake.secret}
+            allow_http: 'true'
+  local-plain: object-native-local
+  local-space:
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state: { location: 'file://${instance.dir}/state dir/' }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: location-space
+  datasets:
+    - from: postgres:public.facts
+      name: facts
+      params: ${sources.src.params}
+      time_column: ts
+      time_format: timestamptz
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: append }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE facts (id int NOT NULL, ts timestamptz NOT NULL, v int NOT NULL);
+        INSERT INTO facts SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i * 10 FROM generate_series(1, 2000) i;
+  - start: {}
+  - query: SELECT * FROM facts
+    eventually: 30s
+
+  # Placement: the data files are in the dataset's folder under the location's
+  # path as written, and nothing of Cayenne's is under a percent-encoded copy of it.
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/facts-, contains: .vortex, min: 1 }
+    only: s3-plain
+  - assert-objects: { source: lake, prefix: state dir/cayenne/v1/datasets/facts-, contains: .vortex, min: 1 }
+    only: s3-space
+  - assert-objects: { source: lake, prefix: state%, contains: /cayenne/, max: 0 }
+    only: s3-space
+  - assert-files: { contains: ['^state/cayenne/v1/datasets/facts-[^/]+/data/.+\.vortex$'] }
+    only: local-plain
+  - assert-files: { contains: ['^state dir/cayenne/v1/datasets/facts-[^/]+/data/.+\.vortex$'], lacks: ['^state%[^/]*/cayenne/'] }
+    only: local-space
+
+  - source-exec: { src: "INSERT INTO facts SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i * 10 FROM generate_series(2001, 3000) i" }
+  - refresh: facts
+  - query: SELECT count(*) AS n, sum(v) AS s FROM facts
+  - restart: {}
+  - query: SELECT * FROM facts
+    eventually: 30s

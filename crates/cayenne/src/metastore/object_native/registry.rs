@@ -610,8 +610,15 @@ fn location_anchor(location: &str, prefix: &Path) -> Option<Arc<str>> {
     }
     let folder: Vec<_> = prefix.parts().collect();
     let folder = Path::from_iter(folder[..folder.len().checked_sub(1)?].iter().cloned());
-    (url.path().trim_matches('/') == folder.as_ref())
-        .then(|| Arc::from(location.trim_end_matches('/')))
+    // The anchor is the URL's serialized form, percent-encoded as every data path
+    // URL the catalog records or compares with it is.
+    (Path::from_url_path(url.path()).ok()? == folder)
+        .then(|| Arc::from(url.as_str().trim_end_matches('/')))
+}
+
+/// The object key `url` names: its path, percent-decoded once.
+fn object_key_of(url: &url::Url) -> Option<Path> {
+    Path::from_url_path(url.path()).ok()
 }
 
 /// A new folder for dataset `name`: its slug and a fresh `UUIDv7`. A caller that
@@ -713,9 +720,9 @@ impl ObjectNativeCatalog {
     /// `…/<datasets>/<folder>/data` in this catalog's location whose folder is one
     /// [`new_dataset_folder`] makes for `name`.
     pub(super) fn folder_named_by(&self, name: &str, base_path: &str) -> Option<String> {
-        let url = url::Url::parse(base_path).ok()?;
-        let path = url.path().trim_matches('/');
-        let rest = path
+        let key = object_key_of(&url::Url::parse(base_path).ok()?)?;
+        let rest = key
+            .as_ref()
             .strip_prefix(self.datasets.as_ref())?
             .strip_prefix('/')?;
         let folder = rest.strip_suffix("/data")?;
@@ -773,17 +780,19 @@ impl ObjectNativeCatalog {
                 // Opened at a location URL: the data must be under that URL, not
                 // under the same key prefix of another bucket.
                 if let Some(anchor) = self.anchor.as_deref()
-                    && !path
+                    && !url
+                        .as_str()
                         .strip_prefix(anchor)
                         .is_some_and(|rest| rest.starts_with('/'))
                 {
                     return false;
                 }
-                url.path()
-                    .trim_matches('/')
-                    .strip_prefix(self.datasets.as_ref())
-                    .and_then(|rest| rest.strip_prefix('/'))
-                    .map(str::to_string)
+                object_key_of(&url).and_then(|key| {
+                    key.as_ref()
+                        .strip_prefix(self.datasets.as_ref())
+                        .and_then(|rest| rest.strip_prefix('/'))
+                        .map(str::to_string)
+                })
             }
             Err(_) => path
                 .trim_matches('/')

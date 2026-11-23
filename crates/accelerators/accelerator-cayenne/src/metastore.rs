@@ -524,6 +524,9 @@ impl CayenneAccelerator {
                 .await
                 .boxed()
                 .context(AccelerationInitializationFailedSnafu)?;
+                let prefix = object_store::path::Path::parse(&prefix)
+                    .boxed()
+                    .context(AccelerationInitializationFailedSnafu)?;
                 let data_store = runtime_state_location::metrics::metered(
                     Arc::clone(&store),
                     runtime_state_location::StateFeature::CayenneData,
@@ -534,9 +537,7 @@ impl CayenneAccelerator {
                             store,
                             runtime_state_location::StateFeature::CayenneMetastore,
                         ),
-                        object_store::path::Path::from(prefix)
-                            .join("v1")
-                            .join("catalog"),
+                        prefix.join("v1").join("catalog"),
                         &format!("{}/cayenne/v1", location.location.trim_end_matches('/')),
                     )
                     .await
@@ -831,7 +832,9 @@ impl CayenneAccelerator {
             .await
             .boxed()
             .context(AccelerationInitializationFailedSnafu)?;
-            let head = object_store::path::Path::from(prefix)
+            let head = object_store::path::Path::parse(&prefix)
+                .boxed()
+                .context(AccelerationInitializationFailedSnafu)?
                 .join("v1")
                 .join("catalog")
                 .join("head");
@@ -887,11 +890,18 @@ pub(super) fn location_datasets_url(
     location: &url::Url,
     datasets_prefix: &object_store::path::Path,
 ) -> Option<String> {
-    match (location.scheme(), location.host_str()) {
-        ("s3", Some(bucket)) => Some(format!("s3://{bucket}/{datasets_prefix}")),
-        ("file", None | Some("" | "localhost")) => Some(format!("file:///{datasets_prefix}")),
-        _ => None,
-    }
+    let mut url = match (location.scheme(), location.host_str()) {
+        ("s3", Some(bucket)) => url::Url::parse(&format!("s3://{bucket}/")).ok()?,
+        ("file", None | Some("" | "localhost")) => url::Url::parse("file:///").ok()?,
+        _ => return None,
+    };
+    // The prefix's parts are object keys; the URL percent-encodes each one, so
+    // decoding the URL's path gives the same keys back.
+    url.path_segments_mut()
+        .ok()?
+        .pop_if_empty()
+        .extend(datasets_prefix.parts());
+    Some(url.into())
 }
 
 /// What `source` needs that data in the object-native location does not support yet,

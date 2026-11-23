@@ -367,6 +367,11 @@ pub async fn build_unmetered_object_store(
         StateSource::FeatureSetting => location_prefix.to_string(),
     };
 
+    let cayenne = matches!(
+        feature,
+        StateFeature::CayenneMetastore | StateFeature::CayenneData
+    );
+
     if url.scheme() == "file" {
         let local_path = url
             .to_file_path()
@@ -388,10 +393,6 @@ pub async fn build_unmetered_object_store(
         // paths, as an S3 store is keyed from its bucket's root, so the
         // `file://` URL of a dataset's data folder in the location names its
         // objects the way an `s3://` URL does.
-        let cayenne = matches!(
-            feature,
-            StateFeature::CayenneMetastore | StateFeature::CayenneData
-        );
         let local = if cayenne {
             object_store_occ::LocalConditionalPut::new_durable_keyed_by_absolute_path(&local_path)
         } else {
@@ -424,6 +425,18 @@ pub async fn build_unmetered_object_store(
         && !feature.keeps_abfs_path_in_own_setting()
     {
         String::new()
+    } else if cayenne {
+        // Cayenne keys objects by the URL's path decoded once (`state dir`, not
+        // `state%20dir`), as it does in a local directory, so the `s3://` URL of
+        // a key it derives names the same object.
+        let key = object_store::path::Path::from_url_path(url.path()).map_err(|source| {
+            Error::ObjectStoreParse {
+                usage,
+                location: state_location.to_string(),
+                source: source.into(),
+            }
+        })?;
+        feature_prefix(key.as_ref())
     } else {
         feature_prefix(url.path().trim_matches('/'))
     };
@@ -802,6 +815,32 @@ mod tests {
                 "{} for {feature:?}",
                 state.location
             );
+        }
+    }
+
+    /// Cayenne's prefix in an `s3://` location is the URL's path decoded once,
+    /// as in a local directory: a space is a space in the object key, and a
+    /// literal `%` stays one `%`.
+    #[tokio::test]
+    async fn runtime_state_s3_location_decodes_the_cayenne_prefix_once() {
+        for (location, expected) in [
+            ("s3://bucket/state dir/", "state dir/cayenne"),
+            ("s3://bucket/state%20dir/", "state dir/cayenne"),
+            ("s3://bucket/100%25/", "100%/cayenne"),
+            ("s3://bucket/state/", "state/cayenne"),
+            ("s3://bucket", "cayenne"),
+        ] {
+            for feature in [StateFeature::CayenneMetastore, StateFeature::CayenneData] {
+                let (_, prefix) = build_object_store(
+                    secrets(),
+                    Handle::current(),
+                    &runtime_state(location, S3_KEY_PARAMS),
+                    feature,
+                )
+                .await
+                .expect("runtime.state store should build");
+                assert_eq!(prefix, expected, "{location} for {feature:?}");
+            }
         }
     }
 
