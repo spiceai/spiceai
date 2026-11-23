@@ -1737,6 +1737,18 @@ impl Step {
         (location, process)
     }
 
+    /// The actions besides `AddFiles` of the record that makes the step's new
+    /// files live. An append adds its files to the current snapshot, which is
+    /// live already.
+    fn live_actions(self) -> &'static [&'static str] {
+        match self {
+            Self::Overwrite => &["RemoveGroups", "SetCurrentSnapshot"],
+            Self::Merge => &["RemoveGroups", "SetGroup"],
+            Self::Upsert | Self::ChangeStreamUpsert => &["SetGroup"],
+            Self::Append => &[],
+        }
+    }
+
     fn before(self) -> Vec<(i64, i64)> {
         if self.keyed() {
             upserted(4)
@@ -2042,17 +2054,11 @@ async fn kill_at_every_request(step: Step) {
         );
         next.assert_named_files_stored(&location, &format!("{what}, after the orphan sweep"))
             .await;
-        // Only an overwrite names its files in the record that makes its
-        // snapshot current. A merge and a keyed write still name theirs a record
-        // before the one that makes the snapshot live, so a kill between the two
-        // strands them (#16709).
-        if matches!(step, Step::Overwrite) {
-            let stranded = next.rows_outside_live_snapshots().await;
-            assert!(
-                stranded.is_empty(),
-                "{what}: after every sweep the state still names files of snapshots the table does not serve: {stranded:?}"
-            );
-        }
+        let stranded = next.rows_outside_live_snapshots().await;
+        assert!(
+            stranded.is_empty(),
+            "{what}: after every sweep the state still names files of snapshots the table does not serve: {stranded:?}"
+        );
         let mut swept = next.rows("orders").await;
         swept.sort_unstable();
         assert_eq!(swept, rows, "{what}: the orphan sweep changed the rows");
@@ -2062,24 +2068,22 @@ async fn kill_at_every_request(step: Step) {
         "{step:?}: {} kill points: {killed} killed mid-step, {acknowledged} acknowledged before the kill, {unnamed_total} data files no commit names left in all",
         steps.len()
     );
-    if matches!(step, Step::Overwrite) {
-        // An overwrite names its files and makes its snapshot current in one
-        // record, so no crash leaves a snapshot named that never became live.
-        let with_files: Vec<&Vec<String>> = records
-            .iter()
-            .filter(|record| record.iter().any(|action| action == "AddFiles"))
-            .collect();
-        assert_eq!(
-            with_files.len(),
-            1,
-            "{step:?}: one record names the new snapshot's files: {records:?}"
+    // A step names its new files in the record that makes them live, so no
+    // crash leaves files named that never became live.
+    let with_files: Vec<&Vec<String>> = records
+        .iter()
+        .filter(|record| record.iter().any(|action| action == "AddFiles"))
+        .collect();
+    assert_eq!(
+        with_files.len(),
+        1,
+        "{step:?}: one record names the new snapshot's files: {records:?}"
+    );
+    for kind in step.live_actions() {
+        assert!(
+            with_files[0].iter().any(|action| action == kind),
+            "{step:?}: the record that names the files has no {kind}: {records:?}"
         );
-        for kind in ["RemoveGroups", "SetCurrentSnapshot"] {
-            assert!(
-                with_files[0].iter().any(|action| action == kind),
-                "{step:?}: the record that names the files has no {kind}: {records:?}"
-            );
-        }
     }
 }
 

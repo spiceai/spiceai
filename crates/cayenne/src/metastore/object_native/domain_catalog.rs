@@ -624,12 +624,16 @@ impl MetadataCatalog for Domain {
         old_snapshot_ids: &[String],
         new_snapshot_id: &str,
         new_sequence_number: i64,
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<bool> {
         validate_uuid("table_id", table_id)?;
         validate_uuid("new_snapshot_id", new_snapshot_id)?;
         for id in old_snapshot_ids {
             validate_uuid("old_snapshot_id", id)?;
         }
+        let manifest = files
+            .map(|files| snapshot_manifest_action(table_id, new_snapshot_id, files))
+            .transpose()?;
         let mut inner = self.inner.take().await;
         let table = inner.table(table_id)?;
         let unique: std::collections::BTreeSet<_> = old_snapshot_ids.iter().collect();
@@ -645,12 +649,14 @@ impl MetadataCatalog for Domain {
         // manifest rows: a scan that captured them as live before the in-memory
         // swap still reads them from those rows. The retirement sweep forgets
         // the rows together with the files, once no scan holds them.
-        inner
-            .commit(vec![
-                actions::remove_groups(table_id, proto::Select::Listed, old_snapshot_ids, true),
-                actions::set_group(table_id, new_snapshot_id, new_sequence_number),
-            ])
-            .await?;
+        let mut batch = vec![
+            actions::remove_groups(table_id, proto::Select::Listed, old_snapshot_ids, true),
+            actions::set_group(table_id, new_snapshot_id, new_sequence_number),
+        ];
+        // After the swap, so the record checks the merged snapshot's files
+        // against the files it retires.
+        batch.extend(manifest);
+        inner.commit(batch).await?;
         Ok(true)
     }
     async fn commit_overwrite(
