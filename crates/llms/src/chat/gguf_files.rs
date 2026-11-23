@@ -660,8 +660,8 @@ fn answers_to(quantization: &Quantization, entry: &str) -> bool {
 /// Resolves a model's `files` against the repository listing. An exact `.gguf` path is
 /// honoured, with the sibling shards of a shard, a draft head's included; any other entry names
 /// a quantization, by its name, the folder that holds only it, or its tag or path stem, which
-/// brings all its shards and, unless a draft head or a drafter ([`resolve_with_drafters`]) is
-/// named, the repository's draft head.
+/// brings all its shards and, unless a draft head is named, the repository's draft head; a
+/// drafter told by its header replaces that head through [`resolve_with_drafters`].
 /// Another file the repository has is left to the engine, and so is every entry of a
 /// repository that offers no GGUF quantization. `Ok(None)` when `files` names no GGUF weights.
 ///

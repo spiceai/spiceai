@@ -396,8 +396,9 @@ impl Snapshot {
     }
 
     /// Whether the snapshot lists only the files the cache holds because `HF_HUB_OFFLINE` or
-    /// `TRANSFORMERS_OFFLINE` is set, which lasts until the process restarts without it. With the Hub out of reach
-    /// instead, a later snapshot can list the repository's files again.
+    /// `TRANSFORMERS_OFFLINE` is set, which lasts until the process restarts without them.
+    /// With the Hub out of reach instead, a later snapshot can list the repository's files
+    /// again.
     #[must_use]
     pub fn is_offline(&self) -> bool {
         matches!(self.source, Source::OfflineCache { .. })

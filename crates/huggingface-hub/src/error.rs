@@ -179,8 +179,9 @@ impl DownloadError {
 
     /// The repository's files, as the snapshot lists them, cannot be used; `message` says why,
     /// as the clause after a colon. When the snapshot lists only the cache, the error says so
-    /// and what clears it (how to fill the cache, or, when the Hub refused the request, the fix
-    /// for the token, the access conditions or the limit), and `message` reads after "where":
+    /// and what clears it (offline, how to fill the cache; in an outage, to check the network;
+    /// when the Hub refused the request, the fix for the token, the access conditions or the
+    /// limit), and `message` reads after "where":
     /// it says what the cache's listing lacks, since the repository, which was not read, may
     /// hold it.
     #[must_use]
