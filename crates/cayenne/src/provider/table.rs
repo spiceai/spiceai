@@ -58118,10 +58118,8 @@ mod tests {
                         .expect("restart");
                     restarted.install_slot_advancer(Arc::new(NoopSlotAdvancer));
                     let ids = |v: Vec<(i64, i64)>| v.into_iter().map(|(id, _)| id).collect();
-                    seen.lock().push((
-                        "after_open",
-                        ids(collect_id_value_pairs(&ctx, &restarted, table).await),
-                    ));
+                    let got = ids(collect_id_value_pairs(&ctx, &restarted, table).await);
+                    seen.lock().push(("after_open", got));
                     let surviving: Vec<i64> =
                         all.iter().copied().filter(|id| id % 11 != 0).collect();
                     let values: Vec<i64> = surviving.iter().map(|id| id * 10 + 1).collect();
@@ -58131,25 +58129,19 @@ mod tests {
                         id_value_batch(Arc::clone(&schema), &surviving, &values),
                     )
                     .await;
-                    seen.lock().push((
-                        "after_overwrite",
-                        ids(collect_id_value_pairs(&ctx, &restarted, table).await),
-                    ));
+                    let got = ids(collect_id_value_pairs(&ctx, &restarted, table).await);
+                    seen.lock().push(("after_overwrite", got));
                     let deleted: Vec<i64> = all.iter().copied().filter(|id| id % 11 == 0).collect();
                     restarted
                         .write_cdc_delete_keys_in_memory(&int64_id_batch(&deleted))
                         .await
                         .expect("replayed delete");
-                    seen.lock().push((
-                        "after_delete",
-                        ids(collect_id_value_pairs(&ctx, &restarted, table).await),
-                    ));
+                    let got = ids(collect_id_value_pairs(&ctx, &restarted, table).await);
+                    seen.lock().push(("after_delete", got));
                     // Lazy recovery: a later scan, after the work above, must agree.
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    seen.lock().push((
-                        "later",
-                        ids(collect_id_value_pairs(&ctx, &restarted, table).await),
-                    ));
+                    let got = ids(collect_id_value_pairs(&ctx, &restarted, table).await);
+                    seen.lock().push(("later", got));
                 })
             }));
         }
