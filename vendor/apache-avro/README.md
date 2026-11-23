@@ -38,8 +38,14 @@ decodes an item, and moving to it needs a matching `iceberg` release, so the fix
   `MemoryAllocation` error. Nested collections share the budget, so they cannot multiply it.
 - The other values the decoder builds without copying them from the input debit the same budget:
   each record its field list (`size_of::<(String, Value)>()` per field) plus its field-name bytes,
-  each union its boxed `Value`, and each enum its symbol bytes. Strings, bytes and fixed values are
-  copies of input bytes, so the input length already bounds them.
+  each union its boxed `Value`, and each enum its symbol bytes.
+- A fixed value's size, which comes from the schema, is checked against `max_allocation_bytes`
+  before its buffer is allocated, as 0.21.0 already does for the declared length of bytes and
+  strings. Before, a one-byte body with a `fixed` schema of 1 TiB allocated the whole buffer and
+  kept about 1 GB of it resident after the decode failed.
+- Bytes, strings and fixed values are not debited from the budget: each is allocated at its
+  declared length, at most 512 MiB, and survives the decode only once the input has filled it, so
+  what a datum keeps of them is bounded by the input length.
 - The array and map arms reserve at most `MAX_PREALLOCATED_ITEMS` (1024) items before decoding.
   Past that, the collection grows as items actually decode, so a declared count with no items
   behind it costs a bounded allocation.

@@ -87,7 +87,10 @@ const MAX_PREALLOCATED_ITEMS: usize = 1024;
 /// map blocks their declared item count at the in-memory size of an item, and
 /// records, unions and enums the field list, box or symbol they build. Values
 /// such as `null`, or a record of them, encode in zero bytes, so the budget, not
-/// the input length, is what bounds how many of them one datum can hold.
+/// the input length, is what bounds how many of them one datum can hold. Bytes,
+/// strings and fixed values are not debited: each is allocated at its declared
+/// length, which [`safe_len`] caps at [`max_allocation_bytes`], and is kept only
+/// once the input has filled it.
 pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
     schema: &Schema,
     names: &HashMap<Name, S>,
@@ -231,7 +234,7 @@ fn decode_with_budget<R: Read, S: Borrow<Schema>>(
             }
         }
         Schema::Fixed(FixedSchema { size, .. }) => {
-            let mut buf = vec![0u8; size];
+            let mut buf = vec![0u8; safe_len(size)?];
             reader
                 .read_exact(&mut buf)
                 .map_err(|e| Details::ReadFixed(e, size))?;

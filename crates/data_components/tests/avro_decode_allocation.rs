@@ -222,4 +222,41 @@ fn declared_collection_sizes_do_not_drive_allocation() {
             "{schema}: a block of zero-byte items grew the heap by {peak} bytes"
         );
     }
+
+    // An enum item encodes in one byte but clones its symbol, so one byte of
+    // input per 4,096-byte symbol spends the same remaining budget.
+    let symbol = format!("S{}", "a".repeat(4095));
+    let enum_array = format!(
+        r#"{{"type": "array", "items": {{"type": "enum", "name": "e", "symbols": ["{symbol}"]}}}}"#
+    );
+    let mut enum_body = block_of_9m.clone();
+    enum_body.resize(enum_body.len() + 9_000, 0);
+    let (error, peak) = decode_error_and_peak_heap(&runtime, &enum_array, &enum_body);
+    assert_eq!(
+        error,
+        format!(
+            "Failed to decode Avro datum: Unable to allocate {} bytes (maximum allowed: {MAX_ALLOCATION_BYTES})",
+            symbol.len()
+        )
+    );
+    assert!(
+        peak < 48 * 1024 * 1024,
+        "an array of enum items grew the heap by {peak} bytes"
+    );
+
+    // A fixed value's size comes from the schema, and its buffer is allocated
+    // before the input is read.
+    let fixed_size: usize = 1 << 40;
+    let fixed = format!(r#"{{"type": "fixed", "name": "f", "size": {fixed_size}}}"#);
+    let (error, peak) = decode_error_and_peak_heap(&runtime, &fixed, b"x");
+    assert_eq!(
+        error,
+        format!(
+            "Failed to decode Avro datum: Unable to allocate {fixed_size} bytes (maximum allowed: {MAX_ALLOCATION_BYTES})"
+        )
+    );
+    assert!(
+        peak < MAX_HEAP_BYTES,
+        "a one-byte body with a {fixed_size}-byte fixed schema grew the heap by {peak} bytes"
+    );
 }
