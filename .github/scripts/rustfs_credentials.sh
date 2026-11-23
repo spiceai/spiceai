@@ -82,7 +82,11 @@ if [ "$status" -ne 0 ]; then
   fail "Could not exchange the OIDC token with RustFS (curl exit $status, HTTP $code)."
 fi
 if [ "$code" != 200 ]; then
-  fail "RustFS refused the OIDC token (HTTP $code): $(xml_value Code): $(xml_value Message)"
+  # The store's own reason, with the token cut out should the store repeat it: nothing this
+  # script prints may carry a credential, so no caller has to mask one.
+  reason="$(xml_value Code): $(xml_value Message)"
+  reason="${reason//"$oidc_token"/***}"
+  fail "RustFS refused the OIDC token (HTTP $code): $reason"
 fi
 
 access_key="$(xml_value AccessKeyId)"

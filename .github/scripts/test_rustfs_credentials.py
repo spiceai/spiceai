@@ -143,6 +143,16 @@ class RustfsCredentialsActionTest(unittest.TestCase):
         )
         self.assertEqual(outputs, "")
 
+    def test_a_refusal_that_repeats_the_token_does_not_log_it(self):
+        self.store.sts_status = 400
+        self.store.sts_error_message = f"Invalid token {OIDC_TOKEN}"
+        proc, _, _ = self.run_action()
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn(OIDC_TOKEN, proc.stdout + proc.stderr)
+        self.assertIn(
+            "::error::RustFS refused the OIDC token (HTTP 400): AccessDenied: Invalid token ***", proc.stdout
+        )
+
     def test_an_answer_without_credentials_fails(self):
         self.store.sts_credentials = ("", "", "")
         proc, outputs, _ = self.run_action()

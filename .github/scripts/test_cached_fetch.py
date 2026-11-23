@@ -115,6 +115,7 @@ class Server:
         self.put_status = 200
         self.sts_requests = []
         self.sts_status = 200
+        self.sts_error_message = "No policy for this repository"
         self.sts_credentials = (ACCESS_KEY, SECRET_KEY, SESSION_TOKEN)
         server = self
 
@@ -140,9 +141,9 @@ class Server:
                 server.sts_requests.append(form)
                 if server.sts_status != 200:
                     status, reply = server.sts_status, (
-                        b"<ErrorResponse><Error><Code>AccessDenied</Code>"
-                        b"<Message>No policy for this repository</Message></Error></ErrorResponse>"
-                    )
+                        "<ErrorResponse><Error><Code>AccessDenied</Code>"
+                        f"<Message>{server.sts_error_message}</Message></Error></ErrorResponse>"
+                    ).encode()
                 elif (
                     form.get("Action") != "AssumeRoleWithWebIdentity"
                     or form.get("WebIdentityToken") != OIDC_TOKEN
@@ -471,6 +472,16 @@ class CachedFetchTest(unittest.TestCase):
             "RustFS refused the OIDC token (HTTP 403): AccessDenied: No policy for this repository",
             proc.stdout,
         )
+
+    def test_a_refusal_that_repeats_the_token_does_not_log_it(self):
+        self.cache.sts_status = 400
+        self.cache.sts_error_message = f"Invalid token {OIDC_TOKEN} for this role"
+        self.source.script[SOURCE_PATH] = [CONTENT]
+        proc = self.run_fetch(oidc=True)
+        self.assert_fetched(proc)
+        self.assert_no_write_attempt()
+        self.assertNotIn(OIDC_TOKEN, proc.stdout + proc.stderr)
+        self.assertIn("AccessDenied: Invalid token *** for this role", proc.stdout)
 
     def test_a_token_github_will_not_issue_skips_the_write_with_a_warning(self):
         self.github.status = 500
