@@ -1714,6 +1714,33 @@ pub(crate) const SEQ_RESERVE_BLOCK: i64 = 1024;
 /// BEFORE advancing `next` past the newly reserved range, so a crash/restart
 /// reseeds from a DB high-water that is `>=` every value ever handed out and
 /// therefore never reissues one. See `reserve_sequences_local`.
+/// The head confirmations of a replica's table, shared by its concurrent
+/// scans. Each scan needs a confirmation whose read was sent after it arrived;
+/// one poll runs at a time, and a scan that waited behind a poll sent after it
+/// arrived uses that poll's result instead of reading the head again.
+#[derive(Debug)]
+struct HeadFollow {
+    /// Serializes polls; held across the read of the head and the reload.
+    lock: tokio::sync::Mutex<()>,
+    /// Polls started, numbered from 1.
+    started: AtomicU64,
+    /// The number of the last poll that completed, reload included.
+    done: AtomicU64,
+    /// Open while this instance writes the table, which then needs no poll.
+    writes: crate::catalog::DataWriteGate,
+}
+
+impl HeadFollow {
+    fn new(writes: crate::catalog::DataWriteGate) -> Self {
+        Self {
+            lock: tokio::sync::Mutex::new(()),
+            started: AtomicU64::new(0),
+            done: AtomicU64::new(0),
+            writes,
+        }
+    }
+}
+
 pub(crate) struct SeqAllocator {
     /// Next sequence number to hand out.
     next: i64,
@@ -2864,6 +2891,9 @@ pub struct CayenneTableProvider {
     /// loads plus a cache-hit inlined read); writers take **write** around the
     /// matching publish.
     scan_state_lock: Arc<tokio::sync::RwLock<()>>,
+    /// Shares one head confirmation among the concurrent scans of a replica.
+    /// Shared across all clones for the same table.
+    head_follow: Arc<HeadFollow>,
     /// The dataset's store, for a table whose data path is an object-store URL:
     /// `url` is `cayenne://<table id>/` and `store` is [`Self::dataset_storage`]'s
     /// store, registered under that URL in each `RuntimeEnv` the table uses.
@@ -12267,6 +12297,9 @@ impl CayenneTableProvider {
             persisted_hi,
             writes: catalog.data_write_gate(&table_id).for_table(),
         }));
+        let head_follow = Arc::new(HeadFollow::new(
+            catalog.data_write_gate(&table_id).for_table(),
+        ));
 
         let force_staging_probe_on_startup = dataset_storage.is_some();
         // A replacement inherits the replaced instance's pins; any other
@@ -12463,6 +12496,7 @@ impl CayenneTableProvider {
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
             scan_state_lock: Arc::new(tokio::sync::RwLock::new(())),
+            head_follow,
             object_store_config,
             dataset_storage,
             data_root,
@@ -14915,6 +14949,7 @@ impl CayenneTableProvider {
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             visibility_lock: Arc::clone(&self.visibility_lock),
             scan_state_lock: Arc::clone(&self.scan_state_lock),
+            head_follow: Arc::clone(&self.head_follow),
             object_store_config: self.object_store_config.clone(),
             dataset_storage: self.dataset_storage.clone(),
             data_root: Arc::clone(&self.data_root),
@@ -35195,6 +35230,20 @@ impl CayenneTableProvider {
     /// Returns an error when the head cannot be read or the reload fails; the
     /// query then fails rather than answer from a state it could not confirm.
     pub async fn follow_writer(&self) -> Result<()> {
+        let follow = &self.head_follow;
+        // The instance that writes the table is current by construction.
+        if follow.writes.allows() {
+            return Ok(());
+        }
+        // A confirmation serves this scan only if its read was sent after the
+        // scan arrived: polls are numbered as they start, so one numbered past
+        // what had started by now was sent after it.
+        let wanted = follow.started.load(Ordering::Acquire) + 1;
+        let _poll = follow.lock.lock().await;
+        if follow.done.load(Ordering::Acquire) >= wanted {
+            return Ok(());
+        }
+        let number = follow.started.fetch_add(1, Ordering::AcqRel) + 1;
         let moved = self
             .catalog
             .follow_commits(&self.table_metadata.table_id)
@@ -35205,6 +35254,9 @@ impl CayenneTableProvider {
             self.reload_from_catalog().await?;
             self.reload_cached_statistics_and_inline_state().await?;
         }
+        // Published only once the reload is done, so a scan that relies on this
+        // confirmation never plans against caches older than the head it read.
+        follow.done.store(number, Ordering::Release);
         Ok(())
     }
 

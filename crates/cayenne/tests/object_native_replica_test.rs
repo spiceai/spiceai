@@ -290,3 +290,97 @@ async fn a_replica_follows_keyed_inlined_upserts_and_deletes() {
     })
     .await;
 }
+
+/// Concurrent queries on a replica share one read of the dataset head, and a
+/// query only shares a read sent after it started. One query's read is held in
+/// flight while A commits and sixteen more queries start: those sixteen cannot
+/// use the held read, sent before they started, so they share exactly one
+/// more, and every query returns A's commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_replica_queries_share_one_head_read_sent_after_they_start() {
+    let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let replica_requests = Arc::new(FaultStore::new(Arc::clone(&objects)));
+    let replica_store: Arc<dyn ObjectStore> = Arc::clone(&replica_requests) as Arc<dyn ObjectStore>;
+
+    let (a, data_url) = Instance::open(&objects, Access::Writer).await;
+    let table = a
+        .builder(&objects, &data_url)
+        .create(CreateTableOptions {
+            table_name: TABLE.to_string(),
+            schema: schema(),
+            primary_key: Vec::new(),
+            on_conflict: None,
+            base_path: data_url.clone(),
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        })
+        .await
+        .expect("create the table on A");
+    a.register(table);
+    a.insert(1, 100).await.expect("A writes 1..=100");
+
+    let (b, _) = Instance::open(&replica_store, Access::Replica).await;
+    let table = b
+        .builder(&replica_store, &data_url)
+        .open(TABLE)
+        .await
+        .expect("open the table on B");
+    b.register(table);
+    let b = Arc::new(b);
+    assert_eq!(b.count_and_sum().await, expected(1..=100), "B before");
+
+    let is_head = |path: &Path| path.filename() == Some("head");
+    let head_polls = |from: usize| {
+        replica_requests.log()[from..]
+            .iter()
+            .filter(|request| request.op == Op::GetConditional && is_head(&request.path))
+            .count()
+    };
+    let from = replica_requests.log().len();
+    replica_requests.gate_polls(is_head);
+
+    // The first query's read of the head is held before it is sent.
+    let first = tokio::spawn({
+        let b = Arc::clone(&b);
+        async move { b.count_and_sum().await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(30), replica_requests.wait_gated(1))
+        .await
+        .expect("a query on B confirms the head with a read sent after it started");
+
+    a.insert(101, 200).await.expect("A writes 101..=200");
+
+    // Sixteen queries start after A's commit, while the first read is held:
+    // each runs until it waits for the read in flight.
+    let mut later: Vec<_> = (0..16)
+        .map(|_| {
+            let b = Arc::clone(&b);
+            Box::pin(async move { b.count_and_sum().await })
+        })
+        .collect();
+    for query in &mut later {
+        assert!(
+            futures::poll!(query.as_mut()).is_pending(),
+            "a later query waits for the read in flight"
+        );
+    }
+
+    replica_requests.open_reads();
+    assert_eq!(
+        first.await.expect("first query"),
+        expected(1..=200),
+        "the first query"
+    );
+    for (index, query) in later.into_iter().enumerate() {
+        assert_eq!(
+            query.await,
+            expected(1..=200),
+            "later query {index} returns A's commit"
+        );
+    }
+    assert_eq!(
+        head_polls(from),
+        2,
+        "the held read, and one more shared by the sixteen later queries"
+    );
+}
