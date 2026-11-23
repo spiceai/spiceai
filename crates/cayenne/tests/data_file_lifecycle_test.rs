@@ -2042,10 +2042,10 @@ async fn kill_at_every_request(step: Step) {
         );
         next.assert_named_files_stored(&location, &format!("{what}, after the orphan sweep"))
             .await;
-        // An overwrite names its files in the record that makes its snapshot
-        // current. A merge and a keyed write name theirs a record before the
-        // one that makes the snapshot live, so a kill between the two strands
-        // them.
+        // Only an overwrite names its files in the record that makes its
+        // snapshot current. A merge and a keyed write still name theirs a record
+        // before the one that makes the snapshot live, so a kill between the two
+        // strands them (#16709).
         if matches!(step, Step::Overwrite) {
             let stranded = next.rows_outside_live_snapshots().await;
             assert!(

@@ -117,10 +117,9 @@ pub struct PreparedOverwrite {
     delete_files: Vec<DeleteFile>,
     /// The file-local positions `delete_files` hide, per data file.
     position_deletions: HashMap<String, Vec<u32>>,
-    /// The new snapshot's manifest, for a table in the object-native location:
-    /// recorded by the commit that makes the snapshot current. Empty when the
-    /// manifest was recorded before that commit, or there is none.
-    manifest: Vec<SnapshotFile>,
+    /// The new snapshot's manifest, for the commit to record; `None` when it is
+    /// recorded already, or there is none.
+    manifest: Option<Vec<SnapshotFile>>,
 }
 
 impl std::fmt::Debug for PreparedOverwrite {
@@ -191,13 +190,13 @@ impl PreparedOverwrite {
         catalog: &CayenneCatalog,
         txn: &mut dyn MetastoreTransaction,
     ) -> CatalogResult<()> {
-        if !self.manifest.is_empty() {
+        if let Some(manifest) = &self.manifest {
             catalog
                 .replace_snapshot_files_in_txn(
                     txn,
                     self.table_id(),
                     &self.new_snapshot_id,
-                    &self.manifest,
+                    manifest,
                 )
                 .await?;
         }
@@ -233,11 +232,11 @@ impl PreparedOverwrite {
                 &self.new_snapshot_id,
                 self.inlined.as_ref(),
                 &self.delete_files,
-                &self.manifest,
+                self.manifest.as_deref(),
             )
             .await?;
-        if !self.manifest.is_empty() {
-            // The commit names the files now: they are no longer a write in flight.
+        if self.manifest.is_some() {
+            // Named by the commit, the files are no longer a write in flight.
             self.table.uncommitted_files().forget(&self.new_snapshot_id);
         }
         Ok(())
@@ -677,7 +676,7 @@ impl CayenneTableProvider {
                     _inline_admission: Some(inlined.admission),
                     delete_files: Vec::new(),
                     position_deletions: HashMap::new(),
-                    manifest: Vec::new(),
+                    manifest: None,
                 });
             }
             OverwriteAdmission::Fallback(stream) => stream,
@@ -866,14 +865,13 @@ impl CayenneTableProvider {
         // prune. Skip authoring entirely and leave the scan on directory listing.
         //
         // A table in the object-native location scans only its manifest, so an
-        // overwrite does not commit a snapshot the manifest lacks. Its manifest
-        // is recorded by the commit that makes the snapshot current: a manifest
-        // committed on its own would name a snapshot that a crash before the
-        // flip leaves never current, whose files no sweep reclaims.
-        let mut manifest = Vec::new();
+        // overwrite does not commit a snapshot the manifest lacks, and records
+        // the manifest in the commit that makes the snapshot current.
+        let in_location = self.data_in_object_native_location();
+        let mut manifest = None;
         match self.reserve_sequences_local(1).await {
-            Ok(overwrite_sequence) if self.data_in_object_native_location() => {
-                match self
+            Ok(overwrite_sequence) => {
+                let recorded = match self
                     .uniform_snapshot_manifest_rows(
                         &new_snapshot_id,
                         overwrite_sequence,
@@ -881,22 +879,18 @@ impl CayenneTableProvider {
                     )
                     .await
                 {
-                    Ok(rows) => manifest = rows,
-                    Err(error) => {
+                    Ok(rows) if in_location => {
+                        manifest = Some(rows);
+                        Ok(())
+                    }
+                    Ok(rows) => self.record_snapshot_manifest(&new_snapshot_id, &rows).await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = recorded {
+                    if in_location {
                         self.abandon_overwrite_snapshot(&new_snapshot_id).await;
                         return Err(super::Error::Catalog { source: error });
                     }
-                }
-            }
-            Ok(overwrite_sequence) => {
-                if let Err(error) = self
-                    .author_uniform_snapshot_manifest(
-                        &new_snapshot_id,
-                        overwrite_sequence,
-                        overwrite_sequence,
-                    )
-                    .await
-                {
                     tracing::warn!(
                         table = self.table_name(),
                         %error,
@@ -906,7 +900,7 @@ impl CayenneTableProvider {
                     );
                 }
             }
-            Err(error) if self.data_in_object_native_location() => {
+            Err(error) if in_location => {
                 self.abandon_overwrite_snapshot(&new_snapshot_id).await;
                 return Err(super::Error::Catalog { source: error });
             }

@@ -4148,7 +4148,7 @@ impl MetadataCatalog for CayenneCatalog {
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
         delete_files: &[crate::metadata::DeleteFile],
-        files: &[SnapshotFile],
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()> {
         // Same retry-on-conflict shape as commit_compaction; the only
         // additional work happens inside the transaction via
@@ -4171,7 +4171,7 @@ impl MetadataCatalog for CayenneCatalog {
             })?;
 
             let applied = async {
-                if !files.is_empty() {
+                if let Some(files) = files {
                     self.replace_snapshot_files_in_txn(&mut *tx, table_id, new_snapshot_id, files)
                         .await?;
                 }

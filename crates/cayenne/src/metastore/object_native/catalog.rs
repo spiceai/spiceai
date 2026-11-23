@@ -513,7 +513,7 @@ impl MetadataCatalog for ObjectNativeCatalog {
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
         delete_files: &[crate::metadata::DeleteFile],
-        files: &[SnapshotFile],
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()> {
         self.for_table(table_id)
             .commit_overwrite(table_id, new_snapshot_id, inlined, delete_files, files)
