@@ -314,7 +314,10 @@ impl ObjectNativeCatalog {
             routes.refresh(&domain, domain.tables().await);
             routes.datasets.insert(name, domain);
         }
-        registry.commit_actions(stale).await?;
+        // Only the instance that writes the registry removes its stale entries.
+        if registry.data_writes.allows() {
+            registry.commit_actions(stale).await?;
+        }
         let catalog = Self {
             store,
             data_store: None,
@@ -410,6 +413,11 @@ impl ObjectNativeCatalog {
         options: CreateTableOptions,
     ) -> CatalogResult<String> {
         let name = options.table_name.clone();
+        // Another instance writes the registry: it creates the dataset when it
+        // loads it, and this instance opens what it created.
+        if !self.registry.data_writes.allows() && !self.routes.read().by_name.contains_key(&name) {
+            self.wait_for_registration(&name).await?;
+        }
         let (existing, parent) = {
             let routes = self.routes.read();
             let parent = routes
@@ -725,6 +733,72 @@ impl ObjectNativeCatalog {
     pub fn data_store(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(self.data_store.as_ref().unwrap_or(&self.store))
     }
+    /// Open the logs of datasets the registry names that this catalog has not
+    /// opened yet: datasets another instance created since this one opened.
+    async fn open_new_dataset_logs(&self) -> CatalogResult<()> {
+        for (name, folder) in self.registry.positions_under(REGISTRY).await {
+            if self.routes.read().datasets.contains_key(&name) {
+                continue;
+            }
+            let folder = String::from_utf8(folder).map_err(invalid)?;
+            let prefix = self.datasets.clone().join(folder.as_str());
+            match self.store.head(&prefix.clone().join("head")).await {
+                Ok(_) => {}
+                // Registered, and its log not created yet.
+                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(error) => return Err(invalid(error)),
+            }
+            let mut domain = Domain::open_with_config(
+                Arc::clone(&self.store),
+                prefix,
+                self.config,
+                self.config.commit_each_change,
+                self.anchor.clone(),
+                &name,
+            )
+            .await?;
+            domain.folder = folder;
+            let domain = Arc::new(domain);
+            keep_lease_while_open(&domain);
+            let tables = domain.tables().await;
+            let mut routes = self.routes.write();
+            routes.refresh(&domain, tables);
+            routes.datasets.insert(name, domain);
+        }
+        Ok(())
+    }
+
+    /// Wait until the instance that writes the registry has registered dataset
+    /// `name`, following the registry and opening the logs of the datasets it
+    /// gains; or until this instance writes the registry itself, which then
+    /// creates the dataset. Two instances started together on an empty location
+    /// both load the dataset, and only the one writing the registry creates it.
+    async fn wait_for_registration(&self, name: &str) -> CatalogResult<()> {
+        let lease = match self.config.access {
+            super::Access::Leased(settings) => settings.duration,
+            super::Access::Writer | super::Access::Replica => {
+                super::LeaseSettings::default().duration
+            }
+        };
+        let deadline = tokio::time::Instant::now() + lease * 4;
+        loop {
+            if self.registry.data_writes.allows() {
+                return Ok(());
+            }
+            self.registry.follow_commits("").await?;
+            self.open_new_dataset_logs().await?;
+            if self.routes.read().by_name.contains_key(name) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(invalid(format!(
+                    "Dataset '{name}' (cayenne) is not in the shared state location yet, and another Spice instance writes the location, so this instance waits for that instance to create it rather than create a second copy. Load the dataset on the instance that writes the location, or retry once it has."
+                )));
+            }
+            tokio::time::sleep((lease / 6).max(std::time::Duration::from_millis(50))).await;
+        }
+    }
+
     /// Follow whether this instance writes dataset `name`: `true` while it
     /// does, changing when another instance takes it over or this one does.
     /// `None` when no log holds the dataset.

@@ -130,6 +130,48 @@ impl Instance {
         self.data_url.clone()
     }
 
+    /// Load the dataset as the accelerator does: open it when the catalog
+    /// holds it, create it otherwise.
+    async fn open_or_create(&self) -> Result<(), String> {
+        match self.catalog.get_table(TABLE).await {
+            Ok(_) => {
+                let table = self
+                    .builder(&self.data_url)
+                    .open(TABLE)
+                    .await
+                    .map_err(|error| format!("open: {error}"))?;
+                self.ctx
+                    .register_table(TABLE, Arc::new(table))
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            }
+            Err(cayenne::CatalogError::TableNotFound { .. }) => {
+                let table = self
+                    .builder(&self.data_url)
+                    .create(CreateTableOptions {
+                        table_name: TABLE.to_string(),
+                        schema: schema(),
+                        primary_key: Vec::new(),
+                        on_conflict: None,
+                        base_path: self.data_url.clone(),
+                        partition_column: None,
+                        vortex_config: VortexConfig {
+                            inline_max_rows: 0,
+                            inline_max_bytes: 0,
+                            ..VortexConfig::default()
+                        },
+                    })
+                    .await
+                    .map_err(|error| format!("create: {error}"))?;
+                self.ctx
+                    .register_table(TABLE, Arc::new(table))
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            }
+            Err(error) => Err(format!("get_table: {error}")),
+        }
+    }
+
     /// Open (or open again) the table, as the runtime does when it loads a
     /// dataset or reloads it after taking it over.
     async fn open_table(&self, data_url: &str) {
@@ -212,6 +254,31 @@ impl Instance {
             }
         }
     }
+}
+
+/// Two instances start together on an empty location, as a deployment of two
+/// replicas does, and each loads the dataset the way the accelerator does:
+/// open it if the location holds it, create it otherwise. Both serve it, and
+/// exactly one writes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_instances_starting_together_both_serve_the_dataset() {
+    let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (a, b) = tokio::join!(
+        Instance::start(&objects, "a", LEASE),
+        Instance::start(&objects, "b", LEASE)
+    );
+    let (loaded_a, loaded_b) = tokio::join!(a.open_or_create(), b.open_or_create());
+    loaded_a.expect("A loads the dataset");
+    loaded_b.expect("B loads the dataset");
+
+    // Whichever writes it takes the rows; both serve them.
+    let (written_a, written_b) = tokio::join!(a.insert(1, 100), b.insert(1, 100));
+    assert!(
+        written_a.is_ok() != written_b.is_ok(),
+        "exactly one instance writes: A {written_a:?}, B {written_b:?}"
+    );
+    assert_eq!(a.count_and_sum().await, expected(1..=100));
+    assert_eq!(b.count_and_sum().await, expected(1..=100));
 }
 
 /// The first instance writes; a second follows its commits as a replica,
