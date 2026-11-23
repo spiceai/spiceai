@@ -113,27 +113,29 @@ async fn over_deep_chains_are_parse_errors_on_the_worker_stack() {
 /// Regression test: each `[]` after a type wraps it in one more array type in
 /// a loop, so `INT[][]…` parsed into a type as deep as its dimension count, and
 /// dropping 100,000 of them overflowed the worker stack. The parser now refuses
-/// to build more than its tree-depth bound, and the planner refuses a type at
-/// the bound.
+/// a tree deeper than its bound, alone or nested in other types, and the
+/// planner refuses a deep type the parser builds.
 #[tokio::test]
 async fn array_dimension_chains_are_bounded_on_the_worker_stack() {
     let cast = |dimensions: usize| format!("SELECT CAST(NULL AS INT{})", "[]".repeat(dimensions));
 
-    let err = plan_on_default_worker_stack(cast(MAX_PARSED_TREE_DEPTH))
+    let err = plan_on_default_worker_stack(cast(1000))
         .await
-        .expect_err("a type at the parser bound does not plan");
+        .expect_err("a type 1,000 levels deep does not plan");
     assert_eq!(
         err.strip_backtrace(),
         "Error during planning: SQL data type nesting depth exceeds the maximum of 64"
     );
-    for dimensions in [MAX_PARSED_TREE_DEPTH + 1, 100_000] {
-        let err = plan_on_default_worker_stack(cast(dimensions))
+    let nested = format!(
+        "SELECT CAST(NULL AS ARRAY<INT{}>{})",
+        "[]".repeat(2000),
+        "[]".repeat(2000)
+    );
+    for sql in [cast(MAX_PARSED_TREE_DEPTH + 1), cast(100_000), nested] {
+        let err = plan_on_default_worker_stack(sql.clone())
             .await
             .expect_err("a type past the parser bound does not parse");
-        assert!(
-            is_parser_depth_error(&err),
-            "{dimensions} dimensions: {err}"
-        );
+        assert!(is_parser_depth_error(&err), "{sql:.60}…: {err}");
     }
 }
 

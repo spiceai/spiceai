@@ -69,8 +69,10 @@ Two more Spice changes, not upstream, that keep deep trees from overflowing the 
   2048 is four times Spice's own expression depth limit (`MAX_SQL_EXPR_DEPTH`, 512), so every
   statement that limit admits still parses and gets that limit's error instead. The same bound
   applies to the array dimensions after a data type (`INT[][]…`, in `parse_data_type_helper`),
-  which wrap the type once each in a loop. A parse that fails leaves the depth count as it was, so
-  an attempt that `maybe_parse` rolls back counts nothing. `test_ast_depth_bound` and
+  which wrap the type once each in a loop; a nested type (`ARRAY<INT[]…>[]…`) counts toward the
+  same depth as the type around it. A parse that fails leaves the depth count as it was, and
+  `Parser::try_parse` restores it with the token position, so an attempt that `maybe_parse` rolls
+  back counts nothing, even the trees it completed. `test_ast_depth_bound` and
   `test_failed_parse_restores_ast_depth` in `src/parser/mod.rs` fail if this is lost.
 - `src/ast/spans.rs`, `Spanned for SetExpr`: the span of a set-operation chain is computed by
   walking its left spine in a loop; upstream recurses once per operation. DataFusion takes that

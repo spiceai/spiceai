@@ -5133,11 +5133,13 @@ impl<'a> Parser<'a> {
         F: FnMut(&mut Parser) -> Result<T, ParserError>,
     {
         let index = self.index;
+        let ast_depth = self.ast_depth;
         match f(self) {
             Ok(t) => Ok(t),
             Err(e) => {
                 // Unwind stack if limit exceeded
                 self.index = index;
+                self.ast_depth = ast_depth;
                 Err(e)
             }
         }
@@ -12360,6 +12362,15 @@ impl<'a> Parser<'a> {
     fn parse_data_type_helper(
         &mut self,
     ) -> Result<(DataType, MatchedTrailingBracket), ParserError> {
+        let outer_depth = core::mem::take(&mut self.ast_depth);
+        let data_type = self.parse_data_type_tree();
+        self.ast_depth = Self::ast_depth_after(outer_depth, self.ast_depth, &data_type);
+        data_type
+    }
+
+    /// The type [`Parser::parse_data_type_helper`] parses, leaving its depth,
+    /// counting the types nested in it, in `ast_depth`.
+    fn parse_data_type_tree(&mut self) -> Result<(DataType, MatchedTrailingBracket), ParserError> {
         let dialect = self.dialect;
         self.advance_token();
         let next_token = self.get_current_token();
@@ -12793,17 +12804,18 @@ impl<'a> Parser<'a> {
             _ => self.expected_at("a data type name", next_token_index),
         }?;
 
+        let mut depth = Self::ast_depth_above(self.ast_depth)?;
         if self.dialect.supports_array_typedef_with_brackets() {
-            let mut dimensions = 0;
             while self.consume_token(&Token::LBracket) {
                 // Each `[]` wraps the type once more, in a loop with no nesting.
-                dimensions = Self::ast_depth_above(dimensions)?;
+                depth = Self::ast_depth_above(depth)?;
                 // Parse optional array data type size
                 let size = self.maybe_parse(|p| p.parse_literal_uint())?;
                 self.expect_token(&Token::RBracket)?;
                 data = DataType::Array(ArrayElemTypeDef::SquareBracket(Box::new(data), size))
             }
         }
+        self.ast_depth = depth;
         Ok((data, trailing_bracket))
     }
 
@@ -20710,13 +20722,39 @@ mod tests {
         let dialect = crate::dialect::PostgreSqlDialect {};
         let operators = |n: usize| format!("SELECT 1{}", "+1".repeat(n - 1));
         let set_operations = |n: usize| vec!["SELECT 1"; n].join(" UNION ALL ");
-        let dimensions = |n: usize| format!("SELECT CAST(NULL AS INT{})", "[]".repeat(n));
-        for chain in [operators, set_operations, dimensions] {
+        for chain in [operators, set_operations] {
             assert!(Parser::parse_sql(&dialect, &chain(MAX_AST_DEPTH)).is_ok());
             assert_eq!(
                 Parser::parse_sql(&dialect, &chain(MAX_AST_DEPTH + 1)),
                 Err(ParserError::RecursionLimitExceeded)
             );
+        }
+
+        // A type is one level deep, and each `[]` after it, and each type it is
+        // nested in, adds one, however the two are combined.
+        let data_type = |sql: &str| {
+            Parser::new(&dialect)
+                .try_with_sql(sql)
+                .unwrap()
+                .parse_data_type()
+                .map(|_| ())
+        };
+        let dimensions = |n: usize| format!("INT{}", "[]".repeat(n));
+        let nested = |inner: usize, outer: usize| {
+            format!("ARRAY<INT{}>{}", "[]".repeat(inner), "[]".repeat(outer))
+        };
+        for (sql, depth) in [
+            (dimensions(MAX_AST_DEPTH - 1), MAX_AST_DEPTH),
+            (dimensions(MAX_AST_DEPTH), MAX_AST_DEPTH + 1),
+            (nested(1000, MAX_AST_DEPTH - 1002), MAX_AST_DEPTH),
+            (nested(1000, MAX_AST_DEPTH - 1001), MAX_AST_DEPTH + 1),
+        ] {
+            let expected = if depth > MAX_AST_DEPTH {
+                Err(ParserError::RecursionLimitExceeded)
+            } else {
+                Ok(())
+            };
+            assert_eq!(data_type(&sql), expected, "a type {depth} deep");
         }
     }
 
@@ -20728,10 +20766,22 @@ mod tests {
         assert!(parser.parse_subexpr(0).is_err());
         assert_eq!(parser.ast_depth, 7);
 
-        let mut parser = Parser::new(&dialect).try_with_sql("SELECT 1 UNION )").unwrap();
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql("SELECT 1 UNION )")
+            .unwrap();
         parser.ast_depth = 7;
         assert!(parser.parse_query_body(0).is_err());
         assert_eq!(parser.ast_depth, 7);
+
+        // A rolled-back attempt counts nothing, even the trees it completed.
+        let dialect = crate::dialect::PostgreSqlDialect {};
+        let mut parser = Parser::new(&dialect).try_with_sql("INT[][] )").unwrap();
+        let attempt = parser.maybe_parse(|p| {
+            p.parse_data_type()?;
+            p.expect_token(&Token::Comma)
+        });
+        assert_eq!(attempt, Ok(None));
+        assert_eq!(parser.ast_depth, 0);
     }
 
     #[test]
