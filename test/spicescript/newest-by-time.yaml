@@ -1,4 +1,5 @@
 name: newest-by-time
+tags: [long]
 description: >
   A Cayenne acceleration with a primary key and a time_column keeps, per key,
   the row with the greatest time, whatever order the versions arrive in (a

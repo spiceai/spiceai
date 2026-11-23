@@ -70,7 +70,6 @@ use runtime::dataconnector::spiceai as _;
 
 // Force linkage of all data accelerator modules
 use accelerator_cayenne as _;
-use accelerator_postgres as _;
 use accelerator_sqlite as _;
 #[expect(unused_imports)]
 use runtime::dataaccelerator::arrow as _;

@@ -840,7 +840,7 @@ fn validate_distributed_engine(
 
 /// Converts a runtime `Engine` to a snapshot `AccelerationEngine`.
 ///
-/// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow, `PostgreSQL`).
+/// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow).
 pub(crate) fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
     match engine {
         #[cfg(feature = "sqlite")]
@@ -8741,7 +8741,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "sqlite", feature = "snapshots"))]
+    #[cfg(feature = "snapshots")]
     mod build_snapshot_creation_config_tests {
         use super::*;
         use crate::component::dataset::Dataset;
@@ -8751,6 +8751,14 @@ mod tests {
         use spicepod::component::snapshot::Snapshots;
         use std::sync::Arc;
         use tempfile::TempDir;
+
+        /// The Cayenne snapshot engine production passes as the override; without it a
+        /// Cayenne archive would be unrestorable and no config is built at all (see
+        /// `cayenne_does_not_publish_without_its_snapshot_engine`).
+        fn test_snapshot_engine() -> Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>
+        {
+            Arc::new(runtime_acceleration::snapshot::engine::DefaultSnapshotEngine)
+        }
 
         async fn create_test_dataset(time_column: Option<String>) -> Dataset {
             let runtime = crate::Runtime::builder().build().await;
@@ -8823,7 +8831,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::Sqlite,
+                Engine::Cayenne,
                 None,
                 None,
                 &dataset.runtime().secrets(),
@@ -8836,7 +8844,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -8902,7 +8910,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::RefreshComplete),
                 None,
                 &dataset.runtime().secrets(),
@@ -8915,7 +8923,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Snapshot,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -8930,7 +8938,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("not-a-valid-batch-count".to_string()),
                 &dataset.runtime().secrets(),
@@ -8943,7 +8951,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Snapshot,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -8960,7 +8968,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("25".to_string()),
                 &dataset.runtime().secrets(),
@@ -8973,7 +8981,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -8998,7 +9006,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("25".to_string()),
                 &dataset.runtime().secrets(),
@@ -9011,7 +9019,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Changes,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9036,7 +9044,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 None,
                 &dataset.runtime().secrets(),
@@ -9049,7 +9057,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9069,7 +9077,7 @@ mod tests {
             let dataset = create_test_dataset(Some("created_at".to_string())).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 None,
                 &dataset.runtime().secrets(),
@@ -9082,7 +9090,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9102,7 +9110,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 None,
                 &dataset.runtime().secrets(),
@@ -9115,7 +9123,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9135,7 +9143,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("-10".to_string()),
                 &dataset.runtime().secrets(),
@@ -9148,7 +9156,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9164,7 +9172,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("0".to_string()),
                 &dataset.runtime().secrets(),
@@ -9177,7 +9185,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9193,7 +9201,7 @@ mod tests {
             let dataset = create_test_dataset(Some("ts".to_string())).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::TimeInterval),
                 Some(String::new()),
                 &dataset.runtime().secrets(),
@@ -9206,7 +9214,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9225,7 +9233,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some(String::new()),
                 &dataset.runtime().secrets(),
@@ -9238,7 +9246,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Changes,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9313,27 +9321,12 @@ mod tests {
         }
 
         #[test]
-        fn postgresql_rejected_in_distributed_mode() {
-            let config = make_cluster_config(Role::Scheduler);
-            let result = validate_distributed_engine(&config, Engine::PostgreSQL, "my_dataset");
-            assert!(
-                matches!(
-                    result,
-                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
-                ),
-                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
-            );
-        }
-
-        #[test]
         fn any_engine_allowed_in_non_distributed_mode() {
             let config = make_non_distributed_config();
             validate_distributed_engine(&config, Engine::Sqlite, "ds")
                 .expect("duckdb should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Sqlite, "ds")
                 .expect("sqlite should be allowed when not in distributed mode");
-            validate_distributed_engine(&config, Engine::PostgreSQL, "ds")
-                .expect("postgresql should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Arrow, "ds")
                 .expect("arrow should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Cayenne, "ds")

@@ -1,4 +1,5 @@
 name: kafka-partitions
+tags: [long]
 description: >
   A Kafka topic spread over three partitions loads every message with the
   schema of its JSON; a full text index over a topic finds the messages

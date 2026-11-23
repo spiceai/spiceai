@@ -29,6 +29,7 @@ use spice_cloud_client::redirect::same_origin_redirect_policy;
 pub use auth_config::{
     env_file_path, env_file_vars, merge_auth_config, read_env_var, store_keychain,
 };
+pub(crate) use auth_config::{read_env_file_for_update, replace_env_file, unsafe_credential_file};
 
 #[cfg(test)]
 pub(crate) use auth_config::test_env_file;
