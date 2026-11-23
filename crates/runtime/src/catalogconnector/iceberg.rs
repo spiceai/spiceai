@@ -64,7 +64,8 @@ use iceberg::{
     },
 };
 use iceberg_catalog_rest::{
-    REST_CATALOG_PROP_URI, RestCatalog as IcebergRestCatalog, RestCatalogBuilder,
+    EndpointOverrideCheck, REST_CATALOG_PROP_URI, RestCatalog as IcebergRestCatalog,
+    RestCatalogBuilder,
 };
 use iceberg_storage_opendal::{CustomAwsCredentialLoader, OpenDalStorageFactory};
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
@@ -1197,6 +1198,83 @@ fn vended_endpoint_rewritten_message(
     )
 }
 
+/// Refuses a catalog or OAuth2 token endpoint that a REST catalog's
+/// `GET /v1/config` response substitutes for the configured one when it
+/// targets a private, loopback, or link-local host, so the catalog cannot send
+/// its requests and credentials there. An endpoint on the origin of a
+/// configured one is allowed, so a catalog the operator runs on an internal
+/// host keeps working.
+#[derive(Debug)]
+struct ConfigEndpointGuard {
+    component: String,
+    configured_origins: Vec<url::Origin>,
+}
+
+impl ConfigEndpointGuard {
+    fn new(props: &HashMap<String, String>, component: String) -> Self {
+        let configured_origins = [REST_CATALOG_PROP_URI, REST_CATALOG_PROP_OAUTH2_SERVER_URI]
+            .iter()
+            .filter_map(|key| Url::parse(props.get(*key)?).ok())
+            .map(|url| url.origin())
+            .filter(url::Origin::is_tuple)
+            .collect();
+        Self {
+            component,
+            configured_origins,
+        }
+    }
+}
+
+#[async_trait]
+impl EndpointOverrideCheck for ConfigEndpointGuard {
+    async fn check(&self, key: &str, endpoint: &str) -> iceberg::Result<()> {
+        if url_table::allow_private_hosts() {
+            return Ok(());
+        }
+        let url = Url::parse(endpoint).ok();
+        if url
+            .as_ref()
+            .is_some_and(|url| self.configured_origins.contains(&url.origin()))
+        {
+            return Ok(());
+        }
+        let reason = if endpoint_targets_internal_host(endpoint) {
+            Some("it is a private, loopback, or link-local address".to_string())
+        } else if let Some(url::Host::Domain(domain)) = url.as_ref().and_then(Url::host) {
+            vended_transport::refused_host_reason(domain).await
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => Err(iceberg::Error::new(
+                iceberg::ErrorKind::DataInvalid,
+                config_endpoint_refused_message(&self.component, key, endpoint, &reason),
+            )),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The REST catalog property that sets the OAuth2 token endpoint.
+const REST_CATALOG_PROP_OAUTH2_SERVER_URI: &str = "oauth2-server-uri";
+
+fn config_endpoint_refused_message(
+    component: &str,
+    key: &str,
+    endpoint: &str,
+    reason: &str,
+) -> String {
+    let param_hint = if key == REST_CATALOG_PROP_OAUTH2_SERVER_URI {
+        "set the `oauth2_server_url` parameter to it"
+    } else {
+        "use it as the catalog URL in the Spicepod"
+    };
+    format!(
+        "The Iceberg catalog for {component} answered `GET /v1/config` with `{key}` set to {endpoint:?}, but {reason}, so no catalog request or credential is sent to it and the catalog cannot be read. If this endpoint is trusted, {param_hint}, or set `{}=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
+        url_table::ALLOW_PRIVATE_HOSTS_ENV
+    )
+}
+
 /// Builds an `IcebergRestCatalog` from a base URI and properties.
 ///
 /// `component` names the dataset or catalog (e.g. `dataset 'orders'`) in errors.
@@ -1208,10 +1286,12 @@ pub async fn get_rest_catalog(
 ) -> Result<IcebergRestCatalog> {
     props.insert(REST_CATALOG_PROP_URI.to_string(), base_uri);
     let inner = storage_factory.unwrap_or_else(|| default_storage_factory_from_props(&props));
+    let endpoint_check = Arc::new(ConfigEndpointGuard::new(&props, component.clone()));
     let factory: Arc<dyn StorageFactory> =
         Arc::new(VendedEndpointGuard::new(inner, &props, component));
     RestCatalogBuilder::default()
         .with_storage_factory(factory)
+        .with_endpoint_override_check(endpoint_check)
         .load("rest", props)
         .await
         .context(UnableToBuildCatalogSnafu)
@@ -1672,6 +1752,203 @@ mod tests {
         );
     }
 
+    mod config_endpoint_override {
+        use super::super::{ConfigEndpointGuard, get_rest_catalog};
+        use super::vended_storage_endpoint::{LOOPBACK, ResolverOverride, start_sentinel};
+        use std::collections::HashMap;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        use axum::{Json, Router, routing::get, routing::post};
+        use iceberg::{Catalog, NamespaceIdent};
+        use iceberg_catalog_rest::EndpointOverrideCheck;
+        use serde_json::{Value, json};
+
+        /// Serves an Iceberg REST catalog whose `GET /v1/config` answers with
+        /// `overrides`. It lists namespace `db` at `/v1/namespaces` and at
+        /// `/sub/v1/namespaces`, and issues OAuth2 tokens.
+        async fn start_rest_catalog(overrides: impl FnOnce(&str) -> Value) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind the REST catalog listener");
+            let uri = format!(
+                "http://{}",
+                listener
+                    .local_addr()
+                    .expect("read the REST catalog address")
+            );
+            let config = json!({"defaults": {}, "overrides": overrides(&uri)});
+            let namespaces = || async { Json(json!({"namespaces": [["db"]]})) };
+            let app = Router::new()
+                .route(
+                    "/v1/config",
+                    get(move || {
+                        let config = config.clone();
+                        async move { Json(config) }
+                    }),
+                )
+                .route(
+                    "/v1/oauth/tokens",
+                    post(|| async {
+                        Json(json!({"access_token": "catalog-token", "token_type": "bearer"}))
+                    }),
+                )
+                .route("/v1/namespaces", get(namespaces))
+                .route("/sub/v1/namespaces", get(namespaces));
+            tokio::spawn(async move { axum::serve(listener, app).await });
+            uri
+        }
+
+        async fn list_namespaces(
+            catalog_uri: String,
+            props: HashMap<String, String>,
+        ) -> iceberg::Result<Vec<NamespaceIdent>> {
+            get_rest_catalog(catalog_uri, props, None, "catalog 'ice'".to_string())
+                .await
+                .expect("build the REST catalog")
+                .list_namespaces(None)
+                .await
+        }
+
+        fn token_props() -> HashMap<String, String> {
+            HashMap::from([("token".to_string(), "bootstrap-token".to_string())])
+        }
+
+        fn refusal(key: &str, endpoint: &str, reason: &str) -> String {
+            let hint = if key == "uri" {
+                "use it as the catalog URL in the Spicepod"
+            } else {
+                "set the `oauth2_server_url` parameter to it"
+            };
+            format!(
+                "The Iceberg catalog for catalog 'ice' answered `GET /v1/config` with `{key}` set to {endpoint:?}, but {reason}, so no catalog request or credential is sent to it and the catalog cannot be read. If this endpoint is trusted, {hint}, or set `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg"
+            )
+        }
+
+        const INTERNAL: &str = "it is a private, loopback, or link-local address";
+
+        #[tokio::test]
+        async fn a_catalog_uri_override_to_an_internal_host_is_refused_without_a_request() {
+            let sentinel = start_sentinel().await;
+            let endpoints = [
+                sentinel.endpoint.clone(),
+                format!("http://localhost:{}", sentinel.port),
+                format!("http://[::ffff:127.0.0.1]:{}", sentinel.port),
+                "http://169.254.169.254/latest/meta-data".to_string(),
+                "http://10.0.0.5:8181".to_string(),
+            ];
+            for endpoint in endpoints {
+                let override_uri = endpoint.clone();
+                let catalog_uri =
+                    start_rest_catalog(move |_| json!({ "uri": override_uri })).await;
+                let err = list_namespaces(catalog_uri, token_props())
+                    .await
+                    .expect_err("an internal catalog URI override must be refused");
+                assert_eq!(err.kind(), iceberg::ErrorKind::DataInvalid, "{endpoint}");
+                assert_eq!(
+                    err.message(),
+                    refusal("uri", &endpoint, INTERNAL),
+                    "{endpoint}"
+                );
+            }
+            assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn a_token_endpoint_override_to_an_internal_host_is_refused_without_a_request() {
+            let sentinel = start_sentinel().await;
+            let endpoint = format!("{}/v1/oauth/tokens", sentinel.endpoint);
+            let override_uri = endpoint.clone();
+            let catalog_uri =
+                start_rest_catalog(move |_| json!({ "oauth2-server-uri": override_uri })).await;
+            let props =
+                HashMap::from([("credential".to_string(), "client:secret".to_string())]);
+            let err = list_namespaces(catalog_uri, props)
+                .await
+                .expect_err("an internal token endpoint override must be refused");
+            assert_eq!(
+                err.message(),
+                refusal("oauth2-server-uri", &endpoint, INTERNAL)
+            );
+            assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn a_catalog_uri_override_naming_an_internal_host_is_refused_without_a_request() {
+            let sentinel = start_sentinel().await;
+            let cases = [
+                (
+                    "loopback.config.test",
+                    vec![LOOPBACK],
+                    "\"loopback.config.test\" is or resolves to a private, loopback, or link-local address",
+                ),
+                (
+                    "mixed.config.test",
+                    vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), LOOPBACK],
+                    "\"mixed.config.test\" is or resolves to a private, loopback, or link-local address",
+                ),
+                (
+                    "unresolved.config.test",
+                    Vec::new(),
+                    "\"unresolved.config.test\" could not be resolved to a public address",
+                ),
+            ];
+            for (host, addrs, reason) in cases {
+                let _dns = ResolverOverride::set(host, addrs, false);
+                let endpoint = format!("http://{host}:{}", sentinel.port);
+                let override_uri = endpoint.clone();
+                let catalog_uri =
+                    start_rest_catalog(move |_| json!({ "uri": override_uri })).await;
+                let err = list_namespaces(catalog_uri, token_props())
+                    .await
+                    .expect_err("a catalog URI override resolving internally must be refused");
+                assert_eq!(err.message(), refusal("uri", &endpoint, reason), "{host}");
+            }
+            assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn a_catalog_uri_override_on_the_configured_origin_is_followed() {
+            let catalog_uri = start_rest_catalog(|uri| json!({ "uri": format!("{uri}/sub") })).await;
+            let namespaces = list_namespaces(catalog_uri, token_props())
+                .await
+                .expect("an override on the catalog's own origin is followed");
+            assert_eq!(namespaces, vec![NamespaceIdent::new("db".to_string())]);
+        }
+
+        #[tokio::test]
+        async fn a_catalog_without_overrides_is_read() {
+            let catalog_uri = start_rest_catalog(|_| json!({})).await;
+            let namespaces = list_namespaces(catalog_uri, token_props())
+                .await
+                .expect("a catalog without overrides is read");
+            assert_eq!(namespaces, vec![NamespaceIdent::new("db".to_string())]);
+        }
+
+        #[tokio::test]
+        async fn an_override_to_a_public_host_passes_the_check() {
+            let _dns = ResolverOverride::set(
+                "public.config.test",
+                vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+                false,
+            );
+            let guard = ConfigEndpointGuard::new(
+                &HashMap::from([("uri".to_string(), "http://127.0.0.1:8181".to_string())]),
+                "catalog 'ice'".to_string(),
+            );
+            for (key, endpoint) in [
+                ("uri", "https://public.config.test/catalog"),
+                ("uri", "https://93.184.216.34/catalog"),
+                ("oauth2-server-uri", "https://public.config.test/v1/oauth/tokens"),
+                ("uri", "http://127.0.0.1:8181/prefix"),
+            ] {
+                guard
+                    .check(key, endpoint)
+                    .await
+                    .unwrap_or_else(|err| panic!("{endpoint} must pass the check: {err}"));
+            }
+        }
+    }
+
     mod vended_storage_endpoint {
         use super::super::{
             S3_ENDPOINT, STORAGE_ENDPOINT_PROPS, get_rest_catalog, vended_endpoint_refused_message,
@@ -1773,13 +2050,13 @@ mod tests {
         /// An object store stand-in on a loopback address that records the
         /// request line of every connection it accepts. It answers `404`, or
         /// `302` to `redirect_to` when that is set.
-        struct Sentinel {
-            endpoint: String,
-            port: u16,
-            requests: Arc<Mutex<Vec<String>>>,
+        pub(super) struct Sentinel {
+            pub(super) endpoint: String,
+            pub(super) port: u16,
+            pub(super) requests: Arc<Mutex<Vec<String>>>,
         }
 
-        async fn start_sentinel() -> Sentinel {
+        pub(super) async fn start_sentinel() -> Sentinel {
             start_listener(None).await
         }
 
@@ -1881,12 +2158,12 @@ mod tests {
 
         /// Answers lookups of `host` with `addrs` until the test ends.
         /// `treat_as_public` lets a public name reach a local fixture.
-        struct ResolverOverride {
+        pub(super) struct ResolverOverride {
             host: String,
         }
 
         impl ResolverOverride {
-            fn set(host: &str, addrs: Vec<IpAddr>, treat_as_public: bool) -> Self {
+            pub(super) fn set(host: &str, addrs: Vec<IpAddr>, treat_as_public: bool) -> Self {
                 set_resolver_override(host, addrs, treat_as_public);
                 Self {
                     host: host.to_string(),
@@ -1907,7 +2184,7 @@ mod tests {
             }
         }
 
-        const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        pub(super) const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
         #[tokio::test]
         async fn catalog_vended_internal_endpoint_is_refused_without_connecting() {

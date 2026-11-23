@@ -77,6 +77,16 @@ pub(super) fn normalized_host(host: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// Why `host` must not be dialed, as the guarded resolver decides it: a
+/// well-known internal name, or a name that resolves to no address or to an
+/// internal one. `None` when every address it resolves to is public.
+pub(super) async fn refused_host_reason(host: &str) -> Option<String> {
+    public_addrs(normalized_host(host))
+        .await
+        .err()
+        .map(|refused| refused.to_string())
+}
+
 /// Runs `fut` with `hosts` recorded, so requests to them are guarded.
 pub(super) async fn scope<T>(hosts: Option<VendedHosts>, fut: impl Future<Output = T>) -> T {
     match hosts {
