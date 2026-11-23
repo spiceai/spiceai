@@ -248,6 +248,12 @@ impl GraphQL {
         // leaves the endpoint's origin.
         let redirects = if auth_header.is_some() && token.is_some() {
             RedirectScope::RequestOrigin
+        } else if token.is_some()
+            || user.is_some()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+        {
+            RedirectScope::PublicHostsWithCredentials
         } else {
             RedirectScope::PublicHosts
         };
@@ -713,6 +719,97 @@ mod tests {
                 .sum();
             assert_eq!(rows, 1);
         }
+    }
+
+    /// An endpoint that redirects to `/a` on another port, whose server redirects `/a` to its own
+    /// `/b` and serves users at `/b`. Returns the endpoint URL and both servers.
+    async fn redirect_chain() -> (String, wiremock::MockServer, wiremock::MockServer) {
+        let target = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/a"))
+            .respond_with(redirect_response("/b"))
+            .mount(&target)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::path("/b"))
+            .respond_with(users_response())
+            .mount(&target)
+            .await;
+        let endpoint = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(redirect_response(&format!("{}/a", target.uri())))
+            .mount(&endpoint)
+            .await;
+        (format!("{}/graphql", endpoint.uri()), endpoint, target)
+    }
+
+    async fn requests_for(server: &wiremock::MockServer, path: &str) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("requests are recorded")
+            .iter()
+            .filter(|request| request.url.path() == path)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_dataset_with_credentials_does_not_follow_a_redirect_chain_that_continues_on_another_host()
+     {
+        for (userinfo, params) in [
+            (
+                "",
+                &[
+                    ("graphql_auth_token", "test-token"),
+                    ("json_pointer", "/data/users"),
+                ][..],
+            ),
+            (
+                "",
+                &[
+                    ("graphql_auth_user", "user"),
+                    ("json_pointer", "/data/users"),
+                ][..],
+            ),
+            ("svc:s3cret@", &[("json_pointer", "/data/users")][..]),
+        ] {
+            let (endpoint_url, _endpoint, target) = redirect_chain().await;
+            let endpoint_url = endpoint_url.replacen("://", &format!("://{userinfo}"), 1);
+
+            let Err(error) = query_users(params, &endpoint_url).await else {
+                panic!("the redirect chain must be refused with {params:?}");
+            };
+
+            assert!(
+                error.to_string().contains(&format!(
+                    "Refused to follow the redirect to {}/b",
+                    target.uri()
+                )),
+                "unexpected error with {params:?}: {error}"
+            );
+            assert_eq!(requests_for(&target, "/a").await, 1);
+            assert_eq!(
+                requests_for(&target, "/b").await,
+                0,
+                "the second hop on the target must not be requested with {params:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dataset_without_credentials_follows_a_redirect_chain_that_continues_on_another_host()
+    {
+        let (endpoint_url, _endpoint, target) = redirect_chain().await;
+
+        let result = query_users(&[("json_pointer", "/data/users")], &endpoint_url)
+            .await
+            .expect("the redirect chain is followed");
+
+        let rows: usize = result
+            .records
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 1);
+        assert_eq!(requests_for(&target, "/b").await, 1);
     }
 }
 

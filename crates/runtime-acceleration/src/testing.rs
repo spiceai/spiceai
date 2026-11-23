@@ -40,7 +40,6 @@ use datafusion::common::TableReference;
 use runtime_secrets::Secrets;
 use tokio::sync::RwLock;
 
-use crate::Engine;
 use crate::acceleration::{Acceleration, Mode};
 use crate::acceleration_source::AccelerationSource;
 use crate::schema_change::OnSchemaChange;
@@ -142,20 +141,13 @@ impl AccelerationSource for TestAccelerationSource {
         Arc::new(self.clone())
     }
 
-    /// Mirrors `DatasetSpec::is_file_accelerated`, including its two quirks and the
-    /// order they apply in: a `PostgreSQL` acceleration counts as file-backed whatever its
-    /// mode *and even when disabled*, because that check short-circuits first; for every
-    /// other engine, a disabled acceleration counts as nothing. A double that answered
-    /// otherwise would send a test down an initialization path the runtime skips.
-    /// (`View`'s implementation deliberately differs on `PostgreSQL`; this stands in for a
-    /// dataset.)
+    /// Mirrors `DatasetSpec::is_file_accelerated`: a disabled acceleration counts as
+    /// nothing. A double that answered otherwise would send a test down an
+    /// initialization path the runtime skips.
     fn is_file_accelerated(&self) -> bool {
         let Some(acceleration) = self.acceleration.as_ref() else {
             return false;
         };
-        if acceleration.engine == Engine::PostgreSQL {
-            return true;
-        }
         acceleration.enabled
             && matches!(
                 acceleration.mode,

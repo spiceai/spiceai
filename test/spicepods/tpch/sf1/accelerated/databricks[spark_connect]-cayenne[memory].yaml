@@ -2,7 +2,7 @@ version: v1
 kind: Spicepod
 name: databricks[spark_connect]-cayenne[memory]
 datasets:
-  - from: databricks:spiceai_sandbox.tpch.customer
+  - from: databricks:spiceai_ci.tpch.customer
     name: customer
     params: &databricks_spark_params
       mode: spark_connect
@@ -14,30 +14,30 @@ datasets:
       enabled: true
       engine: cayenne
       mode: memory
-  - from: databricks:spiceai_sandbox.tpch.lineitem
+  - from: databricks:spiceai_ci.tpch.lineitem
     name: lineitem
     params: *databricks_spark_params
     acceleration: *acceleration
-  - from: databricks:spiceai_sandbox.tpch.nation
+  - from: databricks:spiceai_ci.tpch.nation
     name: nation
     params: *databricks_spark_params
     acceleration: *acceleration
-  - from: databricks:spiceai_sandbox.tpch.orders
+  - from: databricks:spiceai_ci.tpch.orders
     name: orders
     params: *databricks_spark_params
     acceleration: *acceleration
-  - from: databricks:spiceai_sandbox.tpch.part
+  - from: databricks:spiceai_ci.tpch.part
     name: part
     params: *databricks_spark_params
-  - from: databricks:spiceai_sandbox.tpch.partsupp
+  - from: databricks:spiceai_ci.tpch.partsupp
     name: partsupp
     params: *databricks_spark_params
     acceleration: *acceleration
-  - from: databricks:spiceai_sandbox.tpch.region
+  - from: databricks:spiceai_ci.tpch.region
     name: region
     params: *databricks_spark_params
     acceleration: *acceleration
-  - from: databricks:spiceai_sandbox.tpch.supplier
+  - from: databricks:spiceai_ci.tpch.supplier
     name: supplier
     params: *databricks_spark_params
     acceleration: *acceleration

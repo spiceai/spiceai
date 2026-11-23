@@ -434,7 +434,7 @@ pub(crate) async fn load_app(args: &CommonArgs) -> anyhow::Result<App> {
     let mut dependencies = Vec::new();
     if let Some(dependencies_root) = &args.spicepod_dependencies {
         for dependency in &spicepod.dependencies {
-            dependencies.push(Spicepod::load(&dependencies_root.join(dependency)).await?);
+            dependencies.push(Spicepod::load(&dependencies_root.join(dependency.from())).await?);
         }
     }
     spicepod.dependencies = vec![];

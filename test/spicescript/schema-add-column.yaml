@@ -1,4 +1,5 @@
 name: schema-add-column
+tags: [long]
 description: >
   A column added at the source is handled by each on_schema_change mode as
   documented: block keeps serving the registered columns and keeps up with
