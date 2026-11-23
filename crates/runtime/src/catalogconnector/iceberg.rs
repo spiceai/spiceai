@@ -1265,7 +1265,7 @@ fn config_endpoint_refused_message(
     reason: &str,
 ) -> String {
     let param_hint = if key == REST_CATALOG_PROP_OAUTH2_SERVER_URI {
-        "set the `oauth2_server_url` parameter to it"
+        "set the `iceberg_oauth2_server_url` parameter to it"
     } else {
         "use it as the catalog URL in the Spicepod"
     };
@@ -1767,6 +1767,14 @@ mod tests {
         /// `overrides`. It lists namespace `db` at `/v1/namespaces` and at
         /// `/sub/v1/namespaces`, and issues OAuth2 tokens.
         async fn start_rest_catalog(overrides: impl FnOnce(&str) -> Value) -> String {
+            start_rest_catalog_with_config(
+                |uri| json!({"defaults": {}, "overrides": overrides(uri)}),
+            )
+            .await
+        }
+
+        /// Like [`start_rest_catalog`], with the whole `GET /v1/config` answer.
+        async fn start_rest_catalog_with_config(config: impl FnOnce(&str) -> Value) -> String {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind the REST catalog listener");
@@ -1776,7 +1784,7 @@ mod tests {
                     .local_addr()
                     .expect("read the REST catalog address")
             );
-            let config = json!({"defaults": {}, "overrides": overrides(&uri)});
+            let config = config(&uri);
             let namespaces = || async { Json(json!({"namespaces": [["db"]]})) };
             let app = Router::new()
                 .route(
@@ -1817,7 +1825,7 @@ mod tests {
             let hint = if key == "uri" {
                 "use it as the catalog URL in the Spicepod"
             } else {
-                "set the `oauth2_server_url` parameter to it"
+                "set the `iceberg_oauth2_server_url` parameter to it"
             };
             format!(
                 "The Iceberg catalog for catalog 'ice' answered `GET /v1/config` with `{key}` set to {endpoint:?}, but {reason}, so no catalog request or credential is sent to it and the catalog cannot be read. If this endpoint is trusted, {hint}, or set `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg"
@@ -1863,6 +1871,26 @@ mod tests {
             let err = list_namespaces(catalog_uri, props)
                 .await
                 .expect_err("an internal token endpoint override must be refused");
+            assert_eq!(
+                err.message(),
+                refusal("oauth2-server-uri", &endpoint, INTERNAL)
+            );
+            assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn a_token_endpoint_default_to_an_internal_host_is_refused_without_a_request() {
+            let sentinel = start_sentinel().await;
+            let endpoint = format!("{}/v1/oauth/tokens", sentinel.endpoint);
+            let default_uri = endpoint.clone();
+            let catalog_uri = start_rest_catalog_with_config(
+                move |_| json!({"defaults": { "oauth2-server-uri": default_uri }, "overrides": {}}),
+            )
+            .await;
+            let props = HashMap::from([("credential".to_string(), "client:secret".to_string())]);
+            let err = list_namespaces(catalog_uri, props)
+                .await
+                .expect_err("an internal token endpoint default must be refused");
             assert_eq!(
                 err.message(),
                 refusal("oauth2-server-uri", &endpoint, INTERNAL)
