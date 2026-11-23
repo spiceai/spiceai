@@ -22,14 +22,15 @@ EXHAUST=1 nice -n 10 cargo run --release -p cayenne-metastore-model -- run seq-o
 
 ## Run kinds
 
-Every run demonstrates one of four things; `list` prints the kind first, and
+Every run demonstrates one of five things; `list` prints the kind first, and
 `RESULT` lines carry `kind=`:
 
 | Kind | What the run shows | How it is declared |
 |---|---|---|
 | `holds` | The design's properties hold: exhaustively within the bound, or not violated on a simulation run's sampled paths (a sampled run has a seed and cannot establish exhaustive safety) | No expected failure |
 | `rule-required` | A safeguard or an assumption is removed and the run must find the named failure, so the design needs it | An expected failure |
-| `rule-not-required` | A safeguard is removed and every property still holds, so the design does not need it for safety in that graph | `RULE_NOT_REQUIRED` in `src/lib.rs` |
+| `rule-not-required` | A safeguard or an assumption is removed and every property still holds, so the design does not need it for safety in that graph | `RULE_NOT_REQUIRED` in `src/lib.rs` |
+| `stronger-property` | The run checks a property stronger than the design guarantees and must find the named failure; no safeguard is removed, so the failure is not evidence that the design needs a rule | `STRONGER_PROPERTIES` in `src/lib.rs` |
 | `current-defect` | The model follows the current code, not the design, and reproduces a known defect in it | `CURRENT_DEFECTS` in `src/lib.rs` |
 
 Separately, a run is `replayed` when the implementation's own tests replay its
@@ -37,8 +38,10 @@ traces: the trace files under `crates/cayenne/tests/traces` and
 `crates/object_store_occ/tests/traces`, and the runs `crates/cayenne`'s mem-tier
 replay names. Those runs check the code; every other run checks the design.
 `REPLAYED_AGAINST_CODE` lists them, and a test keeps that list equal to the runs
-the replay files name. Another test requires every run that removes a safeguard
-(a `-no-` mode) and still holds to be listed as `rule-not-required`.
+the replay files name. Another test requires every run whose mode names a
+removal (`-no-`, `-ignores-` or `-without-`) and still holds to be listed as
+`rule-not-required`; removals named otherwise, such as `standby-early-safety`,
+are listed by hand.
 
 ```sh
 target/release/cayenne-metastore-model list rule-not-required
@@ -273,7 +276,8 @@ as a separate maintenance process does.
 ## Negative controls
 
 `list` prints every individual bound, seed and expected downstream failure. Rows below
-that hold are `rule-not-required` runs; the rest are `rule-required`.
+that hold are `rule-not-required` runs, `replicas-readers-adoption-all-present`
+is a `stronger-property` run, and the rest are `rule-required`.
 
 | Control suffix | Removed safeguard and required downstream failure |
 |---|---|

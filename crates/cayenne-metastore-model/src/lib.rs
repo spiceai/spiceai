@@ -41,7 +41,8 @@ pub struct Run {
 
 /// What a run demonstrates. A run that expects no failure is [`Kind::Holds`]
 /// and one that expects a failure is [`Kind::RuleRequired`], unless it is
-/// listed in [`RULE_NOT_REQUIRED`] or [`CURRENT_DEFECTS`].
+/// listed in [`RULE_NOT_REQUIRED`], [`STRONGER_PROPERTIES`] or
+/// [`CURRENT_DEFECTS`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
     /// The design's properties hold: exhaustively within the run's bound, or
@@ -50,18 +51,23 @@ pub enum Kind {
     /// A safeguard or an assumption is removed and the run must find the named
     /// failure, which shows the design needs it.
     RuleRequired,
-    /// A safeguard is removed and every property still holds, which shows the
-    /// design does not need it for safety in this graph.
+    /// A safeguard or an assumption is removed and every property still holds,
+    /// which shows the design does not need it for safety in this graph.
     RuleNotRequired,
+    /// The run checks a property stronger than the design guarantees and must
+    /// find the named failure: the design does not promise that property, and
+    /// no safeguard is removed.
+    StrongerProperty,
     /// The model follows the current code rather than the design and must
     /// find the named failure: a known defect, not a design rule.
     CurrentDefect,
 }
 impl Kind {
-    pub const ALL: [Kind; 4] = [
+    pub const ALL: [Kind; 5] = [
         Kind::Holds,
         Kind::RuleRequired,
         Kind::RuleNotRequired,
+        Kind::StrongerProperty,
         Kind::CurrentDefect,
     ];
     #[must_use]
@@ -70,13 +76,14 @@ impl Kind {
             Kind::Holds => "holds",
             Kind::RuleRequired => "rule-required",
             Kind::RuleNotRequired => "rule-not-required",
+            Kind::StrongerProperty => "stronger-property",
             Kind::CurrentDefect => "current-defect",
         }
     }
 }
 
-/// Runs that remove a safeguard and still hold.
-const RULE_NOT_REQUIRED: [&str; 11] = [
+/// Runs that remove a safeguard or an assumption and still hold.
+const RULE_NOT_REQUIRED: [&str; 14] = [
     "transactions-txn-no-owner-resolve-1-exhaust",
     "dataset-byte-window-metadata-prefix-no-sealed-floor-without-readers",
     "dataset-query-expiry-no-delete-selection",
@@ -88,7 +95,13 @@ const RULE_NOT_REQUIRED: [&str; 11] = [
     "read-transaction-minimal-no-overlay-read-keys",
     "read-transaction-widened-no-overlay-read-keys",
     "mem-tier-late-stamp",
+    "data-files-retire-prepared-lean-3-retire-ignores-reservation",
+    "standby-early-safety",
+    "intent-roll-forward-partitioned-without-done-2-exhaust",
 ];
+
+/// Runs that check a property stronger than the design guarantees, and fail it.
+const STRONGER_PROPERTIES: [&str; 1] = ["replicas-readers-adoption-all-present"];
 
 /// Runs that model the current code and reproduce a known defect in it.
 const CURRENT_DEFECTS: [&str; 1] = ["mem-tier-current-3-exhaust"];
@@ -144,6 +157,8 @@ impl Run {
             Kind::CurrentDefect
         } else if RULE_NOT_REQUIRED.contains(&self.name) {
             Kind::RuleNotRequired
+        } else if STRONGER_PROPERTIES.contains(&self.name) {
+            Kind::StrongerProperty
         } else if self.failure.is_empty() {
             Kind::Holds
         } else {
@@ -3855,7 +3870,9 @@ mod explorer_tests {
 
 #[cfg(test)]
 mod run_kind_tests {
-    use super::{CURRENT_DEFECTS, Kind, REPLAYED_AGAINST_CODE, RULE_NOT_REQUIRED, runs};
+    use super::{
+        CURRENT_DEFECTS, Kind, REPLAYED_AGAINST_CODE, RULE_NOT_REQUIRED, STRONGER_PROPERTIES, runs,
+    };
     use std::collections::BTreeSet;
     use std::path::Path;
 
@@ -3879,11 +3896,11 @@ mod run_kind_tests {
         };
         for name in RULE_NOT_REQUIRED {
             assert!(find(name).failure.is_empty(), "{name} expects a failure");
-            assert!(
-                find(name).mode.contains("-no-"),
-                "{name} removes no safeguard"
-            );
             assert_eq!(find(name).kind(), Kind::RuleNotRequired);
+        }
+        for name in STRONGER_PROPERTIES {
+            assert!(!find(name).failure.is_empty(), "{name} expects no failure");
+            assert_eq!(find(name).kind(), Kind::StrongerProperty);
         }
         for name in CURRENT_DEFECTS {
             assert!(!find(name).failure.is_empty(), "{name} expects no failure");
@@ -3894,13 +3911,19 @@ mod run_kind_tests {
         }
     }
 
-    /// A run that removes a safeguard (a `-no-` mode) and still holds must be
-    /// classified, so a new one cannot pass as a plain positive.
+    /// A run whose mode names a removal (`-no-`, `-ignores-` or `-without-`) and
+    /// still holds must be classified, so a new one cannot pass as a plain
+    /// positive. Removals named otherwise are listed by hand.
     #[test]
     fn every_holding_safeguard_removal_is_rule_not_required() {
         let unclassified: Vec<&str> = runs()
             .iter()
-            .filter(|r| r.mode.contains("-no-") && r.failure.is_empty())
+            .filter(|r| {
+                ["-no-", "-ignores-", "-without-"]
+                    .iter()
+                    .any(|marker| r.mode.contains(marker))
+                    && r.failure.is_empty()
+            })
             .filter(|r| r.kind() != Kind::RuleNotRequired)
             .map(|r| r.name)
             .collect();

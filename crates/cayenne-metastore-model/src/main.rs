@@ -17,8 +17,10 @@ fn main() -> Result<(), String> {
                 && f != "replayed"
                 && !Kind::ALL.iter().any(|k| k.name() == f)
             {
+                let kinds: Vec<&str> = Kind::ALL.iter().map(|k| k.name()).collect();
                 return Err(format!(
-                    "Unknown filter {f}; use holds, rule-required, rule-not-required, current-defect or replayed"
+                    "Unknown filter {f}; use {} or replayed",
+                    kinds.join(", ")
                 ));
             }
             for r in runs() {
