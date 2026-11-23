@@ -878,8 +878,10 @@ and a required check nothing reports blocks every pull request instead of
 passing it. Re-enable the workflow before adding it back to `REQUIRED_CHECKS`.
 
 Advisory checks that also run on `merge_group` but don't block (they can be
-promoted to required with a gate job later): `integration tests (llms)`,
-`Elasticsearch Integration Tests`, `Helm Lint`.
+promoted to required with a gate job later): `Elasticsearch Integration Tests`,
+`Helm Lint`. The model integration tests (`integration tests (llms)`) run after
+merge instead: on a push that touches the model crates, and in every
+`trunk_tests.yml` run, where a failure counts toward Trunk Health.
 
 GitHub uses one required-checks list both before queue entry and on the merge
 queue commit. Therefore every required workflow triggers on both `pull_request`

@@ -530,17 +530,14 @@ pub(crate) mod fake {
                 }
             })?;
             if self.block_manifest_write {
-                std::fs::create_dir_all(request.config_dir).map_err(|e| Error::CloudConnectIo {
-                    message: format!("create the fake config directory: {e}"),
+                let state_dir = runtime_cloud_connect::state_dir::state_dir(request.config_dir);
+                std::fs::create_dir_all(&state_dir).map_err(|e| Error::CloudConnectIo {
+                    message: format!("create the fake state directory: {e}"),
                 })?;
-                std::fs::create_dir(
-                    request
-                        .config_dir
-                        .join(super::super::manifest::SERVICE_MANIFEST_FILE),
-                )
-                .map_err(|e| Error::CloudConnectIo {
-                    message: format!("block the fake manifest destination: {e}"),
-                })?;
+                std::fs::create_dir(state_dir.join(super::super::manifest::SERVICE_MANIFEST_FILE))
+                    .map_err(|e| Error::CloudConnectIo {
+                        message: format!("block the fake manifest destination: {e}"),
+                    })?;
             }
             Ok(InstalledService {
                 name,

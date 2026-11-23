@@ -156,22 +156,109 @@ impl ConnectStatus {
     /// directory makes no request at all, and the clock is measured only where
     /// a wrong one is the explanation.
     pub(crate) async fn collect(instance_dir: &Path, config_dir: &Path, endpoint: &str) -> Self {
-        let service_instance_dir = instance_dir.to_path_buf();
-        let service_config_dir = config_dir.to_path_buf();
-        let service_status = tokio::task::spawn_blocking(move || {
-            service::status(
-                service::backend(),
-                &service_instance_dir,
-                &service_config_dir,
-            )
-        })
+        Self::collect_inspecting(
+            instance_dir,
+            config_dir,
+            endpoint,
+            |instance_dir, config_dir| {
+                service::status(service::backend(), instance_dir, config_dir)
+            },
+        )
         .await
-        .unwrap_or_else(|source| {
-            ServiceStatus::inspection_unavailable(format!(
-                "service status inspection task failed: {source}"
-            ))
-        });
-        Self::collect_with_service(service_status, instance_dir, config_dir, endpoint).await
+    }
+
+    /// [`Self::collect`], with `inspect_service` answering for the service.
+    async fn collect_inspecting(
+        instance_dir: &Path,
+        config_dir: &Path,
+        endpoint: &str,
+        inspect_service: impl FnOnce(&Path, &Path) -> ServiceStatus + Send + 'static,
+    ) -> Self {
+        // First, so the service manifest is read from where it now lives.
+        let prepared = prepare_state_dir(config_dir).await;
+        // The service manifest is in the state directory, so it is read only
+        // from one that passed the state-directory rule. Otherwise the service
+        // is reported as not inspected, for the same reason.
+        let service_status = match &prepared {
+            Ok(()) => {
+                let service_instance_dir = instance_dir.to_path_buf();
+                let service_config_dir = config_dir.to_path_buf();
+                tokio::task::spawn_blocking(move || {
+                    inspect_service(&service_instance_dir, &service_config_dir)
+                })
+                .await
+                .unwrap_or_else(|source| {
+                    ServiceStatus::inspection_unavailable(format!(
+                        "service status inspection task failed: {source}"
+                    ))
+                })
+            }
+            Err(diagnostic) => ServiceStatus::inspection_unavailable(diagnostic.clone()),
+        };
+        Self::collect_prepared(prepared, service_status, instance_dir, config_dir, endpoint).await
+    }
+
+    /// [`Self::collect`] once the state directory has been prepared and the
+    /// service half is known: the state directory is read only when it passed
+    /// the state-directory rule.
+    async fn collect_prepared(
+        prepared: std::result::Result<(), String>,
+        service_status: ServiceStatus,
+        instance_dir: &Path,
+        config_dir: &Path,
+        endpoint: &str,
+    ) -> Self {
+        let state_dir = runtime_cloud_connect::state_dir::state_dir(config_dir);
+        match prepared {
+            Ok(()) => {
+                Self::collect_with_service(service_status, instance_dir, &state_dir, endpoint).await
+            }
+            Err(diagnostic) => Self::untrusted_state(
+                service_status,
+                instance_dir,
+                &state_dir,
+                endpoint,
+                diagnostic,
+            ),
+        }
+    }
+
+    /// A state directory that cannot be trusted is reported, and nothing in it
+    /// is read.
+    fn untrusted_state(
+        service: ServiceStatus,
+        instance_dir: &Path,
+        state_dir: &Path,
+        endpoint: &str,
+        diagnostic: String,
+    ) -> Self {
+        Self {
+            schema_version: STATUS_SCHEMA_VERSION,
+            connection: ConnectionStatus {
+                state: ConnectionState::Unreadable,
+                directory: instance_dir.to_path_buf(),
+                identity_path: state_dir.join(IDENTITY_FILE),
+                endpoint: endpoint.to_string(),
+                identifier: None,
+                org_name: None,
+                app_id: None,
+                app_name: None,
+                monitor_url: None,
+                gateway_addr: None,
+                expires_at_unix: None,
+                expired: false,
+                draft_path: None,
+                clock: None,
+                diagnostic: Some(diagnostic),
+            },
+            service,
+            deployment: DeploymentStatus {
+                state: DeploymentState::None,
+                spicepod_path: None,
+                secrets: SecretsState::NotDelivered,
+                secret_names: Vec::new(),
+            },
+        }
     }
 
     async fn collect_with_service(
@@ -362,7 +449,22 @@ impl ConnectStatus {
     }
 }
 
-/// Read what the last deployment left in the config dir.
+/// Move state an earlier version kept in the config directory, then apply the
+/// state-directory rule, answering with the sentence `status` reports when
+/// either fails.
+async fn prepare_state_dir(config_dir: &Path) -> std::result::Result<(), String> {
+    runtime_cloud_connect::state_dir::migrate_legacy_state_when_idle(config_dir)
+        .await
+        .map_err(|error| error.sentence())?;
+    let state_dir = runtime_cloud_connect::state_dir::state_dir(config_dir);
+    tokio::task::spawn_blocking(move || runtime_cloud_connect::state_dir::check(&state_dir, false))
+        .await
+        .map_err(|source| format!("The state directory check task failed: {source}"))?
+        .map_err(|error| error.sentence())?;
+    Ok(())
+}
+
+/// Read what the last deployment left in the state directory.
 ///
 /// Reads files only, so it answers on a host with no network. Full cache
 /// authentication and file I/O run off the Tokio worker thread.
@@ -660,16 +762,130 @@ fn render_next_steps(status: &ConnectStatus) {
 mod tests {
     use super::super::service::backend::fake::FakeBackend;
     use super::*;
+    use runtime_cloud_connect::state_dir::state_dir;
 
     async fn snapshot(root: &Path, instance_dir: &Path, config_dir: &Path) -> ConnectStatus {
         let service_status = service::status(&FakeBackend::new(root), instance_dir, config_dir);
         ConnectStatus::collect_with_service(
             service_status,
             instance_dir,
-            config_dir,
+            &state_dir(config_dir),
             "https://api.example",
         )
         .await
+    }
+
+    /// The service manifest lives in the state directory, so a state directory
+    /// that cannot be used is not read for the service either: the service is
+    /// reported as not inspected, for the same reason, and nothing in the
+    /// directory is parsed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_state_directory_that_cannot_be_used_is_not_read_for_the_service() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        let config_dir = instance_dir.join(".spice");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        std::fs::create_dir_all(&elsewhere).expect("create link target");
+        std::fs::write(
+            super::super::service::ServiceManifest::path_in(&elsewhere),
+            "UNTRUSTED_SERVICE_MANIFEST",
+        )
+        .expect("plant a service manifest");
+        std::os::unix::fs::symlink(&elsewhere, state_dir(&config_dir)).expect("link");
+
+        let root = dir.path().to_path_buf();
+        let status = ConnectStatus::collect_inspecting(
+            &instance_dir,
+            &config_dir,
+            "https://api.example",
+            move |instance_dir, config_dir| {
+                service::status(&FakeBackend::new(&root), instance_dir, config_dir)
+            },
+        )
+        .await;
+
+        let refused = format!(
+            "Could not use the Spice Cloud Connect state directory '{}': it is a symbolic link, and Spice keeps this state only in a real directory",
+            state_dir(&config_dir).display()
+        );
+        assert_eq!(
+            status.service,
+            ServiceStatus::inspection_unavailable(refused)
+        );
+    }
+
+    /// A state directory that is not a real directory is reported, with
+    /// nothing in it read, and makes the report degraded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_state_directory_that_cannot_be_used_is_reported() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        let config_dir = instance_dir.join(".spice");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        std::fs::create_dir_all(&elsewhere).expect("create link target");
+        std::fs::write(elsewhere.join(IDENTITY_FILE), "not valid JSON").expect("write identity");
+        std::os::unix::fs::symlink(&elsewhere, state_dir(&config_dir)).expect("link");
+
+        let prepared = prepare_state_dir(&config_dir).await;
+        let service_status =
+            service::status(&FakeBackend::new(dir.path()), &instance_dir, &config_dir);
+        let status = ConnectStatus::collect_prepared(
+            prepared,
+            service_status,
+            &instance_dir,
+            &config_dir,
+            "https://api.example",
+        )
+        .await;
+        let expected = format!(
+            "Could not use the Spice Cloud Connect state directory '{}': it is a symbolic link, and Spice keeps this state only in a real directory",
+            state_dir(&config_dir).display()
+        );
+        assert_eq!(status.connection.state, ConnectionState::Unreadable);
+        assert_eq!(
+            status.connection.diagnostic.as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(status.degradation().as_deref(), Some(expected.as_str()));
+        assert_eq!(status.connection.identifier, None, "nothing in it is read");
+    }
+
+    /// State an earlier version kept in the config directory moves into the
+    /// state directory when `status` first looks, and is reported from there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn status_moves_state_kept_in_the_config_directory() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        let config_dir = instance_dir.join(".spice");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        std::fs::write(config_dir.join(IDENTITY_FILE), "not valid JSON").expect("write identity");
+
+        let prepared = prepare_state_dir(&config_dir).await;
+        let service_status =
+            service::status(&FakeBackend::new(dir.path()), &instance_dir, &config_dir);
+        let status = ConnectStatus::collect_prepared(
+            prepared,
+            service_status,
+            &instance_dir,
+            &config_dir,
+            "https://api.example",
+        )
+        .await;
+        assert_eq!(
+            status.connection.identity_path,
+            state_dir(&config_dir).join(IDENTITY_FILE)
+        );
+        assert_eq!(status.connection.state, ConnectionState::Unreadable);
+        assert!(!config_dir.join(IDENTITY_FILE).exists());
+        assert_eq!(
+            std::fs::read_to_string(state_dir(&config_dir).join(IDENTITY_FILE)).expect("read"),
+            "not valid JSON"
+        );
     }
 
     #[tokio::test]
@@ -695,9 +911,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let instance_dir = dir.path().join("edge-1");
         let config_dir = instance_dir.join(".spice");
-        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        std::fs::create_dir_all(state_dir(&config_dir)).expect("create state dir");
         std::fs::write(
-            super::super::service::ServiceManifest::path_in(&config_dir),
+            super::super::service::ServiceManifest::path_in(&state_dir(&config_dir)),
             "{",
         )
         .expect("write a broken manifest");
@@ -718,11 +934,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let instance_dir = dir.path().join("edge-1");
         let config_dir = instance_dir.join(".spice");
-        std::fs::create_dir_all(&config_dir).expect("create config dir");
-        std::fs::write(config_dir.join(IDENTITY_FILE), "not valid JSON")
+        std::fs::create_dir_all(state_dir(&config_dir)).expect("create state dir");
+        std::fs::write(state_dir(&config_dir).join(IDENTITY_FILE), "not valid JSON")
             .expect("write a malformed identity");
         std::fs::write(
-            runtime_cloud_connect::EnrollmentDraft::path_in(&config_dir),
+            runtime_cloud_connect::EnrollmentDraft::path_in(&state_dir(&config_dir)),
             "unfinished enrollment",
         )
         .expect("write an enrollment draft beside the malformed identity");
@@ -748,9 +964,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let instance_dir = dir.path().join("edge-1");
         let config_dir = instance_dir.join(".spice");
-        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        std::fs::create_dir_all(state_dir(&config_dir)).expect("create state dir");
         std::fs::write(
-            config_dir.join(IDENTITY_FILE),
+            state_dir(&config_dir).join(IDENTITY_FILE),
             serde_json::json!({
                 "identifier": "",
                 "identity_cert_pem": "credential-that-must-not-be-printed",
@@ -780,9 +996,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let instance_dir = dir.path().join("edge-1");
         let config_dir = instance_dir.join(".spice");
-        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        std::fs::create_dir_all(state_dir(&config_dir)).expect("create state dir");
         std::fs::write(
-            config_dir.join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE),
+            state_dir(&config_dir).join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE),
             "version: v1beta1\n",
         )
         .expect("write a deployed spicepod");
@@ -800,10 +1016,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let instance_dir = dir.path().join("edge-1");
         let config_dir = instance_dir.join(".spice");
-        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        std::fs::create_dir_all(state_dir(&config_dir)).expect("create state dir");
         symlink(
-            config_dir.join("missing-cache-target"),
-            config_dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE),
+            state_dir(&config_dir).join("missing-cache-target"),
+            state_dir(&config_dir).join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE),
         )
         .expect("create dangling cache symlink");
 
@@ -824,7 +1040,9 @@ mod tests {
             connection: ConnectionStatus {
                 state: ConnectionState::Enrolled,
                 directory: PathBuf::from("/srv/edge-analytics"),
-                identity_path: PathBuf::from("/srv/edge-analytics/.spice/identity.json"),
+                identity_path: PathBuf::from(
+                    "/srv/edge-analytics/.spice/cloud-connect/identity.json",
+                ),
                 endpoint: "https://api.spice.ai".to_string(),
                 identifier: Some("inst_0123456789".to_string()),
                 org_name: Some("acme".to_string()),
@@ -864,7 +1082,7 @@ mod tests {
             deployment: DeploymentStatus {
                 state: DeploymentState::Deployed,
                 spicepod_path: Some(PathBuf::from(
-                    "/srv/edge-analytics/.spice/spicepod-cloud-managed.yml",
+                    "/srv/edge-analytics/.spice/cloud-connect/spicepod-cloud-managed.yml",
                 )),
                 secrets: SecretsState::Delivered,
                 secret_names: vec!["pg_password".to_string(), "s3_key".to_string()],

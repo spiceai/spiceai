@@ -38,7 +38,6 @@ mod cron;
 mod decimal_division;
 #[cfg(feature = "sqlite")]
 mod empty_projection_scan;
-#[cfg(feature = "sqlite")]
 mod file_watcher;
 mod hash_index;
 mod localpod_sync;
