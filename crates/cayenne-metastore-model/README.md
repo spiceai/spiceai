@@ -1050,12 +1050,27 @@ write their usual reinsert vector stamps and precomputed insert records.
 publication of every staged catalog call. Its `Flush` is idempotent and has no
 durability effect; the object-native run also accepts an empty `Flush`.
 
-All four negative controls are based on `mem-tier-seal-delete-only`. They keep
-requiring their named downstream failure even if exhaustive exploration finds
-none; a missing failure is reported rather than relabeled safe or hidden. Bounds
-are three source applies, one seal, two explicit checkpoints, one bake attempt,
+All four mutations are based on `mem-tier-seal-delete-only`. Three are negative
+controls: they keep requiring their named downstream failure even if exhaustive
+exploration finds none, and a missing failure is reported rather than relabeled
+safe or hidden. The fourth, `mem-tier-late-stamp`, is a `rule-not-required` run:
+it expects to hold, because its
+mutation is unobservable rather than unexplored: an insert stamp makes a row
+visible only on the current snapshot's scan, and only while no protected
+snapshot exists (`table.rs`, `InsertRecordHandling`; the key-delete pushdown
+also reads stamps, but only to skip keys before that filter), and every
+checkpoint that writes
+insert records also publishes a protected snapshot. A full rewrite removes that
+snapshot only together with every stamp at or below its cutoff. The run checks
+that a late stamp stays safe under that rule; the
+[object-native design](../../docs/design/object-native-metastore-technical.md#commit-numbers-and-sequence-numbers)
+records why a design that read the stamp elsewhere would make it required
+again. Bounds
+are three source applies, two seals, two explicit checkpoints, one bake attempt,
 one full-rewrite attempt and one crash/recovery, with budgets retained across
-restart. Six threads and the shared 540-second watchdog apply.
+restart. The second seal is what lets a later seal acknowledge an apply that
+landed while an earlier seal was in flight; with one seal, the source redelivers
+that apply after a restart and `no-capture-reservation` has nothing to break. Six threads and the shared 540-second watchdog apply.
 
 ```sh
 nice -n 10 cargo build --release -p cayenne-metastore-model
@@ -1116,7 +1131,12 @@ records are stored separately in the symbolic catalog so this distinction also
 holds during recovery. Unreferenced physical file reclamation is not modeled.
 
 The bake merges all protected snapshots using partial deletion filters, tags the
-output with the capped delete fence, and prunes only the RAM index at that fence.
+output with the capped delete fence, and prunes only the RAM index, at or below
+the lower of that fence and the highest sequence among the snapshots it folds
+(`table.rs::bake_seq_prefix_protected_snapshots_inner`; the engine also caps it
+below its cold-tier files, which the model does not have). A tombstone above the
+folded snapshots may still hide an inline seal shadow, which the bake does not
+fold.
 It retains durable vectors and insert records. The replay configures the
 existing `compaction_trigger_protected_snapshots` threshold to 2, so the engine
 keeps zero recent snapshots. The model enables `Bake` only with at least two
@@ -1150,7 +1170,7 @@ The optional `protected survivor excluded by pushdown` diagnostic is hypothesis 
 | `mem-tier-no-one-call` | Stage seal shadow before pure vectors; stage checkpoint insert records after snapshot/vectors/clear, allowing flush/crash between | `recovered reads match the source` |
 | `mem-tier-no-insert-records` | Omit checkpoint insert records and hidden-key RAM upgrade, retaining checkpoint vector stamps | `recovered reads match the source` |
 | `mem-tier-no-capture-reservation` | Reserve the pure-delete seal's shadow sequence after releasing capture | `recovered reads match the source` |
-| `mem-tier-late-stamp` | Reserve a fresh insert-record stamp at checkpoint staging after a post-capture apply | `recovered reads match the source` |
+| `mem-tier-late-stamp` | Reserve a fresh insert-record stamp at checkpoint staging after a post-capture apply | none: holds (see above) |
 
 Control names retain their original API; their modes have the
 `mem-tier-seal-delete-only-no-` prefix (`no-early-stamp` for late stamping).

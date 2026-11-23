@@ -17,18 +17,19 @@ test-threads = "num-cpus"
 [test-groups]
 cayenne-property-tests = { max-threads = 2 }
 
-# The result-correctness lanes generate their SF1 TPC-H/TPC-DS fixtures into one
-# shared scratch directory — `tpch_full_result_parity_vs_duckdb` and
-# `spicebench_sf1_tpch_scenario_parity_vs_duckdb` read the very same `tpch_sf1`
-# tree — so two of them running at once would race on `dbgen` output that neither
-# wrote atomically. The SSB fixture is shared the same way and by one more lane:
-# `standalone_duckdb_vs_sqlite_ssb` and `ssb_full_result_parity_vs_sqlite` both
-# check for `ssb_scale{scale}/lineorder.parquet` and generate it when absent, so
-# whichever loses the race reads a file the winner is still writing. Every lane
-# that touches the scratch tree therefore belongs in this group. Serializing it
-# also keeps one bundled DuckDB instance per machine, which is how #12098 ran this
-# lane when it hit allocator aborts under parallelism.
-result-correctness = { max-threads = 1 }
+# The result-correctness lanes compare Cayenne with standalone DuckDB and SQLite
+# over SF1 fixtures, and each lane loads its tables in full, so a few at once is
+# what a runner holds alongside the rest of the suite. Several lanes read one
+# fixture (`tpch_sf1` for the TPC-H and SpiceBench lanes, `ssb_scale1` for every
+# SSB lane); `lock_fixture` in `crates/cayenne/tests/correctness/support` makes
+# the first to need one write it while the others wait, so they can share a
+# fixture without one reading files another is still writing.
+#
+# Three at a time, from an empty scratch tree on a quiet M-series Mac at
+# 570e9dd9f2, ran the 17 lanes in 312s against 607s one at a time. Neither that
+# run nor a second at three without the lock hit a DuckDB failure like the
+# allocator aborts of #12098, which ran its lanes one at a time.
+result-correctness = { max-threads = 3 }
 
 # Every GitHub test authenticates as the same account, and GitHub's secondary
 # rate limit is per account rather than per connection. nextest runs each test in

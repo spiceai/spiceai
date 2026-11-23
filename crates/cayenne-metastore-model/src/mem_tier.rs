@@ -615,7 +615,7 @@ impl Model for Protocol {
                 (true, _) => Action::CkEnd,
             });
         } else if state.replay.is_none() {
-            if state.seals < 1 && state.tier.iter().any(|s| !s.sealed) {
+            if state.seals < 2 && state.tier.iter().any(|s| !s.sealed) {
                 actions.push(Action::SealCapture);
             }
             if state.checkpoints < 2 && !state.tier.is_empty() {
@@ -787,7 +787,15 @@ impl Model for Protocol {
                     .filter_map(|(d, _)| (d > 0).then_some(d))
                     .min();
                 let fence = pending_min.map_or(durable_max, |d| durable_max.min(d - 1));
-                let clean = next.current_min.is_none_or(|min| min > fence);
+                // table.rs::bake_seq_prefix_protected_snapshots_inner: T is the
+                // highest data sequence of the baked inputs. The clean-prefix gate
+                // is judged at T, and the prune is capped at both T and the delete
+                // fence (and, in the engine, below cold-tier files, which this
+                // model does not have): a tombstone above T may still hide a row
+                // the bake did not fold, such as an inline seal shadow.
+                let prefix_cutoff = next.snapshots.iter().map(|s| s.sequence).max()?;
+                let cutoff = prefix_cutoff.min(fence);
+                let clean = next.current_min.is_none_or(|min| min > prefix_cutoff);
                 let eligible =
                     pending_min.is_none() || next.snapshots.iter().all(|s| s.sequence <= fence);
                 if clean && eligible {
@@ -812,9 +820,9 @@ impl Model for Protocol {
                     Self::flush(&mut next);
                     next.snapshots = vec![snapshot];
                     for (key, entry) in next.index.iter().enumerate() {
-                        next.pruned[key] |= entry.0 > 0 && entry.0 <= fence;
+                        next.pruned[key] |= entry.0 > 0 && entry.0 <= cutoff;
                     }
-                    prune_index(&mut next.index, fence);
+                    prune_index(&mut next.index, cutoff);
                 }
             }
             Action::FullRewriteCapture => {

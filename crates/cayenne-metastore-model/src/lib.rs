@@ -76,7 +76,7 @@ impl Kind {
 }
 
 /// Runs that remove a safeguard and still hold.
-const RULE_NOT_REQUIRED: [&str; 10] = [
+const RULE_NOT_REQUIRED: [&str; 11] = [
     "transactions-txn-no-owner-resolve-1-exhaust",
     "dataset-byte-window-metadata-prefix-no-sealed-floor-without-readers",
     "dataset-query-expiry-no-delete-selection",
@@ -87,6 +87,7 @@ const RULE_NOT_REQUIRED: [&str; 10] = [
     "remote-maintenance-minimal-no-guard-revalidation",
     "read-transaction-minimal-no-overlay-read-keys",
     "read-transaction-widened-no-overlay-read-keys",
+    "mem-tier-late-stamp",
 ];
 
 /// Runs that model the current code and reproduce a known defect in it.
@@ -97,7 +98,7 @@ const CURRENT_DEFECTS: [&str; 1] = ["mem-tier-current-3-exhaust"];
 /// (including the data-file replay),
 /// and the runs `crates/cayenne`'s mem-tier replay names directly. A test keeps
 /// this list equal to the runs those files name.
-const REPLAYED_AGAINST_CODE: [&str; 34] = [
+const REPLAYED_AGAINST_CODE: [&str; 35] = [
     "commits-restart-no-persist-before-send",
     "commits-restart-turnover",
     "data-files",
@@ -114,6 +115,7 @@ const REPLAYED_AGAINST_CODE: [&str; 34] = [
     "data-files-retire-sweep-uncommitted",
     "data-files-retire-whole-snapshot",
     "mem-tier-current-3-exhaust",
+    "mem-tier-no-capture-reservation",
     "mem-tier-no-one-call",
     "mem-tier-seal-delete-only",
     "mem-tier-seal-delete-only-sqlite",
@@ -220,7 +222,10 @@ pub fn runs() -> Vec<Run> {
             mode: "mem-tier-seal-delete-only-no-early-stamp",
             bound: 3,
             seed: None,
-            failure: "recovered reads match the source",
+            // A late stamp never makes a row visible while the snapshot it
+            // describes is live, so this mutation must hold (see the mem-tier
+            // README).
+            failure: "",
         },
         Run {
             name: "dataset-lifecycle",
