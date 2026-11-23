@@ -29,10 +29,11 @@ limitations under the License.
 //! they are postconditions the [Verus](https://github.com/verus-lang/verus)
 //! verifier discharges for every input:
 //!
-//! - [`Rescaler::rescale`] returns exactly the value [`Rescaler::expected`]
-//!   specifies, and never overflows or panics.
-//! - [`Rescaler::lemma_rescale_monotonic`]: a larger key never rescales to a
-//!   smaller value, which is the property clustering depends on.
+//! - `Rescaler::new(lo, hi).rescale(key)` returns exactly [`rescaled`]`(lo, hi,
+//!   key)`, a formula stated only in terms of the caller's inputs, and never
+//!   overflows or panics.
+//! - [`lemma_rescaled_monotonic`]: a larger key never rescales to a smaller
+//!   value, which is the property clustering depends on.
 //!
 //! This is the executable code, not a model of it: the functions below are the
 //! ones callers run. Verus reads the `verus!` block; a normal `cargo build`
@@ -65,11 +66,30 @@ spec fn p128() -> int {
     LIMB as int * LIMB as int
 }
 
-/// Rescales keys from `[lo, hi]` onto `0..=u64::MAX`.
+/// The number of low bits [`Rescaler`] drops from a range of width `span` so
+/// that the width fits in a `u64`: `max(0, bit_width(span) - 64)`.
+pub open spec fn shift_for(span: u128) -> nat
+    decreases span,
+    via shift_for_decreases
+{
+    if span <= 0xffff_ffff_ffff_ffffu128 {
+        0
+    } else {
+        1 + shift_for(span >> 1u128)
+    }
+}
+
+#[via_fn]
+proof fn shift_for_decreases(span: u128) {
+    if span > 0xffff_ffff_ffff_ffffu128 {
+        assert(span > 0xffff_ffff_ffff_ffffu128 ==> span >> 1u128 < span) by (bit_vector);
+    }
+}
+
+/// The value `Rescaler::new(lo, hi).rescale(key)` returns.
 ///
-/// With `x = clamp(key, lo, hi) - lo`, `span = hi - lo`, and
-/// `shift = max(0, bit_width(span) - 64)`, [`Rescaler::rescale`] computes
-/// `floor((x >> shift) * u64::MAX / (span >> shift))` exactly.
+/// With `x = clamp(key, lo, hi) - lo`, `span = hi - lo` and
+/// `shift = shift_for(span)`, it is `floor((x >> shift) * u64::MAX / (span >> shift))`.
 ///
 /// - Keys outside `[lo, hi]` clamp to its ends.
 /// - A constant or inverted range (`hi <= lo`) carries no information to
@@ -77,7 +97,22 @@ spec fn p128() -> int {
 /// - `x * u64::MAX` must fit in `u128`, which needs `span < 2^64`, so `shift`
 ///   is 0 for those spans. For a wider span the low `shift` bits of both `x`
 ///   and `span` are dropped first. The result can then differ slightly from
-///   `floor(x * u64::MAX / span)`, but it stays monotonic in `key`.
+///   `floor(x * u64::MAX / span)`, but it stays monotonic in `key`
+///   ([`lemma_rescaled_monotonic`]).
+pub open spec fn rescaled(lo: u128, hi: u128, key: u128) -> int {
+    if hi <= lo {
+        0
+    } else {
+        let span = (hi - lo) as u128;
+        let shift = shift_for(span) as u128;
+        let clamped = if key < lo { lo } else if key > hi { hi } else { key };
+        let x = ((clamped - lo) as u128) >> shift;
+        (x as int) * 0xffff_ffff_ffff_ffffint / ((span >> shift) as int)
+    }
+}
+
+/// Rescales keys from `[lo, hi]` onto `0..=u64::MAX`, computing [`rescaled`]
+/// exactly: `Rescaler::new(lo, hi).rescale(key) == rescaled(lo, hi, key)`.
 pub struct Rescaler {
     lo: u128,
     hi: u128,
@@ -87,33 +122,40 @@ pub struct Rescaler {
 }
 
 impl Rescaler {
-    /// What every constructed `Rescaler` satisfies: `span` is the shifted
-    /// range width and fits in a `u64`, it is zero exactly when the range is
-    /// constant or inverted, and `reciprocal` is `floor((2^128 - 1) / span)`
+    /// What every constructed `Rescaler` satisfies: `shift` and `span` are
+    /// [`rescaled`]'s shift and shifted width for `[lo, hi]` (0 when the range
+    /// is constant or inverted), and `reciprocal` is `floor((2^128 - 1) / span)`
     /// whenever the division is not trivial.
     #[verifier::type_invariant]
     spec fn inv(self) -> bool {
         &&& self.shift <= 64
         &&& self.span <= MAX_CODE
-        &&& self.span == (if self.hi > self.lo { (self.hi - self.lo) as u128 } else { 0u128 }) >> self.shift
-        &&& (self.span == 0 <==> self.hi <= self.lo)
+        &&& (self.hi > self.lo ==> {
+            &&& self.shift == shift_for((self.hi - self.lo) as u128) as u128
+            &&& self.span == ((self.hi - self.lo) as u128) >> self.shift
+            &&& self.span >= 1
+        })
+        &&& (self.hi <= self.lo ==> self.span == 0)
         &&& (self.span >= 2 ==> self.reciprocal == u128::MAX / self.span)
     }
 
-    /// The value [`Rescaler::rescale`] returns for `key`.
-    pub closed spec fn expected(&self, key: u128) -> int {
-        if self.hi <= self.lo || self.span == 0 {
-            0
-        } else {
-            let clamped = if key < self.lo { self.lo } else if key > self.hi { self.hi } else { key };
-            let x = ((clamped - self.lo) as u128) >> self.shift;
-            (x as int) * (MAX_CODE as int) / (self.span as int)
-        }
+    /// The `lo` this rescaler was built with.
+    pub closed spec fn lo(&self) -> u128 {
+        self.lo
+    }
+
+    /// The `hi` this rescaler was built with.
+    pub closed spec fn hi(&self) -> u128 {
+        self.hi
     }
 
     /// Prepares to rescale keys from `[lo, hi]`.
     #[must_use]
-    pub fn new(lo: u128, hi: u128) -> Self {
+    pub fn new(lo: u128, hi: u128) -> (r: Self)
+        ensures
+            r.lo() == lo,
+            r.hi() == hi,
+    {
         let full: u128 = hi.saturating_sub(lo);
         let mut shift: u128 = 0;
         let mut span: u128 = full;
@@ -124,6 +166,7 @@ impl Rescaler {
             invariant
                 shift <= 64,
                 span == full >> shift,
+                shift + shift_for(span) == shift_for(full),
                 full >= 1 ==> span >= 1,
             decreases 64 - shift,
         {
@@ -142,7 +185,7 @@ impl Rescaler {
         Rescaler { lo, hi, shift, span, reciprocal }
     }
 
-    /// Rescales `key`; see [`Rescaler`] for the exact formula.
+    /// Rescales `key` to exactly [`rescaled`]`(lo, hi, key)`.
     #[inline]
     #[must_use]
     #[expect(
@@ -151,7 +194,7 @@ impl Rescaler {
     )]
     pub fn rescale(&self, key: u128) -> (r: u64)
         ensures
-            r as int == self.expected(key),
+            r as int == rescaled(self.lo(), self.hi(), key),
     {
         proof {
             use_type_invariant(self);
@@ -212,30 +255,68 @@ impl Rescaler {
         }
         quotient as u64
     }
+}
 
-    /// A larger key never rescales to a smaller value.
-    pub proof fn lemma_rescale_monotonic(&self, a: u128, b: u128)
-        requires
-            a <= b,
-        ensures
-            self.expected(a) <= self.expected(b),
-    {
-        if !(self.hi <= self.lo || self.span == 0) {
-            let ca = if a < self.lo { self.lo } else if a > self.hi { self.hi } else { a };
-            let cb = if b < self.lo { self.lo } else if b > self.hi { self.hi } else { b };
-            let xa = ((ca - self.lo) as u128) >> self.shift;
-            let xb = ((cb - self.lo) as u128) >> self.shift;
-            lemma_shr_monotone((ca - self.lo) as u128, (cb - self.lo) as u128, self.shift);
-            assert(xa as int * MAX_CODE as int <= xb as int * MAX_CODE as int) by (nonlinear_arith)
-                requires
-                    xa <= xb,
-            ;
-            lemma_div_is_ordered(
-                xa as int * MAX_CODE as int,
-                xb as int * MAX_CODE as int,
-                self.span as int,
-            );
+/// `shift_for` keeps the shifted width within a `u64` and nonzero, and never
+/// shifts by more than 64. The last ensures clause is minimality, which bounds
+/// the shift: a width already shifted below `2^127` needs at most 63 more bits.
+pub proof fn lemma_shift_for(span: u128)
+    ensures
+        shift_for(span) <= 64,
+        span >> (shift_for(span) as u128) <= 0xffff_ffff_ffff_ffffu128,
+        span >= 1 ==> span >> (shift_for(span) as u128) >= 1,
+        shift_for(span) >= 1 ==> span >> ((shift_for(span) - 1) as u128) > 0xffff_ffff_ffff_ffffu128,
+    decreases span,
+{
+    if span <= 0xffff_ffff_ffff_ffffu128 {
+        lemma_shr_zero(span);
+    } else {
+        let h = span >> 1u128;
+        assert(span > 0xffff_ffff_ffff_ffffu128 ==> span >> 1u128 < span) by (bit_vector);
+        lemma_shift_for(h);
+        let s = shift_for(h);
+        // h < 2^127, so shifting it by 63 already fits: the minimal shift of h
+        // is at most 63.
+        assert(h == span >> 1u128 ==> h >> 63u128 <= 0xffff_ffff_ffff_ffffu128) by (bit_vector);
+        if s == 64 {
+            assert(false);
         }
+        // span >> (s + 1) == h >> s, and span >> s == h >> (s - 1).
+        lemma_shr_one_then(span, s as u128);
+        lemma_half_of_wide_is_positive(span);
+        if s >= 1 {
+            lemma_shr_one_then(span, (s - 1) as u128);
+        } else {
+            lemma_shr_zero(span);
+        }
+    }
+}
+
+/// A larger key never rescales to a smaller value.
+pub proof fn lemma_rescaled_monotonic(lo: u128, hi: u128, a: u128, b: u128)
+    requires
+        a <= b,
+    ensures
+        rescaled(lo, hi, a) <= rescaled(lo, hi, b),
+{
+    if hi > lo {
+        let span = (hi - lo) as u128;
+        lemma_shift_for(span);
+        let shift = shift_for(span) as u128;
+        let ca = if a < lo { lo } else if a > hi { hi } else { a };
+        let cb = if b < lo { lo } else if b > hi { hi } else { b };
+        let xa = ((ca - lo) as u128) >> shift;
+        let xb = ((cb - lo) as u128) >> shift;
+        lemma_shr_monotone((ca - lo) as u128, (cb - lo) as u128, shift);
+        assert(xa as int * MAX_CODE as int <= xb as int * MAX_CODE as int) by (nonlinear_arith)
+            requires
+                xa <= xb,
+        ;
+        lemma_div_is_ordered(
+            xa as int * MAX_CODE as int,
+            xb as int * MAX_CODE as int,
+            (span >> shift) as int,
+        );
     }
 }
 
@@ -537,6 +618,15 @@ proof fn lemma_shr_step(x: u128, s: u128)
         (x >> s) >> 1u128 == x >> (s + 1) as u128,
 {
     assert(s < 64 ==> (x >> s) >> 1u128 == x >> add(s, 1u128)) by (bit_vector);
+}
+
+proof fn lemma_shr_one_then(x: u128, s: u128)
+    requires
+        s < 127,
+    ensures
+        (x >> 1u128) >> s == x >> (s + 1) as u128,
+{
+    assert(s < 127 ==> (x >> 1u128) >> s == x >> add(s, 1u128)) by (bit_vector);
 }
 
 /// Shifting right by 64 or more always lands within a `u64`, so a span still
