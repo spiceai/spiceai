@@ -110,6 +110,7 @@ impl SQLExecutor for FlightSQLTable {
                 query.to_string(),
                 Arc::clone(&self.cookie_store),
                 self.table_reference.to_quoted_string(),
+                self.statement_ticket,
             ),
         )))
     }

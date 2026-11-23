@@ -31,6 +31,7 @@ use flight_client::{
     within_decompression_bound,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
+use prost::Message;
 use snafu::prelude::*;
 use std::{fmt, sync::Arc, vec};
 
@@ -39,7 +40,10 @@ use arrow_flight::{
     decode::FlightRecordBatchStream,
     error::FlightError,
     flight_service_client::FlightServiceClient,
-    sql::{CommandGetTables, client::FlightSqlServiceClient},
+    sql::{
+        CommandGetTables, CommandStatementQuery, ProstMessageExt, SqlInfo,
+        client::FlightSqlServiceClient,
+    },
 };
 use datafusion::{
     arrow::datatypes::SchemaRef,
@@ -140,6 +144,93 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub type FlightSqlClient = FlightSqlServiceClient<CookieService<Channel>>;
 
+/// The name a Spice runtime reports as `FlightSqlServerName` in `GetSqlInfo`.
+const SPICE_SERVER_NAME: &str = "Spice.ai";
+
+/// How a statement's `DoGet` ticket is obtained.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StatementTicket {
+    /// Ask the server with `GetFlightInfo`, then `DoGet` every endpoint it returns: what the
+    /// Flight SQL specification requires of a client, since the ticket is the server's to define.
+    #[default]
+    FromFlightInfo,
+    /// Send the statement itself as the ticket and skip `GetFlightInfo`. Only for a Spice
+    /// server: its `GetFlightInfo` answers a statement with exactly this ticket, on one endpoint
+    /// with no location, so asking for it costs a round trip and a second planning of the query
+    /// on the server, and changes nothing about where or how the query runs.
+    Inline,
+}
+
+impl StatementTicket {
+    /// The ticket kind for a server that reported `server_name` (`None` when it did not say).
+    #[must_use]
+    pub fn for_server_name(server_name: Option<&str>) -> Self {
+        if server_name == Some(SPICE_SERVER_NAME) {
+            Self::Inline
+        } else {
+            Self::FromFlightInfo
+        }
+    }
+
+    /// Asks the server its name with `GetSqlInfo`. A server that cannot say keeps the
+    /// specification's `GetFlightInfo` path.
+    pub async fn detect(mut client: FlightSqlClient) -> Self {
+        let name = match client
+            .get_sql_info(vec![SqlInfo::FlightSqlServerName])
+            .await
+        {
+            Ok(info) => {
+                let mut name = None;
+                for ticket in info.endpoint.into_iter().filter_map(|ep| ep.ticket) {
+                    let batches = match guarded_do_get(&mut client, ticket).await {
+                        Ok(stream) => stream.try_collect::<Vec<_>>().await,
+                        Err(e) => Err(e),
+                    };
+                    match batches {
+                        Ok(batches) => name = server_name(&batches),
+                        Err(e) => tracing::debug!("Flight SQL GetSqlInfo DoGet failed: {e}"),
+                    }
+                    if name.is_some() {
+                        break;
+                    }
+                }
+                name
+            }
+            Err(e) => {
+                tracing::debug!("Flight SQL GetSqlInfo failed: {e}");
+                None
+            }
+        };
+        let ticket = Self::for_server_name(name.as_deref());
+        tracing::debug!("Flight SQL server {name:?}: statement tickets {ticket:?}");
+        ticket
+    }
+}
+
+/// `FlightSqlServerName` from a `GetSqlInfo` answer: rows of `info_name` (`UInt32`) and a
+/// dense-union `value`, whose string member carries the name.
+fn server_name(batches: &[RecordBatch]) -> Option<String> {
+    let wanted = SqlInfo::FlightSqlServerName as u32;
+    batches.iter().find_map(|batch| {
+        let names = batch
+            .column_by_name("info_name")?
+            .as_any()
+            .downcast_ref::<array::UInt32Array>()?;
+        let values = batch
+            .column_by_name("value")?
+            .as_any()
+            .downcast_ref::<array::UnionArray>()?;
+        (0..batch.num_rows()).find_map(|row| {
+            if !names.is_valid(row) || names.value(row) != wanted {
+                return None;
+            }
+            let value = values.value(row);
+            let value = value.as_any().downcast_ref::<array::StringArray>()?;
+            (value.len() == 1 && value.is_valid(0)).then(|| value.value(0).to_string())
+        })
+    })
+}
+
 #[derive(Clone)]
 pub struct FlightSQLFactory {
     client: FlightSqlClient,
@@ -236,6 +327,7 @@ pub struct FlightSQLTable {
     function_support: Option<FunctionSupport>,
     token: Option<String>,
     spice_sql: bool,
+    statement_ticket: StatementTicket,
 }
 
 #[expect(clippy::needless_pass_by_value)]
@@ -253,6 +345,7 @@ impl FlightSQLTable {
         // layout forbids. Correcting it here keeps the schema this table reports to the planner
         // in step with the batches `execute` hands back, which are normalized to the same shape.
         let schema = map_entries::conforming_schema(schema);
+        let statement_ticket = StatementTicket::detect(client.clone()).await;
         Ok(Self {
             name,
             client,
@@ -264,6 +357,7 @@ impl FlightSQLTable {
             function_support: None,
             token: None,
             spice_sql: false,
+            statement_ticket,
         })
     }
 
@@ -288,6 +382,7 @@ impl FlightSQLTable {
             function_support: None,
             token: None,
             spice_sql: false,
+            statement_ticket: StatementTicket::FromFlightInfo,
         }
     }
 
@@ -508,7 +603,8 @@ impl FlightSQLTable {
         )?;
         let exec = exec
             .with_token(self.token.clone())
-            .with_spice_sql(self.spice_sql);
+            .with_spice_sql(self.spice_sql)
+            .with_statement_ticket(self.statement_ticket);
         // Project the table-level statistics onto the scan's (projected) output
         // schema so the column-statistics list lines up with the output columns.
         //
@@ -612,6 +708,7 @@ pub struct FlightSqlExec {
     statistics: Statistics,
     token: Option<String>,
     spice_sql: bool,
+    statement_ticket: StatementTicket,
 }
 
 impl FlightSqlExec {
@@ -659,7 +756,15 @@ impl FlightSqlExec {
             statistics,
             token: None,
             spice_sql: false,
+            statement_ticket: StatementTicket::FromFlightInfo,
         })
+    }
+
+    /// How [`query_to_stream`] obtains the statement's `DoGet` ticket.
+    #[must_use]
+    pub fn with_statement_ticket(mut self, statement_ticket: StatementTicket) -> Self {
+        self.statement_ticket = statement_ticket;
+        self
     }
 
     /// Use Spice's exact Arrow numeric SQL encoding for a trusted executor.
@@ -694,6 +799,13 @@ impl FlightSqlExec {
     pub fn with_token(mut self, token: Option<String>) -> Self {
         self.token = token;
         self
+    }
+
+    /// How [`query_to_stream`] obtains the statement's `DoGet` ticket, for a plan built from
+    /// this scan.
+    #[must_use]
+    pub fn statement_ticket(&self) -> StatementTicket {
+        self.statement_ticket
     }
 
     /// Returns the currently configured W3C `traceparent` value, if any.
@@ -908,6 +1020,7 @@ impl ExecutionPlan for FlightSqlExec {
             statistics: self.statistics.clone(),
             token: self.token.clone(),
             spice_sql: self.spice_sql,
+            statement_ticket: self.statement_ticket,
         };
 
         Ok(SortOrderPushdownResult::Exact {
@@ -946,6 +1059,7 @@ impl ExecutionPlan for FlightSqlExec {
             sql,
             Arc::clone(&self.cookie_store),
             self.table_reference.to_quoted_string(),
+            self.statement_ticket,
         )
         .map(move |result| result.and_then(|batch| coerce_batch_to_schema(&batch, &target_schema)));
 
@@ -1020,6 +1134,7 @@ impl ExecutionPlan for FlightSqlExec {
             statistics,
             token: self.token.clone(),
             spice_sql: self.spice_sql,
+            statement_ticket: self.statement_ticket,
         };
 
         Some(Arc::new(new_plan))
@@ -1124,14 +1239,24 @@ pub fn query_to_stream(
     sql: String,
     cookie_store: Arc<CookieStore>,
     table_name: String,
+    statement_ticket: StatementTicket,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     stream! {
-        let flight_info = client
-            .execute(sql, None)
-            .await
-            .map_err(to_execution_error)?;
+        let endpoints = match statement_ticket {
+            StatementTicket::FromFlightInfo => client
+                .execute(sql, None)
+                .await
+                .map_err(to_execution_error)?
+                .endpoint,
+            StatementTicket::Inline => {
+                let command = CommandStatementQuery { query: sql, transaction_id: None };
+                vec![FlightEndpoint::new().with_ticket(Ticket {
+                    ticket: command.as_any().encode_to_vec().into(),
+                })]
+            }
+        };
 
-        for ep in flight_info.endpoint {
+        for ep in endpoints {
             if let Some(tkt) = ep.clone().ticket {
                 // The raw stream rather than `do_get`, which decodes internally: arrow 59 refuses
                 // a schema message that declares a map's `entries` nullable (#13495), so the
@@ -1614,6 +1739,50 @@ mod tests {
         }
     }
 
+    /// A `GetSqlInfo` answer encoded the way a server encodes it (Spice's handler uses the same
+    /// builder), with other entries beside the name in either order.
+    fn sql_info_answer(server_name: Option<&str>) -> Vec<arrow::array::RecordBatch> {
+        use arrow_flight::sql::{SqlInfo, metadata::SqlInfoDataBuilder};
+        let mut builder = SqlInfoDataBuilder::new();
+        builder.append(SqlInfo::FlightSqlServerReadOnly, true);
+        if let Some(name) = server_name {
+            builder.append(SqlInfo::FlightSqlServerName, name);
+        }
+        builder.append(SqlInfo::FlightSqlServerVersion, "1.0.0");
+        let data = builder.build().expect("sql info should build");
+        vec![
+            data.record_batch([SqlInfo::FlightSqlServerVersion as u32])
+                .expect("first batch"),
+            data.record_batch([
+                SqlInfo::FlightSqlServerReadOnly as u32,
+                SqlInfo::FlightSqlServerName as u32,
+            ])
+            .expect("second batch"),
+        ]
+    }
+
+    #[test]
+    fn only_a_server_reporting_spice_gets_inline_statement_tickets() {
+        use super::{StatementTicket, server_name};
+        let cases = [
+            (Some("Spice.ai"), StatementTicket::Inline),
+            (Some("Dremio"), StatementTicket::FromFlightInfo),
+            (Some("spice.ai"), StatementTicket::FromFlightInfo),
+            (Some(""), StatementTicket::FromFlightInfo),
+            (None, StatementTicket::FromFlightInfo),
+        ];
+        for (reported, expected) in cases {
+            let decoded = server_name(&sql_info_answer(reported));
+            assert_eq!(decoded.as_deref(), reported, "decoding {reported:?}");
+            assert_eq!(
+                StatementTicket::for_server_name(decoded.as_deref()),
+                expected,
+                "server name {reported:?}"
+            );
+        }
+        assert_eq!(server_name(&[]), None, "no answer names no server");
+    }
+
     #[tokio::test]
     async fn query_to_stream_sends_cookie_to_endpoint_client() {
         let cookie_seen = Arc::new(AtomicBool::new(false));
@@ -1633,6 +1802,7 @@ mod tests {
             "SELECT 1".to_string(),
             Arc::clone(&cookie_store),
             "\"t\"".to_string(),
+            super::StatementTicket::FromFlightInfo,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -2090,6 +2260,7 @@ mod tests {
             "SELECT m FROM t".to_string(),
             cookie_store,
             "\"t\"".to_string(),
+            super::StatementTicket::FromFlightInfo,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -2149,6 +2320,7 @@ mod tests {
             "SELECT a, m, c FROM t".to_string(),
             cookie_store,
             "\"t\"".to_string(),
+            super::StatementTicket::FromFlightInfo,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -2211,6 +2383,7 @@ mod tests {
             "SELECT 1".to_string(),
             Arc::clone(&cookie_store),
             "\"t\"".to_string(),
+            super::StatementTicket::FromFlightInfo,
         )
         .try_collect::<Vec<_>>()
         .await

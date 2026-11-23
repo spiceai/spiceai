@@ -1,0 +1,59 @@
+# A `flightsql:` dataset over a Spice upstream sends each statement straight to
+# DoGet, as the ticket the upstream's GetFlightInfo would have returned, so a
+# query costs the upstream one round trip and one planning instead of two
+# (`StatementTicket` in crates/data_components/src/flightsql.rs). The answers
+# must not change, and the upstream must see no statement GetFlightInfo at all.
+name: sidecar-flightsql
+description: >
+  Through a sidecar's flightsql dataset over a Spice upstream, lookups, scans
+  and aggregates answer as PostgreSQL does, and each reaches the upstream as
+  one DoGet with no GetFlightInfo.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: sidecar-flightsql-upstream
+  datasets:
+    - { from: 'postgres:public.orders', name: orders, params: '${sources.src.params}' }
+
+sidecar:
+  spicepod:
+    version: v1
+    kind: Spicepod
+    name: sidecar-flightsql-app
+    datasets:
+      - from: flightsql:orders
+        name: orders
+        params: { flightsql_endpoint: 'http://127.0.0.1:${instance.flight_port}' }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - generate:
+      src:
+        table: orders
+        rows: 5000
+        seed: 31
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: customer_id, int: [1, 320], nulls: 0.05 }
+          - { name: amount, decimal: { range: [0, 1000], scale: 2 } }
+          - { name: status, choice: [open, shipped, returned] }
+  - start: {}
+  - mark-metrics: before-sidecar
+    on: upstream
+  - query: SELECT id, amount FROM orders WHERE id = 1234
+  - query: SELECT id, customer_id, amount, status FROM orders WHERE customer_id = 7
+  - query: SELECT status, count(*) AS n, sum(amount) AS total FROM orders GROUP BY status
+  - query: SELECT id FROM orders WHERE id = 999999
+    expect-empty: true
+  # Four statements reached the upstream, each as a DoGet and none as a GetFlightInfo.
+  - wait-metric: { name: flight_requests, labels: { method: get_flight_info, command: statement_query }, increased-by: 0, since: before-sidecar, timeout: 30s }
+    on: upstream
+  - wait-metric: { name: flight_requests, labels: { method: do_get, command: statement_query }, increased-by: 4, since: before-sidecar, timeout: 30s }
+    on: upstream

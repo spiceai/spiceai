@@ -78,7 +78,9 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 
-use data_components::flightsql::{FlightSqlClient, FlightSqlExec, query_to_stream};
+use data_components::flightsql::{
+    FlightSqlClient, FlightSqlExec, StatementTicket, query_to_stream,
+};
 use flight_client::cookie::CookieStore;
 
 /// Pass-through nodes that may sit between a `HashJoinExec` and the federated
@@ -108,6 +110,7 @@ pub struct BroadcastJoinFlightSqlExec {
     source_tables: String,
     client: FlightSqlClient,
     cookie_store: Arc<CookieStore>,
+    statement_ticket: StatementTicket,
     output_schema: SchemaRef,
     trace_parent: Option<String>,
     properties: Arc<PlanProperties>,
@@ -115,13 +118,13 @@ pub struct BroadcastJoinFlightSqlExec {
 }
 
 impl BroadcastJoinFlightSqlExec {
+    /// Runs `sql` where `source`, a scan of the fact partition, would have run its own query:
+    /// with its client, cookies, statement tickets and trace parent.
     fn new(
         sql: String,
         source_tables: String,
-        client: FlightSqlClient,
-        cookie_store: Arc<CookieStore>,
+        source: &FlightSqlExec,
         output_schema: SchemaRef,
-        trace_parent: Option<String>,
         statistics: Statistics,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
@@ -133,10 +136,11 @@ impl BroadcastJoinFlightSqlExec {
         Self {
             sql,
             source_tables,
-            client,
-            cookie_store,
+            client: source.client().clone(),
+            cookie_store: Arc::clone(source.cookie_store()),
+            statement_ticket: source.statement_ticket(),
             output_schema,
-            trace_parent,
+            trace_parent: source.trace_parent().map(str::to_string),
             properties,
             statistics: Arc::new(statistics),
         }
@@ -206,6 +210,7 @@ impl ExecutionPlan for BroadcastJoinFlightSqlExec {
             self.sql.clone(),
             Arc::clone(&self.cookie_store),
             self.source_tables.clone(),
+            self.statement_ticket,
         )
         .map(move |res| res.and_then(|batch| coerce_batch(batch, &target_for_map)));
         Ok(Box::pin(RecordBatchStreamAdapter::new(target, stream)))
@@ -370,10 +375,8 @@ fn try_rewrite(
         children.push(Arc::new(BroadcastJoinFlightSqlExec::new(
             sql.clone(),
             source_tables.clone(),
-            fe.client().clone(),
-            Arc::clone(fe.cookie_store()),
+            fe,
             Arc::clone(&output_schema),
-            fe.trace_parent().map(str::to_string),
             statistics.clone(),
         )));
     }

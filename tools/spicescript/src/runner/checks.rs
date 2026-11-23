@@ -278,7 +278,12 @@ pub(super) async fn wait_metric(
             last_drive = Instant::now();
         }
         let text = instance.spiced.metrics().await?;
-        let value = read(&text, &w.name);
+        let value = match (&w.condition, read(&text, &w.name)) {
+            // A counter that was never created has counted nothing: without this, a check that
+            // a counter rose by 0 could never pass for a series that never appeared.
+            (MetricCondition::IncreasedBy { .. }, None) => Some(0.0),
+            (_, value) => value,
+        };
         let met = match (&w.condition, value) {
             (_, None) => false,
             (MetricCondition::Above(x), Some(v)) => v > *x,

@@ -195,11 +195,16 @@ impl FederatedTaskHistoryTable {
         table_ref: String,
     ) -> Result<Vec<RecordBatch>, (String, String)> {
         let cookie_store = Arc::new(CookieStore::new());
-        let batches: Vec<RecordBatch> =
-            data_components::flightsql::query_to_stream(client, sql, cookie_store, table_ref)
-                .try_collect()
-                .await
-                .map_err(|e| (executor_id, format!("FlightSQL query failed: {e}")))?;
+        let batches: Vec<RecordBatch> = data_components::flightsql::query_to_stream(
+            client,
+            sql,
+            cookie_store,
+            table_ref,
+            data_components::flightsql::StatementTicket::FromFlightInfo,
+        )
+        .try_collect()
+        .await
+        .map_err(|e| (executor_id, format!("FlightSQL query failed: {e}")))?;
         Ok(batches)
     }
 }
