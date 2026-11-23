@@ -1294,13 +1294,14 @@ async fn an_unusable_listing_read_from_the_cache_says_so_and_is_retried() {
     assert!(!error.is_configuration_error());
 }
 
-/// The content of a file the snapshot holds is what the repository committed, wherever the
-/// listing came from: the error reads the same online, offline and in an outage, says nothing of
-/// filling the cache, and is not retried.
+/// A file the snapshot holds whose content cannot be used is a mistake in the repository when the
+/// Hub was read. Read from the cache alone, the copy need not be the one the repository committed,
+/// so the error says only the cache was read. Offline, retries read the same copy, so it is not
+/// retried, and it says to unset the variable so that Spice compares the copy with the Hub. In an
+/// outage it is retried, since the Hub's return lets Spice do that itself.
 #[tokio::test]
-async fn a_file_whose_content_cannot_be_used_fails_the_same_from_the_cache() {
+async fn a_file_whose_content_cannot_be_used_is_retried_only_in_an_outage() {
     const WHY: &str = "'model.safetensors.index.json' has no `weight_map`";
-    const ERROR: &str = "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): 'model.safetensors.index.json' has no `weight_map`. See: https://spiceai.org/docs/components/models/huggingface";
     let fixture = Fixture::new().await;
     fixture.mock.commit(MODEL, C1, model_files());
     fixture.mock.branch(MODEL, "main", C1);
@@ -1313,18 +1314,92 @@ async fn a_file_whose_content_cannot_be_used_fails_the_same_from_the_cache() {
     fixture.mock.faults(|faults| faults.hub_down = true);
     let outage = fixture.open(None, &[]).await;
 
-    for (snapshot, cache_only) in [
-        (&online, None),
-        (&offline, Some("`HF_HUB_OFFLINE` is set")),
+    for (snapshot, message, permanent) in [
+        (
+            &online,
+            "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): 'model.safetensors.index.json' has no `weight_map`. See: https://spiceai.org/docs/components/models/huggingface".to_string(),
+            true,
+        ),
+        (
+            &offline,
+            format!(
+                "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): `HF_HUB_OFFLINE` is set, so Spice read only the Hugging Face cache at '{}', where 'model.safetensors.index.json' has no `weight_map`. Unset `HF_HUB_OFFLINE` so that Spice compares the cache's copy with the Hugging Face Hub and downloads it again if its size differs. See: https://spiceai.org/docs/components/models/huggingface",
+                fixture.cache().display()
+            ),
+            true,
+        ),
         (
             &outage,
-            Some("the Hugging Face Hub could not be reached (HTTP 503)"),
+            "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): the Hugging Face Hub could not be reached (HTTP 503), so Spice read only the Hugging Face cache, where 'model.safetensors.index.json' has no `weight_map`. Spice retries the download; check the network connection. See: https://spiceai.org/docs/components/models/huggingface".to_string(),
+            false,
         ),
     ] {
-        assert_eq!(snapshot.cache_only_reason().as_deref(), cache_only);
         let error = huggingface_hub::DownloadError::invalid_file(snapshot, WHY);
-        assert_eq!(error.to_string(), ERROR, "{cache_only:?}");
-        assert!(error.is_configuration_error(), "{cache_only:?}");
+        assert_eq!(error.to_string(), message);
+        assert_eq!(error.is_configuration_error(), permanent, "{message}");
+    }
+}
+
+/// A copy in the cache can be short: a copy made where the filesystem has no links, or a blob
+/// another writer renamed into place, cut off by a crash. Read from the cache alone it is used as
+/// it is; once the Hub's listing is read, a copy whose size differs is downloaded again. That is
+/// what retrying in an outage, and reading the Hub when offline, rely on.
+#[tokio::test]
+async fn a_short_copy_in_the_cache_is_downloaded_again_once_the_hub_is_read() {
+    const INDEX: &str = r#"{"metadata":{},"weight_map":{"a":"model-00001-of-00001.safetensors"}}"#;
+    const NAME: &str = "model.safetensors.index.json";
+    for damage in ["short copy", "empty copy", "truncated blob"] {
+        let fixture = Fixture::new().await;
+        fixture.mock.commit(
+            MODEL,
+            C1,
+            vec![
+                ("config.json", MockFile::text("{}")),
+                (NAME, MockFile::text(INDEX)),
+            ],
+        );
+        fixture.mock.branch(MODEL, "main", C1);
+        let online = fixture.open(None, &[]).await;
+        online.download(&[NAME]).await.expect("the index downloads");
+        let entry = online.dir().join(NAME);
+        let damaged: &[u8] = match damage {
+            "short copy" => &INDEX.as_bytes()[..30],
+            _ => b"",
+        };
+        if damage == "truncated blob" {
+            let blob = std::fs::canonicalize(&entry).expect("the entry links to a blob");
+            assert_ne!(blob, entry, "the cache links the entry to its blob");
+            std::fs::write(&blob, damaged).expect("truncates the blob");
+        } else {
+            std::fs::remove_file(&entry).expect("removes the entry");
+            std::fs::write(&entry, damaged).expect("writes the copy");
+        }
+
+        fixture.mock.faults(|faults| faults.hub_down = true);
+        let outage = fixture.open(None, &[]).await;
+        assert!(outage.cache_only_reason().is_some(), "{damage}");
+        let read = outage
+            .fetch_quietly(&[NAME])
+            .await
+            .expect("the cache lists the index");
+        assert_eq!(
+            std::fs::read(&read[0]).expect("reads the copy"),
+            damaged,
+            "{damage}: read from the cache alone, the copy is used as it is"
+        );
+
+        fixture.mock.faults(|faults| faults.hub_down = false);
+        let back = fixture.open(None, &[]).await;
+        assert_eq!(back.cache_only_reason(), None, "{damage}");
+        let read = back
+            .fetch_quietly(&[NAME])
+            .await
+            .expect("the index downloads again");
+        assert_eq!(
+            std::fs::read_to_string(&read[0]).expect("reads the index"),
+            INDEX,
+            "{damage}: with the Hub read, the copy is the committed index again"
+        );
     }
 }
 

@@ -107,9 +107,11 @@ pub(crate) enum Cause {
         message: String,
         source: Source,
     },
-    /// The content of a file the snapshot holds cannot be used: `message` says why.
+    /// The content of a file the snapshot holds, read from `source`, cannot be used: `message`
+    /// says why.
     InvalidFile {
         message: String,
+        source: Source,
     },
     /// The repository id is not one the Hub allows.
     InvalidRepo,
@@ -201,36 +203,41 @@ impl DownloadError {
     }
 
     /// The content of a file the snapshot holds cannot be used; `message` says why, as the
-    /// clause after a colon. The error is the same whether or not the Hub was read: the cache
-    /// holds a file as the repository committed it, so neither a retry nor filling the cache
-    /// changes it.
+    /// clause after a colon. With the Hub read, the file is the one the repository committed,
+    /// and the error is a mistake in the Spicepod. Read from the cache alone, the copy need not
+    /// be: a copy cut short by a crash is used as it is until the Hub's listing is read, and is
+    /// then downloaded again because its size differs. So the error says only the cache was
+    /// read. Offline, where a retry reads the same copy, it says that unsetting the variable
+    /// lets Spice compare the copy with the Hub; in an outage, Spice retries until the Hub is
+    /// back.
     #[must_use]
     pub fn invalid_file(snapshot: &crate::snapshot::Snapshot, message: impl Into<String>) -> Self {
         snapshot.error(
             None,
             Cause::InvalidFile {
                 message: message.into(),
+                source: snapshot.source().clone(),
             },
         )
     }
 
     /// Whether the download cannot succeed until the Spicepod changes: a setting that is not
     /// valid, a repository that does not hold what the component loads, or a file of it whose
-    /// content the component cannot use, from the Hub or the cache alike. A refusal from the
-    /// Hub is not one: a missing or private repository, a rejected token and a gated
-    /// repository can all be fixed on the Hub's side, and a network failure, a full disk or a
-    /// cache `hf download` can fill can clear while Spice runs. Nor is what a listing of the
-    /// cache alone lacks, which the cache, not the repository, is missing.
+    /// content the component cannot use, read from the Hub or, offline, from the cache, where
+    /// a retry reads the same copy. A refusal from the Hub is not one: a missing or private
+    /// repository, a rejected token and a gated repository can all be fixed on the Hub's side,
+    /// and a network failure, a full disk or a cache `hf download` can fill can clear while
+    /// Spice runs. Nor is what a listing of the cache alone lacks, which the cache, not the
+    /// repository, is missing, nor a file read from the cache in an outage, which the Hub's
+    /// return can replace.
     #[must_use]
     pub fn is_configuration_error(&self) -> bool {
         match self.cause.as_ref() {
-            Cause::Settings(_)
-            | Cause::InvalidFile { .. }
-            | Cause::InvalidPath
-            | Cause::InvalidRepo => true,
+            Cause::Settings(_) | Cause::InvalidPath | Cause::InvalidRepo => true,
             Cause::Missing { source, .. } | Cause::Unusable { source, .. } => {
                 matches!(source, Source::Hub)
             }
+            Cause::InvalidFile { source, .. } => !matches!(source, Source::CacheInOutage { .. }),
             Cause::Hub(error) | Cause::Fetch(FetchError::Hub { source: error }) => matches!(
                 error,
                 client::Error::InvalidEndpoint { .. } | client::Error::InvalidToken { .. }
@@ -356,7 +363,24 @@ impl DownloadError {
                 message,
                 source: Source::Hub,
             }
-            | Cause::InvalidFile { message } => (message.clone(), None),
+            | Cause::InvalidFile {
+                message,
+                source: Source::Hub,
+            } => (message.clone(), None),
+            Cause::InvalidFile {
+                message,
+                source: Source::OfflineCache { by },
+            } => (
+                format!(
+                    "{}, so Spice read only the Hugging Face cache at '{}', where {message}",
+                    by.is_set(),
+                    display_path(&context.cache_dir)
+                ),
+                Some(format!(
+                    "Unset {} so that Spice compares the cache's copy with the Hugging Face Hub and downloads it again if its size differs",
+                    by.variables()
+                )),
+            ),
             Cause::Unusable {
                 message,
                 source: Source::OfflineCache { by },
@@ -371,6 +395,10 @@ impl DownloadError {
             Cause::Unusable {
                 message,
                 source: Source::CacheInOutage { error },
+            }
+            | Cause::InvalidFile {
+                message,
+                source: Source::CacheInOutage { error },
             } if refused(error) => {
                 let (cause, fix) =
                     hub_cause_and_fix(error, token, no_token_fix, &context.revision, retried);
@@ -380,6 +408,10 @@ impl DownloadError {
                 )
             }
             Cause::Unusable {
+                message,
+                source: Source::CacheInOutage { error },
+            }
+            | Cause::InvalidFile {
                 message,
                 source: Source::CacheInOutage { error },
             } => (

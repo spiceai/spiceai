@@ -184,11 +184,12 @@ async fn a_model_with_no_files_keeps_its_safetensors_offline() {
     );
 }
 
-/// A file the cache holds is the repository's committed bytes, so a safetensors index whose
-/// content cannot be used fails as it does when the Hub is read: no retry or `hf download`
-/// changes those bytes, so the error is not retried and gives no advice to fill the cache.
+/// Offline, a safetensors index the cache holds whose content cannot be used fails to load, and
+/// is not retried: retries read the same copy. The error says the cache alone was read, since
+/// its copy need not be the one the repository committed, and that unsetting `HF_HUB_OFFLINE`
+/// has Spice compare that copy with the Hub. An index that is not UTF-8 is one of these.
 #[tokio::test]
-async fn a_safetensors_index_the_cache_holds_that_cannot_be_used_is_not_retried() {
+async fn a_safetensors_index_the_cache_holds_that_cannot_be_used_offline_says_to_read_the_hub() {
     crate::require_process_per_test(WHY);
     let cache = tempfile::tempdir().expect("creates a cache directory");
     let snapshot = offline_snapshot(cache.path());
@@ -197,6 +198,10 @@ async fn a_safetensors_index_the_cache_holds_that_cannot_be_used_is_not_retried(
 
     for (index, why) in [
         (&b"not json"[..], "is not valid JSON"),
+        (
+            &b"{\"weight_map\":{\"a\":\"\xff\"}}"[..],
+            "is not valid JSON",
+        ),
         (&b"{}"[..], "has no `weight_map`"),
         (&br#"{"weight_map":{}}"#[..], "names no weight files"),
     ] {
@@ -214,7 +219,8 @@ async fn a_safetensors_index_the_cache_holds_that_cannot_be_used_is_not_retried(
         assert_eq!(
             error.to_string(),
             format!(
-                "Failed to download model 'test' from Hugging Face repo '{REPO_ID}' (revision 'main'): 'model.safetensors.index.json' {why}. See: https://spiceai.org/docs/components/models/huggingface"
+                "Failed to download model 'test' from Hugging Face repo '{REPO_ID}' (revision 'main'): `HF_HUB_OFFLINE` is set, so Spice read only the Hugging Face cache at '{}', where 'model.safetensors.index.json' {why}. Unset `HF_HUB_OFFLINE` so that Spice compares the cache's copy with the Hugging Face Hub and downloads it again if its size differs. See: https://spiceai.org/docs/components/models/huggingface",
+                cache.path().display()
             )
         );
         assert!(error.is_configuration_error(), "{why}");
