@@ -1218,10 +1218,16 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
             "a shared slot is not this instance's own"
         );
         // Another location, or another dataset, is another slot.
-        assert_ne!(first, default_slot_name_on("orders", Some("s3://other/spice")));
+        assert_ne!(
+            first,
+            default_slot_name_on("orders", Some("s3://other/spice"))
+        );
         assert_ne!(first, default_slot_name_on("lineitem", Some(location)));
         // Without a shared location: this instance's slot, as before.
-        assert_eq!(default_slot_name_on("orders", None), default_slot_name("orders"));
+        assert_eq!(
+            default_slot_name_on("orders", None),
+            default_slot_name("orders")
+        );
         assert!(first.len() <= PG_IDENTIFIER_MAX_BYTES, "{first}");
     }
 
