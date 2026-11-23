@@ -201,10 +201,15 @@ pub fn write_secure_file(path: &Path, contents: &[u8]) -> Result<()> {
 pub fn ensure_string_sequence_item(value: &mut Value, field: &str, item: &str) -> Result<bool> {
     let sequence = ensure_sequence_field(value, field)?;
 
-    if sequence
-        .iter()
-        .any(|entry| entry.as_str().is_some_and(|value| value == item))
-    {
+    // An entry is present in its short form (`- acme/support`) or as a mapping
+    // naming it under `from` (`- { from: acme/support, trust: full }`).
+    if sequence.iter().any(|entry| {
+        entry.as_str().is_some_and(|value| value == item)
+            || entry
+                .get("from")
+                .and_then(Value::as_str)
+                .is_some_and(|from| from == item)
+    }) {
         return Ok(false);
     }
 

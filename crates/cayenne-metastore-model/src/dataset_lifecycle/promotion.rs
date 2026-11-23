@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Warm inputs replaced by a cold output in one conditional head record.
-use super::{Data, Protocol as Local, Record};
+use super::{Data, Protocol as Local, Record, record_lines, rows_text};
 use stateright::{Model, Property};
 
 #[derive(Clone, Debug)]
@@ -120,6 +120,52 @@ impl Model for Protocol {
             }
         }
         (n != *s).then_some(n)
+    }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Stage => "plan promotion of every warm file to cold".into(),
+            Action::Deliver(0) => "the promotion CAS arrives".into(),
+            Action::Deliver(_) => "a delayed duplicate of the promotion CAS arrives".into(),
+            Action::Checkpoint => "write a checkpoint".into(),
+            Action::Recover => "recover from checkpoint plus log tail".into(),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        let mut lines = vec![format!("reader sees: {}", rows_text(&s.data.rows()))];
+        if let Some(data) = &s.recovered {
+            lines.push(format!("recovered:   {}", rows_text(&data.rows())));
+        }
+        lines.push(format!("copies delivered: {:02b}", s.delivered));
+        Some(crate::explorer::summary(&lines))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{Svg, Tone, row};
+        let s = path.last_state();
+        let mut svg = Svg::new();
+        let head = vec![format!("commit {}", s.log.len())];
+        let bottom = s
+            .data
+            .draw(&mut svg, 0, 0, "DATASET HEAD AND FILES", &head, None);
+        let mut boxes = vec![];
+        if let Some((base, r)) = &s.request {
+            boxes.push((
+                format!("PROMOTION CAS (on commit {base})"),
+                record_lines(r),
+                Tone::Staged,
+            ));
+        }
+        if let Some((c, data)) = &s.checkpoint {
+            boxes.push((
+                format!("CHECKPOINT at commit {c}"),
+                vec![rows_text(&data.rows())],
+                Tone::Live,
+            ));
+        }
+        if !boxes.is_empty() {
+            row(&mut svg, bottom + 24, &boxes);
+        }
+        Some(svg.finish())
     }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![

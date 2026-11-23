@@ -37,14 +37,15 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use rustls::{
     DigitallySignedStruct, DistinguishedName, SignatureScheme,
-    client::danger::HandshakeSignatureValid,
+    client::{WebPkiServerVerifier, danger::HandshakeSignatureValid},
     pki_types::{
-        CertificateDer, PrivateKeyDer, UnixTime,
+        CertificateDer, PrivateKeyDer, ServerName, UnixTime,
         pem::{self, PemObject},
     },
     server::{
@@ -58,6 +59,9 @@ use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 use x509_certificate::CapturedX509Certificate;
 
 use runtime_tls::{CertWatcher, ReloadScope, reload::record_reload_metric};
+use tokio::io::AsyncWriteExt;
+
+use crate::peer::PeerIdentity;
 
 /// Set of paths the bundle re-reads on every reload.
 #[derive(Clone, Debug)]
@@ -79,6 +83,9 @@ struct ClusterPkiSnapshot {
     /// builds its own internal rustls config from this when each channel
     /// is constructed; storing the immutable input is sufficient.
     client_tls: Arc<ClientTlsConfig>,
+    /// The same outbound trust and client identity as `client_tls`, as a
+    /// rustls config [`ClusterPkiBundle::observe_peer_identity`] connects with.
+    observe_tls: Arc<rustls::ClientConfig>,
     /// SHA-256 over (CA || cert || key) for change detection. The
     /// watcher already debounces, but on slow filesystems `notify` can
     /// surface modify events for files whose contents are byte-identical
@@ -110,6 +117,20 @@ pub struct ClusterPkiBundle {
     /// (rare) requires a restart for the hint to refresh; verification
     /// itself uses the current snapshot and remains correct.
     hint_subjects: Vec<DistinguishedName>,
+    /// The node's kind (`executor`/`scheduler`), instance identity, and the host
+    /// it advertises to peers, set once cluster configuration resolves them (see
+    /// [`Self::set_advertise_identity`]). When set, a reloaded certificate that
+    /// does not name the host is rejected, because peers reach this node there
+    /// and verify its certificate against the host.
+    advertise: ArcSwapOption<AdvertiseIdentity>,
+}
+
+/// How this node is reached by its peers, for the certificate reload check.
+#[derive(Debug)]
+struct AdvertiseIdentity {
+    node_kind: String,
+    node_id: String,
+    host: String,
 }
 
 impl std::fmt::Debug for ClusterPkiSnapshot {
@@ -150,6 +171,7 @@ impl ClusterPkiBundle {
             inner: ArcSwap::from_pointee(snapshot),
             paths: paths.clone(),
             hint_subjects,
+            advertise: ArcSwapOption::empty(),
         });
 
         let weak = Arc::downgrade(&this);
@@ -178,6 +200,110 @@ impl ClusterPkiBundle {
         Arc::clone(&self.inner.load().client_tls)
     }
 
+    /// Connects to the cluster node at `host:port` the way this node connects
+    /// to its peers — verifying the node's certificate against the cluster CA
+    /// and `host`, and presenting this node's certificate — and returns the
+    /// identity the node's certificate gives it. The connection is closed once
+    /// the TLS handshake completes; no request is sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node cannot be reached within `timeout`, `host`
+    /// is not a DNS name or IP address, or the handshake fails, for example
+    /// because the node's certificate is not valid for `host`.
+    pub async fn observe_peer_identity(
+        &self,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+    ) -> io::Result<PeerIdentity> {
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        let server_name = ServerName::try_from(host.to_string()).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("'{host}' is not a DNS name or IP address: {err}"),
+            )
+        })?;
+        let connector =
+            tokio_rustls::TlsConnector::from(Arc::clone(&self.inner.load().observe_tls));
+        let observe = async {
+            let tcp = tokio::net::TcpStream::connect((host, port)).await?;
+            let mut tls = connector.connect(server_name, tcp).await?;
+            let identity = tls
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(<[CertificateDer<'static>]>::first)
+                .and_then(PeerIdentity::from_certificate);
+            // Best effort: the handshake is all this connection is for.
+            let _ = tls.shutdown().await;
+            identity.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("the node at {host}:{port} presented no readable certificate"),
+                )
+            })
+        };
+        tokio::time::timeout(timeout, observe).await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no TLS handshake with {host}:{port} within {timeout:?}"),
+            )
+        })?
+    }
+
+    /// Records how this node is reached by its peers — its kind, instance
+    /// identity, and advertise host — so a later certificate reload that drops
+    /// the host name is rejected (see [`Self::reload_now`]). Each scheduler and
+    /// executor sets it once its cluster configuration resolves
+    /// (spiceai/spiceai#16481).
+    pub fn set_advertise_identity(
+        &self,
+        node_kind: impl Into<String>,
+        node_id: impl Into<String>,
+        host: impl Into<String>,
+    ) {
+        self.advertise.store(Some(Arc::new(AdvertiseIdentity {
+            node_kind: node_kind.into(),
+            node_id: node_id.into(),
+            host: host.into(),
+        })));
+    }
+
+    /// This node's own identity, from the leaf of the certificate it currently
+    /// serves. `None` only if that leaf does not parse, which construction
+    /// already rejects.
+    #[must_use]
+    pub fn self_identity(&self) -> Option<PeerIdentity> {
+        let snapshot = self.inner.load();
+        let leaf = snapshot.cert.end_entity_cert().ok()?;
+        PeerIdentity::from_certificate(leaf)
+    }
+
+    /// The subject of this node's own certificate, for messages (for example
+    /// `CN=executor-1`); empty when the subject is empty.
+    #[must_use]
+    pub fn self_subject(&self) -> String {
+        self.self_identity()
+            .map(|identity| identity.subject().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Whether this node's own certificate is valid for `host` — the check a TLS
+    /// client applies when it dials this node there. A node advertises only an
+    /// address its certificate names.
+    #[must_use]
+    pub fn self_certificate_names_host(&self, host: &str) -> bool {
+        let snapshot = self.inner.load();
+        let Ok(leaf) = snapshot.cert.end_entity_cert() else {
+            return false;
+        };
+        crate::peer::certificate_names_host(leaf, host)
+    }
+
     /// Fingerprint of the currently-loaded bundle, for tests.
     #[doc(hidden)]
     #[must_use]
@@ -197,6 +323,39 @@ impl ClusterPkiBundle {
                 if new_snap.fingerprint == self.inner.load().fingerprint {
                     tracing::debug!("Cluster mTLS reload: file changed but content identical");
                     return;
+                }
+                // A rotated certificate that no longer names the address this
+                // node advertises is not loaded: peers reach this node there and
+                // verify its certificate against the host, so loading it would
+                // make the node unreachable.
+                if let Some(advertise) = self.advertise.load_full() {
+                    let names = new_snap.cert.end_entity_cert().is_ok_and(|leaf| {
+                        crate::peer::certificate_names_host(leaf, &advertise.host)
+                    });
+                    if !names {
+                        let subject = new_snap
+                            .cert
+                            .end_entity_cert()
+                            .ok()
+                            .and_then(PeerIdentity::from_certificate)
+                            .map(|identity| identity.subject().to_string())
+                            .unwrap_or_default();
+                        tracing::error!(
+                            "{}",
+                            crate::peer::advertise_address_mismatch_message(
+                                crate::peer::MismatchSite::Reload,
+                                &advertise.node_kind,
+                                &advertise.node_id,
+                                &subject,
+                                &advertise.host,
+                            )
+                        );
+                        // Counted with the other rotations whose material fails
+                        // validation and is not loaded; the log line names the
+                        // cause.
+                        record_reload_metric(ReloadScope::Cluster, "parse_error");
+                        return;
+                    }
                 }
                 self.inner.store(Arc::new(new_snap));
                 tracing::info!(
@@ -328,13 +487,16 @@ fn parse_and_validate(paths: &ClusterPkiPaths) -> io::Result<ClusterPkiSnapshot>
             )
         })?;
     }
-    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+    let roots = Arc::new(roots);
+    let verifier = WebPkiClientVerifier::builder(Arc::clone(&roots))
         .build()
         .map_err(|err| {
             io::Error::other(format!(
                 "rustls failed to build cluster client verifier: {err}"
             ))
         })?;
+
+    let observe_tls = build_observe_config(roots, &cert_pem, &key_pem)?;
 
     // Outbound ClientTlsConfig.
     let client_tls = Arc::new(
@@ -349,8 +511,38 @@ fn parse_and_validate(paths: &ClusterPkiPaths) -> io::Result<ClusterPkiSnapshot>
         cert: Arc::new(cert),
         verifier,
         client_tls,
+        observe_tls,
         fingerprint,
     })
+}
+
+/// The rustls client config [`ClusterPkiBundle::observe_peer_identity`] uses:
+/// the cluster CA as the only trust anchor, this node's certificate as its
+/// client identity, and h2, the protocol every cluster listener serves.
+fn build_observe_config(
+    roots: Arc<rustls::RootCertStore>,
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> io::Result<Arc<rustls::ClientConfig>> {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let server_verifier = WebPkiServerVerifier::builder_with_provider(roots, Arc::clone(&provider))
+        .build()
+        .map_err(|err| {
+            io::Error::other(format!(
+                "rustls failed to build cluster server verifier: {err}"
+            ))
+        })?;
+    let chain = load_certs(cert_pem)
+        .map_err(|err| io::Error::other(format!("node cert parse failed: {err}")))?;
+    let key = load_key(key_pem).map_err(io::Error::other)?;
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|err| io::Error::other(format!("rustls protocol versions: {err}")))?
+        .with_webpki_verifier(server_verifier)
+        .with_client_auth_cert(chain, key)
+        .map_err(|err| io::Error::other(format!("node cert/key not usable: {err}")))?;
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(Arc::new(config))
 }
 
 fn validate_chain(

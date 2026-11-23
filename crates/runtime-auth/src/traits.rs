@@ -45,6 +45,42 @@ pub trait AuthPrincipal {
         None
     }
 }
+/// Whether `principal` may write: it is in the `write` or `read_write` group, as a read-write
+/// API key and a verified mTLS client are. The one definition of write access a tool call is
+/// authorized against.
+#[must_use]
+pub fn principal_has_write_access(principal: &AuthPrincipalRef) -> bool {
+    principal
+        .groups()
+        .iter()
+        .any(|group| *group == "write" || *group == "read_write")
+}
+
+/// The runtime itself, running work the Spicepod configured rather than serving a caller: a
+/// worker's scheduled prompt. It has write access, as the operator who configured the work
+/// does, so the work may call the read-write tools its model has.
+///
+/// Work the runtime does with no principal at all may only read through tools, so running as
+/// this principal is how such work states that it acts for the operator.
+pub struct SystemPrincipal;
+
+impl AuthPrincipal for SystemPrincipal {
+    fn username(&self) -> &'static str {
+        "spice_system"
+    }
+
+    fn groups(&self) -> &[&str] {
+        &["read_write"]
+    }
+
+    /// Its own identity, never the anonymous one: what the runtime's own work leaves behind for
+    /// its caller (the tool steps a model took, kept so a conversation can continue) must not
+    /// be restored for an anonymous request.
+    fn stable_id(&self) -> Option<Cow<'_, str>> {
+        Some(Cow::Borrowed("system:spice"))
+    }
+}
+
 pub trait AuthRequestContext {
     /// Sets the current authentication principal for the request context.
     ///

@@ -3,8 +3,14 @@ name: spice-mssql-bench docker
 on:
   workflow_dispatch:
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   build:
+    permissions:
+      contents: read
+      packages: write  # docker login ghcr.io with GITHUB_TOKEN; push ghcr.io/spiceai/spice-mssql-bench
     environment: github-publish-autoapprove
     runs-on: ubuntu-24.04
 

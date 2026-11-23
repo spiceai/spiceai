@@ -18,14 +18,14 @@ use async_openai::{
     error::OpenAIError,
     types::responses::{
         CodeInterpreterTool, CreateResponse, EasyInputContent, EasyInputMessage,
-        FunctionCallOutput, FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, InputItem,
-        InputParam, InputTokenDetails, Item, MCPToolCallStatus, MessageItem, MessageType,
-        OutputItem, OutputTokenDetails, Response, ResponseMCPCallArgumentsDeltaEvent,
-        ResponseMCPCallArgumentsDoneEvent, ResponseMCPCallCompletedEvent,
-        ResponseMCPCallFailedEvent, ResponseMCPCallInProgressEvent, ResponseOutputItemAddedEvent,
-        ResponseOutputItemDoneEvent, ResponseStream, ResponseStreamEvent, ResponseUsage, Role,
-        Tool as ToolDefinition, ToolChoiceAllowedMode, ToolChoiceOptions, ToolChoiceParam,
-        WebSearchTool,
+        FunctionCallOutput, FunctionCallOutputItemParam, FunctionTool, FunctionToolCall,
+        InputContent, InputItem, InputParam, InputRole, InputTextContent, InputTokenDetails, Item,
+        MCPToolCallStatus, MessageItem, MessageType, OutputItem, OutputTokenDetails, Response,
+        ResponseMCPCallArgumentsDeltaEvent, ResponseMCPCallArgumentsDoneEvent,
+        ResponseMCPCallCompletedEvent, ResponseMCPCallFailedEvent, ResponseMCPCallInProgressEvent,
+        ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent, ResponseStream,
+        ResponseStreamEvent, ResponseUsage, Role, Tool as ToolDefinition, ToolChoiceAllowedMode,
+        ToolChoiceOptions, ToolChoiceParam, WebSearchTool,
     },
 };
 use async_trait::async_trait;
@@ -33,6 +33,8 @@ use futures::{Stream, StreamExt};
 use llms::responses::Error as ResponsesError;
 use llms::responses::Responses;
 use llms::{chat::Error as LlmError, progress::Progress};
+use runtime_tools::builtin::list_datasets::catalog_prompt_from_tool;
+use runtime_tools::result::{ResultBudget, with_budget};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -92,6 +94,8 @@ pub struct ToolUsingResponses {
     openai_tools: Vec<OpenAIResponsesTools>,
     tools: Vec<Arc<dyn SpiceModelTool>>,
     recursion_limit: Option<usize>,
+    /// The budget for one tool result, sized from the model's context window.
+    result_budget: ResultBudget,
 }
 
 impl ToolUsingResponses {
@@ -107,7 +111,45 @@ impl ToolUsingResponses {
             openai_tools,
             tools,
             recursion_limit,
+            result_budget: ResultBudget::default(),
         }
+    }
+
+    /// Sizes each tool result for a model with a context window of `context_window` tokens.
+    #[must_use]
+    pub fn with_context_window(mut self, context_window: Option<u64>) -> Self {
+        self.result_budget = ResultBudget::for_context_window(context_window);
+        self
+    }
+
+    /// `req` with the datasets the model can query (see [`catalog_prompt_from_tool`]) at the end
+    /// of its `instructions`, after the client's, unless the instructions or the input already
+    /// hold them. The Spicepod `system_prompt` goes before both, below this loop.
+    ///
+    /// Instructions belong to one request: a response that continues this one with
+    /// `previous_response_id` does not carry them over, so a continued conversation holds the
+    /// list once, as the current request gives it, and not a copy for every turn, as an input
+    /// item stored with the conversation would.
+    async fn with_catalog(&self, mut req: CreateResponse) -> CreateResponse {
+        let Some(list_datasets) = self.tools.iter().find(|t| t.name() == "list_datasets") else {
+            return req;
+        };
+        let Some(catalog) = catalog_prompt_from_tool(list_datasets.as_ref()).await else {
+            return req;
+        };
+        if let InputParam::Items(items) = &req.input
+            && items.iter().any(|item| holds_catalog(item, &catalog))
+        {
+            return req;
+        }
+        req.instructions = Some(match req.instructions.take() {
+            Some(instructions) if holds_paragraph(&instructions, &catalog) => instructions,
+            Some(instructions) if !instructions.trim().is_empty() => {
+                format!("{instructions}\n\n{catalog}")
+            }
+            _ => catalog,
+        });
+        req
     }
 
     fn prepare_req(&self, mut req: CreateResponse) -> CreateResponse {
@@ -162,6 +204,10 @@ impl ToolUsingResponses {
             .cloned()
     }
 
+    #[expect(
+        clippy::manual_assert,
+        reason = "if cfg!(...) is intentionally conditional on feature flag"
+    )]
     async fn call_tool(&self, tool_call: &FunctionToolCall) -> ToolOutcome {
         let FunctionToolCall {
             name,
@@ -169,46 +215,43 @@ impl ToolUsingResponses {
             id,
             ..
         } = tool_call;
-        match self.as_spiced_tool(name) {
-            Some(t) => match t.call(arguments).await {
-                Ok(v) => {
-                    tracing::info!(
-                        target: "task_history",
-                        progress = Progress::log()
-                            .id(id.clone())
-                            .title(format!("'{name}' tool completed successfully"))
-                            .json_content(v.clone())
-                            .to_jsonl(),
-                    );
-                    ToolOutcome::Completed(v)
-                }
-                Err(e) => {
-                    tracing::info!(
-                        target: "task_history",
-                        progress = Progress::error()
-                            .id(id.clone())
-                            .title(format!("'{name}' tool completed unsuccessfully"))
-                            .content(e.to_string())
-                            .to_jsonl(),
-                    );
-                    ToolOutcome::Failed(format!(
-                        "Failed to call the tool {}. An error occurred: {e}",
-                        t.name()
-                    ))
-                }
-            },
-            None => {
-                // All calls to `call_tool` should have previously checked that `tool_call` has an associated tool.
-                if cfg!(feature = "dev") {
-                    panic!(
-                        "Tool '{name}' was provided to LLM, but now no longer exists. This should not be possible."
-                    );
-                } else {
-                    tracing::warn!(
-                        "Tool '{name}' was provided to LLM, but now no longer exists. This should not be possible.",
-                    );
-                    ToolOutcome::Completed(Value::Null)
-                }
+        let Some(t) = self.as_spiced_tool(name) else {
+            // All calls to `call_tool` should have previously checked that `tool_call` has an associated tool.
+            if cfg!(feature = "dev") {
+                panic!(
+                    "Tool '{name}' was provided to LLM, but now no longer exists. This should not be possible."
+                );
+            }
+            tracing::warn!(
+                "Tool '{name}' was provided to LLM, but now no longer exists. This should not be possible.",
+            );
+            return ToolOutcome::Completed(Value::Null);
+        };
+        match with_budget(self.result_budget, t.call(arguments)).await {
+            Ok(v) => {
+                tracing::info!(
+                    target: "task_history",
+                    progress = Progress::log()
+                        .id(id.clone())
+                        .title(format!("'{name}' tool completed successfully"))
+                        .json_content(v.clone())
+                        .to_jsonl(),
+                );
+                ToolOutcome::Completed(v)
+            }
+            Err(e) => {
+                tracing::info!(
+                    target: "task_history",
+                    progress = Progress::error()
+                        .id(id.clone())
+                        .title(format!("'{name}' tool completed unsuccessfully"))
+                        .content(e.to_string())
+                        .to_jsonl(),
+                );
+                ToolOutcome::Failed(format!(
+                    "Failed to call the tool {}. An error occurred: {e}",
+                    t.name()
+                ))
             }
         }
     }
@@ -565,12 +608,14 @@ impl Responses for ToolUsingResponses {
     }
 
     async fn responses_stream(&self, req: CreateResponse) -> Result<ResponseStream, OpenAIError> {
+        let req = self.with_catalog(req).await;
         let inner_req = self.prepare_req(req.clone());
         self.responses_stream_inner(inner_req, self.recursion_limit)
             .await
     }
 
     async fn responses_request(&self, req: CreateResponse) -> Result<Response, OpenAIError> {
+        let req = self.with_catalog(req).await;
         let inner_req = self.prepare_req(req);
         self.responses_request_inner(inner_req, self.recursion_limit)
             .await
@@ -1099,6 +1144,39 @@ fn to_input_item(input: InputParam) -> Vec<InputItem> {
     }
 }
 
+/// Whether `instructions` hold `catalog` as a paragraph of its own, between blank lines or the
+/// ends of the text. A list that only starts with `catalog`, such as an older one that names a
+/// dataset since renamed or dropped, is a different list and does not count.
+fn holds_paragraph(instructions: &str, catalog: &str) -> bool {
+    instructions
+        .split("\n\n")
+        .any(|paragraph| paragraph.trim_matches('\n') == catalog)
+}
+
+/// Whether `item` is a system message holding `catalog`, as its text or as one of its text parts,
+/// in either message shape the Responses API accepts.
+fn holds_catalog(item: &InputItem, catalog: &str) -> bool {
+    let in_parts = |parts: &[InputContent]| {
+        parts.iter().any(
+            |part| matches!(part, InputContent::InputText(InputTextContent { text }) if text == catalog),
+        )
+    };
+    match item {
+        InputItem::EasyMessage(message) if matches!(message.role, Role::System) => {
+            match &message.content {
+                EasyInputContent::Text(text) => text == catalog,
+                EasyInputContent::ContentList(parts) => in_parts(parts),
+            }
+        }
+        InputItem::Item(Item::Message(MessageItem::Input(message)))
+            if matches!(message.role, InputRole::System) =>
+        {
+            in_parts(&message.content)
+        }
+        _ => false,
+    }
+}
+
 /// `response`, the last round's, as the response to the whole tool-use loop: the output of the
 /// earlier rounds comes first, and the usage covers every round. It keeps the last round's ID,
 /// the response whose input holds the whole exchange, so that a client continuing with
@@ -1169,12 +1247,178 @@ mod tests {
             None
         }
 
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-            self.0.fetch_add(1, Ordering::SeqCst);
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            // Spice's own lookup of the datasets for the system prompt (it asks for a `limit`) is
+            // not a call the model made, and its answer here is no page, so no list is added.
+            if !arg.contains("\"limit\"") {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(json!(["taxi_trips"]))
+        }
+    }
+
+    /// A `list_datasets` tool that lists one dataset, `taxi_trips`.
+    struct OneDataset;
+
+    #[async_trait]
+    impl SpiceModelTool for OneDataset {
+        fn name(&self) -> Cow<'_, str> {
+            "list_datasets".into()
+        }
+
+        fn description(&self) -> Option<Cow<'_, str>> {
+            None
+        }
+
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(
+                json!({"datasets": [{"table": "spice.public.taxi_trips"}], "total": 1, "has_more": false}),
+            )
+        }
+    }
+
+    /// A request as JSON, after Spice adds the dataset list.
+    async fn request_with_catalog(request: Value) -> Value {
+        let model = ToolUsingResponses::new(
+            ScriptedResponses::new(vec![]) as Arc<dyn Responses>,
+            vec![],
+            vec![Arc::new(OneDataset) as Arc<dyn SpiceModelTool>],
+            None,
+        );
+        let request: CreateResponse = serde_json::from_value(request).expect("a valid request");
+        serde_json::to_value(model.with_catalog(request).await).expect("serializable request")
+    }
+
+    /// `request` as JSON after a trip through [`CreateResponse`], which fills in the defaults of
+    /// the shape it parses, and nothing else.
+    fn as_parsed(request: Value) -> Value {
+        let request: CreateResponse = serde_json::from_value(request).expect("a valid request");
+        serde_json::to_value(request).expect("serializable request")
+    }
+
+    /// The datasets reach the model at the end of the request's instructions, after the client's,
+    /// only once, and never as an input item, which a provider stores with the conversation and
+    /// gives again to every response that continues it with `previous_response_id`.
+    #[tokio::test]
+    async fn the_dataset_list_follows_the_clients_instructions() {
+        let catalog = "Datasets (use these names in sql, search, and table_schema):\n- spice.public.taxi_trips";
+        let input = json!([
+            {"type": "message", "role": "system", "content": [{"type": "input_text", "text": "You answer about trips."}]},
+            {"type": "message", "role": "developer", "content": "Be brief."},
+            {"type": "message", "role": "user", "content": "How many trips?"},
+        ]);
+
+        let request = request_with_catalog(json!({"model": "m", "input": input})).await;
+        assert_eq!(request["instructions"], catalog);
+        assert_eq!(
+            request["input"],
+            as_parsed(json!({"model": "m", "input": input}))["input"],
+            "the input is left as the client sent it"
+        );
+
+        let continued = json!({
+            "model": "m",
+            "instructions": "Answer in French.",
+            "input": [{"type": "message", "role": "user", "content": "And yesterday?"}],
+            "previous_response_id": "resp_1",
+        });
+        let request = request_with_catalog(continued.clone()).await;
+        let instructions = format!("Answer in French.\n\n{catalog}");
+        assert_eq!(request["instructions"], instructions.as_str());
+        assert_eq!(
+            request["input"],
+            as_parsed(continued)["input"],
+            "a continued response gets no input item"
+        );
+
+        let again = request_with_catalog(request.clone()).await;
+        assert_eq!(
+            again["instructions"],
+            instructions.as_str(),
+            "instructions that hold the list keep it once"
+        );
+    }
+
+    /// Instructions hold the current dataset list only when it is a paragraph of its own. An older
+    /// list that merely starts with the current one, because a dataset was renamed, dropped, or
+    /// described since, does not count, and the current list follows it.
+    #[tokio::test]
+    async fn an_older_dataset_list_in_the_instructions_does_not_hide_the_current_one() {
+        let header = "Datasets (use these names in sql, search, and table_schema):";
+        let catalog = format!("{header}\n- spice.public.taxi_trips");
+        for instructions in [
+            catalog.clone(),
+            format!("Answer in French.\n\n{catalog}"),
+            format!("{catalog}\n\nAnswer in French."),
+            format!("Answer in French.\n\n\n{catalog}\n"),
+        ] {
+            let request = request_with_catalog(
+                json!({"model": "m", "instructions": instructions, "input": "Hi"}),
+            )
+            .await;
+            assert_eq!(
+                request["instructions"],
+                instructions.as_str(),
+                "the current list is kept once"
+            );
+        }
+        let older = [
+            format!("{header}\n- spice.public.taxi_trips_2025"),
+            format!("{header}\n- spice.public.taxi_trips\n- spice.public.zones"),
+            format!("{header}\n- spice.public.taxi_trips: Trips before 2025"),
+        ];
+        let mut given = Vec::new();
+        for instructions in &older {
+            let request = request_with_catalog(
+                json!({"model": "m", "instructions": instructions, "input": "Hi"}),
+            )
+            .await;
+            given.push(request["instructions"].clone());
+        }
+        let expected: Vec<Value> = older
+            .iter()
+            .map(|instructions| Value::from(format!("{instructions}\n\n{catalog}")))
+            .collect();
+        assert_eq!(given, expected, "the current list follows an older one");
+    }
+
+    /// A client that sends the dataset list back as a system message, as text or as `input_text`
+    /// parts, in either message shape the API accepts, gets it once.
+    #[tokio::test]
+    async fn a_dataset_list_sent_back_in_the_input_is_kept_once() {
+        let catalog = "Datasets (use these names in sql, search, and table_schema):\n- spice.public.taxi_trips";
+        for system in [
+            json!({"role": "system", "content": catalog}),
+            json!({"role": "system", "content": [{"type": "input_text", "text": catalog}]}),
+            json!({"type": "message", "role": "system", "content": [{"type": "input_text", "text": catalog}]}),
+        ] {
+            let input = json!([
+                system,
+                {"type": "message", "role": "user", "content": "How many trips?"},
+            ]);
+            let sent = json!({"model": "m", "input": input});
+            let request = request_with_catalog(sent.clone()).await;
+            assert_eq!(request, as_parsed(sent), "{system}");
+            assert_eq!(
+                request
+                    .to_string()
+                    .matches("spice.public.taxi_trips")
+                    .count(),
+                1,
+                "{system}: {request}"
+            );
         }
     }
 
@@ -1195,10 +1439,11 @@ mod tests {
             None
         }
 
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Err("no such table".into())
         }
     }

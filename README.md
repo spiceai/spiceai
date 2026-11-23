@@ -39,6 +39,8 @@ Install the CLI on macOS, Linux, or WSL:
 curl https://install.spiceai.org | /bin/bash   # or: brew install spiceai/spiceai/spice
 ```
 
+The installer checks the sha256 of each download before installing it.
+
 Or let your coding agent set it up. Install [Spice Skills](https://github.com/spiceai/skills), and your agent can write and run the Spicepod for you:
 
 | Agent        | Install                                                                                   |
@@ -127,7 +129,7 @@ Next, connect your own sources with the [data connector docs](https://spiceai.or
 | [Vector search](https://spiceai.org/docs/features/search/vector-search)    | Spice Cayenne vector indexes, Amazon S3 Vectors, Elasticsearch                                  |
 | [Secret stores](https://spiceai.org/docs/components/secret-stores)         | Environment, Kubernetes, OS keyring, AWS Secrets Manager, HashiCorp Vault, Azure Key Vault      |
 
-Each component page lists every supported option and its release status. Spice Cayenne is the default accelerator. The DuckDB and Turso accelerators were removed in v2.5, and the Arrow, SQLite, and PostgreSQL accelerators are deprecated and will be removed. See the [migration guide](https://spiceai.org/docs/components/data-accelerators/cayenne/migration).
+Each component page lists every supported option and its release status. Spice Cayenne is the default accelerator. The DuckDB, PostgreSQL, and Turso accelerators were removed in v2.5, and the Arrow and SQLite accelerators are deprecated and will be removed. See the [migration guide](https://spiceai.org/docs/components/data-accelerators/cayenne/migration).
 
 ## Deploy anywhere
 

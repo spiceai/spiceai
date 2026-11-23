@@ -63,8 +63,9 @@ pub fn to_sql_preserving_precedence(expr_value: &Expr) -> Result<String> {
             "({} IS NOT UNKNOWN)",
             to_sql_preserving_precedence(inner.as_ref())?
         )),
+        // The space keeps a negative operand from forming `--`, which starts a comment.
         Expr::Negative(inner) => Ok(format!(
-            "(-{})",
+            "(- {})",
             to_sql_preserving_precedence(inner.as_ref())?
         )),
         _ => {
@@ -206,6 +207,17 @@ fn typed_numeric_literal(value: &datafusion::scalar::ScalarValue) -> Result<Opti
 mod tests {
     use super::*;
     use datafusion::{logical_expr::lit, prelude::SessionContext, scalar::ScalarValue};
+
+    #[test]
+    fn a_negated_negative_number_is_not_a_comment() -> Result<()> {
+        for (value, sql) in [(-5_i64, "(- -5)"), (i64::MIN, "(- -9223372036854775808)")] {
+            assert_eq!(
+                to_sql_preserving_precedence(&Expr::Negative(Box::new(lit(value))))?,
+                sql
+            );
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn executor_numeric_sql_preserves_arrow_values_and_types() -> Result<()> {

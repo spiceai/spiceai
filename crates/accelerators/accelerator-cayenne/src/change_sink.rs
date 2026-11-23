@@ -17,6 +17,8 @@ limitations under the License.
 //! Native CDC execution and storage durability fences for the table owner.
 
 #[cfg(test)]
+mod crash_tests;
+#[cfg(test)]
 mod tests;
 
 use std::sync::Arc;
@@ -50,9 +52,9 @@ use runtime_acceleration::change_sink::provider::{
     reject_unknown_operations,
 };
 use runtime_acceleration::change_sink::{
-    BackendWrite, ChangeBatch, ChangeCapabilities, ChangePayload, ChangeSinkBackend,
-    ChangeSinkContext, DurabilityObserver, PositionWrite, Recovery, ReplacementSupport,
-    SchemaEvolutionSupport, StorageDurability, WriteOptions, replaced_scope_filters,
+    BackendWrite, ChangeCapabilities, ChangeSinkBackend, ChangeSinkContext, ChangeWrite,
+    DurabilityObserver, PositionWrite, Recovery, ReplacementSupport, SchemaEvolutionSupport,
+    StorageDurability, WriteOptions, replaced_scope_filters,
 };
 use runtime_table_partition::provider::PartitionTableProvider;
 use spice_table::{LayerWalk, find_concrete};
@@ -155,8 +157,7 @@ impl CayenneChangeSinkBackend {
     /// checkpoint's maintenance, such as a maintained-aggregate rebuild, on every
     /// durable write.
     async fn select_recovery_path(&self, recovery: Recovery) -> Result<()> {
-        let buffered = self.table.is_cdc_memory_mode() && !self.table.is_memory_resident_mode();
-        let observer = if recovery == Recovery::Replayable && buffered {
+        let observer = if recovery == Recovery::Replayable && self.buffers_cdc_in_memory() {
             self.observer.read().clone()
         } else {
             None
@@ -173,65 +174,24 @@ impl CayenneChangeSinkBackend {
         Ok(())
     }
 
-    /// Apply a CDC batch. With the object-native metastore, an upsert or delete
-    /// batch's metastore changes and its inputs' source positions commit as one
-    /// record, once the write is durable and before the source is acknowledged.
-    /// A truncate replaces files, so its batch keeps one commit per change, and
-    /// the committers save positions afterwards, as with every other metastore.
-    async fn apply_cdc(
-        &self,
-        batch: CdcBatch,
-        options: WriteOptions,
-        ctx: &SessionContext,
-        positions: Vec<PositionWrite>,
-    ) -> Result<BackendWrite> {
-        let same_record = !positions.is_empty()
-            && self.table.catalog().commits_source_positions()
-            && !group_into_sub_batches(&batch)
-                .iter()
-                .any(|(op, _)| matches!(op, ChangeOperationType::Truncate));
-        if !same_record {
-            return self.apply_cdc_groups(batch, options, ctx).await;
-        }
-        let mut write =
-            cayenne::catalog::with_same_record_commits(self.apply_cdc_groups(batch, options, ctx))
-                .await?;
-        let catalog = Arc::clone(self.table.catalog());
-        let table_id = self.table.table_id().to_string();
-        // A write kept in the in-memory tier is not durable yet; its checkpoint
-        // records the position instead.
-        let durable = write.durability == StorageDurability::Durable;
-        let finalizer = write.finalizer.take();
-        write.finalizer = Some(Box::pin(async move {
-            cayenne::catalog::with_same_record_commits(async move {
-                if let Some(finalizer) = finalizer {
-                    finalizer.await?;
-                }
-                if durable {
-                    for position in positions {
-                        position.await.map_err(DataFusionError::External)?;
-                    }
-                }
-                Ok::<(), DataFusionError>(())
-            })
-            .await?;
-            catalog
-                .commit_pending_for(&table_id)
-                .await
-                .map_err(|error| DataFusionError::External(Box::new(error)))
-        }));
-        Ok(write)
+    /// Whether this table keeps replayable CDC rows in its in-memory tier
+    /// (`cdc_durability: memory`), behind a source callback that a checkpoint
+    /// of the tier acknowledges.
+    fn buffers_cdc_in_memory(&self) -> bool {
+        self.table.is_cdc_memory_mode()
+            && !self.table.is_memory_resident_mode()
+            && self.observer.read().is_some()
     }
 
-    async fn apply_cdc_groups(
+    /// Whether the source can replay every change of `batch`, so its rows may
+    /// wait in the in-memory tier: upserts, and deletes the tier can hold.
+    fn is_replayable(
         &self,
-        batch: CdcBatch,
+        batch: &CdcBatch,
+        groups: &[(ChangeOperationType, Vec<usize>)],
         options: WriteOptions,
-        ctx: &SessionContext,
-    ) -> Result<BackendWrite> {
-        let groups = group_into_sub_batches(&batch);
-        reject_unknown_operations(&groups)?;
-        let replayable = options.recovery == Recovery::Replayable
+    ) -> bool {
+        options.recovery == Recovery::Replayable
             && groups.iter().all(|(op, rows)| match op {
                 ChangeOperationType::Upsert => true,
                 ChangeOperationType::Delete => {
@@ -239,7 +199,94 @@ impl CayenneChangeSinkBackend {
                         && rows.iter().all(|&row| batch.has_primary_keys(row))
                 }
                 ChangeOperationType::Truncate | ChangeOperationType::Unknown => false,
-            });
+            })
+    }
+
+    /// Apply a CDC batch. With the object-native metastore, an upsert or delete
+    /// batch's metastore changes and its inputs' source positions commit as one
+    /// record, once the write is durable and before the source is acknowledged.
+    /// A truncate replaces files, so its batch keeps one commit per change, and
+    /// the committers save positions afterwards, as with every other metastore.
+    ///
+    /// So does a batch whose rows may wait in the in-memory tier. A checkpoint
+    /// of the tier, not the batch, makes those rows durable and records the
+    /// newest position it covers, and the tier's budget can send any group of
+    /// the batch down the durable path, after a checkpoint that may run between
+    /// two of its groups. Each such group commits before it becomes visible,
+    /// so a checkpoint never runs inside the batch while an earlier group's
+    /// change waits for the batch's record.
+    async fn apply_cdc(
+        &self,
+        batch: CdcBatch,
+        options: WriteOptions,
+        ctx: &SessionContext,
+        positions: Vec<PositionWrite>,
+    ) -> Result<BackendWrite> {
+        let groups = group_into_sub_batches(&batch);
+        let same_record = !positions.is_empty()
+            && self.table.catalog().commits_source_positions()
+            && !groups
+                .iter()
+                .any(|(op, _)| matches!(op, ChangeOperationType::Truncate))
+            && (!self.buffers_cdc_in_memory() || !self.is_replayable(&batch, &groups, options));
+        if !same_record {
+            return self.apply_cdc_groups(batch, groups, options, ctx).await;
+        }
+        let (write, after_commit) = cayenne::catalog::with_same_record_commits(
+            self.apply_cdc_groups(batch, groups, options, ctx),
+        )
+        .await;
+        let mut write = write?;
+        let catalog = Arc::clone(self.table.catalog());
+        let table_id = self.table.table_id().to_string();
+        // A write kept in the in-memory tier is not durable yet; its checkpoint
+        // records the position instead.
+        let durable = write.durability == StorageDurability::Durable;
+        let finalizer = write.finalizer.take();
+        write.finalizer = Some(Box::pin(async move {
+            // The write's data goes into the record first, then the positions,
+            // so a position never commits without the rows it covers.
+            // Part of the burst's scope, so the finalizer's write reads the
+            // burst's earlier, unpublished groups as its own.
+            let (finished, finalize_after_commit) = after_commit
+                .continue_scope(async move {
+                    if let Some(finalizer) = finalizer {
+                        finalizer.await?;
+                    }
+                    if durable {
+                        for position in positions {
+                            position.await.map_err(DataFusionError::External)?;
+                        }
+                    }
+                    Ok::<(), DataFusionError>(())
+                })
+                .await;
+            finished?;
+            after_commit.extend(finalize_after_commit);
+            catalog
+                .commit_pending_for(&table_id)
+                .await
+                .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            // Only now that the record has committed do the rows become visible,
+            // and do the staging objects the write no longer needs go. The
+            // source is acknowledged after this returns.
+            after_commit.run().await;
+            Ok(())
+        }));
+        Ok(write)
+    }
+
+    /// The caller groups the batch once, encoding every row's primary key,
+    /// and passes the result in.
+    async fn apply_cdc_groups(
+        &self,
+        batch: CdcBatch,
+        groups: Vec<(ChangeOperationType, Vec<usize>)>,
+        options: WriteOptions,
+        ctx: &SessionContext,
+    ) -> Result<BackendWrite> {
+        reject_unknown_operations(&groups)?;
+        let replayable = self.is_replayable(&batch, &groups, options);
         self.select_recovery_path(if replayable {
             Recovery::Replayable
         } else {
@@ -251,7 +298,11 @@ impl CayenneChangeSinkBackend {
         let mut finalizer: Option<BoxFuture<'static, Result<()>>> = None;
         let mut max_epoch: Option<u64> = None;
         for (op, rows) in groups {
-            // A later sub-operation can conflict with the previous append.
+            // A later group can conflict with the previous append, so that
+            // append is finished first. Inside the batch's same-record scope its
+            // changes are only buffered and its publish waits for the batch's
+            // one record: the later group reads them from the table's writer
+            // view, and no reader sees them before that record commits.
             if let Some(pending) = finalizer.take() {
                 pending.await?;
             }
@@ -280,7 +331,8 @@ impl CayenneChangeSinkBackend {
                         // The driver owns and polls this future even if the
                         // producer drops its receipt. No task is spawned here.
                         // Dropping an unpublished staged write retains its WAL;
-                        // it is recovery-required, not rolled back. A failed
+                        // it is recovery-required, not rolled back. One written
+                        // at final keys leaves only orphans. A failed
                         // predecessor must fence this owner before dropping it.
                         finalizer = Some(Box::pin(async move {
                             write
@@ -461,32 +513,25 @@ impl ChangeSinkBackend for CayenneChangeSinkBackend {
 
     async fn apply(
         &self,
-        batch: ChangeBatch,
+        write: ChangeWrite,
         options: WriteOptions,
         ctx: &SessionContext,
         positions: Vec<PositionWrite>,
     ) -> Result<BackendWrite> {
-        let replacement_filters = replaced_scope_filters(batch.replaced_scopes());
-        match batch.into_payload() {
-            ChangePayload::Cdc(rows) => {
+        let replacement_filters = replaced_scope_filters(write.replaced_scopes());
+        match write {
+            ChangeWrite::Cdc(rows) => {
                 let batch = rows.into_built().map_err(before_mutation)?;
                 self.apply_cdc(batch, options, ctx, positions).await
             }
-            ChangePayload::Rows {
-                schema,
-                batches,
-                scoped_inputs,
-            } => {
-                let batches = if self.table.is_memory_resident_mode()
-                    && batches.iter().any(|batch| batch.num_rows() > 0)
-                {
-                    let target = self.context.table.schema();
-                    let batches = batches
-                        .into_iter()
-                        .map(|batch| try_cast_to(batch, Arc::clone(&target)).map_err(Into::into))
-                        .collect::<Result<Vec<_>>>()
+            ChangeWrite::Rows(write) => {
+                let write = if self.table.is_memory_resident_mode() && write.num_rows() > 0 {
+                    let write = write
+                        .cast_to(&self.context.table.schema())
                         .map_err(before_mutation)?;
-                    let incoming_bytes = batches
+                    let incoming_bytes = write
+                        .rows()
+                        .batches()
                         .iter()
                         .map(|batch| {
                             u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX)
@@ -496,9 +541,9 @@ impl ChangeSinkBackend for CayenneChangeSinkBackend {
                         .preflight_memory_append(incoming_bytes, replacement_filters.as_deref())
                         .await
                         .map_err(|error| before_mutation(error.into()))?;
-                    batches
+                    write
                 } else {
-                    batches
+                    write
                 };
                 let rebuildable = options.recovery == Recovery::Rebuildable;
                 self.select_recovery_path(if rebuildable {
@@ -513,7 +558,7 @@ impl ChangeSinkBackend for CayenneChangeSinkBackend {
                 // every burst, which every point lookup then has to read.
                 let changed = self
                     .provider
-                    .apply_rows(schema, batches, scoped_inputs, options, ctx, Some(self))
+                    .apply_rows(write, options, ctx, Some(self))
                     .await?;
                 Ok(BackendWrite::complete(
                     changed,

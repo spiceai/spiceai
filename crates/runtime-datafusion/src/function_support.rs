@@ -324,6 +324,8 @@ pub fn expression_support_for_engine(engine: &str) -> Option<ExpressionSupport> 
 ///   `regexp_count` — `SQLite` has none of these, so a federated call
 ///   fails with `no such function` or, for `date_trunc`, a cast of the
 ///   truncated `'2026-01'` text back into a timestamp.
+/// * `strpos` (and its aliases `instr` and `position`) — `SQLite` names it
+///   `instr`, so a federated call fails with `no such function: strpos`.
 ///
 /// Aggregates (only [`SQLITE_AGGREGATES`] federate), windows, `LIKE` / `ILIKE`
 /// and `ROLLUP` / `CUBE` / `GROUPING SETS` are not names the scalar deny-list
@@ -340,6 +342,7 @@ pub const SQLITE_DENIED_BUILTINS: &[&str] = &[
     "encode",
     "date_part",
     "date_trunc",
+    "strpos",
     crate::dialect::REGEXP_LIKE_NAME,
     crate::dialect::REGEXP_REPLACE_NAME,
     crate::dialect::REGEXP_MATCH_NAME,
@@ -470,8 +473,14 @@ pub fn sqlite_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) ->
         // case (`'alice' LIKE '%ALICE%'` is true) and `ILIKE` does not exist,
         // so both Like forms stay local rather than matching the wrong rows
         // or failing remotely. SQLite has no `ROLLUP`, `CUBE` or
-        // `GROUPING SETS` (`no such function: ROLLUP`).
-        Expr::TryCast(_) | Expr::Like(_) | Expr::GroupingSet(_) => false,
+        // `GROUPING SETS` (`no such function: ROLLUP`). SQLite has no
+        // `IS [NOT] UNKNOWN` and reads `UNKNOWN` as a column name, so the
+        // query fails with `no such column: UNKNOWN`.
+        Expr::TryCast(_)
+        | Expr::Like(_)
+        | Expr::GroupingSet(_)
+        | Expr::IsUnknown(_)
+        | Expr::IsNotUnknown(_) => false,
         // SQLite has no decimal type: it stores a decimal as a REAL or an
         // INTEGER and computes `avg` and `sum` over it in floating point or in
         // 64-bit integers. `avg` reads one unit high in the last place against
@@ -574,13 +583,23 @@ fn sqlite_cast_is_faithful(from: &DataType, to: &DataType) -> bool {
 /// strips repetitions of `chars` as a *string*, where `btrim` strips any
 /// character in it — so a rewrite would trade a failed query for wrong rows.
 ///
-/// A cast from a fractional value into an integer stays local too, because
-/// `MySQL` rounds it where `DataFusion` truncates
-/// ([`crate::dialect::mysql_can_evaluate_expression`]).
+/// Arithmetic `MySQL` evaluates differently stays local too
+/// ([`crate::dialect::mysql_can_evaluate_expression`]): a cast from a
+/// fractional value into an integer and a decimal `/`, which `MySQL` rounds
+/// where `DataFusion` truncates, a `/` or `%` whose divisor might be zero,
+/// which `MySQL` answers with `NULL` where `DataFusion` fails the query, and a
+/// `DISTINCT` aggregate `MySQL` cannot parse, such as `stddev(DISTINCT x)`.
+///
+/// So does every `DataFusion` array, list and map function: `MySQL` has none of
+/// those types, so `range`, `make_array` and the rest fail there, and an
+/// `UNNEST` over one goes with them (`ERROR 1064 … near 'range(0, 100))'`).
 #[must_use]
 pub fn deny_spice_functions_for_mysql_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
-        .deny_also([crate::dialect::BTRIM_NAME.to_string()])
+        .deny_also(
+            std::iter::once(crate::dialect::BTRIM_NAME.to_string())
+                .chain(datafusion_nested_function_names().iter().cloned()),
+        )
         .expression(Arc::new(crate::dialect::mysql_can_evaluate_expression))
         .build()
 }
@@ -612,7 +631,9 @@ pub const POSTGRES_PUSHABLE_ARRAY_FUNCTIONS: &[&str] = &[
 /// `PostgreSQL` connector's federation deny-list. See issue #10703.
 ///
 /// A cast from a fractional value into an integer stays local too, because
-/// `PostgreSQL` rounds it where `DataFusion` truncates
+/// `PostgreSQL` rounds it where `DataFusion` truncates, and so do a decimal `/`,
+/// which `PostgreSQL` answers with more digits than `DataFusion`'s scale, and a
+/// window function with `DISTINCT`, which `PostgreSQL` does not implement
 /// ([`crate::dialect::postgres_can_evaluate_expression`]).
 #[must_use]
 pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {

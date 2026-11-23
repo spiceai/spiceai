@@ -477,6 +477,30 @@ def check_cache_endpoint_isolation(jobs: dict) -> list[str]:
     return problems
 
 
+def check_action_descriptions(document: dict) -> list[str]:
+    """Report a `${{` in an action's descriptions.
+
+    GitHub evaluates expressions anywhere in an action's metadata when a job loads the
+    action, descriptions included, and the contexts a step has (`runner`, `github`, …)
+    do not exist there. So an example such as `${{ runner.temp }}` written into an input's
+    description fails every job that uses the action in `Set up job`, with "Unrecognized
+    named-value: 'runner'", before any step runs.
+    """
+    places = [("the action's description", document.get("description"))]
+    for section in ("inputs", "outputs"):
+        entries = document.get(section)
+        if isinstance(entries, dict):
+            for name, entry in entries.items():
+                if isinstance(entry, dict):
+                    places.append((f"the description of {section[:-1]} `{name}`", entry.get("description")))
+    return [
+        f"{where} contains `${{{{`, which GitHub evaluates as an expression when it loads the action, "
+        "failing every job that uses it; describe the value in words instead"
+        for where, text in places
+        if isinstance(text, str) and "${{" in text
+    ]
+
+
 def check_action(text: str) -> list[str]:
     """Return the problems with one composite action definition's contents."""
     document, problems = _parse_mapping(text)
@@ -486,7 +510,7 @@ def check_action(text: str) -> list[str]:
     if "runs" not in document:
         return ["has no `runs:` block"]
 
-    return check_action_conditions(document["runs"])
+    return check_action_descriptions(document) + check_action_conditions(document["runs"])
 
 
 def _format_yaml_error(error: yaml.YAMLError) -> str:

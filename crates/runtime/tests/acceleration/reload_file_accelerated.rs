@@ -24,9 +24,9 @@ limitations under the License.
 //! checkpoint and schedules nothing, while readiness — decided from the path —
 //! never arrives.
 //!
-//! The `DuckDB` `mode: file` and `SQLite` `mode: file_create` arms check that
-//! their engines reach the reload with a usable file. Cayenne's `file_create`
-//! arm is `test/spicescript/cron-and-reload.yaml`, which drives the reload
+//! The Cayenne `mode: file` arm checks that the engine reaches the reload with a
+//! usable file. Cayenne's `file_create` arm is
+//! `test/spicescript/cayenne-file-create-reload.yaml`, which drives the reload
 //! through a watched Spicepod.
 
 use anyhow::anyhow;
@@ -222,28 +222,6 @@ async fn test_reload_changed_cayenne_file_dataset() -> Result<(), anyhow::Error>
                 ));
             }
             Ok(())
-        })
-        .await
-}
-
-/// `SQLite` reopens its database file on every pool handout, so it recreates the
-/// file `file_create` removed on its own. This pins that.
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn test_reload_changed_sqlite_file_create_dataset() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
-
-    test_request_context()
-        .scope_retry(3, || async {
-            reload_changed_file_accelerated_dataset(
-                "test_reload_changed_sqlite_file_create",
-                "sqlite",
-                &Mode::FileCreate,
-                i64::try_from(ROWS_AFTER)?,
-            )
-            .await
-            .map(|_| ())
         })
         .await
 }

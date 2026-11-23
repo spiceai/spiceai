@@ -62,6 +62,13 @@ pub(crate) fn remove_files(table_id: &str, select: Select, snapshot_ids: &[Strin
     }))
 }
 
+pub(crate) fn forget_retired(table_id: &str, keys: &[String]) -> Action {
+    Action::new(Kind::ForgetRetired(proto::FileKeys {
+        table_id: table_id.to_string(),
+        keys: keys.to_vec(),
+    }))
+}
+
 pub(crate) fn remove_file_stats(table_id: &str, select: Select, snapshot_ids: &[String]) -> Action {
     Action::new(Kind::RemoveFileStats(proto::RemoveBySnapshot {
         table_id: table_id.to_string(),
@@ -234,9 +241,41 @@ pub(crate) fn set_published(
 
 /// The actions of `commit_overwrite_in_txn`'s clearing batch, in its order.
 pub(crate) fn overwrite_clear(table_id: &str, new_snapshot_id: &str) -> Vec<Action> {
-    vec![
+    overwrite_clear_with(
+        table_id,
+        new_snapshot_id,
         remove_delete_files(table_id, Select::All, &[], None),
         clear_insert_records(table_id, None),
+    )
+}
+
+/// [`overwrite_clear`] for a datalake promotion that keeps the tombstones above
+/// `cutoff` (`commit_overwrite_clearing_in_txn` with a cutoff): it removes only
+/// the deletion vectors `removed_delete_files` lists and the insert records at
+/// or below `cutoff`.
+pub(crate) fn overwrite_clear_retaining(
+    table_id: &str,
+    new_snapshot_id: &str,
+    removed_delete_files: &[String],
+    cutoff: i64,
+) -> Vec<Action> {
+    overwrite_clear_with(
+        table_id,
+        new_snapshot_id,
+        remove_delete_files(table_id, Select::Listed, removed_delete_files, None),
+        clear_insert_records(table_id, Some(cutoff)),
+    )
+}
+
+fn overwrite_clear_with(
+    table_id: &str,
+    new_snapshot_id: &str,
+    delete_files: Action,
+    insert_records: Action,
+) -> Vec<Action> {
+    vec![
+        delete_files,
+        insert_records,
         remove_groups(table_id, Select::All, &[], false),
         remove_inlined(table_id, Select::All, &[]),
         remove_inlined_deletes(table_id, Select::All, &[]),
