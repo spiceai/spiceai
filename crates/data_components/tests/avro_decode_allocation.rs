@@ -107,7 +107,11 @@ fn decode_error_and_peak_heap(
     let result = runtime.block_on(parse_avro_change_events(body, &options));
     let peak = PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(base);
     match result {
-        Ok(events) => panic!("a body of {} bytes decoded to {events:?}", body.len()),
+        Ok(events) => panic!(
+            "a body of {} bytes decoded to {} change events",
+            body.len(),
+            events.len()
+        ),
         Err(err) => (err.to_string(), peak),
     }
 }
