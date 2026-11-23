@@ -28,7 +28,7 @@ use data_components::Read;
 #[cfg(feature = "spark")]
 use data_components::databricks::DatabricksSparkConnect;
 use data_components::databricks::sql_warehouse::DatabricksMetrics;
-use data_components::databricks::{DatabricksDelta, DatabricksSqlWarehouse, sql_warehouse};
+use data_components::databricks::{DatabricksDelta, DatabricksSqlWarehouse, delta, sql_warehouse};
 use data_components::unity_catalog::{Endpoint, UnityCatalog as UnityCatalogClient};
 use data_connector_api::ConnectorContext;
 use data_connector_api::{
@@ -1313,6 +1313,11 @@ fn databricks_invalid_configuration_message(
                 _ => {}
             }
         }
+        if let Some(error @ delta::Error::UnsupportedStorageLocation { .. }) =
+            err.downcast_ref::<delta::Error>()
+        {
+            return Some(error.to_string());
+        }
         current = err.source();
     }
 
@@ -2036,6 +2041,25 @@ mod tests {
                     message.contains("Lakehouse Federation foreign table"),
                     "expected the typed Databricks error message: {message}"
                 );
+            }
+            other => panic!("unexpected error classification: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_classify_table_provider_error_does_not_retry_an_unsupported_storage_location() {
+        let dataset = make_dataset("databricks:cat.sch.local", "local").await;
+        let refusal = delta::Error::UnsupportedStorageLocation {
+            table_reference: TableReference::parse_str("cat.sch.local"),
+            reason: "its storage location uses the 'file' scheme".to_string(),
+        };
+        let expected = refusal.to_string();
+
+        let err = classify_table_provider_error(&dataset, Box::new(refusal));
+
+        match err {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert_eq!(message, expected);
             }
             other => panic!("unexpected error classification: {other}"),
         }
