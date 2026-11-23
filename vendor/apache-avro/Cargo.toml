@@ -48,6 +48,11 @@ snappy = [
 xz = ["dep:liblzma"]
 zstandard = ["dep:zstd"]
 
+# Upstream's `#[expect(deprecated)]` on its `digest` imports is unfulfilled with
+# the `digest` this workspace resolves; keep `src/` unmodified and quiet it here.
+[lints.rust]
+unfulfilled_lint_expectations = "allow"
+
 [lib]
 name = "apache_avro"
 path = "src/lib.rs"
