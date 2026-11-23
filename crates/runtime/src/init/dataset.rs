@@ -1180,7 +1180,13 @@ impl Runtime {
             let ds = Arc::clone(&ds_for_build);
             Box::pin(async move { ds.runtime().build_dataset_connector(Arc::clone(&ds)).await })
         });
-        Arc::new(ReconnectingConnector::new(ds.source(), build))
+        let connector = ReconnectingConnector::new(ds.source(), build);
+        let connector = if resumes_changes_after_restart(ds) {
+            connector.resuming_changes(Arc::clone(ds))
+        } else {
+            connector
+        };
+        Arc::new(connector)
     }
 
     /// Whether `ds` is served from its existing acceleration as soon as it loads,
@@ -1201,8 +1207,8 @@ impl Runtime {
     ///
     /// Only datasets whose startup the source does not otherwise shape qualify:
     /// read-only (the write path binds the source when the table is built), not
-    /// `changes` (CDC keeps no dataset checkpoint to serve from; see #14611) or
-    /// `caching` (which is ready immediately and serves its cache on its own), not
+    /// `changes` unless its change stream [resumes after a restart](resumes_changes_after_restart),
+    /// not `caching` (which is ready immediately and serves its cache on its own), not
     /// `append` without a `time_column` (which takes the connector's append stream
     /// when the table is built), no embedding or full-text search columns (whose
     /// search indexes wrap the source's provider, so search would fail until the
@@ -1275,8 +1281,12 @@ impl Runtime {
             "`mode: file_create`".to_string()
         } else if ds.source() == crate::dataconnector::file::FILE_DATACONNECTOR {
             "the `file` connector".to_string()
-        } else if refresh_mode == RefreshMode::Changes {
-            "`refresh_mode: changes`".to_string()
+        } else if refresh_mode == RefreshMode::Changes && !resumes_changes_after_restart(ds) {
+            if acceleration.partition_by.is_empty() {
+                "`refresh_mode: changes`".to_string()
+            } else {
+                "`refresh_mode: changes` with `partition_by`".to_string()
+            }
         } else if refresh_mode == RefreshMode::Caching {
             "`refresh_mode: caching`".to_string()
         } else if refresh_mode == RefreshMode::Append && ds.time_column.is_none() {
@@ -3963,6 +3973,21 @@ fn load_failure_status(ds: &Dataset, cause: &str) -> String {
 
 fn not_served_status(reason: &str, cause: &str) -> String {
     format!("Not served: waits for its source because it uses {reason}. Cause: {cause}")
+}
+
+/// Whether `ds` is a `refresh_mode: changes` dataset whose change stream resumes
+/// after a restart from a recorded position, so it is served from its existing
+/// acceleration at startup and starts its stream once the source answers. A
+/// dataset partitioned across executors waits for its source: its change stream
+/// is scoped to this executor's partitions when the table is built, which needs
+/// the connector.
+pub(crate) fn resumes_changes_after_restart(ds: &Dataset) -> bool {
+    ds.acceleration.as_ref().is_some_and(|acceleration| {
+        acceleration.enabled
+            && acceleration.partition_by.is_empty()
+            && acceleration.refresh_mode == Some(RefreshMode::Changes)
+            && crate::dataconnector::connector_resumes_changes_after_restart(ds.source())
+    })
 }
 
 /// Whether a dataset's `drasi:` block is live.

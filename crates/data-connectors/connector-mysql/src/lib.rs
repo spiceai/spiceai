@@ -222,6 +222,11 @@ impl DataConnectorFactory for MySQLFactory {
         self
     }
 
+    /// The binlog position of a file acceleration is stored in its sidecar.
+    fn resumes_changes_after_restart(&self) -> bool {
+        true
+    }
+
     fn create<'a>(
         &'a self,
         mut params: ConnectorParams,

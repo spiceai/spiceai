@@ -4375,12 +4375,19 @@ impl DataFusion {
             .await
             && checkpoint.exists().await
         {
-            // For CDC we let connector/stream to decide when dataset is ready.
+            // For CDC we let connector/stream to decide when dataset is ready, except
+            // for a stream that resumes after a restart while the dataset is served
+            // from its acceleration: like the other refresh modes, it is ready now and
+            // catches up in the background. Its checkpoint is written only once the
+            // stream has first reported the dataset ready, so the acceleration is
+            // complete.
             //
             // A dataset that reads snapshots (`file_format: snapshot`) is ready only once it
             // has restored a snapshot in this process: a copy left from an earlier run can be
             // arbitrarily old, or from a location the dataset no longer reads.
-            let delay_initial_ready = matches!(refresh_mode, RefreshMode::Changes)
+            let delay_initial_ready = (matches!(refresh_mode, RefreshMode::Changes)
+                && !(source_table_provider.awaits_source()
+                    && crate::init::dataset::resumes_changes_after_restart(dataset)))
                 || (dataset.is_snapshot_source()
                     && bootstrap_status.loaded_snapshot_id().is_none());
 
@@ -4849,6 +4856,10 @@ impl DataFusion {
         }
 
         if refresh_mode == RefreshMode::Changes {
+            if crate::init::dataset::resumes_changes_after_restart(dataset) {
+                accelerated_table_builder.checkpoint_when_changes_ready();
+            }
+
             // Make the dataset's `on_schema_change` policy + constraint columns
             // available to the CDC apply loop before the changes stream starts.
             // Connectors (e.g. Debezium) may have pre-installed a default; this

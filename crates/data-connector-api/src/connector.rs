@@ -241,6 +241,17 @@ pub trait DataConnectorFactory: Send + Sync {
     ) -> Option<SchemaRef> {
         None
     }
+
+    /// Whether this connector's change stream resumes after a restart from a
+    /// position that outlives the process (a replication slot on the source, or a
+    /// position stored with the acceleration). A `refresh_mode: changes` dataset of
+    /// such a connector is served from its existing acceleration at startup, and
+    /// its change stream starts once the source answers.
+    ///
+    /// Called before the connector is built; must not perform I/O.
+    fn resumes_changes_after_restart(&self) -> bool {
+        false
+    }
 }
 
 /// A `DataConnector` knows how to retrieve and optionally write or stream data.

@@ -927,10 +927,16 @@ pub struct Refresher {
     refresh_task_runner: Option<RefreshTaskRunner>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     refresh_on_startup: RefreshOnStartup,
+    /// Whether a change stream records the dataset checkpoint when it first
+    /// reports the dataset ready.
+    checkpoint_when_changes_ready: bool,
     synchronize_with: Option<SynchronizedTable>,
     snapshot_config: Option<SnapshotCreationConfig>,
     snapshot_refresh_state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
     snapshot_task: Option<tokio::task::JoinHandle<()>>,
+    /// Records the dataset checkpoint once a change stream first reports the
+    /// dataset ready.
+    ready_checkpoint_task: Option<tokio::task::JoinHandle<()>>,
     initial_snapshot: Option<InitialSnapshot>,
 
     initial_load_completed: Arc<AtomicBool>,
@@ -1013,6 +1019,7 @@ impl Refresher {
             refresh_task_runner: None,
             checkpointer: None,
             refresh_on_startup: RefreshOnStartup::default(),
+            checkpoint_when_changes_ready: false,
             synchronize_with: None,
             initial_load_completed: Arc::new(AtomicBool::new(false)),
             disable_federation: false,
@@ -1021,6 +1028,7 @@ impl Refresher {
             snapshot_config: None,
             snapshot_refresh_state: None,
             snapshot_task: None,
+            ready_checkpoint_task: None,
             initial_snapshot: None,
             metrics: None,
             cpu_runtime,
@@ -1085,6 +1093,11 @@ impl Refresher {
 
     pub fn refresh_on_startup(&mut self, refresh_on_startup: RefreshOnStartup) -> &mut Self {
         self.refresh_on_startup = refresh_on_startup;
+        self
+    }
+
+    pub fn checkpoint_when_changes_ready(&mut self, enabled: bool) -> &mut Self {
+        self.checkpoint_when_changes_ready = enabled;
         self
     }
 
@@ -1393,9 +1406,14 @@ impl Refresher {
         // a refresh writes the checkpoint of a dataset that neither creates snapshots
         // (whose interval checkpoints without refreshing) nor was restored from one
         // (whose checkpoint is the snapshot's); for those, the last refresh is
-        // reported once one completes.
+        // reported once one completes. A change stream's checkpoint records when it
+        // first caught up, not a refresh, so it is not reported.
         if self.snapshot_config.is_none()
             && !self.bootstrap_status.is_bootstrapped()
+            && !matches!(
+                acceleration_refresh_mode,
+                AccelerationRefreshMode::Changes(..)
+            )
             && let Some(checkpointer) = &self.checkpointer
             && let Ok(Some(last_refresh)) = checkpointer.last_checkpoint_time().await
         {
@@ -1478,6 +1496,41 @@ impl Refresher {
                     }
                 };
                 self.snapshot_task = snapshot_task;
+
+                // A change stream writes no checkpoint of its own. Recording one once
+                // the stream first reports the dataset ready marks the acceleration as
+                // complete, so a later start can serve it before the source answers;
+                // an acceleration interrupted before then has none and waits for its
+                // source.
+                if self.checkpoint_when_changes_ready
+                    && let (Some(checkpointer), Some(completion)) =
+                        (checkpointer, self.refresh_completion.clone())
+                {
+                    let ready = completion.any();
+                    let checkpoint_schema = Arc::clone(&checkpoint_schema);
+                    let accelerator_write_mutex = Arc::clone(&self.accelerator_write_mutex);
+                    let dataset_name = dataset_name.clone();
+                    let last_updated_at = Arc::clone(&self.last_updated_at);
+                    self.ready_checkpoint_task = Some(tokio::spawn(async move {
+                        if ready.wait().await.is_answered()
+                            && !completion.closed_without_a_refresh()
+                        {
+                            create_checkpoint_and_snapshot(
+                                &checkpointer,
+                                None,
+                                &checkpoint_schema,
+                                &accelerator_write_mutex,
+                                &dataset_name,
+                                &last_updated_at,
+                                ForceCreate(false),
+                                None,
+                                None,
+                                None,
+                            )
+                            .await;
+                        }
+                    }));
+                }
 
                 return Ok(Some(self.start_changes_stream(
                     stream,
@@ -1857,7 +1910,7 @@ impl Refresher {
 
     /// Transfer every nested worker to the table generation's drain owner.
     pub(crate) fn take_background_tasks(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
-        let mut tasks = Vec::with_capacity(2);
+        let mut tasks = Vec::with_capacity(3);
         if let Some(task) = self
             .refresh_task_runner
             .as_mut()
@@ -1866,6 +1919,9 @@ impl Refresher {
             tasks.push(task);
         }
         if let Some(task) = self.snapshot_task.take() {
+            tasks.push(task);
+        }
+        if let Some(task) = self.ready_checkpoint_task.take() {
             tasks.push(task);
         }
         tasks
@@ -1946,6 +2002,9 @@ impl Drop for Refresher {
             refresh_task_runner.abort();
         }
         if let Some(task) = self.snapshot_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.ready_checkpoint_task.take() {
             task.abort();
         }
     }

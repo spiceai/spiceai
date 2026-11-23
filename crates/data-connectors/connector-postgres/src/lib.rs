@@ -294,6 +294,11 @@ impl DataConnectorFactory for PostgresFactory {
         self
     }
 
+    /// The replication slot keeps the position on the source.
+    fn resumes_changes_after_restart(&self) -> bool {
+        true
+    }
+
     fn create<'a>(
         &'a self,
         params: ConnectorParams,
