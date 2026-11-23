@@ -1,0 +1,100 @@
+name: 'E2E: DuckDB quickstart'
+description: |
+  The DuckDB quickstart: generates a TPC-H SF1 DuckDB file, configures a dataset
+  over it with `spice dataset configure`, starts the runtime and checks the dataset
+  loads. Expects `spice` installed (install-spice) and stops the runtime it starts.
+  Shared by the Linux leg of `test_quickstart_duckdb` and by `test_macos_short`,
+  which runs several of these on one macOS runner.
+
+inputs:
+  app-dir:
+    description: 'Directory for the Spice app; unique among the tests a job runs'
+    required: false
+    default: 'duckdb-app'
+  github-token:
+    description: 'GITHUB_TOKEN, for the runtime'
+    required: true
+  duckdb-version:
+    description: 'DuckDB CLI release that generates the TPC-H file'
+    required: false
+    default: 'v0.10.2'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install DuckDB
+      shell: bash
+      env:
+        DUCKDB_VERSION: ${{ inputs.duckdb-version }}
+      run: |
+        case "${RUNNER_OS}" in
+          Linux) zip=duckdb_cli-linux-amd64.zip ;;
+          macOS) zip=duckdb_cli-osx-universal.zip ;;
+          *) echo "::error::No DuckDB CLI download for ${RUNNER_OS}"; exit 1 ;;
+        esac
+        dir="${RUNNER_TEMP}/duckdb-cli"
+        mkdir -p "$dir"
+        curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 -o "${dir}/${zip}" \
+          "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/${zip}"
+        unzip -o "${dir}/${zip}" -d "$dir"
+        chmod +x "${dir}/duckdb"
+        echo "DUCKDB_CLI=${dir}/duckdb" >> "$GITHUB_ENV"
+
+    - name: Generate TPCH database
+      shell: bash
+      run: |
+        # Extensions go to the job's own directory: the default, under $HOME, is shared
+        # by every job on a self-hosted host.
+        "${DUCKDB_CLI}" -s "SET extension_directory='${RUNNER_TEMP}/duckdb_extensions';INSTALL tpch;LOAD tpch;CALL dbgen(sf = 1);" ./tpch.db
+
+    # duckdb: datasets load the DuckDB library installed on the host.
+    - name: Set up libduckdb
+      uses: $/.github/actions/setup-libduckdb
+
+    - name: Init Spice app
+      shell: bash
+      env:
+        APP_DIR: ${{ inputs.app-dir }}
+      run: |
+        spice init "$APP_DIR"
+
+    - name: Spice dataset configure
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      run: |
+        echo -e "tpch_customer\nTPC-H customer table\nduckdb:customer\ny" | spice dataset configure
+        echo -e "params:\n  duckdb_open: ../tpch.db\n" >> datasets/tpch_customer/dataset.yaml
+        cat spicepod.yaml
+        cat datasets/tpch_customer/dataset.yaml
+
+    # The macOS leg shares its host with other jobs' runtimes, so spiced's default
+    # 8090/50051 cannot be assumed free (#12419). The actions below read these ports.
+    - name: Allocate Spice runtime ports
+      uses: $/.github/actions/allocate-spice-ports
+
+    - name: Start Spice runtime
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
+        # time to initialize added dataset
+        sleep 5
+
+    - name: Wait for dataset to be ready
+      uses: $/.github/actions/wait-for-spice-ready
+      with:
+        working-directory: ${{ inputs.app-dir }}
+        timeout: '60'
+
+    - name: Verify dataset
+      uses: $/.github/actions/verify-dataset
+      with:
+        name: tpch_customer
+
+    - name: Stop spice and check logs
+      if: always()
+      uses: $/.github/actions/stop-spice
+      with:
+        working-directory: ${{ inputs.app-dir }}

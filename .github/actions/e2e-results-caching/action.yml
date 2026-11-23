@@ -1,0 +1,204 @@
+name: 'E2E: SQL results caching'
+description: |
+  SQL results caching on an accelerated S3 dataset: a miss then a hit, a refresh that
+  leaves the cached result, expiry at item_ttl, and a custom cache key with its Vary
+  header. Expects `spice` installed (install-spice) and stops the runtime it starts.
+  Shared by the Linux leg of `test_results_caching` and by `test_macos_short`, which
+  runs several of these on one macOS runner.
+
+inputs:
+  app-dir:
+    description: 'Directory for the Spice app; unique among the tests a job runs'
+    required: false
+    default: 'test_app'
+  github-token:
+    description: 'GITHUB_TOKEN, for the runtime'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Init spice app
+      shell: bash
+      env:
+        APP_DIR: ${{ inputs.app-dir }}
+      run: |
+        spice init "$APP_DIR"
+
+    - name: Spice configure
+      working-directory: ${{ inputs.app-dir }}
+      shell: bash
+      run: |
+        echo "runtime:" >> spicepod.yaml
+        echo "  caching:" >> spicepod.yaml
+        echo "    sql_results:" >> spicepod.yaml
+        echo "      enabled: true" >> spicepod.yaml
+        echo "      caching_policy: lru" >> spicepod.yaml
+        echo "      max_size: 128MiB" >> spicepod.yaml
+        echo "      item_ttl: 60s" >> spicepod.yaml
+        echo "datasets:" >> spicepod.yaml
+        echo "  - from: s3://spiceai-demo-datasets/tpch/customer/" >> spicepod.yaml
+        echo "    name: customer" >> spicepod.yaml
+        echo "    params:" >> spicepod.yaml
+        echo "      file_format: parquet" >> spicepod.yaml
+        echo "    acceleration:" >> spicepod.yaml
+        echo "      enabled: true" >> spicepod.yaml
+        echo "      refresh_sql: select * from customer limit 1;" >> spicepod.yaml
+        cat spicepod.yaml
+
+    # The macOS leg shares its host with other jobs' runtimes, so spiced's default
+    # 8090/50051 cannot be assumed free (#12419). The actions below read these ports.
+    - name: Allocate Spice runtime ports
+      uses: $/.github/actions/allocate-spice-ports
+
+    - name: Start spice runtime
+      working-directory: ${{ inputs.app-dir }}
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      shell: bash
+      run: |
+        spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
+        # time to initialize added dataset
+        sleep 10
+
+    - name: Wait for dataset to be ready
+      uses: $/.github/actions/wait-for-spice-ready
+      with:
+        working-directory: ${{ inputs.app-dir }}
+        timeout: '60'
+
+    - name: Run SQL query and check Miss cache header
+      working-directory: ${{ inputs.app-dir }}
+      shell: bash
+      run: |
+        # The entry's age counts from this query's start; the expiry check below uses it.
+        echo "CACHED_AT=$(date +%s)" >> "$GITHUB_ENV"
+        response=$(curl -i -XPOST "${SPICE_HTTP_ENDPOINT}/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+        echo "$response"
+        if echo "$response" | grep -q "results-cache-status: MISS"; then
+          echo "Cache miss detected as expected"
+        else
+          echo "Cache miss not detected" >&2
+          exit 1
+        fi
+
+    - name: Run SQL query and check Hit cache header
+      working-directory: ${{ inputs.app-dir }}
+      shell: bash
+      run: |
+        response=$(curl -i -XPOST "${SPICE_HTTP_ENDPOINT}/v1/sql" --data "select c_name from (select * from customer)")
+        echo "$response"
+        if echo "$response" | grep -q "results-cache-status: HIT"; then
+          echo "Cache hit detected as expected"
+        else
+          echo "Cache hit not detected" >&2
+          exit 1
+        fi
+
+    - name: Manually refresh dataset
+      working-directory: ${{ inputs.app-dir }}
+      shell: bash
+      run: |
+        output=$(spice --http-endpoint "${SPICE_HTTP_ENDPOINT}" refresh customer 2>&1)
+        echo "$output"
+        if [[ $output != *"Dataset refresh triggered"* ]]; then
+          echo "Failed to trigger dataset refresh."
+          exit 1
+        fi
+
+    - name: Wait for the refresh to complete
+      working-directory: ${{ inputs.app-dir }}
+      shell: bash
+      run: |
+        # `spice refresh` only triggers the refresh. The initial load and this refresh each
+        # log one "Loaded ... for dataset customer" line; poll for the second.
+        deadline=$((SECONDS + 30))
+        until (( $(grep -c "Loaded .* for dataset customer" spice.log) >= 2 )); do
+          if (( SECONDS >= deadline )); then
+            grep -E "for dataset customer" spice.log || true
+            echo "::error::The refresh of customer did not complete within 30s of 'spice refresh customer'."
+            exit 1
+          fi
+          sleep 1
+        done
+        grep -E "for dataset customer" spice.log
+
+    - name: Run SQL query and check the refresh left the cached result
+      working-directory: ${{ inputs.app-dir }}
+      shell: bash
+      run: |
+        # A refresh does not invalidate SQL results: they expire by item_ttl, counted from
+        # the query that produced them.
+        response=$(curl -sS -i --max-time 5 -XPOST "${SPICE_HTTP_ENDPOINT}/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+        echo "$response"
+        if echo "$response" | grep -q "results-cache-status: HIT"; then
+          echo "Cache hit after refresh detected as expected"
+        else
+          echo "::error::The cached result for customer was not served after the refresh completed; a refresh must not invalidate SQL results." >&2
+          exit 1
+        fi
+
+    - name: Run SQL query and check Miss cache header after item_ttl
+      working-directory: ${{ inputs.app-dir }}
+      shell: bash
+      run: |
+        # item_ttl is 60s and no stale_while_revalidate_ttl is set, so the entry stored by the
+        # first query becomes a miss 60s after that query started, and not before.
+        deadline=$((CACHED_AT + 90))
+        while :; do
+          response=$(curl -sS -i --max-time 5 -XPOST "${SPICE_HTTP_ENDPOINT}/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+          age=$(( $(date +%s) - CACHED_AT ))
+          if echo "$response" | grep -q "results-cache-status: MISS"; then
+            echo "$response"
+            if (( age < 59 )); then
+              echo "::error::The cached result for customer became a miss ${age}s after it was stored, before item_ttl (60s)."
+              exit 1
+            fi
+            echo "Cache miss detected ${age}s after the result was stored, as expected"
+            break
+          fi
+          if (( $(date +%s) >= deadline )); then
+            echo "$response"
+            echo "::error::The cached result for customer was still served ${age}s after it was stored; item_ttl is 60s."
+            exit 1
+          fi
+          sleep 1
+        done
+
+    - name: Run SQL query with custom cache key and check for miss header
+      working-directory: ${{ inputs.app-dir }}
+      shell: bash
+      run: |
+        response=$(curl -i -XPOST -H"Spice-Cache-Key: e2eci" "${SPICE_HTTP_ENDPOINT}/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+        echo "$response"
+        if echo "$response" | grep -q "results-cache-status: MISS"; then
+          echo "Cache miss detected as expected"
+        else
+          echo "Cache miss not detected" >&2
+          exit 1
+        fi
+
+    - name: Run SQL query with custom cache key and check for hit and vary header
+      working-directory: ${{ inputs.app-dir }}
+      shell: bash
+      run: |
+        response=$(curl -i -XPOST -H"Spice-Cache-Key: e2eci" "${SPICE_HTTP_ENDPOINT}/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+        echo "$response"
+        if echo "$response" | grep -q "results-cache-status: HIT"; then
+          echo "Cache hit detected as expected"
+        else
+          echo "Cache hit not detected" >&2
+          exit 1
+        fi
+        if echo "$response" | grep -q "vary: Spice-Cache-Key"; then
+          echo "Vary Spice-Cache-Key detected as expected"
+        else
+          echo "Vary Spice-Cache-Key not detected" >&2
+          exit 1
+        fi
+
+    - name: Stop spice and check logs
+      if: always()
+      uses: $/.github/actions/stop-spice
+      with:
+        working-directory: ${{ inputs.app-dir }}

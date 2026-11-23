@@ -154,6 +154,10 @@ jobs:
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
+      # The Linux entry alone, for jobs whose macOS leg runs in `test_macos_short`.
+      linux_matrix: ${{ steps.setup-matrix.outputs.linux_matrix }}
+      # The macOS entry, or empty where the matrix has none (pull requests).
+      darwin_target: ${{ steps.setup-matrix.outputs.darwin_target }}
 
     steps:
       - name: Set up matrix
@@ -186,7 +190,11 @@ jobs:
             ];
 
             const isPrEvent = context.eventName === 'pull_request';
-            return isPrEvent ? matrix.slice(0, 1) : matrix;
+            const selected = isPrEvent ? matrix.slice(0, 1) : matrix;
+            core.setOutput('linux_matrix', JSON.stringify(selected.filter(t => t.target_os === 'linux')));
+            const darwin = selected.find(t => t.target_os === 'darwin');
+            core.setOutput('darwin_target', darwin ? JSON.stringify(darwin) : '');
+            return selected;
 
   build:
     name: Build ${{ matrix.target.name }} binaries
@@ -566,7 +574,11 @@ jobs:
             HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install expect
           fi
 
+      # A self-test of the expect helpers against stand-in processes: no runtime, no
+      # model and no network, so it runs once, here. The REPL scripts below exercise the
+      # same helpers on every leg.
       - name: Test the expect scripts driving the REPLs
+        if: matrix.target.target_os == 'linux'
         run: |
           ./test/models/expect_test.sh
 
@@ -754,10 +766,6 @@ jobs:
           else
             HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install expect
           fi
-
-      - name: Test the expect scripts driving the REPLs
-        run: |
-          ./test/models/expect_test.sh
 
       - name: Test vector search
         run: |
@@ -1627,10 +1635,11 @@ jobs:
         with:
           working-directory: test_app
 
+  # The Linux legs of the short single-runtime tests. Their macOS legs run together in
+  # `test_macos_short`, on one runner: on `spiceai-macos-large` each of these ~2-minute
+  # jobs waited up to an hour and a half for a runner of its own.
   test_quickstart_duckdb:
     environment: secret-free
-    env:
-      duckdb_version: v0.10.2
     name: 'Test DuckDB quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -1642,30 +1651,10 @@ jobs:
 
     strategy:
       matrix:
-        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+        target: ${{ fromJson(needs.setup-matrix.outputs.linux_matrix) }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install DuckDB
-        if: matrix.target.target_os == 'linux'
-        run: |
-          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 -O https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-linux-amd64.zip
-          unzip duckdb_cli-linux-amd64.zip
-          chmod +x ./duckdb
-
-      - name: Install DuckDB
-        if: matrix.target.target_os == 'darwin'
-        run: |
-          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 -O https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-osx-universal.zip
-          unzip duckdb_cli-osx-universal.zip
-          chmod +x ./duckdb
-
-      - name: Generate TPCH database
-        run: |
-          # Extensions go to the job's own directory: the default, under $HOME, is shared
-          # by every job on a self-hosted host.
-          ./duckdb -s "SET extension_directory='${RUNNER_TEMP}/duckdb_extensions';INSTALL tpch;LOAD tpch;CALL dbgen(sf = 1);" ./tpch.db
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -1673,58 +1662,16 @@ jobs:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
-      # duckdb: datasets load the DuckDB library installed on the host.
-      - name: Set up libduckdb
-        uses: $/.github/actions/setup-libduckdb
-
-      - name: Install Spice
+      - name: Install spice
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
           install-scope: job
 
-      - name: Init Spice app
-        run: |
-          spice init duckdb-app
-
-      - name: Spice dataset configure
-        working-directory: duckdb-app
-        run: |
-          echo -e "tpch_customer\nTPC-H customer table\nduckdb:customer\ny" | spice dataset configure
-          echo -e "params:\n  duckdb_open: ../tpch.db\n" >> datasets/tpch_customer/dataset.yaml
-          cat spicepod.yaml
-          cat datasets/tpch_customer/dataset.yaml
-
-      # The macOS leg shares its host with other jobs' runtimes, so spiced's default
-      # 8090/50051 cannot be assumed free (#12419). The actions below read these ports.
-      - name: Allocate Spice runtime ports
-        uses: $/.github/actions/allocate-spice-ports
-
-      - name: Start Spice runtime
-        working-directory: duckdb-app
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
-          # time to initialize added dataset
-          sleep 5
-
-      - name: Wait for dataset to be ready
-        uses: $/.github/actions/wait-for-spice-ready
+      - name: DuckDB quickstart
+        uses: $/.github/actions/e2e-duckdb-quickstart
         with:
-          working-directory: duckdb-app
-          timeout: '60'
-
-      - name: Verify dataset
-        uses: $/.github/actions/verify-dataset
-        with:
-          name: tpch_customer
-
-      - name: Stop spice and check logs
-        if: always()
-        uses: $/.github/actions/stop-spice
-        with:
-          working-directory: duckdb-app
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
   test_local_acceleration:
     environment: secret-free
@@ -1745,7 +1692,7 @@ jobs:
             { engine: cayenne, mode: memory },
             { engine: cayenne, mode: file },
           ]
-        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+        target: ${{ fromJson(needs.setup-matrix.outputs.linux_matrix) }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1762,103 +1709,13 @@ jobs:
           build-path: ./build
           install-scope: job
 
-      - name: Init spice app
-        run: |
-          spice init test_app
-
-      # A file source, so the macOS leg needs no database on its shared host. What this
-      # job tests is the accelerator and `spice refresh` with a refresh SQL; refreshes from
-      # PostgreSQL are covered by the PostgreSQL quickstart above and by spicescript.
-      - name: Spice dataset configure
-        working-directory: test_app
-        run: |
-          ENGINE=$(echo '${{ matrix.acceleration.engine }}')
-          MODE=$(echo '${{ matrix.acceleration.mode }}')
-
-          cat > recent_blocks.csv <<'CSV'
-          id,block_number,block_hash
-          1,1,0x1234
-          2,2,0x5678
-          3,3,0x9abc
-          CSV
-
-          echo "datasets:" >> spicepod.yaml
-          echo "  - name: eth.recent_blocks" >> spicepod.yaml
-          echo "    from: file:recent_blocks.csv" >> spicepod.yaml
-          echo "    acceleration:" >> spicepod.yaml
-          echo "      enabled: true" >> spicepod.yaml
-          echo "      engine: $ENGINE" >> spicepod.yaml
-          if [[ -n "$MODE" ]]; then
-            echo "      mode: $MODE" >> spicepod.yaml
-          fi
-          echo "      refresh_sql: SELECT * FROM eth.recent_blocks LIMIT 1" >> spicepod.yaml
-          echo "    params:" >> spicepod.yaml
-          echo "      file_format: csv" >> spicepod.yaml
-          cat spicepod.yaml
-
-      # The macOS leg shares its host with other jobs' runtimes, so spiced's default
-      # 8090/50051 cannot be assumed free (#12419). The actions below read these ports.
-      - name: Allocate Spice runtime ports
-        uses: $/.github/actions/allocate-spice-ports
-
-      - name: Start spice runtime
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        working-directory: test_app
-        run: |
-          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
-          # time to initialize added dataset
-          sleep 10
-
-      - name: Wait for dataset to be ready
-        uses: $/.github/actions/wait-for-spice-ready
+      - name: Acceleration with ${{ matrix.acceleration.engine }} (${{ matrix.acceleration.mode }})
+        uses: $/.github/actions/e2e-local-acceleration
         with:
-          working-directory: test_app
-          timeout: '60'
-
-      - name: Manually refresh dataset (no params)
-        working-directory: test_app
-        run: |
-          output=$(spice --http-endpoint "${SPICE_HTTP_ENDPOINT}" refresh eth.recent_blocks 2>&1)
-          echo "$output"
-          if [[ $output == *"Dataset refresh triggered"* ]]; then
-            # time to refresh dataset
-            sleep 5
-          else
-            echo "Failed to trigger dataset refresh."
-            exit 1
-          fi
-
-      - name: Verify dataset
-        uses: $/.github/actions/verify-dataset
-        with:
-          name: eth.recent_blocks
-          expected-rows-count: 1
-
-      - name: Manually refresh dataset (with params)
-        working-directory: test_app
-        run: |
-          output=$(spice --http-endpoint "${SPICE_HTTP_ENDPOINT}" refresh eth.recent_blocks --refresh-jitter-max=1s --refresh-sql='SELECT * FROM eth.recent_blocks LIMIT 2' 2>&1)
-          echo "$output"
-          if [[ $output == *"Dataset refresh triggered"* ]]; then
-            # time to refresh dataset
-            sleep 5
-          else
-            echo "Failed to trigger dataset refresh."
-            exit 1
-          fi
-
-      - name: Verify dataset
-        uses: $/.github/actions/verify-dataset
-        with:
-          name: eth.recent_blocks
-          expected-rows-count: 2
-
-      - name: Stop spice and check logs
-        if: always()
-        uses: $/.github/actions/stop-spice
-        with:
-          working-directory: test_app
+          engine: ${{ matrix.acceleration.engine }}
+          mode: ${{ matrix.acceleration.mode }}
+          app-dir: test_app
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
   test_results_caching:
     environment: secret-free
@@ -1873,7 +1730,7 @@ jobs:
 
     strategy:
       matrix:
-        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+        target: ${{ fromJson(needs.setup-matrix.outputs.linux_matrix) }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1890,177 +1747,88 @@ jobs:
           build-path: ./build
           install-scope: job
 
-      - name: Init spice app
-        run: |
-          spice init test_app
-
-      - name: Spice configure
-        working-directory: test_app
-        run: |
-          echo "runtime:" >> spicepod.yaml
-          echo "  caching:" >> spicepod.yaml
-          echo "    sql_results:" >> spicepod.yaml
-          echo "      enabled: true" >> spicepod.yaml
-          echo "      caching_policy: lru" >> spicepod.yaml
-          echo "      max_size: 128MiB" >> spicepod.yaml
-          echo "      item_ttl: 60s" >> spicepod.yaml
-          echo "datasets:" >> spicepod.yaml
-          echo "  - from: s3://spiceai-demo-datasets/tpch/customer/" >> spicepod.yaml
-          echo "    name: customer" >> spicepod.yaml
-          echo "    params:" >> spicepod.yaml
-          echo "      file_format: parquet" >> spicepod.yaml
-          echo "    acceleration:" >> spicepod.yaml
-          echo "      enabled: true" >> spicepod.yaml
-          echo "      refresh_sql: select * from customer limit 1;" >> spicepod.yaml
-          cat spicepod.yaml
-
-      # The macOS leg shares its host with other jobs' runtimes, so spiced's default
-      # 8090/50051 cannot be assumed free (#12419). The actions below read these ports.
-      - name: Allocate Spice runtime ports
-        uses: $/.github/actions/allocate-spice-ports
-
-      - name: Start spice runtime
-        working-directory: test_app
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
-          # time to initialize added dataset
-          sleep 10
-
-      - name: Wait for dataset to be ready
-        uses: $/.github/actions/wait-for-spice-ready
+      - name: SQL results caching
+        uses: $/.github/actions/e2e-results-caching
         with:
-          working-directory: test_app
-          timeout: '60'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Run SQL query and check Miss cache header
-        working-directory: test_app
-        run: |
-          # The entry's age counts from this query's start; the expiry check below uses it.
-          echo "CACHED_AT=$(date +%s)" >> "$GITHUB_ENV"
-          response=$(curl -i -XPOST "${SPICE_HTTP_ENDPOINT}/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
-          echo "$response"
-          if echo "$response" | grep -q "results-cache-status: MISS"; then
-            echo "Cache miss detected as expected"
-          else
-            echo "Cache miss not detected" >&2
-            exit 1
-          fi
+  # The macOS legs of the jobs above, one after another on one runner. Each test
+  # takes 1-2 minutes, about half of it downloading the build and installing spice,
+  # which this job does once. Every step runs even when an earlier one failed, and
+  # each test stops the runtime it started and uses ports of its own.
+  test_macos_short:
+    environment: secret-free
+    name: 'Test DuckDB quickstart, acceleration and results caching on ${{ fromJson(needs.setup-matrix.outputs.darwin_target).name }}'
+    runs-on: ${{ fromJson(needs.setup-matrix.outputs.darwin_target).runner }}
+    needs:
+      - build
+      - setup-matrix
+      - check_changes
+    if: ${{ needs.check_changes.outputs.merge_queue_passed != 'true' && needs.setup-matrix.outputs.darwin_target != '' }}
+    # The five tests' own bounds summed (5 min each), which no healthy run nears.
+    timeout-minutes: 25
+    env:
+      DARWIN_BUILD: build_${{ fromJson(needs.setup-matrix.outputs.darwin_target).target_os }}_${{ fromJson(needs.setup-matrix.outputs.darwin_target).target_arch }}
 
-      - name: Run SQL query and check Hit cache header
-        working-directory: test_app
-        run: |
-          response=$(curl -i -XPOST "${SPICE_HTTP_ENDPOINT}/v1/sql" --data "select c_name from (select * from customer)")
-          echo "$response"
-          if echo "$response" | grep -q "results-cache-status: HIT"; then
-            echo "Cache hit detected as expected"
-          else
-            echo "Cache hit not detected" >&2
-            exit 1
-          fi
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Manually refresh dataset
-        working-directory: test_app
-        run: |
-          output=$(spice --http-endpoint "${SPICE_HTTP_ENDPOINT}" refresh customer 2>&1)
-          echo "$output"
-          if [[ $output != *"Dataset refresh triggered"* ]]; then
-            echo "Failed to trigger dataset refresh."
-            exit 1
-          fi
-
-      - name: Wait for the refresh to complete
-        working-directory: test_app
-        run: |
-          # `spice refresh` only triggers the refresh. The initial load and this refresh each
-          # log one "Loaded ... for dataset customer" line; poll for the second.
-          deadline=$((SECONDS + 30))
-          until (( $(grep -c "Loaded .* for dataset customer" spice.log) >= 2 )); do
-            if (( SECONDS >= deadline )); then
-              grep -E "for dataset customer" spice.log || true
-              echo "::error::The refresh of customer did not complete within 30s of 'spice refresh customer'."
-              exit 1
-            fi
-            sleep 1
-          done
-          grep -E "for dataset customer" spice.log
-
-      - name: Run SQL query and check the refresh left the cached result
-        working-directory: test_app
-        run: |
-          # A refresh does not invalidate SQL results: they expire by item_ttl, counted from
-          # the query that produced them.
-          response=$(curl -sS -i --max-time 5 -XPOST "${SPICE_HTTP_ENDPOINT}/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
-          echo "$response"
-          if echo "$response" | grep -q "results-cache-status: HIT"; then
-            echo "Cache hit after refresh detected as expected"
-          else
-            echo "::error::The cached result for customer was not served after the refresh completed; a refresh must not invalidate SQL results." >&2
-            exit 1
-          fi
-
-      - name: Run SQL query and check Miss cache header after item_ttl
-        working-directory: test_app
-        run: |
-          # item_ttl is 60s and no stale_while_revalidate_ttl is set, so the entry stored by the
-          # first query becomes a miss 60s after that query started, and not before.
-          deadline=$((CACHED_AT + 90))
-          while :; do
-            response=$(curl -sS -i --max-time 5 -XPOST "${SPICE_HTTP_ENDPOINT}/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
-            age=$(( $(date +%s) - CACHED_AT ))
-            if echo "$response" | grep -q "results-cache-status: MISS"; then
-              echo "$response"
-              if (( age < 59 )); then
-                echo "::error::The cached result for customer became a miss ${age}s after it was stored, before item_ttl (60s)."
-                exit 1
-              fi
-              echo "Cache miss detected ${age}s after the result was stored, as expected"
-              break
-            fi
-            if (( $(date +%s) >= deadline )); then
-              echo "$response"
-              echo "::error::The cached result for customer was still served ${age}s after it was stored; item_ttl is 60s."
-              exit 1
-            fi
-            sleep 1
-          done
-
-      - name: Run SQL query with custom cache key and check for miss header
-        working-directory: test_app
-        run: |
-          response=$(curl -i -XPOST -H"Spice-Cache-Key: e2eci" "${SPICE_HTTP_ENDPOINT}/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
-          echo "$response"
-          if echo "$response" | grep -q "results-cache-status: MISS"; then
-            echo "Cache miss detected as expected"
-          else
-            echo "Cache miss not detected" >&2
-            exit 1
-          fi
-
-      - name: Run SQL query with custom cache key and check for hit and vary header
-        working-directory: test_app
-        run: |
-          response=$(curl -i -XPOST -H"Spice-Cache-Key: e2eci" "${SPICE_HTTP_ENDPOINT}/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
-          echo "$response"
-          if echo "$response" | grep -q "results-cache-status: HIT"; then
-            echo "Cache hit detected as expected"
-          else
-            echo "Cache hit not detected" >&2
-            exit 1
-          fi
-          if echo "$response" | grep -q "vary: Spice-Cache-Key"; then
-            echo "Vary Spice-Cache-Key detected as expected"
-          else
-            echo "Vary Spice-Cache-Key not detected" >&2
-            exit 1
-          fi
-
-      - name: Stop spice and check logs
-        if: always()
-        uses: $/.github/actions/stop-spice
+      - name: download artifacts - ${{ env.DARWIN_BUILD }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          working-directory: test_app
+          name: ${{ env.DARWIN_BUILD }}
+          path: ./build
+
+      - name: Install spice
+        uses: $/.github/actions/install-spice
+        with:
+          build-path: ./build
+          install-scope: job
+
+      - name: DuckDB quickstart
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        uses: $/.github/actions/e2e-duckdb-quickstart
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Acceleration with arrow (memory)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        uses: $/.github/actions/e2e-local-acceleration
+        with:
+          engine: arrow
+          mode: memory
+          app-dir: accel_arrow_memory
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Acceleration with cayenne (memory)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        uses: $/.github/actions/e2e-local-acceleration
+        with:
+          engine: cayenne
+          mode: memory
+          app-dir: accel_cayenne_memory
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Acceleration with cayenne (file)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        uses: $/.github/actions/e2e-local-acceleration
+        with:
+          engine: cayenne
+          mode: file
+          app-dir: accel_cayenne_file
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: SQL results caching
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        uses: $/.github/actions/e2e-results-caching
+        with:
+          app-dir: results_caching
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
   test_results_caching_source_down:
     environment: secret-free
@@ -3303,6 +3071,7 @@ jobs:
       - test_quickstart_duckdb
       - test_local_acceleration
       - test_results_caching
+      - test_macos_short
       - test_results_caching_source_down
       - gh_connector_quickstart
       - hf_connector_live

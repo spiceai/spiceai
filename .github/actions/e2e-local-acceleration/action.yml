@@ -1,0 +1,130 @@
+name: 'E2E: local acceleration'
+description: |
+  Accelerates a CSV file with the given engine and mode, then checks `spice refresh`
+  with the dataset's refresh SQL and with one passed on the command line. Expects
+  `spice` installed (install-spice) and stops the runtime it starts. Shared by the
+  Linux leg of `test_local_acceleration` and by `test_macos_short`, which runs
+  several of these on one macOS runner.
+
+inputs:
+  engine:
+    description: 'Acceleration engine'
+    required: true
+  mode:
+    description: 'Acceleration mode; empty for the engine default'
+    required: false
+    default: ''
+  app-dir:
+    description: 'Directory for the Spice app; unique among the tests a job runs'
+    required: true
+  github-token:
+    description: 'GITHUB_TOKEN, for the runtime'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Init spice app
+      shell: bash
+      env:
+        APP_DIR: ${{ inputs.app-dir }}
+      run: |
+        spice init "$APP_DIR"
+
+    # A file source, so the macOS leg needs no database on its shared host. What this
+    # tests is the accelerator and `spice refresh` with a refresh SQL; refreshes from
+    # PostgreSQL are covered by the PostgreSQL quickstart and by spicescript.
+    - name: Spice dataset configure
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      env:
+        ENGINE: ${{ inputs.engine }}
+        MODE: ${{ inputs.mode }}
+      run: |
+        cat > recent_blocks.csv <<'CSV'
+        id,block_number,block_hash
+        1,1,0x1234
+        2,2,0x5678
+        3,3,0x9abc
+        CSV
+
+        echo "datasets:" >> spicepod.yaml
+        echo "  - name: eth.recent_blocks" >> spicepod.yaml
+        echo "    from: file:recent_blocks.csv" >> spicepod.yaml
+        echo "    acceleration:" >> spicepod.yaml
+        echo "      enabled: true" >> spicepod.yaml
+        echo "      engine: $ENGINE" >> spicepod.yaml
+        if [[ -n "$MODE" ]]; then
+          echo "      mode: $MODE" >> spicepod.yaml
+        fi
+        echo "      refresh_sql: SELECT * FROM eth.recent_blocks LIMIT 1" >> spicepod.yaml
+        echo "    params:" >> spicepod.yaml
+        echo "      file_format: csv" >> spicepod.yaml
+        cat spicepod.yaml
+
+    # The macOS leg shares its host with other jobs' runtimes, so spiced's default
+    # 8090/50051 cannot be assumed free (#12419). The actions below read these ports.
+    - name: Allocate Spice runtime ports
+      uses: $/.github/actions/allocate-spice-ports
+
+    - name: Start spice runtime
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
+        # time to initialize added dataset
+        sleep 10
+
+    - name: Wait for dataset to be ready
+      uses: $/.github/actions/wait-for-spice-ready
+      with:
+        working-directory: ${{ inputs.app-dir }}
+        timeout: '60'
+
+    - name: Manually refresh dataset (no params)
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      run: |
+        output=$(spice --http-endpoint "${SPICE_HTTP_ENDPOINT}" refresh eth.recent_blocks 2>&1)
+        echo "$output"
+        if [[ $output == *"Dataset refresh triggered"* ]]; then
+          # time to refresh dataset
+          sleep 5
+        else
+          echo "Failed to trigger dataset refresh."
+          exit 1
+        fi
+
+    - name: Verify dataset
+      uses: $/.github/actions/verify-dataset
+      with:
+        name: eth.recent_blocks
+        expected-rows-count: 1
+
+    - name: Manually refresh dataset (with params)
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      run: |
+        output=$(spice --http-endpoint "${SPICE_HTTP_ENDPOINT}" refresh eth.recent_blocks --refresh-jitter-max=1s --refresh-sql='SELECT * FROM eth.recent_blocks LIMIT 2' 2>&1)
+        echo "$output"
+        if [[ $output == *"Dataset refresh triggered"* ]]; then
+          # time to refresh dataset
+          sleep 5
+        else
+          echo "Failed to trigger dataset refresh."
+          exit 1
+        fi
+
+    - name: Verify dataset
+      uses: $/.github/actions/verify-dataset
+      with:
+        name: eth.recent_blocks
+        expected-rows-count: 2
+
+    - name: Stop spice and check logs
+      if: always()
+      uses: $/.github/actions/stop-spice
+      with:
+        working-directory: ${{ inputs.app-dir }}
