@@ -29,7 +29,9 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::{common::TableReference, sql::sqlparser};
 use datafusion_expr::sqlparser::ast::LimitClause;
 use itertools::Itertools;
-use runtime_query_engine::sql_depth_guard::ensure_statement_within_depth_limits;
+use runtime_query_engine::sql_depth_guard::{
+    ensure_data_types_within_depth_limit, ensure_statement_within_depth_limits,
+};
 use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
 
@@ -259,6 +261,8 @@ pub fn parse_refresh_sql(
     refresh_sql: &str,
     source_schema: Arc<Schema>,
 ) -> Result<(RefreshSQL, Arc<Schema>)> {
+    ensure_data_types_within_depth_limit(refresh_sql, &PostgreSqlDialect {})
+        .context(TooComplexSnafu)?;
     let mut statements = DFParser::parse_sql_with_dialect(refresh_sql, &PostgreSqlDialect {})
         .context(UnableToParseSqlSnafu)?;
     if statements.len() != 1 {

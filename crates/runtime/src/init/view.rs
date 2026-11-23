@@ -504,7 +504,9 @@ impl Runtime {
 
                     // Validate SQL and extract dependencies in a single parse
                     let sql = view.sql.as_ref();
-                    let statements = match DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}) {
+                    let statements = match crate::datafusion::sql_depth_guard::ensure_data_types_within_depth_limit(sql, &PostgreSqlDialect {})
+                        .and_then(|()| DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}))
+                    {
                         Ok(stmts) => stmts,
                         Err(e) => {
                             if log_errors.0 {
