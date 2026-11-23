@@ -203,13 +203,14 @@ impl DownloadError {
     }
 
     /// The content of a file the snapshot holds cannot be used; `message` says why, as the
-    /// clause after a colon. With the Hub read, the copy has the size the Hub lists, and the
-    /// error is taken as a mistake in the Spicepod. Read from the cache alone, the copy's size
-    /// is not checked: a copy cut short by a crash is used as it is until the Hub's listing is
-    /// read, and is then downloaded again because its size differs. So the error says only the
-    /// cache was read. Offline, where a retry reads the same copy, it says that unsetting the
-    /// variable lets Spice compare the copy with the Hub; in an outage, Spice retries until the
-    /// Hub is back.
+    /// clause after a colon. In a snapshot `Snapshot::open` made with the Hub read, the copy has
+    /// the size the Hub lists, and the error is taken as a mistake in the Spicepod. Read from the
+    /// cache alone, the copy's size is not checked: a copy cut short by a crash is used as it is
+    /// until `Snapshot::open` reads the Hub's listing, and is then downloaded again because its
+    /// size differs. So the error says only the cache was read. Offline, where a retry reads the
+    /// same copy, it says that unsetting the variable lets Spice compare the copy with the Hub;
+    /// in an outage, Spice retries until the Hub is back. A snapshot `Snapshot::open_paths` made
+    /// takes a cached copy's size from the copy, with or without the Hub.
     #[must_use]
     pub fn invalid_file(snapshot: &crate::snapshot::Snapshot, message: impl Into<String>) -> Self {
         snapshot.error(
