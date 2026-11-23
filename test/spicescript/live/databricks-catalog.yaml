@@ -1,0 +1,41 @@
+name: databricks-catalog
+description: >
+  A Databricks Unity Catalog (mode: delta_lake) registers the tables its
+  `include` patterns name and no others, authenticating by workload identity
+  federation (the client ID and audience, exchanging the job's GitHub OIDC
+  token), and its TPC-H and TPC-DS tables answer with the spec's rows at scale
+  factor 1. Needs DATABRICKS_HOST, DATABRICKS_OIDC_CLIENT_ID,
+  DATABRICKS_OIDC_AUDIENCE, the AWS_DATABRICKS_DELTA_* credentials of the
+  catalog's storage, and a GitHub Actions job with `id-token: write`.
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: databricks-catalog
+  catalogs:
+    - from: databricks:spiceai_ci
+      name: db_uc
+      include: ['tpcds.*', 'tpch.*']
+      params:
+        mode: delta_lake
+        databricks_endpoint: ${env:DATABRICKS_HOST}
+        databricks_client_id: ${secrets:DATABRICKS_OIDC_CLIENT_ID}
+        databricks_token_audience: ${secrets:DATABRICKS_OIDC_AUDIENCE}
+        databricks_aws_access_key_id: ${secrets:AWS_DATABRICKS_DELTA_ACCESS_KEY_ID}
+        databricks_aws_secret_access_key: ${secrets:AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY}
+        databricks_aws_session_token: ${secrets:AWS_DATABRICKS_DELTA_SESSION_TOKEN}
+        databricks_aws_region: us-west-2
+        client_timeout: 120s
+
+steps:
+  - start: {}
+  # The catalog also holds an `integration` schema, which `include` leaves out.
+  - query: SELECT DISTINCT table_schema FROM information_schema.tables WHERE table_catalog = 'db_uc'
+    expect: { rows: [[tpcds], [tpch]] }
+  - query: SELECT r_regionkey, r_name FROM db_uc.tpch.region
+    expect:
+      rows: [['0', AFRICA], ['1', AMERICA], ['2', ASIA], ['3', EUROPE], ['4', MIDDLE EAST]]
+  - query: SELECT count(*) AS n FROM db_uc.tpch.nation
+    expect: { rows: [['25']] }
+  - query: SELECT count(*) AS n FROM db_uc.tpcds.store
+    expect: { rows: [['12']] }

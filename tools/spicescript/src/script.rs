@@ -39,7 +39,14 @@ pub enum Tag {
     /// runs every script. As with Go's `-short`, a script runs before merge
     /// unless it opts out.
     Long,
+    /// Run on the macOS runners too, by E2E Test CI's `spicescript: macOS
+    /// smoke` job (`--only-tag macos-smoke`), as well as on Linux. Those
+    /// runners have no Docker, so every source must be `files` or `mock-http`.
+    MacosSmoke,
 }
+
+/// Source kinds that run in this process rather than in a container.
+const IN_PROCESS_SOURCES: &[&str] = &["files", "mock-http"];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -545,9 +552,11 @@ pub enum Action {
         /// Failures matching one of these do not fail the step.
         allow: Vec<regex::Regex>,
     },
-    /// Runs the `spice` CLI against the instance's runtime.
+    /// Runs the `spice` CLI against the instance's runtime, in the instance's
+    /// directory, with `input` on its standard input.
     SpiceCli {
         args: Vec<String>,
+        input: Option<String>,
         output_contains: Option<String>,
         expect_error: bool,
     },
@@ -1139,6 +1148,17 @@ impl Script {
                 tag.to_possible_value()
                     .map_or_else(String::new, |value| value.get_name().to_string())
             );
+        }
+        if script.tags.contains(&Tag::MacosSmoke) {
+            for (name, source) in &script.sources {
+                ensure!(
+                    IN_PROCESS_SOURCES.contains(&source.kind.as_str()),
+                    "Source `{name}` is `{}`, which runs in Docker, but the script is tagged \
+                     `macos-smoke` and the macOS runners have no Docker; use a `files` or \
+                     `mock-http` source, or drop the tag",
+                    source.kind
+                );
+            }
         }
         let Value::Array(steps) = steps else {
             bail!("`steps` must be a list");
@@ -1992,9 +2012,10 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
             })
         }
         "spice" => {
-            let (args, output_contains, expect_error) = match arg {
+            let (args, input, output_contains, expect_error) = match arg {
                 Value::Array(_) => (
                     serde_json::from_value(arg).context("`spice` arguments must be strings")?,
+                    opts.string("input")?,
                     opts.string("output-contains")?,
                     opts.bool("expect-error")?,
                 ),
@@ -2003,15 +2024,17 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
                     let args = inner
                         .parse("args", "`args` must be a list of strings")?
                         .context("`spice` needs `args`")?;
+                    let input = inner.string("input")?;
                     let contains = inner.string("output-contains")?;
                     let expect_error = inner.bool("expect-error")?;
                     inner.finish()?;
-                    (args, contains, expect_error)
+                    (args, input, contains, expect_error)
                 }
                 _ => bail!("`spice` takes a list of arguments, or a mapping with `args`"),
             };
             Action::SpiceCli {
                 args,
+                input,
                 output_contains,
                 expect_error,
             }

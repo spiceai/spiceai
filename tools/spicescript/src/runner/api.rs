@@ -145,9 +145,17 @@ pub(super) async fn refresh(
 
 /// Runs the `spice` CLI against the instance's runtime and checks its exit
 /// status and output.
+///
+/// The CLI runs in the instance's directory, as a user runs it in their app's,
+/// so a command that edits `./spicepod.yaml` (`spice dataset configure`) edits
+/// the instance's. `input` is written to its standard input, for the prompts
+/// of an interactive command. A spicepod the command changed becomes the
+/// instance's spicepod, so a later `start` or `restart` keeps the change
+/// rather than writing the script's spicepod over it.
 pub(super) async fn spice_cli(
-    instance: &Instance,
+    instance: &mut Instance,
     args: &[String],
+    input: Option<&str>,
     output_contains: Option<&str>,
     expect_error: bool,
 ) -> Result<String> {
@@ -155,23 +163,48 @@ pub(super) async fn spice_cli(
         .iter()
         .map(|a| instance.sql(a))
         .collect::<Result<Vec<_>>>()?;
+    let input = input.map(|i| instance.sql(i)).transpose()?;
+    // Before the first start the directory holds no spicepod yet; a command
+    // that edits one needs the instance's to be there.
+    let spicepod_path = instance.spiced.dir.join("spicepod.yaml");
+    if !spicepod_path.exists() {
+        std::fs::write(&spicepod_path, &instance.spicepod_yaml)?;
+    }
+    let before = std::fs::read_to_string(&spicepod_path)?;
     // `spice sql` reaches the runtime over Flight, which it addresses
     // separately from HTTP.
     let flight = (args.first().map(String::as_str) == Some("sql"))
         .then(|| ["--endpoint".to_string(), instance.spiced.flight_endpoint()]);
-    let out = tokio::process::Command::new(&instance.spice_cli)
+    let mut child = tokio::process::Command::new(&instance.spice_cli)
         .args(&args)
         .args(["--http-endpoint", &instance.spiced.http_endpoint()])
         .args(flight.iter().flatten())
-        .stdin(std::process::Stdio::null())
-        .output()
-        .await
+        .current_dir(&instance.spiced.dir)
+        .stdin(if input.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
         .with_context(|| {
             format!(
                 "Failed to run {}; pass --spice-cli",
                 instance.spice_cli.display()
             )
         })?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        use tokio::io::AsyncWriteExt;
+        // Dropped once written: a prompt the input does not answer reads end of
+        // input rather than waiting for more.
+        stdin.write_all(input.as_bytes()).await?;
+    }
+    let out = tokio::time::timeout(Duration::from_secs(120), child.wait_with_output())
+        .await
+        .with_context(|| format!("`spice {}` did not exit within 120s", args.join(" ")))??;
+    adopt_spicepod(instance, &spicepod_path, &before)?;
     let output = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -201,6 +234,19 @@ pub(super) async fn spice_cli(
         );
     }
     Ok(one_line(output.trim(), 100))
+}
+
+/// Makes the spicepod on disk the instance's when a `spice` command changed it
+/// from `before`. Compared with what the file held, not with the instance's
+/// spicepod, which a sidecar's file never equals.
+fn adopt_spicepod(instance: &mut Instance, path: &std::path::Path, before: &str) -> Result<()> {
+    let on_disk = std::fs::read_to_string(path)?;
+    if on_disk != before {
+        instance.spicepod = yaml::from_str(&on_disk)
+            .with_context(|| format!("the spicepod `spice` wrote is not YAML: {on_disk}"))?;
+        instance.spicepod_yaml = on_disk;
+    }
+    Ok(())
 }
 
 /// Sends the step's request, retrying as its timing asks, until the response

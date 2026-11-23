@@ -14,7 +14,10 @@ The merge queue runs every script here except those tagged `tags: [long]`
 or changes. An edit to a script's `tags:` line alone does not count: it moves
 the script between runs without changing what it does.
 `trunk_tests.yml` runs every script after merge, on trunk. Use
-`--exclude-tag long` for a quick local run.
+`--exclude-tag long` for a quick local run. Scripts tagged `macos-smoke` also
+run against the macOS build, in E2E Test CI's `spicescript: macOS smoke` job;
+their sources must be `files` or `mock-http`, since those runners have no
+Docker.
 
 ## Layout
 

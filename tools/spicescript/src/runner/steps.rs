@@ -810,11 +810,18 @@ async fn run_step(
         }
         Action::SpiceCli {
             args,
+            input,
             output_contains,
             expect_error,
         } => {
-            let shown =
-                spice_cli(instance, args, output_contains.as_deref(), *expect_error).await?;
+            let shown = spice_cli(
+                instance,
+                args,
+                input.as_deref(),
+                output_contains.as_deref(),
+                *expect_error,
+            )
+            .await?;
             return Ok(format!(
                 " ({:.1}s) {shown}",
                 started.elapsed().as_secs_f64()

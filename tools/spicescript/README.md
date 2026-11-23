@@ -166,13 +166,19 @@ steps:
     eventually: 60s
 ```
 
-`tags:` is optional. The one tag is `long`: the script is too slow for the
+`tags:` is optional. `long` means the script is too slow for the
 run before every merge, for what it catches there, so the merge queue skips it
 (`--exclude-tag long`) and it runs after merge, on trunk, in
 `trunk_tests.yml`. A script without it runs before every merge. Leave a new
 script untagged unless it is slow; tag it `long` when its CI time is high and
 its failure history low. A PR that edits a `long` script runs it in the merge
-queue too; a PR that only changes its `tags:` line does not. Write the list on
+queue too; a PR that only changes its `tags:` line does not. `macos-smoke`
+also runs the script against the macOS build, in E2E Test CI's `spicescript:
+macOS smoke` job (`--only-tag macos-smoke`); those runners have no Docker, so
+every source of such a script must be `files` or `mock-http`, and the parser
+refuses any other. Keep that set small: it is the macOS coverage of what
+differs by platform (file-mode acceleration on its filesystem, the CLI, the
+protocols), not a second copy of the suite. Write the list on
 one line with plain names (`tags: [long]`), since CI selects those scripts by
 that line; a block list, a list over several lines, a quoted or escaped name,
 and unknown or duplicate tags are rejected.
@@ -293,7 +299,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `flight-put: { dataset, rows \| from-source }` | Write rows with Flight `DoPut`; `times: n` repeats it. |
 | `flight-exec: <sql>` | Flight SQL `ExecuteUpdate`; `count: n` affected rows. |
 | `http: { path, method, query, headers, body, api-key }` | One request; `query:` maps URL parameters, which are encoded and appended to `path`. `expect: { status, headers, lacks-headers, body-contains, body-matches, body-lacks, json }`; `json` checks the body as JSON (see [JSON responses](#json-responses)). |
-| `spice: [args…]` | Run the `spice` CLI against the instance; `output-contains`, `expect-error`. |
+| `spice: [args…]` | Run the `spice` CLI against the instance, in the instance's directory (so `spice dataset configure` edits its `spicepod.yaml`); `input` is written to its standard input, for an interactive command's prompts; `output-contains`, `expect-error`. A spicepod the command changes becomes the instance's, so a later `start` or `restart` keeps the change. |
 | `refresh: <dataset>` | Trigger a refresh and wait for it to finish; `expect-error`; `wait: false` only triggers it. |
 | `explain: <sql>` | `EXPLAIN` (`analyze: true`), requiring `contains:` fragments or the absence of `omits:` ones. |
 | `assert-status: { dataset, status, message-contains, ready, has, lacks }` | Check a dataset's status from `/v1/datasets`. |

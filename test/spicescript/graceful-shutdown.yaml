@@ -5,7 +5,9 @@ description: >
   refreshes running against them, `spiced` exits cleanly and promptly on
   SIGTERM, leaves a file acceleration it can reopen, and after a restart
   serves one row per key: the newest version (Cayenne keeps the newest by time
-  column whatever `on_conflict` says). Every query during the load succeeds.
+  column whatever `on_conflict` says), or with no primary key every version it
+  read, the newest of each key the source's. Every query during the load
+  succeeds. Keyed and indexed, keyed only, and indexed only.
 
 sources:
   src: { kind: postgres }
@@ -17,6 +19,11 @@ variants:
   default: {}
   # The spicepod as written, with the prototype object-native Cayenne metastore.
   object-native: object-native
+  # A primary key without an index, and indexes without a primary key: the
+  # appends then keep every version they read, and each key's newest is the
+  # source's.
+  primary-key-only: { datasets: { '*': { acceleration: { indexes: null } } } }
+  indexes-only: { datasets: { '*': { acceleration: { primary_key: null, on_conflict: null } } } }
 
 spicepod:
   version: v1
@@ -114,11 +121,23 @@ steps:
   - query: SELECT * FROM data_upsert
     oracle-sql: SELECT * FROM service_data
     eventually: 60s
+    except: indexes-only
   # Cayenne keeps each key's newest version whatever `on_conflict` says.
   - query: SELECT * FROM data_drop
     oracle-sql: SELECT * FROM service_data
     eventually: 60s
     when: { engine: cayenne }
+    except: indexes-only
+  # Without a primary key every version read is kept; the newest of each is
+  # the source's row.
+  - query: SELECT id, max(date_updated) AS newest FROM data_upsert GROUP BY id
+    oracle-sql: SELECT id, date_updated AS newest FROM service_data
+    eventually: 60s
+    only: indexes-only
+  - query: SELECT id, max(date_updated) AS newest FROM data_drop GROUP BY id
+    oracle-sql: SELECT id, date_updated AS newest FROM service_data
+    eventually: 60s
+    only: indexes-only
   # A refresh in flight when SIGTERM arrives can log this as an ERROR,
   # though the shutdown is clean and no data is affected.
   - assert-log: { clean: true, allow: ['ERROR runtime_table::accelerated::refresh_task: Failed to provide stats on the amount of data written into data_(full|drop|upsert) *$'] }
