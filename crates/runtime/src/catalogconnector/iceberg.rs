@@ -1838,8 +1838,7 @@ mod tests {
             ];
             for endpoint in endpoints {
                 let override_uri = endpoint.clone();
-                let catalog_uri =
-                    start_rest_catalog(move |_| json!({ "uri": override_uri })).await;
+                let catalog_uri = start_rest_catalog(move |_| json!({ "uri": override_uri })).await;
                 let err = list_namespaces(catalog_uri, token_props())
                     .await
                     .expect_err("an internal catalog URI override must be refused");
@@ -1860,8 +1859,7 @@ mod tests {
             let override_uri = endpoint.clone();
             let catalog_uri =
                 start_rest_catalog(move |_| json!({ "oauth2-server-uri": override_uri })).await;
-            let props =
-                HashMap::from([("credential".to_string(), "client:secret".to_string())]);
+            let props = HashMap::from([("credential".to_string(), "client:secret".to_string())]);
             let err = list_namespaces(catalog_uri, props)
                 .await
                 .expect_err("an internal token endpoint override must be refused");
@@ -1896,8 +1894,7 @@ mod tests {
                 let _dns = ResolverOverride::set(host, addrs, false);
                 let endpoint = format!("http://{host}:{}", sentinel.port);
                 let override_uri = endpoint.clone();
-                let catalog_uri =
-                    start_rest_catalog(move |_| json!({ "uri": override_uri })).await;
+                let catalog_uri = start_rest_catalog(move |_| json!({ "uri": override_uri })).await;
                 let err = list_namespaces(catalog_uri, token_props())
                     .await
                     .expect_err("a catalog URI override resolving internally must be refused");
@@ -1908,7 +1905,8 @@ mod tests {
 
         #[tokio::test]
         async fn a_catalog_uri_override_on_the_configured_origin_is_followed() {
-            let catalog_uri = start_rest_catalog(|uri| json!({ "uri": format!("{uri}/sub") })).await;
+            let catalog_uri =
+                start_rest_catalog(|uri| json!({ "uri": format!("{uri}/sub") })).await;
             let namespaces = list_namespaces(catalog_uri, token_props())
                 .await
                 .expect("an override on the catalog's own origin is followed");
@@ -1938,7 +1936,10 @@ mod tests {
             for (key, endpoint) in [
                 ("uri", "https://public.config.test/catalog"),
                 ("uri", "https://93.184.216.34/catalog"),
-                ("oauth2-server-uri", "https://public.config.test/v1/oauth/tokens"),
+                (
+                    "oauth2-server-uri",
+                    "https://public.config.test/v1/oauth/tokens",
+                ),
                 ("uri", "http://127.0.0.1:8181/prefix"),
             ] {
                 guard
