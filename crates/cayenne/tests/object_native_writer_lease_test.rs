@@ -104,6 +104,9 @@ impl Instance {
                 store: Arc::clone(&self.store),
             },
         )
+        // Strict reads: every query confirms the dataset head, so a query sees
+        // each commit acknowledged before it started.
+        .with_scan_view_reuse(cayenne::ScanViewReuse::WithinLag(std::time::Duration::ZERO))
     }
 
     async fn create(&self) -> String {

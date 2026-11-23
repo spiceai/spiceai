@@ -22,7 +22,7 @@ use std::sync::Arc;
 use arrow::array::Int64Array;
 use cayenne::metadata::{CreateTableOptions, ObjectStoreConfig, VortexConfig};
 use cayenne::metastore::object_native::{Access, NativeCatalogConfig, ObjectNativeCatalog};
-use cayenne::{CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, ScanViewReuse};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
@@ -86,6 +86,9 @@ impl Instance {
                 store: Arc::clone(store),
             },
         )
+        // Strict reads: every query confirms the dataset head, so a query sees
+        // each commit acknowledged before it started.
+        .with_scan_view_reuse(cayenne::ScanViewReuse::WithinLag(std::time::Duration::ZERO))
     }
 
     fn register(&self, table: impl TableProvider + 'static) {
@@ -382,5 +385,171 @@ async fn concurrent_replica_queries_share_one_head_read_sent_after_they_start() 
         head_polls(from),
         2,
         "the held read, and one more shared by the sixteen later queries"
+    );
+}
+
+/// A writer and a replica of an unkeyed table with rows 1..=100, the replica's
+/// table built with `lag` and its requests recorded.
+async fn writer_and_lagging_replica(
+    lag: std::time::Duration,
+) -> (Instance, Instance, Arc<CayenneTableProvider>, Arc<FaultStore>) {
+    writer_and_replica_with(ScanViewReuse::WithinLag(lag)).await
+}
+
+/// A writer and a replica of an unkeyed table with rows 1..=100, the replica's
+/// table built with `reuse` and its requests recorded.
+async fn writer_and_replica_with(
+    reuse: ScanViewReuse,
+) -> (Instance, Instance, Arc<CayenneTableProvider>, Arc<FaultStore>) {
+    let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let replica_requests = Arc::new(FaultStore::new(Arc::clone(&objects)));
+    let replica_store: Arc<dyn ObjectStore> = Arc::clone(&replica_requests) as Arc<dyn ObjectStore>;
+
+    let (a, data_url) = Instance::open(&objects, Access::Writer).await;
+    let table = a
+        .builder(&objects, &data_url)
+        .create(CreateTableOptions {
+            table_name: TABLE.to_string(),
+            schema: schema(),
+            primary_key: Vec::new(),
+            on_conflict: None,
+            base_path: data_url.clone(),
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        })
+        .await
+        .expect("create the table on A");
+    a.register(table);
+    a.insert(1, 100).await.expect("A writes 1..=100");
+
+    let (b, _) = Instance::open(&replica_store, Access::Replica).await;
+    let table = Arc::new(
+        b.builder(&replica_store, &data_url)
+            .with_scan_view_reuse(reuse)
+            .open(TABLE)
+            .await
+            .expect("open the table on B"),
+    );
+    b.ctx
+        .register_table(TABLE, Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register");
+    (a, b, table, replica_requests)
+}
+
+/// Conditional reads of a dataset head recorded from `from` on.
+fn head_polls(requests: &FaultStore, from: usize) -> usize {
+    requests.log()[from..]
+        .iter()
+        .filter(|request| {
+            request.op == Op::GetConditional && request.path.filename() == Some("head")
+        })
+        .count()
+}
+
+/// A replica's query serves its cached view for the replica's lag without
+/// reading the location, so a commit made meanwhile shows only once the view
+/// is older than the lag and a query confirms the head again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replica_serves_its_view_for_its_lag_then_confirms_the_head() {
+    let lag = std::time::Duration::from_secs(2);
+    let (a, b, _table, requests) = writer_and_lagging_replica(lag).await;
+    let first_confirmed = std::time::Instant::now();
+    assert_eq!(b.count_and_sum().await, expected(1..=100), "B's first query");
+
+    a.insert(101, 200).await.expect("A writes 101..=200");
+    let from = requests.log().len();
+    assert_eq!(
+        b.count_and_sum().await,
+        expected(1..=100),
+        "within its lag, B serves the view it confirmed before A's commit"
+    );
+    assert_eq!(head_polls(&requests, from), 0, "and reads nothing to do so");
+
+    let deadline = first_confirmed + lag * 5;
+    loop {
+        let answer = b.count_and_sum().await;
+        if answer == expected(1..=200) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "B still serves {answer:?} {:?} after its first confirmation",
+            first_confirmed.elapsed()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        first_confirmed.elapsed() >= lag,
+        "B showed A's commit only once its view was older than its lag"
+    );
+    assert!(
+        head_polls(&requests, from) >= 1,
+        "a query past the lag confirmed the head"
+    );
+}
+
+/// While queries use a replica's table, the background refresh confirms the
+/// head and rebuilds the view ahead of them, so a query after a commit finds a
+/// fresh view and reads nothing itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replica_refreshes_its_view_in_the_background_while_queried() {
+    let lag = std::time::Duration::from_secs(6);
+    let (a, b, table, requests) = writer_and_lagging_replica(lag).await;
+    table.init_scan_view_cache();
+    assert_eq!(b.count_and_sum().await, expected(1..=100), "B's first query");
+
+    let from = requests.log().len();
+    a.insert(101, 200).await.expect("A writes 101..=200");
+    tokio::time::timeout(lag * 2, async {
+        while head_polls(&requests, from) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the background refresh confirms the head while no query runs");
+
+    // The refresh rebuilt the view after confirming the head; the next round is
+    // half a lag away, so this query is served by that view.
+    let before = requests.log().len();
+    assert_eq!(
+        b.count_and_sum().await,
+        expected(1..=200),
+        "B's next query shows A's commit"
+    );
+    assert_eq!(
+        head_polls(&requests, before),
+        0,
+        "and reads nothing itself"
+    );
+}
+
+/// A table whose own views last until a write invalidates them (a `full` or
+/// `append` refresh, a writable table) sees no write of the replica's own, so
+/// on a replica its views are reused for the default lag and then confirm the
+/// head again: a commit by the writer shows within that lag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replica_of_a_table_invalidated_by_writes_follows_within_the_default_lag() {
+    let (a, b, _table, requests) =
+        writer_and_replica_with(ScanViewReuse::UntilInvalidated).await;
+    assert_eq!(b.count_and_sum().await, expected(1..=100), "B's first query");
+
+    a.insert(101, 200).await.expect("A writes 101..=200");
+    let from = requests.log().len();
+    let committed = std::time::Instant::now();
+    loop {
+        let answer = b.count_and_sum().await;
+        if answer == expected(1..=200) {
+            break;
+        }
+        assert!(
+            committed.elapsed() < std::time::Duration::from_secs(10),
+            "B still serves {answer:?} {:?} after A's commit",
+            committed.elapsed()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        head_polls(&requests, from) >= 1,
+        "a query confirmed the head to show A's commit"
     );
 }
