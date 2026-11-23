@@ -300,11 +300,6 @@ pub enum Error {
         path: Option<String>,
     },
 
-    /// `acceleration.partition_by` on a file-mode dataset with
-    /// `runtime.params.cayenne_vnext` enabled.
-    #[snafu(display("{}", partition_by_under_vnext_refusal(dataset)))]
-    PartitionByUnderVnextRefused { dataset: Arc<str> },
-
     /// A setting that data in the object-native location does not support yet, on
     /// a file-mode dataset with `runtime.params.cayenne_vnext` enabled.
     #[snafu(display("{}", setting_under_vnext_refusal(dataset, *setting)))]
@@ -5248,16 +5243,6 @@ fn object_store_data_path_refusal(dataset: &str, path: Option<&str>) -> String {
     )
 }
 
-/// The text of [`Error::PartitionByUnderVnextRefused`]: with `runtime.params.cayenne_vnext`
-/// enabled, a file-mode dataset cannot set `partition_by` yet.
-fn partition_by_under_vnext_refusal(dataset: &str) -> String {
-    format!(
-        "Failed to load dataset '{dataset}' (cayenne): `acceleration.partition_by` is not supported yet with `runtime.params.cayenne_vnext` enabled. \
-        Remove `partition_by` from the dataset, or set `runtime.params.cayenne_vnext: disabled`. \
-        See: https://spiceai.org/docs/components/data-accelerators/cayenne"
-    )
-}
-
 /// A dataset setting that data in the object-native location does not support yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnsupportedSetting {
@@ -5265,6 +5250,21 @@ pub enum UnsupportedSetting {
     RefreshMode(&'static str),
     /// An `acceleration.params` key the dataset sets.
     Param(&'static str),
+    /// `acceleration.partition_by`.
+    PartitionBy,
+}
+
+/// Fails with [`Error::SettingUnderVnextRefused`] for `dataset` when `unsupported`
+/// names a setting.
+fn ensure_setting_supported(dataset: &str, unsupported: Option<UnsupportedSetting>) -> Result<()> {
+    match unsupported {
+        Some(setting) => SettingUnderVnextRefusedSnafu {
+            dataset: Arc::from(dataset),
+            setting,
+        }
+        .fail(),
+        None => Ok(()),
+    }
 }
 
 /// The text of [`Error::SettingUnderVnextRefused`]: with `runtime.params.cayenne_vnext`
@@ -5279,6 +5279,10 @@ fn setting_under_vnext_refusal(dataset: &str, setting: UnsupportedSetting) -> St
         UnsupportedSetting::Param(param) => (
             format!("`acceleration.params.{param}`"),
             format!("Remove `{param}` from the dataset"),
+        ),
+        UnsupportedSetting::PartitionBy => (
+            "`acceleration.partition_by`".to_string(),
+            "Remove `partition_by` from the dataset".to_string(),
         ),
     };
     format!(
@@ -5328,13 +5332,10 @@ impl CayenneAccelerator {
         if !partitioned || !source.is_file_accelerated() || self.cluster_role.is_some() {
             return Ok(());
         }
-        ensure!(
-            !Self::vnext_enabled(source)?,
-            PartitionByUnderVnextRefusedSnafu {
-                dataset: Arc::from(source.name().to_string()),
-            }
-        );
-        Ok(())
+        ensure_setting_supported(
+            &source.name().to_string(),
+            Self::vnext_enabled(source)?.then_some(UnsupportedSetting::PartitionBy),
+        )
     }
     /// Deletes every object under the object-store data path `data_dir` through
     /// the dataset's store, for `mode: file_create`, and returns how many it deleted.
@@ -5391,13 +5392,7 @@ impl CayenneAccelerator {
                 table_name,
             )),
         };
-        if let Some(setting) = object_native_data_unsupported(source) {
-            return SettingUnderVnextRefusedSnafu {
-                dataset: Arc::from(table_name),
-                setting,
-            }
-            .fail();
-        }
+        ensure_setting_supported(table_name, object_native_data_unsupported(source))?;
         let datasets_url = url::Url::parse(&effective_state_location(&source.app())?.location)
             .ok()
             .and_then(|location| location_datasets_url(&location, native.datasets_prefix()))
@@ -5448,13 +5443,10 @@ impl CayenneAccelerator {
         {
             return Ok(LocationPlacement::Elsewhere);
         }
-        if let Some(setting) = object_native_data_unsupported(source) {
-            return SettingUnderVnextRefusedSnafu {
-                dataset: Arc::from(source.name().to_string()),
-                setting,
-            }
-            .fail();
-        }
+        ensure_setting_supported(
+            &source.name().to_string(),
+            object_native_data_unsupported(source),
+        )?;
         let in_object_store = url::Url::parse(&effective_state_location(&source.app())?.location)
             .is_ok_and(|location| {
                 location_datasets_url(&location, &object_store::path::Path::default()).is_some()
@@ -6786,10 +6778,7 @@ mod tests {
             // A dataset's own `cayenne_file_path` is named first, as the setting to
             // remove; without one, the location itself takes no data.
             let expected = if explicit_path {
-                setting_under_vnext_refusal(
-                    "orders",
-                    UnsupportedSetting::Param("cayenne_file_path"),
-                )
+                "Failed to load dataset 'orders' (cayenne): `acceleration.params.cayenne_file_path` is not supported yet with `runtime.params.cayenne_vnext` enabled. Remove `cayenne_file_path` from the dataset, or set `runtime.params.cayenne_vnext: disabled`. See: https://spiceai.org/docs/components/data-accelerators/cayenne".to_string()
             } else {
                 format!(
                     "Invalid Cayenne acceleration configuration: {}",
@@ -6805,30 +6794,27 @@ mod tests {
     /// with a message naming the dataset, the setting, and both fixes.
     #[tokio::test]
     async fn a_setting_the_location_does_not_support_is_refused_with_both_fixes() {
-        assert_eq!(
-            setting_under_vnext_refusal("orders", UnsupportedSetting::Param("cayenne_file_path")),
-            "Failed to load dataset 'orders' (cayenne): `acceleration.params.cayenne_file_path` is not supported yet with `runtime.params.cayenne_vnext` enabled. Remove `cayenne_file_path` from the dataset, or set `runtime.params.cayenne_vnext: disabled`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
-        );
-        assert_eq!(
-            setting_under_vnext_refusal("orders", UnsupportedSetting::RefreshMode("caching")),
-            "Failed to load dataset 'orders' (cayenne): `acceleration.refresh_mode: caching` is not supported yet with `runtime.params.cayenne_vnext` enabled. Set `refresh_mode` to `full`, `append`, or `changes`, or set `runtime.params.cayenne_vnext: disabled`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
-        );
-
         let accelerator = CayenneAccelerator::new();
-        for param in [
-            "cayenne_file_path",
-            "cayenne_s3_zone_ids",
-            "cayenne_datalake_location",
+        for (param, expected) in [
+            (
+                "cayenne_file_path",
+                "Failed to load dataset 'orders' (cayenne): `acceleration.params.cayenne_file_path` is not supported yet with `runtime.params.cayenne_vnext` enabled. Remove `cayenne_file_path` from the dataset, or set `runtime.params.cayenne_vnext: disabled`. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+            ),
+            (
+                "cayenne_s3_zone_ids",
+                "Failed to load dataset 'orders' (cayenne): `acceleration.params.cayenne_s3_zone_ids` is not supported yet with `runtime.params.cayenne_vnext` enabled. Remove `cayenne_s3_zone_ids` from the dataset, or set `runtime.params.cayenne_vnext: disabled`. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+            ),
+            (
+                "cayenne_datalake_location",
+                "Failed to load dataset 'orders' (cayenne): `acceleration.params.cayenne_datalake_location` is not supported yet with `runtime.params.cayenne_vnext` enabled. Remove `cayenne_datalake_location` from the dataset, or set `runtime.params.cayenne_vnext: disabled`. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+            ),
         ] {
             let source = data_path_source("enabled", &[(param, "/tmp/elsewhere")]);
             let error = accelerator
                 .metastore_type_for(&source, "/nonexistent/metadata")
                 .await
                 .expect_err("the setting is refused under the flag");
-            assert_eq!(
-                error.to_string(),
-                setting_under_vnext_refusal("orders", UnsupportedSetting::Param(param))
-            );
+            assert_eq!(error.to_string(), expected, "param {param}");
         }
         let mut caching = data_path_source("enabled", &[]);
         caching.set_acceleration(Acceleration {
@@ -6843,7 +6829,7 @@ mod tests {
             .expect_err("`refresh_mode: caching` is refused under the flag");
         assert_eq!(
             error.to_string(),
-            setting_under_vnext_refusal("orders", UnsupportedSetting::RefreshMode("caching"))
+            "Failed to load dataset 'orders' (cayenne): `acceleration.refresh_mode: caching` is not supported yet with `runtime.params.cayenne_vnext` enabled. Set `refresh_mode` to `full`, `append`, or `changes`, or set `runtime.params.cayenne_vnext: disabled`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
         );
     }
 

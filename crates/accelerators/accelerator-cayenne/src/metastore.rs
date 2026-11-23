@@ -36,8 +36,8 @@ use tokio::sync::OnceCell;
 
 use super::{
     AccelerationInitializationFailedSnafu, CAYENNE_MIGRATION_DOCS, CayenneAccelerator, Error,
-    InvalidConfigurationSnafu, Result, SettingUnderVnextRefusedSnafu, TursoMetastoreOnDiskSnafu,
-    UnsupportedSetting, native_sidecar, overlapping_metastore_dir, path_exists,
+    InvalidConfigurationSnafu, Result, TursoMetastoreOnDiskSnafu, UnsupportedSetting,
+    ensure_setting_supported, native_sidecar, overlapping_metastore_dir, path_exists,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -311,13 +311,7 @@ impl CayenneAccelerator {
             .acceleration()
             .is_some_and(|acceleration| !acceleration.partition_by.is_empty());
         if vnext {
-            if let Some(setting) = object_native_data_unsupported(source) {
-                return SettingUnderVnextRefusedSnafu {
-                    dataset: Arc::from(table_name.as_str()),
-                    setting,
-                }
-                .fail();
-            }
+            ensure_setting_supported(&table_name, object_native_data_unsupported(source))?;
             let location_supported = url::Url::parse(
                 &effective_state_location(&source.app())?.location,
             )
