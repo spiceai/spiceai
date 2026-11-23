@@ -384,15 +384,16 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
 
 /// Maps a provider build failure to the connector error the runtime retries on.
 ///
-/// An invalid query and a refusal the API named (HTTP 401/403, a `FORBIDDEN` or
-/// `UNAUTHENTICATED` GraphQL error) are permanent: retrying cannot change the answer.
-/// Everything else, including a refusal inferred from an ambiguous message, is retriable.
+/// An invalid query, a resource the API reports as `NOT_FOUND`, and a refusal the API
+/// named (HTTP 401/403, a `FORBIDDEN` or `UNAUTHENTICATED` GraphQL error) are permanent:
+/// retrying cannot change the answer. Everything else, including a refusal inferred from
+/// an ambiguous message, is retriable.
 fn read_provider_error(
     e: graphql::Error,
     connector_component: ConnectorComponent,
 ) -> DataConnectorError {
     match &e {
-        graphql::Error::InvalidGraphQLQuery { .. } => {
+        graphql::Error::InvalidGraphQLQuery { .. } | graphql::Error::ResourceNotFound { .. } => {
             let message = format!("{e}");
             DataConnectorError::InvalidConfiguration {
                 dataconnector: "graphql".to_string(),
@@ -613,12 +614,8 @@ mod tests {
         wiremock::ResponseTemplate::new(307).insert_header("location", location)
     }
 
-    /// Queries `endpoint` with the client a dataset with `params` gets.
-    async fn query_users(
-        params: &[(&str, &str)],
-        endpoint: &str,
-    ) -> graphql::Result<graphql::client::GraphQLQueryResult> {
-        let connector = GraphQL {
+    async fn test_connector(params: &[(&str, &str)]) -> GraphQL {
+        GraphQL {
             app_name: std::sync::Arc::from("test_app"),
             params: test_params(params).await,
             runtime_rate_control_params: None,
@@ -626,7 +623,15 @@ mod tests {
             metrics: Arc::new(HttpRateControlMetrics::default()),
             emit_rate_control_metrics: true,
             rate_control_metric_source: None,
-        };
+        }
+    }
+
+    /// Queries `endpoint` with the client a dataset with `params` gets.
+    async fn query_users(
+        params: &[(&str, &str)],
+        endpoint: &str,
+    ) -> graphql::Result<graphql::client::GraphQLQueryResult> {
+        let connector = test_connector(params).await;
         let dataset = test_dataset(endpoint).await;
         let (client, reservation) = connector
             .get_client(
@@ -640,6 +645,58 @@ mod tests {
             graphql::client::GraphQLQuery::try_from(Arc::<str>::from("query { users { id } }"))
                 .expect("the query parses");
         client.execute(&query, None, None, None, None, None).await
+    }
+
+    /// Builds the table provider of a dataset with `params` at `endpoint` as `read_provider`
+    /// does, and returns the connector error its failure maps to.
+    async fn read_provider_failure(params: &[(&str, &str)], endpoint: &str) -> DataConnectorError {
+        let connector = test_connector(params).await;
+        let dataset = test_dataset(endpoint).await;
+        let (client, reservation) = connector
+            .get_client(
+                &dataset,
+                Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+            )
+            .await
+            .expect("the GraphQL client builds");
+        let Err(error) = GraphQLTableProviderBuilder::new(client)
+            .build("query { users { id } }")
+            .await
+        else {
+            panic!("the table provider must fail to build against {endpoint}");
+        };
+        reservation.rollback().await;
+        read_provider_error(error, ConnectorComponent::from(&dataset))
+    }
+
+    /// A GraphQL `NOT_FOUND` names a resource that does not exist, so registration fails with a
+    /// configuration error that startup does not retry, even behind an earlier bare timeout.
+    #[tokio::test]
+    async fn a_not_found_resource_is_a_permanent_configuration_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(
+                r#"{"data": null, "errors": [{"message": "upstream timeout"}, {"message": "no such repository", "type": "NOT_FOUND"}]}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+
+        let error = read_provider_failure(
+            &[("json_pointer", "/data/users")],
+            &format!("{}/graphql", server.uri()),
+        )
+        .await;
+
+        assert!(
+            matches!(error, DataConnectorError::InvalidConfiguration { .. }),
+            "a NOT_FOUND maps to InvalidConfiguration, got {error:?}"
+        );
+        assert!(!error.is_retriable());
+        assert!(
+            error.to_string().contains("no such repository"),
+            "the error names the missing resource: {error}"
+        );
     }
 
     #[tokio::test]
