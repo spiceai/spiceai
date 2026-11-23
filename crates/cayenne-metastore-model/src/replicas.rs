@@ -119,6 +119,49 @@ pub(crate) enum Action {
     ReplicaExpire(usize),
     ReplicaSweep(usize),
 }
+/// The replica reader's box: its held and confirmed heads and its query, red
+/// when the query broke a property (named by `query_outcome`) or the reader
+/// adopted a head it must not.
+fn reader_box(last: &State, n: usize) -> (String, Vec<String>, crate::explorer::Tone) {
+    use crate::explorer::Tone;
+    let mut lines = vec![format!("holds v{}", last.held)];
+    if let Some((at, v)) = last.confirmed {
+        lines.push(format!("confirmed v{v} at {at}"));
+    }
+    // A query keeps its start tick and the live set of the head it
+    // confirmed, not that head's version.
+    let (outcome, tone) =
+        crate::explorer::query_outcome(last.result, last.bad_availability, last.bad_rows);
+    if let Some((start, set)) = last.query {
+        lines.push(format!(
+            "query started {start} reads objects {}: {outcome}",
+            set_label(set, n),
+        ));
+    }
+    let tone = if tone == Tone::Bad || last.bad_adopt || last.lower_adopt {
+        Tone::Bad
+    } else {
+        Tone::Actor
+    };
+    ("REPLICA READER".into(), lines, tone)
+}
+/// The replica head's references, and the ones whose objects have not reached
+/// the replica yet.
+fn replica_head_lines(refs: u8, replica: u8, n: usize) -> Vec<String> {
+    let mut lines = vec![format!("references {}", set_label(refs, n))];
+    if refs & !replica != 0 {
+        lines.push(format!("not yet copied {}", set_label(refs & !replica, n)));
+    }
+    lines
+}
+/// The members of a bit set of objects or versions.
+fn set_label(set: u8, n: usize) -> String {
+    let members: Vec<String> = (0..n)
+        .filter(|i| set & bit(*i) != 0)
+        .map(|i| i.to_string())
+        .collect();
+    format!("{{{}}}", members.join(", "))
+}
 const fn bit(o: usize) -> u8 {
     1 << o
 }
@@ -427,6 +470,150 @@ impl Model for Protocol {
         }
         if n == *s { None } else { Some(n) }
     }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Tick => "the clock ticks".into(),
+            Action::Upload(o) => format!("the writer uploads object {o} at the source"),
+            Action::Publish(o) => format!("the writer commits a reference to object {o}"),
+            Action::Remove(o) => format!("the writer removes object {o} from the head"),
+            Action::Bump => "the source GC's empty commit moves the head".into(),
+            Action::SourceExpire(o) => {
+                format!("source GC deletes removed object {o} after retention")
+            }
+            Action::SourceSweep(o) => format!("source GC deletes orphan upload {o}"),
+            Action::CopyObject(o) => format!("replication copies object {o} to the replica"),
+            Action::CopyHead(v) => format!("replication copies head version {v} to the replica"),
+            Action::Adopt => "the replica reader adopts the replicated head".into(),
+            Action::Confirm => {
+                "the replica reader sends a conditional GET on the source head".into()
+            }
+            Action::Respond => "the source head GET responds".into(),
+            Action::Start => "a query starts from the confirmed head".into(),
+            Action::Get(o) => format!("the query reads object {o} from the replica"),
+            Action::ReplicaRead => "replica GC reads the replicated removals".into(),
+            Action::ReplicaExpire(o) => {
+                format!("replica GC deletes its copy of removed object {o}")
+            }
+            Action::ReplicaSweep(o) => {
+                format!("replica GC deletes its copy of object {o} the source no longer has")
+            }
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        Some(crate::explorer::summary(&[
+            format!(
+                "retention T = {T}, staleness S = {S}, upload age T_O = {T_O}; clock {}",
+                s.now
+            ),
+            format!("head versions at the replica: {}", set_label(s.arrived, V)),
+            crate::explorer::flags(&[
+                ("reader waited", s.waited),
+                ("reader lagging", s.lagging),
+                ("query error after retention", s.late_error),
+                ("removed object collected", s.removed_collected),
+                ("orphan collected", s.orphan_collected),
+                ("BAD adopt", s.bad_adopt),
+                ("BAD lower-version adopt", s.lower_adopt),
+                ("BAD confirm", s.bad_confirm),
+                ("BAD availability", s.bad_availability),
+                ("BAD rows", s.bad_rows),
+                ("BAD committed object deleted", s.committed_deleted),
+            ]),
+        ]))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{Event, Timeline, Tone, state_and_trace, steps};
+        let last = path.last_state().clone();
+        let n = self.objects();
+        let refs = |v: u8| last.live[usize::from(v)];
+        let replica_refs = refs(last.replica_head);
+        let mut boxes = vec![
+            (
+                format!("SOURCE HEAD v{} (at {})", last.version, last.head_time),
+                vec![format!("references {}", set_label(refs(last.version), n))],
+                Tone::Live,
+            ),
+            (
+                "SOURCE STORE".into(),
+                vec![format!("objects {}", set_label(last.source, n))],
+                Tone::Live,
+            ),
+            (
+                format!("REPLICA HEAD v{}", last.replica_head),
+                replica_head_lines(replica_refs, last.replica, n),
+                // Replication copies objects and heads in any order, so a
+                // replicated head may name objects not yet copied; the property
+                // concerns a reader adopting it, which the reader box shows.
+                if replica_refs & !last.replica == 0 {
+                    Tone::Live
+                } else {
+                    Tone::Staged
+                },
+            ),
+            (
+                "REPLICA STORE".into(),
+                vec![format!("objects {}", set_label(last.replica, n))],
+                Tone::Live,
+            ),
+        ];
+        if self.readers() {
+            boxes.push(reader_box(&last, n));
+        }
+        let (writer, source, replication, replica, reader, gc) = (0, 1, 2, 3, 4, 5);
+        let lanes = ["writer", "source", "replication", "replica", "reader", "GC"]
+            .map(String::from)
+            .to_vec();
+        let mut events = vec![];
+        for (before, action, after) in steps(path) {
+            let label = self.format_action(&action);
+            let event = match action {
+                Action::Tick => {
+                    Event::on(source, format!("clock -> {}", after.now)).tone(Tone::Gone)
+                }
+                Action::Upload(_) | Action::Publish(_) | Action::Remove(_) => {
+                    Event::on(writer, label).to(source)
+                }
+                Action::Bump | Action::SourceExpire(_) | Action::SourceSweep(_) => {
+                    Event::on(gc, label).to(source)
+                }
+                Action::CopyObject(_) | Action::CopyHead(_) => {
+                    Event::on(replication, label).to(replica)
+                }
+                Action::Adopt => {
+                    let ok = after.held != before.held;
+                    Event::on(
+                        reader,
+                        if ok {
+                            format!("adopt v{}", after.held)
+                        } else {
+                            "adopt: nothing newer".into()
+                        },
+                    )
+                    .to(replica)
+                    .tone(if ok { Tone::Actor } else { Tone::Gone })
+                }
+                Action::Confirm => Event::on(reader, label).to(source).tone(Tone::Staged),
+                Action::Respond => Event::on(source, label).to(reader),
+                Action::Start => Event::on(reader, label).tone(Tone::Actor),
+                Action::Get(o) => {
+                    let (text, tone) = crate::explorer::fetch_event(
+                        o,
+                        before.replica & bit(o) != 0,
+                        after.bad_availability && !before.bad_availability,
+                        after.bad_rows && !before.bad_rows,
+                        label,
+                    );
+                    Event::on(reader, text).to(replica).tone(tone)
+                }
+                Action::ReplicaRead | Action::ReplicaExpire(_) | Action::ReplicaSweep(_) => {
+                    Event::on(gc, label).to(replica)
+                }
+            };
+            events.push(event.breaking(&crate::explorer::broken(self, &before, &after)));
+        }
+        Some(state_and_trace(&boxes, &Timeline { lanes, events }))
+    }
     fn properties(&self) -> Vec<Property<Self>> {
         let mut properties = vec![Property::always(
             "replica GC never deletes an object the source head references",
@@ -500,5 +687,60 @@ impl Model for Protocol {
             }),
         ]);
         properties
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::{Protocol, replica_head_lines, set_label};
+    use stateright::Model;
+
+    /// A query holds its start tick and the set of objects it reads, not a
+    /// head version; the reader box names the set.
+    #[test]
+    fn query_names_its_object_set() {
+        let model = Protocol::new("replicas-readers");
+        let path =
+            crate::explorer::path_to(&model, |s| s.query.is_some()).expect("a started query");
+        let (start, set) = path.last_state().query.expect("query");
+        let svg = model.as_svg(path).expect("replicas draws");
+        let line = format!("query started {start} reads objects {}", set_label(set, 1));
+        assert!(svg.contains(&line), "{line} missing");
+        assert!(!svg.contains("query on v"), "{svg}");
+    }
+
+    /// Wrong rows from a missing object read as empty turn the reader box red
+    /// and say so, like the query outcome elsewhere.
+    #[test]
+    fn wrong_rows_turn_the_reader_red() {
+        let state = super::State {
+            query: Some((0, 1)),
+            result: Some(true),
+            bad_rows: true,
+            ..super::State::default()
+        };
+        let (_, lines, tone) = super::reader_box(&state, 1);
+        assert_eq!(tone, crate::explorer::Tone::Bad);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("query started 0 reads objects {0}: WRONG ROWS (a missing object read as empty)")
+        );
+    }
+
+    /// A replicated head naming objects not yet copied is normal; the box says
+    /// which ones rather than flagging a violation.
+    #[test]
+    fn uncopied_objects_are_listed() {
+        assert_eq!(
+            replica_head_lines(0b11, 0b01, 2),
+            vec![
+                "references {0, 1}".to_string(),
+                "not yet copied {1}".to_string()
+            ]
+        );
+        assert_eq!(
+            replica_head_lines(0b01, 0b01, 2),
+            vec!["references {0}".to_string()]
+        );
     }
 }
