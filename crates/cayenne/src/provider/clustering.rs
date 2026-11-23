@@ -426,6 +426,10 @@ fn hilbert_transpose(coords: &mut [Vec<u64>]) {
     let Some((head, tail)) = coords.split_first_mut() else {
         return;
     };
+    // In one dimension the transform is the identity, so skip the passes.
+    if tail.is_empty() {
+        return;
+    }
     let mut last = vec![0; TRANSPOSE_BLOCK_ROWS];
     for start in (0..head.len()).step_by(TRANSPOSE_BLOCK_ROWS) {
         let end = (start + TRANSPOSE_BLOCK_ROWS).min(head.len());
