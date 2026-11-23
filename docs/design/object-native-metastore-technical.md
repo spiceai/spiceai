@@ -1359,8 +1359,8 @@ the writer's process.
   a carried file is never removed, so it is never retired. At three uploads the
   model found that a snapshot-level rule keeping only the files live snapshots
   reference is not enough once files are shared: a later sweep could delete a
-  file a pinned scan still reads ([Data-files model](#data-files-model)). The
-  model is to be rewritten for per-file retirement, keeping that control.
+  file a running scan still reads ([Data-files model](#data-files-model)), so
+  the model checks per-file retirement with that control.
 
 **The retirement sweep.**
 
@@ -1386,7 +1386,7 @@ the writer's process.
   snapshot's files are not under one prefix anyway.
 - Every data-file and deletion-vector delete goes through one check: no live
   entry and no unresolved `Prepare` names the key. The file's own retired
-  entry does not block it; the retention, pins and holds above do. Only dropping a dataset and
+  entry does not block it; the retention and the holds above do. Only dropping a dataset and
   `mode: file_create` delete a folder, the dataset's own, after T.
 - A compaction's carried files never enter the writer's record of uncommitted
   files. They are committed already, and the record protects only uploads not
@@ -2257,7 +2257,7 @@ the model README maps each to its runs.
 | I12 | The state at every commit equals running the accepted writes one at a time in commit order, read-dependent writes included, and each key has at most one live row. |
 | I13 | Every data file the committed state names exists in the store; a commit names only files whose upload has returned. |
 | I14 | A reader sees only data files committed at its head version, and an upload whose commit was aborted or abandoned never becomes visible. An unknown outcome resolves all-or-nothing: either every file of the attempt is committed or none is. |
-| I15 | A data file or deletion vector is deleted only after the record that removed it from the live set, and no earlier than T after the sweep observed that removal; never while a scan pins a commit that includes it or a restore point copies it; and a forgotten file leaves nothing behind. |
+| I15 | A data file or deletion vector is deleted only after the record that removed it from the live set, and no earlier than T after the sweep observed that removal; never while a restore point or snapshot export holds the table's deletions; and a forgotten file leaves nothing behind. |
 | I16 | A row the mem-tier's seal made durable is in exactly one durable place at every commit: the commit that registers a checkpoint's snapshot also clears the seal's shadow of the same rows, so no crash leaves a row both in the shadow and in the snapshot ([The in-memory tier's seal and checkpoint](#the-in-memory-tiers-seal-and-checkpoint)). |
 
 ### Data-files model
