@@ -2458,21 +2458,28 @@ async fn scans_under_store_latency_are_stable_with_runtime_change_stream_default
 /// else delayed, a durable change stream keeps a head write in flight almost all
 /// the time and leaves its upserts' snapshots uncompacted, while readers read
 /// every row, aggregate a scan, and count from statistics. No read fails or sees
-/// a torn state, and each kind of read keeps its P99 below one head write.
+/// a torn state. Then, with one head write held, every kind of read answers the
+/// rows from before it while it stays held: how long a read takes depends on the
+/// runner, whether it waits for the head write does not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn scans_do_not_wait_for_a_slow_head_write() {
     const HEAD_WRITE: Duration = Duration::from_millis(200);
     let name = "slow_head_cdc";
+    let mut faults = None;
     let fixture = crate::common::TestFixture::object_native_wrapped(|store| {
-        Arc::new(LatencyStore::new(
+        let delayed: Arc<dyn ObjectStore> = Arc::new(LatencyStore::new(
             store,
             LatencyProfile::default()
                 .with(Op::Cas, Delay::new(HEAD_WRITE, Duration::from_millis(250))),
             0x16132,
-        ))
+        ));
+        let store = Arc::new(FaultStore::new(delayed));
+        faults = Some(Arc::clone(&store));
+        store as Arc<dyn ObjectStore>
     })
     .await
     .expect("object-native fixture");
+    let faults = faults.expect("the fixture wraps its store");
     let ctx = SessionContext::new();
     let store = fixture
         .data_store
@@ -2505,15 +2512,47 @@ async fn scans_do_not_wait_for_a_slow_head_write() {
         "the fastest apply took {fastest_apply:?}, so head writes were not delayed"
     );
     for path in ReadPath::ALL {
-        let reads = timings.reads_of(path);
-        assert!(!reads.is_empty(), "no {path:?} read completed");
-        let p99 = crate::common::percentile(&reads, 99.0);
         assert!(
-            p99 < HEAD_WRITE,
-            "{path:?} read P99 {p99:?} over {} reads is not below one head write ({HEAD_WRITE:?})",
-            reads.len()
+            !timings.reads_of(path).is_empty(),
+            "no {path:?} read completed"
         );
     }
+
+    let before = i64::try_from(sorted_rows(&ctx, name).await.len()).expect("row count");
+    faults.arm(Op::Cas, is_head, Fault::Hold);
+    let rows: Vec<(i64, i64)> = (before + 1..=before + 50).map(|id| (id, id * 10)).collect();
+    let apply = tokio::spawn({
+        let table = Arc::clone(&table);
+        async move { cdc_upsert(&table, &rows).await }
+    });
+    let held = tokio::time::timeout(Duration::from_secs(30), faults.wait_held(None))
+        .await
+        .expect("the apply reaches its head write");
+    for path in ReadPath::ALL {
+        let sql = path.sql(name);
+        let answer = tokio::time::timeout(Duration::from_secs(30), async {
+            ctx.sql(&sql).await?.collect().await
+        })
+        .await;
+        let Ok(batches) = answer else {
+            panic!("a {path:?} read waited for the held head write");
+        };
+        assert_eq!(
+            path.prefix_count(&batches.expect("the read")),
+            Ok(before),
+            "a {path:?} read during the held head write answers the rows from before it"
+        );
+    }
+    assert!(!apply.is_finished(), "the apply waits for its head write");
+
+    faults.clear_rules();
+    faults.deliver(held).await.expect("deliver the head write");
+    faults.respond(held).expect("return its response");
+    tokio::time::timeout(Duration::from_secs(30), apply)
+        .await
+        .expect("the apply returns")
+        .expect("the apply task");
+    assert_eq!(sorted_rows(&ctx, name).await, prefix_rows(before + 50));
 }
 
 /// An object-native fixture in the store `CAYENNE_TEST_DATA_STORE` names, with
