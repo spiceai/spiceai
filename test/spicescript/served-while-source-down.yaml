@@ -49,6 +49,9 @@ spicepod:
 
 defaults:
   expect: { oracle: src }
+  # Logs when a change stream records its acceleration as loaded, which a
+  # restart without the source needs.
+  spiced-args: [-v]
 
 steps:
   - source-exec:
@@ -60,6 +63,8 @@ steps:
     id: loaded
   - query: SELECT * FROM items_cdc
     oracle-sql: SELECT * FROM items
+    eventually: 30s
+  - assert-log: { count: { "Dataset 'items_cdc' recorded its acceleration as loaded": '>=1' } }
     eventually: 30s
 
   # Restart with the source down.
@@ -119,6 +124,8 @@ steps:
   - assert-status: { dataset: items, status: Ready, ready: true }
     eventually: 30s
   - assert-status: { dataset: items_cdc, status: Ready, ready: true }
+    eventually: 30s
+  - assert-log: { count: { "Dataset 'items_cdc' recorded its acceleration as loaded": '>=2' } }
     eventually: 30s
 
   # A source that accepts the connection but never answers (frozen): the

@@ -298,7 +298,8 @@ impl DataConnector for ReconnectingConnector {
         // still describes it.
         let stream = futures::stream::once(async move {
             federated_table.table_provider().await;
-            let stream = match inner.get().map(Arc::clone) {
+            let reached = inner.get().map(Arc::clone);
+            let stream = match &reached {
                 Some(inner) => {
                     inner
                         .changes_stream(
@@ -309,13 +310,17 @@ impl DataConnector for ReconnectingConnector {
                         )
                         .await
                 }
-                // The table stopped waiting for its source without reaching it.
                 None => None,
             };
             stream.unwrap_or_else(|| {
                 if !resuming.runtime().status().is_shutdown() {
+                    let cause = if reached.is_some() {
+                        "its connector did not start a change stream"
+                    } else {
+                        "the connection to its source was abandoned"
+                    };
                     tracing::warn!(
-                        "Dataset '{}' did not start its change stream after reaching its source, so it is served from its acceleration without applying new changes. Restart the runtime to retry.",
+                        "Dataset '{}' did not start its change stream because {cause}, so it is served from its acceleration without applying new changes. Restart the runtime to retry. See: https://spiceai.org/docs/features/data-acceleration/data-refresh",
                         dataset.name
                     );
                 }

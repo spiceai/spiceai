@@ -32,6 +32,9 @@ spicepod:
 
 defaults:
   expect: { oracle: my }
+  # Logs when a change stream records its acceleration as loaded, which a
+  # restart without the source needs.
+  spiced-args: [-v]
 
 steps:
   - source-exec:
@@ -49,6 +52,8 @@ steps:
     oracle-sql: SELECT * FROM idle
     eventually: 60s
     id: idle-loaded
+  - assert-log: { count: { "Dataset 'busy' recorded its acceleration as loaded": '>=1', "Dataset 'idle' recorded its acceleration as loaded": '>=1' } }
+    eventually: 30s
 
   # Restart with MySQL stopped: served from the acceleration.
   - kill-spiced: {}
@@ -79,6 +84,8 @@ steps:
     eventually: 90s
     id: idle-caught-up
   - assert-log: { lacks: 'rebuilt the acceleration from the source' }
+  - assert-log: { count: { "Dataset 'busy' recorded its acceleration as loaded": '>=2', "Dataset 'idle' recorded its acceleration as loaded": '>=2' } }
+    eventually: 30s
 
   # Restart with MySQL frozen: served from the acceleration. A graceful stop
   # makes the applied changes durable, so the restart serves them.

@@ -1503,44 +1503,34 @@ impl Refresher {
                 // an acceleration interrupted before then has none and waits for its
                 // source. The changes applied so far are flushed first, so the
                 // checkpoint never claims more than storage holds.
-                if self.checkpoint_when_changes_ready
-                    && let (Some(checkpointer), Some(completion)) =
-                        (checkpointer, self.refresh_completion.clone())
-                {
-                    let ready = completion.any();
-                    let checkpoint_schema =
-                        super::checkpoint_primary_key::with_changes_loaded(&checkpoint_schema);
-                    let accelerator_write_mutex = Arc::clone(&self.accelerator_write_mutex);
-                    let dataset_name = dataset_name.clone();
-                    let last_updated_at = Arc::clone(&self.last_updated_at);
-                    let change_sink = self.change_sink.clone();
-                    self.ready_checkpoint_task = Some(tokio::spawn(async move {
-                        if !ready.wait().await.is_answered()
-                            || completion.closed_without_a_refresh()
-                        {
-                            return;
-                        }
-                        if let Some(sink) = &change_sink
-                            && let Err(error) = sink.flush().await
-                        {
-                            tracing::debug!(dataset = %dataset_name, %error, "Did not record the dataset checkpoint: flushing its changes failed");
-                            return;
-                        }
-                        create_checkpoint_and_snapshot(
-                            &checkpointer,
-                            None,
-                            &checkpoint_schema,
-                            &accelerator_write_mutex,
-                            &dataset_name,
-                            &last_updated_at,
-                            ForceCreate(false),
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
-                    }));
-                }
+                //
+                // A dataset that is not served that way (`partition_by`, snapshots, and
+                // the rest) may still carry the mark from a run that was, over an
+                // acceleration it has since changed, so the mark is cleared.
+                self.ready_checkpoint_task = match checkpointer {
+                    Some(checkpointer) if self.checkpoint_when_changes_ready => {
+                        self.refresh_completion.clone().map(|completion| {
+                            tokio::spawn(record_changes_loaded(
+                                checkpointer,
+                                completion,
+                                self.change_sink.clone(),
+                                Arc::clone(&checkpoint_schema),
+                                Arc::clone(&self.accelerator_write_mutex),
+                                dataset_name.clone(),
+                                Arc::clone(&self.last_updated_at),
+                                Arc::clone(&self.runtime_status),
+                            ))
+                        })
+                    }
+                    Some(checkpointer) => Some(tokio::spawn(clear_changes_loaded(
+                        checkpointer,
+                        Arc::clone(&checkpoint_schema),
+                        Arc::clone(&self.accelerator_write_mutex),
+                        dataset_name.clone(),
+                        Arc::clone(&self.last_updated_at),
+                    ))),
+                    None => None,
+                };
 
                 return Ok(Some(self.start_changes_stream(
                     stream,
@@ -2003,6 +1993,96 @@ impl Refresher {
         } else {
             tokio::spawn(changes_task)
         }
+    }
+}
+
+/// Whether `checkpointer` holds a checkpoint marked as written by a change stream
+/// that had loaded the acceleration.
+async fn records_changes_loaded(checkpointer: &Arc<dyn DatasetCheckpointer>) -> bool {
+    checkpointer
+        .get_schema()
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|schema| super::checkpoint_primary_key::records_changes_loaded(&schema))
+}
+
+/// Records the dataset checkpoint, marked as loaded by its change stream, once the
+/// stream first reports the dataset ready and its changes are flushed.
+#[expect(clippy::too_many_arguments)]
+fn record_changes_loaded(
+    checkpointer: Arc<dyn DatasetCheckpointer>,
+    completion: RefreshCompletion,
+    change_sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+    checkpoint_schema: Arc<Schema>,
+    accelerator_write_mutex: Arc<Mutex<()>>,
+    dataset_name: TableReference,
+    last_updated_at: Arc<AtomicI64>,
+    runtime_status: Arc<status::RuntimeStatus>,
+) -> impl Future<Output = ()> + Send + 'static {
+    let ready = completion.any();
+    async move {
+        if !ready.wait().await.is_answered() || completion.closed_without_a_refresh() {
+            return;
+        }
+        if let Some(sink) = &change_sink
+            && let Err(error) = sink.flush().await
+        {
+            if !runtime_status.is_shutdown() {
+                tracing::warn!(
+                    "Dataset '{dataset_name}' could not flush its changes, so its acceleration is not recorded as loaded and the next start waits for its source before serving it. Cause: {error}. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+                );
+            }
+            return;
+        }
+        let checkpoint_schema =
+            super::checkpoint_primary_key::with_changes_loaded(&checkpoint_schema);
+        create_checkpoint_and_snapshot(
+            &checkpointer,
+            None,
+            &checkpoint_schema,
+            &accelerator_write_mutex,
+            &dataset_name,
+            &last_updated_at,
+            ForceCreate(false),
+            None,
+            None,
+            None,
+        )
+        .await;
+        if records_changes_loaded(&checkpointer).await {
+            tracing::info!(
+                "Dataset '{dataset_name}' recorded its acceleration as loaded, so a later start serves it while its source is unavailable."
+            );
+        }
+    }
+}
+
+/// Rewrites a checkpoint marked as loaded by a change stream without the mark.
+fn clear_changes_loaded(
+    checkpointer: Arc<dyn DatasetCheckpointer>,
+    checkpoint_schema: Arc<Schema>,
+    accelerator_write_mutex: Arc<Mutex<()>>,
+    dataset_name: TableReference,
+    last_updated_at: Arc<AtomicI64>,
+) -> impl Future<Output = ()> + Send + 'static {
+    async move {
+        if !records_changes_loaded(&checkpointer).await {
+            return;
+        }
+        create_checkpoint_and_snapshot(
+            &checkpointer,
+            None,
+            &checkpoint_schema,
+            &accelerator_write_mutex,
+            &dataset_name,
+            &last_updated_at,
+            ForceCreate(false),
+            None,
+            None,
+            None,
+        )
+        .await;
     }
 }
 

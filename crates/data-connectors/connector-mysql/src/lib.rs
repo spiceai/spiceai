@@ -608,7 +608,7 @@ impl DataConnector for MySQL {
         context: &dyn ConnectorContext,
         federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
         dataset: &DatasetSpec,
-        _acceleration: data_components::cdc::AccelerationContents,
+        acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
         let position_store = replication::resolve_position_store(context, dataset).await;
         Some(replication::build_changes_stream(
@@ -617,6 +617,7 @@ impl DataConnector for MySQL {
             position_store,
             federated_table,
             Arc::clone(&self.replication_metrics),
+            acceleration,
         ))
     }
 
