@@ -86,7 +86,7 @@ impl EnsureSupportedFileScan {
         {
             let store: &url::Url = file_scan_config.object_store_url.as_ref();
             return plan_err!(
-                "Distributed queries cannot read the file '{}://{}/{}': a per-file row filter, such as a Delta Lake deletion vector, removes some of its rows, and executors cannot apply it. Run the query through /v1/sql instead of the async queries API.",
+                "Distributed queries cannot read the file '{}://{}/{}': a per-file row filter, such as a Delta Lake deletion vector, removes some of its rows, and executors cannot apply it. Use the synchronous query API (/v1/sql or Flight SQL) instead.",
                 store.scheme(),
                 store.host_str().unwrap_or_default(),
                 file.object_meta.location
