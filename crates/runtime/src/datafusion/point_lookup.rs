@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Planning for primary-key point lookups.
+//! Planning for point lookups.
 //!
-//! `SELECT <columns> FROM t WHERE pk = <value>`, with an equality on every primary-key column,
-//! plans to a single filtered scan. The session runs about a hundred analyzer, logical and
+//! `SELECT <columns or constants> FROM t WHERE col = <value> [LIMIT n]` plans to a single filtered
+//! scan, under a limit when it has one. The session runs about a hundred analyzer, logical and
 //! physical rule invocations on every query, and on this shape only a handful can change the plan
 //! (`type_coercion`, `simplify_expressions`, `push_down_filter`, `optimize_projections`,
 //! `FilterPushdown`, `BytesProcessedPhysicalOptimizer`). The rest rewrite joins, aggregates,
@@ -48,16 +48,18 @@ use datafusion::logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator, Projecti
 use datafusion::optimizer::{AnalyzerRule, ApplyOrder, Optimizer, OptimizerConfig, OptimizerRule};
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::physical_optimizer::{PhysicalOptimizerContext, PhysicalOptimizerRule};
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::{Distribution, ExecutionPlan};
 
 /// Rules that cannot change the plan of a query [`is_point_lookup`] accepts: a projection of
-/// plain columns over a filter of column-against-constant comparisons over one table scan, with
-/// no join, aggregate, subquery, window, sort, union, distinct or limit anywhere.
+/// plain columns or constants over a filter of column-against-constant comparisons over one table
+/// scan, under at most one `LIMIT` with no offset, and with no join, aggregate, subquery, window,
+/// sort, union or distinct anywhere.
 ///
-/// `EnsureRequirements` is here because the shape has no distribution or ordering requirement;
-/// that holds only while `LIMIT` stays excluded (a global limit needs a single input partition,
-/// which `EnsureRequirements` would provide). An operator a table scan returns must therefore meet
-/// its own input requirements, such as coalescing a multi-partition input. Rules that act on a scan
+/// `EnsureRequirements` is here because without a limit the shape has no distribution or ordering
+/// requirement. A limit needs a single input partition, so under one it is skipped only when the
+/// plan already meets every requirement (see [`requirements_met`]); a limit over a
+/// multi-partition scan still gets the coalescing it needs. An operator a table scan returns must
+/// meet its own input requirements, such as coalescing a multi-partition input. Rules that act on a scan
 /// of a particular connector (`HttpParamsPushdown`) and `propagate_empty_relation` (which shapes
 /// the plan of a contradictory predicate) are not here: they cost well under a microsecond and are
 /// not worth reasoning about per connector.
@@ -109,12 +111,18 @@ pub(crate) const SKIPPABLE_RULES: &[&str] = &[
     "CayenneAntiJoinSortMergeRewriter",
 ];
 
-tokio::task_local! {
-    static PLANNING_POINT_LOOKUP: ();
+/// A plan [`is_point_lookup`] accepts, and whether a `LIMIT` sits above it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PointLookup {
+    limited: bool,
 }
 
-fn planning_point_lookup() -> bool {
-    PLANNING_POINT_LOOKUP.try_with(|()| ()).is_ok()
+tokio::task_local! {
+    static PLANNING_POINT_LOOKUP: PointLookup;
+}
+
+fn planning_point_lookup() -> Option<PointLookup> {
+    PLANNING_POINT_LOOKUP.try_with(|lookup| *lookup).ok()
 }
 
 fn is_skippable(name: &str) -> bool {
@@ -135,13 +143,13 @@ fn is_skippable(name: &str) -> bool {
 pub(crate) async fn create_physical_plan(
     session: &mut SessionState,
     plan: &LogicalPlan,
-    point_lookup: bool,
+    point_lookup: Option<PointLookup>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    if !point_lookup {
+    let Some(lookup) = point_lookup else {
         return session.create_physical_plan(plan).await;
-    }
+    };
     PLANNING_POINT_LOOKUP
-        .scope((), async {
+        .scope(lookup, async {
             let max_passes = session.config().options().optimizer.max_passes;
             session.config_mut().options_mut().optimizer.max_passes = 1;
             let optimized = session.optimize(plan);
@@ -179,17 +187,37 @@ fn has_constant_predicate(plan: &LogicalPlan) -> bool {
     .unwrap_or(true)
 }
 
-/// Whether `plan` (unoptimized) is a primary-key point lookup: plain columns projected from a
-/// single table scan through filters made only of column-against-constant comparisons, one of
-/// which is an equality on each primary-key column of the scanned table.
-pub(crate) fn is_point_lookup(plan: &LogicalPlan) -> bool {
+/// Whether `plan` (unoptimized) is a point lookup: plain columns or constants projected from a
+/// single table scan through filters made only of column-against-constant comparisons, at least
+/// one of them an equality, optionally under one `LIMIT` with no offset. On a table with a
+/// primary key, every key column must be pinned by an equality.
+///
+/// Which rules can change the plan depends only on this shape, not on whether the equality is on
+/// a key: an equality on any column plans to the same filtered scan, and pays for the same rules.
+pub(crate) fn is_point_lookup(plan: &LogicalPlan) -> Option<PointLookup> {
     let mut node = plan;
+    let mut limited = false;
+    if let LogicalPlan::Limit(limit) = node {
+        let no_offset = limit
+            .skip
+            .as_deref()
+            .is_none_or(|skip| matches!(skip, Expr::Literal(ScalarValue::Int64(Some(0)), _)));
+        let literal_fetch = limit
+            .fetch
+            .as_deref()
+            .is_some_and(|fetch| matches!(fetch, Expr::Literal(ScalarValue::Int64(Some(_)), _)));
+        if !no_offset || !literal_fetch {
+            return None;
+        }
+        limited = true;
+        node = limit.input.as_ref();
+    }
     let mut predicates: Vec<&Expr> = Vec::new();
     loop {
         match node {
             LogicalPlan::Projection(projection) => {
-                if !projection.expr.iter().all(is_plain_column) {
-                    return false;
+                if !projection.expr.iter().all(is_plain_column_or_constant) {
+                    return None;
                 }
                 node = projection.input.as_ref();
             }
@@ -198,25 +226,16 @@ pub(crate) fn is_point_lookup(plan: &LogicalPlan) -> bool {
                 predicates.push(&filter.predicate);
                 node = filter.input.as_ref();
             }
-            LogicalPlan::TableScan(scan) => return scan_is_keyed_by(scan, &predicates),
-            _ => return false,
+            LogicalPlan::TableScan(scan) => {
+                return scan_is_keyed_by(scan, &predicates).then_some(PointLookup { limited });
+            }
+            _ => return None,
         }
     }
 }
 
 fn scan_is_keyed_by(scan: &TableScan, predicates: &[&Expr]) -> bool {
     if !scan.filters.is_empty() || scan.fetch.is_some() {
-        return false;
-    }
-    let Some(primary_key) = scan.source.constraints().and_then(|constraints| {
-        constraints.iter().find_map(|constraint| match constraint {
-            Constraint::PrimaryKey(indices) => Some(indices),
-            Constraint::Unique(_) => None,
-        })
-    }) else {
-        return false;
-    };
-    if primary_key.is_empty() {
         return false;
     }
     let conjuncts: Vec<&Expr> = predicates
@@ -230,14 +249,27 @@ fn scan_is_keyed_by(scan: &TableScan, predicates: &[&Expr]) -> bool {
         return false;
     }
     let schema = scan.source.schema();
-    primary_key.iter().all(|&index| {
-        index < schema.fields().len() && {
-            let name = schema.field(index).name();
+    let primary_key = scan.source.constraints().and_then(|constraints| {
+        constraints.iter().find_map(|constraint| match constraint {
+            Constraint::PrimaryKey(indices) if !indices.is_empty() => Some(indices),
+            _ => None,
+        })
+    });
+    match primary_key {
+        Some(primary_key) => primary_key.iter().all(|&index| {
+            index < schema.fields().len() && {
+                let name = schema.field(index).name();
+                conjuncts
+                    .iter()
+                    .any(|conjunct| is_equality_on(conjunct, name))
+            }
+        }),
+        None => schema.fields().iter().any(|field| {
             conjuncts
                 .iter()
-                .any(|conjunct| is_equality_on(conjunct, name))
-        }
-    })
+                .any(|conjunct| is_equality_on(conjunct, field.name()))
+        }),
+    }
 }
 
 /// The most primary keys a query may name and still count as a [bounded key
@@ -428,12 +460,33 @@ fn values_pinned(expr: &Expr, column: &str) -> Option<usize> {
     }
 }
 
-fn is_plain_column(expr: &Expr) -> bool {
+fn is_plain_column_or_constant(expr: &Expr) -> bool {
     match expr {
-        Expr::Column(_) => true,
-        Expr::Alias(alias) => matches!(alias.expr.as_ref(), Expr::Column(_)),
+        Expr::Column(_) | Expr::Literal(..) => true,
+        Expr::Alias(alias) => matches!(alias.expr.as_ref(), Expr::Column(_) | Expr::Literal(..)),
         _ => false,
     }
+}
+
+/// Whether `plan` already meets every input requirement its operators state: no operator needs a
+/// single partition from a child that has several, or a particular partitioning or ordering at
+/// all. `EnsureRequirements` changes nothing in such a plan.
+fn requirements_met(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let children = plan.children();
+    let distributions_met =
+        children
+            .iter()
+            .zip(plan.required_input_distribution())
+            .all(|(child, distribution)| match distribution {
+                Distribution::UnspecifiedDistribution => true,
+                Distribution::SinglePartition => {
+                    child.properties().output_partitioning().partition_count() == 1
+                }
+                _ => false,
+            });
+    distributions_met
+        && plan.required_input_ordering().iter().all(Option::is_none)
+        && children.into_iter().all(requirements_met)
 }
 
 fn is_constant(expr: &Expr) -> bool {
@@ -565,7 +618,7 @@ impl Debug for SkippableAnalyzerRule {
 
 impl AnalyzerRule for SkippableAnalyzerRule {
     fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
-        if planning_point_lookup() {
+        if planning_point_lookup().is_some() {
             return Ok(plan);
         }
         self.0.analyze(plan, config)
@@ -592,7 +645,7 @@ impl OptimizerRule for SkippableOptimizerRule {
     fn apply_order(&self) -> Option<ApplyOrder> {
         // A skipped rule is handed the whole plan once and returns it, rather than being driven
         // over every node by the optimizer.
-        if planning_point_lookup() {
+        if planning_point_lookup().is_some() {
             None
         } else {
             self.0.apply_order()
@@ -612,7 +665,7 @@ impl OptimizerRule for SkippableOptimizerRule {
         plan: LogicalPlan,
         config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        if planning_point_lookup() {
+        if planning_point_lookup().is_some() {
             return Ok(Transformed::no(plan));
         }
         self.0.rewrite(plan, config)
@@ -620,6 +673,19 @@ impl OptimizerRule for SkippableOptimizerRule {
 }
 
 struct SkippablePhysicalRule(Arc<dyn PhysicalOptimizerRule + Send + Sync>);
+
+impl SkippablePhysicalRule {
+    /// Whether to hand `plan` back untouched: while planning a point lookup, except
+    /// `EnsureRequirements` under a limit when the plan does not yet meet its requirements.
+    fn skips(&self, plan: &Arc<dyn ExecutionPlan>) -> bool {
+        match planning_point_lookup() {
+            None => false,
+            Some(PointLookup { limited }) => {
+                !(limited && self.0.name() == "EnsureRequirements" && !requirements_met(plan))
+            }
+        }
+    }
+}
 
 impl Debug for SkippablePhysicalRule {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -633,7 +699,7 @@ impl PhysicalOptimizerRule for SkippablePhysicalRule {
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if planning_point_lookup() {
+        if self.skips(&plan) {
             return Ok(plan);
         }
         self.0.optimize(plan, config)
@@ -644,7 +710,7 @@ impl PhysicalOptimizerRule for SkippablePhysicalRule {
         plan: Arc<dyn ExecutionPlan>,
         context: &dyn PhysicalOptimizerContext,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if planning_point_lookup() {
+        if self.skips(&plan) {
             return Ok(plan);
         }
         self.0.optimize_with_context(plan, context)
@@ -703,7 +769,16 @@ mod tests {
             .with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
                 vec![1, 0],
             )]));
-        let unkeyed = MemTable::try_new(schema, vec![vec![batch]]).expect("table");
+        let unkeyed =
+            MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]]).expect("table");
+        // Four partitions of 16 rows: a limit above this scan needs its partitions coalesced.
+        let split = MemTable::try_new(
+            schema,
+            (0..4)
+                .map(|part| vec![batch.slice(part * 16, 16)])
+                .collect(),
+        )
+        .expect("table");
 
         let mut builder = SessionStateBuilder::new().with_default_features();
         wrap_skippable_rules(&mut builder);
@@ -713,6 +788,8 @@ mod tests {
         ctx.register_table("composite", Arc::new(composite))
             .expect("register");
         ctx.register_table("unkeyed", Arc::new(unkeyed))
+            .expect("register");
+        ctx.register_table("split", Arc::new(split))
             .expect("register");
         ctx
     }
@@ -731,8 +808,19 @@ mod tests {
             "SELECT * FROM keyed WHERE id = '5'",
             "SELECT * FROM composite WHERE region = 1 AND id = 5",
             "SELECT * FROM keyed WHERE id = 5 AND name IS NOT NULL",
+            // Constants in the projection, and a limit with no offset.
+            "SELECT 1 AS present FROM keyed WHERE id = 5 LIMIT 1",
+            "SELECT * FROM keyed WHERE id = 5 LIMIT 1",
+            "SELECT 1 FROM keyed WHERE id = 5",
+            // A table without a primary key is looked up by an equality on any column.
+            "SELECT * FROM unkeyed WHERE id = 5",
+            "SELECT 1 AS present FROM unkeyed WHERE name = 'n5' LIMIT 1",
+            "SELECT 1 AS present FROM split WHERE name = 'n5' LIMIT 1",
         ] {
-            assert!(is_point_lookup(&unoptimized(&ctx, sql).await), "{sql}");
+            assert!(
+                is_point_lookup(&unoptimized(&ctx, sql).await).is_some(),
+                "{sql}"
+            );
         }
     }
 
@@ -740,10 +828,14 @@ mod tests {
     async fn rejects_everything_else() {
         let ctx = context();
         for sql in [
-            "SELECT * FROM unkeyed WHERE id = 5",
+            // A table with a primary key needs every key column pinned.
             "SELECT * FROM keyed WHERE region = 1",
             "SELECT * FROM composite WHERE id = 5",
-            "SELECT * FROM keyed WHERE id = 5 LIMIT 1",
+            // A filter with no equality, an offset, or a limit below the projection.
+            "SELECT * FROM unkeyed WHERE id > 5",
+            "SELECT * FROM keyed WHERE id = 5 LIMIT 1 OFFSET 1",
+            "SELECT * FROM (SELECT * FROM keyed WHERE id = 5 LIMIT 1) q",
+            "SELECT id + 1 FROM keyed WHERE id = 5",
             "SELECT * FROM keyed WHERE id = 5 ORDER BY name",
             "SELECT count(*) FROM keyed WHERE id = 5",
             "SELECT upper(name) FROM keyed WHERE id = 5",
@@ -755,7 +847,10 @@ mod tests {
             "SELECT DISTINCT id FROM keyed WHERE id = 5",
             "SELECT * FROM keyed",
         ] {
-            assert!(!is_point_lookup(&unoptimized(&ctx, sql).await), "{sql}");
+            assert!(
+                is_point_lookup(&unoptimized(&ctx, sql).await).is_none(),
+                "{sql}"
+            );
         }
     }
 
@@ -843,15 +938,26 @@ mod tests {
             "SELECT * FROM keyed WHERE id = 5 AND id IS NULL",
             "SELECT * FROM keyed WHERE id = 5 AND name = 'n5'",
             "SELECT * FROM keyed WHERE id = 5 AND name IS NOT NULL",
+            "SELECT 1 AS present FROM keyed WHERE id = 5 LIMIT 1",
+            "SELECT * FROM keyed WHERE id = 5 LIMIT 1",
+            "SELECT 1 AS present FROM keyed WHERE id = 6 AND id = 5 LIMIT 1",
+            "SELECT * FROM unkeyed WHERE id = 5",
+            "SELECT 1 AS present FROM unkeyed WHERE name = 'n5' LIMIT 1",
+            "SELECT 1 AS present FROM unkeyed WHERE name = 'absent' LIMIT 1",
+            // Several partitions under a limit: `EnsureRequirements` must still coalesce them.
+            "SELECT 1 AS present FROM split WHERE name = 'n5' LIMIT 1",
+            "SELECT * FROM split WHERE region = 1 LIMIT 3",
+            "SELECT * FROM split WHERE region = 1",
         ] {
             let plan = unoptimized(&ctx, sql).await;
-            assert!(is_point_lookup(&plan), "{sql}");
+            let lookup = is_point_lookup(&plan);
+            assert!(lookup.is_some(), "{sql}");
             let full = ctx
                 .state()
                 .create_physical_plan(&plan)
                 .await
                 .expect("full plan");
-            let lean = create_physical_plan(&mut ctx.state(), &plan, true)
+            let lean = create_physical_plan(&mut ctx.state(), &plan, lookup)
                 .await
                 .expect("lean plan");
             assert_eq!(
@@ -875,7 +981,7 @@ mod tests {
         // `EnsureRequirements` must still shape a query that needs it.
         let sql = "SELECT region, count(*) FROM keyed GROUP BY region ORDER BY region";
         let plan = unoptimized(&ctx, sql).await;
-        assert!(!is_point_lookup(&plan));
+        assert!(is_point_lookup(&plan).is_none());
         let physical = ctx
             .state()
             .create_physical_plan(&plan)
