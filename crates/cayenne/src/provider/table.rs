@@ -7313,10 +7313,16 @@ impl CayenneTableProvider {
     /// committed or been abandoned, so the write acts on the appended rows like
     /// on every other committed row: a key delete (see
     /// [`Self::key_tombstones_wait_for_staged_appends`]) or an overwrite, which
-    /// replaces them. The wait holds [`Self::append_admission`] so no append
-    /// stages meanwhile, and not `write_lock`, which an append into the current
-    /// snapshot takes to commit.
-    /// `write` names the waiting write in the timeout error.
+    /// replaces them. `write` names the waiting write in the timeout error.
+    ///
+    /// The wait holds [`Self::append_admission`], so no new append stages
+    /// meanwhile, and not `write_lock`, which an append into the current
+    /// snapshot takes to commit. A same-record scope that already holds
+    /// unpublished changes to this table writes past it: the wait is for that
+    /// scope's record, which commits only after the scope's last write. Such a
+    /// write can stage while the wait holds admission, so the lock is taken
+    /// only once nothing is in flight under it, which no append can change
+    /// while it is held.
     ///
     /// # Errors
     ///
@@ -7326,20 +7332,30 @@ impl CayenneTableProvider {
         &self,
         write: &str,
     ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
-        let _admission = self.append_admission.write().await;
-        if !self
-            .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
-            .await
-        {
-            return Err(Error::Internal {
-                table: self.table_metadata.table_name.clone(),
-                message: format!(
-                    "A change-stream write did not commit within {} s, so {write} was not applied; retry it",
-                    STAGED_WRITE_DRAIN_TIMEOUT.as_secs()
-                ),
-            });
+        let _admission = if self.scope_has_unpublished_changes() {
+            None
+        } else {
+            Some(self.append_admission.write().await)
+        };
+        let deadline = Instant::now() + STAGED_WRITE_DRAIN_TIMEOUT;
+        loop {
+            if !self
+                .drain_inflight_staged_writes(deadline.saturating_duration_since(Instant::now()))
+                .await
+            {
+                return Err(Error::Internal {
+                    table: self.table_metadata.table_name.clone(),
+                    message: format!(
+                        "A change-stream write did not commit within {} s, so {write} was not applied; retry it",
+                        STAGED_WRITE_DRAIN_TIMEOUT.as_secs()
+                    ),
+                });
+            }
+            let write_guard = self.write_lock_arc().lock_owned().await;
+            if !self.staged_writes_inflight_by_others() {
+                return Ok(write_guard);
+            }
         }
-        Ok(self.write_lock_arc().lock_owned().await)
     }
 
     /// Wait for in-flight pipelined Stage-B publishes (staged WALs, staged
@@ -7358,15 +7374,19 @@ impl CayenneTableProvider {
     /// lock + listing fence and therefore completes under the held lock.
     pub(crate) async fn drain_inflight_staged_writes(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
-        while self.staging_appends_inflight_by_others()
-            || self.inline_changes_unpublished_by_others()
-        {
+        while self.staged_writes_inflight_by_others() {
             if Instant::now() >= deadline {
                 return false;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         true
+    }
+
+    /// Whether a write of another same-record scope, or of none, has staged or
+    /// committed a change that is not yet published.
+    fn staged_writes_inflight_by_others(&self) -> bool {
+        self.staging_appends_inflight_by_others() || self.inline_changes_unpublished_by_others()
     }
 
     pub(crate) fn staging_wal_present(&self) -> &AtomicBool {
@@ -7461,15 +7481,18 @@ impl CayenneTableProvider {
         ));
 
         let lock_wait_start = Instant::now();
-        // Held while this append stages: a key delete waiting for the appends
-        // staged before it holds it exclusively
+        // Held while this append stages: a key delete or an overwrite waiting
+        // for the appends staged before it holds it exclusively
         // (`lock_write_after_staged_appends`). Not taken under an outer
-        // `write_lock` hold, which already excludes that delete.
-        let _admission = if super::write_lock_held::is_held() {
-            None
-        } else {
-            Some(self.append_admission.read().await)
-        };
+        // `write_lock` hold, which already excludes that write, nor by a
+        // same-record scope that already holds unpublished changes here, whose
+        // record that write may be waiting for.
+        let _admission =
+            if super::write_lock_held::is_held() || self.scope_has_unpublished_changes() {
+                None
+            } else {
+                Some(self.append_admission.read().await)
+            };
         // Autocommit UPDATE already holds `write_lock`. A second acquire
         // deadlocks. `acquire_or_share` reuses that hold; spawned commit
         // keeps a clone of it (task-locals do not cross `tokio::spawn`).

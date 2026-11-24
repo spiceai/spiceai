@@ -1930,6 +1930,90 @@ async fn staged_cdc_write_is_ordered_before_overwrite_impl(f: TestFixture) -> Te
 }
 test_on_data_store!(staged_cdc_write_is_ordered_before_overwrite_impl);
 
+// A change-stream batch applied as one metastore record publishes each group
+// only when the record commits, after its last group. An overwrite that starts
+// between two groups waits for that record, so the later groups must still be
+// able to stage and delete: otherwise the batch and the overwrite each wait for
+// the other until the overwrite times out.
+async fn overwrite_lets_a_waiting_batch_finish_its_groups_impl(f: TestFixture) -> TestResult<()> {
+    if !matches!(f.backend_type, BackendType::ObjectNative) {
+        // Only the object-native metastore commits a batch as one record.
+        return Ok(());
+    }
+    let name = "overwrite_waits_for_batch_record".to_string();
+    let opts = CreateTableOptions {
+        table_name: name.clone(),
+        schema: schema(),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+        base_path: f.data_store.base_path(&name),
+        partition_column: None,
+        vortex_config: config(Mode::Key, Durability::File, None, None),
+    };
+    let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&f.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        f.data_store
+            .create(catalog, ctx.runtime_env(), opts)
+            .await?,
+    );
+    ctx.register_table(name.as_str(), Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    upsert(&table, &[(1, 10), (2, 20)], Durability::File).await?;
+
+    let replacement = [(100, 1000), (101, 1010)];
+    let started = std::time::Instant::now();
+    let (overwritten, after_commit) = cayenne::catalog::with_same_record_commits(async {
+        let first = table
+            .write_cdc_append_stream(batch_to_stream(rows_to_batch(&[(3, 30)])), &ctx.task_ctx())
+            .await?;
+        first.finish().await?;
+        let overwrite_task = tokio::spawn({
+            let table = Arc::clone(&table);
+            async move {
+                overwrite(&table, &replacement)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        });
+        // Time is what is under test: let the overwrite start waiting.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let second = table
+            .write_cdc_append_stream(batch_to_stream(rows_to_batch(&[(4, 40)])), &ctx.task_ctx())
+            .await?;
+        second.finish().await?;
+        let deleted = table.delete_from_cdc_fast(&[col("id").eq(lit(1))]).await?;
+        assert_eq!(
+            deleted,
+            Some(1),
+            "the batch's delete group runs as a key delete"
+        );
+        TestResult::Ok((overwrite_task, started.elapsed()))
+    })
+    .await;
+    let (overwrite_task, second_group_after) = overwritten?;
+    assert!(
+        !overwrite_task.is_finished(),
+        "the overwrite waits for the batch's record"
+    );
+    table.catalog().commit_pending_for(table.table_id()).await?;
+    after_commit.run().await;
+    let overwrite_result = overwrite_task.await?;
+    let message = format!(
+        "later groups ran after {second_group_after:?}, overwrite result {overwrite_result:?}"
+    );
+    assert!(
+        second_group_after < std::time::Duration::from_secs(10),
+        "{message}"
+    );
+    overwrite_result?;
+    let model: Model = replacement.into_iter().collect();
+    assert_converged_no_duplicates(&ctx, &name, &model, &message).await?;
+    Ok(())
+}
+test_on_data_store!(overwrite_lets_a_waiting_batch_finish_its_groups_impl);
+
 // --- Concurrent pure-upsert convergence (GREEN control: loss needs deletes) ---
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_upsert_only_key() -> TestResult<()> {
