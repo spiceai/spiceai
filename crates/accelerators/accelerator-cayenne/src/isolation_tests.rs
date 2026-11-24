@@ -299,4 +299,8 @@ async fn dropped_accelerator_releases_dir_so_restart_reuses_path() {
         !second_data.contains("-instance-"),
         "restart path must be the configured directory: {second_data}"
     );
+    assert!(
+        first_data.ends_with('/'),
+        "a Cayenne data directory ends with '/': {first_data}"
+    );
 }
