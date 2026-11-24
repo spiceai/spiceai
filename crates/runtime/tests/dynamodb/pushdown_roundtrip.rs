@@ -326,7 +326,8 @@ fn dataset_with(
     if accelerated {
         dataset.acceleration = Some(Acceleration {
             enabled: true,
-            engine: Some("arrow".to_string()),
+            engine: Some("cayenne".to_string()),
+            mode: spicepod::acceleration::Mode::Memory,
             ..Acceleration::default()
         });
     }
