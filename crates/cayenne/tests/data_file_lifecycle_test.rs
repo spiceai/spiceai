@@ -1543,6 +1543,100 @@ async fn a_rolled_back_overwrite_deletes_its_files_and_deletion_vectors() {
     );
 }
 
+/// An overwrite whose commit the store refuses leaves its files to the orphan
+/// sweep of the same process: no commit names them, and the writer no longer
+/// holds them once the commit has failed. The rows are the ones before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_overwrite_commit_leaves_its_files_to_the_orphan_sweep() {
+    let (location, process) = Location::create("orders", false, SessionConfig::new()).await;
+    common::insert_batch(&process.table, batch(0..KEYS, |id| id))
+        .await
+        .expect("load");
+    process
+        .table
+        .drain_in_flight_maintenance()
+        .await
+        .expect("drain");
+    let before = location.data_files().await;
+
+    let replacement: datafusion::execution::SendableRecordBatchStream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            schema(),
+            stream::iter([Ok(batch(5_000..5_000 + KEYS, |id| -id))]),
+        ),
+    );
+    let prepared = process
+        .table
+        .begin_overwrite(replacement, 1)
+        .await
+        .expect("prepare the overwrite");
+    let written: BTreeSet<String> = location
+        .data_files()
+        .await
+        .into_keys()
+        .filter(|key| !before.contains_key(key))
+        .collect();
+    assert!(
+        !written.is_empty(),
+        "the overwrite wrote its snapshot's files"
+    );
+
+    // Every commit to a log fails before it reaches storage.
+    for op in [Op::Cas, Op::Create] {
+        process
+            .faults
+            .fail_while(op, |path: &Path| path.as_ref().ends_with("/head"));
+    }
+    let committed = tokio::time::timeout(Duration::from_mins(2), prepared.apply_owned_txn())
+        .await
+        .expect("the refused commit returns");
+    assert!(
+        committed.is_err(),
+        "the store refused every commit, yet the overwrite committed"
+    );
+    // As the sink does on a failed commit: the prepared overwrite is dropped.
+    drop(prepared);
+    process.faults.clear_rules();
+
+    assert_eq!(
+        process.rows("orders").await,
+        (0..KEYS).map(|id| (id, id)).collect::<Vec<_>>(),
+        "the failed overwrite changed the rows"
+    );
+    let named = process.named_files(&location).await;
+    assert!(
+        written.iter().all(|key| !named.contains(key)),
+        "a commit names the failed overwrite's files: {written:?}"
+    );
+
+    process.table.set_orphan_age_floor(Duration::ZERO);
+    let report = process
+        .table
+        .sweep_orphan_files_now()
+        .await
+        .expect("the orphan sweep");
+    assert_eq!(report.skipped, None, "the orphan sweep ran");
+    let left: Vec<String> = location
+        .data_files()
+        .await
+        .into_keys()
+        .filter(|key| written.contains(key))
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the orphan sweep left the failed overwrite's files: {left:?} (it deleted {:?})",
+        report.deleted
+    );
+    process
+        .assert_named_files_stored(&location, "after the orphan sweep")
+        .await;
+    assert_eq!(
+        process.rows("orders").await,
+        (0..KEYS).map(|id| (id, id)).collect::<Vec<_>>(),
+        "the orphan sweep changed the rows"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Dropped datasets
 // ---------------------------------------------------------------------------

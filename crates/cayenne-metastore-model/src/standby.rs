@@ -403,6 +403,185 @@ impl Model for Protocol {
         }
         (next != *s).then_some(next)
     }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Tick => "the clock ticks".into(),
+            Action::Acquire(i) => format!("instance {i} acquires the expired lease"),
+            Action::Renew(i) => format!("instance {i} renews its lease"),
+            Action::Takeover(i) if self.has("no-generation") => {
+                format!(
+                    "instance {i} takes over (lease object only; the head generation is not raised)"
+                )
+            }
+            Action::Takeover(i) => {
+                format!("instance {i} takes over the head (raises its generation)")
+            }
+            Action::Read(i) => format!("instance {i} reads a source change and prepares a commit"),
+            Action::Commit(i) => format!("instance {i}'s commit CAS arrives at the head"),
+            Action::Ack(i) => format!("instance {i} acknowledges the source"),
+            Action::Crash(i) => format!("instance {i} crashes"),
+            Action::Restart(i) => format!("instance {i} restarts"),
+            Action::Pause(i) => format!("instance {i} pauses (GC pause, VM freeze)"),
+            Action::Resume(i) => format!("instance {i} resumes"),
+            Action::Serve(i) => format!("instance {i} serves a read from the head"),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        let committers: Vec<String> = s
+            .committers
+            .iter()
+            .map(|(g, i)| format!("i{i}@gen{g}"))
+            .collect();
+        Some(crate::explorer::summary(&[
+            format!(
+                "head: generation {}, {} changes committed {:?}; acknowledged {}",
+                s.head.generation, s.head.pos, s.rows, s.acknowledged
+            ),
+            format!(
+                "commits by (instance, generation): {}",
+                committers.join(" ")
+            ),
+            format!(
+                "ticks with no ingester since the last holder failure: {}",
+                s.waiting
+            ),
+            crate::explorer::flags(&[
+                ("stale commit attempted", s.stale),
+                ("lease churn", s.churn),
+                ("takeover after crash", s.crash_takeover),
+                ("paused writer resumed and was fenced", s.fenced_resume),
+                ("standby served a read", s.standby_read),
+                ("BAD read", s.bad_read),
+                ("file unreadable from another instance", s.unreadable_file),
+            ]),
+        ]))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{Event, Timeline, Tone, state_and_trace, steps};
+        let last = path.last_state().clone();
+        let n = last.instances.len();
+        let (lease, head) = (n, n + 1);
+        let mut lane_names: Vec<String> = (0..n).map(|i| format!("instance {i}")).collect();
+        lane_names.push("lease object".into());
+        lane_names.push("head".into());
+        let mut events = vec![];
+        for (before, action, after) in steps(path) {
+            let ev = match action {
+                Action::Tick => Event::on(lease, format!("tick (lease {} left)", after.lease.left))
+                    .tone(Tone::Gone),
+                Action::Acquire(i) => {
+                    Event::on(i, format!("acquire lease epoch {}", after.lease.epoch)).to(lease)
+                }
+                Action::Renew(i) => Event::on(i, "renew").to(lease),
+                Action::Takeover(i) => {
+                    // A takeover succeeds when the instance becomes the ingester; with
+                    // fencing by the lease object alone the head generation stays put.
+                    let ok = after.instances[i].generation != 0;
+                    Event::on(
+                        i,
+                        if ok {
+                            format!(
+                                "takeover: ingester at generation {}",
+                                after.instances[i].generation
+                            )
+                        } else {
+                            "takeover rejected".into()
+                        },
+                    )
+                    .to(head)
+                    .tone(if ok { Tone::Live } else { Tone::Gone })
+                }
+                Action::Read(i) => Event::on(i, "read a change, prepare commit").tone(Tone::Staged),
+                Action::Commit(i) => {
+                    let ok = after.head.pos > before.head.pos;
+                    Event::on(
+                        i,
+                        if ok {
+                            format!("commit lands: change {}", after.head.pos)
+                        } else {
+                            "commit rejected (head moved or fenced)".into()
+                        },
+                    )
+                    .to(head)
+                    .tone(if ok { Tone::Live } else { Tone::Gone })
+                }
+                Action::Ack(i) => Event::on(i, "acknowledge source").tone(Tone::Actor),
+                Action::Crash(i) => Event::on(i, "CRASH").tone(Tone::Bad),
+                Action::Restart(i) => Event::on(i, "restart"),
+                Action::Pause(i) => Event::on(i, "PAUSE").tone(Tone::Bad),
+                Action::Resume(i) => Event::on(i, "resume"),
+                Action::Serve(i) => Event::on(head, format!("instance {i} reads the head"))
+                    .to(i)
+                    .tone(Tone::Actor),
+            };
+            events.push(ev.breaking(&crate::explorer::broken(self, &before, &after)));
+        }
+        let mut boxes: Vec<(String, Vec<String>, Tone)> = last
+            .instances
+            .iter()
+            .enumerate()
+            .map(|(i, inst)| {
+                let status = match inst.status {
+                    Status::Running => "running",
+                    Status::Paused => "PAUSED",
+                    Status::Crashed => "CRASHED",
+                };
+                let mut lines = vec![
+                    status.to_string(),
+                    format!(
+                        "believes lease epoch {} ({} ticks left)",
+                        inst.epoch, inst.left
+                    ),
+                    if inst.generation == 0 {
+                        "standby: serves reads".into()
+                    } else {
+                        format!("ingester at generation {}", inst.generation)
+                    },
+                ];
+                if let Some(c) = inst.pending {
+                    lines.push(format!(
+                        "prepared commit of change {} on (gen {}, pos {})",
+                        c.change, c.base.generation, c.base.pos
+                    ));
+                }
+                let tone = match inst.status {
+                    Status::Running => Tone::Actor,
+                    _ => Tone::Gone,
+                };
+                (format!("INSTANCE {i}"), lines, tone)
+            })
+            .collect();
+        boxes.push((
+            "LEASE OBJECT".into(),
+            vec![
+                format!("holder instance {}", last.lease.holder),
+                format!("epoch {}", last.lease.epoch),
+                format!("{} ticks to expiry", last.lease.left),
+            ],
+            if last.lease.left > 0 {
+                Tone::Live
+            } else {
+                Tone::Gone
+            },
+        ));
+        boxes.push((
+            "HEAD".into(),
+            vec![
+                format!("generation {}", last.head.generation),
+                format!("changes committed: {}", last.head.pos),
+                format!("acknowledged: {}", last.acknowledged),
+            ],
+            Tone::Live,
+        ));
+        Some(state_and_trace(
+            &boxes,
+            &Timeline {
+                lanes: lane_names,
+                events,
+            },
+        ))
+    }
     fn properties(&self) -> Vec<Property<Self>> {
         let mut p = vec![
             Property::always("source change applied at most once", |_, s: &State| {
@@ -476,5 +655,73 @@ impl Model for Protocol {
             ));
         }
         p
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::{Action, Protocol, State};
+    use stateright::{Model, Path};
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    /// The takeover label follows the mode: only with head fencing does it
+    /// raise the generation.
+    #[test]
+    fn takeover_label_follows_the_mode() {
+        assert_eq!(
+            Protocol::new("standby").format_action(&Action::Takeover(1)),
+            "instance 1 takes over the head (raises its generation)"
+        );
+        assert_eq!(
+            Protocol::new("standby-no-generation").format_action(&Action::Takeover(1)),
+            "instance 1 takes over (lease object only; the head generation is not raised)"
+        );
+    }
+
+    /// With fencing by the lease object alone, a takeover succeeds without
+    /// raising the head's generation; the timeline must still call it a
+    /// takeover.
+    #[test]
+    fn lease_only_takeover_is_drawn_as_a_takeover() {
+        let model = Protocol::new("standby-no-generation");
+        let init = model.init_states().remove(0);
+        let mut parent: HashMap<State, (State, Action)> = HashMap::new();
+        let mut seen = HashSet::from([init.clone()]);
+        let mut queue = VecDeque::from([init.clone()]);
+        let mut found = None;
+        'search: while let Some(state) = queue.pop_front() {
+            let mut candidates = vec![];
+            model.actions(&state, &mut candidates);
+            for action in candidates {
+                let Some(next) = model.next_state(&state, action.clone()) else {
+                    continue;
+                };
+                if let Action::Takeover(i) = action
+                    && next.instances[i].generation != 0
+                {
+                    let mut actions = vec![action];
+                    let mut at = state;
+                    while let Some((before, a)) = parent.get(&at) {
+                        actions.push(a.clone());
+                        at = before.clone();
+                    }
+                    actions.reverse();
+                    found = Some(actions);
+                    break 'search;
+                }
+                if seen.insert(next.clone()) {
+                    parent.insert(next.clone(), (state.clone(), action));
+                    queue.push_back(next);
+                }
+            }
+        }
+        let actions = found.expect("a successful takeover");
+        let path = Path::from_actions(&model, init, &actions).expect("the path replays");
+        let svg = model.as_svg(path).expect("standby draws");
+        assert!(!svg.contains("takeover rejected"), "{actions:?}");
+        assert!(
+            svg.contains("takeover: ingester at generation"),
+            "{actions:?}"
+        );
     }
 }

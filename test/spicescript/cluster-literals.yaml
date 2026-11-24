@@ -1,11 +1,11 @@
 name: cluster-literals
 description: >
-  Known failing (#15538), on a cluster only. The SQL sent to executors writes typed
-  literals bare, so the executor reads them as other types: a REAL literal
-  (`r = 0.1`) is read as a double and matches nothing, an infinity is
-  written `inf` and read as a column name, and a 38-digit decimal is read
-  as Decimal128(38, 15) and overflows. On one spiced all of these answer as
-  PostgreSQL does (postgres-literals.yaml).
+  On a cluster, typed literals sent to executors keep their types (#15538):
+  a REAL literal (`r = 0.1`) stays a REAL, an infinity stays a float rather
+  than a column name, and a 38-digit decimal keeps its precision. Each
+  answer must match PostgreSQL's, as on one spiced (postgres-literals.yaml).
+
+tags: [long]
 
 sources:
   src: { kind: postgres }

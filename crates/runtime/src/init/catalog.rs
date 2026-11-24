@@ -295,8 +295,9 @@ impl Runtime {
                 };
 
             // A load of the replaced configuration that is still retrying must not register
-            // after this one.
+            // after this one, and a request must not load it while it is deferred.
             self.catalog_loads.stop(&catalog.name).await;
+            self.df.remove_deferred_catalog(&catalog.name).await;
             // Access the new configuration does not allow ends now; access it adds starts when
             // it registers.
             if let Err(err) = self
@@ -316,6 +317,7 @@ impl Runtime {
         for catalog in &existing_catalogs {
             if !valid_catalogs.iter().any(|c| c.name == catalog.name) {
                 self.catalog_loads.stop(&catalog.name).await;
+                self.df.remove_deferred_catalog(&catalog.name).await;
                 if let Err(err) = self
                     .df
                     .restrict_catalog_access(&catalog.name, &AccessMode::Read)
@@ -823,6 +825,104 @@ mod tests {
             .await;
         assert!(!runtime.df.is_catalog_writable("reloaded"));
         assert!(!runtime.df.is_catalog_ddl_enabled("reloaded"));
+    }
+
+    /// A Databricks catalog with user-to-machine auth, which loads when a request carries a
+    /// user token for it.
+    #[cfg(feature = "databricks")]
+    fn app_with_u2m_catalog(params: &[(&str, &str)]) -> Arc<App> {
+        let mut catalog = spicepod::component::catalog::Catalog::new(
+            "databricks:main".to_string(),
+            "reloaded".to_string(),
+        );
+        catalog.params = Some(spicepod::param::Params::from_string_map(
+            [
+                ("mode", "delta_lake"),
+                ("databricks_auth_mode", "u2m"),
+                ("databricks_client_id", "u2m-client"),
+            ]
+            .iter()
+            .chain(params)
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect(),
+        ));
+        Arc::new(
+            app::AppBuilder::new("catalog_reload")
+                .with_catalog(catalog)
+                .build(),
+        )
+    }
+
+    /// A request with a user token loads a deferred catalog; one the Spicepod no longer
+    /// declares must not load.
+    #[cfg(feature = "databricks")]
+    #[tokio::test]
+    async fn removing_a_deferred_catalog_keeps_requests_from_loading_it() {
+        let runtime = Arc::new(Runtime::builder().build().await);
+        let u2m = app_with_u2m_catalog(&[("databricks_endpoint", "http://127.0.0.1:1")]);
+        let empty = Arc::new(app::AppBuilder::new("catalog_reload").build());
+        Arc::clone(&runtime).apply_catalog_diff(&empty, &u2m).await;
+        wait_for_the_load_to_end(&runtime).await;
+
+        assert_eq!(
+            runtime
+                .df
+                .deferred_catalogs_for(&["u2m-client".to_string()])
+                .await,
+            vec!["reloaded".to_string()]
+        );
+
+        Arc::clone(&runtime).apply_catalog_diff(&u2m, &empty).await;
+        assert!(!runtime.df.is_deferred_catalog("reloaded").await);
+        runtime
+            .df
+            .load_deferred_catalog("reloaded")
+            .await
+            .expect("a removed catalog has nothing to load");
+        assert!(!runtime.df.catalog_exists("reloaded"));
+    }
+
+    /// A U2M catalog in `spark_connect` mode is a configuration error at startup, not a
+    /// deferred catalog whose session keeps the first request's token.
+    #[cfg(feature = "databricks")]
+    #[tokio::test]
+    async fn a_u2m_catalog_in_spark_connect_mode_is_not_deferred() {
+        let runtime = Arc::new(Runtime::builder().build().await);
+        let u2m = app_with_u2m_catalog(&[
+            ("databricks_endpoint", "http://127.0.0.1:1"),
+            ("mode", "spark_connect"),
+            ("databricks_cluster_id", "cluster"),
+        ]);
+        let empty = Arc::new(app::AppBuilder::new("catalog_reload").build());
+        Arc::clone(&runtime).apply_catalog_diff(&empty, &u2m).await;
+        wait_for_the_load_to_end(&runtime).await;
+
+        assert!(!runtime.df.is_deferred_catalog("reloaded").await);
+        assert!(matches!(
+            runtime.status.get_catalog_statuses().get("reloaded"),
+            Some(crate::status::ComponentStatus::Error(_))
+        ));
+    }
+
+    /// A reload whose new declaration of a deferred catalog does not register must not leave
+    /// the old declaration for a request to load, with the access the reload withdrew.
+    #[cfg(feature = "databricks")]
+    #[tokio::test]
+    async fn changing_a_deferred_catalog_forgets_the_old_declaration() {
+        let runtime = Arc::new(Runtime::builder().build().await);
+        let u2m = app_with_u2m_catalog(&[("databricks_endpoint", "http://127.0.0.1:1")]);
+        let empty = Arc::new(app::AppBuilder::new("catalog_reload").build());
+        Arc::clone(&runtime).apply_catalog_diff(&empty, &u2m).await;
+        wait_for_the_load_to_end(&runtime).await;
+        assert!(runtime.df.is_deferred_catalog("reloaded").await);
+
+        // Without its required endpoint, the new declaration fails before it registers.
+        let changed = app_with_u2m_catalog(&[]);
+        Arc::clone(&runtime)
+            .apply_catalog_diff(&u2m, &changed)
+            .await;
+        wait_for_the_load_to_end(&runtime).await;
+        assert!(!runtime.df.is_deferred_catalog("reloaded").await);
     }
 
     /// Removing a catalog stops its load: a removed catalog whose source does not answer
