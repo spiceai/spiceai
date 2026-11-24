@@ -62,8 +62,8 @@
       "key": "query: SELECT * FROM docs #2",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -72,8 +72,8 @@
       "key": "query: SELECT * FROM docs #3",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -82,8 +82,8 @@
       "key": "query: SELECT * FROM docs #4",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -92,8 +92,8 @@
       "key": "query: SELECT * FROM docs WHERE id > 1000 ORDER BY id NULLS LAST",
       "kind": "empty",
       "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 20",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -102,8 +102,8 @@
       "key": "query: SELECT * FROM docs #5",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -112,8 +112,8 @@
       "key": "query: SELECT * FROM docs #6",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -122,8 +122,8 @@
       "key": "query: SELECT * FROM docs #7",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -132,8 +132,8 @@
       "key": "query: SELECT count(*), count(body), count(blob), sum(length(body)), sum(version) FROM docs",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(docs.body)\", row_number: 1, expected: \"\\\"295\\\"\", actual: \"\\\"300\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -142,8 +142,8 @@
       "key": "query: SELECT * FROM docs #2",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -152,8 +152,8 @@
       "key": "query: SELECT * FROM docs #3",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -162,8 +162,8 @@
       "key": "query: SELECT * FROM docs #4",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -172,8 +172,8 @@
       "key": "query: SELECT * FROM docs WHERE id > 1000 ORDER BY id NULLS LAST",
       "kind": "empty",
       "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 20",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -182,8 +182,8 @@
       "key": "query: SELECT * FROM docs #5",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -192,8 +192,8 @@
       "key": "query: SELECT * FROM docs #6",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -202,8 +202,8 @@
       "key": "query: SELECT * FROM docs #7",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -212,8 +212,8 @@
       "key": "query: SELECT count(*), count(body), count(blob), sum(length(body)), sum(version) FROM docs",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(docs.body)\", row_number: 1, expected: \"\\\"295\\\"\", actual: \"\\\"300\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -282,8 +282,8 @@
       "key": "query: SELECT * FROM docs #2",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -292,8 +292,8 @@
       "key": "query: SELECT * FROM docs #3",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -302,8 +302,8 @@
       "key": "query: SELECT * FROM docs #4",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -312,8 +312,8 @@
       "key": "query: SELECT * FROM docs WHERE id > 1000 ORDER BY id NULLS LAST",
       "kind": "empty",
       "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 20",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -322,8 +322,8 @@
       "key": "query: SELECT * FROM docs #5",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -332,8 +332,8 @@
       "key": "query: SELECT * FROM docs #6",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -342,8 +342,8 @@
       "key": "query: SELECT * FROM docs #7",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -352,8 +352,8 @@
       "key": "query: SELECT count(*), count(body), count(blob), sum(length(body)), sum(version) FROM docs",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(docs.body)\", row_number: 1, expected: \"\\\"295\\\"\", actual: \"\\\"300\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -362,8 +362,8 @@
       "key": "query: SELECT * FROM docs #2",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -372,8 +372,8 @@
       "key": "query: SELECT * FROM docs #3",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -382,8 +382,8 @@
       "key": "query: SELECT * FROM docs #4",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -392,8 +392,8 @@
       "key": "query: SELECT * FROM docs WHERE id > 1000 ORDER BY id NULLS LAST",
       "kind": "empty",
       "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 20",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -402,8 +402,8 @@
       "key": "query: SELECT * FROM docs #5",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -412,8 +412,8 @@
       "key": "query: SELECT * FROM docs #6",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -422,8 +422,8 @@
       "key": "query: SELECT * FROM docs #7",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -432,8 +432,8 @@
       "key": "query: SELECT count(*), count(body), count(blob), sum(length(body)), sum(version) FROM docs",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(docs.body)\", row_number: 1, expected: \"\\\"295\\\"\", actual: \"\\\"300\\\"\" }",
-      "group": "cdc-postgres",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{|Spice returned no rows",
+      "group": "cdc-postgres",
       "may-pass": true
     },
     {
@@ -455,6 +455,456 @@
       "pattern": "spiced not ready: a dataset is in Error",
       "group": "cdc-postgres",
       "may-pass": true
+    }
+  ],
+  "postgres-cdc-replay-after-reconnect": [
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=connection-lost]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=connection-lost]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=connection-lost]",
+      "who": "as-written",
+      "key": "query: SELECT id, t FROM g WHERE id = 0 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"t\", row_number: 1, expected: \"\\\"last\\\"\", actual: \"\\\"HOLD 1026\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=connection-lost]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=connection-lost]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=connection-lost]",
+      "who": "as-written",
+      "key": "query: SELECT id, t FROM g WHERE id = 0 #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"t\", row_number: 1, expected: \"\\\"last\\\"\", actual: \"\\\"HOLD 1026\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=connection-lost]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=connection-lost]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=connection-lost]",
+      "who": "object-native",
+      "key": "query: SELECT id, t FROM g WHERE id = 0 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"t\", row_number: 1, expected: \"\\\"last\\\"\", actual: \"\\\"HOLD 1026\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=connection-lost]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=connection-lost]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=connection-lost]",
+      "who": "object-native",
+      "key": "query: SELECT id, t FROM g WHERE id = 0 #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"t\", row_number: 1, expected: \"\\\"last\\\"\", actual: \"\\\"HOLD 1026\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=snapshot-done]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=snapshot-done]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=snapshot-done]",
+      "who": "as-written",
+      "key": "query: SELECT id, t FROM g WHERE id = 0 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"t\", row_number: 1, expected: \"\\\"last\\\"\", actual: \"\\\"HOLD 1026\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=snapshot-done]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=snapshot-done]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=snapshot-done]",
+      "who": "as-written",
+      "key": "query: SELECT id, t FROM g WHERE id = 0 #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"t\", row_number: 1, expected: \"\\\"last\\\"\", actual: \"\\\"HOLD 1026\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=snapshot-done]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=snapshot-done]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=snapshot-done]",
+      "who": "object-native",
+      "key": "query: SELECT id, t FROM g WHERE id = 0 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"t\", row_number: 1, expected: \"\\\"last\\\"\", actual: \"\\\"HOLD 1026\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=snapshot-done]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=snapshot-done]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=snapshot-done]",
+      "who": "object-native",
+      "key": "query: SELECT id, t FROM g WHERE id = 0 #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"t\", row_number: 1, expected: \"\\\"last\\\"\", actual: \"\\\"HOLD 1026\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-snapshot]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-snapshot]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-snapshot]",
+      "who": "as-written",
+      "key": "query: SELECT id, t FROM g WHERE id = 0 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"t\", row_number: 1, expected: \"\\\"last\\\"\", actual: \"\\\"HOLD 1026\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-snapshot]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-snapshot]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-snapshot]",
+      "who": "as-written",
+      "key": "query: SELECT id, t FROM g WHERE id = 0 #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"t\", row_number: 1, expected: \"\\\"last\\\"\", actual: \"\\\"HOLD 1026\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-snapshot]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-snapshot]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-snapshot]",
+      "who": "object-native",
+      "key": "query: SELECT id, t FROM g WHERE id = 0 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"t\", row_number: 1, expected: \"\\\"last\\\"\", actual: \"\\\"HOLD 1026\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-snapshot]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-snapshot]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-snapshot]",
+      "who": "object-native",
+      "key": "query: SELECT id, t FROM g WHERE id = 0 #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"t\", row_number: 1, expected: \"\\\"last\\\"\", actual: \"\\\"HOLD 1026\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-rebuild]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-rebuild]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-rebuild]",
+      "who": "as-written",
+      "key": "query: SELECT id, t FROM g WHERE id = 0 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"t\", row_number: 1, expected: \"\\\"last\\\"\", actual: \"\\\"HOLD 1026\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-rebuild]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-rebuild]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-rebuild]",
+      "who": "as-written",
+      "key": "query: SELECT id, t FROM g WHERE id = 0 #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"t\", row_number: 1, expected: \"\\\"last\\\"\", actual: \"\\\"HOLD 1026\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-rebuild]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-rebuild]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-rebuild]",
+      "who": "object-native",
+      "key": "query: SELECT id, t FROM g WHERE id = 0 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"t\", row_number: 1, expected: \"\\\"last\\\"\", actual: \"\\\"HOLD 1026\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-rebuild]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-rebuild]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-in-rebuild]",
+      "who": "object-native",
+      "key": "query: SELECT id, t FROM g WHERE id = 0 #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"t\", row_number: 1, expected: \"\\\"last\\\"\", actual: \"\\\"HOLD 1026\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-after-checkpoint]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-after-checkpoint]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-after-checkpoint]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-after-checkpoint]",
+      "who": "as-written",
+      "key": "query: SELECT id, n FROM v #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-after-checkpoint]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-after-checkpoint]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-after-checkpoint]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v WHERE id = 5000 #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-replay-after-reconnect[reconnect=kill-after-checkpoint]",
+      "who": "object-native",
+      "key": "query: SELECT id, n FROM v #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1000, actual: 1001 }",
+      "group": "cdc-postgres"
     }
   ],
   "postgres-cdc-unchanged-toast": [
@@ -484,9 +934,9 @@
       "key": "query: SELECT id, version, length(body) FROM docs #3",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 3, actual: 2 }",
+      "varies": true,
       "group": "cdc-postgres",
-      "may-pass": true,
-      "varies": true
+      "may-pass": true
     },
     {
       "run": "postgres-cdc-unchanged-toast",
@@ -524,9 +974,9 @@
       "key": "query: SELECT id, version, length(body) FROM docs #3",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 3, actual: 2 }",
+      "varies": true,
       "group": "cdc-postgres",
-      "may-pass": true,
-      "varies": true
+      "may-pass": true
     },
     {
       "run": "postgres-cdc-unchanged-toast",
