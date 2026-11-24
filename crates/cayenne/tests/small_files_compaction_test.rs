@@ -27,6 +27,8 @@ limitations under the License.
 
 use crate::common;
 
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
