@@ -1508,7 +1508,8 @@ impl Refresher {
                         (checkpointer, self.refresh_completion.clone())
                 {
                     let ready = completion.any();
-                    let checkpoint_schema = Arc::clone(&checkpoint_schema);
+                    let checkpoint_schema =
+                        super::checkpoint_primary_key::with_changes_loaded(&checkpoint_schema);
                     let accelerator_write_mutex = Arc::clone(&self.accelerator_write_mutex);
                     let dataset_name = dataset_name.clone();
                     let last_updated_at = Arc::clone(&self.last_updated_at);

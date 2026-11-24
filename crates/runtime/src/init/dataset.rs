@@ -49,7 +49,9 @@ use crate::{
     UnknownDataConnectorSnafu,
     component::dataset::{
         Dataset,
-        acceleration::{Acceleration, DurableWriteBackKey, Engine, Mode, RefreshMode},
+        acceleration::{
+            Acceleration, DurableWriteBackKey, Engine, Mode, RefreshMode, ZeroResultsAction,
+        },
         builder::DatasetBuilder,
     },
     component::{
@@ -1281,14 +1283,10 @@ impl Runtime {
             "`mode: file_create`".to_string()
         } else if ds.source() == crate::dataconnector::file::FILE_DATACONNECTOR {
             "the `file` connector".to_string()
-        } else if refresh_mode == RefreshMode::Changes && !resumes_changes_after_restart(ds) {
-            if !crate::dataconnector::connector_resumes_changes_after_restart(ds.source()) {
-                "`refresh_mode: changes`".to_string()
-            } else if !acceleration.partition_by.is_empty() {
-                "`refresh_mode: changes` with `partition_by`".to_string()
-            } else {
-                "`refresh_mode: changes` with `snapshots`".to_string()
-            }
+        } else if refresh_mode == RefreshMode::Changes
+            && let Some(reason) = changes_wait_reason(ds.source(), acceleration)
+        {
+            reason.to_string()
         } else if refresh_mode == RefreshMode::Caching {
             "`refresh_mode: caching`".to_string()
         } else if refresh_mode == RefreshMode::Append && ds.time_column.is_none() {
@@ -1355,12 +1353,21 @@ impl Runtime {
                 },
             )
         };
-        let federated_table = FederatedTable::new_deferred(
-            Arc::new(ds.spec.clone()),
-            refresh_source,
-            checkpoint_schema,
-            self.status.shutdown_token(),
-        );
+        let federated_table = if resumes_changes_after_restart(&ds) {
+            FederatedTable::new_deferred_for_change_stream(
+                Arc::new(ds.spec.clone()),
+                refresh_source,
+                checkpoint_schema,
+                self.status.shutdown_token(),
+            )
+        } else {
+            FederatedTable::new_deferred(
+                Arc::new(ds.spec.clone()),
+                refresh_source,
+                checkpoint_schema,
+                self.status.shutdown_token(),
+            )
+        };
         if resolved_refresh_mode != RefreshMode::Snapshot {
             reason.log_serving_from_acceleration(&ds.name);
         }
@@ -1375,6 +1382,14 @@ impl Runtime {
     /// checkpoint records the key.
     async fn existing_acceleration_schema(ds: &Dataset) -> Option<arrow_schema::SchemaRef> {
         let schema = crate::dataconnector::sink::recorded_checkpoint_schema(ds).await?;
+        // A change stream's acceleration is complete only once the stream has
+        // loaded it, which its own checkpoint records; a checkpoint left by a
+        // `full` refresh or a snapshot does not show that.
+        if resumes_changes_after_restart(ds)
+            && !runtime_table::accelerated::checkpoint_primary_key::records_changes_loaded(&schema)
+        {
+            return None;
+        }
         if records_acceleration_primary_key(&schema) {
             return Some(schema);
         }
@@ -3980,22 +3995,39 @@ fn not_served_status(reason: &str, cause: &str) -> String {
 /// Whether `ds` is a `refresh_mode: changes` dataset whose change stream resumes
 /// after a restart from a recorded position, so it is served from its existing
 /// acceleration at startup and starts its stream once the source answers.
-///
-/// A dataset partitioned across executors waits for its source: its change stream
-/// is scoped to this executor's partitions when the table is built, which needs
-/// the connector. So does a dataset with snapshots, whose snapshot checkpoints can
-/// be written before its change stream has finished loading the acceleration.
 pub(crate) fn resumes_changes_after_restart(ds: &Dataset) -> bool {
     ds.acceleration.as_ref().is_some_and(|acceleration| {
         acceleration.enabled
-            && acceleration.partition_by.is_empty()
-            && matches!(
-                acceleration.snapshot_behavior,
-                runtime_acceleration::snapshot::SnapshotBehavior::Disabled
-            )
             && acceleration.refresh_mode == Some(RefreshMode::Changes)
-            && crate::dataconnector::connector_resumes_changes_after_restart(ds.source())
+            && changes_wait_reason(ds.source(), acceleration).is_none()
     })
+}
+
+/// Why a `refresh_mode: changes` dataset of the connector `source` waits for its
+/// source instead of being served from its existing acceleration, named the way
+/// the user wrote it, or `None` when it is served.
+///
+/// Its change stream must resume from a position the connector records. A dataset
+/// partitioned across executors scopes its stream to this executor's partitions
+/// when the table is built, which needs the connector. Snapshot checkpoints can be
+/// written before the stream has loaded the acceleration. `on_zero_results:
+/// use_source` reads the source's provider, which is not held to the
+/// acceleration's schema while the stream runs.
+fn changes_wait_reason(source: &str, acceleration: &Acceleration) -> Option<&'static str> {
+    if !crate::dataconnector::connector_resumes_changes_after_restart(source) {
+        Some("`refresh_mode: changes`")
+    } else if !acceleration.partition_by.is_empty() {
+        Some("`refresh_mode: changes` with `partition_by`")
+    } else if !matches!(
+        acceleration.snapshot_behavior,
+        runtime_acceleration::snapshot::SnapshotBehavior::Disabled
+    ) {
+        Some("`refresh_mode: changes` with `snapshots`")
+    } else if acceleration.on_zero_results == ZeroResultsAction::UseSource {
+        Some("`refresh_mode: changes` with `on_zero_results: use_source`")
+    } else {
+        None
+    }
 }
 
 /// Whether a dataset's `drasi:` block is live.

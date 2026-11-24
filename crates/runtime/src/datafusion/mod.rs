@@ -6915,7 +6915,7 @@ impl DataFusion {
         spec.metadata.clone_from(&view.metadata);
         spec.columns.clone_from(&view.columns);
         let served_schema =
-            runtime_table::accelerated::checkpoint_primary_key::without_acceleration_primary_key(
+            runtime_table::accelerated::checkpoint_primary_key::without_acceleration_checkpoint_metadata(
                 Arc::clone(&checkpoint_schema),
             );
         let source = crate::view::ViewRefreshSource::new_arc(

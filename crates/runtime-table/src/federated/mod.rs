@@ -180,19 +180,6 @@ impl DeferredTableProvider {
     }
 }
 
-/// Whether `dataset` is a `refresh_mode: changes` dataset under
-/// `on_schema_change: block`. Its change stream applies that policy itself as it
-/// streams, keeping the acceleration's columns, so a source schema that differs
-/// from the acceleration's does not hold the source back: holding it would stop
-/// the stream from starting at all.
-fn change_stream_keeps_acceleration_schema(dataset: &DatasetSpec) -> bool {
-    dataset.on_schema_change == OnSchemaChange::Block
-        && dataset
-            .acceleration
-            .as_ref()
-            .is_some_and(|acceleration| acceleration.refresh_mode == Some(RefreshMode::Changes))
-}
-
 impl FederatedTable {
     /// Creates a federated table without checking if the schema matches the existing acceleration checkpoint.
     pub fn new_unchecked(table_provider: Arc<dyn TableProvider>) -> Self {
@@ -232,9 +219,6 @@ impl FederatedTable {
         let federated_schema = table_provider.schema();
 
         if dataset.on_schema_change == OnSchemaChange::Block {
-            if change_stream_keeps_acceleration_schema(&dataset) {
-                return Self::new_unchecked(table_provider);
-            }
             // `on_schema_change: block` (default): today's behavior verbatim.
             // `schema_difference` is nullability-insensitive, so a no-op (or a
             // nullability-only change) registers immediately and any other
@@ -458,6 +442,25 @@ impl FederatedTable {
         Self::Deferred(deferred)
     }
 
+    /// [`Self::new_deferred`] for a `refresh_mode: changes` dataset served from its
+    /// acceleration, which resolves once the source is reached even when the
+    /// source's schema differs from the checkpoint's. Its change stream applies
+    /// `on_schema_change` itself, and holding the provider back would keep the
+    /// stream from starting at all. The dataset is served from its acceleration
+    /// from registration on, so queries do not read this provider.
+    #[must_use]
+    pub fn new_deferred_for_change_stream(
+        dataset: Arc<DatasetSpec>,
+        source: Arc<dyn RefreshSource>,
+        checkpoint_schema: SchemaRef,
+        shutdown_token: CancellationToken,
+    ) -> Self {
+        let mut deferred =
+            Self::spawn_deferred(dataset, source, checkpoint_schema, shutdown_token, false);
+        deferred.awaits_source = true;
+        Self::Deferred(deferred)
+    }
+
     /// Waits until the source has been reached: at once for an immediate table; for a
     /// deferred one, the first time its background task reads the source, whether or
     /// not the schema it reports matches the acceleration's (the dataset then serves
@@ -610,14 +613,28 @@ impl FederatedTable {
         schema: SchemaRef,
         shutdown_token: CancellationToken,
     ) -> DeferredTableProvider {
+        Self::spawn_deferred(dataset, source, schema, shutdown_token, true)
+    }
+
+    /// A deferred provider whose background task retries the source until it is
+    /// reached and, when `holds_schema_difference`, until its schema matches
+    /// `schema`.
+    fn spawn_deferred(
+        dataset: Arc<DatasetSpec>,
+        source: Arc<dyn RefreshSource>,
+        schema: SchemaRef,
+        shutdown_token: CancellationToken,
+        holds_schema_difference: bool,
+    ) -> DeferredTableProvider {
         let constraints =
             crate::accelerated::checkpoint_primary_key::acceleration_primary_key(&schema);
         let schema =
-            crate::accelerated::checkpoint_primary_key::without_acceleration_primary_key(schema);
+            crate::accelerated::checkpoint_primary_key::without_acceleration_checkpoint_metadata(
+                schema,
+            );
         let dataset_name = dataset.name.clone();
         let dataset_name_str = dataset_name.to_string();
         let accelerated_schema = Arc::clone(&schema);
-        let holds_schema_difference = !change_stream_keeps_acceleration_schema(&dataset);
 
         let (tx, rx) = oneshot::channel();
         let (source_reached_tx, source_reached) = watch::channel(false);

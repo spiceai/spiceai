@@ -75,6 +75,13 @@ pub const INFERRED_PRIMARY_KEY_METADATA_KEY: &str = "spice.inferred_primary_key"
 /// not a setting to fill in.
 pub const ACCELERATION_PRIMARY_KEY_METADATA_KEY: &str = "spice.acceleration_primary_key";
 
+/// Schema-level metadata key that marks a checkpoint written by a change stream
+/// once it first reported its dataset ready, after flushing the changes it had
+/// applied. Only such a checkpoint shows that a `refresh_mode: changes`
+/// acceleration is complete enough to serve before its source answers; one
+/// written by a `full` refresh or a snapshot does not. The value is `"true"`.
+pub const ACCELERATION_CHANGES_LOADED_METADATA_KEY: &str = "spice.acceleration_changes_loaded";
+
 /// Schema-level metadata key for inferred secondary indexes (schema inference).
 ///
 /// The value is a JSON array of objects, each describing one index:

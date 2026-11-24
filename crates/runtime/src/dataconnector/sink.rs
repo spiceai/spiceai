@@ -74,7 +74,7 @@ fn placeholder_schema() -> SchemaRef {
 pub(crate) async fn accelerated_checkpoint_schema(dataset: &Dataset) -> Option<SchemaRef> {
     recorded_checkpoint_schema(dataset)
         .await
-        .map(runtime_table::accelerated::checkpoint_primary_key::without_acceleration_primary_key)
+        .map(runtime_table::accelerated::checkpoint_primary_key::without_acceleration_checkpoint_metadata)
 }
 
 /// The acceleration checkpoint's schema as stored, including the primary key it
