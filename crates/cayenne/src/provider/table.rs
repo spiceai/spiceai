@@ -34103,9 +34103,10 @@ impl CayenneTableProvider {
             .min()
     }
 
-    /// The delete sequence a protected-snapshot merge tags its output with: the
-    /// newest tombstone in `deletion_snapshot`, and never below the newest one a
-    /// prune has dropped from the index.
+    /// The delete fence a protected-snapshot merge starts from, before
+    /// [`Self::protected_snapshot_merge_fence_and_floor`] caps it below a pending
+    /// mem-tier delete: the newest tombstone in `deletion_snapshot`, raised to the
+    /// newest one a prune has dropped from the index.
     ///
     /// A scan applies to a protected snapshot only the deletions above its tag,
     /// and ignores re-inserts there. The seq-prefix bake drops tombstones from the
