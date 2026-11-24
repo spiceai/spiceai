@@ -581,6 +581,29 @@ async fn read_rows(ctx: &SessionContext, name: &str) -> TestResult<Model> {
     Ok(model)
 }
 
+/// Every `(id, value)` row, sorted, duplicates kept: the whole content of a
+/// table without a key, which [`read_rows`] would fold by key.
+async fn read_row_multiset(ctx: &SessionContext, name: &str) -> TestResult<Vec<(i64, i64)>> {
+    let df = ctx
+        .sql(&format!("SELECT id, value FROM {name} ORDER BY id, value"))
+        .await?;
+    let mut rows = Vec::new();
+    for b in &df.collect().await? {
+        let ids = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id");
+        let vals = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value");
+        rows.extend((0..b.num_rows()).map(|i| (ids.value(i), vals.value(i))));
+    }
+    Ok(rows)
+}
+
 fn assert_converged(live: &Model, model: &Model, ctx_msg: &str) {
     let missing: Vec<(i64, i64)> = model
         .iter()
@@ -1893,8 +1916,14 @@ async fn staged_cdc_write_is_ordered_before_overwrite_impl(f: TestFixture) -> Te
             assert_converged_no_duplicates(&ctx, &name, &model, &format!("{message}, next write"))
                 .await?;
         } else {
-            let count = scalar_i64(&ctx, &format!("SELECT COUNT(*) FROM {name}")).await?;
-            assert_eq!(count, 5, "{message}, next write appends");
+            // A table without a key keeps both rows of key 50.
+            let mut expected: Vec<(i64, i64)> = replacement.into_iter().chain(next).collect();
+            expected.sort_unstable();
+            assert_eq!(
+                read_row_multiset(&ctx, &name).await?,
+                expected,
+                "{message}, next write appends"
+            );
         }
     }
     Ok(())
