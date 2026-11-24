@@ -1512,6 +1512,13 @@ async fn a_superseded_deletion_vector_of_an_idle_table_is_deleted_after_the_rete
     let process = location
         .open("events", &position, SessionConfig::new())
         .await;
+    // Background maintenance, as the accelerator starts it for every table.
+    assert!(
+        process
+            .table
+            .spawn_background_compaction(Arc::new(tokio::sync::Semaphore::new(1))),
+        "background compaction"
+    );
     let delete = async |sql: &str| {
         process
             .ctx
