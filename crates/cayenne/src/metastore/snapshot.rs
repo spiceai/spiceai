@@ -303,21 +303,22 @@ fn make_absolute(rel_or_abs: &str, anchor: &Path) -> String {
     }
 }
 
-/// Use the same URL-to-key conversion as the table's file listings. In
-/// particular, local keys omit the leading slash without resolving symlinks.
+/// Convert an absolute local path to a key without resolving symlinks or
+/// interpreting directory names as glob patterns. Local keys omit the leading slash.
 fn source_key_anchor(anchor: &Path) -> CatalogResult<String> {
-    datafusion::datasource::listing::ListingTableUrl::parse(anchor.to_string_lossy())
-        .map(|url| url.prefix().to_string())
+    object_store::path::Path::from_absolute_path(anchor)
+        .map(|path| path.to_string())
         .map_err(|source| CatalogError::Database {
             message: format!("cannot form metastore slice source key anchor: {source}"),
         })
 }
 
-/// Locate the writer's table directory by its relative path followed by its
-/// table id. Exactly one match is required so an anchor that contains the same
-/// directory names cannot make a source refer to a different file.
+/// Locate the writer's table directory by the rightmost match of its relative
+/// path followed by its table id (just the id when the relative path is empty).
+/// Cayenne generates the snapshot directory and file name after that match;
+/// earlier matches may be part of the writer's anchor.
 fn import_source_key(
-    source: &str,
+    source: &SliceValue,
     row: &SliceRow,
     slice: &DatasetMetastoreSlice,
     anchor: &Path,
@@ -327,6 +328,9 @@ fn import_source_key(
             "refusing the metastore slice for dataset '{}': a position-delete source in the snapshot does not belong to its table, so its deletes cannot be applied; the import was not applied",
             slice.dataset_name
         ),
+    };
+    let SliceValue::Text(source) = source else {
+        return Err(refuse());
     };
     let owner = text_at(row, table_id_column_index("cayenne_delete_file")).ok_or_else(refuse)?;
     let table = slice_rows(slice, "cayenne_table")
@@ -338,7 +342,7 @@ fn import_source_key(
     if !matches!(table.get(relative_index), Some(SliceValue::Bool(true))) {
         let key = source_key_anchor(&Path::new(root).join(owner))?;
         return if Path::new(root).is_absolute() && Path::new(source).strip_prefix(key).is_ok() {
-            Ok(source.to_string())
+            Ok(source.clone())
         } else {
             Err(refuse())
         };
@@ -352,17 +356,14 @@ fn import_source_key(
         return Err(refuse());
     }
     let source_parts: Vec<_> = Path::new(source).components().collect();
-    let mut matches = source_parts
+    let (position, _) = source_parts
         .windows(table_parts.len() + 1)
         .enumerate()
-        .filter(|(_, parts)| {
+        .rfind(|(_, parts)| {
             parts[..table_parts.len()] == table_parts
                 && parts[table_parts.len()] == std::path::Component::Normal(owner.as_ref())
-        });
-    let (position, _) = matches.next().ok_or_else(refuse)?;
-    if matches.next().is_some() {
-        return Err(refuse());
-    }
+        })
+        .ok_or_else(refuse)?;
     let rest = &source_parts[position + table_parts.len() + 1..];
     if rest
         .iter()
@@ -1044,7 +1045,14 @@ pub async fn import_dataset(
             // Convert SliceValue -> MetastoreValue, applying path rewriting.
             let mut params: Vec<MetastoreValue> = Vec::with_capacity(row.len());
             for (i, v) in row.iter().cloned().enumerate() {
-                let mut mv = v.into_metastore_value()?;
+                let mut mv = if expected.name == "cayenne_delete_file"
+                    && i == CAYENNE_DELETE_SOURCE_INDEX
+                    && !matches!(v, SliceValue::Null)
+                {
+                    MetastoreValue::Text(import_source_key(&v, row, slice, data_dir_anchor)?)
+                } else {
+                    v.into_metastore_value()?
+                };
                 if let Some((path_idx, rel_idx)) = path_cols {
                     if i == path_idx {
                         if let MetastoreValue::Text(p) = &mv {
@@ -1056,17 +1064,6 @@ pub async fn import_dataset(
                         // shape they always have.
                         mv = MetastoreValue::Bool(false);
                     }
-                }
-                if expected.name == "cayenne_delete_file"
-                    && i == CAYENNE_DELETE_SOURCE_INDEX
-                    && let MetastoreValue::Text(source) = &mv
-                {
-                    mv = MetastoreValue::Text(import_source_key(
-                        source,
-                        row,
-                        slice,
-                        data_dir_anchor,
-                    )?);
                 }
                 params.push(mv);
             }
@@ -1326,6 +1323,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn position_sources_use_the_rightmost_table_directory() {
+        for (writer_anchor, table_relative, source, expected, same_anchor_expected) in [
+            (
+                "/writer",
+                "trips.dir",
+                "writer/trips.dir/tid-trips/trips.dir/tid-trips/data.vortex",
+                "reader/data/trips.dir/tid-trips/data.vortex",
+                "writer/trips.dir/tid-trips/data.vortex",
+            ),
+            (
+                "/w/trips.dir/tid-trips/data",
+                "trips.dir",
+                "w/trips.dir/tid-trips/data/trips.dir/tid-trips/snapshot/data.vortex",
+                "reader/data/trips.dir/tid-trips/snapshot/data.vortex",
+                "w/trips.dir/tid-trips/data/trips.dir/tid-trips/snapshot/data.vortex",
+            ),
+            (
+                "/w/tid-trips/data",
+                "",
+                "w/tid-trips/data/tid-trips/snapshot/data.vortex",
+                "reader/data/tid-trips/snapshot/data.vortex",
+                "w/tid-trips/data/tid-trips/snapshot/data.vortex",
+            ),
+        ] {
+            let (ms, _tmp) = fresh_metastore().await;
+            let writer_anchor = Path::new(writer_anchor);
+            insert_dataset(&ms, "trips", writer_anchor, &[]).await;
+            ms.execute(ExecuteParams {
+                sql: "UPDATE cayenne_table SET path = ? WHERE table_id = 'tid-trips'",
+                params: vec![MetastoreValue::Text(
+                    writer_anchor
+                        .join(table_relative)
+                        .to_string_lossy()
+                        .into_owned(),
+                )],
+            })
+            .await
+            .expect("set table directory");
+            insert_position_source(&ms, writer_anchor, Some(source.to_string())).await;
+            let slice = export_dataset(ms.as_ref(), "trips", writer_anchor)
+                .await
+                .expect("export");
+            assert_eq!(
+                text_at(&slice.tables["cayenne_table"][0], CAYENNE_TABLE_PATH_INDEX),
+                Some(table_relative)
+            );
+            import_dataset(ms.as_ref(), &slice, Path::new("/reader/data"))
+                .await
+                .expect("moved anchor");
+            assert_eq!(stored_position_source(&ms).await.as_deref(), Some(expected));
+            import_dataset(ms.as_ref(), &slice, writer_anchor)
+                .await
+                .expect("same anchor");
+            assert_eq!(
+                stored_position_source(&ms).await.as_deref(),
+                Some(same_anchor_expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn position_source_anchors_preserve_glob_characters() {
+        let writer_anchor = Path::new("/writer/data?*[");
+        let reader_anchor = Path::new("/reader/data?*[");
+        let source = "writer/data?*[/trips.dir/tid-trips/snapshot/data.vortex";
+        assert_eq!(
+            source_key_anchor(&writer_anchor.join("trips.dir/tid-trips/snapshot/data.vortex"))
+                .expect("literal source key"),
+            source
+        );
+        assert_eq!(
+            source_key_anchor(reader_anchor).expect("literal anchor key"),
+            "reader/data?*["
+        );
+        let (ms, _tmp) = fresh_metastore().await;
+        insert_dataset(&ms, "trips", writer_anchor, &[]).await;
+        insert_position_source(&ms, writer_anchor, Some(source.to_string())).await;
+        let slice = export_dataset(ms.as_ref(), "trips", writer_anchor)
+            .await
+            .expect("export");
+        import_dataset(ms.as_ref(), &slice, reader_anchor)
+            .await
+            .expect("moved anchor");
+        assert_eq!(
+            stored_position_source(&ms).await.as_deref(),
+            Some("reader/data?*[/trips.dir/tid-trips/snapshot/data.vortex")
+        );
+        import_dataset(ms.as_ref(), &slice, writer_anchor)
+            .await
+            .expect("same anchor");
+        assert_eq!(stored_position_source(&ms).await.as_deref(), Some(source));
+    }
+
+    #[tokio::test]
     async fn invalid_position_sources_refuse_import_and_roll_back() {
         let (ms, tmp) = fresh_metastore().await;
         insert_dataset(&ms, "trips", tmp.path(), &[]).await;
@@ -1340,15 +1431,14 @@ mod tests {
             .await
             .expect("before");
         for source in [
-            "writer/trips.dir/snapshot/data.vortex",
-            "writer/trips.dir/tid-trips/trips.dir/tid-trips/data.vortex",
-            "writer/trips.dir/tid-trips/../data.vortex",
+            SliceValue::Text("writer/trips.dir/snapshot/data.vortex".to_string()),
+            SliceValue::Text("writer/trips.dir/tid-trips/../data.vortex".to_string()),
+            SliceValue::Integer(42),
         ] {
             slice
                 .tables
                 .get_mut("cayenne_delete_file")
-                .expect("delete rows")[0][CAYENNE_DELETE_SOURCE_INDEX] =
-                SliceValue::Text(source.to_string());
+                .expect("delete rows")[0][CAYENNE_DELETE_SOURCE_INDEX] = source;
             for version in [SLICE_FORMAT_VERSION, SLICE_FORMAT_VERSION_FULL_CLEANUP] {
                 slice.format_version = version;
                 let error = import_dataset(ms.as_ref(), &slice, Path::new("/different/data"))
