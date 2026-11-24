@@ -345,10 +345,10 @@ When you can't (or don't want to) run the checks on your machine, dispatch the
 **Remote Sign-off** GitHub Actions workflow on a self-hosted runner:
 
 ```bash
-make signoff-remote                 # current branch
+make signoff-remote                 # current branch; prints the command that watches the run
 # equivalent to:
-gh workflow run signoff.yml -f branch=<your-branch>
-gh run watch --workflow signoff.yml
+gh workflow run signoff.yml -f branch=<your-branch>   # prints the created run's URL
+gh run watch <run-id>                                  # the number that URL ends in
 ```
 
 Sign-off runs only where it is accountable: your machine, or the Actions
@@ -447,11 +447,12 @@ even when the check is already green, which is the one case the success path
 deliberately skips. If the status post itself fails, the run says so and leaves
 **Attestation** showing the previous sign-off; re-dispatch or push to move it.
 
-Two cases the re-run cannot cover, both reported by the run rather than hidden:
-an **Attestation** run that is still in flight may already have read the status
-this verdict replaced, so it can finish green and needs re-running by hand; and
-a HEAD that only merges the base branch can *inherit* an earlier sign-off, which
-the failing status on HEAD does not veto ([#12357](https://github.com/spiceai/spiceai/issues/12357)).
+One case the re-run cannot cover, reported by the run rather than hidden: an
+**Attestation** run that is still in flight may already have read the status
+this verdict replaced, so it can finish green and needs re-running by hand. A
+HEAD that only merges the base branch cannot inherit past the failure, because
+**Attestation** rejects a failed sign-off on HEAD before it looks for one to
+inherit.
 
 A branch whose sign-off keeps running out of budget is contending for the pool
 rather than doing anything wrong. Remote runs already skip the branch-scoped
@@ -464,8 +465,12 @@ SSH key access to the host and `gh` auth on that machine.
 
 ### A cancelled Remote Sign-off is not a failed one
 
-`signoff.yml` sets `concurrency: signoff-<pr|branch>` with `cancel-in-progress`, so
-re-dispatching sign-off for a branch cancels the run before it. A cancelled job is
+`signoff.yml` cancels in progress at two levels: the workflow's concurrency group
+is keyed on the dispatch input (`signoff-<pr|branch>`), and the sign-off job's on
+the commit that input resolves to (`signoff-commit-<sha>`). So re-dispatching
+sign-off for a branch cancels the run before it, and so does dispatching
+`-f pr_number=<N>` for a commit a `-f branch=<branch>` run is already signing off,
+or the other way round. A cancelled job is
 killed by signal, and a run that was signalled judged nothing — so it must publish
 no verdict at all, in either direction: not the `failure` that says the branch's
 checks failed, and not the `success` that would clear a branch whose checks were
@@ -504,10 +509,10 @@ that passed and cost another 1-4 hour run:
 
 - Its own `Sign off` step completed, and the cancel signal landed in the window
   before the correction ran.
-- A second run signed the same commit off. The concurrency group keys on the
-  dispatch *input*, so `-f branch=my-branch` and `-f pr_number=123` for that same
-  branch are different groups: they do not cancel each other, and either can be
-  cancelled after the other has succeeded.
+- An earlier run had already signed the same commit off. Runs for one commit
+  share the sign-off job's commit-keyed group whichever input dispatched them, so
+  they cancel each other rather than overlap; but a re-dispatch for a commit that
+  is already signed off can itself be cancelled, and it then finds that `success`.
 
 **It reads until the commit stops changing.** The `if: cancelled()` step starts
 when the `Sign off` step is *marked* cancelled, which is before that step's
