@@ -934,7 +934,7 @@ async fn duckdb_binary_literal_filters_agree_with_local_evaluation() -> Result<(
 
             let app = AppBuilder::new("duckdb_binary_literal_filters")
                 .with_dataset(dataset("federated", None))
-                .with_dataset(dataset("local", Some("arrow")))
+                .with_dataset(dataset("local", Some("cayenne")))
                 .build();
 
             configure_test_datafusion();
