@@ -7469,19 +7469,44 @@ mod tests {
             )
             .await;
         }
-        assert_eq!(drain_ready(&mut receivers[0]), 2, "t0 applied the rows of 100 and 300");
+        assert_eq!(
+            drain_ready(&mut receivers[0]),
+            2,
+            "t0 applied the rows of 100 and 300"
+        );
         assert_eq!(drain_ready(&mut receivers[1]), 1, "t1 applied 200");
         assert_eq!(t0.committed(), 0, "t0 has checkpointed nothing");
 
         // The pump reconnects at the floor and the source sends the same commits
         // again. t0's checkpoint acknowledges the delete partway through.
-        deliver_one_commit(&source, &decoder, &routes, txn_with(&[(100, "x")]), 100, None)
-            .await;
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "x")]),
+            100,
+            None,
+        )
+        .await;
         t0.commit(300);
-        deliver_one_commit(&source, &decoder, &routes, txn_with(&[(101, "x")]), 200, None)
-            .await;
-        deliver_one_commit(&source, &decoder, &routes, txn_with(&[(100, "x")]), 300, None)
-            .await;
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(101, "x")]),
+            200,
+            None,
+        )
+        .await;
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "x")]),
+            300,
+            None,
+        )
+        .await;
         assert_eq!(
             drain_ready(&mut receivers[0]),
             0,
@@ -7496,8 +7521,15 @@ mod tests {
         // A commit staged for t0 but never placed in its mailbox (an eager hold a
         // reconnect discards) is still sent when the replay reaches it.
         t0.deliver(400);
-        deliver_one_commit(&source, &decoder, &routes, txn_with(&[(100, "x")]), 400, None)
-            .await;
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "x")]),
+            400,
+            None,
+        )
+        .await;
         assert_eq!(
             drain_ready(&mut receivers[0]),
             1,
@@ -7508,8 +7540,15 @@ mod tests {
         // sent again: its old mailbox went with the old stream.
         source.ack.register(&key("t0"), false);
         source.ack.promote_ready_members();
-        deliver_one_commit(&source, &decoder, &routes, txn_with(&[(100, "x")]), 400, None)
-            .await;
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "x")]),
+            400,
+            None,
+        )
+        .await;
         assert_eq!(
             drain_ready(&mut receivers[0]),
             1,
