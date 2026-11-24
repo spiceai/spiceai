@@ -83,6 +83,19 @@ pub fn redirect_continues_off_origin(chain: &[Url], next: &Url) -> bool {
     }
 }
 
+/// Why a client that sends a custom credential header refuses a redirect for which
+/// [`redirect_leaves_origin`] is true.
+pub const OFF_ORIGIN_REDIRECT_REFUSED: &str = "a request that carries a custom credential header follows a redirect only to its own scheme, host, and port. Configure the endpoint URL as the redirect target directly.";
+
+/// Whether a redirect to `next`, after the URLs in `chain` (the request's own URL first), leaves
+/// the request's own scheme, host, or port.
+#[must_use]
+pub fn redirect_leaves_origin(chain: &[Url], next: &Url) -> bool {
+    chain
+        .first()
+        .is_none_or(|own| own.origin() != next.origin())
+}
+
 /// Client options [`build_client`] does not apply; each must keep its default.
 const UNAPPLIED: &[ClientConfigKey] = &[
     ClientConfigKey::AllowInvalidCertificates,
@@ -200,6 +213,17 @@ impl DestinationRefused {
         Self {
             target: target.origin().ascii_serialization(),
             reason: Arc::from(REDIRECT_CHAIN_REFUSED),
+        }
+    }
+
+    /// The refusal of a redirect to `target` that [`redirect_leaves_origin`] reports for a request
+    /// that carries a custom credential header. It names only the target's origin, because a path
+    /// or query can hold secrets.
+    #[must_use]
+    pub fn off_origin(target: &Url) -> Self {
+        Self {
+            target: target.origin().ascii_serialization(),
+            reason: Arc::from(OFF_ORIGIN_REDIRECT_REFUSED),
         }
     }
 }

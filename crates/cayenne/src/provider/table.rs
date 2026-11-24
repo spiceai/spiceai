@@ -7374,6 +7374,16 @@ impl CayenneTableProvider {
         &self.staging_may_have_files
     }
 
+    /// Records that the staged append `staging_snapshot_id` may leave files
+    /// under `_staging/`, so the next write or open looks there. An append at
+    /// its final keys ([`Self::is_final_key_write`]) stages nothing and records
+    /// nothing.
+    pub(crate) fn mark_staging_may_have_files(&self, staging_snapshot_id: &str) {
+        if !self.is_final_key_write(staging_snapshot_id) {
+            self.staging_may_have_files.store(true, Ordering::Release);
+        }
+    }
+
     pub(crate) fn publication_outcome_unknown(&self) -> &AtomicBool {
         &self.publication_outcome_unknown
     }
@@ -11713,7 +11723,7 @@ impl CayenneTableProvider {
         staging_snapshot_id: &str,
         target_partitions: usize,
     ) -> Result<u64> {
-        self.staging_may_have_files().store(true, Ordering::Release);
+        self.mark_staging_may_have_files(staging_snapshot_id);
         let (row_count, _writer_ops, _stats_acc) = self
             .write_to_snapshot(
                 stream,
@@ -12222,7 +12232,14 @@ impl CayenneTableProvider {
             persisted_hi,
         }));
 
-        let force_staging_probe_on_startup = dataset_storage.is_some();
+        // A store-backed table's staging is only found by listing it, so its open
+        // lists `_staging/` for a write a crash left there. A table in the
+        // object-native location never stages: every write puts its files at
+        // their final keys, and what an unfinished one left is the orphan
+        // sweep's. Any other store-backed table may still stage a partitioned
+        // append (`begin_deferred_snapshot_append`) and recover it from here.
+        let force_staging_probe_on_startup = dataset_storage.is_some()
+            && !crate::metastore_layout::is_object_native_data_path(&table_metadata.path);
         // A replacement inherits the replaced instance's pins; any other
         // instance starts with none.
         let snapshot_dir_pins = snapshot_dir_pins.unwrap_or_default();
@@ -47262,6 +47279,17 @@ impl CayenneTableProvider {
         // own files.
         let protected_lookup_selection = lookup_selection.clone();
         let protected_pinned_lookup_index = pinned_lookup_index.clone();
+        // The file and protected-snapshot branches are wrapped in a key-deletion
+        // filter built from this scan's captured deletions, which include CDC
+        // deletes still held in the in-memory tier. A limit handed to those
+        // branches would cap the raw rows read (the Vortex scan limit, and the
+        // listing's truncation by file row counts) before the filter removes
+        // deleted ones, so the scan could return fewer rows than `limit` while more
+        // live rows exist. The branch builder's own guard reads only the durable
+        // deletion state, which does not see the in-memory tier. Keep the limit
+        // out of both branches whenever this scan applies a key-deletion filter;
+        // the `GlobalLimitExec` below still applies it over live rows.
+        let branch_limit = if need_pk_deletion { None } else { limit };
         let listing_scan_start = Instant::now();
         let main_plan_result = self
             .create_snapshot_scan_plan_with_config(
@@ -47269,7 +47297,7 @@ impl CayenneTableProvider {
                 &current_snapshot_id,
                 effective_projection.as_ref(),
                 scan_filters,
-                limit,
+                branch_limit,
                 scan_listing_config,
                 allow_sorted_ordering,
                 Some(Arc::clone(&read_schema)),
@@ -47300,7 +47328,7 @@ impl CayenneTableProvider {
                 state,
                 projection: effective_projection.as_ref(),
                 filters: scan_filters,
-                limit,
+                limit: branch_limit,
                 pk_indices_in_projection: &pk_indices_in_projection,
                 protected_snapshots: protected_map,
                 protected_files,
