@@ -701,6 +701,41 @@ async fn a_placed_dataset_keeps_working_across_session_credential_replacements()
     );
 }
 
+/// The log lines at `WARN` and above that every thread writes, for a test running
+/// in a process of its own.
+#[derive(Clone, Default)]
+struct Warnings(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Warnings {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Warnings {
+    fn capture() -> Self {
+        let warnings = Self::default();
+        let writer = warnings.clone();
+        tracing_subscriber::fmt()
+            .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .try_init()
+            .expect("no other subscriber in the test's process");
+        warnings
+    }
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock()).into_owned()
+    }
+}
+
+/// How `object_store` reports S3's `403` for the expired set.
+const REJECTED: &str = "The operation lacked the necessary privileges to complete";
+
 /// Control: a store whose credentials are never replaced fails once they expire,
 /// so the test above passes only because the store replaces them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -708,6 +743,7 @@ async fn control_a_dataset_whose_credentials_are_never_replaced_fails_once_they_
     let Some((issuer, directory)) = start(Refresh::Never).await else {
         return;
     };
+    let warnings = Warnings::capture();
     let (ctx, table) = open_placed_dataset(&issuer.rustfs, directory.path()).await;
     let outcome = workload(&ctx, &table, &issuer, |_| false).await;
     let Err((run, error)) = outcome else {
@@ -727,10 +763,27 @@ async fn control_a_dataset_whose_credentials_are_never_replaced_fails_once_they_
         run.expired, 1,
         "the step failed after the set expired: {error}"
     );
-    assert!(
-        !error.contains("deadline"),
-        "the step failed, rather than the run timing out: {error}"
-    );
+    // The step fails on the first request signed with the expired set, and says
+    // why. A commit published in the background can meet it first: its outcome
+    // is unknown, its warning names the rejection, and the step is refused
+    // until the dataset reads its state back.
+    let rejected = |text: &str| text.contains(REJECTED) && text.contains("InvalidAccessKeyId");
+    if error.contains(
+        "Dataset 'orders' (cayenne) is reading its state back after a change whose outcome is unknown",
+    ) {
+        let warnings = warnings.text();
+        assert!(
+            warnings.lines().any(|line| line.contains(
+                "Dataset 'orders' (cayenne) could not confirm whether its last change was saved"
+            ) && rejected(line)),
+            "the unconfirmed commit that stopped the step failed on the expired set: {warnings}"
+        );
+    } else {
+        assert!(
+            rejected(&error),
+            "the step failed on the expired set, not for another reason: {error}"
+        );
+    }
     // The store's only set is the one RustFS now refuses.
     let set = issuer
         .last
