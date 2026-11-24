@@ -206,11 +206,16 @@ impl ObjectNativeLocation {
         })
     }
 
+    /// The key prefix of the catalog's head log in `store`.
+    fn catalog_prefix(&self) -> object_store::path::Path {
+        object_store::path::Path::from(format!("{}/cayenne/v1/catalog", self.state_prefix))
+    }
+
     /// Open the catalog, creating it on first use, as the runtime opens it.
     async fn open(&self) -> Result<ObjectNativeCatalog, Box<dyn std::error::Error>> {
         let catalog = ObjectNativeCatalog::open_or_create_at_with_config(
             Arc::clone(&self.store),
-            object_store::path::Path::from(format!("{}/cayenne/v1/catalog", self.state_prefix)),
+            self.catalog_prefix(),
             &format!("{}/cayenne/v1", self.state_url),
             harness_native_config(),
         )
@@ -565,6 +570,32 @@ impl TestFixture {
     /// Get the database path for SQLite-specific verification
     pub fn db_path(&self) -> std::path::PathBuf {
         self.temp_dir.path().join("test.db")
+    }
+
+    /// The head commit of `dataset`'s log on an object-native fixture; `None` on
+    /// the SQLite backend.
+    /// # Errors
+    /// The catalog or the dataset's log could not be read.
+    pub async fn object_native_head_commit(
+        &self,
+        dataset: &str,
+    ) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+        let Some(location) = OBJECT_NATIVE_LOCATIONS
+            .lock()
+            .get(self.db_path().to_string_lossy().as_ref())
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let log = cayenne::metastore::object_native::dataset_log_at(
+            Arc::clone(&location.store),
+            &location.catalog_prefix(),
+            dataset,
+        )
+        .await?
+        .ok_or_else(|| format!("dataset '{dataset}' has no log"))?;
+        let (reader, _) = object_store_occ::headlog::Reader::open(location.store, log).await?;
+        Ok(Some(reader.state().head.commit))
     }
 
     /// Connection string for this fixture's catalog, which [`fixture_catalog`]
