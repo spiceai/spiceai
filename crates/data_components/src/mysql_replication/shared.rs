@@ -143,18 +143,16 @@ const DEFAULT_MEMBER_CHANNEL_CAPACITY: usize = 1024;
 const IDLE_TICK_CAP: Duration = Duration::from_secs(1);
 
 /// How long a single member's delivery may block the pump before we WARN and
-/// re-check shutdown. Purely observability + shutdown responsiveness: what the
-/// source sends meanwhile waits in the socket buffer, and the dump session's
-/// raised `net_write_timeout` keeps the source from dropping the connection.
+/// re-check shutdown. Purely observability + shutdown responsiveness: unread
+/// events wait in the socket buffer, and the raised `net_write_timeout` keeps
+/// the source from dropping the dump.
 const MEMBER_SEND_STALL_WARN: Duration = Duration::from_secs(5);
 
-/// Upper bound on the source head poll, which runs on the pump: a side
-/// connection hung on an unreachable source must not hold the pump for good,
-/// while a source slow to answer under load must still be polled.
+/// Bounds the head poll, which runs on the pump, so an unreachable source
+/// cannot stall it.
 const HEAD_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Upper bound on asking the source whether a silent dump still runs (see
-/// [`super::binlog::dump_silence_limit`]).
+/// Bounds the check of whether a silent dump is still running.
 const DUMP_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `(database, table)` of a member's source table — the routing key.
@@ -1923,8 +1921,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
         // Commit time of the transaction currently being read, in milliseconds, from
         // its GTID event; taken by the commit or statement that closes it.
         let mut current_txn_commit_ts_ms: Option<i64> = None;
-        // Restarted by every event and by every liveness check that does not
-        // find the dump gone, so the source is asked at most once per limit.
+        // Reset by each event and by each check that finds the dump running.
         let mut silent_since = Instant::now();
 
         'recv: loop {
@@ -1978,8 +1975,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                             );
                             break 'recv;
                         }
-                        // A source that could not be asked is asked again on
-                        // the next tick.
+                        // If the source could not be asked, retry next tick.
                         if gone == Some(false) {
                             silent_since = Instant::now();
                         }
@@ -2962,8 +2958,8 @@ async fn persist_all(source: &Arc<SharedSource>, last: &mut HashMap<MemberKey, P
     }
 }
 
-/// Count and log a dump connection that was lost mid-stream; the caller then
-/// reopens it from the persisted position.
+/// Records a lost dump connection; the caller reopens it from the persisted
+/// position.
 fn note_connection_lost(
     source: &SharedSource,
     reconnect_attempts: &mut u32,
@@ -2984,9 +2980,8 @@ fn note_connection_lost(
     );
 }
 
-/// Run `query` on the side connection, opening it if there is none, within
-/// `timeout`. On any failure the connection is dropped so the next call starts
-/// on a fresh one, and `None` is returned.
+/// Runs `query` on the side connection within `timeout`, opening the
+/// connection if needed. On failure, drops the connection and returns `None`.
 async fn side_query<T, E: std::fmt::Display>(
     source: &SharedSource,
     side_conn: &mut Option<Conn>,
@@ -3016,8 +3011,8 @@ async fn side_query<T, E: std::fmt::Display>(
     None
 }
 
-/// Whether the source no longer runs the dump `dump`, or `None` when the
-/// source could not be asked.
+/// Whether the source no longer runs `dump`, or `None` if it could not be
+/// asked.
 async fn dump_gone(
     source: &SharedSource,
     side_conn: &mut Option<Conn>,
@@ -3031,9 +3026,8 @@ async fn dump_gone(
         "dump liveness query",
         DUMP_LIVENESS_TIMEOUT,
         async |conn| -> std::result::Result<bool, mysql_async::Error> {
-            // A user always sees their own threads, so no `PROCESS` grant is
-            // needed; the command filter skips a reused id held by another kind
-            // of connection.
+            // Users see their own threads without a `PROCESS` grant. The
+            // command filter ignores the id if a non-dump connection reuses it.
             let (server_id, dumps_with_id) = conn
                 .exec_first::<(u64, u64), _, _>(
                     "SELECT @@server_id, (SELECT COUNT(*) FROM information_schema.PROCESSLIST \

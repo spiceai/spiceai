@@ -30,7 +30,7 @@ pub struct Mysql {
     container: Container,
     /// The source's name on the run's MySQL network.
     peer_host: String,
-    /// The connector path only; the harness's own `mysql` commands stay direct.
+    /// Proxies `spiced`'s connections only; harness commands connect directly.
     proxy: Option<PartitionProxy>,
 }
 

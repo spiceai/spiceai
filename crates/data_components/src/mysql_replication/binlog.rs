@@ -119,23 +119,18 @@ fn net_write_timeout_left_alone_warning(connection: &str, reason: &str) -> Strin
     )
 }
 
-/// How often the source is asked to send a heartbeat event while the dump has
-/// nothing else to send. Half the checkpoint interval (min 500ms) keeps idle
-/// persists within ~1.5× the interval.
+/// Heartbeat interval requested from the source for an idle dump: half the
+/// checkpoint interval, at least 500ms.
 fn dump_heartbeat_period(checkpoint_interval: Duration) -> Duration {
     (checkpoint_interval / 2).max(Duration::from_millis(500))
 }
 
-/// How long a dump may deliver nothing, neither an event nor a heartbeat,
-/// before the source is asked whether the dump is still running.
+/// How long a dump may receive nothing, not even a heartbeat, before the source
+/// is asked whether it still runs the dump.
 ///
-/// A dump client never writes, so a connection the source closed while the
-/// network dropped its packets stays open on the client forever: no error and
-/// no end of stream ever arrives. The source sends a heartbeat at least every
-/// [`dump_heartbeat_period`] while it has nothing else to send, so three missed
-/// heartbeats (at least 10 s) make the dump suspect. Silence alone is not
-/// proof: an event arrives only once it is complete, so a large event on a slow
-/// link is silent for as long as it takes to transfer.
+/// A dump client never writes, so if the source closes the connection during a
+/// network partition, the client may never see an error. Silence alone is not
+/// proof of that: a large event on a slow link arrives only once complete.
 pub(super) fn dump_silence_limit(checkpoint_interval: Duration) -> Duration {
     dump_heartbeat_period(checkpoint_interval)
         .saturating_mul(3)
@@ -247,26 +242,24 @@ pub(super) struct OpenedDump {
     pub identity: DumpIdentity,
 }
 
-/// What names a dump on its source, so the source can later be asked whether
-/// it still runs it.
+/// Identifies a dump on its source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct DumpIdentity {
-    /// The dump connection's id, which names its thread in the process list.
+    /// Connection id of the dump, as shown in the source's process list.
     pub thread_id: u64,
-    /// The source's `@@server_id`, which tells a failover target apart.
+    /// The source's `@@server_id`, to detect a failover.
     pub server_id: u64,
     pub opened_at: std::time::Instant,
 }
 
 impl DumpIdentity {
-    /// Whether the source's answers show it no longer runs this dump: the
-    /// thread is gone, the answer came from a different server, or the source
-    /// restarted since the dump opened (connection ids start again at 1, so a
-    /// later dump may hold this one's id).
+    /// Whether the dump is gone: its thread ended, a different server answered,
+    /// or the source restarted since the dump opened (a new dump may then reuse
+    /// its id).
     pub(super) fn is_gone(&self, server_id: u64, uptime: Duration, dumps_with_id: u64) -> bool {
         dumps_with_id == 0
             || server_id != self.server_id
-            // A second of slack: uptime is reported in whole seconds.
+            // Uptime is reported in whole seconds.
             || uptime.saturating_add(Duration::from_secs(1)) < self.opened_at.elapsed()
     }
 }
@@ -282,8 +275,7 @@ pub(super) async fn open_binlog_stream(
     gtid: &GtidSet,
 ) -> std::result::Result<OpenedDump, mysql_async::Error> {
     let mut conn = Conn::new(params.opts.clone()).await?;
-    // `CONNECTION_ID()` rather than the handshake's id, which carries only 32
-    // bits where MariaDB's are 64.
+    // The handshake id is 32-bit; MariaDB ids are 64-bit.
     let (thread_id, server_id) = mysql_async::prelude::Queryable::query_first::<(u64, u64), _>(
         &mut conn,
         "SELECT CONNECTION_ID(), @@server_id",
@@ -1664,13 +1656,8 @@ mod tests {
         let up_for_an_hour = Duration::from_secs(3600);
         assert!(!dump.is_gone(1, up_for_an_hour, 1), "still running");
         assert!(dump.is_gone(1, up_for_an_hour, 0), "thread ended");
-        // A failover target answers with its own server id, even when a dump
-        // there holds the same connection id.
         assert!(dump.is_gone(2, up_for_an_hour, 1), "different server");
-        // Up for less time than the dump has existed: the source restarted, and
-        // a dump holding the id now is a later one.
         assert!(dump.is_gone(1, Duration::from_secs(30), 1), "restarted");
-        // Whole-second uptime just short of the dump's age is not a restart.
         assert!(
             !dump.is_gone(1, Duration::from_secs(60), 1),
             "uptime rounding"

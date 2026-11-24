@@ -1,8 +1,7 @@
 name: mysql-cdc-partition
 description: >
-  MySQL CDC reconnects after a packet-dropping network partition hides the
-  source closing both the binlog stream and its side connections; a busy and
-  a quiet dataset both remain exactly equal to their source tables.
+  MySQL CDC resumes after a network partition during which the source closed
+  the runtime's connections, and both datasets match the source.
 
 sources:
   src: { kind: mysql, partitionable: true }
@@ -64,8 +63,8 @@ steps:
           DECLARE victims CURSOR FOR
             SELECT id, command
             FROM information_schema.processlist
-            -- Each instance connects with its own database, so concurrent
-            -- instances kill only their own connections.
+            -- Each instance uses its own database, so it kills only its own
+            -- connections.
             WHERE id <> CONNECTION_ID()
               AND db = DATABASE()
               AND host NOT LIKE '127.0.0.1:%'
@@ -93,15 +92,14 @@ steps:
         DELIMITER ;
         CALL kill_spiced_connections();
         DROP PROCEDURE kill_spiced_connections;
-  # Time is the fault under test: MySQL's closes stay lost while writes keep
-  # entering the binlog and the client-side sockets remain half-open.
+  # Writes continue during the partition, so the runtime falls behind.
   - sleep: 20s
   - source-query: { src: "SELECT count(*) AS recent FROM busy WHERE id = 1 AND v >= 20" }
     expect: { rows: [['1']] }
     eventually: 60s
   - heal-source: src
 
-  # Only a resumed change stream brings either table level with the source.
+  # Only a resumed change stream can bring both tables up to date.
   - source-exec: { src: "UPDATE quiet SET v = v + 100 WHERE id = 2" }
   - stop-background: busy-writer
   - query: SELECT id, v FROM busy

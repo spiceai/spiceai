@@ -69,8 +69,8 @@ pub trait Source: Send + Sync {
     /// The source's container; `None` for a source with no server (files).
     fn container(&self) -> Option<&Container>;
 
-    /// Changes the harness-owned connector path between connected and
-    /// black-holed. Returns false for sources without that path.
+    /// Partitions or heals the connector path. Returns false for sources
+    /// without one.
     fn set_partitioned(&self, _partitioned: bool) -> bool {
         false
     }

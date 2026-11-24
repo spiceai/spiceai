@@ -14,12 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! A TCP proxy whose partition withholds an upstream close as well as data.
-//!
-//! Toxiproxy's timeout toxic delivers the queued close when the toxic is
-//! removed, so the client sees EOF and recovers. Modeling a lost close needs a
-//! proxy that keeps the client connection open and continues answering its TCP
-//! keepalive probes.
+//! A TCP proxy that simulates a network partition, including a lost close from
+//! the upstream. Toxiproxy cannot model this: its timeout toxic delivers the
+//! close once the toxic is removed.
 
 use std::future::pending;
 use std::io;
@@ -109,9 +106,8 @@ async fn accept_connections(
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                // A client that gives up before it is accepted fails only its
-                // own accept; the pause keeps a persistent error (too many open
-                // files) from spinning.
+                // Skip a failed accept; the pause avoids spinning on a
+                // persistent error such as too many open files.
                 let Ok((client, _)) = accepted else {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     continue;
