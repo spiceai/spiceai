@@ -49,7 +49,10 @@ pub enum RequestPages {
     /// The source paginates. Each row stores the path and query of the page
     /// it came from, and the request's body, so the rows of one response,
     /// now or on a later fetch, may carry several paths and queries.
-    Paginated,
+    Paginated {
+        /// Whether the fetch followed a link to another page.
+        followed_pages: bool,
+    },
 }
 
 /// Completion of one dedicated HTTP source execution, across all its partitions.
@@ -105,12 +108,15 @@ impl HttpFetchCompletion {
     ///
     /// A paginated source answers [`RequestPages::Paginated`] even for a
     /// response that fit on one page, because the stored rows it replaces may
-    /// span several.
+    /// span several. The classification also records whether this fetch followed
+    /// another page, for destinations that can store only single-page responses.
     #[must_use]
     pub fn complete_request(&self) -> Option<RequestPages> {
         (self.partitions.len() == 1 && self.is_complete()).then(|| {
             if self.paginated_source || self.followed_page.load(Ordering::Acquire) {
-                RequestPages::Paginated
+                RequestPages::Paginated {
+                    followed_pages: self.followed_page.load(Ordering::Acquire),
+                }
             } else {
                 RequestPages::Single
             }

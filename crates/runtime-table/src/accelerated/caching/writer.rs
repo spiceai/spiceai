@@ -58,8 +58,8 @@ use tokio_util::task::TaskTracker;
 use super::{
     CACHE_NAMESPACE_COLUMN, CACHE_REQUEST_COLUMN, CACHE_WRITE_CHANNEL_CAPACITY,
     CACHE_WRITE_FLUSH_INTERVAL_MS, CacheKeyClaim, CacheRefreshHelper, CacheWriteHealth,
-    CacheWriteRequest, InFlightRevalidations, REQUEST_KEY_COLUMNS, namespace_filter_expr,
-    request_entry_key, stamp_namespace_column,
+    CacheWriteRequest, InFlightRevalidations, REQUEST_KEY_COLUMNS, cache_write_pages,
+    namespace_filter_expr, request_entry_key, stamp_namespace_column,
 };
 
 /// Maximum time a cache fill waits for its writer's queue admission.
@@ -730,7 +730,16 @@ impl CacheSinkWriter {
             .column_with_name(CACHE_REQUEST_COLUMN)
             .and_then(|_| request_entry_key(&request.filters));
         let batches = self.stamp_request_key(entry_key.as_deref(), batches, reservation)?;
-        let batches = if request.pages == RequestPages::Paginated {
+        let pages = cache_write_pages(
+            request.pages,
+            self.schema.column_with_name(CACHE_REQUEST_COLUMN).is_some(),
+        )
+        .ok_or_else(|| {
+            DataFusionError::Plan(
+                "A cache fill that followed pages requires request grouping".into(),
+            )
+        })?;
+        let batches = if matches!(pages, RequestPages::Paginated { .. }) {
             let filters = canonical.as_ref().ok_or_else(|| {
                 DataFusionError::Plan(
                     "A cache fill from a paginated source requires filters that name one request"
@@ -893,9 +902,10 @@ impl CacheSinkWriter {
         claim: Option<CacheKeyClaim>,
         completed: Option<oneshot::Sender<Result<()>>>,
     ) -> Result<()> {
-        if request.pages == RequestPages::Paginated
-            && self.schema.column_with_name(CACHE_REQUEST_COLUMN).is_none()
-        {
+        let Some(pages) = cache_write_pages(
+            request.pages,
+            self.schema.column_with_name(CACHE_REQUEST_COLUMN).is_some(),
+        ) else {
             tracing::debug!(
                 "Declining paginated cache population: the destination has no request grouping column"
             );
@@ -905,7 +915,8 @@ impl CacheSinkWriter {
                 let _ = completed.send(Ok(()));
             }
             return Ok(());
-        }
+        };
+        request.pages = pages;
         let mut claim = claim.ok_or_else(|| {
             DataFusionError::Internal(
                 "Native cache writes require exclusive scope ownership".into(),
@@ -1610,85 +1621,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn caching_keyed_write_scopes_match_stamps_for_every_write_shape() {
+    async fn caching_write_scopes_match_stamps_for_every_write_shape() {
         use arrow::array::StringArray;
         use arrow::datatypes::Field;
         use runtime_acceleration::change_sink::ChangeSinkContext;
         use runtime_acceleration::change_sink::provider::ProviderChangeSinkBackend;
 
-        let source_schema = Arc::new(Schema::new(vec![
-            Field::new("request_path", DataType::Utf8, false),
-            Field::new("request_query", DataType::Utf8, false),
-            Field::new("request_body", DataType::Utf8, false),
-            Field::new("content", DataType::Utf8, false),
-        ]));
-        let storage_schema = Arc::new(
-            super::super::extend_schema_with_cache_request(
-                "scope_test",
-                &super::super::extend_schema_with_cache_namespace("scope_test", &source_schema)
-                    .expect("namespace schema"),
-            )
-            .expect("entry schema"),
-        );
-        let accelerator: Arc<dyn TableProvider> = Arc::new(
-            data_components::arrow::write::MemTable::try_new(
-                Arc::clone(&storage_schema),
-                vec![vec![]],
-            )
-            .expect("storage"),
-        );
-        let dataset = TableReference::bare("scope_test");
-        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
-        let sink = ChangeSink::new(
-            Arc::new(
-                ProviderChangeSinkBackend::new(ChangeSinkContext::new(
-                    dataset.clone(),
-                    accelerator,
-                ))
-                .with_ordered_replacement(),
-            ),
-            SessionContext::new(),
-            &Handle::current(),
-            8,
-        );
-        let sender = CacheWriteSender::from_sink(
-            sink.clone(),
-            Arc::clone(&storage_schema),
-            dataset,
-            RuntimeStatus::new(),
-            Arc::new(AtomicI64::new(0)),
-            Arc::clone(&pool),
-        );
-        let CacheWriteSender::Sink(writer) = sender else {
-            panic!("native writer");
-        };
-        let filters = vec![col("request_path").eq(lit("/pages"))];
-        // The request omits query; the response's first page names cursor=2.
-        let key = r#"{"request_body":"","request_path":"/pages"}"#;
-        let expected_scope = vec![
-            namespace_filter_expr("public"),
-            col(CACHE_REQUEST_COLUMN).eq(lit(key)),
-        ];
-        for pages in [RequestPages::Single, RequestPages::Paginated] {
-            for replaces_existing in [false, true] {
-                for empty in [false, true] {
-                    let batch = if empty {
-                        RecordBatch::new_empty(Arc::clone(&source_schema))
-                    } else {
-                        RecordBatch::try_new(
-                            Arc::clone(&source_schema),
-                            vec![
-                                Arc::new(StringArray::from(vec!["/pages"])),
-                                Arc::new(StringArray::from(vec!["cursor=2"])),
-                                Arc::new(StringArray::from(vec![""])),
-                                Arc::new(StringArray::from(vec!["B"])),
-                            ],
+        for keyed in [false, true] {
+            let source_schema = Arc::new(Schema::new(vec![
+                Field::new("request_path", DataType::Utf8, false),
+                Field::new("request_query", DataType::Utf8, false),
+                Field::new("request_body", DataType::Utf8, false),
+                Field::new("content", DataType::Utf8, false),
+            ]));
+            let storage_schema = if keyed {
+                Arc::new(
+                    super::super::extend_schema_with_cache_request(
+                        "scope_test",
+                        &super::super::extend_schema_with_cache_namespace(
+                            "scope_test",
+                            &source_schema,
                         )
-                        .expect("response")
-                    };
-                    let reservation = MemoryConsumer::new("scope test").register(&pool);
-                    let prepared = writer
-                        .prepare(
+                        .expect("namespace schema"),
+                    )
+                    .expect("entry schema"),
+                )
+            } else {
+                Arc::new(
+                    super::super::extend_schema_with_cache_namespace("scope_test", &source_schema)
+                        .expect("namespace schema"),
+                )
+            };
+            let accelerator: Arc<dyn TableProvider> = Arc::new(
+                data_components::arrow::write::MemTable::try_new(
+                    Arc::clone(&storage_schema),
+                    vec![vec![]],
+                )
+                .expect("storage"),
+            );
+            let dataset = TableReference::bare("scope_test");
+            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let sink = ChangeSink::new(
+                Arc::new(
+                    ProviderChangeSinkBackend::new(ChangeSinkContext::new(
+                        dataset.clone(),
+                        accelerator,
+                    ))
+                    .with_ordered_replacement(),
+                ),
+                SessionContext::new(),
+                &Handle::current(),
+                8,
+            );
+            let sender = CacheWriteSender::from_sink(
+                sink.clone(),
+                Arc::clone(&storage_schema),
+                dataset,
+                RuntimeStatus::new(),
+                Arc::new(AtomicI64::new(0)),
+                Arc::clone(&pool),
+            );
+            let CacheWriteSender::Sink(writer) = sender else {
+                panic!("native writer");
+            };
+            let filters = vec![col("request_path").eq(lit("/pages"))];
+            // The request omits query; the response's first page names cursor=2.
+            let key = r#"{"request_body":"","request_path":"/pages"}"#;
+            let expected_scope = if keyed {
+                vec![
+                    namespace_filter_expr("public"),
+                    col(CACHE_REQUEST_COLUMN).eq(lit(key)),
+                ]
+            } else {
+                vec![
+                    col("request_path").eq(lit("/pages")),
+                    col("request_query").eq(lit("cursor=2")),
+                    col("request_body").eq(lit("")),
+                    namespace_filter_expr("public"),
+                ]
+            };
+            for pages in [
+                RequestPages::Single,
+                RequestPages::Paginated {
+                    followed_pages: false,
+                },
+                RequestPages::Paginated {
+                    followed_pages: true,
+                },
+            ] {
+                for replaces_existing in [false, true] {
+                    for empty in [false, true] {
+                        let batch = if empty {
+                            RecordBatch::new_empty(Arc::clone(&source_schema))
+                        } else {
+                            RecordBatch::try_new(
+                                Arc::clone(&source_schema),
+                                vec![
+                                    Arc::new(StringArray::from(vec!["/pages"])),
+                                    Arc::new(StringArray::from(vec!["cursor=2"])),
+                                    Arc::new(StringArray::from(vec![""])),
+                                    Arc::new(StringArray::from(vec!["B"])),
+                                ],
+                            )
+                            .expect("response")
+                        };
+                        let reservation = MemoryConsumer::new("scope test").register(&pool);
+                        if !keyed && empty {
+                            continue;
+                        }
+                        let prepared = writer.prepare(
                             CacheWriteRequest {
                                 batches: vec![batch],
                                 filters: filters.clone(),
@@ -1699,33 +1740,61 @@ mod tests {
                             },
                             &reservation,
                             false,
-                        )
-                        .expect("prepare");
-                    let rows = match &prepared {
-                        ChangeBatch::Replace { rows, .. } if replaces_existing => rows,
-                        ChangeBatch::AppendScoped { rows, .. } if !replaces_existing => rows,
-                        other => panic!("unexpected write: {other:?}"),
-                    };
-                    assert_eq!(rows.scope().filters(), expected_scope);
-                    assert_eq!(prepared.num_rows(), usize::from(!empty));
-                    for batch in rows.rows().batches() {
-                        let keys = batch
-                            .column_by_name(CACHE_REQUEST_COLUMN)
-                            .expect("entry column")
-                            .as_any()
-                            .downcast_ref::<StringArray>()
-                            .expect("entry strings");
-                        assert_eq!(
-                            keys.iter().collect::<Vec<_>>(),
-                            if empty { vec![] } else { vec![Some(key)] }
                         );
+                        if !keyed
+                            && pages
+                                == (RequestPages::Paginated {
+                                    followed_pages: true,
+                                })
+                        {
+                            assert_eq!(
+                                prepared
+                                    .expect_err("followed pages need grouping")
+                                    .to_string(),
+                                "Error during planning: A cache fill that followed pages requires request grouping"
+                            );
+                            continue;
+                        }
+                        let prepared = prepared.expect("prepare");
+                        let rows = match &prepared {
+                            ChangeBatch::Replace { rows, .. } if replaces_existing => rows,
+                            ChangeBatch::AppendScoped { rows, .. } if !replaces_existing => rows,
+                            other => panic!("unexpected write: {other:?}"),
+                        };
+                        assert_eq!(rows.scope().filters(), expected_scope);
+                        assert_eq!(prepared.num_rows(), usize::from(!empty));
+                        for batch in rows.rows().batches() {
+                            let content = batch
+                                .column_by_name("content")
+                                .expect("content")
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .expect("strings");
+                            assert_eq!(
+                                content.iter().collect::<Vec<_>>(),
+                                if empty { vec![] } else { vec![Some("B")] }
+                            );
+                            if !keyed {
+                                continue;
+                            }
+                            let keys = batch
+                                .column_by_name(CACHE_REQUEST_COLUMN)
+                                .expect("entry column")
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .expect("entry strings");
+                            assert_eq!(
+                                keys.iter().collect::<Vec<_>>(),
+                                if empty { vec![] } else { vec![Some(key)] }
+                            );
+                        }
                     }
                 }
             }
+            sink.close(Duration::from_secs(5))
+                .await
+                .expect("close sink");
         }
-        sink.close(Duration::from_secs(5))
-            .await
-            .expect("close sink");
     }
 
     fn foreign_buffer(buffer: Buffer, owners: &mut Vec<Weak<Buffer>>) -> Buffer {

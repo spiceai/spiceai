@@ -1532,11 +1532,26 @@ pub struct CacheWriteRequest {
     /// upsert filter set so concurrent writers in different namespaces never
     /// overwrite each other's rows for the same request entry.
     pub namespace_id: Arc<str>,
-    /// Whether the response is one page, whose rows all store the request's
-    /// own path, query and body, or several, whose rows store each page's own
-    /// path and query. Paginated writes select the pages matching the request
-    /// predicates; every selected row shares the request's entry key.
+    /// Whether the source paginates and whether this fetch followed another page.
+    /// With request grouping, paginated writes select pages matching the request
+    /// predicates and stamp every selected row with the request's entry key.
+    /// Without it, only a single-page response can use its row dimensions as scope.
     pub pages: RequestPages,
+}
+
+/// Selects request scoping supported by the destination. Without request grouping,
+/// only responses that stayed on one page can use the row's dimensions as scope.
+fn cache_write_pages(pages: RequestPages, stores_request_groups: bool) -> Option<RequestPages> {
+    match (pages, stores_request_groups) {
+        (
+            RequestPages::Paginated {
+                followed_pages: true,
+            },
+            false,
+        ) => None,
+        (_, false) => Some(RequestPages::Single),
+        (_, true) => Some(pages),
+    }
 }
 
 /// Receiver half of the cache write channel
@@ -3429,7 +3444,9 @@ impl CacheRefreshHelper {
                 // A group stored under a request key may span pages; one
                 // stored without it is one path, query and body.
                 pages: if entry.request_key.is_some() {
-                    RequestPages::Paginated
+                    RequestPages::Paginated {
+                        followed_pages: true,
+                    }
                 } else {
                     RequestPages::Single
                 },
@@ -3552,13 +3569,9 @@ impl CacheRefreshHelper {
         let complete = completion
             .as_ref()
             .and_then(|completion| {
-                if stores_paginated_responses {
-                    completion.complete_request()
-                } else {
-                    completion
-                        .is_complete_single_request()
-                        .then_some(RequestPages::Single)
-                }
+                completion
+                    .complete_request()
+                    .and_then(|pages| cache_write_pages(pages, stores_paginated_responses))
             })
             .filter(|_| memory_pool.is_none() || charge.is_some());
 
@@ -5849,42 +5862,59 @@ mod pool_tests {
     }
 
     #[tokio::test]
-    async fn caching_legacy_sink_declines_paginated_admission_without_changing_rows() {
+    async fn caching_legacy_sink_admits_only_single_page_responses() {
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
         let (child, sink, _) = target(&pool, vec![row("old")]);
         let filters = vec![col("request_path").eq(lit("/items"))];
         for wait in [false, true] {
-            let key = compute_cache_key_from_filters_and_namespace(&filters, "public");
-            let ClaimOutcome::Leader(claim) =
-                CacheKeyClaim::acquire(&child.in_flight, key.clone(), None)
-            else {
-                panic!("exclusive claim");
-            };
-            let request = CacheWriteRequest {
-                batches: vec![row("new")],
-                filters: filters.clone(),
-                cache_key: key,
-                namespace_id: "public".into(),
-                replaces_existing: true,
-                pages: RequestPages::Paginated,
-            };
-            if wait {
-                child
-                    .writer
-                    .send_claimed_and_wait(request, claim)
-                    .await
-                    .expect("declined publication");
-            } else {
-                child
-                    .writer
-                    .send_claimed(request, claim)
-                    .await
-                    .expect("declined admission");
+            for followed_pages in [true, false] {
+                let key = compute_cache_key_from_filters_and_namespace(&filters, "public");
+                let ClaimOutcome::Leader(claim) =
+                    CacheKeyClaim::acquire(&child.in_flight, key.clone(), None)
+                else {
+                    panic!("exclusive claim");
+                };
+                let request = CacheWriteRequest {
+                    batches: vec![row(if followed_pages {
+                        "declined"
+                    } else if wait {
+                        "newer"
+                    } else {
+                        "new"
+                    })],
+                    filters: filters.clone(),
+                    cache_key: key,
+                    namespace_id: "public".into(),
+                    replaces_existing: true,
+                    pages: RequestPages::Paginated { followed_pages },
+                };
+                if wait {
+                    child
+                        .writer
+                        .send_claimed_and_wait(request, claim)
+                        .await
+                        .expect("declined publication");
+                } else {
+                    child
+                        .writer
+                        .send_claimed(request, claim)
+                        .await
+                        .expect("declined admission");
+                }
+                sink.flush().await.expect("flush");
+                assert_eq!(
+                    contents(&child.accelerator).await,
+                    vec![if followed_pages && !wait {
+                        "old"
+                    } else if wait && !followed_pages {
+                        "newer"
+                    } else {
+                        "new"
+                    }]
+                );
+                assert!(child.in_flight.lock().is_empty());
+                assert_eq!(pool.reserved(), 0);
             }
-            sink.flush().await.expect("flush");
-            assert_eq!(contents(&child.accelerator).await, vec!["old"]);
-            assert!(child.in_flight.lock().is_empty());
-            assert_eq!(pool.reserved(), 0);
         }
         sink.close(Duration::from_secs(5))
             .await
