@@ -22,8 +22,8 @@
 //!
 //! Two more controls serve protocol replays: a read gate that holds plain GETs
 //! of chosen paths, so a reader can read a head and fetch what it lists later,
-//! and a store clock that runs ahead, stamping each object's `LastModified`
-//! when it is written, as a real store does.
+//! and a store clock that runs ahead of or behind the process's, stamping each
+//! object's `LastModified` when it is written, as a real store does.
 use std::{
     collections::{BTreeMap, HashMap},
     fmt,
@@ -102,7 +102,8 @@ struct State {
     /// GETs waiting at the gate now.
     gated: usize,
     /// How far the store's clock runs ahead of the inner store's, in
-    /// milliseconds. Each write takes the offset current when it lands.
+    /// milliseconds; negative when it runs behind. Each write takes the offset
+    /// current when it lands.
     clock_offset_ms: i64,
     /// The clock offset each object was last written at, which every GET, HEAD
     /// and LIST adds to its `LastModified`, so an object's time stays fixed
@@ -359,6 +360,15 @@ impl FaultStore {
         let by = i64::try_from(by.as_millis()).unwrap_or(i64::MAX);
         let mut state = self.shared.state.lock();
         state.clock_offset_ms = state.clock_offset_ms.saturating_add(by);
+    }
+
+    /// Run the store's clock behind by `by`: an object written from now on
+    /// carries a `LastModified` that much earlier than the inner store gives
+    /// it, as a store whose clock lags the process's does.
+    pub fn set_clock_back(&self, by: std::time::Duration) {
+        let by = i64::try_from(by.as_millis()).unwrap_or(i64::MAX);
+        let mut state = self.shared.state.lock();
+        state.clock_offset_ms = state.clock_offset_ms.saturating_sub(by);
     }
 
     /// Wait at the read gate while it holds `path`.

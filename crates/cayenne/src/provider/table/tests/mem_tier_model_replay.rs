@@ -941,13 +941,16 @@ async fn control_witness(text: &str) {
         .expect("FAIL witness");
     // The split model has extra phase actions. On the one-call engine these
     // boundaries do not exist; the mutation inserts its second call between
-    // CkStage and CkPublish, with the partial commit exposed at CkStage.
+    // CkStage and CkPublish, with the partial commit exposed at CkStage. The
+    // engine reserves the seal's sequence inside its capture, so the late
+    // reservation the unreserved model makes in `SealReserve` has no boundary
+    // either: an apply replayed after `SealCapture` lands after that reservation.
     let actions = trace["actions"]
         .as_array()
         .expect("actions")
         .iter()
         .map(|a| a.as_str().expect("action"))
-        .filter(|a| !matches!(*a, "CkStageRest" | "SealStageRest"))
+        .filter(|a| !matches!(*a, "CkStageRest" | "SealStageRest" | "SealReserve"))
         .map(str::to_string)
         .collect::<Vec<_>>();
     let mut counts = Counts::default();
@@ -978,6 +981,79 @@ async fn mem_tier_model_replay_control_one_call() {
         "../../../../tests/traces/mem-tier-no-one-call.jsonl"
     ))
     .await;
+}
+/// A second seal acknowledges an apply that landed while the first seal was
+/// encoding its shadow rows. The shadow's sequence must be below that apply's
+/// delete, or the superseded shadow row is visible beside its replacement after
+/// a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mem_tier_model_replay_control_capture_reservation() {
+    control_witness(include_str!(
+        "../../../../tests/traces/mem-tier-no-capture-reservation.jsonl"
+    ))
+    .await;
+}
+
+/// After two seals and a restart, a bake must leave the key with one visible
+/// row: the second seal's tombstone hides the first seal's inline shadow, and
+/// that tombstone is above every snapshot the bake folds, so the bake must not
+/// prune it. The engine and the model must agree on this trace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mem_tier_model_replay_bake_after_two_seals() {
+    let actions: Vec<String> = [
+        "Upsert(0, 10)",
+        "CkCapture",
+        "CkPrecompute",
+        "CkStage",
+        "CkPublish",
+        "Upsert(0, 11)",
+        "CkEnd",
+        "SealCapture",
+        "SealStage",
+        "SealEnd",
+        "Upsert(0, 12)",
+        "SealCapture",
+        "SealStage",
+        "SealEnd",
+        "Crash",
+        "Recover",
+        "Bake",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    let model = cayenne_metastore_model::mem_tier_steps("mem-tier-seal-delete-only", &actions)
+        .expect("enabled model trace");
+    let last = model.last().expect("step");
+    assert_eq!(
+        last.live_rows,
+        vec![(0, 12), (1, 2)],
+        "the model keeps one row"
+    );
+    for (backend, run) in [
+        (Backend::Object, "mem-tier-seal-delete-only"),
+        (Backend::Sqlite, "mem-tier-seal-delete-only-sqlite"),
+    ] {
+        let mut counts = Counts::default();
+        let failures = replay(backend, run, &actions, &mut counts).await;
+        eprintln!("bake after two seals {backend:?} {counts:?}");
+        assert_eq!(
+            counts.bakes_committed, 1,
+            "{backend:?}: the bake must commit"
+        );
+        // The only delete is key 0's, from the second seal, above every snapshot
+        // the bake folds: pruning it would leave the first seal's shadow
+        // unhidden.
+        assert_eq!(
+            counts.bake_pruned_entries, 0,
+            "{backend:?}: the bake must keep the delete above the snapshots it folds"
+        );
+        assert!(
+            failures.is_empty(),
+            "{backend:?}: {} divergences (traces printed above)",
+            failures.len()
+        );
+    }
 }
 
 async fn log_records(disk: &Disk, label: &str) -> Vec<(u64, Vec<&'static str>)> {

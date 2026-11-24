@@ -468,6 +468,12 @@ pub trait CatalogConnector: Send + Sync {
     fn initialization(&self) -> ComponentInitialization {
         ComponentInitialization::default()
     }
+
+    /// The OAuth client ID whose user tokens, sent with a request, load a catalog that
+    /// initializes on trigger.
+    fn user_token_client_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Trait for catalog providers that can report partition metadata labels for their tables.
