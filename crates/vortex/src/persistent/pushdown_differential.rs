@@ -229,3 +229,54 @@ fn projections_are_pushed_whole_or_not_at_all() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// A list cast stays above the scan unless Vortex evaluates its element cast. Vortex has no
+/// cast from a fixed-size list to a list, so pushing `array_length(CAST(f AS INT[]))` over a
+/// `FixedSizeList` column failed the read with "No `CastKernel` to cast canonical array
+/// `vortex.fixed_size_list`"; above the scan the filter answers as `DataFusion` does.
+#[tokio::test]
+async fn a_fixed_size_list_cast_to_a_list_stays_above_the_scan() -> anyhow::Result<()> {
+    let ctx = TestSessionContext::with_nested_functions(true);
+    ctx.session
+        .sql(
+            "COPY (SELECT 1 AS id, arrow_cast(make_array(1, 2), 'FixedSizeList(2, Int32)') AS f \
+             UNION ALL SELECT 2 AS id, arrow_cast(NULL, 'FixedSizeList(2, Int32)') AS f) \
+             TO '/fixed_size_list/' STORED AS vortex",
+        )
+        .await?
+        .collect()
+        .await?;
+    ctx.session
+        .sql("CREATE EXTERNAL TABLE fsl STORED AS vortex LOCATION '/fixed_size_list/'")
+        .await?
+        .collect()
+        .await?;
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM fsl WHERE array_length(CAST(f AS INT[])) = 2",
+            vec![1],
+        ),
+        (
+            "SELECT id FROM fsl WHERE CAST(f AS BIGINT[]) IS NOT NULL",
+            vec![1],
+        ),
+        ("SELECT id FROM fsl WHERE CAST(f AS INT[]) IS NULL", vec![2]),
+    ] {
+        let batches = ctx.session.sql(sql).await?.collect().await?;
+        let ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                datafusion::arrow::compute::cast(batch.column(0), &arrow_schema::DataType::Int64)
+                    .expect("ids cast to Int64")
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                    .expect("Int64 ids")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, expected, "{sql}");
+    }
+    Ok(())
+}

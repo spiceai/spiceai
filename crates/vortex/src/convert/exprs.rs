@@ -1054,6 +1054,25 @@ fn vortex_evaluates_cast(source: &DataType, target: &DataType) -> bool {
     static EVALUATES: LazyLock<DashMap<(DataType, DataType), bool>> =
         LazyLock::new(DashMap::default);
 
+    match (source, target) {
+        // A list cast casts each element, so it is evaluated as its element cast is, with the
+        // same exclusion of decimal-to-floating casts as a column's. Casting nullable elements
+        // to non-nullable ones fails on a null element.
+        (
+            DataType::List(from) | DataType::LargeList(from),
+            DataType::List(to) | DataType::LargeList(to),
+        ) => {
+            return (to.is_nullable() || !from.is_nullable())
+                && !(is_decimal(from.data_type()) && to.data_type().is_floating())
+                && vortex_evaluates_cast(from.data_type(), to.data_type());
+        }
+        // Vortex has no cast from a fixed-size list to a list.
+        (DataType::FixedSizeList(..), DataType::List(_) | DataType::LargeList(_)) => {
+            return false;
+        }
+        _ => {}
+    }
+
     if let Some(evaluates) = EVALUATES.get(&(source.clone(), target.clone())) {
         return *evaluates;
     }
@@ -1965,6 +1984,49 @@ mod tests {
         DataType::Utf8,
         true
     )]
+    // A list cast casts each element, so it is pushed exactly when its element cast is.
+    #[case::list_int_to_float(
+        list_of(DataType::Int32, true),
+        list_of(DataType::Float64, true),
+        true
+    )]
+    #[case::large_list_int_to_list_float(
+        DataType::LargeList(Arc::new(Field::new_list_field(DataType::Int64, true))),
+        list_of(DataType::Float64, true),
+        true
+    )]
+    #[case::list_bool_to_float(
+        list_of(DataType::Boolean, true),
+        list_of(DataType::Float64, true),
+        true
+    )]
+    #[case::list_decimal_to_float(
+        list_of(DataType::Decimal128(15, 2), true),
+        list_of(DataType::Float64, true),
+        false
+    )]
+    #[case::list_decimal_scale_down(
+        list_of(DataType::Decimal128(10, 2), true),
+        list_of(DataType::Decimal128(10, 0), true),
+        false
+    )]
+    #[case::list_string_to_float(
+        list_of(DataType::Utf8, true),
+        list_of(DataType::Float64, true),
+        false
+    )]
+    // Casting to non-null elements fails on a null element.
+    #[case::list_to_non_null_elements(
+        list_of(DataType::Int32, true),
+        list_of(DataType::Int32, false),
+        false
+    )]
+    // Vortex has no cast from a fixed-size list to a list.
+    #[case::fixed_size_list_to_list(
+        DataType::FixedSizeList(Arc::new(Field::new_list_field(DataType::Int32, true)), 2),
+        list_of(DataType::Float64, true),
+        false
+    )]
     fn test_cast_pushdown(
         #[case] source: DataType,
         #[case] target: DataType,
@@ -2096,6 +2158,11 @@ mod tests {
             as Arc<dyn PhysicalExpr>;
 
         assert!(can_be_pushed_down_impl(&binary_expr, &test_schema));
+    }
+
+    /// A `List` of `element`, with the element field `DataFusion` names `item`.
+    fn list_of(element: DataType, nullable: bool) -> DataType {
+        DataType::List(Arc::new(Field::new_list_field(element, nullable)))
     }
 
     #[test]
