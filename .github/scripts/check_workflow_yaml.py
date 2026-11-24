@@ -167,9 +167,10 @@ UNTRUSTED_CONTEXT = re.compile(
     r"|head_commit|commits|pages|workflow_run|discussion|client_payload)\b)",
     re.IGNORECASE,
 )
-EXPANSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
-# A literal-key bracket read, `x['y']`, which reads the same value as `x.y`.
-BRACKET_KEY = re.compile(r"\s*\[\s*'([^'\]]*)'\s*\]")
+# In one left-to-right pass over an expression: a literal-key bracket read, `x['y']`,
+# which reads the same value as `x.y`, and a string literal, with `''` for a quote.
+# One pass, so a `[` inside one literal never pairs with a `]` inside another.
+EXPRESSION_TOKEN = re.compile(r"\s*\[\s*'((?:[^']|'')*)'\s*\]|'(?:[^']|'')*'")
 
 
 def workflow_files(github_dir: Path) -> list[Path]:
@@ -456,16 +457,47 @@ def _expression_text(expression: str) -> str:
     """An expression as the taint patterns read it.
 
     `x['y']` becomes `x.y`, so a bracket read matches the pattern its dot form does,
-    then every string literal is emptied, so a literal such as `'github'` never does.
+    and every string literal is emptied, so a literal such as `'github'` never does.
     A bracket with any other key (`env[matrix.k]`) is kept, and the patterns treat it
     as reading every member.
     """
-    return STRING_LITERAL.sub("''", BRACKET_KEY.sub(lambda m: "." + m.group(1), expression))
+    def token(match: re.Match) -> str:
+        if match.group(1) is not None:
+            return "." + match.group(1).replace("''", "'")
+        return "''"
+
+    return EXPRESSION_TOKEN.sub(token, expression)
+
+
+def _expansions(text: object) -> list[tuple[str, str]]:
+    """(whole, inner) for each `${{ … }}` in a text.
+
+    An expansion ends at the first `}}` outside a string literal, as GitHub reads it, so
+    `format('{{"k":"{0}"}}', inputs.x)` keeps its `inputs.x`. An unterminated one ends
+    the text.
+    """
+    s, found, i = str(text or ""), [], 0
+    while (start := s.find("${{", i)) >= 0:
+        j, quoted = start + 3, False
+        while j < len(s):
+            if quoted:
+                if s.startswith("''", j):
+                    j += 2
+                    continue
+                quoted = s[j] != "'"
+            elif s[j] == "'":
+                quoted = True
+            elif s.startswith("}}", j):
+                break
+            j += 1
+        found.append((s[start : j + 2], s[start + 3 : j]))
+        i = j + 2
+    return found
 
 
 def _expressions(value: object) -> str:
     """The `${{ }}` expressions in a value, each as `_expression_text` reads it."""
-    return " ".join(_expression_text(m.group(1)) for m in EXPANSION.finditer(str(value or "")))
+    return " ".join(_expression_text(inner) for _, inner in _expansions(value))
 
 
 def _tainted_references(document: dict, jobs: dict) -> dict[str, re.Pattern]:
@@ -550,9 +582,9 @@ def _script_expansions(step: dict, tainted: re.Pattern) -> list[tuple[str, str]]
         tainted = re.compile("|".join([tainted.pattern, *local, _ref(r"env\s*\[")]), re.IGNORECASE)
     found = []
     for key, script in scripts:
-        for match in EXPANSION.finditer(str(script or "")):
-            if tainted.search(_expression_text(match.group(1))):
-                found.append((key, match.group(0).strip()))
+        for whole, inner in _expansions(script):
+            if tainted.search(_expression_text(inner)):
+                found.append((key, whole.strip()))
     return found
 
 

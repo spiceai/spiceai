@@ -731,10 +731,11 @@ class CachedFetchTest(unittest.TestCase):
         self.assertEqual(self.cache.requests + self.source.requests, [])
 
     def test_rejects_a_malformed_size_bound(self):
-        for value in ("0", "1e9", "256M"):
+        # 19 digits passes the digit pattern, but curl would refuse it as --max-filesize.
+        for value in ("0", "1e9", "256M", "9" * 19):
             proc = self.run_fetch(max_bytes=value)
             self.assertEqual(proc.returncode, 2, value)
-            self.assertIn("CI_FETCH_MAX_BYTES must be a whole number", proc.stdout)
+            self.assertIn("CI_FETCH_MAX_BYTES must ", proc.stdout)
         self.assertEqual(self.cache.requests + self.source.requests, [])
 
 

@@ -81,6 +81,12 @@ source_attempts="${CI_SOURCE_ATTEMPTS:-4}"
 cache_delay="${CI_CACHE_DELAY_SECONDS:-2}"
 source_delay="${CI_SOURCE_DELAY_SECONDS:-5}"
 max_bytes="${CI_FETCH_MAX_BYTES:-268435456}"
+# curl reads --max-filesize as a 64-bit count and refuses a longer number, which would
+# then read as a failed download instead of a wrong setting.
+if [ "${#max_bytes}" -gt 18 ]; then
+  echo "::error::CI_FETCH_MAX_BYTES must have at most 18 digits, got ${#max_bytes}."
+  exit 2
+fi
 name="$(basename "${sources[0]%%\?*}")"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

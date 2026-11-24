@@ -377,6 +377,24 @@ class CheckUntrustedExpansionsTest(unittest.TestCase):
         problems = self.problems(steps, document)
         self.assertEqual(len(problems), 6, "\n".join(problems))
 
+    def test_brackets_in_separate_literals_do_not_hide_a_read_between_them(self):
+        steps = "      - run: echo \"${{ format('{0}{1}{2}', '[', inputs.spicepod_path, ']') }}\""
+        self.assertEqual(len(self.problems(steps)), 1)
+
+    def test_closing_braces_inside_a_literal_do_not_end_the_expansion(self):
+        # GitHub ends `${{ }}` at the first `}}` outside a string literal.
+        with self.subTest(where="script"):
+            steps = "      - run: echo '${{ format('{{\"k\":\"{0}\"}}', inputs.spicepod_path) }}'"
+            self.assertEqual(len(self.problems(steps)), 1)
+        with self.subTest(where="env source"):
+            document = CREDENTIALED.replace(
+                "    steps:\n",
+                "    env:\n"
+                "      J: ${{{{ format('{{{{\"k\":\"{{0}}\"}}}}', inputs.spicepod_path) }}}}\n"
+                "    steps:\n",
+            )
+            self.assertEqual(len(self.problems("      - run: echo \"${{ env.J }}\"", document)), 1)
+
     def test_string_literals_naming_a_context_are_not_a_read(self):
         steps = (
             "      - run: echo \"${{ format('github {0} inputs', github.sha) }}\""
