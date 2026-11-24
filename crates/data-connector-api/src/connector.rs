@@ -455,6 +455,12 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         ComponentInitialization::default()
     }
 
+    /// The OAuth client ID whose user tokens, sent with a request, initialize a data
+    /// connector that initializes on trigger.
+    fn user_token_client_id(&self) -> Option<&str> {
+        None
+    }
+
     /// Returns whether the data connector should be initialized on startup or on trigger,
     /// with dataset-specific logic.
     ///

@@ -1344,3 +1344,121 @@ async fn a_compressed_file_of_concatenated_members_is_read_in_full_from_an_objec
         "expected {expected:?} from every table, got {wrong:#?}"
     );
 }
+
+/// spiceai/datafusion#308. The simplifier rewrote a regex that matches a
+/// backslash to `LIKE`, where `\` is the escape character, so the rewritten
+/// filter selected other rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_regex_that_matches_a_backslash_is_not_rewritten_to_like() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &[r"CREATE TABLE backslash_strings(s VARCHAR) AS VALUES ('a\b'), ('a%'), ('plain')"],
+    )
+    .await;
+    for sql in [
+        r"SELECT s FROM backslash_strings WHERE s ~ '\\'",
+        r"SELECT s FROM backslash_strings WHERE regexp_like(s, '^a\\')",
+    ] {
+        assert_eq!(
+            sorted_answer(&ctx, sql).await,
+            Ok(owned(&[r"a\b"])),
+            "{sql}"
+        );
+    }
+}
+
+/// spiceai/datafusion#309. The unparser wrote the qualifier of a wildcard
+/// inside an expression bare, so `coalesce(("a b".*))` reached the source as
+/// SQL it rejects.
+#[test]
+fn the_unparser_quotes_the_qualifier_of_a_wildcard() {
+    use datafusion::common::TableReference;
+    use datafusion::logical_expr::{Expr, expr::WildcardOptions};
+    use datafusion::sql::unparser::Unparser;
+
+    #[expect(deprecated)]
+    let wildcard = |qualifier: &str| Expr::Wildcard {
+        qualifier: Some(TableReference::bare(qualifier)),
+        options: Box::new(WildcardOptions::default()),
+    };
+    let unparser = Unparser::default();
+    for (qualifier, expected) in [("a b", r#""a b".*"#), ("q", "q.*")] {
+        assert_eq!(
+            unparser
+                .expr_to_sql(&wildcard(qualifier))
+                .expect("a wildcard unparses")
+                .to_string(),
+            expected
+        );
+    }
+}
+
+/// spiceai/datafusion#310. `RewriteSetComparison` gave the column of an
+/// `ANY`/`ALL` subquery the outer column's name, so a subquery over the outer
+/// query's own table compared each row with itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_any_or_all_subquery_over_the_outer_table_reads_its_own_rows() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &["CREATE TABLE set_cmp_self(id INT, age INT) AS VALUES (1, 10), (2, 20), (3, 30)"],
+    )
+    .await;
+    for (sql, expected) in [
+        (
+            "SELECT id FROM set_cmp_self WHERE age = ANY (SELECT age FROM set_cmp_self WHERE id < 3)",
+            &["1", "2"][..],
+        ),
+        (
+            "SELECT id FROM set_cmp_self WHERE age > ANY (SELECT age FROM set_cmp_self WHERE id < 3)",
+            &["2", "3"][..],
+        ),
+        (
+            "SELECT id FROM set_cmp_self WHERE age <> ALL (SELECT age FROM set_cmp_self WHERE id < 3)",
+            &["3"][..],
+        ),
+    ] {
+        assert_eq!(
+            sorted_answer(&ctx, sql).await,
+            Ok(sorted(expected)),
+            "{sql}"
+        );
+    }
+}
+
+/// spiceai/datafusion#311 (apache/datafusion#25391, #26544 and #26677).
+/// Decorrelating an aggregate without `GROUP BY` dropped the outer rows with no
+/// inner row, although `count(*)` still returns a row for them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_correlated_count_without_group_by_keeps_the_rows_with_no_match() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &[
+            "CREATE TABLE count_bug_outer(id INT) AS VALUES (11), (22), (33), (44)",
+            "CREATE TABLE count_bug_inner(id INT) AS VALUES (11), (22), (44)",
+        ],
+    )
+    .await;
+    for (sql, expected) in [
+        (
+            "SELECT id FROM count_bug_outer o WHERE EXISTS (SELECT count(*) FROM count_bug_inner i WHERE i.id = o.id)",
+            &["11", "22", "33", "44"][..],
+        ),
+        (
+            "SELECT id FROM count_bug_outer o WHERE EXISTS (SELECT count(*) FROM count_bug_inner i WHERE i.id = o.id HAVING count(*) = 0)",
+            &["33"][..],
+        ),
+        (
+            "SELECT id FROM count_bug_outer o WHERE 0 = ANY (SELECT count(*) FROM count_bug_inner i WHERE i.id = o.id)",
+            &["33"][..],
+        ),
+    ] {
+        assert_eq!(
+            sorted_answer(&ctx, sql).await,
+            Ok(sorted(expected)),
+            "{sql}"
+        );
+    }
+}
