@@ -44,7 +44,16 @@ runs:
         echo "CI_STORE_PREFIX=$prefix" >> "$GITHUB_ENV"
         echo "CI store prefix: '${prefix}'"
         if [ -n "$SPICEPOD" ] && [ -n "$prefix" ]; then
-          sed -i.bak -E "s#s3://benchmarks/(cold_start|cayenne-cold-sf10|cayenne-cold-sf1000)/#s3://benchmarks/${prefix}\1/#g" "$SPICEPOD"
-          rm -f "${SPICEPOD}.bak"
+          # A literal replacement, not sed: a ref may hold `&`, `#` or `\`. bash 5.2 reads `&` in
+          # a replacement as the match unless patsub_replacement is off; bash 3.2 has no such option.
+          shopt -u patsub_replacement 2>/dev/null || true
+          content="$(cat "$SPICEPOD"; printf x)"
+          content="${content%x}"
+          for fixed in cold_start cayenne-cold-sf10 cayenne-cold-sf1000; do
+            from="s3://benchmarks/${fixed}/"
+            to="s3://benchmarks/${prefix}${fixed}/"
+            content="${content//"$from"/$to}"
+          done
+          printf '%s' "$content" > "$SPICEPOD"
           grep -n 's3://benchmarks/' "$SPICEPOD" || true
         fi

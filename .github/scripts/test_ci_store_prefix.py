@@ -75,7 +75,14 @@ class CiStorePrefixTest(unittest.TestCase):
             .replace("s3://benchmarks/cayenne-cold-sf10/", "s3://benchmarks/untrusted/refs/pull/7/merge/cayenne-cold-sf10/")
             .replace("s3://benchmarks/cayenne-cold-sf1000/", "s3://benchmarks/untrusted/refs/pull/7/merge/cayenne-cold-sf1000/"),
         )
-        self.assertFalse((self.dir / "spicepod.yaml.bak").exists())
+
+    def test_a_ref_with_replacement_characters_is_written_literally(self):
+        pod = self.dir / "spicepod.yaml"
+        pod.write_text(SPICEPOD)
+        ref = "refs/heads/a&b#c\\d"
+        self.assertEqual(self.prefix(ref, str(pod))[0].returncode, 0)
+        self.assertIn(f"s3://benchmarks/untrusted/{ref}/cold_start/audit_events_3m/", pod.read_text())
+        self.assertIn("s3://benchmarks/cayenne-datalake/123/", pod.read_text())
 
     def test_on_trunk_the_spicepod_is_left_alone(self):
         pod = self.dir / "spicepod.yaml"
