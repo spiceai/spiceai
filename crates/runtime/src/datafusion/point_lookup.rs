@@ -187,34 +187,37 @@ fn has_constant_predicate(plan: &LogicalPlan) -> bool {
     .unwrap_or(true)
 }
 
-/// Whether `plan` (unoptimized) is a point lookup: plain columns or constants projected from a
-/// single table scan through filters made only of column-against-constant comparisons, at least
-/// one of them an equality, optionally under one `LIMIT` with no offset. On a table with a
+/// Whether `plan` is a point lookup: plain columns or constants projected from a single table scan
+/// through filters made only of column-against-constant comparisons, at least one of them an
+/// equality, optionally with one `LIMIT` with no offset above every filter. On a table with a
 /// primary key, every key column must be pinned by an equality.
+///
+/// The limit may sit above or below the projections: an unoptimized plan carries it on top, and
+/// an optimized one (such as the Substrait plan a sidecar sends) below the projection, which the
+/// optimizer moves above it. A limit below a filter limits the rows the filter sees, a different
+/// query, and is not a point lookup.
 ///
 /// Which rules can change the plan depends only on this shape, not on whether the equality is on
 /// a key: an equality on any column plans to the same filtered scan, and pays for the same rules.
 pub(crate) fn is_point_lookup(plan: &LogicalPlan) -> Option<PointLookup> {
     let mut node = plan;
     let mut limited = false;
-    if let LogicalPlan::Limit(limit) = node {
-        let no_offset = limit
-            .skip
-            .as_deref()
-            .is_none_or(|skip| matches!(skip, Expr::Literal(ScalarValue::Int64(Some(0)), _)));
-        let literal_fetch = limit
-            .fetch
-            .as_deref()
-            .is_some_and(|fetch| matches!(fetch, Expr::Literal(ScalarValue::Int64(Some(_)), _)));
-        if !no_offset || !literal_fetch {
-            return None;
-        }
-        limited = true;
-        node = limit.input.as_ref();
-    }
     let mut predicates: Vec<&Expr> = Vec::new();
     loop {
         match node {
+            LogicalPlan::Limit(limit) => {
+                let no_offset = limit.skip.as_deref().is_none_or(|skip| {
+                    matches!(skip, Expr::Literal(ScalarValue::Int64(Some(0)), _))
+                });
+                let literal_fetch = limit.fetch.as_deref().is_some_and(|fetch| {
+                    matches!(fetch, Expr::Literal(ScalarValue::Int64(Some(_)), _))
+                });
+                if limited || !predicates.is_empty() || !no_offset || !literal_fetch {
+                    return None;
+                }
+                limited = true;
+                node = limit.input.as_ref();
+            }
             LogicalPlan::Projection(projection) => {
                 if !projection.expr.iter().all(is_plain_column_or_constant) {
                     return None;
@@ -816,6 +819,8 @@ mod tests {
             "SELECT * FROM unkeyed WHERE id = 5",
             "SELECT 1 AS present FROM unkeyed WHERE name = 'n5' LIMIT 1",
             "SELECT 1 AS present FROM split WHERE name = 'n5' LIMIT 1",
+            // The limit below the projection, as an optimized plan carries it.
+            "SELECT 1 AS present FROM (SELECT * FROM keyed WHERE id = 5 LIMIT 1) q",
         ] {
             assert!(
                 is_point_lookup(&unoptimized(&ctx, sql).await).is_some(),
@@ -834,7 +839,9 @@ mod tests {
             // A filter with no equality, an offset, or a limit below the projection.
             "SELECT * FROM unkeyed WHERE id > 5",
             "SELECT * FROM keyed WHERE id = 5 LIMIT 1 OFFSET 1",
-            "SELECT * FROM (SELECT * FROM keyed WHERE id = 5 LIMIT 1) q",
+            // A filter above a limit filters the rows the limit kept, and two limits nest.
+            "SELECT * FROM (SELECT * FROM keyed LIMIT 10) q WHERE id = 5",
+            "SELECT * FROM (SELECT * FROM keyed WHERE id = 5 LIMIT 3) q LIMIT 1",
             "SELECT id + 1 FROM keyed WHERE id = 5",
             "SELECT * FROM keyed WHERE id = 5 ORDER BY name",
             "SELECT count(*) FROM keyed WHERE id = 5",
@@ -948,6 +955,8 @@ mod tests {
             "SELECT 1 AS present FROM split WHERE name = 'n5' LIMIT 1",
             "SELECT * FROM split WHERE region = 1 LIMIT 3",
             "SELECT * FROM split WHERE region = 1",
+            "SELECT 1 AS present FROM (SELECT * FROM split WHERE name = 'n5' LIMIT 1) q",
+            "SELECT 1 AS present FROM (SELECT * FROM keyed WHERE id = 5 LIMIT 1) q",
         ] {
             let plan = unoptimized(&ctx, sql).await;
             let lookup = is_point_lookup(&plan);
