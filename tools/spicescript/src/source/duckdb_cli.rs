@@ -158,7 +158,7 @@ async fn download_to_cache(
 }
 
 /// The longest one download of a release may take (curl's `--max-time`).
-const DOWNLOAD_MAX: std::time::Duration = std::time::Duration::from_secs(1800);
+const DOWNLOAD_MAX: std::time::Duration = std::time::Duration::from_mins(30);
 
 /// Removes staging directories of this release that a process killed while
 /// downloading left behind. Only those older than four times the longest a
