@@ -2059,31 +2059,29 @@ fn record_changes_loaded(
 }
 
 /// Rewrites a checkpoint marked as loaded by a change stream without the mark.
-fn clear_changes_loaded(
+async fn clear_changes_loaded(
     checkpointer: Arc<dyn DatasetCheckpointer>,
     checkpoint_schema: Arc<Schema>,
     accelerator_write_mutex: Arc<Mutex<()>>,
     dataset_name: TableReference,
     last_updated_at: Arc<AtomicI64>,
-) -> impl Future<Output = ()> + Send + 'static {
-    async move {
-        if !records_changes_loaded(&checkpointer).await {
-            return;
-        }
-        create_checkpoint_and_snapshot(
-            &checkpointer,
-            None,
-            &checkpoint_schema,
-            &accelerator_write_mutex,
-            &dataset_name,
-            &last_updated_at,
-            ForceCreate(false),
-            None,
-            None,
-            None,
-        )
-        .await;
+) {
+    if !records_changes_loaded(&checkpointer).await {
+        return;
     }
+    create_checkpoint_and_snapshot(
+        &checkpointer,
+        None,
+        &checkpoint_schema,
+        &accelerator_write_mutex,
+        &dataset_name,
+        &last_updated_at,
+        ForceCreate(false),
+        None,
+        None,
+        None,
+    )
+    .await;
 }
 
 impl Drop for Refresher {
