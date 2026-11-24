@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import check_workflow_yaml  # noqa: E402
 
@@ -450,6 +452,148 @@ class CheckUntrustedExpansionsTest(unittest.TestCase):
         problems = self.problems("      - run: echo ok", document)
         self.assertEqual(len(problems), 1)
         self.assertIn("job `setup`", problems[0])
+
+
+REUSABLE_CI_ROLE = """\
+---
+on:
+  workflow_call:
+    inputs:
+      spiced_commit:
+        type: string
+        default: ''
+      runner_type:
+        type: string
+        required: true
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    environment: ci
+    permissions:
+      id-token: write
+    steps:
+{steps}
+"""
+
+CHOOSE = (
+    "      - name: Choose the CI role\n"
+    "        id: ci-role\n"
+    f"        uses: {check_workflow_yaml.CI_ROLE_ACTION}\n"
+    "        with:\n"
+    "          pull-request-role-set: ${{ secrets.CI_AWS_PULL_REQUEST_ROLE_ARN != '' }}\n"
+    "          builds: |\n"
+    "            spiced_commit=${{ inputs.spiced_commit }}\n"
+)
+ASSUME = (
+    "      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd\n"
+    "        with:\n"
+    "          role-to-assume: {role}\n"
+)
+CHOSEN = "${{ steps.ci-role.outputs.full == 'true' && secrets.CI_AWS_DYNAMODB_ROLE_ARN || secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}"
+
+
+class CheckCiRoleJobsTest(unittest.TestCase):
+    def problems(self, steps, document=REUSABLE_CI_ROLE):
+        return [p for p in check_workflow_yaml.check_workflow(document.replace("{steps}", steps)) if "role" in p]
+
+    def test_a_chosen_role_in_a_reusable_workflow_is_accepted(self):
+        self.assertEqual(self.problems(CHOOSE + ASSUME.format(role=CHOSEN)), [])
+
+    def test_a_ci_role_job_in_a_dispatched_workflow_is_reported(self):
+        document = REUSABLE_CI_ROLE.replace("  workflow_call:\n", "  workflow_dispatch:\n")
+        problems = self.problems(CHOOSE + ASSUME.format(role=CHOSEN), document)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("job `bench` assumes a CI AWS role in a workflow with triggers of its own", problems[0])
+
+    def test_a_reusable_workflow_that_also_has_its_own_trigger_is_reported(self):
+        document = REUSABLE_CI_ROLE.replace("on:\n", "on:\n  push:\n")
+        self.assertEqual(len(self.problems(CHOOSE + ASSUME.format(role=CHOSEN), document)), 1)
+
+    def test_the_pull_request_role_alone_makes_no_ci_role_job(self):
+        document = REUSABLE_CI_ROLE.replace("  workflow_call:\n", "  workflow_dispatch:\n")
+        steps = ASSUME.format(role="${{ secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}")
+        self.assertEqual(self.problems(steps, document), [])
+
+    def test_a_job_that_does_not_choose_its_role_first_is_reported(self):
+        for steps in (ASSUME.format(role=CHOSEN), "      - run: echo first\n" + CHOOSE + ASSUME.format(role=CHOSEN)):
+            with self.subTest(steps=steps[:30]):
+                problems = self.problems(steps)
+                self.assertEqual(len(problems), 1)
+                self.assertIn("does not choose it first", problems[0])
+
+    def test_a_role_not_chosen_by_the_first_step_is_reported(self):
+        for role in (
+            "${{ secrets.CI_AWS_DYNAMODB_ROLE_ARN }}",
+            "${{ steps.ci-role.outputs.full != 'true' && secrets.CI_AWS_PULL_REQUEST_ROLE_ARN || secrets.CI_AWS_DYNAMODB_ROLE_ARN }}",
+            "${{ env.FULL == 'true' && secrets.CI_AWS_DYNAMODB_ROLE_ARN || secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}",
+        ):
+            with self.subTest(role=role):
+                problems = self.problems(CHOOSE + ASSUME.format(role=role))
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn("sets `role-to-assume:", problems[0])
+
+    def test_a_build_input_the_role_step_is_not_given_is_reported(self):
+        steps = CHOOSE.replace("          builds: |\n            spiced_commit=${{ inputs.spiced_commit }}\n", "")
+        problems = self.problems(steps + ASSUME.format(role=CHOSEN))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("takes input `spiced_commit`, which names another build", problems[0])
+
+    def test_a_repository_write_needs_the_full_roles(self):
+        write = "      - name: Push snapshots\n{cond}        uses: ./.github/actions/push-snap-changes\n"
+        with self.subTest(gated=False):
+            problems = self.problems(CHOOSE + ASSUME.format(role=CHOSEN) + write.format(cond=""))
+            self.assertEqual(len(problems), 1)
+            self.assertIn("step `Push snapshots` writes to the repository", problems[0])
+        with self.subTest(gated=True):
+            cond = "        if: ${{ always() && steps.ci-role.outputs.full == 'true' }}\n"
+            self.assertEqual(self.problems(CHOOSE + ASSUME.format(role=CHOSEN) + write.format(cond=cond)), [])
+
+
+class CheckCiRoleCallsTest(unittest.TestCase):
+    REUSABLE = yaml.safe_load(REUSABLE_CI_ROLE.replace("{steps}", CHOOSE + ASSUME.format(role=CHOSEN)))
+
+    def caller(self, uses, with_="      runner_type: x\n"):
+        return yaml.safe_load(
+            "on:\n  workflow_dispatch:\njobs:\n  call:\n"
+            f"    uses: {uses}\n" + ("    with:\n" + with_ if with_ else "")
+        )
+
+    def problems(self, workflows):
+        return check_workflow_yaml.check_ci_role_calls(workflows)
+
+    def test_a_call_at_trunk_is_accepted(self):
+        calls = {"x_aws.yml": self.REUSABLE, "x.yml": self.caller("spiceai/spiceai/.github/workflows/x_aws.yml@trunk")}
+        self.assertEqual(self.problems(calls), [])
+
+    def test_a_call_at_any_other_ref_or_from_the_working_tree_is_reported(self):
+        for uses in ("./.github/workflows/x_aws.yml", "spiceai/spiceai/.github/workflows/x_aws.yml@main"):
+            with self.subTest(uses=uses):
+                problems = self.problems({"x_aws.yml": self.REUSABLE, "x.yml": self.caller(uses)})
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn("spiceai/spiceai/.github/workflows/x_aws.yml@trunk`", problems[0])
+
+    def test_the_merge_queue_callers_use_their_local_file(self):
+        local = {"integration_aws.yml": self.REUSABLE}
+        ok = dict(local, **{"integration.yml": self.caller("./.github/workflows/integration_aws.yml")})
+        self.assertEqual(self.problems(ok), [])
+        at_trunk = dict(local, **{"integration.yml": self.caller("spiceai/spiceai/.github/workflows/integration_aws.yml@trunk")})
+        problems = self.problems(at_trunk)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("is a required merge-queue check", problems[0])
+
+    def test_inputs_are_checked_against_the_called_file(self):
+        uses = "spiceai/spiceai/.github/workflows/x_aws.yml@trunk"
+        problems = self.problems({"x_aws.yml": self.REUSABLE, "x.yml": self.caller(uses, "      typo: y\n")})
+        self.assertEqual(
+            sorted(p.split(": ", 1)[1] for p in problems),
+            ["job `call` does not pass `runner_type`, which x_aws.yml requires",
+             "job `call` passes input `typo`, which x_aws.yml does not declare"],
+        )
+
+    def test_a_call_at_trunk_to_a_missing_file_is_reported(self):
+        problems = self.problems({"x.yml": self.caller("spiceai/spiceai/.github/workflows/gone.yml@trunk")})
+        self.assertEqual(len(problems), 1)
+        self.assertIn("there is no .github/workflows/gone.yml", problems[0])
 
 
 class CheckActionExpansionsTest(unittest.TestCase):

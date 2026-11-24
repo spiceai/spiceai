@@ -1,0 +1,150 @@
+---
+# The jobs of e2e_test_ci.yml that assume a CI AWS role.
+# e2e_test_ci.yml calls this file with `./`, so the merge queue tests a change to it.
+# A job here assumes the full roles only on trunk or in the trunk merge queue and the
+# read-only pull request role anywhere else, and skips its writes there (the `Choose
+# the CI role` step). check_workflow_yaml.py keeps every such job in a file like this.
+name: E2E Test CI (CI AWS role jobs)
+
+on:
+  workflow_call:
+    inputs:
+      needs_setup_matrix_matrix:
+        type: string
+        required: false
+        default: ''
+
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
+env:
+  # The CI cache's anonymous read URL (.github/ci-cache/README.md). setup-rust and
+  # install-cargo-deny read pinned downloads from it, falling back to the source; empty
+  # where the repository has no CI object store, which turns the cache off.
+  CI_CACHE_URL: ${{ vars.TEST_MINIO_ENDPOINT && format('{0}/ci-cache', vars.TEST_MINIO_ENDPOINT) || '' }}
+  # CI performance optimizations
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  databricks_delta_catalog_connector_quickstart:
+    name: 'Test Databricks catalog connector (mode: delta_lake) on ${{ matrix.target.name }}'
+    runs-on: ${{ matrix.target.runner }}
+    timeout-minutes: 5
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
+
+    strategy:
+      matrix:
+        target: ${{ fromJson(inputs.needs_setup_matrix_matrix) }}
+
+    steps:
+      # Which CI AWS role this job gets, and whether its writes run; see the action.
+      - name: Choose the CI role
+        id: ci-role
+        uses: $/.github/actions/ci-role
+        with:
+          pull-request-role-set: ${{ secrets.CI_AWS_PULL_REQUEST_ROLE_ARN != '' }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        uses: $/.github/actions/install-spice
+        with:
+          build-path: ./build
+          install-scope: job
+
+      - name: Init spice app
+        run: |
+          spice init test_app
+
+      - name: Spice configure
+        working-directory: test_app
+        run: |
+
+          echo "catalogs:" >> spicepod.yaml
+          echo "  - from: databricks:spiceai_ci" >> spicepod.yaml
+          echo "    name: db_uc" >> spicepod.yaml
+          echo "    include:" >> spicepod.yaml
+          echo "      - 'tpcds.*'" >> spicepod.yaml
+          echo "      - 'tpch.*'" >> spicepod.yaml
+          echo "    params:" >> spicepod.yaml
+          echo "      mode: delta_lake" >> spicepod.yaml
+          echo "      databricks_aws_access_key_id: \${ secrets:AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }" >> spicepod.yaml
+          echo "      databricks_aws_secret_access_key: \${ secrets:AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }" >> spicepod.yaml
+          echo "      databricks_aws_session_token: \${ secrets:AWS_DATABRICKS_DELTA_SESSION_TOKEN }" >> spicepod.yaml
+          echo "      databricks_aws_region: us-west-2" >> spicepod.yaml
+          echo "      databricks_endpoint: \${ secrets:DATABRICKS_ENDPOINT }" >> spicepod.yaml
+          echo "      databricks_client_id: \${ secrets:DATABRICKS_OIDC_CLIENT_ID }" >> spicepod.yaml
+          echo "      databricks_token_audience: \${ secrets:DATABRICKS_OIDC_AUDIENCE }" >> spicepod.yaml
+
+          cat spicepod.yaml
+
+      - name: Assume the Databricks Delta role
+        id: aws-databricks-delta-new
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.ci-role.outputs.full == 'true' && secrets.CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN || secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}
+          role-session-name: gha-databricks-delta-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      # The macOS leg shares its host with other jobs' runtimes, so spiced's default
+      # 8090/50051 cannot be assumed free (#12419). The actions below read these ports.
+      - name: Allocate Spice runtime ports
+        uses: $/.github/actions/allocate-spice-ports
+
+      - name: Start spice runtime
+        working-directory: test_app
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta-new.outputs.aws-access-key-id }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta-new.outputs.aws-secret-access-key }}
+          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta-new.outputs.aws-session-token }}
+          DATABRICKS_ENDPOINT: ${{ vars.CI_DATABRICKS_HOST }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
+        run: |
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
+          # time to initialize added datasets
+          sleep 20
+
+      - name: Wait for dataset to be ready
+        uses: $/.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
+
+      - name: Run test query (tpch)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: $/.github/actions/run-query
+        with:
+          fail-on-error: true
+          query: 'select * from db_uc.tpch.lineitem limit 1;'
+
+      - name: Run test query (tpcds)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: $/.github/actions/run-query
+        with:
+          fail-on-error: true
+          query: 'select * from db_uc.tpcds.store limit 1;'
+
+      - name: Stop spice and check logs
+        if: always()
+        uses: $/.github/actions/stop-spice
+        with:
+          working-directory: test_app

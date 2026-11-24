@@ -272,14 +272,17 @@ class CachedFetchTest(unittest.TestCase):
         oidc=False,
         max_bytes=None,
         path=None,
+        read_only=False,
     ):
         env = {
             **os.environ,
             "CI_CACHE_DELAY_SECONDS": "0",
             "CI_SOURCE_DELAY_SECONDS": "0",
         }
-        for name in ("CI_CACHE_URL", "CI_CACHE_DIR", "CI_FETCH_MAX_BYTES"):
+        for name in ("CI_CACHE_URL", "CI_CACHE_DIR", "CI_FETCH_MAX_BYTES", "CI_CACHE_READ_ONLY"):
             env.pop(name, None)
+        if read_only:
+            env["CI_CACHE_READ_ONLY"] = "true"
         # A job's OIDC token only where the test gives it one, even when the tests run in
         # a job that has one.
         env.pop("ACTIONS_ID_TOKEN_REQUEST_URL", None)
@@ -448,6 +451,15 @@ class CachedFetchTest(unittest.TestCase):
         self.assertEqual(len(notes), 1, proc.stdout)
         self.assertNotIn("::warning::", notes[0])
         self.assertNotIn("Could not write", proc.stdout)
+
+    def test_a_read_only_run_writes_nothing_and_says_so_in_one_line(self):
+        self.cache.script[CACHE_PATH] = [404]
+        self.source.script[SOURCE_PATH] = [CONTENT]
+        proc = self.run_fetch(oidc=True, read_only=True)
+        self.assert_fetched(proc)
+        self.assertEqual(self.cache.puts, [])
+        self.assertEqual(self.github.audiences, [])
+        self.assertIn("not written to the CI cache, since this run is read-only", proc.stdout)
 
     def test_an_unsigned_write_is_what_the_store_refuses(self):
         # The model this suite holds the script to: the store answers 403 to the

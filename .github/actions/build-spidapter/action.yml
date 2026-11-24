@@ -94,7 +94,7 @@ runs:
     - name: Cache spidapter binary
       if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true'
       id: cache-spidapter
-      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           target/release/spidapter${{ steps.detect-os.outputs.ext }}
@@ -152,7 +152,7 @@ runs:
         CARGO_NET_GIT_FETCH_WITH_CLI: true
 
     - name: Save to cache
-      if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true' && steps.cache-spidapter.outputs.cache-hit != 'true'
+      if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true' && steps.cache-spidapter.outputs.cache-hit != 'true' && env.CI_CACHE_READ_ONLY != 'true'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
@@ -160,7 +160,7 @@ runs:
         key: spidapter-${{ steps.detect-os.outputs.os }}-${{ steps.commit-sha.outputs.sha }}
 
     - name: Upload spidapter to MinIO
-      if: inputs.download_from_minio == 'true' && steps.minio-download.outputs.found != 'true' && (inputs.force_rebuild == 'true' || steps.cache-spidapter.outputs.cache-hit != 'true')
+      if: inputs.download_from_minio == 'true' && steps.minio-download.outputs.found != 'true' && (inputs.force_rebuild == 'true' || steps.cache-spidapter.outputs.cache-hit != 'true') && env.CI_CACHE_READ_ONLY != 'true'
       shell: bash
       env:
         DETECT_OS_EXT: ${{ steps.detect-os.outputs.ext }}

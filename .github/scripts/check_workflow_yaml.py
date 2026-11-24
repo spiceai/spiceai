@@ -37,6 +37,15 @@
 # `${{ }}` into the script before the shell parses it, so `$(…)` in a dispatch
 # input runs as code, with the token the job can trade for the store's
 # credentials.
+#
+# And it keeps every job that assumes a CI AWS role in a reusable workflow (`on:
+# workflow_call` only), called at trunk (`spiceai/spiceai/.github/workflows/<file>@trunk`)
+# by every caller except the two the merge queue tests, which call theirs with `./`. Each
+# such job chooses its role in its first step (`.github/actions/ci-role`), asks for the
+# read-only pull request role off trunk, gives that step every other build it runs, and
+# writes to the repository only with the full roles. The roles' AWS trust policies make the
+# same split by `job_workflow_ref` and `ref`; this keeps the workflows asking for what AWS
+# would grant.
 """Validate the repository's GitHub Actions workflow and composite action YAML."""
 
 from __future__ import annotations
@@ -173,6 +182,159 @@ UNTRUSTED_CONTEXT = re.compile(
 EXPRESSION_TOKEN = re.compile(r"\s*\[\s*'((?:[^']|'')*)'\s*\]|'(?:[^']|'')*'")
 
 
+# A CI AWS role, read from its secret. The read-only pull request role is the one every such
+# job may fall back to, so it alone does not make a job a CI role job.
+CI_ROLE_SECRET = re.compile(r"secrets\.(CI_(?:NEW_)?AWS_[A-Z0-9_]*ROLE_ARN)\b")
+PULL_REQUEST_ROLE = "CI_AWS_PULL_REQUEST_ROLE_ARN"
+# Spelled in two parts so the `$/`-to-`./` copy workflow_yaml_check.yml lints finds no
+# `$/` call left in this file.
+CI_ROLE_ACTION = "$/" + ".github/actions/ci-role"
+# The one `role-to-assume` a CI role job may write: the full role only when the first step
+# chose it, else the read-only one. `&&`/`||` with the full role first, so an unset full
+# role falls back to the read-only one and never the other way.
+ROLE_CHOICE = re.compile(
+    r"\$\{\{\s*steps\.ci-role\.outputs\.full\s*==\s*'true'\s*&&\s*secrets\.(CI_(?:NEW_)?AWS_[A-Z0-9_]*ROLE_ARN)"
+    r"\s*\|\|\s*secrets\.CI_AWS_PULL_REQUEST_ROLE_ARN\s*\}\}"
+)
+FULL_ROLE = re.compile(r"steps\.ci-role\.outputs\.full\s*==\s*'true'")
+# Steps that write to the repository: a snapshot branch or pull request.
+REPOSITORY_WRITES = re.compile(r"push-snap-changes|\bgh\s+pr\s+create\b|\bgit\s+push\b")
+# Inputs that name a build other than the run's own commit. A job given one of them has to
+# hand it to the role step, which keeps the full roles only for trunk's builds.
+BUILD_INPUTS = frozenset(
+    {"spiced_commit", "spiced_ref", "custom_image_tag", "ec2_images", "channel", "ref", "needs_resolve_sha"}
+)
+# This repository's reusable workflow at trunk, as CI role jobs are called.
+TRUNK_CALL = re.compile(r"spiceai/spiceai/\.github/workflows/([\w.-]+\.ya?ml)@trunk")
+LOCAL_CALL = re.compile(r"\./\.github/workflows/([\w.-]+\.ya?ml)")
+# The two callers whose runs are required merge-queue checks. A `@trunk` call there would
+# test trunk's copy of the called jobs, never the pull request's, so they call theirs with
+# `./`, and the roles also trust that file at the trunk merge queue's ref.
+LOCAL_CI_ROLE_CALLERS = {"e2e_test_ci.yml": "e2e_test_ci_aws.yml", "integration.yml": "integration_aws.yml"}
+
+
+def _triggers(document: dict) -> object:
+    return next((document[key] for key in TRIGGER_KEYS if key in document), None)
+
+
+def ci_role_jobs(document: dict) -> list[str]:
+    """The jobs of a workflow that assume a CI AWS role."""
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict):
+        return []
+    return [
+        name
+        for name, job in jobs.items()
+        if isinstance(job, dict)
+        and any(role != PULL_REQUEST_ROLE for role in CI_ROLE_SECRET.findall(yaml.safe_dump(job.get("steps") or [])))
+    ]
+
+
+def check_ci_role_jobs(document: dict) -> list[str]:
+    """Report a CI role job outside a reusable workflow, or one that does not choose its role."""
+    names = ci_role_jobs(document)
+    if not names:
+        return []
+    triggers = _triggers(document)
+    problems = []
+    if not (isinstance(triggers, dict) and set(triggers) == {"workflow_call"}):
+        problems.extend(
+            f"job `{name}` assumes a CI AWS role in a workflow with triggers of its own; move it into a "
+            "reusable workflow (`on: workflow_call` only) and call that at "
+            "`spiceai/spiceai/.github/workflows/<file>@trunk`"
+            for name in names
+        )
+        return problems
+    call = triggers.get("workflow_call") or {}
+    declared = set((call.get("inputs") or {}) if isinstance(call, dict) else {})
+    for name in names:
+        steps = [s for s in document["jobs"][name].get("steps") or [] if isinstance(s, dict)]
+        first = steps[0] if steps else {}
+        if first.get("uses") != CI_ROLE_ACTION or first.get("id") != "ci-role":
+            problems.append(
+                f"job `{name}` assumes a CI AWS role but does not choose it first; make its first step "
+                f"`id: ci-role`, `uses: {CI_ROLE_ACTION}`"
+            )
+            continue
+        builds = str((first.get("with") or {}).get("builds", ""))
+        for build in sorted(declared & BUILD_INPUTS):
+            if not re.search(rf"\binputs\.{re.escape(build)}\b", builds):
+                problems.append(
+                    f"job `{name}` takes input `{build}`, which names another build, but does not give it to "
+                    f"the `ci-role` step's `builds`, so it would get the full roles for a build off trunk"
+                )
+        for position, step in enumerate(steps, start=1):
+            label = step.get("name") or f"step {position}"
+            if "aws-actions/configure-aws-credentials" in str(step.get("uses", "")):
+                role = str((step.get("with") or {}).get("role-to-assume", ""))
+                if not ROLE_CHOICE.fullmatch(role.strip()):
+                    problems.append(
+                        f"job `{name}` step `{label}` sets `role-to-assume: {role}`; write "
+                        "`${{ steps.ci-role.outputs.full == 'true' && secrets.<ROLE> || "
+                        "secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}`"
+                    )
+            elif REPOSITORY_WRITES.search(yaml.safe_dump(step)) and not FULL_ROLE.search(str(step.get("if", ""))):
+                problems.append(
+                    f"job `{name}` step `{label}` writes to the repository without "
+                    "`steps.ci-role.outputs.full == 'true'` in its `if:`, so it would write off trunk too"
+                )
+    return problems
+
+
+def check_ci_role_calls(workflows: dict[str, dict]) -> list[str]:
+    """Report a call to a CI role workflow that is not at trunk, or one that names it wrongly.
+
+    `workflows` maps each file name under `.github/workflows/` to its parsed document.
+    """
+    reusable = {name for name, document in workflows.items() if ci_role_jobs(document)}
+    problems = []
+    for caller, document in sorted(workflows.items()):
+        jobs = document.get("jobs")
+        if not isinstance(jobs, dict):
+            continue
+        for job_name, job in jobs.items():
+            uses = job.get("uses") if isinstance(job, dict) else None
+            if not isinstance(uses, str):
+                continue
+            trunk, local = TRUNK_CALL.fullmatch(uses), LOCAL_CALL.fullmatch(uses)
+            target = (trunk or local).group(1) if (trunk or local) else None
+            where = f"{caller}: job `{job_name}`"
+            if trunk and target not in workflows:
+                problems.append(f"{where} calls `{uses}`, but there is no .github/workflows/{target}")
+                continue
+            if target not in reusable:
+                other_ref = next(
+                    (name for name in reusable if uses.startswith(f"spiceai/spiceai/.github/workflows/{name}@")), None
+                )
+                if other_ref:
+                    problems.append(
+                        f"{where} calls the CI AWS role workflow `{uses}`; call "
+                        f"`spiceai/spiceai/.github/workflows/{other_ref}@trunk`, so trunk's definition chooses the role"
+                    )
+                continue
+            if LOCAL_CI_ROLE_CALLERS.get(caller) == target:
+                if not local:
+                    problems.append(
+                        f"{where} calls `{uses}`; {caller} is a required merge-queue check, so it calls "
+                        f"`./.github/workflows/{target}`, which the queue then tests"
+                    )
+            elif not trunk:
+                problems.append(
+                    f"{where} calls the CI AWS role workflow `{uses}`; call "
+                    f"`spiceai/spiceai/.github/workflows/{target}@trunk`, so trunk's definition chooses the role"
+                )
+            called = _triggers(workflows[target])
+            spec = (called.get("workflow_call") or {}) if isinstance(called, dict) else {}
+            declared = (spec.get("inputs") or {}) if isinstance(spec, dict) else {}
+            given = job.get("with") if isinstance(job.get("with"), dict) else {}
+            for key in sorted(set(given) - set(declared)):
+                problems.append(f"{where} passes input `{key}`, which {target} does not declare")
+            for key, value in sorted(declared.items()):
+                if isinstance(value, dict) and value.get("required") and key not in given:
+                    problems.append(f"{where} does not pass `{key}`, which {target} requires")
+    return problems
+
+
 def workflow_files(github_dir: Path) -> list[Path]:
     """Return the workflow definitions under `<github_dir>/workflows`, sorted."""
     workflows = github_dir / "workflows"
@@ -222,6 +384,7 @@ def check_workflow(text: str) -> list[str]:
         problems.extend(check_cache_endpoint_isolation(jobs))
         problems.extend(check_suite_visibility(jobs, is_scheduled(document)))
         problems.extend(check_untrusted_expansions(document, jobs))
+        problems.extend(check_ci_role_jobs(document))
 
     return problems
 
@@ -773,6 +936,12 @@ def check_definitions(github_dir: Path) -> list[str]:
                 f"{path}: {problem}"
                 for problem in check(path.read_text(encoding="utf-8"))
             )
+    workflows = {}
+    for path in workflow_files(github_dir):
+        document, _ = _parse_mapping(path.read_text(encoding="utf-8"))
+        if document is not None:
+            workflows[path.name] = document
+    failures.extend(f"{github_dir / 'workflows'}/{problem}" for problem in check_ci_role_calls(workflows))
     return failures
 
 

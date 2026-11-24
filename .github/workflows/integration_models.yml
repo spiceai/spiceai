@@ -594,12 +594,9 @@ jobs:
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
   test-bedrock:
-    name: Test Bedrock Models
+    # Assumes a CI AWS role, so it runs from integration_models_aws.yml; see that file.
     needs: [build]
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
-    runs-on: spiceai-macos-large
-    # Holds the ARN of the IAM role the tests call Bedrock as (`CI_AWS_BEDROCK_ROLE_ARN`).
-    environment: ci
     permissions:
       contents: write
       pull-requests: write
@@ -607,130 +604,9 @@ jobs:
       actions: write
       # Exchanged for the Bedrock role's AWS credentials: workload identity federation.
       id-token: write
-    env:
-      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Set up Rust
-        uses: $/.github/actions/setup-rust
-
-      - name: Set up Nextest
-        uses: $/.github/actions/setup-nextest
-
-      # The role trusts this job's GitHub OIDC token (subject
-      # `repo:spiceai/spiceai:environment:ci`), so CI holds no AWS access key. The credentials
-      # go to the test step alone, not the job's environment. Assumed before spiceio starts, so
-      # no build-cache endpoint can reach the STS call.
-      - name: Check for the Bedrock role
-        env:
-          CI_AWS_BEDROCK_ROLE_ARN: ${{ secrets.CI_AWS_BEDROCK_ROLE_ARN }}
-        run: |
-          if [ -z "$CI_AWS_BEDROCK_ROLE_ARN" ]; then
-            echo "::error::CI_AWS_BEDROCK_ROLE_ARN is not set in the ci environment, so the Bedrock tests cannot authenticate. Create the IAM role that trusts this repository's GitHub OIDC tokens and set the secret to its ARN."
-            exit 1
-          fi
-
-      - name: Assume the Bedrock role
-        id: bedrock-role
-        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ secrets.CI_AWS_BEDROCK_ROLE_ARN }}
-          role-session-name: gha-bedrock-${{ github.run_id }}
-          aws-region: us-east-1
-          output-env-credentials: false
-          output-credentials: true
-
-      - name: Set up spiceio
-        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
-        id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
-        with:
-          smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.SMB_PASSWORD }}
-          token: ${{ github.token }}
-          bucket: build
-          region: us-west-1
-          otel-endpoint: spicehq/spiceio
-          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
-          otel-region: us-west-2
-          instance-id: ci-${{ github.run_id }}-${{ github.job }}
-          machine: ${{ runner.name }}
-
-      - name: Download test archive from spiceio
-        if: env.HAS_SPICEIO_SECRET == 'true'
-        env:
-          SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
-        run: |
-          set -euo pipefail
-          : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to download the AI integration test archive}"
-          mkdir -p ./integration_test
-          archive_url="${SPICEIO_ENDPOINT%/}/${AI_INTEGRATION_TEST_ARCHIVE_S3_URI#s3://}"
-          curl --fail --silent --show-error --output ./integration_test/integration.tar.zst "$archive_url"
-
-      - name: Download test archive
-        if: env.HAS_SPICEIO_SECRET != 'true'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: ai-integration-test-archive
-          path: ./integration_test
-
-      - name: Run Beta functionality embedding tests
-        env:
-          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
-          AWS_BEDROCK_KEY: ${{ steps.bedrock-role.outputs.aws-access-key-id }}
-          AWS_BEDROCK_SECRET: ${{ steps.bedrock-role.outputs.aws-secret-access-key }}
-          AWS_BEDROCK_SESSION_TOKEN: ${{ steps.bedrock-role.outputs.aws-session-token }}
-        run: |
-          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- bedrock_test
-
-      - name: Run Bedrock decisions tests
-        if: ${{ !cancelled() }}
-        env:
-          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
-          AWS_BEDROCK_KEY: ${{ steps.bedrock-role.outputs.aws-access-key-id }}
-          AWS_BEDROCK_SECRET: ${{ steps.bedrock-role.outputs.aws-secret-access-key }}
-          AWS_BEDROCK_SESSION_TOKEN: ${{ steps.bedrock-role.outputs.aws-session-token }}
-        run: |
-          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -E 'test(/decisions::provider_answers_decisions.*bedrock/)'
-
-      # The path EKS (IRSA) and any other OIDC token file take: no key at all, only
-      # `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`, which spiced's AWS credential chain
-      # exchanges with STS itself. A GitHub OIDC token lives 5 minutes, which this one test
-      # needs for a single exchange; STS's credentials then last the role's session.
-      - name: Run a Bedrock test with web identity credentials
-        if: ${{ !cancelled() }}
-        env:
-          AWS_ROLE_ARN: ${{ secrets.CI_AWS_BEDROCK_ROLE_ARN }}
-          AWS_ROLE_SESSION_NAME: gha-bedrock-web-identity-${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
-          export AWS_WEB_IDENTITY_TOKEN_FILE="${RUNNER_TEMP}/aws-web-identity-token"
-          trap 'rm -f "$AWS_WEB_IDENTITY_TOKEN_FILE"' EXIT
-          umask 077
-          # The request token goes to curl on stdin, out of the process list.
-          printf 'header = "Authorization: bearer %s"\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" |
-            curl --config - --fail --silent --show-error --max-time 30 \
-              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" |
-            python3 -c 'import json, sys; sys.stdout.write(json.load(sys.stdin)["value"])' \
-              > "$AWS_WEB_IDENTITY_TOKEN_FILE"
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- bedrock_test_ai_if_answers
-
-      - name: Push snapshots to branch
-        if: ${{ !cancelled() && (github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule') }}
-        timeout-minutes: 10
-        uses: $/.github/actions/push-snap-changes
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Kill spiceio
-        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
-        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+    uses: spiceai/spiceai/.github/workflows/integration_models_aws.yml@trunk
+    with:
+      update_snapshots: ${{ github.event.inputs.update_snapshots }}
 
   build-extended:
     name: Build Test Binary (Extended)

@@ -38,7 +38,9 @@
 # rustfs_credentials.sh gets for this job's GitHub OIDC token. Signing needs curl 7.87 or
 # later: an older curl leaves the session token and the body's hash out of the signature,
 # and the store refuses it. A job without an OIDC token (one without `permissions:
-# id-token: write`, or any pull request from a fork) only reads, and says so in one line.
+# id-token: write`, or any pull request from a fork) only reads, and says so in one line,
+# as does a run with CI_CACHE_READ_ONLY=true (a CI AWS role job off trunk and the trunk
+# merge queue).
 # A write that fails is a warning, never a failed job. Nothing is written when the bucket
 # could not be reached or refused the read: it would refuse or stall the write too. The
 # credentials never leave this script's process and are never printed.
@@ -218,6 +220,10 @@ write_back() {
     missing | wrong) ;;
     *) return 0 ;;
   esac
+  if [ "${CI_CACHE_READ_ONLY:-}" = true ]; then
+    echo "$name: not written to the CI cache, since this run is read-only (CI_CACHE_READ_ONLY)."
+    return 0
+  fi
   if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
     echo "$name: not written to the CI cache, which takes writes only from a job with an OIDC token (permissions: id-token: write; a pull request from a fork never has one)."
     return 0

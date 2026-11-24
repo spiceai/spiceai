@@ -39,6 +39,12 @@ With --check, nothing is written, and the script fails on any remote `uses:`
 that is not a full-length SHA, or that has no lockfile entry under exactly
 that `owner/repo@sha`. CI runs it in verify-lockfile.yml.
 
+One remote `uses:` is exempt: a job that calls this repository's own reusable workflow
+at trunk, `spiceai/spiceai/.github/workflows/<file>@trunk`. The jobs that assume a CI AWS
+role are called that way on purpose, so the definition that chooses the role is always
+trunk's (check_workflow_yaml.py requires it). Pinning it to a commit would freeze that
+definition; the file is in this tree, and its own `uses:` are pinned and checked here.
+
 A `uses:` is a job's or a step's `uses` key, found by parsing the YAML, so a
 quoted key or a multi-line value counts and script text never does. Needs
 PyYAML (`pip install pyyaml`).
@@ -67,6 +73,9 @@ FULL_SHA = re.compile(r"[0-9a-f]{40}")
 # Local actions run at the workflow's own commit and container images are not
 # actions, so neither takes a commit SHA.
 NOT_REMOTE = ("./", "$/", "docker://")
+# A job calling this repository's own reusable workflow at trunk (see the module docstring).
+# Only a workflow path matches, which a step's `uses:` can never be.
+SAME_REPOSITORY_TRUNK = re.compile(r"spiceai/spiceai/\.github/workflows/[^/@]+\.ya?ml@trunk")
 
 # The layout `gh actions-lock` v0.4.1 writes. Anything else fails closed.
 LOCK_ENTRY = re.compile(r"^    '(?P<key>[^']+)':(?P<empty> \[\])?$")
@@ -315,7 +324,7 @@ def parse_action_file(root: Path, path: Path, text: str) -> ActionFile:
         start = (node.start_mark.line, node.start_mark.column)
         if not isinstance(node, yaml.ScalarNode):
             raise LockfileError(f"{path.relative_to(root)}:{start[0] + 1}: `uses:` is not a string")
-        if node.value.startswith(NOT_REMOTE):
+        if node.value.startswith(NOT_REMOTE) or SAME_REPOSITORY_TRUNK.fullmatch(node.value):
             continue
         # An alias names its anchor's node again; one source location is one `uses:`.
         found[start] = Uses(path, node.value, node.style, start, (node.end_mark.line, node.end_mark.column))

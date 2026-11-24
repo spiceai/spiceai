@@ -158,6 +158,31 @@ jobs:
             ],
         )
 
+    def test_this_repositorys_reusable_workflow_at_trunk_is_checked_as_a_local_file(self):
+        document = """\
+jobs:
+  call:
+    uses: spiceai/spiceai/.github/workflows/x_aws.yml@trunk
+"""
+        parsed = yaml.safe_load(document)
+        self.assertEqual(check_workflow_environments.check_workflow(parsed, frozenset({"x_aws.yml"})), [])
+        self.assertEqual(
+            check_workflow_environments.check_workflow(parsed, frozenset({"y.yml"})),
+            [
+                "job 'call' calls 'spiceai/spiceai/.github/workflows/x_aws.yml@trunk', but this "
+                "repository has no .github/workflows/x_aws.yml to check"
+            ],
+        )
+
+    def test_this_repositorys_reusable_workflow_at_another_ref_fails(self):
+        for uses in (
+            "spiceai/spiceai/.github/workflows/x_aws.yml@main",
+            "spiceai/spiceai/.github/workflows/x_aws.yml@0123456789abcdef0123456789abcdef01234567",
+            "other/spiceai/.github/workflows/x_aws.yml@trunk",
+        ):
+            with self.subTest(uses=uses):
+                self.assertEqual(len(problems(f"jobs:\n  call:\n    uses: {uses}\n")), 1)
+
     def test_reusable_workflow_caller_with_environment_fails(self):
         self.assertEqual(
             problems(
