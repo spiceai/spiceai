@@ -1818,8 +1818,19 @@ async fn assert_no_staged_files(fixture: &common::TestFixture, table: &CayenneTa
         assert_staging_empty(&staging_dir(table));
         return;
     }
+    table
+        .drain_in_flight_maintenance()
+        .await
+        .expect("drain post-write maintenance");
     common::reclaim_delayed_deletes(fixture, table).await;
     let data_path = table.metadata().path.clone();
+    // Listed before the catalog is read, so a file a commit adds in between is
+    // missing from the listing rather than reported as unnamed.
+    let stored = fixture
+        .data_store
+        .list_files(&data_path)
+        .await
+        .expect("list the table's data path");
     let metadata = fixture
         .catalog
         .get_table(&table.metadata().table_name)
@@ -1848,11 +1859,7 @@ async fn assert_no_staged_files(fixture: &common::TestFixture, table: &CayenneTa
         .map(|file| file.relative)
         .collect();
     let table_dir = format!("{}/", metadata.table_id);
-    let unnamed: Vec<String> = fixture
-        .data_store
-        .list_files(&data_path)
-        .await
-        .expect("list the table's data path")
+    let unnamed: Vec<String> = stored
         .into_iter()
         .filter(|file| {
             file.is_staged()
