@@ -27958,7 +27958,8 @@ impl CayenneTableProvider {
                     table = self.table_metadata.table_name.as_str(),
                     %error,
                     new_snapshot_id = snapshot_id,
-                    "Failed to author merged {pass} manifest before swap; scan falls back to directory listing"
+                    "Failed to record the files of dataset '{}' merged by {pass}, so its queries find the merged files by listing storage until the next rebuild records them. Cause: {error}",
+                    self.table_metadata.table_name
                 );
                 Ok(None)
             }
