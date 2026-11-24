@@ -936,7 +936,7 @@ pub fn require_process_per_test(why: &str) {
 /// | `file_scan_statistics_source_test::scan_file_statistics_counters_match_the_store_and_the_metastore` | As above. |
 /// | `integration_test::test_cayenne_catalog_persistence_impl` | Reopens a SQLite catalog file. |
 /// | `listing_cache_retention_race_test` (all) | Races a snapshot-directory listing through the list-files cache; a table in the object-native location never lists its files. |
-/// | `mem_tier_overwrite_retention_test::retention_judges_a_key_by_its_live_version_impl` | Open defect on the local-location store: under concurrent load, the retention pass after a mem-tier checkpoint can leave a RAM-tier row that matches `retention_sql` visible. |
+/// | `mem_tier_overwrite_retention_test::retention_judges_a_key_by_its_live_version_impl` | Fails intermittently on the local-location store when many tests run at once, with a RAM-tier row that matches `retention_sql` still visible after the retention pass; the cause is not yet known. |
 /// | `mem_tier_overwrite_retention_test::a_waiting_publish_does_not_hold_back_the_other_partitions_impl` | Commits partitions' overwrites in one SQLite metastore transaction; the object-native metastore does not hold partitioned tables. |
 /// | `orphan_dv_compaction_test::provider_open_replays_an_orphan_backlog_left_by_a_crash_impl` | Writes deletion vectors and their catalog rows by hand at a local path. |
 /// | `orphan_dv_compaction_test::scheduled_cleanup_waits_for_the_orphan_threshold_impl` | As above. |
