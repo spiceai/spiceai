@@ -366,9 +366,7 @@ impl RefreshTask {
                         accepted
                     };
                 if bulk_snapshot {
-                    if !pending.is_empty() {
-                        Event::Published(await_front(&mut pending).await)
-                    } else {
+                    if pending.is_empty() {
                         let Some(envelope) = held.take() else {
                             continue;
                         };
@@ -408,6 +406,7 @@ impl RefreshTask {
                         }
                         continue;
                     }
+                    Event::Published(await_front(&mut pending).await)
                 } else if envelope.history_unavailable() {
                     if pending.is_empty() {
                         let Some(envelope) = held.take() else {
