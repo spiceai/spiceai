@@ -135,8 +135,21 @@ async fn download_to_cache(
     let dir = std::path::PathBuf::from(home).join(format!(".cache/spicescript/duckdb-{version}"));
     let binary = dir.join(file);
     if !binary.is_file() {
-        tokio::fs::create_dir_all(&dir).await?;
-        let archive = dir.join(asset);
+        // Unpacked into a directory of this process's own, then renamed into
+        // place: runners that share a home directory (several runner instances
+        // on one macOS host) must never load a library or run a CLI another is
+        // still writing.
+        let staging = dir.with_file_name(format!(
+            "{}.tmp-{}",
+            dir.file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+            std::process::id()
+        ));
+        if staging.exists() {
+            tokio::fs::remove_dir_all(&staging).await?;
+        }
+        tokio::fs::create_dir_all(&staging).await?;
+        let archive = staging.join(asset);
         let url = format!("https://github.com/duckdb/duckdb/releases/download/v{version}/{asset}");
         let status = tokio::process::Command::new("curl")
             .args(crate::release::CURL_RELEASE_RETRY)
@@ -151,20 +164,29 @@ async fn download_to_cache(
         }
         let mut unpack = if asset.ends_with(".tar.gz") {
             let mut tar = tokio::process::Command::new("tar");
-            tar.arg("-xzf").arg(&archive).arg("-C").arg(&dir);
+            tar.arg("-xzf").arg(&archive).arg("-C").arg(&staging);
             tar
         } else {
             let mut unzip = tokio::process::Command::new("unzip");
-            unzip.args(["-o", "-q"]).arg(&archive).arg("-d").arg(&dir);
+            unzip
+                .args(["-o", "-q"])
+                .arg(&archive)
+                .arg("-d")
+                .arg(&staging);
             unzip
         };
         let status = unpack.status().await.context("Failed to unpack")?;
-        if !status.success() || !binary.is_file() {
+        if !status.success() || !staging.join(file).is_file() {
             bail!(
                 "Failed to unpack the DuckDB {version} {file} from {}",
                 archive.display()
             );
         }
+        // One file renamed into the shared directory: atomic within a
+        // filesystem, and replacing an identical copy another process put there.
+        tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::rename(staging.join(file), &binary).await?;
+        tokio::fs::remove_dir_all(&staging).await?;
     }
     Ok(binary.display().to_string())
 }

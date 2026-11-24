@@ -1,4 +1,5 @@
 name: duckdb-types-acceleration
+tags: [macos-smoke]
 description: >
   A DuckDB table with a column of each Arrow type a `duckdb:` dataset reads
   (boolean, the signed integers, both floats, date, timestamps at millisecond

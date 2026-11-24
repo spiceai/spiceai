@@ -7,10 +7,11 @@ description: >
   Hub's `resolve-cache`, newline-delimited JSON, and a TSV glob. Each dataset
   is pinned to a commit, so the answers recorded with DuckDB (v1.5.6) cannot
   drift; the two tables small enough are compared row for row, by an MD5 of
-  every row in order. The converted branch has no pin: its answer holds while
-  stanfordnlp/imdb's `main` is the commit pinned here, and a mismatch on it
-  alone means `main` moved and the answer needs recording again. Uses
-  `HF_TOKEN` when it is set: anonymous Hub requests share a per-IP quota.
+  every row in order, each text field prefixed with its length. The converted
+  branch has no pin: its answer holds while stanfordnlp/imdb's `main` is the
+  commit pinned here, and a mismatch on it alone means `main` moved and the
+  answer needs recording again. Uses `HF_TOKEN` when it is set: anonymous Hub
+  requests share a per-IP quota.
 
 variants:
   federated: {}
@@ -66,13 +67,16 @@ steps:
   - query: SELECT count(*) AS n, sum(label) AS s, sum(character_length(text)) AS c FROM imdb_converted
     expect: { rows: [['25000', '12500', '32344810']] }
 
-  # Every row, in order, as one MD5 recorded with DuckDB from the same query:
-  #   SELECT md5(string_agg(concat_ws('|', <columns>), ';' ORDER BY <key>)) FROM <file>
+  # Every row, in order, as one MD5 recorded with DuckDB (v1.5.6). Each text
+  # field carries its length in bytes before it (`strlen` in DuckDB,
+  # `octet_length` here), so no text a field holds can shift where it ends and
+  # two different row sets cannot serialize alike. Recorded with:
+  #   SELECT md5(string_agg(concat(<field or strlen(text):text>, …), ';' ORDER BY <key>)) FROM <file>
   - query: >
-      SELECT md5(string_agg(concat_ws('|', "Id", "SepalLengthCm", "SepalWidthCm", "PetalLengthCm",
-        "PetalWidthCm", "Species"), ';' ORDER BY "Id")) AS h, count(*) AS n FROM iris
-    expect: { rows: [[c5bcfdbbc6e17ef680f71a774ab2ae6c, '150']] }
+      SELECT md5(string_agg(concat("Id", '|', "SepalLengthCm", '|', "SepalWidthCm", '|', "PetalLengthCm", '|',
+        "PetalWidthCm", '|', octet_length("Species"), ':', "Species"), ';' ORDER BY "Id")) AS h, count(*) AS n FROM iris
+    expect: { rows: [[4300d12cb9fdb5f0bd847acbac013756, '150']] }
   - query: >
-      SELECT md5(string_agg(concat_ws('|', question, answer), ';' ORDER BY question, answer)) AS h,
-        count(*) AS n FROM gsm8k_test
-    expect: { rows: [[e86a9cbebee14acae7585c5029b15055, '1319']] }
+      SELECT md5(string_agg(concat(octet_length(question), ':', question, octet_length(answer), ':', answer), ''
+        ORDER BY question, answer)) AS h, count(*) AS n FROM gsm8k_test
+    expect: { rows: [[f38ab36669a42720ec33dbca2ef478be, '1319']] }

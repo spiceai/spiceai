@@ -887,7 +887,7 @@ jobs:
         uses: $/.github/actions/stop-spice
 
       # The scenario scripts tagged `macos-smoke`: they need no Docker (their sources are
-      # `files`, `mock-http` or none), which this pool does not have. Every other script
+      # `files`, `mock-http`, `duckdb` or none), which this pool does not have. Every other script
       # runs on Linux, in `test_spicescript`. They run whatever the model tests did.
       # Built by `build_macos`, which holds no credentials (see its build step).
       - name: 'spicescript: download'

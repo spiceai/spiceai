@@ -41,12 +41,13 @@ pub enum Tag {
     Long,
     /// Run on the macOS runners too, by E2E Test CI's `spicescript: macOS
     /// smoke` job (`--only-tag macos-smoke`), as well as on Linux. Those
-    /// runners have no Docker, so every source must be `files` or `mock-http`.
+    /// runners have no Docker, so every source must be `files`, `mock-http` or
+    /// `duckdb`.
     MacosSmoke,
 }
 
-/// Source kinds that run in this process rather than in a container.
-const IN_PROCESS_SOURCES: &[&str] = &["files", "mock-http"];
+/// Source kinds that run on the host rather than in a container.
+const IN_PROCESS_SOURCES: &[&str] = &["files", "mock-http", "duckdb"];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -300,6 +301,11 @@ pub struct Defaults {
     /// node mTLS with a CA and certificates generated for the run.
     #[serde(default)]
     pub cluster: Option<ClusterDefaults>,
+    /// Why the script runs only as a single node: `--cluster` skips it with
+    /// this reason. For what the runner cannot see in the spicepod up front,
+    /// such as datasets a `spice` step adds while it runs.
+    #[serde(default)]
+    pub single_node: Option<String>,
     /// When the script runs as a cluster, the column each acceleration without
     /// `partition_by` is bucketed on, by dataset name (`*` for any other).
     #[serde(default)]
@@ -370,6 +376,7 @@ impl Default for Defaults {
             spiced_args: Vec::new(),
             executor_args: None,
             cluster: None,
+            single_node: None,
             cluster_partition_by: BTreeMap::new(),
             exclusive: false,
             run_variants: RunVariants::OneAfterAnother,
@@ -1164,6 +1171,10 @@ impl Script {
                     .map_or_else(String::new, |value| value.get_name().to_string())
             );
         }
+        ensure!(
+            script.defaults.single_node.is_none() || script.defaults.cluster.is_none(),
+            "`defaults.single-node` and `defaults.cluster` contradict each other; keep one"
+        );
         for name in &script.requires_env {
             ensure!(
                 !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
@@ -1175,8 +1186,8 @@ impl Script {
                 ensure!(
                     IN_PROCESS_SOURCES.contains(&source.kind.as_str()),
                     "Source `{name}` is `{}`, which runs in Docker, but the script is tagged \
-                     `macos-smoke` and the macOS runners have no Docker; use a `files` or \
-                     `mock-http` source, or drop the tag",
+                     `macos-smoke` and the macOS runners have no Docker; use a `files`, \
+                     `mock-http` or `duckdb` source, or drop the tag",
                     source.kind
                 );
             }
@@ -3053,12 +3064,13 @@ mod tests {
         };
         assert_eq!(parse("files"), Ok(vec![Tag::MacosSmoke]));
         assert_eq!(parse("mock-http"), Ok(vec![Tag::MacosSmoke]));
+        assert_eq!(parse("duckdb"), Ok(vec![Tag::MacosSmoke]));
         assert_eq!(
             parse("postgres"),
             Err(
                 "Source `src` is `postgres`, which runs in Docker, but the script is tagged \
-                 `macos-smoke` and the macOS runners have no Docker; use a `files` or \
-                 `mock-http` source, or drop the tag"
+                 `macos-smoke` and the macOS runners have no Docker; use a `files`, \
+                 `mock-http` or `duckdb` source, or drop the tag"
                     .to_string()
             )
         );

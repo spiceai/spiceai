@@ -185,10 +185,11 @@ its failure history low. A PR that edits a `long` script runs it in the merge
 queue too; a PR that only changes its `tags:` line does not. `macos-smoke`
 also runs the script against the macOS build, in E2E Test CI's `spicescript:
 macOS smoke` job (`--only-tag macos-smoke`); those runners have no Docker, so
-every source of such a script must be `files` or `mock-http`, and the parser
-refuses any other. Keep that set small: it is the macOS coverage of what
-differs by platform (file-mode acceleration on its filesystem, the CLI, the
-protocols), not a second copy of the suite. Write the list on
+every source of such a script must be `files`, `mock-http` or `duckdb` (which
+run on the host), and the parser refuses any other. Keep that set small: it is
+the macOS coverage of what differs by platform (file-mode acceleration on its
+filesystem, loading the host's DuckDB library, the CLI, the protocols), not a
+second copy of the suite. Write the list on
 one line with plain names (`tags: [long]`), since CI selects those scripts by
 that line; a block list, a list over several lines, a quoted or escaped name,
 and unknown or duplicate tags are rejected.
@@ -686,7 +687,7 @@ Defaults (`defaults:`):
 - **Comparing variants:** `compare-variants: false` turns off agreement between variants; `compare-to: <variant>` compares every variant with one.
 - **Protocols and auth:** `also-http: true` also asks every query over HTTP JSON and requires the same answer; `also-async: true` also runs every query as a `/v1/queries` job (a distributed job on a cluster) and requires the same answer; `api-key`; `tls: { ca }`.
 - **Running spiced:** `spiced-args`, `executor-args`.
-- **Clusters:** `cluster: { executors, spare, containers }`, and `cluster-partition-by: { <dataset or *>: <column> }` for `--cluster` runs. `containers: true` runs each executor in a container of its own on the host's network (Linux only; elsewhere the script is skipped), with the work and script directories mounted. Behind a rootless Docker daemon, whose host network is not this machine's, the executors run on the bridge network instead: their ports and the script's object store sources are published on every interface, which reaches them at this machine's routable address as well as loopback, the nodes advertise that address, and the spicepod names the sources at it. Each object store then has a secret of its own. The spicepod of such a script may name only `rustfs`, `files` and `duckdb` sources; its other sources, such as an oracle, stay on loopback, and a spicepod that names one is refused. Each executor writes shuffle output to its own `/tmp`, so a stage reads another executor's output over the network, as on separate hosts; a spicepod that sets `runtime.query.temp_directory` to a shared path undoes this, since an executor reads a peer's shuffle file from disk wherever its path exists.
+- **Clusters:** `single-node: <reason>` makes `--cluster` skip the script with that reason, for what it cannot see in the spicepod up front (datasets a `spice` step adds while the script runs); `cluster: { executors, spare, containers }`, and `cluster-partition-by: { <dataset or *>: <column> }` for `--cluster` runs. `containers: true` runs each executor in a container of its own on the host's network (Linux only; elsewhere the script is skipped), with the work and script directories mounted. Behind a rootless Docker daemon, whose host network is not this machine's, the executors run on the bridge network instead: their ports and the script's object store sources are published on every interface, which reaches them at this machine's routable address as well as loopback, the nodes advertise that address, and the spicepod names the sources at it. Each object store then has a secret of its own. The spicepod of such a script may name only `rustfs`, `files` and `duckdb` sources; its other sources, such as an oracle, stay on loopback, and a spicepod that names one is refused. Each executor writes shuffle output to its own `/tmp`, so a stage reads another executor's output over the network, as on separate hosts; a spicepod that sets `runtime.query.temp_directory` to a shared path undoes this, since an executor reads a peer's shuffle file from disk wherever its path exists.
 - **Scheduling:**
   - `exclusive: true` runs the script alone, its instances one after another;
   - `run-variants: side-by-side` runs variants that work together (a snapshot writer and its reader) a step at a time, as one job.

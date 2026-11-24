@@ -282,6 +282,15 @@ fn adopt_spicepod(
     if on_disk == before {
         return Ok(());
     }
+    // A cluster's executors were started from the spicepod as it was, in
+    // directories of their own: they would get the edit without the files it
+    // references (`datasets/<name>/dataset.yaml`) and without the cluster's
+    // partitioning of new accelerations.
+    ensure!(
+        tier == Tier::Sidecar || instance.executors.is_empty(),
+        "`spice` changed the spicepod of a cluster instance, which its executors cannot \
+         follow; set `defaults.single-node` with the reason so --cluster skips the script"
+    );
     match tier {
         Tier::Upstream => {
             instance.spicepod = yaml::from_str(&on_disk)

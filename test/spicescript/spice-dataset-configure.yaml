@@ -14,6 +14,12 @@ description: >
 sources:
   src: { kind: files }
 
+defaults:
+  # The CLI adds datasets as the script runs, which a cluster's executors,
+  # started from the spicepod before, cannot follow; and `orders` is a memory
+  # acceleration, which does not run distributed.
+  single-node: datasets are added by the CLI while it runs, after the executors start
+
 # The app as `spice init` leaves it: no datasets until the CLI adds them.
 spicepod:
   version: v1
