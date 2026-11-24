@@ -482,7 +482,7 @@ async fn a_writer_that_cannot_renew_its_lease_deletes_nothing_its_successor_comm
 
     // Two hours pass on the store's clock, and B commits again: B's first
     // files are past the orphan sweep's age floor.
-    clock.advance_clock(Duration::from_secs(2 * 3600));
+    clock.advance_clock(Duration::from_hours(2));
     b.insert(201, 300).await.expect("B writes again");
     assert_eq!(b.count_and_sum().await, expected(1..=300));
     let swept = a_table.sweep_orphan_files_now().await;

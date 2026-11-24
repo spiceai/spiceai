@@ -190,7 +190,10 @@ impl Domain {
                 }
                 match inner.reload_committed().await {
                     Ok(()) => {
-                        tracing::info!("{}", super::handed_over_message(dataset, holder.as_deref()))
+                        tracing::info!(
+                            "{}",
+                            super::handed_over_message(dataset, holder.as_deref())
+                        );
                     }
                     Err(error) => {
                         inner.stop = Some(Stop::Fenced);
