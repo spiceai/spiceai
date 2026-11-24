@@ -289,7 +289,6 @@ async fn seed_blobs_without_nan_counts(
 ) -> Vec<(String, String)> {
     use datafusion::datasource::TableProvider;
     use vortex::expr::stats::{Precision as VortexPrecision, Stat};
-    use vortex::flatbuffers::WriteFlatBufferExt;
 
     // The scans persist in the background; seeding before they land would have
     // them overwrite the seeded rows.
@@ -313,7 +312,10 @@ async fn seed_blobs_without_nan_counts(
             .expect("the scans above persisted the file's statistics");
         let file_stats = cayenne::stats::deserialize_file_statistics(&row.statistics_blob, &schema)
             .expect("blob decodes");
-        let mut sets: Vec<_> = file_stats.into_iter().map(|(set, _)| set.clone()).collect();
+        let mut sets: Vec<_> = cayenne::stats::column_stats_sets(&file_stats, &schema)
+            .into_iter()
+            .map(|(set, _)| set)
+            .collect();
         // The `K` column: NaN-excluding bounds and no NaN count.
         sets[1].clear(Stat::NaNCount);
         sets[1].set(
@@ -324,14 +326,9 @@ async fn seed_blobs_without_nan_counts(
             Stat::Max,
             VortexPrecision::Exact(vortex::scalar::ScalarValue::from(nan_free_bounds.1)),
         );
-        let dtype = vortex::arrow::ArrowSession::default()
-            .from_arrow_schema(&schema)
-            .expect("schema converts");
-        let legacy = vortex::file::FileStatistics::new_with_dtype(sets.into(), &dtype)
-            .write_flatbuffer_bytes()
-            .expect("blob encodes")
-            .as_slice()
-            .to_vec();
+        let legacy = cayenne::stats::build_file_statistics(&sets, &schema)
+            .and_then(|stats| cayenne::stats::serialize_file_statistics(&stats))
+            .expect("blob encodes");
         fixture
             .catalog
             .upsert_snapshot_file_statistics(&cayenne::metadata::SnapshotFileStatistics {
@@ -415,10 +412,13 @@ async fn blobs_written_before_nan_was_accounted_for_are_not_trusted() {
             let file_stats =
                 cayenne::stats::deserialize_file_statistics(&row.statistics_blob, &schema)
                     .expect("blob decodes");
-            let (k_stats, k_dtype) = file_stats.into_iter().nth(1).expect("K column");
+            let (k_stats, k_dtype) = cayenne::stats::column_stats_sets(&file_stats, &schema)
+                .into_iter()
+                .nth(1)
+                .expect("K column");
             let bounded = !k_stats.get(Stat::Max).is_absent();
             assert!(
-                !bounded || vortex_datafusion::bounds_account_for_nan(k_stats, k_dtype),
+                !bounded || vortex_datafusion::bounds_account_for_nan(&k_stats, &k_dtype),
                 "{name}: row {key} was not rewritten (its float bounds carry no NaN count)"
             );
             if !bounded {
