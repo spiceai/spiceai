@@ -151,10 +151,8 @@ pub async fn register_all() {
     }
 }
 
-/// Whether the connector `name` resumes its change stream after a restart (see
-/// [`DataConnectorFactory::resumes_changes_after_restart`]). Answered synchronously
-/// from the connectors linked into the binary, because startup decides whether a
-/// dataset waits for its source in code that cannot await the factory registry.
+/// Whether the connector `name` resumes its change stream after a restart. Read
+/// from the linked connectors because the startup checks cannot await the registry.
 #[must_use]
 pub fn connector_resumes_changes_after_restart(name: &str) -> bool {
     static RESUMING: LazyLock<std::collections::HashSet<&'static str>> = LazyLock::new(|| {

@@ -712,9 +712,7 @@ impl Builder {
         self
     }
 
-    /// Record the dataset checkpoint once the change stream first reports the
-    /// dataset ready, so a later start can serve the acceleration before its
-    /// source answers.
+    /// Record the dataset checkpoint once the change stream first reports ready.
     pub fn checkpoint_when_changes_ready(&mut self) -> &mut Self {
         self.checkpoint_when_changes_ready = true;
         self

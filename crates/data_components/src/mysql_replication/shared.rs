@@ -1241,9 +1241,8 @@ async fn attach_member(
             // Clear whatever a crashed earlier load left behind, so the snapshot
             // is a full replace rather than an upsert over rows the source no
             // longer has. Reached only when nothing was persisted for this member
-            // and the acceleration was observed empty, so there is no completed
-            // load to preserve; any other acceleration takes the `Rebuild` arm
-            // above.
+            // and the acceleration was observed empty; any other acceleration takes
+            // the `Rebuild` arm above.
             let truncate = super::truncate_envelope(&schema, &primary_keys, &column_map)?;
             // Built before the snapshot input takes ownership of `dataset_name`.
             //
@@ -1417,10 +1416,8 @@ impl MemberStart {
 /// Neither route uses the snapshot path: a rebuild is a single zero-row signal
 /// the consumer answers with an atomic replacement ([`MemberStart::Rebuild`]).
 ///
-/// An acceleration not observed empty with no position recorded (its sidecar
-/// could not be read, or a save failed) is rebuilt for the same reason when the
-/// table is to be read at all: it may be served while the load runs, and a
-/// snapshot would empty it first.
+/// An acceleration with no recorded position that was not observed empty is
+/// rebuilt too: it may be served while it loads, and a snapshot would empty it.
 ///
 /// Pure so the ordering is unit-testable without a live `MySQL`.
 fn start_without_usable_position(
@@ -3494,9 +3491,7 @@ mod tests {
 
     #[test]
     fn rows_held_without_a_recorded_position_are_replaced_rather_than_emptied() {
-        // An acceleration not observed empty can be served while it loads, so a
-        // load that reads the table replaces it atomically. `disabled`
-        // reads nothing and still streams.
+        // An acceleration not observed empty is rebuilt; `disabled` still streams.
         for mode in [InitialSnapshotMode::Auto, InitialSnapshotMode::Always] {
             assert_eq!(
                 start_without_usable_position(mode, false, true),

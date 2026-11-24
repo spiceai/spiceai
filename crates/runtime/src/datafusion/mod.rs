@@ -4361,9 +4361,8 @@ impl DataFusion {
         // acceleration — empty on a first start — already holds the whole dataset, and a scan
         // must not fail while a refresh that reads no rows runs. A snapshot refresh is the
         // exception, since its rows do arrive by refresh.
-        // A change stream that resumes after a restart is served from its acceleration
-        // before the source answers. An executor's scoped dataset arrives here with its
-        // `partition_by` cleared, so its partition filters exclude it.
+        // Executor-scoped datasets arrive with `partition_by` cleared, so check the
+        // partition filters too.
         let resumes_changes = initial_partition_filters.is_none()
             && crate::Runtime::may_serve_existing_acceleration(dataset);
         let mut initial_load_complete = matches!(refresh_mode, RefreshMode::Caching)
@@ -4380,12 +4379,9 @@ impl DataFusion {
             .await
             && checkpoint.exists().await
         {
-            // For CDC we let connector/stream to decide when dataset is ready, except
-            // for a stream that resumes after a restart while the dataset is served
-            // from its acceleration: like the other refresh modes, it is ready now and
-            // catches up in the background. Its checkpoint is written only once the
-            // stream has first reported the dataset ready, so the acceleration is
-            // complete.
+            // For CDC the change stream decides when the dataset is ready, except when a
+            // resuming stream's dataset is served from its acceleration: then it is ready
+            // now and catches up in the background.
             //
             // A dataset that reads snapshots (`file_format: snapshot`) is ready only once it
             // has restored a snapshot in this process: a copy left from an earlier run can be

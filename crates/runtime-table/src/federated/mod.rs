@@ -442,12 +442,9 @@ impl FederatedTable {
         Self::Deferred(deferred)
     }
 
-    /// [`Self::new_deferred`] for a `refresh_mode: changes` dataset served from its
-    /// acceleration, which resolves once the source is reached even when the
-    /// source's schema differs from the checkpoint's. Its change stream applies
-    /// `on_schema_change` itself, and holding the provider back would keep the
-    /// stream from starting at all. The dataset is served from its acceleration
-    /// from registration on, so queries do not read this provider.
+    /// [`Self::new_deferred`] for a CDC dataset served from its acceleration. It
+    /// resolves once the source is reached, even if the source schema differs,
+    /// because the change stream applies `on_schema_change` itself.
     #[must_use]
     pub fn new_deferred_for_change_stream(
         dataset: Arc<DatasetSpec>,

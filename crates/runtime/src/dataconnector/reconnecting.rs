@@ -29,9 +29,8 @@ limitations under the License.
 //! Before the real connector exists, each synchronous capability method answers
 //! with the trait's default, and the registration hooks do nothing. That is only
 //! correct for the datasets `Runtime::serves_existing_acceleration` admits. A
-//! `refresh_mode: changes` dataset whose stream resumes after a restart is the
-//! exception: it reports a change stream at once, and the stream it is given
-//! starts the real connector's once the source has been reached.
+//! resuming `refresh_mode: changes` dataset reports a change stream at once and
+//! starts the real one once the source is reached.
 
 use std::{any::Any, sync::Arc};
 
@@ -292,10 +291,9 @@ impl DataConnector for ReconnectingConnector {
         let resuming = Arc::clone(self.resuming_changes.as_ref()?);
         let inner = Arc::clone(&self.inner);
         let dataset = dataset.clone();
-        // The deferred federated table reaches the source through this connector,
-        // which builds the real one; its table provider resolves only after that.
-        // Nothing has written to the acceleration in the meantime, so `acceleration`
-        // still describes it.
+        // The deferred federated table builds the real connector when it reaches the
+        // source. Nothing writes to the acceleration before then, so `acceleration`
+        // is still accurate.
         let stream = futures::stream::once(async move {
             federated_table.table_provider().await;
             let reached = inner.get().map(Arc::clone);

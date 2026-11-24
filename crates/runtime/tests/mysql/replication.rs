@@ -812,9 +812,8 @@ async fn snapshot_survives_a_writer_stall_past_the_sources_net_write_timeout()
     Ok(())
 }
 
-/// An acceleration that may already hold rows, with no recorded position to
-/// resume from, is replaced in one atomic rebuild rather than emptied by a
-/// truncate and refilled by a snapshot, since it may be served while it loads.
+/// With no recorded position, an acceleration that may hold rows opens with a
+/// rebuild signal, not a truncate.
 #[tokio::test(flavor = "multi_thread")]
 async fn rows_held_without_a_recorded_position_open_with_a_rebuild_not_a_truncate()
 -> Result<(), anyhow::Error> {
@@ -838,7 +837,11 @@ async fn rows_held_without_a_recorded_position_open_with_a_rebuild_not_a_truncat
             assert_eq!(num_rows(&envelope), 0, "the rebuild signal carries no rows");
         } else {
             assert!(!envelope.history_unavailable());
-            assert_eq!(ops_of(&envelope), vec!["t"], "an empty acceleration is snapshotted");
+            assert_eq!(
+                ops_of(&envelope),
+                vec!["t"],
+                "an empty acceleration is snapshotted"
+            );
         }
     }
     Ok(())

@@ -1385,9 +1385,7 @@ impl Runtime {
     /// checkpoint records the key.
     async fn existing_acceleration_schema(ds: &Dataset) -> Option<arrow_schema::SchemaRef> {
         let schema = crate::dataconnector::sink::recorded_checkpoint_schema(ds).await?;
-        // A change stream's acceleration is complete only once the stream has
-        // loaded it, which its own checkpoint records; a checkpoint left by a
-        // `full` refresh or a snapshot does not show that.
+        // Only a checkpoint written by the change stream shows the acceleration is loaded.
         if resumes_changes_after_restart(ds)
             && !runtime_table::accelerated::checkpoint_primary_key::records_changes_loaded(&schema)
         {
@@ -4011,16 +4009,11 @@ pub(crate) fn resumes_changes_after_restart(ds: &Dataset) -> bool {
 }
 
 /// Why a `refresh_mode: changes` dataset waits for its source instead of being
-/// served from its existing acceleration, named the way the user wrote it, or
-/// `None` when it is served. `connector_resumes` is whether its connector resumes
-/// its change stream after a restart.
+/// served from its existing acceleration, or `None` when it is served.
 ///
-/// Its change stream must resume from a position the connector records. A dataset
-/// partitioned across executors scopes its stream to this executor's partitions
-/// when the table is built, which needs the connector. Snapshot checkpoints can be
-/// written before the stream has loaded the acceleration. `on_zero_results:
-/// use_source` reads the source's provider, which is not held to the
-/// acceleration's schema while the stream runs.
+/// A partitioned stream is scoped when the table is built, snapshot checkpoints
+/// can precede a complete load, and `use_source` reads a source whose schema may
+/// differ from the acceleration's.
 fn changes_wait_reason(
     connector_resumes: bool,
     acceleration: &Acceleration,
@@ -4179,8 +4172,7 @@ mod tests {
         );
     }
 
-    /// Each configuration that keeps a resuming connector's CDC dataset waiting for
-    /// its source is named, in the order it is checked, and nothing else waits.
+    /// Each wait reason is named, in order; an eligible dataset does not wait.
     #[tokio::test]
     async fn a_changes_dataset_waits_for_its_source_only_for_a_named_reason() {
         use runtime_acceleration::snapshot::SnapshotBehavior;

@@ -1406,8 +1406,7 @@ impl Refresher {
         // a refresh writes the checkpoint of a dataset that neither creates snapshots
         // (whose interval checkpoints without refreshing) nor was restored from one
         // (whose checkpoint is the snapshot's); for those, the last refresh is
-        // reported once one completes. A change stream's checkpoint records when it
-        // first caught up, not a refresh, so it is not reported.
+        // reported once one completes. A change stream's checkpoint is not a refresh.
         if self.snapshot_config.is_none()
             && !self.bootstrap_status.is_bootstrapped()
             && !matches!(
@@ -1497,16 +1496,9 @@ impl Refresher {
                 };
                 self.snapshot_task = snapshot_task;
 
-                // A change stream writes no checkpoint of its own. Recording one once
-                // the stream first reports the dataset ready marks the acceleration as
-                // complete, so a later start can serve it before the source answers;
-                // an acceleration interrupted before then has none and waits for its
-                // source. The changes applied so far are flushed first, so the
-                // checkpoint never claims more than storage holds.
-                //
-                // A dataset that is not served that way (`partition_by`, snapshots, and
-                // the rest) may still carry the mark from a run that was, over an
-                // acceleration it has since changed, so the mark is cleared.
+                // Once the change stream first reports ready and its changes are flushed,
+                // a marked checkpoint lets a later start serve the acceleration before the
+                // source answers. Datasets not served that way clear a stale mark.
                 self.ready_checkpoint_task = match checkpointer {
                     Some(checkpointer) if self.checkpoint_when_changes_ready => {
                         self.refresh_completion.clone().map(|completion| {
@@ -2021,8 +2013,7 @@ fn record_changes_loaded(
         if !ready.wait().await.is_answered() || completion.closed_without_a_refresh() {
             return;
         }
-        // A mark from an earlier run stays valid if this one cannot be written: the
-        // acceleration it describes has only moved forward since.
+        // A mark from an earlier run stays valid if this write fails.
         let marked_before = records_changes_loaded(&checkpointer).await;
         let report = |cause: &dyn std::fmt::Display| {
             if !marked_before && !runtime_status.is_shutdown() {
@@ -2687,9 +2678,7 @@ mod tests {
         ))
     }
 
-    /// The checkpoint that lets a CDC dataset be served before its source answers
-    /// is written only once its change stream has reported it ready, and carries
-    /// the mark only that write sets.
+    /// The loaded mark is written only after the change stream reports ready.
     #[tokio::test]
     async fn a_change_stream_records_its_acceleration_as_loaded_only_once_ready() {
         let checkpointer = Arc::new(StoringCheckpointer::default());
@@ -2752,8 +2741,7 @@ mod tests {
         assert!(checkpointer.stored().is_none());
     }
 
-    /// A dataset no longer served from its acceleration drops a mark left by a run
-    /// that was, and leaves an unmarked checkpoint alone.
+    /// A stale mark is cleared; an unmarked checkpoint is left alone.
     #[tokio::test]
     async fn a_dataset_not_served_from_its_acceleration_clears_the_loaded_mark() {
         let schema = changes_checkpoint_schema();
