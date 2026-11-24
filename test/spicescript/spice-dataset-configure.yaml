@@ -4,8 +4,9 @@ description: >
   `spice dataset configure` adds a dataset to an app the way the quickstarts
   do, and Spice serves it. Answering the interactive prompts writes
   `datasets/<name>/dataset.yaml`, references it from the spicepod, and
-  accelerates the dataset into Cayenne, the default engine; `spice dataset
-  add` with flags adds one inline with its params and a `refresh_sql`. Both
+  accelerates the dataset into Cayenne, the default engine, in memory; `spice
+  dataset add` with flags adds one inline with its params, file mode and a
+  `refresh_sql`. Both
   load again after a restart, and `spice refresh` with a one-off
   `--refresh-sql` refreshes with it once. Needs no Docker, so it runs on the
   macOS runners.
@@ -70,8 +71,15 @@ steps:
       - --set
       - acceleration.enabled=true
       - --set
+      - acceleration.mode=file
+      - --set
       - 'acceleration.refresh_sql=SELECT * FROM blocks WHERE id <= 2'
   - restart: {}
+  # `blocks` is accelerated on disk (Cayenne file mode, on this host's
+  # filesystem); `orders` stays in memory, the default.
+  # A table this small can live in the metastore alone, so the check is that
+  # one exists, not that `blocks` has data files yet.
+  - assert-files: { contains: ['^\.spice/data/metadata/cayenne\.db$'], lacks-dirs: ['^\.spice/data/orders/$'] }
   - query: SELECT count(*) AS n, sum(id) AS s FROM orders
     expect: { rows: [['1000', '500500']] }
   - query: SELECT id, block_number FROM blocks ORDER BY id

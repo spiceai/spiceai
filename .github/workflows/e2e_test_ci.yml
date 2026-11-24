@@ -342,6 +342,7 @@ jobs:
         # the last ten (74-138); the self-hosted macOS pool puts several runner instances
         # on one host, which is where that factor-of-two spread comes from, so the bound
         # sits well clear of it rather than close to the median.
+        id: build-spiced
         timeout-minutes: 180
         uses: $/.github/actions/build-spiced
         with:
@@ -351,6 +352,29 @@ jobs:
           artifact_name: build_darwin_aarch64
           artifact_retention_days: '1'
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+
+      # spicescript for `test_macos`'s macos-smoke scripts. Built here rather than there:
+      # this job holds no OIDC token, while `test_macos` holds OpenAI's, and a build runs
+      # every dependency's build script. The same profile and target directory as spiced,
+      # so it reuses the dependencies that build just compiled.
+      - name: Build spicescript (macOS)
+        id: build-spicescript
+        timeout-minutes: 30
+        env:
+          CARGO_TARGET_DIR: ${{ steps.build-spiced.outputs.target_dir }}
+          CARGO_INCREMENTAL: 0
+          CARGO_NET_GIT_FETCH_WITH_CLI: true
+        run: |
+          cargo build --release -p spicescript
+          mkdir -p "$RUNNER_TEMP/spicescript-bin"
+          cp "$CARGO_TARGET_DIR/release/spicescript" "$RUNNER_TEMP/spicescript-bin/spicescript"
+
+      - name: Upload spicescript
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: spicescript_darwin_aarch64
+          path: ${{ runner.temp }}/spicescript-bin/spicescript
+          retention-days: 1
 
       - name: Show sccache stats
         if: always() && env.SCCACHE_SETUP == 'true'
@@ -619,19 +643,18 @@ jobs:
       - build_macos
       - check_changes
     if: ${{ needs.check_changes.outputs.merge_queue_passed != 'true' }}
-    # A backstop above the steps' own bounds (61 minutes: six 5-minute model step bounds,
-    # the 60 s and 300 s readiness waits, 15 minutes to build spicescript and 10 to run
-    # its scripts), leaving room for the checkout, the artifact download and the CLI
-    # install, so that a wedged step is cut by its own bound and named.
-    timeout-minutes: 75
+    # A backstop above the steps' own bounds (46 minutes: six 5-minute model step bounds,
+    # the 60 s and 300 s readiness waits, and 10 minutes for the spicescript scripts),
+    # leaving room for the checkout, the artifact downloads and the CLI install, so that
+    # a wedged step is cut by its own bound and named.
+    timeout-minutes: 55
     permissions:
       contents: read
       actions: read
       # The model tests' Spicepods read this repository's issues with `GITHUB_TOKEN`.
       issues: read
       pull-requests: read
-      # Exchanged for OpenAI access tokens (workload identity federation), and for RustFS
-      # credentials for the spicescript build cache.
+      # Exchanged for OpenAI access tokens: workload identity federation.
       id-token: write
     env:
       # Workload identity federation: spiced and the OpenAI model tests exchange this job's
@@ -866,33 +889,14 @@ jobs:
       # The scenario scripts tagged `macos-smoke`: they need no Docker (their sources are
       # `files`, `mock-http` or none), which this pool does not have. Every other script
       # runs on Linux, in `test_spicescript`. They run whatever the model tests did.
-      - name: 'spicescript: get RustFS credentials'
-        id: rustfs
-        if: ${{ !cancelled() && steps.install-spice.outcome == 'success' }}
-        uses: $/.github/actions/rustfs-credentials
-        with:
-          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
-          duration-seconds: '1800'
-          export-env: 'false'
-
-      - name: 'spicescript: install MinIO'
-        id: minio
-        if: ${{ !cancelled() && steps.rustfs.outcome == 'success' }}
-        uses: $/.github/actions/setup-minio
-        with:
-          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
-          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
-          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
-
-      # Downloaded when this commit's macOS spicescript is cached, built otherwise.
-      - name: 'spicescript: build'
+      # Built by `build_macos`, which holds no credentials (see its build step).
+      - name: 'spicescript: download'
         id: spicescript
-        if: ${{ !cancelled() && steps.minio.outcome == 'success' }}
-        timeout-minutes: 15
-        uses: $/.github/actions/build-tool
+        if: ${{ !cancelled() && steps.install-spice.outcome == 'success' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          package: spicescript
+          name: spicescript_darwin_aarch64
+          path: ${{ runner.temp }}/spicescript-bin
 
       # Several runner instances share each host; spicescript binds free ports and keeps
       # its work under this job's temporary directory.
@@ -900,7 +904,8 @@ jobs:
         if: ${{ !cancelled() && steps.spicescript.outcome == 'success' }}
         timeout-minutes: 10
         run: |
-          "${{ steps.spicescript.outputs.path }}" --jobs 2 \
+          chmod +x "$RUNNER_TEMP/spicescript-bin/spicescript"
+          "$RUNNER_TEMP/spicescript-bin/spicescript" --jobs 2 \
             --only-tag macos-smoke \
             --spiced "$(command -v spiced)" \
             --spice-cli "$(command -v spice)" \

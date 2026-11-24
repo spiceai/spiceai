@@ -40,7 +40,9 @@ spicepod:
 steps:
   - start: {}
   # The catalog also holds an `integration` schema, which `include` leaves out.
-  - query: SELECT DISTINCT table_schema FROM information_schema.tables WHERE table_catalog = 'db_uc'
+  - query: >
+      SELECT DISTINCT table_schema FROM information_schema.tables
+      WHERE table_catalog = 'db_uc' AND table_schema <> 'information_schema'
     expect: { rows: [[tpcds], [tpch]] }
   - query: SELECT r_regionkey, r_name FROM db_uc.tpch.region
     expect:

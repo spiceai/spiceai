@@ -175,7 +175,7 @@
   "slow-refresh-warning": 59,
   "slt-strings": 30,
   "source-down-at-start": 18,
-  "spice-dataset-configure": 1,
+  "spice-dataset-configure": 3,
   "sql-explain-protocols": 1,
   "sql-is-distinct-from-precedence": 1,
   "sql-operator-values": 1,

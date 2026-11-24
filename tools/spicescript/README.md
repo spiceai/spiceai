@@ -309,7 +309,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `flight-put: { dataset, rows \| from-source }` | Write rows with Flight `DoPut`; `times: n` repeats it. |
 | `flight-exec: <sql>` | Flight SQL `ExecuteUpdate`; `count: n` affected rows. |
 | `http: { path, method, query, headers, body, api-key }` | One request; `query:` maps URL parameters, which are encoded and appended to `path`. `expect: { status, headers, lacks-headers, body-contains, body-matches, body-lacks, json }`; `json` checks the body as JSON (see [JSON responses](#json-responses)). |
-| `spice: [args…]` | Run the `spice` CLI against the instance, in the instance's directory (so `spice dataset configure` edits its `spicepod.yaml`); `input` is written to its standard input, for an interactive command's prompts; `output-contains`, `expect-error`. A spicepod the command changes becomes the instance's, so a later `start` or `restart` keeps the change. |
+| `spice: [args…]` | Run the `spice` CLI against the instance, in the instance's directory (so `spice dataset configure` edits its `spicepod.yaml`); `input` is written to its standard input, for an interactive command's prompts; `output-contains`, `expect-error`. A spicepod the command changes becomes that of the tier the step reaches (the upstream's, or the sidecar's on `on: sidecar`), so a later `start` or `restart` keeps the change. |
 | `refresh: <dataset>` | Trigger a refresh and wait for it to finish; `expect-error`; `wait: false` only triggers it. |
 | `explain: <sql>` | `EXPLAIN` (`analyze: true`), requiring `contains:` fragments or the absence of `omits:` ones. |
 | `assert-status: { dataset, status, message-contains, ready, has, lacks }` | Check a dataset's status from `/v1/datasets`. |

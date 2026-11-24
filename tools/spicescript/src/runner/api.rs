@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 
-use crate::script::{HttpStep, Timing};
+use crate::script::{HttpStep, Tier, Timing};
 
 use super::{Instance, Sources, max_wait, metric_value, namespace, one_line, settled};
 
@@ -150,10 +150,12 @@ pub(super) async fn refresh(
 /// so a command that edits `./spicepod.yaml` (`spice dataset configure`) edits
 /// the instance's. `input` is written to its standard input, for the prompts
 /// of an interactive command. A spicepod the command changed becomes the
-/// instance's spicepod, so a later `start` or `restart` keeps the change
-/// rather than writing the script's spicepod over it.
+/// spicepod of the tier the step reaches (the upstream's or the sidecar's), so
+/// a later `start` or `restart` keeps the change rather than writing the
+/// script's spicepod over it.
 pub(super) async fn spice_cli(
     instance: &mut Instance,
+    tier: Tier,
     args: &[String],
     input: Option<&str>,
     output_contains: Option<&str>,
@@ -168,7 +170,7 @@ pub(super) async fn spice_cli(
     // that edits one needs the instance's to be there.
     let spicepod_path = instance.spiced.dir.join("spicepod.yaml");
     if !spicepod_path.exists() {
-        std::fs::write(&spicepod_path, &instance.spicepod_yaml)?;
+        std::fs::write(&spicepod_path, saved_spicepod(instance, tier)?)?;
     }
     let before = std::fs::read_to_string(&spicepod_path)?;
     // `spice sql` reaches the runtime over Flight, which it addresses
@@ -195,16 +197,33 @@ pub(super) async fn spice_cli(
                 instance.spice_cli.display()
             )
         })?;
-    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+    let stdin = child.stdin.take();
+    // Input is written while the output is drained, both inside the timeout: a
+    // command that prints more than a pipe holds before reading all its input
+    // would otherwise never finish either.
+    let feed = async move {
         use tokio::io::AsyncWriteExt;
-        // Dropped once written: a prompt the input does not answer reads end of
-        // input rather than waiting for more.
-        stdin.write_all(input.as_bytes()).await?;
-    }
-    let out = tokio::time::timeout(Duration::from_secs(120), child.wait_with_output())
-        .await
-        .with_context(|| format!("`spice {}` did not exit within 120s", args.join(" ")))??;
-    adopt_spicepod(instance, &spicepod_path, &before)?;
+        let (Some(input), Some(mut stdin)) = (input, stdin) else {
+            return Ok(());
+        };
+        match stdin.write_all(input.as_bytes()).await {
+            // A command that exits without reading all its input is judged by
+            // its status and output below, not by the input it left.
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            // Dropped once written: a prompt the input does not answer reads
+            // end of input rather than waiting for more.
+            other => other,
+        }
+    };
+    let (written, exited) = tokio::time::timeout(
+        Duration::from_secs(120),
+        futures::future::join(feed, child.wait_with_output()),
+    )
+    .await
+    .with_context(|| format!("`spice {}` did not exit within 120s", args.join(" ")))?;
+    written.with_context(|| format!("Failed to write the input of `spice {}`", args.join(" ")))?;
+    let out = exited?;
+    adopt_spicepod(instance, tier, &spicepod_path, &before)?;
     let output = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -236,15 +255,46 @@ pub(super) async fn spice_cli(
     Ok(one_line(output.trim(), 100))
 }
 
-/// Makes the spicepod on disk the instance's when a `spice` command changed it
-/// from `before`. Compared with what the file held, not with the instance's
-/// spicepod, which a sidecar's file never equals.
-fn adopt_spicepod(instance: &mut Instance, path: &std::path::Path, before: &str) -> Result<()> {
+/// The spicepod `start` writes for the tier a step reaches: while a step
+/// reaches the sidecar, `instance.spiced` is the sidecar, but the instance's
+/// own spicepod is still the upstream's.
+fn saved_spicepod(instance: &Instance, tier: Tier) -> Result<&str> {
+    Ok(match tier {
+        Tier::Upstream => &instance.spicepod_yaml,
+        Tier::Sidecar => instance
+            .sidecar
+            .as_ref()
+            .map(|sidecar| sidecar.spicepod_yaml.as_str())
+            .context("a sidecar step on an instance without a sidecar")?,
+    })
+}
+
+/// Makes the spicepod on disk the tier's when a `spice` command changed it
+/// from `before`. Compared with what the file held, not with the saved
+/// spicepod, which `start` may have rendered differently.
+fn adopt_spicepod(
+    instance: &mut Instance,
+    tier: Tier,
+    path: &std::path::Path,
+    before: &str,
+) -> Result<()> {
     let on_disk = std::fs::read_to_string(path)?;
-    if on_disk != before {
-        instance.spicepod = yaml::from_str(&on_disk)
-            .with_context(|| format!("the spicepod `spice` wrote is not YAML: {on_disk}"))?;
-        instance.spicepod_yaml = on_disk;
+    if on_disk == before {
+        return Ok(());
+    }
+    match tier {
+        Tier::Upstream => {
+            instance.spicepod = yaml::from_str(&on_disk)
+                .with_context(|| format!("the spicepod `spice` wrote is not YAML: {on_disk}"))?;
+            instance.spicepod_yaml = on_disk;
+        }
+        Tier::Sidecar => {
+            instance
+                .sidecar
+                .as_mut()
+                .context("a sidecar step on an instance without a sidecar")?
+                .spicepod_yaml = on_disk;
+        }
     }
     Ok(())
 }

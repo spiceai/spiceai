@@ -19,6 +19,8 @@ def main():
     parser.add_argument("--runner", type=Path, required=True)
     parser.add_argument("--spiced", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
+    parser.add_argument("--spice-cli", type=Path, default=None,
+                        help="the `spice` CLI for `spice:` steps; default: `spice` on PATH")
     args = parser.parse_args()
     fixtures = [
         ("nonempty", [{"query": "SELECT 1 AS value", "protocols": ["flightsql", "http"],
@@ -68,12 +70,44 @@ def main():
             (args.work_dir / name / ".env").write_text(f"SPICEAI_API_KEY={DOTENV_KEY}\n")
             fixtures.append((name, count, error, {"spicepod": upstream, "sidecar": sidecar,
                                                   "defaults": {"api-key": DOTENV_KEY}}))
+        # A `spice` step that edits the spicepod of the sidecar it reaches leaves the
+        # upstream's alone: after a restart the upstream still lacks the dataset, and
+        # the sidecar keeps it across its own stop and start.
+        (args.work_dir / "sidecar-spice-edit").mkdir(parents=True, exist_ok=True)
+        (args.work_dir / "sidecar-spice-edit" / ".env").write_text(f"SPICEAI_API_KEY={DOTENV_KEY}\n")
+        fixtures.append(("sidecar-spice-edit", [
+            {"spice": ["dataset", "add", "extra", "--from", f"file:{numbers}", "--param", "file_format=csv"]},
+            {"restart": {}},
+            {"query": "SELECT count(*) AS n FROM numbers", "on": "upstream", "expect": {"rows": [["3"]]}},
+            {"query": "SELECT count(*) AS n FROM extra", "on": "upstream", "expect-error": "not found"},
+            {"stop": {}}, {"start": {}},
+            {"query": "SELECT count(*) AS n FROM extra", "expect": {"rows": [["3"]]}}], None,
+            {"spicepod": upstream, "defaults": {"api-key": DOTENV_KEY},
+             "sidecar": {"spicepod": sidecar_pod, "env": {"SPICEAI_API_KEY": DOTENV_KEY}}}))
+        # `input` is written while the CLI's output is drained (a CLI that echoes
+        # more than a pipe holds finishes), and a CLI that exits without reading it
+        # is judged by its exit status, not by the input it left.
+        echo_cli = Path(directory) / "echo-cli"
+        echo_cli.write_text("#!/bin/sh\ncat\n")
+        exit_cli = Path(directory) / "exit-cli"
+        exit_cli.write_text("#!/bin/sh\nexit 2\n")
+        for cli in (echo_cli, exit_cli):
+            cli.chmod(0o755)
+        big = "x" * 1023 + "\n"
+        fixtures.append(("spice-input-echoed", [{"spice": ["echo"], "input": big * 1024,
+                                                 "output-contains": "xxxx"}], None,
+                         {"spice-cli": echo_cli}))
+        fixtures.append(("spice-input-unread", [{"spice": ["exit"], "input": big * 1024,
+                                                 "expect-error": True}], None,
+                         {"spice-cli": exit_cli}))
         for name, steps, error, extra in fixtures:
             fixture = Path(directory) / f"{name}.yaml"
+            cli = extra.pop("spice-cli", args.spice_cli)
             spicepod = {"version": "v1", "kind": "Spicepod", "name": name, **extra.pop("spicepod", {})}
             fixture.write_text(json.dumps({"name": name, "spicepod": spicepod,
                 "steps": [{"start": {}}] + steps, **extra}))
-            result = subprocess.run([str(args.runner.resolve()), "--record-durations", "--spiced",
+            cli_flags = ["--spice-cli", str(Path(cli).resolve())] if cli else []
+            result = subprocess.run([str(args.runner.resolve()), "--record-durations", *cli_flags, "--spiced",
                 str(args.spiced.resolve()), "--work-dir", str(args.work_dir.resolve() / name), str(fixture)],
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
             (args.work_dir / f"{name}.log").write_text(result.stdout)
