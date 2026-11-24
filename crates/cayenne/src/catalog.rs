@@ -1148,12 +1148,18 @@ pub trait MetadataCatalog: Send + Sync {
     ///
     /// `delete_files` are position deletion vectors on the new snapshot, hiding
     /// the copies of keys its incoming data repeated across record batches.
+    ///
+    /// `files` is the new snapshot's complete manifest, possibly empty, recorded
+    /// in the same commit as the flip so that no crash leaves the files of a
+    /// snapshot that never became current named, where no sweep reclaims them.
+    /// `None` when the caller recorded the manifest already.
     async fn commit_overwrite(
         &self,
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
         delete_files: &[crate::metadata::DeleteFile],
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()>;
 
     /// Add a partition to a table.
