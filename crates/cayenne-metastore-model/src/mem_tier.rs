@@ -180,7 +180,8 @@ pub(crate) struct State {
     floor_raised_tag: bool,
     rewrite: Option<Rewrite>,
     rewrites: u8,
-    rewritten: bool,
+    /// Full rewrites committed; `rewrites` counts captures.
+    rewrites_committed: u8,
     rewrite_interleaved: bool,
     rewrite_preserved: bool,
     crashed: bool,
@@ -366,7 +367,7 @@ impl Protocol {
         self.mode.contains(flag)
     }
     /// Crashes and full rewrites per path: one by default, two in a `deep` run.
-    /// A second of each is reachable and multiplies the graph about elevenfold,
+    /// A second of each is reachable and multiplies the graph more than tenfold,
     /// so the default run keeps one and the `-deep` runs check two.
     fn repeats(&self) -> u8 {
         if self.has("deep") { 2 } else { 1 }
@@ -590,7 +591,7 @@ impl Model for Protocol {
             floor_raised_tag: false,
             rewrite: None,
             rewrites: 0,
-            rewritten: false,
+            rewrites_committed: 0,
             rewrite_interleaved: false,
             rewrite_preserved: false,
             crashed: false,
@@ -905,7 +906,7 @@ impl Model for Protocol {
                 Self::raise_pruned_floor(&mut next, rewrite.cutoff);
                 prune_index(&mut next.index, rewrite.cutoff);
                 next.pk_cache = None;
-                next.rewritten = true;
+                next.rewrites_committed += 1;
             }
             Action::Crash => {
                 next.crashed_stage |= state
@@ -991,7 +992,7 @@ impl Model for Protocol {
                     "bake tag raised to the pruned-delete floor",
                     s.floor_raised_tag,
                 ),
-                ("full rewrite committed", s.rewritten),
+                ("full rewrite committed", s.rewrites_committed > 0),
                 ("rewrite interleaved with apply", s.rewrite_interleaved),
                 (
                     "rewrite kept a later protected snapshot",
@@ -1225,10 +1226,14 @@ impl Model for Protocol {
                 |_, s: &State| s.floor_raised_tag,
             ),
             Property::sometimes("second crash", |_, s: &State| s.crashes >= 2),
-            Property::sometimes("second full rewrite", |_, s: &State| s.rewrites >= 2),
-            Property::sometimes("full rewrite committed", |_, s: &State| s.rewritten),
+            Property::sometimes("second full rewrite committed", |_, s: &State| {
+                s.rewrites_committed >= 2
+            }),
+            Property::sometimes("full rewrite committed", |_, s: &State| {
+                s.rewrites_committed > 0
+            }),
             Property::sometimes("full rewrite interleaves apply", |_, s: &State| {
-                s.rewritten && s.rewrite_interleaved
+                s.rewrites_committed > 0 && s.rewrite_interleaved
             }),
             Property::sometimes(
                 "full rewrite retains later protected snapshot",

@@ -1083,10 +1083,11 @@ again after that delete writes no tombstone of its own. With one bake,
 `mem-tier-seal-delete-only-deep` and `mem-tier-seal-delete-only-sqlite-deep` run
 the same protocols with two crash/recoveries and two full-rewrite attempts. A
 second of each is reachable, and each alone multiplies the graph several times
-over: together about 169 million states in 211 s and 45 million in 54 s on an
+over: together about 200 million states in 215 s and 53 million in 61 s on an
 M-series Mac, against 14 million in 19 s and 4 million in 5 s for the default
 runs. They are not in `quick`, so a pull request does not run them; `all` (the
-scheduled run) does. Each must reach `second crash` and `second full rewrite`.
+scheduled run) does. Each must reach `second crash` and `second full rewrite
+committed`.
 
 ```sh
 nice -n 10 cargo build --release -p cayenne-metastore-model

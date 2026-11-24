@@ -3216,7 +3216,7 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
         || (run.family == "mem-tier"
             && run.failure.is_empty()
             && run.mode.contains("deep")
-            && matches!(name, "second crash" | "second full rewrite"))
+            && matches!(name, "second crash" | "second full rewrite committed"))
         || intent_required
         || added_required
         || standby_required
