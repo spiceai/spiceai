@@ -27696,15 +27696,11 @@ impl CayenneTableProvider {
         tag: ManifestSequenceTag,
         carried: Vec<SnapshotFile>,
     ) -> CatalogResult<Vec<(String, u64)>> {
-        let table_id = self.table_metadata.table_id.clone();
         let (files, replacement) = self
             .snapshot_manifest_rows(snapshot_id, tag, carried)
             .await?;
-        self.catalog
-            .replace_snapshot_files(&table_id, snapshot_id, &replacement)
+        self.record_snapshot_manifest(snapshot_id, &replacement)
             .await?;
-        self.uncommitted_files.forget(snapshot_id);
-
         Ok(files)
     }
 
@@ -27917,25 +27913,41 @@ impl CayenneTableProvider {
             .await
     }
 
-    /// Author one snapshot's manifest with a single uniform commit-seq range
-    /// (`[min, max]` on every file). The `pub(crate)` entry the overwrite path
-    /// uses to record its `[S, S]` range without depending on the private
-    /// [`ManifestSequenceTag`]. Returns the listing on success (discarded by
-    /// callers that only need the side effect).
-    pub(crate) async fn author_uniform_snapshot_manifest(
+    /// Records `rows` as the complete manifest of `snapshot_id`. Its files are
+    /// then named by a commit, so the writer stops tracking them as uncommitted.
+    pub(crate) async fn record_snapshot_manifest(
+        &self,
+        snapshot_id: &str,
+        rows: &[SnapshotFile],
+    ) -> CatalogResult<()> {
+        self.catalog
+            .replace_snapshot_files(&self.table_metadata.table_id, snapshot_id, rows)
+            .await?;
+        self.uncommitted_files.forget(snapshot_id);
+        Ok(())
+    }
+
+    /// The manifest rows of `snapshot_id` with a single uniform commit-sequence
+    /// range (`[min, max]` on every file), without recording them. The
+    /// `pub(crate)` entry the overwrite path uses for its `[S, S]` range without
+    /// depending on the private [`ManifestSequenceTag`].
+    pub(crate) async fn uniform_snapshot_manifest_rows(
         &self,
         snapshot_id: &str,
         min_sequence: i64,
         max_sequence: i64,
-    ) -> CatalogResult<Vec<(String, u64)>> {
-        self.upsert_snapshot_manifest_from_files(
-            snapshot_id,
-            ManifestSequenceTag::Uniform {
-                min: min_sequence,
-                max: max_sequence,
-            },
-        )
-        .await
+    ) -> CatalogResult<Vec<SnapshotFile>> {
+        let (_, rows) = self
+            .snapshot_manifest_rows(
+                snapshot_id,
+                ManifestSequenceTag::Uniform {
+                    min: min_sequence,
+                    max: max_sequence,
+                },
+                Vec::new(),
+            )
+            .await?;
+        Ok(rows)
     }
 
     /// Fold the manifest of every snapshot in `snapshot_ids` into one
@@ -47209,6 +47221,17 @@ impl CayenneTableProvider {
         // own files.
         let protected_lookup_selection = lookup_selection.clone();
         let protected_pinned_lookup_index = pinned_lookup_index.clone();
+        // The file and protected-snapshot branches are wrapped in a key-deletion
+        // filter built from this scan's captured deletions, which include CDC
+        // deletes still held in the in-memory tier. A limit handed to those
+        // branches would cap the raw rows read (the Vortex scan limit, and the
+        // listing's truncation by file row counts) before the filter removes
+        // deleted ones, so the scan could return fewer rows than `limit` while more
+        // live rows exist. The branch builder's own guard reads only the durable
+        // deletion state, which does not see the in-memory tier. Keep the limit
+        // out of both branches whenever this scan applies a key-deletion filter;
+        // the `GlobalLimitExec` below still applies it over live rows.
+        let branch_limit = if need_pk_deletion { None } else { limit };
         let listing_scan_start = Instant::now();
         let main_plan_result = self
             .create_snapshot_scan_plan_with_config(
@@ -47216,7 +47239,7 @@ impl CayenneTableProvider {
                 &current_snapshot_id,
                 effective_projection.as_ref(),
                 scan_filters,
-                limit,
+                branch_limit,
                 scan_listing_config,
                 allow_sorted_ordering,
                 Some(Arc::clone(&read_schema)),
@@ -47247,7 +47270,7 @@ impl CayenneTableProvider {
                 state,
                 projection: effective_projection.as_ref(),
                 filters: scan_filters,
-                limit,
+                limit: branch_limit,
                 pk_indices_in_projection: &pk_indices_in_projection,
                 protected_snapshots: protected_map,
                 protected_files,
