@@ -169,6 +169,20 @@ steps:
   - source-exec: { src: 'DELETE FROM model WHERE id > 2000 AND (v % 4 = 0 OR upper(name) = ''GAMMA'')' }
   - query: SELECT id, region, name, v, f, ts FROM ev
     oracle-sql: SELECT id, region, name, v, f, ts FROM model
+  # A condition the table cannot take as row filters (a subquery, or one no
+  # row can meet) is refused, and no row changes.
+  - spice-exec: 'DELETE FROM ev WHERE id IN (SELECT id FROM ev WHERE region = ''us'')'
+    expect-error: 'restricted by a subquery'
+  - spice-exec: 'DELETE FROM ev WHERE EXISTS (SELECT 1 FROM ev e WHERE e.id = ev.id AND e.region = ''eu'')'
+    expect-error: 'restricted by a subquery'
+  - spice-exec: 'UPDATE ev SET v = 0 WHERE id IN (SELECT id FROM ev WHERE region = ''us'')'
+    expect-error: 'restricted by a subquery'
+  - spice-exec: 'EXPLAIN ANALYZE DELETE FROM ev WHERE id IN (SELECT id FROM ev WHERE region = ''us'')'
+    expect-error: 'restricted by a subquery'
+  - spice-exec: 'DELETE FROM ev WHERE 1 = 0'
+    expect-error: 'restricted by a condition that no row can satisfy'
+  - query: SELECT id, region, name, v, f, ts FROM ev
+    oracle-sql: SELECT id, region, name, v, f, ts FROM model
   # Every row deleted, then one inserted.
   - spice-exec: 'DELETE FROM ev'
     when: { policy: [upsert, drop, keep] }

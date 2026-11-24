@@ -120,12 +120,13 @@ fn count_star(batches: &[RecordBatch]) -> i64 {
     counts.value(0)
 }
 
-/// Materialize the full GitHub table in `Arrow` so the scan runs once at
+/// Materialize the full GitHub table in `Cayenne` so the scan runs once at
 /// dataset load, in parallel with every other accelerated GitHub table.
-fn with_arrow_acceleration(mut dataset: Dataset) -> Dataset {
+fn with_cayenne_acceleration(mut dataset: Dataset) -> Dataset {
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("arrow".to_string()),
+        engine: Some("cayenne".to_string()),
+        mode: spicepod::acceleration::Mode::Memory,
         ..Acceleration::default()
     });
     dataset
@@ -2159,7 +2160,7 @@ async fn test_github_workflow_runs() -> Result<(), String> {
 fn spiceai_accelerated(resource: &str, extra: HashMap<String, String>) -> Dataset {
     let mut params = HashMap::from([("max_concurrent_requests".to_string(), "10".to_string())]);
     params.extend(extra);
-    with_arrow_acceleration(make_github_dataset(
+    with_cayenne_acceleration(make_github_dataset(
         &repo_dataset(resource),
         "auto",
         Some(params),
@@ -2398,7 +2399,7 @@ async fn assert_all_pulls_reviews_and_comments(
 }
 
 /// Loads every `github.com/spiceai/spiceai` pull request with comments, and
-/// every review, in parallel. There is no row limit: `Arrow` acceleration
+/// every review, in parallel. There is no row limit: `Cayenne` acceleration
 /// scans the GitHub history until GitHub reports no further pages.
 ///
 /// Ignored in CI: the GitHub connector job's deadline cannot cover an
@@ -2450,7 +2451,7 @@ async fn test_github_spiceai_pulls_with_comments_and_reviews() -> Result<(), Str
 
 /// Loads every `github.com/spiceai/spiceai` issue with comments, and every
 /// pull request, review, and pull-request comment, in parallel. There is no
-/// row limit: `Arrow` acceleration scans the GitHub history until GitHub
+/// row limit: `Cayenne` acceleration scans the GitHub history until GitHub
 /// reports no further pages.
 ///
 /// Ignored in CI: the GitHub connector job's deadline cannot cover an
@@ -2572,7 +2573,7 @@ async fn test_github_spiceai_issues() -> Result<(), String> {
 }
 
 /// Loads every commit on `github.com/spiceai/spiceai`'s default branch. There
-/// is no row limit: `Arrow` acceleration scans GitHub history until GitHub
+/// is no row limit: `Cayenne` acceleration scans GitHub history until GitHub
 /// reports no further pages.
 ///
 /// Ignored in CI: the GitHub connector job's deadline cannot cover an

@@ -7374,6 +7374,16 @@ impl CayenneTableProvider {
         &self.staging_may_have_files
     }
 
+    /// Records that the staged append `staging_snapshot_id` may leave files
+    /// under `_staging/`, so the next write or open looks there. An append at
+    /// its final keys ([`Self::is_final_key_write`]) stages nothing and records
+    /// nothing.
+    pub(crate) fn mark_staging_may_have_files(&self, staging_snapshot_id: &str) {
+        if !self.is_final_key_write(staging_snapshot_id) {
+            self.staging_may_have_files.store(true, Ordering::Release);
+        }
+    }
+
     pub(crate) fn publication_outcome_unknown(&self) -> &AtomicBool {
         &self.publication_outcome_unknown
     }
@@ -11740,7 +11750,7 @@ impl CayenneTableProvider {
         staging_snapshot_id: &str,
         target_partitions: usize,
     ) -> Result<u64> {
-        self.staging_may_have_files().store(true, Ordering::Release);
+        self.mark_staging_may_have_files(staging_snapshot_id);
         let (row_count, _writer_ops, _stats_acc) = self
             .write_to_snapshot(
                 stream,
@@ -12249,7 +12259,14 @@ impl CayenneTableProvider {
             persisted_hi,
         }));
 
-        let force_staging_probe_on_startup = dataset_storage.is_some();
+        // A store-backed table's staging is only found by listing it, so its open
+        // lists `_staging/` for a write a crash left there. A table in the
+        // object-native location never stages: every write puts its files at
+        // their final keys, and what an unfinished one left is the orphan
+        // sweep's. Any other store-backed table may still stage a partitioned
+        // append (`begin_deferred_snapshot_append`) and recover it from here.
+        let force_staging_probe_on_startup = dataset_storage.is_some()
+            && !crate::metastore_layout::is_object_native_data_path(&table_metadata.path);
         // A replacement inherits the replaced instance's pins; any other
         // instance starts with none.
         let snapshot_dir_pins = snapshot_dir_pins.unwrap_or_default();
