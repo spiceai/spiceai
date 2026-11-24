@@ -43,7 +43,7 @@ variants:
             s3_key: ${sources.lake.key}
             s3_secret: ${sources.lake.secret}
             allow_http: 'true'
-  local-plain: object-native-local
+  local-plain: object-native
   local-space:
     spicepod:
       runtime:

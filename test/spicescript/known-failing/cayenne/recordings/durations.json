@@ -5,7 +5,7 @@
   "cayenne-partitioned-append-key-only": 35,
   "cayenne-torn-reads": 77,
   "cayenne-writes-known": 107,
-  "location-literal-percent": 49,
+  "location-special-characters": 91,
   "maintained-aggregates-served": 12,
   "memory-limit-spill": 106,
   "postgres-cdc-kill-during-compaction": 540
