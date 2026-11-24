@@ -93,10 +93,10 @@ Next, connect your own sources with the [data connector docs](https://spiceai.or
 
 ## The data primitives agents need in one runtime
 
-- **SQL federation and acceleration.** Connect to and query operational databases, data lakes, and warehouses through a single SQL endpoint. Materialize and accelerate working sets in memory or on disk with Spice Cayenne for sub-second access, with secondary indexes for point lookups.
-- **RAG and agentic retrieval.** Combine structured filters, vector similarity, and keyword matches in one SQL query with `vector_search`, `text_search`, `rrf`, and `rerank`, then rank the merged results by relevance.
+- **SQL federation and acceleration.** Connect to and query operational databases, data lakes, warehouses, and APIs through a single SQL endpoint. Materialize and accelerate working sets in memory or on disk with Spice Cayenne for sub-second access, with secondary indexes for point lookups.
+- **RAG and agentic retrieval.** Combine structured filters, vector similarity, and keyword matches in one SQL query with `vector_search`, `text_search`, and `rrf`, then rerank the merged results by relevance with `rerank`, using a reranker, chat, or decision model.
 - **Analytics replica.** Run large analytical queries against an analytics replica of your operational database, kept current through high-throughput CDC.
-- **AI router and SQL functions.** An OpenAI-compatible API that routes to local and hosted models, with AI SQL functions, MCP tools, memory, evals, and observability built into the runtime.
+- **AI router and SQL functions.** An OpenAI-compatible API that routes to local and hosted models, with AI SQL functions, decision functions such as `ai_if`, `ai_classify`, and `ai_score`, MCP tools, memory, evals, and observability built into the runtime.
 
 ## Use cases
 
