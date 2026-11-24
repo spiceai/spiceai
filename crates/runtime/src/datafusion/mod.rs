@@ -4272,6 +4272,10 @@ impl DataFusion {
         // refresh keep a paginated response whole. It is nullable and marked
         // optional: a table created before it opens without it, and the cache
         // then declines responses that followed pages, as it did before.
+        // Downgrading is not safe the same way: an earlier release ignores the
+        // column, evicts a cached paginated response page by page and can serve
+        // the pages it keeps as the whole response, so the caching acceleration's
+        // data must be deleted before downgrading, as for the namespace column.
         let storage_schema = if matches!(refresh_mode, RefreshMode::Caching) {
             let invalid = |source: DataFusionError| Error::UnableToCreateDataAccelerator {
                 source: crate::dataaccelerator::Error::InvalidConfiguration {
