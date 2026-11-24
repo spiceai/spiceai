@@ -304,10 +304,11 @@ steps:
     eventually: 30s
     only: *object-native-data-in-store
 
-  # On every variant, replication resumes after a restart past the compatible
-  # ALTER above. Run last: a restart that does not become ready skips the rest
-  # of its instance. The columns are named because an acceleration loaded
-  # again from the source (cayenne-memory) takes the source's new column.
+  # On every variant, replication should resume after a restart past the
+  # compatible ALTER above; the expected-failures ledger records the variants
+  # where it does not yet. Run last: a restart that does not become ready skips
+  # the rest of its instance. The columns are named because an acceleration
+  # loaded again from the source (cayenne-memory) takes the source's new column.
   - restart: {}
   - source-exec: { src: "UPDATE customers SET c_balance = c_balance + 1 WHERE c_id = 502" }
   - query: SELECT c_id, c_name, c_segment, c_balance, c_active, c_since FROM customers
