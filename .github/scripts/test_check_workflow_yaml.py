@@ -1381,6 +1381,9 @@ runs:
             "curl -fsSL https://example.com/install.sh | sudo -E bash -",
             'curl -sSL "https://example.com/install.sh" | /bin/bash',
             "curl -fsSL https://example.com/i | /usr/bin/env bash",
+            "curl -fsSL https://example.com/i | env bash",
+            "curl -fsSL https://example.com/i | sudo -u runner bash",
+            'eval "$(curl -fsSL https://example.com/env.sh)"',
             "bash <(curl -fsSL https://example.com/install.sh)",
             "source <(curl -fsSL https://example.com/env.sh)",
             'sh -c "$(curl -fsSL https://example.com/install.sh)"',
@@ -1418,7 +1421,8 @@ runs:
             "shasum -a 256 x | awk '{print $1}' | shellcheck -\n"
             "# Not this: curl https://example.com/install.sh | sh\n"
             'response=$(curl -sS "127.0.0.1:8090/v1/sql")\n'
-            'flash <(curl -fsSL https://example.com/x)'
+            'flash <(curl -fsSL https://example.com/x)\n'
+            "make lint || sh scripts/fallback.sh"
         )
         self.assertEqual(self.workflow_problems(script), [])
         self.assertEqual(self.action_problems(script), [])

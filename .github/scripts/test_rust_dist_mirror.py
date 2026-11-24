@@ -306,10 +306,13 @@ class PerJobHomeTest(unittest.TestCase):
         self.base_path = f"{self.shared_bin}{os.pathsep}{os.environ['PATH']}"
 
     def tearDown(self):
-        # Whatever a test flagged immutable or read-only, so the directory can go.
-        if shutil.which("chflags"):
-            subprocess.run(["chflags", "-R", "nouchg", str(self.dir)], check=False)
+        # Whatever a test flagged immutable or locked, so the directory can go.
         self.runner_temp.chmod(0o755)
+        for _ in range(2):
+            if shutil.which("chflags"):
+                subprocess.run(["chflags", "-R", "nouchg", str(self.dir)], check=False, capture_output=True)
+            subprocess.run(["find", str(self.dir), "-type", "d", "-exec", "chmod", "u+rwx", "{}", ";"],
+                           check=False, capture_output=True)
         self.tmp.cleanup()
 
     def write_pins(self, hashes):
@@ -460,15 +463,27 @@ class PerJobHomeTest(unittest.TestCase):
 
     def test_a_rust_home_an_earlier_job_left_is_replaced_not_used(self):
         toolchain = self.plant_rust_home()
+        # Directories rm cannot enter or empty, nested, with an immutable file at the bottom.
+        locked = self.rust_home / "locked"
+        (locked / "inner").mkdir(parents=True)
+        (locked / "inner" / "file").write_text("x")
+        read_only = self.rust_home / "read-only"
+        read_only.mkdir()
+        (read_only / "file").write_text("x")
         if shutil.which("chflags"):
             # Immutable, as the runner's cleanup cannot delete it.
-            subprocess.run(["chflags", "uchg", str(toolchain / "rustc")], check=True)
+            subprocess.run(["chflags", "uchg", str(toolchain / "rustc"), str(locked / "inner" / "file")], check=True)
+        (locked / "inner").chmod(0)
+        locked.chmod(0)
+        read_only.chmod(0o500)
         proc, calls = self.run_step()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn(f"::warning::Removing {self.rust_home}, which an earlier job left behind.", proc.stdout)
         self.assertTrue(calls[0].startswith("rustup-init --no-modify-path"), calls)
         self.assertIn(f"--host {HOST}", self.mirror_log.read_text())
         self.assertFalse((self.rust_home / "cargo" / "config.toml").exists())
+        self.assertFalse(locked.exists())
+        self.assertFalse(read_only.exists())
         self.assert_shared_homes_untouched(proc)
 
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can remove anything")

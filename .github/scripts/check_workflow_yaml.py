@@ -159,15 +159,16 @@ COMMENT_LINE = re.compile(r"^[ \t]*#[^\n]*$", re.MULTILINE)
 # A download run as code without being kept or checked first: piped into a shell (`curl …
 # | sh`, `| sudo -E bash`, `| /bin/bash`), read through a process substitution (`bash
 # <(curl …)`, `source <(curl …)`), handed to `sh -c "$(curl …)"`, or PowerShell's `iex` of
-# one. A cut-off download runs half a script, and nothing pins what ran. The rustup
+# one, or `eval "$(curl …)"`. A cut-off download runs half a script, and nothing pins what ran. The rustup
 # installers are refused by name too: setup-rust installs rustup only from the
 # rustup-init .github/ci-cache/pins.json pins.
-_SHELL = r"(?<![\w.-])(?:/usr/bin/env\s+|/usr/local/bin/|/usr/bin/|/bin/)?(?:ba|da|k|z)?sh\b"
+_SHELL = r"(?<![\w.-])(?:(?:/usr)?/bin/env\s+|env\s+|/usr/local/bin/|/usr/bin/|/bin/)?(?:ba|da|k|z)?sh\b"
 _PS_DOWNLOAD = r"(?:DownloadString|DownloadFile|Invoke-WebRequest|Invoke-RestMethod|\biwr\b|\birm\b)"
 DOWNLOAD_EXECUTION = re.compile(
-    rf"\|\s*(?:sudo(?:\s+-\S+)*\s+)?{_SHELL}"
+    rf"(?<!\|)\|(?!\|)\s*(?:sudo(?:\s+-\S+(?:\s+(?!-)[^\s|;&]+)?)*\s+)?{_SHELL}"
     rf"|(?:{_SHELL}|(?<![\w.-])(?:source|\.))[^\n|;&]*<\(\s*(?:curl|wget)\b"
     rf"|{_SHELL}\s+-c\s+[\"']?\$\(\s*(?:curl|wget)\b"
+    r"|\beval\s+[\"']?\$\(\s*(?:curl|wget)\b"
     rf"|\b(?:iex|Invoke-Expression)\b[^\n]*{_PS_DOWNLOAD}"
     rf"|{_PS_DOWNLOAD}[^\n]*\|\s*(?:iex|Invoke-Expression)\b"
     r"|\b(?:sh|win)\.rustup\.rs\b",
@@ -987,10 +988,13 @@ def check_download_execution(jobs: dict) -> list[str]:
     return problems
 
 
+SCRIPT_SUFFIXES = (".sh", ".bash", ".ps1")
+
+
 def check_script_downloads(github_dir: Path) -> list[str]:
-    """Report a `.sh` file under the .github directory that runs a download as code."""
+    """Report a shell or PowerShell script under the .github directory that runs a download as code."""
     problems = []
-    for path in sorted(github_dir.rglob("*.sh")):
+    for path in sorted(p for p in github_dir.rglob("*") if p.suffix in SCRIPT_SUFFIXES):
         if path.is_file():
             problems.extend(
                 f"{path}:{number}: runs a download as code (`{line}`): {DOWNLOAD_EXECUTION_REMEDY}"

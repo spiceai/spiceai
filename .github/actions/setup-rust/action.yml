@@ -134,8 +134,8 @@ runs:
         # as one user, so any job there can write ~/.cargo and ~/.rustup: a pull request job
         # could replace rustup, a toolchain or a crate source that a later trunk job runs.
         # So a job there gets its own CARGO_HOME and RUSTUP_HOME under RUNNER_TEMP, which the
-        # runner empties when a job starts and again when it ends, and never reads ~/.cargo
-        # or ~/.rustup. Homes it creates get their own rustup, from the pinned rustup-init
+        # runner empties when a job starts and again when it ends (skipping what it cannot
+        # delete, which is handled below), and never reads ~/.cargo or ~/.rustup. Homes it creates get their own rustup, from the pinned rustup-init
         # (install_rustup), and their toolchain from the verified mirror below.
         # The cargo registry and git checkouts live in CARGO_HOME, and sccache's local
         # directory goes next to it, so no job reuses another's crate sources. Any Mac that
@@ -158,9 +158,17 @@ runs:
             # which fails if anything is still there. Nothing in it is then trusted.
             if [ -e "$rust_home" ] || [ -L "$rust_home" ]; then
               echo "::warning::Removing $rust_home, which an earlier job left behind."
-              if command -v chflags >/dev/null 2>&1; then
-                chflags -R nouchg,nouappnd "$rust_home" 2>/dev/null || true
-              fi
+              # Flags first, then any directory whose mode keeps rm out (each one opened before
+              # find reads it, so nesting does not stop it), then flags on what those held.
+              # Neither follows a symbolic link.
+              clear_flags() {
+                if command -v chflags >/dev/null 2>&1; then
+                  chflags -R nouchg,nouappnd "$rust_home" 2>/dev/null || true
+                fi
+              }
+              clear_flags
+              find "$rust_home" -type d ! -perm -700 -exec chmod u+rwx {} \; 2>/dev/null || true
+              clear_flags
               rm -rf "$rust_home" 2>/dev/null || true
             fi
             if ! mkdir "$rust_home" 2>/dev/null; then
