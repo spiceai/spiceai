@@ -374,7 +374,7 @@ impl Protocol {
             state.pruned_floor
         }
     }
-    /// table.rs::pruned_through / raise_pruned_delete_floor: clamped to the
+    /// `table.rs::pruned_through` / `raise_pruned_delete_floor`: clamped to the
     /// newest delete in the index, so a prune past every sequence cannot lift a
     /// later tag above deletes not yet written.
     fn raise_pruned_floor(state: &mut State, cutoff: usize) {
@@ -981,7 +981,10 @@ impl Model for Protocol {
             crate::explorer::flags(&[
                 ("crashed", s.crashed),
                 ("baked", s.bakes > 0),
-                ("bake tag raised to the pruned-delete floor", s.floor_raised_tag),
+                (
+                    "bake tag raised to the pruned-delete floor",
+                    s.floor_raised_tag,
+                ),
                 ("full rewrite committed", s.rewritten),
                 ("rewrite interleaved with apply", s.rewrite_interleaved),
                 (
@@ -1211,9 +1214,10 @@ impl Model for Protocol {
             Property::sometimes("bake prunes then reinsert checkpoints", |_, s: &State| {
                 s.checkpointed_reinsert
             }),
-            Property::sometimes("bake tag raised to the pruned-delete floor", |_, s: &State| {
-                s.floor_raised_tag
-            }),
+            Property::sometimes(
+                "bake tag raised to the pruned-delete floor",
+                |_, s: &State| s.floor_raised_tag,
+            ),
             Property::sometimes("full rewrite committed", |_, s: &State| s.rewritten),
             Property::sometimes("full rewrite interleaves apply", |_, s: &State| {
                 s.rewritten && s.rewrite_interleaved
