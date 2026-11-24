@@ -908,18 +908,14 @@ async fn track_metrics(
 /// shares, on behalf of a caller the runtime refused.
 async fn load_request_extensions(
     State(df): State<Arc<DataFusion>>,
-    Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     req: Request<Body>,
     next: Next,
 ) -> axum::response::Response {
     if let Some(request_context) = req.extensions().get::<Arc<RequestContext>>() {
-        if DatabricksAuthExtension::in_headers(req.headers()) {
-            let app = app.read().await.as_ref().map(Arc::clone);
-            if let Some(extension) =
-                DatabricksAuthExtension::from_headers(&app, &Some(df), req.headers())
-            {
-                request_context.insert_extension(extension);
-            }
+        if DatabricksAuthExtension::in_headers(req.headers())
+            && let Some(extension) = DatabricksAuthExtension::from_headers(&Some(df), req.headers())
+        {
+            request_context.insert_extension(extension);
         }
         request_context.load_extensions().await;
     }

@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use app::App;
 use async_trait::async_trait;
 use http::HeaderMap;
 use runtime_request_context::Extension;
@@ -29,7 +28,6 @@ const SPICE_DATABRICKS_HEADER: &str = "spice-databricks-auth";
 
 #[derive(Clone)]
 pub struct DatabricksAuthExtension {
-    app: Option<Arc<App>>,
     df: Option<Arc<DataFusion>>,
     tokens: Arc<HashMap<String, SecretString>>,
 }
@@ -37,7 +35,6 @@ pub struct DatabricksAuthExtension {
 impl Default for DatabricksAuthExtension {
     fn default() -> Self {
         Self {
-            app: None,
             df: None,
             tokens: Arc::new(HashMap::new()),
         }
@@ -57,12 +54,8 @@ impl Extension for DatabricksAuthExtension {
 
 impl DatabricksAuthExtension {
     #[must_use]
-    pub fn new(
-        app: Option<Arc<App>>,
-        df: Option<Arc<DataFusion>>,
-        tokens: Arc<HashMap<String, SecretString>>,
-    ) -> Self {
-        Self { app, df, tokens }
+    pub fn new(df: Option<Arc<DataFusion>>, tokens: Arc<HashMap<String, SecretString>>) -> Self {
+        Self { df, tokens }
     }
 
     /// Whether `headers` carry Databricks user tokens, which
@@ -73,11 +66,7 @@ impl DatabricksAuthExtension {
     }
 
     #[must_use]
-    pub fn from_headers(
-        app: &Option<Arc<App>>,
-        df: &Option<Arc<DataFusion>>,
-        headers: &HeaderMap,
-    ) -> Option<Self> {
+    pub fn from_headers(df: &Option<Arc<DataFusion>>, headers: &HeaderMap) -> Option<Self> {
         let databricks_headers = headers.get_all(SPICE_DATABRICKS_HEADER);
         let values = databricks_headers.iter();
 
@@ -101,7 +90,6 @@ impl DatabricksAuthExtension {
             None
         } else {
             Some(Self {
-                app: app.as_ref().map(Arc::clone),
                 df: df.as_ref().map(Arc::clone),
                 tokens: Arc::new(auth_map),
             })
