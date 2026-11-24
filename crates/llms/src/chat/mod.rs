@@ -369,9 +369,11 @@ use crate::hf::HubParams;
 ///    be inferred from the `.model_type` key in a HF's `config.json`, or from the GGUF metadata.
 /// `files` are the model's `files`, as the Spicepod lists them: GGUF files within the repo,
 ///    or a quantization by name (`UD-Q4_K_XL`), resolved against the repo
-///    ([`gguf_files::resolve`]); with none, a GGUF repo's largest quantization that fits the
-///    memory the engine reports. A registered engine that serves the GGUF files gets them all,
-///    every shard and any draft head; mistral.rs loads the first.
+///    ([`gguf_files::resolve`]); with none, the quantization llama.cpp's `-hf` loads (`Q4_K_M`,
+///    else `Q8_0`, else the first), or the largest that fits when the memory the engine reports
+///    cannot hold it. A registered engine that serves the GGUF files gets them all,
+///    every shard and any drafter; mistral.rs loads the one that holds the weights
+///    ([`gguf_files::model_file`]).
 /// `hub` is the model's `hf_token` and `hf_endpoint`.
 /// `distributed` optionally runs the model tensor-parallel across multiple nodes.
 /// `reasoning` names the model and its `reasoning_effort` default for the load-time check.
@@ -389,9 +391,10 @@ pub async fn create_hf_model(
         configuration: error.is_configuration_error(),
         source: Box::new(error),
     };
-    // Every node of a split model resolves the files itself, and each would choose by its own
-    // memory, so a split model takes only a repository's one quantization: every node must name
-    // the same files.
+    // Every node of a split model resolves the files itself, so a split model never chooses by
+    // one node's memory: with no `files`, every node takes the repository's default quantization,
+    // which depends on the repository's listing alone. With the Hub out of reach, a node lists
+    // its own cache instead.
     let budget = if distributed.is_some() {
         hf_files::Budget::Split
     } else {
@@ -421,10 +424,13 @@ pub async fn create_hf_model(
             return (engine.load)(&gguf_files, options).await;
         }
     }
-    let hf_files::Downloaded { dir, gguf } =
-        hf_files::download_model(model_id, files, budget, hub, reasoning.model_name)
-            .await
-            .map_err(download_error)?;
+    let hf_files::Downloaded {
+        dir,
+        gguf,
+        chosen_from_cache,
+    } = hf_files::download_model(model_id, files, budget, hub, reasoning.model_name)
+        .await
+        .map_err(download_error)?;
     let gguf_files: Vec<PathBuf> = gguf.iter().map(PathBuf::from).collect();
     let weights: Vec<PathBuf> = gguf_files.iter().map(|file| dir.join(file)).collect();
     if let Some(engine) = engine::engine_for(&gguf_files)
@@ -443,6 +449,19 @@ pub async fn create_hf_model(
         };
         return (engine.load)(&weights, options).await;
     }
+    // mistral.rs splits a model by having every node load the weights itself, so a quantization
+    // this node chose among what its own cache holds need not be the one another node loads.
+    if distributed.is_some()
+        && let Some(chosen) = chosen_from_cache
+    {
+        return Err(Error::SplitModelChoseFromCache {
+            model: reasoning.model_name.to_string(),
+            quantization: chosen.quantization,
+            pinned: chosen.pinned,
+            reason: chosen.reason,
+            configuration: chosen.offline,
+        });
+    }
     // Configure multi-node distributed (ring) inference before loading: the
     // loader reads `RING_CONFIG` from the environment while building the
     // pipeline. The returned guard keeps the temp file alive for the model.
@@ -459,7 +478,7 @@ pub async fn create_hf_model(
     mistral::MistralLlama::from_snapshot(
         &dir,
         model_type,
-        gguf.first().map(String::as_str),
+        gguf_files::model_file(&gguf),
         chat_template_literal,
         ring_config,
         reasoning,

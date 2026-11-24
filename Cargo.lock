@@ -11931,6 +11931,7 @@ dependencies = [
  "tracing-subscriber",
  "util",
  "wiremock",
+ "yaml",
 ]
 
 [[package]]
