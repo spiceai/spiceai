@@ -45283,9 +45283,10 @@ impl CayenneTableProvider {
         // wait for their commits. A row is written only while the live schema is
         // the one it was collected under, and evolution only widens the schema, so
         // a row read while the live schema equals `table_schema` before and after
-        // the read was collected under it. A schema that changed during the read
-        // never returns to `table_schema`, so the row is not used. Footer I/O
-        // below stays outside the lock.
+        // the read was collected under `table_schema` or an older, narrower one,
+        // never a newer one; it is decoded against `table_schema`. A schema that
+        // changed during the read never returns to `table_schema`, so the row is
+        // not used. Footer I/O below stays outside the lock.
         let persisted =
             if written_since_open || table_schema.as_ref() != self.table_schema().as_ref() {
                 None

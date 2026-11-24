@@ -2518,6 +2518,9 @@ async fn scans_do_not_wait_for_a_slow_head_write() {
         );
     }
 
+    // Maintenance the stream left behind commits first, so the held head write
+    // is the apply's.
+    table.drain_in_flight_maintenance().await.expect("drain");
     let before = i64::try_from(sorted_rows(&ctx, name).await.len()).expect("row count");
     faults.arm(Op::Cas, is_head, Fault::Hold);
     let rows: Vec<(i64, i64)> = (before + 1..=before + 50).map(|id| (id, id * 10)).collect();
