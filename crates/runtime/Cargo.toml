@@ -160,7 +160,6 @@ runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-api-types = { path = "../runtime-api-types" }
 runtime-async = { path = "../runtime-async" }
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
-runtime-checkpoint-sqlite = { path = "../runtime-checkpoint-sqlite", optional = true }
 runtime-component = { path = "../runtime-component" }
 runtime-config = { path = "../runtime-config" }
 runtime-metrics = { path = "../runtime-metrics" }
@@ -188,7 +187,6 @@ runtime-secrets = { path = "../runtime-secrets", default-features = false }
 runtime-state-location = { path = "../runtime-state-location" }
 runtime-status = { path = "../runtime-status" }
 runtime-table-partition = { path = "../runtime-table-partition" }
-rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 elasticsearch = { path = "../elasticsearch", optional = true }
 duration-parse = { workspace = true, optional = true }
@@ -216,7 +214,6 @@ tiberius = { workspace = true, optional = true }
 token_provider = { path = "../token_provider" }
 tokenizers.workspace = true
 tokio.workspace = true
-tokio-rusqlite = { workspace = true, optional = true }
 tokio-rustls = "0.26.0"
 tokio-stream.workspace = true
 tokio-util.workspace = true
@@ -299,7 +296,6 @@ connector-mongodb = { path = "../data-connectors/connector-mongodb" }
 connector-mssql = { path = "../data-connectors/connector-mssql" }
 connector-mysql = { path = "../data-connectors/connector-mysql" }
 connector-oracle = { path = "../data-connectors/connector-oracle" }
-accelerator-sqlite = { path = "../accelerators/accelerator-sqlite" }
 accelerator-cayenne = { path = "../accelerators/accelerator-cayenne" }
 connector-postgres = { path = "../data-connectors/connector-postgres" }
 connector-scylladb = { path = "../data-connectors/connector-scylladb" }
@@ -427,14 +423,6 @@ spark = ["data_components/spark_connect", "connector-databricks/spark"]
 # Registers the Cayenne catalog connector. Intended for benchmarking only;
 # deliberately excluded from the default feature set.
 spicebench = []
-sqlite = [
-    "dep:tokio-rusqlite",
-    "dep:runtime-checkpoint-sqlite",
-    "db_connection_pool/sqlite",
-    "data_components/sqlite",
-    "dep:rusqlite",
-    "runtime-acceleration/sqlite",
-]
 vortex = []
 
 [[bench]]

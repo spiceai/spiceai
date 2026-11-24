@@ -6,6 +6,7 @@
   "append-kill": 74,
   "append-time-column": 10,
   "append-time-partition": 15,
+  "append-upsert-same-time": 7,
   "auth": 4,
   "azure-model-credentials": 4,
   "builtins": 8,

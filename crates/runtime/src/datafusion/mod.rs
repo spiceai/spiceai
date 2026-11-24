@@ -521,14 +521,6 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use `engine: cayenne` instead, with `mode: file` to partition it with `partition_by`."
-    ))]
-    UnsupportedDistributedAccelerationEngine {
-        dataset_name: String,
-        engine: String,
-    },
-
-    #[snafu(display(
         "Failed to create an accelerated table for {component_name}. Error setting the underlying table provider: {}",
         format_datafusion_error(source)
     ))]
@@ -648,7 +640,6 @@ impl Error {
                 // connector cannot serve.
                 | Self::InvalidCachingRefreshMode { .. }
                 | Self::ConflictingStaleWhileRevalidateConfig { .. }
-                | Self::UnsupportedDistributedAccelerationEngine { .. }
                 | Self::UnsupportedStreamBatchesForBatchRefresh
                 | Self::UnsupportedRefreshCompleteForStream
                 | Self::UnsupportedSnapshotTriggerForCaching
@@ -827,37 +818,11 @@ fn acceleration_rebuilt_message(cause: &str) -> String {
     format!("{cause}, so it is dropped and reloaded from the source.")
 }
 
-/// Validates that the acceleration engine is supported in distributed mode.
-///
-/// Only Arrow, `PartitionedArrow`, and Cayenne engines are supported for distributed acceleration.
-/// Returns an error if a distributed role is active and the engine is unsupported.
-fn validate_distributed_engine(
-    cluster_config: &ResolvedClusterConfig,
-    engine: Engine,
-    dataset_name: &str,
-) -> Result<()> {
-    if cluster_config.effective_role().is_some()
-        && !matches!(
-            engine,
-            Engine::Arrow | Engine::PartitionedArrow | Engine::Cayenne
-        )
-    {
-        return UnsupportedDistributedAccelerationEngineSnafu {
-            dataset_name: dataset_name.to_string(),
-            engine: engine.to_string(),
-        }
-        .fail();
-    }
-    Ok(())
-}
-
 /// Converts a runtime `Engine` to a snapshot `AccelerationEngine`.
 ///
 /// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow).
 pub(crate) fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
     match engine {
-        #[cfg(feature = "sqlite")]
-        Engine::Sqlite => Some(AccelerationEngine::Sqlite),
         Engine::Cayenne => Some(AccelerationEngine::Cayenne),
         _ => None,
     }
@@ -4121,11 +4086,6 @@ impl DataFusion {
         let constraint_columns =
             dataset_constraint_columns(dataset, source_constraints, &source_schema);
 
-        validate_distributed_engine(
-            &self.cluster_config,
-            acceleration_settings.engine,
-            &dataset.name.to_string(),
-        )?;
         if matches!(refresh_mode, RefreshMode::Caching) {
             crate::accelerated::caching::extend_schema_with_cache_namespace(
                 &dataset.name.to_string(),
@@ -4244,13 +4204,6 @@ impl DataFusion {
         } else {
             source_constraints.cloned()
         };
-
-        // Distributed acceleration is only supported with Arrow, PartitionedArrow, or Cayenne engines.
-        validate_distributed_engine(
-            &self.cluster_config,
-            acceleration_settings.engine,
-            &dataset.name.to_string(),
-        )?;
 
         // For caching mode, the underlying accelerator storage is augmented
         // with a hidden `__spice_cache_namespace` column so cached rows can be
@@ -5121,20 +5074,6 @@ impl DataFusion {
             return Ok(None);
         };
 
-        let needs_dict_normalization = matches!(
-            acceleration_settings.engine.to_unpartitioned(),
-            Engine::Sqlite
-        );
-        let normalized_refresh_schema = if needs_dict_normalization
-            && arrow_tools::schema::has_dictionary_types(refresh_schema)
-        {
-            Arc::new(arrow_tools::type_rewrite::normalize_dictionary_types(
-                refresh_schema,
-            ))
-        } else {
-            Arc::clone(refresh_schema)
-        };
-
         // For `refresh_sql` datasets the canonical checkpoint schema carries
         // non-materialized source columns that are intentionally absent from the
         // projected refresh schema; compare only the materialized (refresh-schema)
@@ -5149,7 +5088,7 @@ impl DataFusion {
         // the refresh schema), defeating `file_update`'s drop-recreate. Compare the
         // full checkpoint there so real removals are still detected.
         let comparison_schema = if dataset.refresh_sql().is_some() {
-            restrict_schema_to(&existing_schema, &normalized_refresh_schema)
+            restrict_schema_to(&existing_schema, refresh_schema)
         } else {
             Arc::clone(&existing_schema)
         };
@@ -5157,11 +5096,8 @@ impl DataFusion {
         if policy != OnSchemaChange::Block {
             let dataset_name = dataset.name.to_string();
             let ctx = EvolutionContext { constraint_columns };
-            match arrow_tools::schema_evolution::classify(
-                &comparison_schema,
-                &normalized_refresh_schema,
-                &ctx,
-            ) {
+            match arrow_tools::schema_evolution::classify(&comparison_schema, refresh_schema, &ctx)
+            {
                 SchemaEvolution::Identical => {
                     // Name-sets match: register with the checkpoint field order (not
                     // source order) so positional engine paths stay aligned with the
@@ -5351,10 +5287,8 @@ impl DataFusion {
         // not evolve falls back to snapshot + drop + recreate with the new schema (under
         // `block`, this is `file_update`'s today's-behavior-verbatim contract).
         if allow_recreate
-            && let Some(diff) = arrow_tools::schema::schema_difference(
-                &comparison_schema,
-                &normalized_refresh_schema,
-            )
+            && let Some(diff) =
+                arrow_tools::schema::schema_difference(&comparison_schema, refresh_schema)
         {
             let dataset_name = dataset.name.to_string();
             let trigger = if is_file_update {
@@ -6955,13 +6889,6 @@ impl DataFusion {
                     name: table.to_string(),
                 })?;
 
-        // Distributed acceleration is only supported with Arrow, PartitionedArrow, or Cayenne engines.
-        validate_distributed_engine(
-            &self.cluster_config,
-            acceleration.engine,
-            &table.to_string(),
-        )?;
-
         let accelerated_table_provider = self
             .create_view_accelerator_table(view, view_plan, schema, acceleration, secrets)
             .await
@@ -7935,8 +7862,6 @@ async fn build_snapshot_creation_config(
     };
 
     let acceleration_engine = match acceleration_settings.engine {
-        #[cfg(feature = "sqlite")]
-        Engine::Sqlite => AccelerationEngine::Sqlite,
         Engine::Cayenne => AccelerationEngine::Cayenne,
         _ => {
             // This code is unreachable since build_snapshot_creation_config is
@@ -9357,79 +9282,6 @@ mod tests {
                 ),
                 "Expected InvalidSnapshotCreationBatches error, got: {result:?}",
             );
-        }
-    }
-
-    mod validate_distributed_engine_tests {
-        use super::super::*;
-        use crate::config::{ClusterConfig, Role};
-
-        fn make_cluster_config(role: Role) -> ResolvedClusterConfig {
-            let config = ClusterConfig {
-                role: Some(role),
-                allow_insecure_connections: true,
-                node_advertise_address: Some("127.0.0.1".to_string()),
-                ..ClusterConfig::default()
-            };
-            ResolvedClusterConfig::try_new(config).expect("valid test cluster config")
-        }
-
-        fn make_non_distributed_config() -> ResolvedClusterConfig {
-            ResolvedClusterConfig::try_new(ClusterConfig::default())
-                .expect("valid default cluster config")
-        }
-
-        #[test]
-        fn arrow_allowed_in_distributed_mode() {
-            let config = make_cluster_config(Role::Scheduler);
-            validate_distributed_engine(&config, Engine::Arrow, "ds")
-                .expect("arrow engine should be allowed in distributed mode");
-        }
-
-        #[test]
-        fn partitioned_arrow_allowed_in_distributed_mode() {
-            let config = make_cluster_config(Role::Scheduler);
-            validate_distributed_engine(&config, Engine::PartitionedArrow, "ds")
-                .expect("partitioned_arrow engine should be allowed in distributed mode");
-        }
-
-        #[test]
-        fn cayenne_allowed_in_distributed_mode() {
-            let config = make_cluster_config(Role::Scheduler);
-            validate_distributed_engine(&config, Engine::Cayenne, "ds")
-                .expect("cayenne engine should be allowed in distributed mode");
-        }
-
-        #[test]
-        fn sqlite_rejected_in_distributed_mode() {
-            let config = make_cluster_config(Role::Executor);
-            let result = validate_distributed_engine(&config, Engine::Sqlite, "my_dataset");
-            assert!(
-                matches!(
-                    result,
-                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
-                ),
-                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
-            );
-            // The fix it names is the engine that stays: Cayenne partitions only in
-            // file mode.
-            assert_eq!(
-                result.expect_err("sqlite is rejected").to_string(),
-                "Failed to create an accelerated table for dataset my_dataset: the 'sqlite' engine is not supported for distributed acceleration. Use `engine: cayenne` instead, with `mode: file` to partition it with `partition_by`."
-            );
-        }
-
-        #[test]
-        fn any_engine_allowed_in_non_distributed_mode() {
-            let config = make_non_distributed_config();
-            validate_distributed_engine(&config, Engine::Sqlite, "ds")
-                .expect("duckdb should be allowed when not in distributed mode");
-            validate_distributed_engine(&config, Engine::Sqlite, "ds")
-                .expect("sqlite should be allowed when not in distributed mode");
-            validate_distributed_engine(&config, Engine::Arrow, "ds")
-                .expect("arrow should be allowed when not in distributed mode");
-            validate_distributed_engine(&config, Engine::Cayenne, "ds")
-                .expect("cayenne should be allowed when not in distributed mode");
         }
     }
 

@@ -107,7 +107,7 @@ make install
 make install-dev
 
 # Also you can specify specific features
-SPICED_CUSTOM_FEATURES="postgres sqlite" make install
+SPICED_CUSTOM_FEATURES="postgres mysql" make install
 
 # Run the following to temporarily add spice to your PATH.
 # Add it to the end of your .bashrc or .zshrc to permanently add spice to your PATH.
@@ -148,7 +148,7 @@ make install
 make install-dev
 
 # Also you can specify specific features
-SPICED_CUSTOM_FEATURES="postgres sqlite" make install
+SPICED_CUSTOM_FEATURES="postgres mysql" make install
 
 # Run the following to temporarily add spice to your PATH.
 # Add it to the end of your .bashrc or .zshrc to permanently add spice to your PATH.
@@ -191,8 +191,8 @@ For example, to support a newly popular database called `newdb`, add it by defau
 
 ```diff
  [features]
--default = ["duckdb", "postgres", "sqlite", "mysql"]
-+default = ["duckdb", "postgres", "sqlite", "mysql", "newdb"]
+-default = ["duckdb", "postgres", "mysql"]
++default = ["duckdb", "postgres", "mysql", "newdb"]
 ```
 
 Next, create the same feature in crates that implement a `newdb` connector or dataset:

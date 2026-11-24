@@ -44,8 +44,6 @@ use accelerator_cayenne as _;
 // unreferenced static — and every integration binary links separately, so each one that
 // exercises an engine needs its own reference. `integration.rs`'s
 // `accelerator_crates_register_their_engines` guards the mechanism.
-#[cfg(feature = "sqlite")]
-use accelerator_sqlite as _;
 
 use std::{
     collections::{HashMap, HashSet},
