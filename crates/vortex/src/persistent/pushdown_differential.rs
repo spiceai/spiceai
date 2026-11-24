@@ -7,7 +7,9 @@
 //! filter and projection may be converted and evaluated by Vortex, and once over
 //! an in-memory `DataFusion` table, which shares none of that code. The answers
 //! have to match row for row. A query `DataFusion` fails has to fail over the
-//! Vortex table too, rather than return rows.
+//! Vortex table too, with `DataFusion`'s own error, rather than return rows or fail
+//! in the scan; [`FAILING`] names those queries, so an error over both tables never
+//! stands in for an answer.
 
 use datafusion::arrow::util::pretty::pretty_format_batches;
 
@@ -16,17 +18,19 @@ use crate::common_tests::TestSessionContext;
 
 /// The columns both tables share.
 const COLUMNS: &str = "id INT NOT NULL, a INT, b INT NOT NULL, p DECIMAL(15, 2) NOT NULL, \
-                       r DECIMAL(10, 0) NOT NULL, s VARCHAR, f DOUBLE";
+                       r DECIMAL(10, 0) NOT NULL, s VARCHAR, f DOUBLE, g DOUBLE, \
+                       w DECIMAL(40, 0)";
 
 /// Integer extremes, zeros to divide by, a null in each nullable column, an empty
-/// string, and both signed zeros.
+/// string, both signed zeros, and a `DECIMAL(40, 0)` (a `Decimal256`) past `BIGINT`'s
+/// range.
 const ROWS: &[&str] = &[
-    "0, 2147483647, 0, 1.50, 0, 'xy', -0.0",
-    "1, -2147483648, 0, 0.00, 0, 'abc', 0.0",
-    "2, 1, 1, 1.00, 1, NULL, 1.5",
-    "3, 2, 2, 2.00, 2, 'q', -0.0",
-    "4, NULL, 0, 0.00, 0, '', NULL",
-    "5, 4, 2, 2.00, 2, 'xyz', 0.0",
+    "0, 2147483647, 0, 1.50, 0, 'xy', -0.0, 0.0, 1000000000000000000000000000000000000000",
+    "1, -2147483648, 0, 0.00, 0, 'abc', 0.0, -0.0, 1",
+    "2, 1, 1, 1.00, 1, NULL, 1.5, 1.5, 2",
+    "3, 2, 2, 2.00, 2, 'q', -0.0, 0.0, NULL",
+    "4, NULL, 0, 0.00, 0, '', NULL, 0.0, 3",
+    "5, 4, 2, 2.00, 2, 'xyz', 0.0, 0.0, -5",
 ];
 
 /// Filters whose conversion into a Vortex predicate has to keep `DataFusion`'s answer.
@@ -55,8 +59,16 @@ const FILTERS: &[&str] = &[
     "p > r",
     "p = r",
     "a + b > 3",
-    // A `CASE` whose unselected branch overflows.
-    "CASE WHEN a > 0 THEN a ELSE a * 2 END > 1",
+    // A `CASE` whose unselected branch overflows: `a + a` stays `INT`, and only the
+    // extremes, which the `THEN` takes, overflow it.
+    "CASE WHEN a > 1000 OR a < -1000 THEN 0 ELSE a + a END > 1",
+    // The same guards under a cast: a `CASE` that guards a division by zero, arithmetic
+    // over decimals of different types, and a comparison of two float columns.
+    "CAST(CASE WHEN b <> 0 THEN 12 / b ELSE 0 END AS DOUBLE) = 6",
+    "CAST(p * r AS DECIMAL(30, 2)) > 3",
+    "CAST(f = g AS INT) = 1",
+    // A cast from a `Decimal256` past the target's range is an error, not a row.
+    "CAST(w AS BIGINT) > 0",
     // Signed zeros compare equal.
     "f = -0.0",
     "f = 0.0",
@@ -64,17 +76,46 @@ const FILTERS: &[&str] = &[
 
 /// Projections whose conversion into a Vortex expression has to keep `DataFusion`'s answer.
 const PROJECTIONS: &[&str] = &[
-    // An alias that shares a column's name.
-    "b AS a, abs(a) AS x",
+    // An alias that shares a column's name, in a projection the scan evaluates whole.
+    "b AS a, a + 1 AS x",
     "a AS b, b AS a",
+    // Computed expressions the scan evaluates.
+    "a + b AS x",
+    "b * 2 AS x",
     // Expressions Vortex has no conversion for.
     "a % 2 AS x",
     "-a AS x",
     "a + character_length(s) AS x",
     "CASE WHEN b > 0 THEN a END AS x",
-    // Expressions it does convert, next to ones it does not.
-    "abs(a) AS x, a % 3 AS y",
+    // An expression it converts, next to one it does not.
+    "a + b AS x, a % 3 AS y",
+    // Arithmetic over decimals of one type, whose result type `DataFusion` chooses.
+    "p * p AS x",
 ];
+
+/// The filters and projections above that `DataFusion` fails over [`ROWS`], each with why.
+const FAILING: &[&str] = &[
+    // `w` holds 10^39, past `BIGINT`'s range.
+    "CAST(w AS BIGINT) > 0",
+    // Negating `INT`'s minimum overflows.
+    "-a AS x",
+];
+
+/// What a query returned: its rows, rendered, or the error it failed with.
+#[derive(PartialEq)]
+enum Answer {
+    Rows(String),
+    Error(String),
+}
+
+impl std::fmt::Display for Answer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rows(rows) => f.write_str(rows),
+            Self::Error(error) => write!(f, "ERROR {error}"),
+        }
+    }
+}
 
 /// Create the Vortex table `v` and the in-memory table `m` holding [`ROWS`].
 async fn tables() -> anyhow::Result<TestSessionContext> {
@@ -97,27 +138,40 @@ async fn tables() -> anyhow::Result<TestSessionContext> {
     Ok(ctx)
 }
 
-/// The rows `sql` returns, rendered, or `ERROR` if it fails.
-async fn answer(ctx: &TestSessionContext, sql: &str) -> String {
+/// The rows `sql` returns, rendered, or the error it fails with.
+async fn answer(ctx: &TestSessionContext, sql: &str) -> Answer {
     let batches = async { ctx.session.sql(sql).await?.collect().await }.await;
     match batches {
-        Ok(batches) => pretty_format_batches(&batches)
-            .map_or_else(|error| format!("FORMAT ERROR {error}"), |t| t.to_string()),
-        Err(_) => "ERROR".to_string(),
+        Ok(batches) => Answer::Rows(
+            pretty_format_batches(&batches)
+                .map_or_else(|error| format!("FORMAT ERROR {error}"), |t| t.to_string()),
+        ),
+        Err(error) => Answer::Error(error.to_string()),
     }
 }
 
-/// Run each query over both tables and return every query whose answers differ.
+/// Run each `(entry, query)` over both tables and return every query whose answers differ,
+/// that fails over the in-memory table without being in [`FAILING`], or that is in
+/// [`FAILING`] and answers. Two failures agree only on the same error.
 async fn mismatches(
     ctx: &TestSessionContext,
-    queries: impl IntoIterator<Item = String>,
+    queries: impl IntoIterator<Item = (&'static str, String)>,
 ) -> Vec<String> {
     let mut mismatches = Vec::new();
-    for query in queries {
+    for (entry, query) in queries {
         let vortex = answer(ctx, &query.replace("{t}", "v")).await;
         let oracle = answer(ctx, &query.replace("{t}", "m")).await;
-        if vortex != oracle {
-            mismatches.push(format!("{query}\nvortex:\n{vortex}\nin-memory:\n{oracle}"));
+        let expected_to_fail = FAILING.contains(&entry);
+        let problem = match (&oracle, expected_to_fail) {
+            (Answer::Error(_), false) => Some("the in-memory table fails it"),
+            (Answer::Rows(_), true) => Some("it is in FAILING, and the in-memory table answers it"),
+            _ if vortex != oracle => Some("the answers differ"),
+            _ => None,
+        };
+        if let Some(problem) = problem {
+            mismatches.push(format!(
+                "{query}: {problem}\nvortex:\n{vortex}\nin-memory:\n{oracle}"
+            ));
         }
     }
     mismatches
@@ -128,9 +182,12 @@ async fn pushed_down_filters_return_what_datafusion_returns() -> anyhow::Result<
     let ctx = tables().await?;
     let mismatches = mismatches(
         &ctx,
-        FILTERS
-            .iter()
-            .map(|filter| format!("SELECT id FROM {{t}} WHERE {filter} ORDER BY id")),
+        FILTERS.iter().map(|filter| {
+            (
+                *filter,
+                format!("SELECT id FROM {{t}} WHERE {filter} ORDER BY id"),
+            )
+        }),
     )
     .await;
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n\n"));
@@ -142,9 +199,12 @@ async fn pushed_down_projections_return_what_datafusion_returns() -> anyhow::Res
     let ctx = tables().await?;
     let mismatches = mismatches(
         &ctx,
-        PROJECTIONS
-            .iter()
-            .map(|projection| format!("SELECT id, {projection} FROM {{t}} ORDER BY id")),
+        PROJECTIONS.iter().map(|projection| {
+            (
+                *projection,
+                format!("SELECT id, {projection} FROM {{t}} ORDER BY id"),
+            )
+        }),
     )
     .await;
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n\n"));
@@ -216,6 +276,16 @@ fn projections_are_pushed_whole_or_not_at_all() -> anyhow::Result<()> {
             (df_expr::col("a", &schema)?, "b"),
         ])?,
         "renamed columns convert, so the projection is evaluated in the scan"
+    );
+
+    let sum: Arc<dyn PhysicalExpr> = Arc::new(df_expr::BinaryExpr::new(
+        df_expr::col("a", &schema)?,
+        datafusion_expr::Operator::Plus,
+        df_expr::col("b", &schema)?,
+    ));
+    assert!(
+        pushed_down(vec![(Arc::clone(&sum), "x")])?,
+        "`a + b` converts, so the projection is evaluated in the scan"
     );
 
     let modulo: Arc<dyn PhysicalExpr> = Arc::new(df_expr::BinaryExpr::new(

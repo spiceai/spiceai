@@ -1745,6 +1745,103 @@ mod tests {
         Ok(())
     }
 
+    /// The rows `sql` returns, rendered, or the error it fails with.
+    async fn rendered_answer(ctx: &TestSessionContext, sql: &str) -> String {
+        match async { ctx.session.sql(sql).await?.collect().await }.await {
+            Ok(batches) => datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+                .map_or_else(|e| format!("FORMAT ERROR {e}"), |t| t.to_string()),
+            Err(e) => format!("ERROR {e}"),
+        }
+    }
+
+    /// The sum a scan of the vortex table `table` reports for its first column.
+    async fn reported_sum(
+        ctx: &TestSessionContext,
+        table: &str,
+    ) -> anyhow::Result<datafusion_common::stats::Precision<ScalarValue>> {
+        use datafusion_physical_plan::{StatisticsArgs, StatisticsContext};
+
+        let provider = ctx.session.table_provider(table).await?;
+        let plan = provider.scan(&ctx.session.state(), None, &[], None).await?;
+        let stats = StatisticsContext::new().compute(&*plan, &StatisticsArgs::new())?;
+        Ok(stats.column_statistics[0].sum_value.clone())
+    }
+
+    /// A column sum that overflows `BIGINT` is never reported as exact: not for the file
+    /// whose own rows overflow it, nor for two files whose sums fit alone and overflow
+    /// together, right after the write or once the footers are read back from storage.
+    /// `DataFusion` answers `SUM` from an exact sum, so `SUM` and `AVG` over the table have
+    /// to answer as they do over the same rows in memory.
+    #[tokio::test]
+    async fn an_overflowing_column_sum_is_never_reported_exact() -> anyhow::Result<()> {
+        use object_store::{ObjectStore as _, ObjectStoreExt as _};
+
+        const COLUMNS: &str = "(n BIGINT NOT NULL)";
+        let ctx = TestSessionContext::new(true);
+        ctx.session
+            .sql(&format!(
+                "CREATE EXTERNAL TABLE big {COLUMNS} STORED AS vortex LOCATION '/big/'"
+            ))
+            .await?
+            .collect()
+            .await?;
+        ctx.session
+            .sql(&format!("CREATE TABLE m {COLUMNS}"))
+            .await?
+            .collect()
+            .await?;
+        // One statement per file: one whose rows overflow, and two whose sums overflow
+        // only together.
+        for values in [
+            "(9223372036854775807), (1)",
+            "(9223372036854775000)",
+            "(1000)",
+        ] {
+            for table in ["big", "m"] {
+                ctx.session
+                    .sql(&format!("INSERT INTO {table} VALUES {values}"))
+                    .await?
+                    .collect()
+                    .await?;
+            }
+        }
+
+        // The same files, read back from storage in a session that has not cached them.
+        let reopened = TestSessionContext::new(true);
+        let mut listing = ctx.store.list(None);
+        while let Some(meta) = futures::StreamExt::next(&mut listing).await {
+            let meta = meta?;
+            let bytes = ctx.store.get(&meta.location).await?.bytes().await?;
+            reopened.store.put(&meta.location, bytes.into()).await?;
+        }
+        reopened
+            .session
+            .sql(&format!(
+                "CREATE EXTERNAL TABLE big {COLUMNS} STORED AS vortex LOCATION '/big/'"
+            ))
+            .await?
+            .collect()
+            .await?;
+
+        for (stage, session) in [("after the write", &ctx), ("read back", &reopened)] {
+            let sum = reported_sum(session, "big").await?;
+            assert!(
+                !matches!(sum, datafusion_common::stats::Precision::Exact(_)),
+                "{stage}: an overflowing sum is reported as {sum:?}"
+            );
+        }
+
+        for aggregate in ["SUM(n)", "AVG(n)"] {
+            let oracle = rendered_answer(&ctx, &format!("SELECT {aggregate} AS x FROM m")).await;
+            for (stage, session) in [("after the write", &ctx), ("read back", &reopened)] {
+                let observed =
+                    rendered_answer(session, &format!("SELECT {aggregate} AS x FROM big")).await;
+                assert_eq!(observed, oracle, "{stage}: {aggregate}");
+            }
+        }
+        Ok(())
+    }
+
     fn split_path(
         base_path: &object_store::path::Path,
         file_index: usize,

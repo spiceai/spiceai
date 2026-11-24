@@ -40,13 +40,13 @@ steps:
       src: |
         CREATE TABLE v (
           id int PRIMARY KEY, a int, b int NOT NULL, p numeric(15, 2) NOT NULL,
-          r numeric(10, 0) NOT NULL, n numeric(19, 0), s text, f float8);
+          r numeric(10, 0) NOT NULL, n numeric(19, 0), s text, f float8, g float8);
         INSERT INTO v VALUES
-          (0, 2147483647, 0, 1.50, 0, 9999999999999999999, 'xy', '-0'),
-          (1, -2147483648, 0, 0.00, 0, 1, 'abc', '0'),
-          (2, 1, 1, 1.00, 1, 2, NULL, 1.5),
-          (3, 2, 2, 2.00, 2, NULL, 'q', '-0'),
-          (4, NULL, 0, 0.00, 0, 3, '', NULL),
-          (5, 4, 2, 2.00, 2, -9223372036854775808, 'xyz', '0');
+          (0, 2147483647, 0, 1.50, 0, 9999999999999999999, 'xy', '-0', '0'),
+          (1, -2147483648, 0, 0.00, 0, 1, 'abc', '0', '-0'),
+          (2, 1, 1, 1.00, 1, 2, NULL, 1.5, 1.5),
+          (3, 2, 2, 2.00, 2, NULL, 'q', '-0', '0'),
+          (4, NULL, 0, 0.00, 0, 3, '', NULL, '0'),
+          (5, 4, 2, 2.00, 2, -9223372036854775808, 'xyz', '0', '0');
   - start: {}
   - corpus: corpus/cayenne-scan-pushdown.sql

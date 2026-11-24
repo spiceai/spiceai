@@ -2842,9 +2842,15 @@ mod tests {
         Ok((bytes.load(std::sync::atomic::Ordering::Relaxed), values))
     }
 
-    /// Reads `limit` rows of a filtered scan of a 65,536-row file and returns the bytes read
-    /// and the values of `a` returned.
-    async fn filtered_limit_read(limit: Option<u64>) -> anyhow::Result<(u64, Vec<i64>)> {
+    /// Reads `limit` rows of a filtered scan of a 65,536-row file, in file order when
+    /// `ordered`, and returns the bytes read and the values of `a` returned. The first
+    /// `heavy_rows` rows carry an 8,000-byte payload, and the rest an 8-byte one, so the
+    /// splits that hold them take longest to decode.
+    async fn filtered_limit_read(
+        limit: Option<u64>,
+        ordered: bool,
+        heavy_rows: i64,
+    ) -> anyhow::Result<(u64, Vec<i64>)> {
         use datafusion::arrow::array::{AsArray, Int64Array};
         use datafusion::arrow::datatypes::Int64Type;
 
@@ -2857,9 +2863,15 @@ mod tests {
             Arc::clone(&schema),
             vec![
                 Arc::new(Int64Array::from_iter_values(0..rows)),
-                Arc::new(StringArray::from_iter_values(
-                    (0..rows).map(|row| format!("payload-{row:08}-{}", "x".repeat(200))),
-                )),
+                Arc::new(StringArray::from_iter_values((0..rows).map(|row| {
+                    if heavy_rows == 0 {
+                        format!("payload-{row:08}-{}", "x".repeat(200))
+                    } else if row < heavy_rows {
+                        "x".repeat(8_000)
+                    } else {
+                        format!("{row:08}")
+                    }
+                }))),
             ],
         )?;
         let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
@@ -2873,6 +2885,7 @@ mod tests {
         let mut opener = make_opener(Arc::clone(&object_store), table_schema, Some(filter));
         opener.projection = ProjectionExprs::from_indices(&[0, 1], &schema);
         opener.limit = limit;
+        opener.has_output_ordering = ordered;
         // Fewer splits in flight than the file has, as for any file larger than the scan's
         // concurrency: the limit stops splits from starting, not ones already running.
         opener.scan_concurrency = Some(2);
@@ -2902,14 +2915,14 @@ mod tests {
     /// decoding every split of the file for the file stream to drop.
     #[tokio::test]
     async fn a_limit_with_a_filter_stops_the_scan_once_it_is_met() -> anyhow::Result<()> {
-        let (unlimited_bytes, all) = filtered_limit_read(None).await?;
+        let (unlimited_bytes, all) = filtered_limit_read(None, false, 0).await?;
         assert_eq!(
             all.len(),
             65_536 - 101,
             "every row past the first hundred matches"
         );
 
-        let (limited_bytes, limited) = filtered_limit_read(Some(10)).await?;
+        let (limited_bytes, limited) = filtered_limit_read(Some(10), false, 0).await?;
         assert!(
             limited.len() >= 10,
             "the scan returns at least the limit: {}",
@@ -2922,6 +2935,36 @@ mod tests {
         assert!(
             limited_bytes * 2 < unlimited_bytes,
             "a limited scan read {limited_bytes} bytes, an unlimited one {unlimited_bytes}"
+        );
+        Ok(())
+    }
+
+    /// An ordered scan with a filter and a limit returns the first matching rows in file
+    /// order, so a sort the plan removed because the file is ordered loses no row: the limit
+    /// stops splits from starting, and the rows it keeps are the earliest ones even when later
+    /// splits finish first. The first 16,384 rows carry the heavy payload, so an unordered
+    /// scan returns rows of a later split first.
+    #[tokio::test]
+    async fn an_ordered_limit_with_a_filter_returns_the_first_matching_rows() -> anyhow::Result<()>
+    {
+        let heavy_rows = 16_384;
+        let (_, all) = filtered_limit_read(None, true, heavy_rows).await?;
+        assert_eq!(
+            all,
+            (101..65_536).collect::<Vec<i64>>(),
+            "an ordered unlimited scan returns every match in file order"
+        );
+
+        let (_, limited) = filtered_limit_read(Some(10), true, heavy_rows).await?;
+        assert!(
+            limited.len() >= 10,
+            "the scan returns at least the limit: {}",
+            limited.len()
+        );
+        assert_eq!(
+            limited,
+            (101..101 + i64::try_from(limited.len())?).collect::<Vec<i64>>(),
+            "an ordered limited scan returns the first matches, in order"
         );
         Ok(())
     }

@@ -11,7 +11,11 @@ use datafusion_common::Result as DFResult;
 use datafusion_common::ScalarValue;
 use datafusion_common::arrow::array::ArrayRef as ArrowArrayRef;
 use datafusion_common::arrow::array::BooleanArray;
+use datafusion_common::arrow::array::Decimal32Array;
+use datafusion_common::arrow::array::Decimal64Array;
 use datafusion_common::arrow::array::Decimal128Array;
+use datafusion_common::arrow::array::Decimal256Array;
+use datafusion_common::arrow::array::Float16Array;
 use datafusion_common::arrow::array::Float32Array;
 use datafusion_common::arrow::array::Float64Array;
 use datafusion_common::arrow::array::Int8Array;
@@ -24,6 +28,7 @@ use datafusion_common::arrow::array::UInt32Array;
 use datafusion_common::arrow::array::UInt64Array;
 use datafusion_common::arrow::compute::CastOptions;
 use datafusion_common::arrow::compute::cast_with_options;
+use datafusion_common::arrow::datatypes::i256;
 use datafusion_common::exec_datafusion_err;
 use datafusion_common::tree_node::TreeNode;
 use datafusion_expr::Operator as DFOperator;
@@ -715,6 +720,11 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
         return false;
     }
 
+    if contains_an_expression_the_scan_evaluates_differently(df_expr, schema) {
+        tracing::debug!(%df_expr, "DataFusion expression contains an expression the scan evaluates differently and can't be pushed down");
+        return false;
+    }
+
     let expr = df_expr;
     if let Some(binary) = expr.downcast_ref::<df_expr::BinaryExpr>() {
         can_binary_be_pushed_down(binary, schema)
@@ -1015,6 +1025,45 @@ fn contains_decimal_to_floating_cast(df_expr: &Arc<dyn PhysicalExpr>, schema: &S
         .any(|child| contains_decimal_to_floating_cast(child, schema))
 }
 
+/// Whether `df_expr` holds, anywhere, an expression the scan evaluates differently from
+/// `DataFusion`: arithmetic over operands of different types, a comparison of two float
+/// expressions, or a `CASE` with a branch `DataFusion` runs on some rows only and that can
+/// fail. The arms of [`can_be_pushed_down_impl`] check these on the expressions they recurse
+/// into, but the expression under a cast, and the argument of `array_length`, are checked only
+/// for being convertible, so the whole tree is searched here. Without it
+/// `CAST(CASE WHEN b <> 0 THEN 12 / b ELSE 0 END AS DOUBLE) = 6` reached the scan, which
+/// evaluates every branch and divides by zero, and `CAST(f = g AS INT) = 1` dropped the rows
+/// where `f` and `g` hold `-0.0` and `0.0`.
+fn contains_an_expression_the_scan_evaluates_differently(
+    df_expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> bool {
+    if let Some(binary) = df_expr.downcast_ref::<df_expr::BinaryExpr>()
+        && (!arithmetic_operands_share_a_type(binary, schema)
+            || compares_two_float_expressions(*binary.op(), binary.left(), binary.right(), schema))
+    {
+        return true;
+    }
+
+    if let Some(case_expr) = df_expr.downcast_ref::<df_expr::CaseExpr>()
+        && case_has_a_conditional_branch_that_can_fail(case_expr, schema)
+    {
+        return true;
+    }
+
+    if let Some(dynamic_filter) = df_expr.downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+        && let Ok(current) = dynamic_filter.current()
+        && contains_an_expression_the_scan_evaluates_differently(&current, schema)
+    {
+        return true;
+    }
+
+    df_expr
+        .children()
+        .into_iter()
+        .any(|child| contains_an_expression_the_scan_evaluates_differently(child, schema))
+}
+
 /// Whether `df_expr` holds a cast Vortex can't evaluate.
 ///
 /// A static filter rarely carries a cast, because `DataFusion` unwraps it into the
@@ -1169,11 +1218,11 @@ fn can_fail(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
 /// casting the value (`CAST(d AS BIGINT) > 0` over a `DECIMAL(19, 0)` of `10^19 - 1`
 /// returned the row where `DataFusion` fails the query), so only a cast that cannot fail is
 /// safe to push. Each extreme, and zero, is cast on its own, so one value's failure does not
-/// hide another's answer. A source type with no extremes to try keeps the answer
-/// [`probe_vortex_cast`] gives.
+/// hide another's answer. A non-numeric source type has no extremes to try and keeps the
+/// answer [`probe_vortex_cast`] gives; a numeric one without them stays above the scan.
 fn vortex_casts_extremes_like_arrow(source: &DataType, target: &DataType) -> bool {
     let Some(values) = extreme_values(source) else {
-        return true;
+        return !source.is_numeric();
     };
     let options = CastOptions {
         safe: false,
@@ -1226,12 +1275,43 @@ fn extreme_values(source: &DataType) -> Option<ArrowArrayRef> {
         DataType::UInt16 => Arc::new(UInt16Array::from(vec![0, u16::MAX])),
         DataType::UInt32 => Arc::new(UInt32Array::from(vec![0, u32::MAX])),
         DataType::UInt64 => Arc::new(UInt64Array::from(vec![0, u64::MAX])),
+        DataType::Float16 => Arc::new(Float16Array::from(vec![
+            f16::MIN,
+            f16::from_f32(0.0),
+            f16::MAX,
+        ])),
         DataType::Float32 => Arc::new(Float32Array::from(vec![f32::MIN, 0.0, f32::MAX])),
         DataType::Float64 => Arc::new(Float64Array::from(vec![f64::MIN, 0.0, f64::MAX])),
+        DataType::Decimal32(precision, scale) => {
+            let largest = 10_i32.checked_pow(u32::from(*precision))?.checked_sub(1)?;
+            Arc::new(
+                Decimal32Array::from(vec![-largest, 0, largest])
+                    .with_precision_and_scale(*precision, *scale)
+                    .ok()?,
+            )
+        }
+        DataType::Decimal64(precision, scale) => {
+            let largest = 10_i64.checked_pow(u32::from(*precision))?.checked_sub(1)?;
+            Arc::new(
+                Decimal64Array::from(vec![-largest, 0, largest])
+                    .with_precision_and_scale(*precision, *scale)
+                    .ok()?,
+            )
+        }
         DataType::Decimal128(precision, scale) => {
             let largest = 10_i128.checked_pow(u32::from(*precision))?.checked_sub(1)?;
             Arc::new(
                 Decimal128Array::from(vec![-largest, 0, largest])
+                    .with_precision_and_scale(*precision, *scale)
+                    .ok()?,
+            )
+        }
+        DataType::Decimal256(precision, scale) => {
+            let largest = i256::from_i128(10)
+                .checked_pow(u32::from(*precision))?
+                .checked_sub(i256::ONE)?;
+            Arc::new(
+                Decimal256Array::from(vec![largest.wrapping_neg(), i256::ZERO, largest])
                     .with_precision_and_scale(*precision, *scale)
                     .ok()?,
             )
@@ -1984,6 +2064,13 @@ mod tests {
         DataType::Utf8,
         true
     )]
+    // Narrow, wide and half-precision sources are probed at their extremes too.
+    #[case::decimal32_to_int16(DataType::Decimal32(9, 0), DataType::Int16, false)]
+    #[case::decimal64_to_int32(DataType::Decimal64(18, 0), DataType::Int32, false)]
+    #[case::decimal256_to_int64(DataType::Decimal256(40, 0), DataType::Int64, false)]
+    #[case::decimal256_widening(DataType::Decimal256(40, 0), DataType::Decimal256(41, 0), true)]
+    #[case::float16_to_int8(DataType::Float16, DataType::Int8, false)]
+    #[case::float16_to_float64(DataType::Float16, DataType::Float64, true)]
     // A list cast casts each element, so it is pushed exactly when its element cast is.
     #[case::list_int_to_float(
         list_of(DataType::Int32, true),

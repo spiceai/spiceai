@@ -701,7 +701,9 @@ async fn an_overwrite_repeating_keys_publishes_one_snapshot() {
 /// The string `MIN`/`MAX` are answered from statistics once the table is
 /// reopened, from the statistics Cayenne persisted. Right after the write the
 /// table's statistics come from the files' Vortex footers, which record a
-/// string column's bounds byte-bounded and so inexact, and the query scans.
+/// string column's bounds byte-bounded and so inexact, and the query scans; the
+/// check that it does fails if those bounds become exact again, which is the
+/// cue to expect statistics there too.
 #[tokio::test(flavor = "multi_thread")]
 async fn aggregates_after_an_overwrite_repeating_keys_ignore_superseded_copies() {
     let mut failures = Vec::new();
@@ -744,6 +746,12 @@ async fn aggregates_after_an_overwrite_repeating_keys_ignore_superseded_copies()
                     "{mode:?} {stage}: scanned instead of using statistics"
                 ));
             }
+            if mode == DeletionMode::Key && stage == "after overwrite" && from_statistics {
+                failures.push(format!(
+                    "{mode:?} {stage}: answered from statistics, so the footers' string bounds \
+                     are exact again; expect statistics after the overwrite too"
+                ));
+            }
             let batches = df.collect().await.expect("collect");
             let row = &batches[0];
             let observed = (
@@ -764,6 +772,92 @@ async fn aggregates_after_an_overwrite_repeating_keys_ignore_superseded_copies()
                 ));
             }
         }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// `SUM` and `AVG` are never answered from a sum that overflowed. Two appends whose ids fit
+/// `BIGINT` alone and overflow it together leave no exact sum, right after the writes and
+/// once the table is reopened from the statistics Cayenne persisted, so both aggregates scan
+/// and answer as `DataFusion` does over the same rows in memory.
+#[tokio::test(flavor = "multi_thread")]
+async fn sum_and_avg_never_use_a_sum_that_overflowed() {
+    async fn answer(ctx: &SessionContext, sql: &str) -> (String, bool) {
+        let df = ctx.sql(sql).await.expect("plan");
+        let plan = arrow::util::pretty::pretty_format_batches(
+            &df.clone()
+                .explain(false, false)
+                .expect("explain")
+                .collect()
+                .await
+                .expect("plan"),
+        )
+        .expect("format")
+        .to_string();
+        let rows = match df.collect().await {
+            Ok(batches) => arrow::util::pretty::pretty_format_batches(&batches)
+                .expect("format")
+                .to_string(),
+            Err(error) => format!("ERROR {error}"),
+        };
+        (rows, plan.contains("PlaceholderRowExec"))
+    }
+
+    let rows = [(9_223_372_036_854_775_000, "a"), (1_000, "b")];
+    let oracle = SessionContext::new();
+    oracle
+        .register_batch("t", batch(&rows))
+        .expect("register the in-memory rows");
+
+    let mut failures = Vec::new();
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, catalog, runtime_env, _dir) = table(mode).await;
+        for row in rows {
+            write(&provider, InsertOp::Append, vec![batch(&[row])])
+                .await
+                .expect("append");
+        }
+        for (stage, provider) in [
+            ("after the writes", provider.clone_for_write()),
+            ("after reopen", reopen(&catalog, &runtime_env).await),
+        ] {
+            let ctx = SessionContext::new();
+            ctx.register_table("t", Arc::new(provider))
+                .expect("register");
+            for sql in ["SELECT SUM(id) AS x FROM t", "SELECT AVG(id) AS x FROM t"] {
+                let (observed, from_statistics) = answer(&ctx, sql).await;
+                let (expected, _) = answer(&oracle, sql).await;
+                if from_statistics {
+                    failures.push(format!(
+                        "{mode:?} {stage}: {sql} was answered from statistics"
+                    ));
+                }
+                if observed != expected {
+                    failures.push(format!(
+                        "{mode:?} {stage}: {sql} returned\n{observed}\nexpected\n{expected}"
+                    ));
+                }
+            }
+        }
+    }
+
+    // The control: two appends whose sum fits are answered from statistics once the table is
+    // reopened, so the check above sees the path it guards.
+    let (provider, catalog, runtime_env, _dir) = table(DeletionMode::Key).await;
+    for row in [(1, "a"), (2, "b")] {
+        write(&provider, InsertOp::Append, vec![batch(&[row])])
+            .await
+            .expect("append");
+    }
+    drop(provider);
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::new(reopen(&catalog, &runtime_env).await))
+        .expect("register");
+    let (sum, from_statistics) = answer(&ctx, "SELECT SUM(id) AS x FROM t").await;
+    if !from_statistics || !sum.contains("| 3 ") {
+        failures.push(format!(
+            "control: a sum that fits was not answered from statistics as 3: {sum}"
+        ));
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }

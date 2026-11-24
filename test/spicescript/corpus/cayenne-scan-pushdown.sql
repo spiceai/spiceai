@@ -23,8 +23,13 @@ SELECT id FROM v WHERE s NOT IN ('xy', 'q', 'zz', 'abc');
 -- A CASE that guards a division by zero.
 SELECT id FROM v WHERE CASE WHEN b <> 0 THEN 12 / b ELSE 0 END = 6;
 SELECT id FROM v WHERE CASE WHEN b = 0 THEN 0 ELSE 12 / b END = 6;
--- A CASE whose unselected branch overflows.
-SELECT id FROM v WHERE CASE WHEN a > 1000 OR a < -1000 THEN 0 ELSE a * 2 END > 1;
+-- A CASE whose unselected branch overflows: `a + a` stays INT, and only the
+-- extremes, which the THEN takes, overflow it.
+SELECT id FROM v WHERE CASE WHEN a > 1000 OR a < -1000 THEN 0 ELSE a + a END > 1;
+-- The same guards under a cast: a CASE that guards a division by zero, and a
+-- comparison of two float columns, where -0.0 and 0.0 are equal.
+SELECT id FROM v WHERE CAST(CASE WHEN b <> 0 THEN 12 / b ELSE 0 END AS DOUBLE PRECISION) = 6;
+SELECT id FROM v WHERE CAST(f = g AS INTEGER) = 1;
 
 -- Arithmetic over operands of different decimal types.
 SELECT id FROM v WHERE p * 2 > 3;
