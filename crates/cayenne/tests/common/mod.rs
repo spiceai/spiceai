@@ -926,6 +926,8 @@ pub fn require_process_per_test(why: &str) {
 /// | `mutation_model_test::test_publication_without_reinsert_sequence_impl` | Writes deletion vectors by hand at a local path. |
 /// | `mutation_property_test::prop_auto_crossing_observes_position_then_key_switch_impl` | `deletion_mode: auto` starts on position deletes only for a table on a local directory. |
 /// | `mutation_property_test::prop_sequential_auto_crossing_impl` | As above. |
+/// | `mutation_property_test::prop_sequential_cold_impl` | Cold tier, which object-native data does not support. |
+/// | `mutation_property_test::prop_sequential_cold_upsert_replay_impl` | As above. |
 /// | `scan_view_retention_test::scan_view_selection_during_retention` | Holds a scan's planning on retention's unlink of a data file; a table in the object-native location keeps a retired file for `DATA_FILE_RETENTION`, so the delete unlinks nothing. |
 /// | `stats_edge_cases_test::test_stats_correct_after_overwrite` | Open defect on the local-location store: under concurrent load, the table statistics after `INSERT OVERWRITE` can keep the pre-overwrite row count. |
 /// | `file_based_retention_delete_test` (all but `test_loader_errors_on_missing_needed_dv_impl`) | File-based retention (whole-file deletes) runs only for local data files; a table in an object store deletes the expired rows through deletion vectors, so the file counts, deleted-row counts and orphaned deletion vectors these tests assert differ. The two list-files cache tests also need a listing the table never makes. |
