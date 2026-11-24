@@ -75,7 +75,9 @@ jobs:
         uses: $/.github/actions/setup-rust
 
       - name: Set up spiceio
-        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        # Not on trunk, whose output is attested: no compiler cache or macOS share, which other
+        # refs can write, until trunk has a share of its own (planned).
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true' && github.ref != 'refs/heads/trunk'
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
@@ -92,7 +94,7 @@ jobs:
           machine: ${{ runner.name }}
 
       - name: Set up sccache
-        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
+        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != '' && github.ref != 'refs/heads/trunk'
         uses: $/.github/actions/setup-sccache
         with:
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
@@ -132,7 +134,9 @@ jobs:
         run: rm -rf "${{ runner.temp }}/spiceio-bin"
 
       - name: Set up spiceio for build archive
-        if: env.HAS_SPICEIO_SECRET == 'true'
+        # Not on trunk, whose output is attested: no compiler cache or macOS share, which other
+        # refs can write, until trunk has a share of its own (planned).
+        if: env.HAS_SPICEIO_SECRET == 'true' && github.ref != 'refs/heads/trunk'
         id: setup-spiceio-build
         uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
@@ -159,7 +163,7 @@ jobs:
           subject-path: ./integration.tar.zst
 
       - name: Upload test archive to spiceio
-        if: env.HAS_SPICEIO_SECRET == 'true'
+        if: env.HAS_SPICEIO_SECRET == 'true' && github.ref != 'refs/heads/trunk'
         env:
           SPICEIO_ENDPOINT: ${{ steps.setup-spiceio-build.outputs.endpoint }}
         run: |
@@ -247,7 +251,7 @@ jobs:
           machine: ${{ runner.name }}
 
       - name: Download test archive from spiceio
-        if: env.HAS_SPICEIO_SECRET == 'true'
+        if: env.HAS_SPICEIO_SECRET == 'true' && github.ref != 'refs/heads/trunk'
         env:
           SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
         run: |
@@ -258,7 +262,7 @@ jobs:
           curl --fail --silent --show-error --output ./integration_test/integration.tar.zst "$archive_url"
 
       - name: Download test archive
-        if: env.HAS_SPICEIO_SECRET != 'true'
+        if: env.HAS_SPICEIO_SECRET != 'true' || github.ref == 'refs/heads/trunk'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ai-integration-test-archive
@@ -545,7 +549,7 @@ jobs:
           machine: ${{ runner.name }}
 
       - name: Download test archive from spiceio
-        if: env.HAS_SPICEIO_SECRET == 'true'
+        if: env.HAS_SPICEIO_SECRET == 'true' && github.ref != 'refs/heads/trunk'
         env:
           SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
         run: |
@@ -556,7 +560,7 @@ jobs:
           curl --fail --silent --show-error --output ./integration_test/integration.tar.zst "$archive_url"
 
       - name: Download test archive
-        if: env.HAS_SPICEIO_SECRET != 'true'
+        if: env.HAS_SPICEIO_SECRET != 'true' || github.ref == 'refs/heads/trunk'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ai-integration-test-archive

@@ -636,6 +636,32 @@ class CheckCiRoleJobsTest(unittest.TestCase):
             self.assertEqual(self.problems(CHOOSE + ASSUME.format(role=CHOSEN) + write.format(cond=cond)), [])
 
 
+class CheckAttestedBuildsTest(unittest.TestCase):
+    DOC = (
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-24.04\n    steps:\n"
+        "      - name: Set up sccache\n{cond}        uses: $/.github/actions/setup-sccache\n"
+        "      - run: make\n"
+        "      - name: Attest\n        uses: actions/attest-build-provenance@v4\n"
+        "        with:\n          subject-path: out\n"
+    )
+
+    def problems(self, cond):
+        text = self.DOC.replace("{cond}", cond)
+        return [p for p in check_workflow_yaml.check_workflow(text) if "shared build cache" in p]
+
+    def test_a_cache_on_trunk_in_an_attesting_job_is_reported(self):
+        for cond in ("", "        if: runner.os == 'macOS'\n"):
+            with self.subTest(cond=cond):
+                self.assertEqual(len(self.problems(cond)), 1)
+
+    def test_a_cache_kept_off_trunk_is_accepted(self):
+        self.assertEqual(self.problems("        if: runner.os == 'macOS' && github.ref != 'refs/heads/trunk'\n"), [])
+
+    def test_a_job_that_attests_nothing_may_use_the_cache(self):
+        text = self.DOC.replace("{cond}", "").split("      - name: Attest")[0]
+        self.assertEqual([p for p in check_workflow_yaml.check_workflow(text) if "shared build cache" in p], [])
+
+
 class CheckCiRoleCallsTest(unittest.TestCase):
     REUSABLE = yaml.safe_load(REUSABLE_CI_ROLE.replace("{steps}", CHOOSE + ASSUME.format(role=CHOSEN)))
 

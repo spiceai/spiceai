@@ -341,6 +341,31 @@ def check_ci_role_jobs(document: dict) -> list[str]:
     return problems
 
 
+# The compiler cache and the macOS SMB share take writes from more than trunk. A job that attests
+# what it builds must not use them on trunk, or a planted object ends up in an attested file.
+SHARED_BUILD_CACHES = ("$/.github/actions/setup-sccache", "spiceai/spiceio/.github/actions/setup")
+OFF_TRUNK = re.compile(r"github\.ref\s*!=\s*'refs/heads/trunk'")
+
+
+def check_attested_builds(jobs: dict) -> list[str]:
+    """Report a job that attests its output and sets up a shared build cache on trunk."""
+    problems = []
+    for name, job in jobs.items():
+        steps = [s for s in (job.get("steps") or []) if isinstance(s, dict)] if isinstance(job, dict) else []
+        if not any("actions/attest-build-provenance" in str(s.get("uses", "")) for s in steps):
+            continue
+        for position, step in enumerate(steps, start=1):
+            uses = str(step.get("uses", ""))
+            if uses.startswith(SHARED_BUILD_CACHES) and not OFF_TRUNK.search(str(step.get("if", ""))):
+                label = step.get("name") or f"step {position}"
+                problems.append(
+                    f"job `{name}` attests its output, but step `{label}` sets up a shared build cache "
+                    "without `github.ref != 'refs/heads/trunk'` in its `if:`; other refs can write that "
+                    "cache, so trunk's attested build must not read it"
+                )
+    return problems
+
+
 def check_ci_role_calls(workflows: dict[str, dict]) -> list[str]:
     """Report a call to a CI role workflow that is not at trunk, or one that names it wrongly.
 
@@ -445,6 +470,7 @@ def check_workflow(text: str) -> list[str]:
         problems.extend(check_suite_visibility(jobs, is_scheduled(document)))
         problems.extend(check_untrusted_expansions(document, jobs))
         problems.extend(check_ci_role_jobs(document))
+        problems.extend(check_attested_builds(jobs))
 
     return problems
 

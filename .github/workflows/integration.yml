@@ -233,7 +233,9 @@ jobs:
           export-env: 'false'
 
       - name: Set up sccache
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        # Not on trunk, whose output is attested: no compiler cache or macOS share, which other
+        # refs can write, until trunk has a share of its own (planned).
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.ref != 'refs/heads/trunk'
         uses: $/.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
