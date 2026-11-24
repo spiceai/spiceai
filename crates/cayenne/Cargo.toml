@@ -48,6 +48,7 @@ datafusion-table-providers = { workspace = true }
 futures = { workspace = true }
 hash-index = { path = "../hash-index" }
 key-index = { path = "../key-index" }
+range-rescale = { path = "../range-rescale" }
 im = "15.1"
 object_store = { workspace = true }
 parking_lot = { workspace = true }
