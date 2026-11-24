@@ -19,7 +19,7 @@ limitations under the License.
 use super::{Domain, NativeCatalogConfig, OpenSummary, ValueChange, invalid, position};
 use crate::{
     catalog::{CatalogError, CatalogResult, MetadataCatalog},
-    dataset_storage::object_key_of_url,
+    dataset_storage::{object_key_of_url, url_of_object_key},
     metadata::CreateTableOptions,
 };
 use cayenne_metastore_actions::proto;
@@ -611,8 +611,13 @@ fn location_anchor(location: &str, prefix: &Path) -> Option<Arc<str>> {
     }
     let folder: Vec<_> = prefix.parts().collect();
     let folder = Path::from_iter(folder[..folder.len().checked_sub(1)?].iter().cloned());
-    // Percent-encoded, like the data path URLs it is compared with.
-    (object_key_of_url(&url).ok()? == folder).then(|| Arc::from(url.as_str().trim_end_matches('/')))
+    if object_key_of_url(&url).ok()? != folder {
+        return None;
+    }
+    // Rebuilt from its keys, so a location that spells an escape differently
+    // (`state%2Ddir`) is encoded as the data paths it is compared with are.
+    let anchor = url_of_object_key(&url, &folder)?;
+    Some(Arc::from(anchor.as_str().trim_end_matches('/')))
 }
 
 /// A new folder for dataset `name`: its slug and a fresh `UUIDv7`. A caller that
@@ -778,19 +783,22 @@ impl ObjectNativeCatalog {
                     !folder.is_empty() && (rest == "data" || rest.starts_with("data/"))
                 });
         };
-        // Opened at a location URL: the data must be under that URL, not under
-        // the same key prefix of another bucket.
-        if let Some(anchor) = self.anchor.as_deref()
-            && !url
-                .as_str()
-                .strip_prefix(anchor)
-                .is_some_and(|rest| rest.starts_with('/'))
-        {
-            return false;
-        }
         let Ok(key) = object_key_of_url(&url) else {
             return false;
         };
+        // Opened at a location URL: the data must be under that URL, not under
+        // the same key prefix of another bucket. Both are compared as encoded
+        // from their keys.
+        if let Some(anchor) = self.anchor.as_deref()
+            && !url_of_object_key(&url, &key).is_some_and(|canonical| {
+                canonical
+                    .as_str()
+                    .strip_prefix(anchor)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+        {
+            return false;
+        }
         // `<folder>/data[/…]` under the datasets prefix.
         key.prefix_match(&self.datasets).is_some_and(|mut rest| {
             rest.next().is_some() && rest.next().is_some_and(|part| part.as_ref() == "data")

@@ -890,18 +890,12 @@ pub(super) fn location_datasets_url(
     location: &url::Url,
     datasets_prefix: &object_store::path::Path,
 ) -> Option<String> {
-    let mut url = match (location.scheme(), location.host_str()) {
+    let root = match (location.scheme(), location.host_str()) {
         ("s3", Some(bucket)) => url::Url::parse(&format!("s3://{bucket}/")).ok()?,
         ("file", None | Some("" | "localhost")) => url::Url::parse("file:///").ok()?,
         _ => return None,
     };
-    // The prefix's parts are object keys; the URL percent-encodes each one, so
-    // decoding the URL's path gives the same keys back.
-    url.path_segments_mut()
-        .ok()?
-        .pop_if_empty()
-        .extend(datasets_prefix.parts());
-    Some(url.into())
+    cayenne::dataset_storage::url_of_object_key(&root, datasets_prefix).map(Into::into)
 }
 
 /// What `source` needs that data in the object-native location does not support yet,

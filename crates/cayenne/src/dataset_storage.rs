@@ -270,11 +270,11 @@ impl DatasetStorage {
             recorded.scheme(),
             recorded.host_str().unwrap_or_default()
         );
-        let data_root = if prefix.as_ref().is_empty() {
-            format!("{DATASET_STORE_SCHEME}://{dataset_id}")
-        } else {
-            format!("{DATASET_STORE_SCHEME}://{dataset_id}/{prefix}")
-        };
+        let data_root = url_of_object_key(&url, &prefix)
+            .ok_or_else(|| format!("dataset id '{dataset_id}' cannot name a store"))?
+            .as_str()
+            .trim_end_matches('/')
+            .to_string();
         let dataset: Arc<str> = Arc::from(dataset);
         let table_path: Arc<str> = Arc::from(table_path.trim_end_matches('/'));
         let scoped: Arc<dyn ObjectStore> = Arc::new(DatasetScopedStore {
@@ -433,6 +433,19 @@ impl DatasetStorage {
 /// Returns an error if the decoded path is not a valid object key.
 pub fn object_key_of_url(url: &url::Url) -> Result<Path, object_store::path::Error> {
     Path::from_url_path(url.path())
+}
+
+/// The URL of object key `key` under `root`'s scheme and authority, with each key
+/// part percent-encoded once, so [`object_key_of_url`] gives `key` back: a space,
+/// a `%` and a literal `%20` in a key each survive the round trip. `None` when
+/// `root` cannot have a path.
+#[must_use]
+pub fn url_of_object_key(root: &url::Url, key: &Path) -> Option<url::Url> {
+    let mut url = root.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    url.path_segments_mut().ok()?.clear().extend(key.parts());
+    Some(url)
 }
 
 /// `location` relative to the dataset's `prefix`, as a user finds it under the
@@ -899,6 +912,58 @@ mod tests {
             "cayenne://0193aaaa-bbbb-7ccc-8ddd-eeeeffff0000/"
         );
         assert!(!storage.is_local());
+    }
+
+    /// A data path whose keys need escaping in a URL (a space, a literal `%20`,
+    /// a `%`) gets a run-time root that encodes each key part once, so a data URL
+    /// built on it names the dataset's own keys and its store accepts them.
+    #[tokio::test]
+    async fn the_data_root_names_the_keys_of_the_data_path() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        for (table_path, key, data_root) in [
+            (
+                "s3://bucket/state%20dir/orders",
+                "state dir/orders",
+                "cayenne://0193aaaa-bbbb-7ccc-8ddd-eeeeffff0000/state%20dir/orders",
+            ),
+            (
+                "s3://bucket/state%2520dir/orders",
+                "state%20dir/orders",
+                "cayenne://0193aaaa-bbbb-7ccc-8ddd-eeeeffff0000/state%2520dir/orders",
+            ),
+            (
+                "s3://bucket/100%25/orders",
+                "100%/orders",
+                "cayenne://0193aaaa-bbbb-7ccc-8ddd-eeeeffff0000/100%25/orders",
+            ),
+        ] {
+            let storage = storage(table_path, &inner);
+            assert_eq!(storage.data_root(), data_root, "{table_path}");
+            let file = storage
+                .resolve(&format!("{}/t/1.vortex", storage.data_root()))
+                .expect("a file of the dataset")
+                .expect("a URL");
+            assert_eq!(file.as_ref(), format!("{key}/t/1.vortex"), "{table_path}");
+            storage
+                .store()
+                .put(&file, PutPayload::from_static(b"a"))
+                .await
+                .expect("put under the dataset");
+        }
+        let mut keys: Vec<String> = inner
+            .list(None)
+            .map(|meta| meta.expect("list").location.as_ref().to_string())
+            .collect()
+            .await;
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "100%/orders/t/1.vortex",
+                "state dir/orders/t/1.vortex",
+                "state%20dir/orders/t/1.vortex",
+            ]
+        );
     }
 
     #[tokio::test]
