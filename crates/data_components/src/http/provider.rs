@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 mod completeness;
-pub use completeness::HttpFetchCompletion;
+pub use completeness::{HttpFetchCompletion, RequestPages};
 
 use super::json_nest::{HttpJsonNesting, decompose_json_row};
 use crate::rate_limit::RateLimiter;

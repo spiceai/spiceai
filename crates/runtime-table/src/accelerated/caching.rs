@@ -26,7 +26,7 @@ use arrow::array::{Array, ArrayRef, RecordBatch, TimestampNanosecondArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_tools::format::SchemaDisplay;
-use data_components::http::provider::HttpTableProvider;
+use data_components::http::provider::{HttpTableProvider, RequestPages};
 use datafusion::common::{DataFusionError, Result as DataFusionResult, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::TaskContext;
@@ -1256,6 +1256,10 @@ pub struct CacheWriteRequest {
     /// overwrite each other's rows for the same `(request_path, query, body)`
     /// key.
     pub namespace_id: Arc<str>,
+    /// Whether the response is one page, whose rows all store the request's
+    /// own path, query and body, or several, whose rows store each page's own
+    /// path and query. The bound writer scopes the two differently.
+    pub pages: RequestPages,
 }
 
 /// Receiver half of the cache write channel
@@ -1950,7 +1954,9 @@ fn charged_response_stream(
 
 struct CacheFetch {
     batches: Vec<RecordBatch>,
-    complete: bool,
+    /// The pages of a complete fetch, or `None` when the fetch may have
+    /// stopped short of the whole response (or its memory was not charged).
+    complete: Option<RequestPages>,
     charge: Option<Arc<RetainedBufferCharge>>,
 }
 
@@ -1990,6 +1996,7 @@ impl NativeCacheWrite {
         let batches = self.request.batches.clone();
         let filters = self.request.filters.clone();
         let namespace_id = Arc::clone(&self.request.namespace_id);
+        let pages = self.request.pages;
 
         // Admission follows registry acquisition. Initialization can therefore
         // flush every write that observed its old list, while a job waiting for
@@ -2063,6 +2070,7 @@ impl NativeCacheWrite {
                 cache_key: claim.key().to_string(),
                 replaces_existing: true,
                 namespace_id: Arc::clone(&namespace_id),
+                pages,
             };
             let result = if child.writer.requires_complete_fetch() {
                 child.writer.send_claimed_and_wait(request, claim).await
@@ -2234,15 +2242,16 @@ impl CacheRefreshHelper {
                     return Ok(0);
                 }
                 if cache_write_tx.requires_complete_fetch() {
-                    if !complete {
+                    let Some(pages) = complete else {
                         return Ok(0);
-                    }
+                    };
                     let request = CacheWriteRequest {
                         batches,
                         filters: row_filters,
                         cache_key: claim.key().to_string(),
                         namespace_id: namespace_id.into(),
                         replaces_existing: true,
+                        pages,
                     };
                     cache_write_tx.send_claimed_and_wait(request, claim).await?;
                     return Ok(refreshed_rows);
@@ -2366,7 +2375,7 @@ impl CacheRefreshHelper {
             tracing::debug!("No cacheable data for dataset={dataset_name} (source returned empty)");
             return Ok(RevalidationOutcome::Empty);
         }
-        if batch_write_tx.requires_complete_fetch() && !complete {
+        if batch_write_tx.requires_complete_fetch() && complete.is_none() {
             return Ok(RevalidationOutcome::NotPopulated);
         }
 
@@ -2380,6 +2389,8 @@ impl CacheRefreshHelper {
             cache_key: claim.key().to_string(),
             namespace_id: namespace.storage_id().into(),
             replaces_existing: true,
+            // Only a native writer scopes by pages, and it required `complete`.
+            pages: complete.unwrap_or(RequestPages::Single),
         };
 
         batch_write_tx.send_claimed(request, claim).await?;
@@ -2884,7 +2895,7 @@ impl CacheRefreshHelper {
         dataset_name: &str,
         filters: &[Expr],
         batches: &[RecordBatch],
-        complete: bool,
+        complete: Option<RequestPages>,
         input_charge: Option<Arc<RetainedBufferCharge>>,
         namespace_id: &str,
     ) {
@@ -2902,7 +2913,7 @@ impl CacheRefreshHelper {
         );
 
         for (idx, child) in children.iter().enumerate() {
-            if (child.writer.requires_complete_fetch() && !complete)
+            if (child.writer.requires_complete_fetch() && complete.is_none())
                 || (!child.writer.requires_complete_fetch()
                     && batches.iter().all(|batch| batch.num_rows() == 0))
             {
@@ -2932,6 +2943,7 @@ impl CacheRefreshHelper {
                 namespace_id: namespace_id.into(),
                 // The parent's cache miss does not establish that the child is empty.
                 replaces_existing: true,
+                pages: complete.unwrap_or(RequestPages::Single),
             };
             if let Err(e) = child.writer.send_claimed(request, claim).await {
                 tracing::warn!(
@@ -3075,6 +3087,8 @@ impl CacheRefreshHelper {
                 cache_key: claim.key().to_string(),
                 namespace_id: namespace_id.into(),
                 replaces_existing: true,
+                // Each group is one stored path, query and body.
+                pages: RequestPages::Single,
             };
             child.writer.send_claimed_and_wait(request, claim).await?;
         }
@@ -3182,9 +3196,10 @@ impl CacheRefreshHelper {
                     })
                     .ok()
             });
-        let complete = completion.as_ref().is_some_and(
-            data_components::http::provider::HttpFetchCompletion::is_complete_single_request,
-        ) && (memory_pool.is_none() || charge.is_some());
+        let complete = completion
+            .as_ref()
+            .and_then(data_components::http::provider::HttpFetchCompletion::complete_request)
+            .filter(|_| memory_pool.is_none() || charge.is_some());
 
         tracing::debug!(
             "Federated source returned {} batches for dataset={}",
@@ -3447,7 +3462,12 @@ impl CacheRefreshHelper {
                     }
 
                     let native = batch_write_tx.requires_complete_fetch();
-                    if (native && complete && (total_rows > 0 || !response_filtered))
+                    if native && complete.is_none() {
+                        tracing::debug!(
+                            "Not caching the response for dataset '{dataset_name}': the fetch is not proven to hold the whole response of one request (a row limit, several requests, a page cap, or an uncharged response)"
+                        );
+                    }
+                    if (native && complete.is_some() && (total_rows > 0 || !response_filtered))
                         || (!native && total_rows > 0)
                     {
                         let write_request = CacheWriteRequest {
@@ -3456,6 +3476,7 @@ impl CacheRefreshHelper {
                             cache_key: claim.key().to_string(),
                             namespace_id: namespace.storage_id().into(),
                             replaces_existing: is_expired,
+                            pages: complete.unwrap_or(RequestPages::Single),
                         };
                         if native {
                             if let Some(input_charge) = &charge {
@@ -4810,6 +4831,7 @@ mod pool_tests {
                     cache_key: key,
                     namespace_id: "public".into(),
                     replaces_existing: true,
+                    pages: RequestPages::Single,
                 },
                 claim,
                 Arc::new(tokio::sync::RwLock::new(Vec::new())),
@@ -5261,7 +5283,7 @@ mod pool_tests {
             )
             .await
             .expect("initial HTTP fetch");
-            assert!(initial.complete);
+            assert_eq!(initial.complete, Some(RequestPages::Single));
             let expected_scope =
                 CacheRefreshHelper::extract_filters_from_row(&initial.batches[0], 0)
                     .expect("initial stored scope");
@@ -5371,7 +5393,7 @@ mod pool_tests {
             "pool_test",
             &[col("request_path").eq(lit("/items"))],
             &[batch],
-            true,
+            Some(RequestPages::Single),
             Some(charge),
             "public",
         )
@@ -5443,6 +5465,7 @@ mod pool_tests {
                 cache_key: key,
                 namespace_id: "public".into(),
                 replaces_existing: true,
+                pages: RequestPages::Single,
             },
             claim,
             Arc::new(tokio::sync::RwLock::new(vec![child.clone()])),
@@ -5515,6 +5538,7 @@ mod pool_tests {
                     cache_key: key,
                     namespace_id: "public".into(),
                     replaces_existing: true,
+                    pages: RequestPages::Single,
                 },
                 claim,
             )
@@ -7910,6 +7934,7 @@ mod tests {
                 cache_key: format!("key_{i}"),
                 namespace_id: "public".into(),
                 replaces_existing: false,
+                pages: RequestPages::Single,
             })
             .await
             .expect("to send write request");
@@ -8888,6 +8913,7 @@ mod tests {
                     cache_key: key.clone(),
                     namespace_id: CacheNamespace::Public.storage_id().into(),
                     replaces_existing: false,
+                    pages: RequestPages::Single,
                 },
                 leader,
             )
@@ -11172,6 +11198,7 @@ mod write_path_tests {
             cache_key: "key".to_string(),
             namespace_id: "public".into(),
             replaces_existing: false,
+            pages: RequestPages::Single,
         })
         .await
         .expect("send");
@@ -11205,6 +11232,7 @@ mod write_path_tests {
                 cache_key: "same-key".to_string(),
                 namespace_id: "public".into(),
                 replaces_existing: false,
+                pages: RequestPages::Single,
             })
             .await
             .expect("send");
@@ -11231,6 +11259,7 @@ mod write_path_tests {
             cache_key: "key".to_string(),
             namespace_id: "public".into(),
             replaces_existing: true,
+            pages: RequestPages::Single,
         })
         .await
         .expect("send");

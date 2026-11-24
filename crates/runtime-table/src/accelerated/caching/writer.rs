@@ -29,7 +29,7 @@ use arrow::array::{
 };
 use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
-use data_components::http::provider::{HttpExec, HttpFetchCompletion};
+use data_components::http::provider::{HttpExec, HttpFetchCompletion, RequestPages};
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{DataFusionError, Result, ScalarValue, TableReference};
 use datafusion::datasource::TableProvider;
@@ -58,7 +58,7 @@ use tokio_util::task::TaskTracker;
 use super::{
     CACHE_NAMESPACE_COLUMN, CACHE_WRITE_CHANNEL_CAPACITY, CACHE_WRITE_FLUSH_INTERVAL_MS,
     CacheKeyClaim, CacheRefreshHelper, CacheWriteHealth, CacheWriteRequest, InFlightRevalidations,
-    REQUEST_KEY_COLUMNS, namespace_filter_expr, stamp_namespace_column,
+    REQUEST_BODY_COLUMN, REQUEST_KEY_COLUMNS, namespace_filter_expr, stamp_namespace_column,
 };
 
 /// Maximum time a cache fill waits for its writer's queue admission.
@@ -705,6 +705,15 @@ impl CacheSinkWriter {
             })
             .collect::<Result<Vec<_>>>()?;
         let canonical = canonical_request_filters(&request.filters);
+        if request.pages == RequestPages::Followed {
+            return self.prepare_followed_pages(
+                &request.namespace_id,
+                request.replaces_existing,
+                canonical,
+                batches,
+                reservation,
+            );
+        }
         if request.replaces_existing
             && canonical.is_none()
             && batches.iter().all(|batch| batch.num_rows() == 0)
@@ -714,17 +723,7 @@ impl CacheSinkWriter {
             ));
         }
         let mut filters = canonical
-            .map(|filters| {
-                filters
-                    .into_iter()
-                    .filter(|filter| {
-                        filter
-                            .column_refs()
-                            .iter()
-                            .all(|column| self.schema.column_with_name(&column.name).is_some())
-                    })
-                    .collect()
-            })
+            .map(|filters| self.stored_columns_only(filters))
             .unwrap_or(request.filters);
         // Include omitted request dimensions from the response so replacing one
         // query/body does not delete other responses stored under the same path.
@@ -733,6 +732,103 @@ impl CacheSinkWriter {
         } else {
             filters.extend(unsent_request_key_filters(&filters, &self.schema));
         }
+        self.scoped_batch(
+            filters,
+            &request.namespace_id,
+            request.replaces_existing,
+            batches,
+            reservation,
+        )
+    }
+
+    /// The scoped write for a response that followed further pages.
+    ///
+    /// Each row stores the path and query of the page it came from, so the
+    /// first row's request key does not name the rows of the others, and
+    /// scoping to it would leave the other pages' earlier rows behind on
+    /// replacement. A lookup for the request reads every stored row its own
+    /// request predicates select, with the request's body (see
+    /// [`super::request_identity_filters`]); the write is scoped to exactly
+    /// that set, so a replacement removes everything the lookup could read
+    /// and a fresh fill appends only where its lookup found nothing. Rows of a
+    /// followed page the request's predicates do not select are never read by
+    /// that lookup, and the query's own filter drops them from its answer, so
+    /// they are not stored.
+    fn prepare_followed_pages(
+        &self,
+        namespace_id: &str,
+        replaces_existing: bool,
+        canonical: Option<Vec<Expr>>,
+        batches: Vec<RecordBatch>,
+        reservation: &MemoryReservation,
+    ) -> Result<ChangeBatch> {
+        let Some(canonical) = canonical else {
+            return Err(DataFusionError::Plan(
+                "A cache fill that followed pages requires filters that name one request".into(),
+            ));
+        };
+        let mut filters = self.stored_columns_only(canonical);
+        let batches = batches
+            .into_iter()
+            .map(|batch| {
+                let selected = rows_matching(&batch, &filters)?;
+                if selected.num_rows() < batch.num_rows() {
+                    reservation.try_grow(selected.get_array_memory_size())?;
+                }
+                Ok(selected)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let names_body = filters
+            .iter()
+            .flat_map(Expr::column_refs)
+            .any(|column| column.name == REQUEST_BODY_COLUMN);
+        if !names_body && self.schema.column_with_name(REQUEST_BODY_COLUMN).is_some() {
+            // Every page is fetched with the request's body.
+            let body = match batches.iter().find(|batch| batch.num_rows() > 0) {
+                Some(first) => {
+                    let column = first.column_by_name(REQUEST_BODY_COLUMN).ok_or_else(|| {
+                        DataFusionError::Internal("A cached row has no request body column".into())
+                    })?;
+                    ScalarValue::try_from_array(column, 0)?
+                }
+                None => ScalarValue::Utf8(Some(String::new())),
+            };
+            filters.push(if body.is_null() {
+                col(REQUEST_BODY_COLUMN).is_null()
+            } else {
+                col(REQUEST_BODY_COLUMN).eq(lit(body))
+            });
+        }
+        self.scoped_batch(
+            filters,
+            namespace_id,
+            replaces_existing,
+            batches,
+            reservation,
+        )
+    }
+
+    /// Request predicates on columns this accelerator stores.
+    fn stored_columns_only(&self, filters: Vec<Expr>) -> Vec<Expr> {
+        filters
+            .into_iter()
+            .filter(|filter| {
+                filter
+                    .column_refs()
+                    .iter()
+                    .all(|column| self.schema.column_with_name(&column.name).is_some())
+            })
+            .collect()
+    }
+
+    fn scoped_batch(
+        &self,
+        mut filters: Vec<Expr>,
+        namespace_id: &str,
+        replaces_existing: bool,
+        batches: Vec<RecordBatch>,
+        reservation: &MemoryReservation,
+    ) -> Result<ChangeBatch> {
         if filters.is_empty() {
             return Err(DataFusionError::Plan(
                 "A cache replacement requires request grouping columns, not only a namespace"
@@ -744,7 +840,7 @@ impl CacheSinkWriter {
             .column_with_name(CACHE_NAMESPACE_COLUMN)
             .is_some()
         {
-            filters.push(namespace_filter_expr(&request.namespace_id));
+            filters.push(namespace_filter_expr(namespace_id));
         }
         let scope = SetKey::from_filters(Arc::clone(&self.schema), &filters)?;
         let row_bytes = batches
@@ -755,7 +851,7 @@ impl CacheSinkWriter {
         // scopes cannot overlap into one delete and one append.
         let rows = ScopedRows::try_new(scope, Arc::clone(&self.schema), batches)?;
         let lane = Some(Arc::clone(&self.append_ingress));
-        let batch = if request.replaces_existing {
+        let batch = if replaces_existing {
             ChangeBatch::Replace { rows, lane }
         } else {
             ChangeBatch::AppendScoped { rows, lane }
@@ -933,8 +1029,8 @@ pub(super) fn canonical_request_filters(filters: &[Expr]) -> Option<Vec<Expr>> {
 /// The request-key columns a response row would have supplied, for a response
 /// with no rows: each column `schema` stores and `filters` leave open is pinned
 /// to `''`, which the HTTP connector stores for a request part it sends no value
-/// for. A cache fill is a single page, whose rows store the request's own path,
-/// query and body, so these complete the key its rows are stored under.
+/// for. A single-page fill's rows store the request's own path, query and
+/// body, so these complete the key its rows are stored under.
 fn unsent_request_key_filters(filters: &[Expr], schema: &Schema) -> Vec<Expr> {
     REQUEST_KEY_COLUMNS
         .into_iter()
@@ -947,6 +1043,61 @@ fn unsent_request_key_filters(filters: &[Expr], schema: &Schema) -> Vec<Expr> {
         })
         .map(|name| col(name).eq(lit("")))
         .collect()
+}
+
+/// The rows of `batch` that every request predicate in `filters` selects:
+/// `column = value` or `column IS NULL`, as [`canonical_request_filters`]
+/// builds them. The batch itself when every row matches.
+fn rows_matching(batch: &RecordBatch, filters: &[Expr]) -> Result<RecordBatch> {
+    let mut selected: Option<arrow::array::BooleanArray> = None;
+    for filter in filters {
+        let matches = match filter {
+            Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+                let (Expr::Column(column), Expr::Literal(value, _)) =
+                    (binary.left.as_ref(), binary.right.as_ref())
+                else {
+                    return Err(unsupported_request_predicate(filter));
+                };
+                let array = batch.column_by_name(&column.name).ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "A cached response has no '{}' column",
+                        column.name
+                    ))
+                })?;
+                let value = value.cast_to(array.data_type())?.to_scalar()?;
+                arrow::compute::kernels::cmp::not_distinct(array, &value)?
+            }
+            Expr::IsNull(inner) => {
+                let Expr::Column(column) = inner.as_ref() else {
+                    return Err(unsupported_request_predicate(filter));
+                };
+                let array = batch.column_by_name(&column.name).ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "A cached response has no '{}' column",
+                        column.name
+                    ))
+                })?;
+                arrow::compute::is_null(array)?
+            }
+            _ => return Err(unsupported_request_predicate(filter)),
+        };
+        selected = Some(match selected {
+            Some(selected) => arrow::compute::and(&selected, &matches)?,
+            None => matches,
+        });
+    }
+    match selected {
+        Some(selected) if selected.true_count() < batch.num_rows() => {
+            Ok(arrow::compute::filter_record_batch(batch, &selected)?)
+        }
+        _ => Ok(batch.clone()),
+    }
+}
+
+fn unsupported_request_predicate(filter: &Expr) -> DataFusionError {
+    DataFusionError::Internal(format!(
+        "A cache fill cannot select rows by the request predicate {filter}"
+    ))
 }
 
 /// Columns the HTTP connector builds a request from. It ignores predicates on
@@ -994,8 +1145,10 @@ type TrackedHttpPlan = (Arc<dyn ExecutionPlan>, HttpFetchCompletion, bool);
 
 fn tracked_http_plan(plan: &Arc<dyn ExecutionPlan>) -> Result<Option<TrackedHttpPlan>> {
     if let Some(http) = plan.downcast_ref::<HttpExec>() {
-        // The completion token must also prove that execution did not follow
-        // another page: page metadata can describe different storage keys.
+        // The completion token also records whether execution followed another
+        // page, whose rows store that page's own path and query; the writer
+        // scopes such a response by the request instead (see
+        // `CacheSinkWriter::prepare_followed_pages`).
         let eligible = http.limit().is_none() && http.partitions().len() == 1;
         let (plan, completion) = http.for_cache_fetch();
         return Ok(Some((Arc::new(plan), completion, eligible)));

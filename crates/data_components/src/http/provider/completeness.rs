@@ -40,6 +40,17 @@ const FAILED: u8 = 5;
 const CANCELLED: u8 = 6;
 const REUSED: u8 = 7;
 
+/// The pages one complete HTTP request read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestPages {
+    /// The response had one page. Its rows store the request's own path,
+    /// query and body.
+    Single,
+    /// Pagination followed at least one further page. Each row stores the
+    /// path and query of the page it came from, and the request's body.
+    Followed,
+}
+
 /// Completion of one dedicated HTTP source execution, across all its partitions.
 /// Reusing a tracked plan invalidates the token rather than sharing a prior result.
 #[derive(Clone, Debug)]
@@ -72,9 +83,22 @@ impl HttpFetchCompletion {
     /// Pagination configuration alone does not imply that multiple pages were fetched.
     #[must_use]
     pub fn is_complete_single_request(&self) -> bool {
-        self.partitions.len() == 1
-            && self.is_complete()
-            && !self.followed_page.load(Ordering::Acquire)
+        self.complete_request() == Some(RequestPages::Single)
+    }
+
+    /// How many pages one request partition read, once it reached EOF with no
+    /// source cap: `None` until then, and for a fetch of several partitions.
+    /// A page cap (`pagination_max_pages`), a limit, a failed or transient page,
+    /// or a cancelled stream never completes.
+    #[must_use]
+    pub fn complete_request(&self) -> Option<RequestPages> {
+        (self.partitions.len() == 1 && self.is_complete()).then(|| {
+            if self.followed_page.load(Ordering::Acquire) {
+                RequestPages::Followed
+            } else {
+                RequestPages::Single
+            }
+        })
     }
 
     pub(super) fn start(&self, partition: usize, limited: bool) -> CompletionGuard {
