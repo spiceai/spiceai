@@ -8,8 +8,10 @@ description: >-
   the read-only pull request role (`full` is `false`), and the job skips the steps that write:
   this action sets CI_CACHE_READ_ONLY=true for the rest of the job, which setup-rust,
   setup-sccache and the build actions read. The roles' AWS trust policies make the same split by
-  `job_workflow_ref` and `ref`; this only asks for the role AWS would grant. A run that needs the
-  read-only role fails here when its secret is not set, rather than later with no credentials.
+  `job_workflow_ref` and `ref`; this only asks for the role AWS would grant. A job that runs a
+  container image (`images`) always gets the read-only role: an image tag can be published from
+  any branch, so it names no trunk commit. A run that needs the read-only role fails here when
+  its secret is not set, rather than later with no credentials.
 
 inputs:
   pull-request-role-set:
@@ -21,6 +23,12 @@ inputs:
       such as `spiced_commit=<sha>`: a commit (40 hex characters), `trunk`, or anything else
       that names a build (a branch, tag or image). An empty value is no build. Only `trunk` and
       commits on trunk keep the full roles.
+    required: false
+    default: ''
+  images:
+    description: >-
+      One `name=value` line for each container image the job runs, such as
+      `custom_image_tag=<tag>`. Any non-empty value gets the read-only role.
     required: false
     default: ''
   token:
@@ -42,6 +50,7 @@ runs:
       env:
         PULL_REQUEST_ROLE_SET: ${{ inputs.pull-request-role-set }}
         BUILDS: ${{ inputs.builds }}
+        IMAGES: ${{ inputs.images }}
         GH_TOKEN: ${{ inputs.token }}
       run: |
         set -euo pipefail
@@ -83,6 +92,19 @@ runs:
           # GIT_NO_LAZY_FETCH keeps a commit trunk lacks missing, so: not on trunk.
           GIT_NO_LAZY_FETCH=1 git --git-dir "$git_dir" merge-base --is-ancestor "$1" refs/remotes/origin/trunk 2>/dev/null
         }
+
+        # An image tag can be published from any branch, so no image counts as trunk's.
+        if [ "$full" = true ]; then
+          while IFS= read -r line || [ -n "$line" ]; do
+            [ -n "${line//[[:space:]]/}" ] || continue
+            name="${line%%=*}"
+            value="${line#*=}"
+            [ -n "$value" ] || continue
+            full=false
+            reason="$name is $value, an image, which names no trunk commit"
+            break
+          done <<<"$IMAGES"
+        fi
 
         if [ "$full" = true ]; then
           while IFS= read -r line || [ -n "$line" ]; do

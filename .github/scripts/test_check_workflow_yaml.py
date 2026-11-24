@@ -532,6 +532,31 @@ class CheckCiRoleJobsTest(unittest.TestCase):
                 self.assertEqual(len(problems), 1, problems)
                 self.assertIn("sets `role-to-assume:", problems[0])
 
+    def test_an_artifact_upload_needs_a_gate(self):
+        upload = (
+            "      - name: Upload\n{cond}        run: mc cp target/release/x \"spice-minio/artifacts/x/$SHA/x\"\n"
+            "      - name: Download\n        run: mc cp \"spice-minio/artifacts/x/$SHA/x\" target/x\n"
+        )
+        steps = CHOOSE + ASSUME.format(role=CHOSEN)
+        with self.subTest(gated=False):
+            problems = self.problems(steps + upload.format(cond=""))
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("step `Upload` writes to shared state", problems[0])
+        with self.subTest(gated=True):
+            cond = "        if: env.CI_CACHE_READ_ONLY != 'true'\n"
+            self.assertEqual(self.problems(steps + upload.format(cond=cond)), [])
+
+    def test_an_image_input_goes_to_images_not_builds(self):
+        document = REUSABLE_CI_ROLE.replace(
+            "      runner_type:\n", "      custom_image_tag:\n        type: string\n      runner_type:\n"
+        )
+        as_build = CHOOSE + "            custom_image_tag=${{ inputs.custom_image_tag }}\n"
+        problems = self.problems(as_build + ASSUME.format(role=CHOSEN), document)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("does not give it to the `ci-role` step's `images`", problems[0])
+        as_image = CHOOSE + "          images: |\n            custom_image_tag=${{ inputs.custom_image_tag }}\n"
+        self.assertEqual(self.problems(as_image + ASSUME.format(role=CHOSEN), document), [])
+
     def test_a_build_input_the_role_step_is_not_given_is_reported(self):
         steps = CHOOSE.replace("          builds: |\n            spiced_commit=${{ inputs.spiced_commit }}\n", "")
         problems = self.problems(steps + ASSUME.format(role=CHOSEN))
@@ -543,7 +568,7 @@ class CheckCiRoleJobsTest(unittest.TestCase):
         with self.subTest(gated=False):
             problems = self.problems(CHOOSE + ASSUME.format(role=CHOSEN) + write.format(cond=""))
             self.assertEqual(len(problems), 1)
-            self.assertIn("step `Push snapshots` writes to the repository", problems[0])
+            self.assertIn("step `Push snapshots` writes to shared state", problems[0])
         with self.subTest(gated=True):
             cond = "        if: ${{ always() && steps.ci-role.outputs.full == 'true' }}\n"
             self.assertEqual(self.problems(CHOOSE + ASSUME.format(role=CHOSEN) + write.format(cond=cond)), [])

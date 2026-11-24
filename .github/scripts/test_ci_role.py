@@ -61,7 +61,7 @@ class CiRoleTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def choose(self, event, ref, builds="", pull_request_role=True, server=None):
+    def choose(self, event, ref, builds="", pull_request_role=True, server=None, images=""):
         with tempfile.TemporaryDirectory() as run:
             out, env_file = Path(run) / "output", Path(run) / "env"
             out.touch()
@@ -78,6 +78,7 @@ class CiRoleTest(unittest.TestCase):
                 "RUNNER_TEMP": run,
                 "PULL_REQUEST_ROLE_SET": "true" if pull_request_role else "false",
                 "BUILDS": builds,
+                "IMAGES": images,
                 "GH_TOKEN": "a-token",
             }
             proc = subprocess.run(["bash", "-e", str(self.script)], env=env, capture_output=True, text=True, timeout=60)
@@ -148,13 +149,27 @@ class CiRoleTest(unittest.TestCase):
             (f"spiced_commit={self.trunk[:12]}", f"spiced_commit is {self.trunk[:12]}"),
             ("spiced_ref=release/2.4", "spiced_ref is release/2.4"),
             ("spiced_ref=v2.1.0", "spiced_ref is v2.1.0"),
-            (f"spiced_commit={self.trunk}\ncustom_image_tag=pr-123", "custom_image_tag is pr-123"),
-            ("channel=stable", "channel is stable"),
         ):
             with self.subTest(builds=builds):
                 proc, output, env = self.choose("workflow_dispatch", "refs/heads/trunk", builds)
                 self.assert_role(proc, output, env, full=False)
                 self.assertIn(f"::notice::{named}, which is not trunk or a commit on trunk", proc.stdout)
+
+    def test_any_image_gets_the_read_only_role(self):
+        # A tag names no commit, and can be published from any branch, even `trunk` or a SHA.
+        for images, named in (
+            ("channel=nightly", "channel is nightly"),
+            (f"custom_image_tag={self.trunk}", f"custom_image_tag is {self.trunk}"),
+            ("custom_image_tag=trunk", "custom_image_tag is trunk"),
+            ("custom_image_tag=\nec2_images=spiceai/spiceai:2.3.2", "ec2_images is spiceai/spiceai:2.3.2"),
+        ):
+            with self.subTest(images=images):
+                proc, output, env = self.choose("push", "refs/heads/trunk", f"spiced_commit={self.trunk}", images=images)
+                self.assert_role(proc, output, env, full=False)
+                self.assertIn(f"::notice::{named}, an image, which names no trunk commit", proc.stdout)
+
+    def test_empty_images_keep_the_full_roles(self):
+        self.assert_role(*self.choose("push", "refs/heads/trunk", images="custom_image_tag=\nec2_images=\n"), full=True)
 
     def test_a_build_off_trunk_without_the_read_only_role_fails(self):
         proc, output, _ = self.choose("push", "refs/heads/trunk", f"spiced_commit={self.feature}", pull_request_role=False)

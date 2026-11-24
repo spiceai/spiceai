@@ -196,14 +196,26 @@ ROLE_CHOICE = re.compile(
     r"\$\{\{\s*steps\.ci-role\.outputs\.full\s*==\s*'true'\s*&&\s*secrets\.(CI_(?:NEW_)?AWS_[A-Z0-9_]*ROLE_ARN)"
     r"\s*\|\|\s*secrets\.CI_AWS_PULL_REQUEST_ROLE_ARN\s*\}\}"
 )
-FULL_ROLE = re.compile(r"steps\.ci-role\.outputs\.full\s*==\s*'true'")
-# Steps that write to the repository: a snapshot branch or pull request.
-REPOSITORY_WRITES = re.compile(r"push-snap-changes|\bgh\s+pr\s+create\b|\bgit\s+push\b")
-# Inputs that name a build other than the run's own commit. A job given one of them has to
-# hand it to the role step, which keeps the full roles only for trunk's builds.
-BUILD_INPUTS = frozenset(
-    {"spiced_commit", "spiced_ref", "custom_image_tag", "ec2_images", "channel", "ref", "needs_resolve_sha"}
+# Steps that write to shared state: a snapshot branch or pull request, or the artifact store.
+# An `mc` copy counts when its destination, the argument after the source, is the store.
+REPOSITORY_WRITES = re.compile(
+    r"push-snap-changes|\bgh\s+pr\s+create\b|\bgit\s+push\b|upload-to-minio"
+    r"|\bmc\s+(?:cp|mirror|put)\s+(?:-\S+\s+)*(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s\"']+)\s+[\"']?spice-minio/"
 )
+# What a write may be gated on: the full roles, or the read-only flag the role step sets.
+WRITE_GATE = re.compile(r"steps\.ci-role\.outputs\.full\s*==\s*'true'|env\.CI_CACHE_READ_ONLY\s*!=\s*'true'")
+# Inputs that name a build other than the run's own commit, which a job has to hand to the
+# role step: commits and refs as `builds`, which keep the full roles only for trunk's, and
+# container images as `images`, which never do.
+BUILD_INPUTS = {
+    "spiced_commit": "builds",
+    "spiced_ref": "builds",
+    "ref": "builds",
+    "needs_resolve_sha": "builds",
+    "custom_image_tag": "images",
+    "ec2_images": "images",
+    "channel": "images",
+}
 # This repository's reusable workflow at trunk, as CI role jobs are called.
 TRUNK_CALL = re.compile(r"spiceai/spiceai/\.github/workflows/([\w.-]+\.ya?ml)@trunk")
 LOCAL_CALL = re.compile(r"\./\.github/workflows/([\w.-]+\.ya?ml)")
@@ -256,12 +268,13 @@ def check_ci_role_jobs(document: dict) -> list[str]:
                 f"`id: ci-role`, `uses: {CI_ROLE_ACTION}`"
             )
             continue
-        builds = str((first.get("with") or {}).get("builds", ""))
-        for build in sorted(declared & BUILD_INPUTS):
-            if not re.search(rf"\binputs\.{re.escape(build)}\b", builds):
+        given = first.get("with") or {}
+        for build in sorted(declared & set(BUILD_INPUTS)):
+            key = BUILD_INPUTS[build]
+            if not re.search(rf"\binputs\.{re.escape(build)}\b", str(given.get(key, ""))):
                 problems.append(
                     f"job `{name}` takes input `{build}`, which names another build, but does not give it to "
-                    f"the `ci-role` step's `builds`, so it would get the full roles for a build off trunk"
+                    f"the `ci-role` step's `{key}`, so it would get the full roles for a build off trunk"
                 )
         for position, step in enumerate(steps, start=1):
             label = step.get("name") or f"step {position}"
@@ -273,9 +286,11 @@ def check_ci_role_jobs(document: dict) -> list[str]:
                         "`${{ steps.ci-role.outputs.full == 'true' && secrets.<ROLE> || "
                         "secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}`"
                     )
-            elif REPOSITORY_WRITES.search(yaml.safe_dump(step)) and not FULL_ROLE.search(str(step.get("if", ""))):
+            elif REPOSITORY_WRITES.search(f"{step.get('uses', '')}\n{step.get('run', '')}") and not WRITE_GATE.search(
+                str(step.get("if", ""))
+            ):
                 problems.append(
-                    f"job `{name}` step `{label}` writes to the repository without "
+                    f"job `{name}` step `{label}` writes to shared state without "
                     "`steps.ci-role.outputs.full == 'true'` in its `if:`, so it would write off trunk too"
                 )
     return problems

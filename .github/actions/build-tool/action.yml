@@ -84,7 +84,8 @@ runs:
         cargo build -p "${INPUT_PACKAGE}" --profile "${INPUT_PROFILE}" ${features:+--features "$features"}
 
     - name: Upload to MinIO
-      if: steps.download.outputs.found != 'true'
+      # Not on a read-only run (a CI AWS role job off trunk; see .github/actions/ci-role).
+      if: steps.download.outputs.found != 'true' && env.CI_CACHE_READ_ONLY != 'true'
       shell: bash
       env:
         PATHS_PATH: ${{ steps.paths.outputs.path }}

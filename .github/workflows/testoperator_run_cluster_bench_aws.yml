@@ -157,10 +157,10 @@ jobs:
         uses: $/.github/actions/ci-role
         with:
           pull-request-role-set: ${{ secrets.CI_AWS_PULL_REQUEST_ROLE_ARN != '' }}
-          builds: |
+          images: |
             custom_image_tag=${{ inputs.custom_image_tag }}
             ec2_images=${{ inputs.ec2_images }}
-            channel=${{ inputs.channel != 'nightly' && inputs.channel || '' }}
+            channel=${{ inputs.channel }}
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
