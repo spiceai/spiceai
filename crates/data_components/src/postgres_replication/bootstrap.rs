@@ -72,8 +72,13 @@ const BATCHES_PER_READER: usize = 2;
 pub fn snapshot_stream(
     input: SnapshotInput,
 ) -> Result<impl Stream<Item = std::result::Result<ChangeEnvelope, StreamError>> + Send + use<>> {
-    Ok(snapshot_stream_inner(input, PAGES_PER_READER, None))
+    Ok(snapshot_stream_inner(input, PAGES_PER_READER, None, None))
 }
+
+/// Awaited by [`snapshot_stream_with_hook_for_test`] after the reader-count
+/// probe and before the snapshot transaction begins.
+#[doc(hidden)]
+pub type AfterProbeHook = Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
 /// Internal integration-test entry point: exercise heap splitting without a
 /// multi-GiB fixture and observe the actual fan-out without adding a metric.
@@ -87,6 +92,25 @@ pub fn snapshot_stream_for_test(
         input,
         pages_per_reader.get(),
         Some(readers),
+        None,
+    ))
+}
+
+/// Internal integration-test entry point: like [`snapshot_stream_for_test`],
+/// and awaits `after_probe` between the reader-count probe and the snapshot
+/// transaction, so a test can commit DDL inside that window.
+#[doc(hidden)]
+pub fn snapshot_stream_with_hook_for_test(
+    input: SnapshotInput,
+    pages_per_reader: std::num::NonZeroU32,
+    readers: Arc<std::sync::atomic::AtomicUsize>,
+    after_probe: AfterProbeHook,
+) -> Result<impl Stream<Item = std::result::Result<ChangeEnvelope, StreamError>> + Send + use<>> {
+    Ok(snapshot_stream_inner(
+        input,
+        pages_per_reader.get(),
+        Some(readers),
+        Some(after_probe),
     ))
 }
 
@@ -141,6 +165,7 @@ fn snapshot_stream_inner(
     input: SnapshotInput,
     pages_per_reader: u32,
     readers_observer: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    after_probe: Option<AfterProbeHook>,
 ) -> impl Stream<Item = std::result::Result<ChangeEnvelope, StreamError>> + Send + use<> {
     // Keep the existing try_stream envelope/error contract at the WAL boundary.
     try_stream! {
@@ -158,7 +183,7 @@ fn snapshot_stream_inner(
             let supports_tid_ranges: bool = metadata.try_get(2)?;
             Ok::<_, tokio_postgres::Error>((pages, ordinary_heap, supports_tid_ranges))
         }.await;
-        let (pages, readers) = match probe {
+        let (pages, mut readers) = match probe {
             Ok((pages, ordinary_heap, supports_tid_ranges)) => {
                 let pages = u32::try_from(pages).unwrap_or_default();
                 let readers = if ordinary_heap && supports_tid_ranges {
@@ -171,17 +196,38 @@ fn snapshot_stream_inner(
                 (0, 1)
             }
         };
-        if let Some(observer) = readers_observer {
+        if let Some(observer) = &readers_observer {
             observer.store(readers, std::sync::atomic::Ordering::Release);
         }
-        tracing::debug!(dataset = %input.dataset_name, readers, pages, "initial snapshot bootstrap readers");
+        if let Some(after_probe) = after_probe {
+            after_probe().await;
+        }
         holder.client.simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
             .await.context(BootstrapSnafu).map_err(super::err_to_stream)?;
-        let snapshot: Option<String> = if readers > 1 {
+        if readers > 1 {
             // TRUNCATE and rewriting ALTER are not MVCC-safe without a table lock
             // held before the snapshot: https://www.postgresql.org/docs/current/mvcc-caveats.html.
             holder.client.simple_query(&format!("LOCK TABLE ONLY {relation} IN ACCESS SHARE MODE"))
                 .await.context(BootstrapSnafu).map_err(super::err_to_stream)?;
+            // The probe ran before the lock, so a child attached by INHERIT since
+            // then would be missed by the `ONLY` range scans. This query takes
+            // the transaction's snapshot, so it sees exactly the children whose
+            // rows that snapshot holds; with any, read through the single
+            // `SELECT`, which includes them.
+            let has_children: bool = holder.client.query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhparent = $1::text::regclass)",
+                &[&relation],
+            ).await.context(BootstrapSnafu).map_err(super::err_to_stream)?
+                .try_get(0).context(BootstrapSnafu).map_err(super::err_to_stream)?;
+            if has_children {
+                readers = 1;
+                if let Some(observer) = &readers_observer {
+                    observer.store(readers, std::sync::atomic::Ordering::Release);
+                }
+            }
+        }
+        tracing::debug!(dataset = %input.dataset_name, readers, pages, "initial snapshot bootstrap readers");
+        let snapshot: Option<String> = if readers > 1 {
             Some(holder.client.query_one("SELECT pg_export_snapshot()", &[])
                 .await.context(BootstrapSnafu).map_err(super::err_to_stream)?
                 .try_get(0).context(BootstrapSnafu).map_err(super::err_to_stream)?)

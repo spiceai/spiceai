@@ -1683,3 +1683,104 @@ fn test_inherited_snapshot_matches_postgres() -> Result<(), anyhow::Error> {
     Ok(())
     })
 }
+
+/// A child attached by `INHERIT` after the reader-count probe saw none, and
+/// committed before the snapshot is taken, belongs to the snapshot: its rows
+/// must be read, as the single-reader `SELECT` reads them.
+#[test]
+fn test_inherit_after_probe_snapshot_matches_postgres() -> Result<(), anyhow::Error> {
+    use std::num::NonZeroU32;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use data_components::postgres_replication::bootstrap::{
+        AfterProbeHook, SnapshotInput, snapshot_stream_with_hook_for_test,
+    };
+
+    if cpu_budget::testing::isolated_budget(
+        "postgres::replication::test_inherit_after_probe_snapshot_matches_postgres",
+    )
+    .map_err(anyhow::Error::msg)?
+        == cpu_budget::testing::Isolation::Parent
+    {
+        return Ok(());
+    }
+    tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
+        let container = common::start_postgres_docker_container().await?;
+        let port = container.host_port(5432)?;
+        let client = Arc::new(common::connect(port).await?);
+        client.batch_execute(
+            "CREATE TABLE public.race_parent (id int, name text); CREATE TABLE public.race_child (id int, name text); INSERT INTO public.race_parent SELECT i, CASE WHEN i % 11 = 0 THEN NULL ELSE repeat(md5(i::text), 8) END FROM generate_series(1, 20000) i; INSERT INTO public.race_child SELECT i, 'child' FROM generate_series(100001, 100100) i; ANALYZE public.race_parent"
+        ).await?;
+
+        let readers = Arc::new(AtomicUsize::new(0));
+        let probe_readers = Arc::new(AtomicUsize::new(0));
+        let hook: AfterProbeHook = {
+            let client = Arc::clone(&client);
+            let readers = Arc::clone(&readers);
+            let probe_readers = Arc::clone(&probe_readers);
+            Arc::new(move || {
+                let client = Arc::clone(&client);
+                let readers = Arc::clone(&readers);
+                let probe_readers = Arc::clone(&probe_readers);
+                Box::pin(async move {
+                    probe_readers.store(readers.load(Ordering::Acquire), Ordering::Release);
+                    client
+                        .batch_execute("ALTER TABLE public.race_child INHERIT public.race_parent")
+                        .await
+                        .expect("attach the child between the probe and the snapshot");
+                })
+            })
+        };
+        let mut params = params_for(port, "unused_snapshot_slot", "unused_snapshot_publication");
+        params.bootstrap_batch_size = 127;
+        let stream = snapshot_stream_with_hook_for_test(
+            SnapshotInput {
+                params,
+                schema_name: "public".into(),
+                table_name: "race_parent".into(),
+                dataset_schema: dataset_schema(),
+                primary_keys: vec!["id".into()],
+                dataset_name: "snapshot_race_parent".into(),
+                metrics: ReplicationMetricsCollector::new(),
+            },
+            NonZeroU32::new(8).expect("positive test threshold"),
+            Arc::clone(&readers),
+            hook,
+        )?;
+        let mut stream = Box::pin(stream);
+        let mut actual: Vec<(i32, Option<String>)> = Vec::new();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some(envelope) = stream.next().await {
+                let envelope = envelope.map_err(|e| anyhow::anyhow!("snapshot failed: {e}"))?;
+                let batch = envelope.change_batch()?.data_batch();
+                let ids = batch.column(0).as_any().downcast_ref::<arrow::array::Int32Array>()
+                    .expect("id int4");
+                let names = batch.column(1).as_any().downcast_ref::<arrow::array::StringArray>()
+                    .expect("name text");
+                for row in 0..batch.num_rows() {
+                    actual.push((ids.value(row), if names.is_null(row) {
+                        None
+                    } else {
+                        Some(names.value(row).to_string())
+                    }));
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        }).await??;
+
+        let probe_readers = probe_readers.load(Ordering::Acquire);
+        assert!(
+            probe_readers > 1,
+            "the probe must choose parallel readers before the child is attached, got {probe_readers}"
+        );
+        let oracle = client.query("SELECT id, name FROM public.race_parent", &[]).await?;
+        let mut expected: Vec<(i32, Option<String>)> =
+            oracle.iter().map(|row| (row.get(0), row.get(1))).collect();
+        assert_eq!(expected.len(), 20_100, "the source reads the attached child's rows");
+        expected.sort();
+        actual.sort();
+        assert_eq!(actual.len(), expected.len(), "snapshot row count");
+        assert_eq!(actual, expected, "snapshot must match the source rows, including the attached child's");
+        Ok(())
+    })
+}
