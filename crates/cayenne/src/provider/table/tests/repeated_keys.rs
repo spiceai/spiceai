@@ -698,12 +698,12 @@ async fn an_overwrite_repeating_keys_publishes_one_snapshot() {
 /// rows or the table's statistics. A key-deletion table keeps its statistics
 /// exact, since its superseded copies leave its files.
 ///
-/// The string `MIN`/`MAX` are answered from statistics once the table is
-/// reopened, from the statistics Cayenne persisted. Right after the write the
-/// table's statistics come from the files' Vortex footers, which record a
-/// string column's bounds byte-bounded and so inexact, and the query scans; the
-/// check that it does fails if those bounds become exact again, which is the
-/// cue to expect statistics there too.
+/// The counts are answered from statistics in a key-deletion table, right after
+/// the write and once it is reopened. The string `MIN`/`MAX` scan in both: the
+/// files' Vortex footers record a string column's bounds byte-bounded and so
+/// inexact, and the statistics Cayenne persists from them stay inexact. The
+/// check that they scan fails if those bounds become exact, which is the cue to
+/// expect statistics for them too.
 #[tokio::test(flavor = "multi_thread")]
 async fn aggregates_after_an_overwrite_repeating_keys_ignore_superseded_copies() {
     let mut failures = Vec::new();
@@ -749,15 +749,46 @@ async fn aggregates_after_an_overwrite_repeating_keys_ignore_superseded_copies()
             .expect("format")
             .to_string();
             let from_statistics = plan.contains("PlaceholderRowExec");
-            if mode == DeletionMode::Key && stage == "after reopen" && !from_statistics {
+            if from_statistics {
                 failures.push(format!(
-                    "{mode:?} {stage}: scanned instead of using statistics"
+                    "{mode:?} {stage}: answered the string MIN/MAX from statistics, so their \
+                     bounds are exact; expect statistics for them here"
                 ));
             }
-            if mode == DeletionMode::Key && stage == "after overwrite" && from_statistics {
+            let counts = ctx
+                .sql("SELECT COUNT(*), COUNT(value) FROM t")
+                .await
+                .expect("count query");
+            let count_plan = arrow::util::pretty::pretty_format_batches(
+                &counts
+                    .clone()
+                    .explain(false, false)
+                    .expect("explain counts")
+                    .collect()
+                    .await
+                    .expect("count plan"),
+            )
+            .expect("format counts")
+            .to_string();
+            if mode == DeletionMode::Key && !count_plan.contains("PlaceholderRowExec") {
                 failures.push(format!(
-                    "{mode:?} {stage}: answered from statistics, so the footers' string bounds \
-                     are exact again; expect statistics after the overwrite too"
+                    "{mode:?} {stage}: scanned for the counts instead of using statistics"
+                ));
+            }
+            let count_row = &counts.collect().await.expect("collect counts")[0];
+            let counted = (
+                count_row
+                    .column(0)
+                    .as_primitive::<arrow::datatypes::Int64Type>()
+                    .value(0),
+                count_row
+                    .column(1)
+                    .as_primitive::<arrow::datatypes::Int64Type>()
+                    .value(0),
+            );
+            if counted != (4, 4) {
+                failures.push(format!(
+                    "{mode:?} {stage}: counts {counted:?}, expected (4, 4)"
                 ));
             }
             let batches = df.collect().await.expect("collect");
@@ -875,6 +906,69 @@ async fn sum_and_avg_never_use_a_sum_that_overflowed() {
         failures.push(format!(
             "control: a sum that fits was not answered from statistics as 3: {sum}"
         ));
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// `MIN` and `MAX` of strings longer than the footer's 64-byte bound return the whole value,
+/// right after the write and after a restart. The footer records a string column's bounds
+/// cut to 64 bytes and inexact. The per-file statistics a scan persists from the footer must
+/// keep them inexact: read back as exact, they answered both from the cut bounds after the
+/// table was reopened.
+#[tokio::test(flavor = "multi_thread")]
+async fn string_min_max_past_the_footer_bound_return_the_whole_value() {
+    let lowest = format!("a{}", "b".repeat(120));
+    let highest = format!("z{}", "y".repeat(120));
+    let mut failures = Vec::new();
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, catalog, runtime_env, _dir) = table(mode).await;
+        write(
+            &provider,
+            InsertOp::Overwrite,
+            vec![batch(&[
+                (1, lowest.as_str()),
+                (2, "m"),
+                (3, highest.as_str()),
+            ])],
+        )
+        .await
+        .expect("overwrite");
+        // The first query after the write persists the files' statistics; the reopen reads
+        // them back.
+        for stage in ["after the write", "after reopen"] {
+            let provider = if stage == "after the write" {
+                provider.clone_for_write()
+            } else {
+                provider
+                    .flush_pending_maintenance()
+                    .await
+                    .expect("flush the write's maintenance");
+                reopen(&catalog, &runtime_env).await
+            };
+            let ctx = SessionContext::new();
+            ctx.register_table("t", Arc::new(provider))
+                .expect("register");
+            let batches = ctx
+                .sql("SELECT MIN(value), MAX(value) FROM t")
+                .await
+                .expect("query")
+                .collect()
+                .await
+                .expect("collect");
+            let observed = (
+                batches[0].column(0).as_string::<i32>().value(0).to_string(),
+                batches[0].column(1).as_string::<i32>().value(0).to_string(),
+            );
+            if observed != (lowest.clone(), highest.clone()) {
+                failures.push(format!(
+                    "{mode:?} {stage}: MIN has {} bytes and MAX {}, expected {} and {}",
+                    observed.0.len(),
+                    observed.1.len(),
+                    lowest.len(),
+                    highest.len()
+                ));
+            }
+        }
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
