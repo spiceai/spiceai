@@ -1501,7 +1501,8 @@ impl Refresher {
                 // the stream first reports the dataset ready marks the acceleration as
                 // complete, so a later start can serve it before the source answers;
                 // an acceleration interrupted before then has none and waits for its
-                // source.
+                // source. The changes applied so far are flushed first, so the
+                // checkpoint never claims more than storage holds.
                 if self.checkpoint_when_changes_ready
                     && let (Some(checkpointer), Some(completion)) =
                         (checkpointer, self.refresh_completion.clone())
@@ -1511,24 +1512,32 @@ impl Refresher {
                     let accelerator_write_mutex = Arc::clone(&self.accelerator_write_mutex);
                     let dataset_name = dataset_name.clone();
                     let last_updated_at = Arc::clone(&self.last_updated_at);
+                    let change_sink = self.change_sink.clone();
                     self.ready_checkpoint_task = Some(tokio::spawn(async move {
-                        if ready.wait().await.is_answered()
-                            && !completion.closed_without_a_refresh()
+                        if !ready.wait().await.is_answered()
+                            || completion.closed_without_a_refresh()
                         {
-                            create_checkpoint_and_snapshot(
-                                &checkpointer,
-                                None,
-                                &checkpoint_schema,
-                                &accelerator_write_mutex,
-                                &dataset_name,
-                                &last_updated_at,
-                                ForceCreate(false),
-                                None,
-                                None,
-                                None,
-                            )
-                            .await;
+                            return;
                         }
+                        if let Some(sink) = &change_sink
+                            && let Err(error) = sink.flush().await
+                        {
+                            tracing::debug!(dataset = %dataset_name, %error, "Did not record the dataset checkpoint: flushing its changes failed");
+                            return;
+                        }
+                        create_checkpoint_and_snapshot(
+                            &checkpointer,
+                            None,
+                            &checkpoint_schema,
+                            &accelerator_write_mutex,
+                            &dataset_name,
+                            &last_updated_at,
+                            ForceCreate(false),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
                     }));
                 }
 

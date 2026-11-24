@@ -180,6 +180,19 @@ impl DeferredTableProvider {
     }
 }
 
+/// Whether `dataset` is a `refresh_mode: changes` dataset under
+/// `on_schema_change: block`. Its change stream applies that policy itself as it
+/// streams, keeping the acceleration's columns, so a source schema that differs
+/// from the acceleration's does not hold the source back: holding it would stop
+/// the stream from starting at all.
+fn change_stream_keeps_acceleration_schema(dataset: &DatasetSpec) -> bool {
+    dataset.on_schema_change == OnSchemaChange::Block
+        && dataset
+            .acceleration
+            .as_ref()
+            .is_some_and(|acceleration| acceleration.refresh_mode == Some(RefreshMode::Changes))
+}
+
 impl FederatedTable {
     /// Creates a federated table without checking if the schema matches the existing acceleration checkpoint.
     pub fn new_unchecked(table_provider: Arc<dyn TableProvider>) -> Self {
@@ -219,6 +232,9 @@ impl FederatedTable {
         let federated_schema = table_provider.schema();
 
         if dataset.on_schema_change == OnSchemaChange::Block {
+            if change_stream_keeps_acceleration_schema(&dataset) {
+                return Self::new_unchecked(table_provider);
+            }
             // `on_schema_change: block` (default): today's behavior verbatim.
             // `schema_difference` is nullability-insensitive, so a no-op (or a
             // nullability-only change) registers immediately and any other
@@ -601,6 +617,7 @@ impl FederatedTable {
         let dataset_name = dataset.name.clone();
         let dataset_name_str = dataset_name.to_string();
         let accelerated_schema = Arc::clone(&schema);
+        let holds_schema_difference = !change_stream_keeps_acceleration_schema(&dataset);
 
         let (tx, rx) = oneshot::channel();
         let (source_reached_tx, source_reached) = watch::channel(false);
@@ -615,8 +632,9 @@ impl FederatedTable {
                         source_reached_tx.send_replace(true);
                         let federated_schema = table_provider.schema();
 
-                        if let Some(differences) =
-                            schema_difference(&accelerated_schema, &federated_schema)
+                        if holds_schema_difference
+                            && let Some(differences) =
+                                schema_difference(&accelerated_schema, &federated_schema)
                         {
                             let error = DataConnectorError::SchemaMismatch {
                                 dataset_name: dataset_name.to_string(),

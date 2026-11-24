@@ -102,3 +102,24 @@ steps:
   # Each row once.
   - query: SELECT count(*) - count(DISTINCT id) AS duplicates FROM busy
     expect: { rows: [['0']] }
+
+  # A column added at the source while the runtime is down: the change stream
+  # starts, refuses to resume across the layout change and says how to rebuild,
+  # while the acceleration stays served. Rebuilding catches up with the source.
+  - query: SELECT id, v, n FROM busy
+    oracle-sql: SELECT id, v, n FROM busy
+    eventually: 60s
+    id: before-alter
+  - stop: {}
+  - source-exec: { my: "ALTER TABLE busy ADD COLUMN extra int" }
+  - start: { ready: false }
+  - assert-status: { dataset: busy, status: Error, message-contains: mysql_replication_invalid_checkpoint_behavior }
+    eventually: 30s
+  - query: SELECT id, v, n FROM busy
+    expect: { same-as: before-alter }
+  - restart:
+      patch: { datasets: { busy: { params: { mysql_replication_invalid_checkpoint_behavior: restart } } } }
+  - source-exec: { my: "INSERT INTO busy VALUES (6000, 'after alter', 2, 7); UPDATE busy SET v = 'altered' WHERE id = 1" }
+  - query: SELECT id, v, n FROM busy
+    oracle-sql: SELECT id, v, n FROM busy
+    eventually: 60s

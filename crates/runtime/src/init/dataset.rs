@@ -1224,7 +1224,7 @@ impl Runtime {
     ///
     /// This runs before the connector exists, so the refresh mode is resolved the way
     /// `DataConnector::resolve_refresh_mode` does by default.
-    fn may_serve_existing_acceleration(ds: &Dataset) -> bool {
+    pub(crate) fn may_serve_existing_acceleration(ds: &Dataset) -> bool {
         ds.acceleration.as_ref().is_some_and(|a| a.enabled)
             && Self::waits_for_source_reason(ds).is_none()
     }
@@ -1282,10 +1282,12 @@ impl Runtime {
         } else if ds.source() == crate::dataconnector::file::FILE_DATACONNECTOR {
             "the `file` connector".to_string()
         } else if refresh_mode == RefreshMode::Changes && !resumes_changes_after_restart(ds) {
-            if acceleration.partition_by.is_empty() {
+            if !crate::dataconnector::connector_resumes_changes_after_restart(ds.source()) {
                 "`refresh_mode: changes`".to_string()
-            } else {
+            } else if !acceleration.partition_by.is_empty() {
                 "`refresh_mode: changes` with `partition_by`".to_string()
+            } else {
+                "`refresh_mode: changes` with `snapshots`".to_string()
             }
         } else if refresh_mode == RefreshMode::Caching {
             "`refresh_mode: caching`".to_string()
@@ -3977,14 +3979,20 @@ fn not_served_status(reason: &str, cause: &str) -> String {
 
 /// Whether `ds` is a `refresh_mode: changes` dataset whose change stream resumes
 /// after a restart from a recorded position, so it is served from its existing
-/// acceleration at startup and starts its stream once the source answers. A
-/// dataset partitioned across executors waits for its source: its change stream
+/// acceleration at startup and starts its stream once the source answers.
+///
+/// A dataset partitioned across executors waits for its source: its change stream
 /// is scoped to this executor's partitions when the table is built, which needs
-/// the connector.
+/// the connector. So does a dataset with snapshots, whose snapshot checkpoints can
+/// be written before its change stream has finished loading the acceleration.
 pub(crate) fn resumes_changes_after_restart(ds: &Dataset) -> bool {
     ds.acceleration.as_ref().is_some_and(|acceleration| {
         acceleration.enabled
             && acceleration.partition_by.is_empty()
+            && matches!(
+                acceleration.snapshot_behavior,
+                runtime_acceleration::snapshot::SnapshotBehavior::Disabled
+            )
             && acceleration.refresh_mode == Some(RefreshMode::Changes)
             && crate::dataconnector::connector_resumes_changes_after_restart(ds.source())
     })

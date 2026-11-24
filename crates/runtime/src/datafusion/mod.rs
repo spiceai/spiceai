@@ -4361,6 +4361,11 @@ impl DataFusion {
         // acceleration — empty on a first start — already holds the whole dataset, and a scan
         // must not fail while a refresh that reads no rows runs. A snapshot refresh is the
         // exception, since its rows do arrive by refresh.
+        // A change stream that resumes after a restart is served from its acceleration
+        // before the source answers. An executor's scoped dataset arrives here with its
+        // `partition_by` cleared, so its partition filters exclude it.
+        let resumes_changes = initial_partition_filters.is_none()
+            && crate::Runtime::may_serve_existing_acceleration(dataset);
         let mut initial_load_complete = matches!(refresh_mode, RefreshMode::Caching)
             || (source.as_any().is::<SinkConnector>()
                 && !matches!(refresh_mode, RefreshMode::Snapshot));
@@ -4386,8 +4391,7 @@ impl DataFusion {
             // has restored a snapshot in this process: a copy left from an earlier run can be
             // arbitrarily old, or from a location the dataset no longer reads.
             let delay_initial_ready = (matches!(refresh_mode, RefreshMode::Changes)
-                && !(source_table_provider.awaits_source()
-                    && crate::init::dataset::resumes_changes_after_restart(dataset)))
+                && !(source_table_provider.awaits_source() && resumes_changes))
                 || (dataset.is_snapshot_source()
                     && bootstrap_status.loaded_snapshot_id().is_none());
 
@@ -4856,7 +4860,7 @@ impl DataFusion {
         }
 
         if refresh_mode == RefreshMode::Changes {
-            if crate::init::dataset::resumes_changes_after_restart(dataset) {
+            if resumes_changes {
                 accelerated_table_builder.checkpoint_when_changes_ready();
             }
 

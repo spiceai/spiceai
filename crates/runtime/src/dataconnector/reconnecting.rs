@@ -298,20 +298,29 @@ impl DataConnector for ReconnectingConnector {
         // still describes it.
         let stream = futures::stream::once(async move {
             federated_table.table_provider().await;
-            let Some(inner) = inner.get().map(Arc::clone) else {
-                // The table stopped waiting for its source without reaching it, at
-                // shutdown.
-                return futures::stream::empty().boxed();
+            let stream = match inner.get().map(Arc::clone) {
+                Some(inner) => {
+                    inner
+                        .changes_stream(
+                            &RuntimeConnectorContext::for_dataset(&resuming),
+                            federated_table,
+                            &dataset,
+                            acceleration,
+                        )
+                        .await
+                }
+                // The table stopped waiting for its source without reaching it.
+                None => None,
             };
-            inner
-                .changes_stream(
-                    &RuntimeConnectorContext::for_dataset(&resuming),
-                    federated_table,
-                    &dataset,
-                    acceleration,
-                )
-                .await
-                .unwrap_or_else(|| futures::stream::empty().boxed())
+            stream.unwrap_or_else(|| {
+                if !resuming.runtime().status().is_shutdown() {
+                    tracing::warn!(
+                        "Dataset '{}' did not start its change stream after reaching its source, so it is served from its acceleration without applying new changes. Restart the runtime to retry.",
+                        dataset.name
+                    );
+                }
+                futures::stream::empty().boxed()
+            })
         })
         .flatten();
         Some(stream.boxed())
