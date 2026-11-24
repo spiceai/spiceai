@@ -70,8 +70,9 @@ def main():
         for name, steps, error, extra in fixtures:
             fixture = Path(directory) / f"{name}.yaml"
             spicepod = {"version": "v1", "kind": "Spicepod", "name": name, **extra.pop("spicepod", {})}
+            # Indented, so `--record-durations` can add the `duration` line after `name`.
             fixture.write_text(json.dumps({"name": name, "spicepod": spicepod,
-                "steps": [{"start": {}}] + steps, **extra}))
+                "steps": [{"start": {}}] + steps, **extra}, indent=2) + "\n")
             result = subprocess.run([str(args.runner.resolve()), "--record-durations", "--spiced",
                 str(args.spiced.resolve()), "--work-dir", str(args.work_dir.resolve() / name), str(fixture)],
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
