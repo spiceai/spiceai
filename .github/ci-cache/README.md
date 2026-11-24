@@ -52,8 +52,8 @@ download the same file with no bound.
 - **The self-hosted Macs' Rust homes.** There, `setup-rust` gives each job its own
   `CARGO_HOME` and `RUSTUP_HOME` in `$RUNNER_TEMP/rust-home`, which the runner empties when
   a job starts and ends (skipping what it cannot delete), and never reads the host's shared `~/.cargo` or `~/.rustup`, which
-  any job there can write. A `rust-home` an earlier job left behind is removed and the
-  directory created anew, and a new home always gets rustup from the pin above and its
+  any job there can write. A `rust-home` an earlier job left behind is moved aside, never
+  used, and the directory created anew, and a new home always gets rustup from the pin above and its
   toolchain from the mirror. A later `setup-rust` in the same job keeps the job's homes.
 - To bump `rustup-init`, take each host's line from
   `https://static.rust-lang.org/rustup/archive/<version>/<host>/rustup-init.sha256` and

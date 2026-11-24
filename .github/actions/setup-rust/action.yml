@@ -153,23 +153,28 @@ runs:
             echo "Keeping this job's Rust homes in $rust_home."
           else
             # The runner skips what it cannot delete when it empties RUNNER_TEMP, and a
-            # same-user job can flag a file immutable (chflags uchg). So a rust-home found here
-            # is not this job's: clear its flags, remove it, and create the directory anew,
-            # which fails if anything is still there. Nothing in it is then trusted.
+            # same-user job can lock what it leaves: immutable flags (chflags uchg), modes and
+            # ACLs that keep rm out. So a rust-home found here is not this job's. It is renamed
+            # aside, which needs only its own flags and ACL cleared however its contents are
+            # locked, and the directory is created anew, which fails if anything is still
+            # there. Nothing in the old one is used; removing it is best-effort.
             if [ -e "$rust_home" ] || [ -L "$rust_home" ]; then
-              echo "::warning::Removing $rust_home, which an earlier job left behind."
-              # Flags first, then any directory whose mode keeps rm out (each one opened before
-              # find reads it, so nesting does not stop it), then flags on what those held.
-              # Neither follows a symbolic link.
-              clear_flags() {
-                if command -v chflags >/dev/null 2>&1; then
-                  chflags -R nouchg,nouappnd "$rust_home" 2>/dev/null || true
-                fi
-              }
-              clear_flags
-              find "$rust_home" -type d ! -perm -700 -exec chmod u+rwx {} \; 2>/dev/null || true
-              clear_flags
-              rm -rf "$rust_home" 2>/dev/null || true
+              echo "::warning::Moving aside $rust_home, which an earlier job left behind; nothing in it is used."
+              if [ ! -L "$rust_home" ]; then
+                chflags nouchg,nouappnd "$rust_home" 2>/dev/null || true
+                chmod -N "$rust_home" 2>/dev/null || true
+              fi
+              leftover="$RUNNER_TEMP/rust-home.leftover.$$.$RANDOM"
+              if mv "$rust_home" "$leftover" 2>/dev/null && ! rm -rf "$leftover" 2>/dev/null && [ ! -L "$leftover" ]; then
+                (
+                  chmod u+rwx "$leftover"
+                  for pass in 1 2 3; do
+                    chflags -R nouchg,nouappnd "$leftover"
+                    find "$leftover" -type d -exec sh -c 'chflags nouchg,nouappnd "$1"; chmod -N "$1"; chmod u+rwx "$1"' sh {} \;
+                  done
+                  rm -rf "$leftover"
+                ) >/dev/null 2>&1 || true
+              fi
             fi
             if ! mkdir "$rust_home" 2>/dev/null; then
               echo "::error::Could not create $rust_home afresh: what an earlier job left there could not be removed, and setup-rust never uses Rust homes it did not create."

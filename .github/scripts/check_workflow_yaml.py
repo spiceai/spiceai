@@ -162,13 +162,16 @@ COMMENT_LINE = re.compile(r"^[ \t]*#[^\n]*$", re.MULTILINE)
 # one, or `eval "$(curl …)"`. A cut-off download runs half a script, and nothing pins what ran. The rustup
 # installers are refused by name too: setup-rust installs rustup only from the
 # rustup-init .github/ci-cache/pins.json pins.
-_SHELL = r"(?<![\w.-])(?:(?:/usr)?/bin/env\s+|env\s+|/usr/local/bin/|/usr/bin/|/bin/)?(?:ba|da|k|z)?sh\b"
+_SHELL = (
+    r"(?<![\w.-])(?:(?:(?:/usr)?/bin/)?env(?:\s+(?:-\S+|\w+=\S*))*\s+|/usr/local/bin/|/usr/bin/|/bin/)?"
+    r"(?:ba|da|k|z)?sh\b"
+)
 _PS_DOWNLOAD = r"(?:DownloadString|DownloadFile|Invoke-WebRequest|Invoke-RestMethod|\biwr\b|\birm\b)"
 DOWNLOAD_EXECUTION = re.compile(
-    rf"(?<!\|)\|(?!\|)\s*(?:sudo(?:\s+-\S+(?:\s+(?!-)[^\s|;&]+)?)*\s+)?{_SHELL}"
+    rf"(?<!\|)\|&?(?!\|)\s*(?:sudo(?:\s+-\S+(?:\s+(?!-)[^\s|;&]+)?)*\s+)?{_SHELL}"
     rf"|(?:{_SHELL}|(?<![\w.-])(?:source|\.))[^\n|;&]*<\(\s*(?:curl|wget)\b"
     rf"|{_SHELL}\s+-c\s+[\"']?\$\(\s*(?:curl|wget)\b"
-    r"|\beval\s+[\"']?\$\(\s*(?:curl|wget)\b"
+    r"|\beval\s+[\"']?(?:\$\(|`)\s*(?:curl|wget)\b"
     rf"|\b(?:iex|Invoke-Expression)\b[^\n]*{_PS_DOWNLOAD}"
     rf"|{_PS_DOWNLOAD}[^\n]*\|\s*(?:iex|Invoke-Expression)\b"
     r"|\b(?:sh|win)\.rustup\.rs\b",
@@ -988,7 +991,7 @@ def check_download_execution(jobs: dict) -> list[str]:
     return problems
 
 
-SCRIPT_SUFFIXES = (".sh", ".bash", ".ps1")
+SCRIPT_SUFFIXES = (".sh", ".bash", ".zsh", ".ksh", ".ps1")
 
 
 def check_script_downloads(github_dir: Path) -> list[str]:

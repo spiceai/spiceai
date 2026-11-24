@@ -308,9 +308,10 @@ class PerJobHomeTest(unittest.TestCase):
     def tearDown(self):
         # Whatever a test flagged immutable or locked, so the directory can go.
         self.runner_temp.chmod(0o755)
-        for _ in range(2):
+        for _ in range(3):
             if shutil.which("chflags"):
                 subprocess.run(["chflags", "-R", "nouchg", str(self.dir)], check=False, capture_output=True)
+                subprocess.run(["chmod", "-R", "-N", str(self.dir)], check=False, capture_output=True)
             subprocess.run(["find", str(self.dir), "-type", "d", "-exec", "chmod", "u+rwx", "{}", ";"],
                            check=False, capture_output=True)
         self.tmp.cleanup()
@@ -476,9 +477,19 @@ class PerJobHomeTest(unittest.TestCase):
         (locked / "inner").chmod(0)
         locked.chmod(0)
         read_only.chmod(0o500)
+        if platform.system() == "Darwin":
+            # The home itself: an ACL that denies listing and deleting, no mode, immutable.
+            deny = "everyone deny list,search,add_file,add_subdirectory,delete,delete_child"
+            subprocess.run(["chmod", "+a", deny, str(self.rust_home)], check=True)
+            self.rust_home.chmod(0)
+            subprocess.run(["chflags", "uchg", str(self.rust_home)], check=True)
         proc, calls = self.run_step()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn(f"::warning::Removing {self.rust_home}, which an earlier job left behind.", proc.stdout)
+        self.assertIn(
+            f"::warning::Moving aside {self.rust_home}, which an earlier job left behind; nothing in it is used.",
+            proc.stdout,
+        )
+        self.assertEqual(list(self.runner_temp.glob("rust-home.leftover.*")), [])
         self.assertTrue(calls[0].startswith("rustup-init --no-modify-path"), calls)
         self.assertIn(f"--host {HOST}", self.mirror_log.read_text())
         self.assertFalse((self.rust_home / "cargo" / "config.toml").exists())
