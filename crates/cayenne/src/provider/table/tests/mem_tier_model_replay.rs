@@ -525,11 +525,12 @@ async fn initial(disk: &Disk, catalog: Arc<dyn MetadataCatalog>) -> Arc<CayenneT
         .expect("genesis sequence");
     assert_eq!(sequence, 1);
     table
-        .insert_to_new_snapshot_with_sequence(
+        .fold_inline_into_new_snapshot(
             single_batch_stream(batch(&[(0, 1), (1, 2)])),
             sequence,
             1,
             None,
+            &[],
         )
         .await
         .expect("genesis snapshot");

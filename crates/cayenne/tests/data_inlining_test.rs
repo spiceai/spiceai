@@ -1680,3 +1680,128 @@ async fn test_wide_rows_still_reach_the_coalesce(
     }
     Ok(())
 }
+
+/// A keyed table's inline flush on the SQLite metastore makes its new snapshot
+/// live and clears the flushed inline rows. A failure between the two, injected
+/// here by a trigger that aborts the clear, stands in for a crash at that point.
+/// After a restart every key must be served once, with the value inserted.
+#[tokio::test(flavor = "multi_thread")]
+async fn keyed_inline_flush_failure_before_clear_serves_each_row_once()
+-> Result<(), Box<dyn std::error::Error>> {
+    const KEYS: i64 = 100;
+    let tmp = tempfile::TempDir::new()?;
+    let connection = format!("sqlite://{}", tmp.path().join("catalog.db").display());
+    let data_path = tmp.path().join("data");
+    std::fs::create_dir_all(&data_path)?;
+    let catalog = Arc::new(cayenne::CayenneCatalog::new(connection.clone())?);
+    catalog.init().await?;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let ctx = SessionContext::new();
+    let table = CayenneTableProvider::create_table(
+        Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+        CreateTableOptions {
+            table_name: "flush_crash".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                "id".to_string(),
+            ]))),
+            base_path: data_path.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: cayenne::metadata::VortexConfig::default(),
+        },
+        ctx.runtime_env(),
+    )
+    .await?;
+    assert!(
+        !table.is_position_based(),
+        "the keyed flush under test publishes a new snapshot"
+    );
+    let table_id = catalog.get_table("flush_crash").await?.table_id;
+    let ids = (1..=KEYS).collect::<Vec<_>>();
+    let names = ids
+        .iter()
+        .map(|id| format!("name_{id}"))
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(ids.clone())),
+            Arc::new(StringArray::from(names.clone())),
+        ],
+    )?;
+    common::insert_batch(&table, batch).await?;
+    assert_eq!(catalog.get_inlined_data_count(&table_id).await?, KEYS);
+    let snapshots_before = catalog.get_all_snapshot_sequences(&table_id).await?.len();
+
+    let set_trigger = |sql: &'static str| {
+        let catalog = Arc::clone(&catalog);
+        async move {
+            let tx = catalog.begin_transaction().await?;
+            tx.execute(cayenne::metastore::ExecuteParams {
+                sql,
+                params: vec![],
+            })
+            .await?;
+            tx.commit().await
+        }
+    };
+    set_trigger(
+        "CREATE TRIGGER fail_inline_clear BEFORE DELETE ON cayenne_inlined_data \
+         BEGIN SELECT RAISE(ABORT, 'inline clear injected failure'); END",
+    )
+    .await?;
+    let error = table
+        .checkpoint_inlined_data()
+        .await
+        .expect_err("the injected failure aborts the flush");
+    assert!(
+        error.to_string().contains("inline clear injected failure"),
+        "{error}"
+    );
+    set_trigger("DROP TRIGGER fail_inline_clear").await?;
+    // The injected failure struck after the flush reached the metastore.
+    assert_eq!(catalog.get_inlined_data_count(&table_id).await?, KEYS);
+    let snapshots_after_failure = catalog.get_all_snapshot_sequences(&table_id).await?.len();
+    drop(table);
+    drop(ctx);
+    drop(catalog);
+
+    let catalog = Arc::new(cayenne::CayenneCatalog::new(connection)?);
+    let ctx = SessionContext::new();
+    let reopened = cayenne::CayenneTableProviderBuilder::new(
+        Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+        ctx.runtime_env(),
+    )
+    .open("flush_crash")
+    .await?;
+    ctx.register_table("flush_crash", Arc::new(reopened))?;
+    let got = collect_sorted(&ctx, "SELECT id, name FROM flush_crash ORDER BY id").await?;
+    let got_ids = got
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id");
+    let got_names = got
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name");
+    eprintln!(
+        "snapshot sequences before flush: {snapshots_before}, after failed flush: {snapshots_after_failure}; rows after reopen: {} for {KEYS} keys",
+        got.num_rows()
+    );
+    assert_eq!(got_ids.values(), ids.as_slice(), "one row per key");
+    assert_eq!(
+        got_names
+            .iter()
+            .map(Option::unwrap_or_default)
+            .collect::<Vec<_>>(),
+        names.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    Ok(())
+}
