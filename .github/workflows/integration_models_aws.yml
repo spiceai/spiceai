@@ -129,11 +129,12 @@ jobs:
 
       # With the full CI roles, it runs only if the build job attested it on trunk.
       - name: Verify the test archive's build attestation
-        if: env.CI_ROLE_FULL == 'true'
+        if: steps.ci-role.outputs.full == 'true'
         uses: $/.github/actions/verify-attestation
         with:
           file: ./integration_test/integration.tar.zst
           signer-workflow: .github/workflows/integration_models.yml
+          source-commit: ${{ github.sha }}
 
       - name: Run Beta functionality embedding tests
         env:

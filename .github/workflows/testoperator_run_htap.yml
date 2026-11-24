@@ -639,7 +639,8 @@ jobs:
           fi
           prefixes=("cayenne-datalake/${GITHUB_RUN_ID}")
           case "${SPICEPOD}" in
-            *-cold*) prefixes+=("${CI_STORE_PREFIX:-}cayenne-cold-sf1000" "${CI_STORE_PREFIX:-}cayenne-cold-sf10") ;;
+            # Only once this run's store prefix is known: an empty one would be trunk's fixtures.
+            *-cold*) [ -n "${CI_STORE_PREFIX+set}" ] && prefixes+=("${CI_STORE_PREFIX}cayenne-cold-sf1000" "${CI_STORE_PREFIX}cayenne-cold-sf10") ;;
           esac
           # Non-fatal: a cleanup miss must never fail the benchmark run, so every mc call is guarded
           # with `|| true`. We print a one-line size/count summary per prefix (mc du) before deleting.

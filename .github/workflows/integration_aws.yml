@@ -121,11 +121,12 @@ jobs:
 
       # With the full CI roles, the archive runs only if integration.yml attested it on trunk.
       - name: Verify the test archive's build attestation
-        if: env.CI_ROLE_FULL == 'true' && (inputs.needs_check_changes_relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true')
+        if: steps.ci-role.outputs.full == 'true' && inputs.needs_check_changes_relevant_changes == 'true'
         uses: $/.github/actions/verify-attestation
         with:
           file: ./integration_tests/integration_tests.tar.zst
           signer-workflow: .github/workflows/integration.yml
+          source-commit: ${{ github.sha }}
 
       - name: Download test archive
         if: inputs.needs_check_changes_relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS != 'true'
@@ -426,11 +427,12 @@ jobs:
 
       # With the full CI roles, the archive runs only if integration.yml attested it on trunk.
       - name: Verify the test archive's build attestation
-        if: env.CI_ROLE_FULL == 'true' && (env.HAS_RUSTFS_ACCESS == 'true')
+        if: steps.ci-role.outputs.full == 'true'
         uses: $/.github/actions/verify-attestation
         with:
           file: ./integration_tests/integration_tests.tar.zst
           signer-workflow: .github/workflows/integration.yml
+          source-commit: ${{ github.sha }}
 
       - name: Download AWS SDK test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -521,11 +523,12 @@ jobs:
 
       # With the full CI roles, the archive runs only if integration.yml attested it on trunk.
       - name: Verify the test archive's build attestation
-        if: env.CI_ROLE_FULL == 'true' && (env.HAS_RUSTFS_ACCESS == 'true')
+        if: steps.ci-role.outputs.full == 'true'
         uses: $/.github/actions/verify-attestation
         with:
           file: ./integration_tests/integration_tests.tar.zst
           signer-workflow: .github/workflows/integration.yml
+          source-commit: ${{ github.sha }}
 
       - name: Download snapshot refresh test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'

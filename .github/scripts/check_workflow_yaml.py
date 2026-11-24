@@ -215,6 +215,7 @@ STORE_DOWNLOAD = re.compile(
     r"|ARCHIVE_S3_URI|TEST_BINARY_OBJECT_KEY"
 )
 VERIFY_ACTION = "$/.github/actions/verify-attestation"
+SETUP_SPICED = "$/.github/actions/setup-spiced"
 WRITE_GATE = re.compile(r"steps\.ci-role\.outputs\.full\s*==\s*'true'|env\.CI_CACHE_READ_ONLY\s*!=\s*'true'")
 # Inputs that name a build other than the run's own commit, which a job has to hand to the
 # role step: commits and refs as `builds`, which keep the full roles only for trunk's, and
@@ -303,6 +304,22 @@ def check_ci_role_jobs(document: dict) -> list[str]:
                         f"does not verify it with `{VERIFY_ACTION}`, so a full-role job would run a file "
                         "the store took from off trunk"
                     )
+            if step.get("uses") == SETUP_SPICED and str((step.get("with") or {}).get("verify", "")).strip() != (
+                "${{ steps.ci-role.outputs.full }}"
+            ):
+                problems.append(
+                    f"job `{name}` step `{label}` runs setup-spiced without `verify: ${{{{ steps.ci-role.outputs.full }}}}`, "
+                    "so with the full roles it would run a spiced nobody checked"
+                )
+            condition = str(step.get("if", "")).strip()
+            if step.get("uses") == VERIFY_ACTION and step.get("if") is not None and (
+                not re.match(r"(?:\$\{\{\s*)?steps\.ci-role\.outputs\.full\s*==\s*'true'\s*(?:&&|\}\}|$)", condition)
+                or re.search(r"(?<![\w.-])env\s*[.\[]", condition)
+            ):
+                problems.append(
+                    f"job `{name}` step `{label}` verifies only `if: {step.get('if')}`; gate it on "
+                    "`steps.ci-role.outputs.full == 'true'` first and on no `env` value, which an earlier step can change"
+                )
             if "aws-actions/configure-aws-credentials" in str(step.get("uses", "")):
                 role = str((step.get("with") or {}).get("role-to-assume", ""))
                 if not ROLE_CHOICE.fullmatch(role.strip()):

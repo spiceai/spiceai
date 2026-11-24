@@ -159,6 +159,7 @@ jobs:
       - name: Setup spiced
         uses: $/.github/actions/setup-spiced
         with:
+          verify: ${{ steps.ci-role.outputs.full }}
           spiced_commit: ${{ inputs.spiced_commit }}
 
       - name: Build Testoperator

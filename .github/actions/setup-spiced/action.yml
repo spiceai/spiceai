@@ -3,8 +3,8 @@ description: 'composite action'
 
 # Downloads the most recent spiced build from MinIO, within the last 10 commits. A run off trunk
 # reads the builds of its own ref, under `untrusted/<ref>/` (.github/actions/ci-store-prefix);
-# a job with the full CI roles (CI_ROLE_FULL) runs spiced only once build_release.yml's trunk
-# attestation of it verifies.
+# a job with the full CI roles (`verify`) runs spiced only once build_release.yml's trunk
+# attestation of it, for that commit, verifies.
 #
 # Requires the MinIO CLI to be installed and configured to use this action
 inputs:
@@ -15,6 +15,10 @@ inputs:
     description: 'target ref'
     required: false
     default: 'refs/heads/trunk'
+  verify: # `steps.ci-role.outputs.full` in a job with a CI AWS role
+    description: '`true` to run spiced only if build_release.yml attested it on trunk; a CI role job passes its role step''s `full` output'
+    required: false
+    default: 'false'
   with_odbc: # whether to download the ODBC-enabled binary
     description: 'download the ODBC-enabled spiced binary'
     required: false
@@ -124,11 +128,12 @@ runs:
 
     # With the full CI roles, spiced runs only if build_release.yml built and attested it on trunk.
     - name: Verify spiced's build attestation
-      if: env.CI_ROLE_FULL == 'true'
+      if: inputs.verify == 'true'
       uses: $/.github/actions/verify-attestation
       with:
         file: ${{ steps.download.outputs.archive }}
         signer-workflow: .github/workflows/build_release.yml
+        source-commit: ${{ steps.output_spiced_commit.outputs.SPICED_COMMIT }}
 
     - name: Install spiced
       shell: bash

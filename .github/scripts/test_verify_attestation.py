@@ -42,7 +42,12 @@ class VerifyAttestationTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def verify(self, file=None, gh_exit=0):
+    def test_a_source_commit_is_required_of_the_attestation(self):
+        proc = self.verify(source_commit="0123abc")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(self.calls.read_text().rstrip("\n").endswith("--source-ref refs/heads/trunk --source-digest 0123abc"))
+
+    def verify(self, file=None, gh_exit=0, source_commit=""):
         env = {
             "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
             "FILE": str(file or self.file),
@@ -50,6 +55,7 @@ class VerifyAttestationTest(unittest.TestCase):
             "GITHUB_REPOSITORY": "spiceai/spiceai",
             "GH_TOKEN": "a-token",
             "FAKE_GH_EXIT": str(gh_exit),
+            "SOURCE_COMMIT": source_commit,
         }
         return subprocess.run(["bash", str(self.script)], env=env, capture_output=True, text=True, timeout=30)
 

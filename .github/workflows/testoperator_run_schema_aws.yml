@@ -143,6 +143,7 @@ jobs:
         uses: $/.github/actions/setup-spiced
         id: setup-spiced
         with:
+          verify: ${{ steps.ci-role.outputs.full }}
           spiced_commit: ${{ inputs.spiced_commit }}
 
       - name: Display spiced commit

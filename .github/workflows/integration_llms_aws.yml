@@ -137,11 +137,12 @@ jobs:
 
       # With the full CI roles, it runs only if the build job attested it on trunk.
       - name: Verify the test binary's build attestation
-        if: env.CI_ROLE_FULL == 'true'
+        if: steps.ci-role.outputs.full == 'true'
         uses: $/.github/actions/verify-attestation
         with:
           file: ./integration_test/llms_integration_test
           signer-workflow: .github/workflows/integration_llms.yml
+          source-commit: ${{ inputs.ref || github.sha }}
 
       - name: Mark test binary as executable
         run: chmod +x ./integration_test/llms_integration_test

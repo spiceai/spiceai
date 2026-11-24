@@ -13,6 +13,10 @@ inputs:
   signer-workflow:
     description: The workflow that builds and attests it on trunk, e.g. `.github/workflows/build_release.yml`.
     required: true
+  source-commit:
+    description: The commit the file must have been built from (`--source-digest`), so an older trunk build cannot stand in for it.
+    required: false
+    default: ''
   token:
     description: A token that can read this repository's attestations.
     required: false
@@ -26,6 +30,7 @@ runs:
       env:
         FILE: ${{ inputs.file }}
         SIGNER_WORKFLOW: ${{ inputs.signer-workflow }}
+        SOURCE_COMMIT: ${{ inputs.source-commit }}
         GH_TOKEN: ${{ inputs.token }}
       run: |
         set -euo pipefail
@@ -35,7 +40,7 @@ runs:
         fi
         signer="${GITHUB_REPOSITORY}/${SIGNER_WORKFLOW#./}"
         if ! out="$(gh attestation verify "$FILE" --repo "$GITHUB_REPOSITORY" \
-          --signer-workflow "$signer" --source-ref refs/heads/trunk 2>&1)"; then
+          --signer-workflow "$signer" --source-ref refs/heads/trunk ${SOURCE_COMMIT:+--source-digest "$SOURCE_COMMIT"} 2>&1)"; then
           printf '%s\n' "$out"
           echo "::error::$FILE has no build attestation from $signer on trunk; not running it."
           exit 1

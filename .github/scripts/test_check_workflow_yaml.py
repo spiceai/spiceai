@@ -572,7 +572,7 @@ class CheckCiRoleJobsTest(unittest.TestCase):
             "      - name: Fallback\n        uses: actions/download-artifact@v8\n"
         )
         verify = (
-            "      - name: Verify\n        if: env.CI_ROLE_FULL == 'true'\n"
+            "      - name: Verify\n        if: steps.ci-role.outputs.full == 'true'\n"
             f"        uses: {check_workflow_yaml.VERIFY_ACTION}\n"
             "        with:\n          file: ./x.tar.zst\n          signer-workflow: .github/workflows/x.yml\n"
         )
@@ -582,6 +582,31 @@ class CheckCiRoleJobsTest(unittest.TestCase):
         problems = self.problems(steps + download + run + verify)
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("step `Download` downloads from the CI object store", problems[0])
+
+    def test_spiced_and_verify_steps_follow_the_role_steps_output(self):
+        steps = CHOOSE + ASSUME.format(role=CHOSEN)
+        spiced = f"      - name: Setup spiced\n        uses: {check_workflow_yaml.SETUP_SPICED}\n"
+        with self.subTest(case="setup-spiced without verify"):
+            problems = self.problems(steps + spiced)
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("runs setup-spiced without", problems[0])
+        with self.subTest(case="setup-spiced with verify"):
+            ok = spiced + "        with:\n          verify: ${{ steps.ci-role.outputs.full }}\n"
+            self.assertEqual(self.problems(steps + ok), [])
+        with self.subTest(case="verify gated on the environment"):
+            verify = (
+                "      - name: Verify\n        if: env.CI_ROLE_FULL == 'true'\n"
+                f"        uses: {check_workflow_yaml.VERIFY_ACTION}\n"
+            )
+            problems = self.problems(steps + verify)
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("on no `env` value", problems[0])
+        with self.subTest(case="verify gated on the role and an input"):
+            verify = (
+                "      - name: Verify\n        if: steps.ci-role.outputs.full == 'true' && inputs.x == 'true'\n"
+                f"        uses: {check_workflow_yaml.VERIFY_ACTION}\n"
+            )
+            self.assertEqual(self.problems(steps + verify), [])
 
     def test_an_image_input_goes_to_images_not_builds(self):
         document = REUSABLE_CI_ROLE.replace(
