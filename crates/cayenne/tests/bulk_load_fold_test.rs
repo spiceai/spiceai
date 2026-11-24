@@ -21,8 +21,8 @@ use crate::common;
 use arrow::array::{AsArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use arrow::record_batch::RecordBatch;
+use cayenne::MetadataCatalog;
 use cayenne::metadata::{CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneTableProvider, MetadataCatalog};
 use datafusion::datasource::{TableProvider, memory::MemorySourceConfig};
 use datafusion::physical_plan::collect;
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -36,8 +36,8 @@ use util::session_state::{SupersededReason, SupersededRows};
 
 const SEED: u64 = 0x5eed_cafe_1234_5678;
 
-test_with_backends!(bulk_load_round_robin_keeps_last_arrival_impl);
-test_with_backends!(bulk_load_clustered_keeps_last_arrival_impl);
+test_on_data_store!(bulk_load_round_robin_keeps_last_arrival_impl);
+test_on_data_store!(bulk_load_clustered_keeps_last_arrival_impl);
 
 async fn bulk_load_round_robin_keeps_last_arrival_impl(
     fixture: common::TestFixture,
@@ -70,30 +70,32 @@ async fn check_load(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            catalog,
-            CreateTableOptions {
-                table_name: "loaded".into(),
-                schema: Arc::clone(&schema),
-                primary_key: keys.clone(),
-                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(keys))),
-                base_path: fixture.data_path.to_string_lossy().into_owned(),
-                partition_column: None,
-                vortex_config: VortexConfig {
-                    deletion_mode: DeletionMode::Key,
-                    inline_max_rows: 0,
-                    inline_max_buffer_bytes: 0,
-                    target_vortex_file_size_mb: 1,
-                    write_concurrency: Some(4),
-                    cluster_by: if clustered { vec!["id".into()] } else { vec![] },
-                    compaction_background_interval_ms: 0,
-                    compaction_trigger_files: usize::MAX,
-                    ..Default::default()
+        fixture
+            .data_store
+            .create(
+                catalog,
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: "loaded".into(),
+                    schema: Arc::clone(&schema),
+                    primary_key: keys.clone(),
+                    on_conflict: Some(OnConflict::Upsert(ColumnReference::new(keys))),
+                    base_path: fixture.data_store.base_path("loaded"),
+                    partition_column: None,
+                    vortex_config: VortexConfig {
+                        deletion_mode: DeletionMode::Key,
+                        inline_max_rows: 0,
+                        inline_max_buffer_bytes: 0,
+                        target_vortex_file_size_mb: 1,
+                        write_concurrency: Some(4),
+                        cluster_by: if clustered { vec!["id".into()] } else { vec![] },
+                        compaction_background_interval_ms: 0,
+                        compaction_trigger_files: usize::MAX,
+                        ..Default::default()
+                    },
                 },
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+            )
+            .await?,
     );
     ctx.register_table("loaded", Arc::clone(&table) as Arc<dyn TableProvider>)?;
     let mut rng = SEED;
@@ -185,18 +187,16 @@ async fn check_load(
         .into_keys()
         .collect();
     snapshot_ids.insert(metadata.current_snapshot_id.clone());
-    let mut files = Vec::new();
-    for snapshot_id in snapshot_ids {
-        let snapshot_dir = std::path::Path::new(&metadata.path)
-            .join(&metadata.table_id)
-            .join(snapshot_id);
-        for entry in std::fs::read_dir(snapshot_dir)? {
-            let path = entry?.path();
-            if path.extension().is_some_and(|ext| ext == "vortex") {
-                files.push(path);
-            }
-        }
-    }
+    let snapshot_ids: Vec<String> = snapshot_ids.into_iter().collect();
+    let files = fixture
+        .data_store
+        .snapshot_data_files(
+            fixture.catalog.as_ref(),
+            &metadata.table_id,
+            &metadata.path,
+            &snapshot_ids,
+        )
+        .await?;
     assert!(
         files.len() > 1,
         "seed={SEED:#x}: fold must retain multiple data files, got {}",
