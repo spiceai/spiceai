@@ -359,21 +359,23 @@ async fn decode_parameterized_request(
         &format!("substrait-template:{}", parameterized.template_digest),
         context,
     );
-    let cached = match (plan_key.as_ref(), datafusion.plans_cache_provider()) {
-        (Some(key), Some(plans)) => plans.get_raw_key(&key.as_u64()).await,
-        _ => None,
+    let cached = if let Some(key) = plan_key.as_ref()
+        && let Some(plans) = datafusion.plans_cache_provider()
+    {
+        plans.get_raw_key(&key.as_u64()).await
+    } else {
+        None
     };
-    let (template, source) = match cached {
-        Some(plan) => (Arc::unwrap_or_clone(plan), TemplateSource::Cached),
-        None => {
-            let plan = lower_plan(&parameterized.template, &session).await?;
-            if let Some(key) = plan_key.as_ref()
-                && !matches!(plan, LogicalPlan::Ddl(_))
-            {
-                datafusion.cache_plan_planned_in(&session, key, &plan).await;
-            }
-            (plan, TemplateSource::Decoded)
+    let (template, source) = if let Some(plan) = cached {
+        (Arc::unwrap_or_clone(plan), TemplateSource::Cached)
+    } else {
+        let plan = lower_plan(&parameterized.template, &session).await?;
+        if let Some(key) = plan_key.as_ref()
+            && !matches!(plan, LogicalPlan::Ddl(_))
+        {
+            datafusion.cache_plan_planned_in(&session, key, &plan).await;
         }
+        (plan, TemplateSource::Decoded)
     };
 
     let values = binding_values(&parameterized, &session).await?;
