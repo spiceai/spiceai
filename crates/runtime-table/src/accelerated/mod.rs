@@ -2353,6 +2353,11 @@ impl AcceleratedTable {
                     filters,
                     federated_provider.as_ref(),
                 ));
+                let mut cache_scan_filters = scan_filters.to_vec();
+                if let Some(filter) = restriction.scan_filter(&self.accelerator.schema()) {
+                    cache_scan_filters.push(filter);
+                }
+                let scan_filters = cache_scan_filters.as_slice();
                 let cache_scan_limit = if restriction.is_active(&self.accelerator.schema()) {
                     None
                 } else {

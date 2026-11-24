@@ -777,6 +777,24 @@ impl RequestEntryRestriction {
             && schema.column_with_name(CACHE_REQUEST_COLUMN).is_some()
     }
 
+    /// Narrow the storage scan while retaining the post-scan restriction.
+    pub(super) fn scan_filter(&self, schema: &arrow::datatypes::Schema) -> Option<Expr> {
+        if !self.is_active(schema) {
+            return None;
+        }
+        let keys = self.keys.as_ref().filter(|keys| !keys.is_empty())?;
+        let mut keys: Vec<_> = keys.iter().collect();
+        keys.sort_unstable();
+        Some(if keys.len() == 1 {
+            col(CACHE_REQUEST_COLUMN).eq(lit(keys[0].as_str()))
+        } else {
+            col(CACHE_REQUEST_COLUMN).in_list(
+                keys.into_iter().map(|key| lit(key.as_str())).collect(),
+                false,
+            )
+        })
+    }
+
     fn apply(&self, batch: RecordBatch) -> DataFusionResult<RecordBatch> {
         if !self.is_active(&batch.schema()) {
             return Ok(batch);
@@ -862,10 +880,16 @@ pub fn extend_schema_with_cache_request(
     let mut fields: Vec<Field> = schema.fields().iter().map(|f| (**f).clone()).collect();
     fields.push(
         Field::new(CACHE_REQUEST_COLUMN, arrow::datatypes::DataType::Utf8, true).with_metadata(
-            HashMap::from([(
-                arrow_tools::metadata_keys::OPTIONAL_TRAILING_COLUMN_METADATA_KEY.to_string(),
-                "true".to_string(),
-            )]),
+            HashMap::from([
+                (
+                    arrow_tools::metadata_keys::OPTIONAL_TRAILING_COLUMN_METADATA_KEY.to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    arrow_tools::metadata_keys::AUTOMATIC_INDEX_METADATA_KEY.to_string(),
+                    "true".to_string(),
+                ),
+            ]),
         ),
     );
     Ok(arrow::datatypes::Schema::new_with_metadata(

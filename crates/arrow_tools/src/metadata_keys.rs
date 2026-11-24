@@ -152,3 +152,10 @@ pub const HTTP_RESPONSE_STATUS_METADATA_KEY: &str = "spice.http_response_status"
 /// projection. Named for the fetch/page it counts, not the rows in it — one
 /// increment can stand for a batch of any row count, including zero.
 pub const HTTP_TRANSIENT_FAILURE_METRIC_NAME: &str = "http_transient_failure_fetches";
+
+/// Field-level metadata requesting an internal single-column secondary index.
+///
+/// The value is `"true"`. Consumers resolve this against the opened storage
+/// schema, omitting the index when an older table lacks the marked column.
+/// This is independent of user-declared acceleration indexes.
+pub const AUTOMATIC_INDEX_METADATA_KEY: &str = "spice.automatic_index";

@@ -3938,6 +3938,7 @@ pub struct CayenneTableProviderBuilder {
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
     secondary_indexes: Vec<Vec<String>>,
+    automatic_index_columns: Vec<String>,
     index_persistence: IndexPersistence,
     index_word_bits: Option<u32>,
     dataset_name: Option<Arc<str>>,
@@ -3967,13 +3968,35 @@ fn validated_lookup_index_keys(
     schema: &arrow_schema::Schema,
     indexes: &[Vec<String>],
     memory_mode: bool,
+    automatic_index_columns: &[String],
 ) -> CatalogResult<Vec<super::lookup_index::KeySpec>> {
     let invalid = |message| Error::InvalidConfiguration {
         table: table_name.to_string(),
         message,
     };
     let mut keys: Vec<super::lookup_index::KeySpec> = Vec::new();
-    for key in super::lookup_index::KeySpec::from_indexes(indexes) {
+    let mut indexes = indexes.to_vec();
+    // Requested metadata also covers tables whose stored column predates the
+    // marker. Only columns present in the opened schema receive an index.
+    indexes.extend(
+        automatic_index_columns
+            .iter()
+            .filter(|name| schema.column_with_name(name).is_some())
+            .map(|name| vec![name.clone()]),
+    );
+    indexes.extend(
+        schema
+            .fields()
+            .iter()
+            .filter(|field| {
+                field
+                    .metadata()
+                    .get(arrow_tools::metadata_keys::AUTOMATIC_INDEX_METADATA_KEY)
+                    .is_some_and(|value| value == "true")
+            })
+            .map(|field| vec![field.name().clone()]),
+    );
+    for key in super::lookup_index::KeySpec::from_indexes(&indexes) {
         let mut columns = Vec::with_capacity(key.columns().len());
         for column in key.columns() {
             let column =
@@ -4093,6 +4116,7 @@ struct CayenneTableProviderOpenOptions {
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
     secondary_indexes: Vec<Vec<String>>,
+    automatic_index_columns: Vec<String>,
     index_persistence: IndexPersistence,
     index_word_bits: Option<u32>,
     dataset_name: Option<Arc<str>>,
@@ -4150,6 +4174,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: false,
             scan_view_reuse: ScanViewReuse::UntilInvalidated,
             secondary_indexes: Vec::new(),
+            automatic_index_columns: Vec::new(),
             index_persistence: IndexPersistence::default(),
             index_word_bits: None,
             dataset_name: None,
@@ -4280,6 +4305,24 @@ impl CayenneTableProviderBuilder {
         self
     }
 
+    /// Request internal indexes from field metadata, independently of configured
+    /// indexes. Missing columns in an older stored schema are ignored on open.
+    #[must_use]
+    pub fn with_schema_indexes(mut self, schema: &arrow_schema::Schema) -> Self {
+        self.automatic_index_columns = schema
+            .fields()
+            .iter()
+            .filter(|field| {
+                field
+                    .metadata()
+                    .get(arrow_tools::metadata_keys::AUTOMATIC_INDEX_METADATA_KEY)
+                    .is_some_and(|value| value == "true")
+            })
+            .map(|field| field.name().clone())
+            .collect();
+        self
+    }
+
     /// Whether the secondary index runs persist as run files. Hidden, for
     /// testing.
     #[doc(hidden)]
@@ -4317,6 +4360,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
             secondary_indexes: self.secondary_indexes,
+            automatic_index_columns: self.automatic_index_columns,
             index_persistence: self.index_persistence,
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
@@ -4343,6 +4387,7 @@ impl CayenneTableProviderBuilder {
             &options.schema,
             &self.secondary_indexes,
             options.vortex_config.memory_mode,
+            &self.automatic_index_columns,
         )?;
         // A create of a table the catalog holds opens it (a restart creates
         // every table again); an error reading it counts as a new table, which
@@ -4359,6 +4404,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
             secondary_indexes: self.secondary_indexes,
+            automatic_index_columns: self.automatic_index_columns,
             index_persistence: self.index_persistence,
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
@@ -12040,6 +12086,7 @@ impl CayenneTableProvider {
             durable_write_back,
             scan_view_reuse,
             secondary_indexes,
+            automatic_index_columns,
             index_persistence,
             index_word_bits,
             dataset_name,
@@ -12284,6 +12331,7 @@ impl CayenneTableProvider {
             &table_metadata.schema,
             &secondary_indexes,
             table_metadata.vortex_config.memory_mode,
+            &automatic_index_columns,
         )?;
         // Shared with the lookup index, which invalidates cached scan views when
         // its published index changes.

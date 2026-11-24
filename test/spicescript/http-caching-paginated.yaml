@@ -111,6 +111,9 @@ steps:
     expect: { rows: [['{"item":"item-0"}'], ['{"item":"item-1"}'], ['{"item":"item-2"}'], ['{"item":"item-3"}'], ['{"item":"item-4"}']] }
   - source-query: { api: count /v1/pages }
     expect: { rows: [['3']] }
+  - explain: SELECT content FROM pages WHERE request_path = '/pages' ORDER BY content
+    analyze: true
+    contains: ['lookup_index=__spice_cache_request']
   # The storage-only request column stays out of the dataset's columns.
   - query: SELECT count(*) FROM information_schema.columns WHERE table_name = 'pages' AND column_name IN ('__spice_cache_request', '__spice_cache_namespace')
     expect: { rows: [['0']] }
