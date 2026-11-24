@@ -883,7 +883,7 @@ mod accelerator_compat_tests {
                         }
                     }
                 }
-                _ => panic!("Unsupported engine for this test"),
+                Engine::PartitionedArrow => panic!("Unsupported engine for this test"),
             };
 
             test_fn(engine, table, mode_label.clone(), &test_env).await;
@@ -2035,7 +2035,7 @@ mod accelerator_compat_tests {
                             .await
                             .expect("Vortex table should be created")
                     }
-                    _ => panic!("Unsupported engine: {:?}", engine),
+                    Engine::PartitionedArrow => panic!("Unsupported engine: {:?}", engine),
                 };
 
                 // Insert boolean data
