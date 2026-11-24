@@ -390,7 +390,7 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
     if let Some(sv) = cs.min_value.get_value()
         && let Some(vortex_sv) = df_scalar_to_vortex(sv)
     {
-        let precision = if cs.min_value.is_exact().is_some() {
+        let precision = if cs.min_value.is_exact() == Some(true) {
             VortexPrecision::Exact(vortex_sv)
         } else {
             VortexPrecision::Inexact(vortex_sv)
@@ -401,7 +401,7 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
     if let Some(sv) = cs.max_value.get_value()
         && let Some(vortex_sv) = df_scalar_to_vortex(sv)
     {
-        let precision = if cs.max_value.is_exact().is_some() {
+        let precision = if cs.max_value.is_exact() == Some(true) {
             VortexPrecision::Exact(vortex_sv)
         } else {
             VortexPrecision::Inexact(vortex_sv)
@@ -419,7 +419,7 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
     if let Some(sv) = cs.sum_value.get_value()
         && let Some(vortex_sv) = df_scalar_to_vortex(sv)
     {
-        let precision = if cs.sum_value.is_exact().is_some() {
+        let precision = if cs.sum_value.is_exact() == Some(true) {
             VortexPrecision::Exact(vortex_sv)
         } else {
             VortexPrecision::Inexact(vortex_sv)
@@ -438,7 +438,7 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
         match u64::try_from(*size) {
             Ok(size_u64) => {
                 let vortex_sv = vortex::scalar::ScalarValue::from(size_u64);
-                if cs.byte_size.is_exact().is_some() {
+                if cs.byte_size.is_exact() == Some(true) {
                     stats.set(
                         Stat::UncompressedSizeInBytes,
                         VortexPrecision::Exact(vortex_sv),
@@ -490,7 +490,7 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
             return stats;
         };
         let vortex_sv = vortex::scalar::ScalarValue::from(count_u64);
-        if cs.null_count.is_exact().is_some() {
+        if cs.null_count.is_exact() == Some(true) {
             stats.set(Stat::NullCount, VortexPrecision::Exact(vortex_sv));
         } else {
             stats.set(Stat::NullCount, VortexPrecision::Inexact(vortex_sv));
@@ -651,7 +651,7 @@ fn align_column_stats_to_schema(cs: &ColumnStatistics, column_type: &DataType) -
             return bound.clone();
         };
         match retag_bound_to_column(value.clone(), column_type) {
-            Some(aligned) if bound.is_exact().is_some() => Precision::Exact(aligned),
+            Some(aligned) if bound.is_exact() == Some(true) => Precision::Exact(aligned),
             Some(aligned) => Precision::Inexact(aligned),
             None => Precision::Absent,
         }
@@ -870,6 +870,111 @@ mod tests {
         ColumnStatistics, ScalarValue, Statistics, stats::Precision as DfPrecision,
     };
     use std::sync::Arc;
+
+    /// An inexact statistic stays inexact through the per-file blob a scan persists from a
+    /// footer, and an exact one stays exact. `Precision::is_exact` is `Some(false)` for an
+    /// inexact value, so testing it with `is_some()` persisted every inexact bound, null
+    /// count, sum and size as exact: after a restart a string column's 64-byte footer bound
+    /// answered `MIN`/`MAX` as if it were the value.
+    #[test]
+    fn inexact_column_statistics_stay_inexact_through_the_persisted_blob() {
+        let schema = Schema::new(vec![
+            Field::new("t", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, true),
+        ]);
+        let bound = |c: char| ScalarValue::Utf8(Some(c.to_string().repeat(64)));
+        for (label, wrap) in [
+            (
+                "inexact",
+                DfPrecision::Inexact as fn(ScalarValue) -> DfPrecision<ScalarValue>,
+            ),
+            (
+                "exact",
+                DfPrecision::Exact as fn(ScalarValue) -> DfPrecision<ScalarValue>,
+            ),
+        ] {
+            let count = |n: usize| {
+                if label == "exact" {
+                    DfPrecision::Exact(n)
+                } else {
+                    DfPrecision::Inexact(n)
+                }
+            };
+            let stats = Statistics {
+                num_rows: DfPrecision::Exact(3),
+                total_byte_size: DfPrecision::Exact(30),
+                column_statistics: vec![
+                    ColumnStatistics {
+                        null_count: count(1),
+                        min_value: wrap(bound('a')),
+                        max_value: wrap(bound('z')),
+                        sum_value: DfPrecision::Absent,
+                        distinct_count: DfPrecision::Absent,
+                        byte_size: count(20),
+                    },
+                    ColumnStatistics {
+                        null_count: count(0),
+                        min_value: wrap(ScalarValue::Int64(Some(1))),
+                        max_value: wrap(ScalarValue::Int64(Some(3))),
+                        sum_value: wrap(ScalarValue::Int64(Some(6))),
+                        distinct_count: DfPrecision::Absent,
+                        byte_size: count(10),
+                    },
+                ],
+            };
+            let blob = statistics_to_persisted_blob(&stats, &schema).expect("blob");
+            let restored = restore_persisted_statistics(&blob, &Arc::new(schema.clone()), 3)
+                .expect("restore")
+                .statistics;
+            let [t, n] = restored.column_statistics.as_slice() else {
+                panic!("{label}: two columns");
+            };
+            assert_eq!(t.min_value, wrap(bound('a')), "{label}: t min");
+            assert_eq!(t.max_value, wrap(bound('z')), "{label}: t max");
+            // A count Vortex keeps only when exact comes back absent rather than inexact,
+            // which is as safe: it is never served as exact.
+            let counted = |restored: &DfPrecision<usize>, expected: usize| {
+                if label == "exact" {
+                    *restored == DfPrecision::Exact(expected)
+                } else {
+                    !matches!(restored, DfPrecision::Exact(_))
+                }
+            };
+            assert!(
+                counted(&t.null_count, 1),
+                "{label}: t nulls {:?}",
+                t.null_count
+            );
+            assert!(
+                counted(&t.byte_size, 20),
+                "{label}: t size {:?}",
+                t.byte_size
+            );
+            assert_eq!(
+                n.min_value,
+                wrap(ScalarValue::Int64(Some(1))),
+                "{label}: n min"
+            );
+            assert_eq!(
+                n.max_value,
+                wrap(ScalarValue::Int64(Some(3))),
+                "{label}: n max"
+            );
+            if label == "exact" {
+                assert_eq!(
+                    n.sum_value,
+                    wrap(ScalarValue::Int64(Some(6))),
+                    "exact: n sum"
+                );
+            } else {
+                assert!(
+                    !matches!(n.sum_value, DfPrecision::Exact(_)),
+                    "inexact: n sum {:?}",
+                    n.sum_value
+                );
+            }
+        }
+    }
 
     fn restored_column(
         data_type: DataType,
