@@ -40,9 +40,7 @@ use arrow::record_batch::RecordBatch;
 
 use cayenne::metadata::{CreateTableOptions, DeletionMode, VortexConfig};
 use cayenne::provider::CayenneContext;
-use cayenne::{
-    CayenneTableProvider, CayenneTableProviderBuilder, LastSmallFileCompactPath, MetadataCatalog,
-};
+use cayenne::{CayenneTableProvider, LastSmallFileCompactPath, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
 use datafusion_expr::dml::InsertOp;
@@ -50,11 +48,11 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
 
-test_with_backends!(position_mode_deletion_index_reaches_bounded_steady_state);
-test_with_backends!(key_mode_deletion_index_still_reclaims);
+test_on_data_store!(position_mode_deletion_index_reaches_bounded_steady_state);
+test_on_data_store!(key_mode_deletion_index_still_reclaims);
 test_with_backends!(default_mode_small_table_reclaims_by_rewriting_itself);
 test_with_backends!(default_mode_table_past_its_bound_reclaims_through_the_bake);
-test_with_backends!(small_write_profile_deletion_index_reclaims_through_the_bake);
+test_on_data_store!(small_write_profile_deletion_index_reclaims_through_the_bake);
 test_with_backends!(empty_table_reclaim_clears_tombstones_and_survives_reopen);
 
 /// Rows per upsert round. Above `INLINE_MAX_ROWS` so each round writes a Vortex
@@ -148,17 +146,25 @@ async fn build_table_with_config(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(name),
         partition_column: None,
         vortex_config,
     };
 
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let mut builder = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env());
-    if let Some(context) = context {
-        builder = builder.with_context(context);
-    }
-    Ok(Arc::new(builder.create(options).await?))
+    let table = fixture
+        .data_store
+        .create_with(
+            catalog,
+            ctx.runtime_env(),
+            options,
+            |builder| match context {
+                Some(context) => builder.with_context(context),
+                None => builder,
+            },
+        )
+        .await?;
+    Ok(Arc::new(table))
 }
 
 /// Deleting every row still requires a durable empty rewrite before the
@@ -226,8 +232,9 @@ async fn empty_table_reclaim_clears_tombstones_and_survives_reopen(
             common::fixture_catalog(fixture.connection_string()).await?;
         catalog.init().await?;
         let reopened = Arc::new(
-            CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-                .open(&name)
+            fixture
+                .data_store
+                .open(catalog, ctx.runtime_env(), &name)
                 .await?,
         );
         assert_eq!(reopened.deletion_index_len(), 0, "{name}: durable prune");

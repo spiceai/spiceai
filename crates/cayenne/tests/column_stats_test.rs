@@ -31,8 +31,8 @@ use cayenne::metadata::{CreateTableOptions, TableStatistics};
 use std::sync::Arc;
 
 // Generate test variants for each backend
-test_with_backends!(test_table_statistics_crud);
-test_with_backends!(test_stats_cleared_on_drop_table);
+test_on_data_store!(test_table_statistics_crud);
+test_on_data_store!(test_stats_cleared_on_drop_table);
 
 /// Test basic CRUD operations on `cayenne_table_statistics`.
 async fn test_table_statistics_crud(
@@ -51,7 +51,7 @@ async fn test_table_statistics_crud(
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: fixture.data_path.to_string_lossy().to_string(),
+            base_path: fixture.data_store.base_path("stats_test"),
             partition_column: None,
             vortex_config: cayenne::metadata::VortexConfig::default(),
         })
@@ -122,7 +122,7 @@ async fn test_stats_cleared_on_drop_table(
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: fixture.data_path.to_string_lossy().to_string(),
+            base_path: fixture.data_store.base_path("drop_stats_test"),
             partition_column: None,
             vortex_config: cayenne::metadata::VortexConfig::default(),
         })
