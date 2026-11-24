@@ -311,10 +311,10 @@ jobs:
       # `~/.cargo/bin` when it restored — the rustup proxies (`cargo`, `rustc`,
       # `rustup`) included. A trunk push saving the cache therefore pulls `cargo` out
       # from under whatever job a sibling instance on the same Mac is running, which
-      # then fails `cargo: command not found` (exit 127) mid-build. Nothing is lost by
-      # skipping it: `~/.cargo` and `target/` persist on those hosts and sccache serves
-      # the compile, while the restore of this multi-GB cache spends up to ten minutes
-      # before it lands or gives up.
+      # then fails `cargo: command not found` (exit 127) mid-build. setup-rust now gives
+      # each job there its own CARGO_HOME, so that race is gone, but the restore of this
+      # multi-GB cache spends up to ten minutes before it lands or gives up, while
+      # `target/` persists on those hosts and sccache serves the compile.
 
       - name: Install Protoc
         uses: $/.github/actions/install-protoc

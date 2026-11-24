@@ -778,9 +778,10 @@ jobs:
       # including jobs like e2e_test_ci that deliberately start from a fresh
       # CARGO_HOME, for a report none of them make.
       #
-      # Cost is one resolution pass with no compilation (~10s against this runner's
-      # warm ~/.cargo), whose registry and git-dependency fetches the build in the
-      # next steps performs anyway.
+      # Cost is one resolution pass with no compilation (~10s against a warm
+      # registry; this job's CARGO_HOME starts empty, since setup-rust gives each job
+      # on these Macs its own), whose registry and git-dependency fetches the build in
+      # the next steps performs anyway.
       - name: Check Cargo.lock matches the manifests
         if: needs.check_changes.outputs.relevant_changes == 'true'
         # Invoked through `bash` rather than as a path so the job does not depend on

@@ -50,12 +50,15 @@ runs:
         mkdir -p ${CARGO_HOME:-~/.cargo}/bin
         curl -LsSf https://get.nexte.st/0.9.89/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
+    # The job's CARGO_HOME, which setup-rust makes the job's own on a self-hosted Mac. A
+    # copy restored into the shared ~/.cargo/bin would be one any job on the host can
+    # replace, and outside the job's own bin.
     - name: Cache Nextest binary (macOS)
       if: runner.os == 'macOS'
       id: cache-nextest-macos
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        path: ~/.cargo/bin/cargo-nextest
+        path: ${{ env.CARGO_HOME || '~/.cargo' }}/bin/cargo-nextest
         key: nextest-macos-${{ runner.arch }}-0.9.89
 
     - name: Install Nextest (macOS)

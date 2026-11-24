@@ -2,8 +2,8 @@
 """Tests for check_ci_cache_pins.py, run on a copy of the files it reads.
 
 Each test copies the checker, pins.json, rust-toolchain.toml and the install-cargo-deny
-action into a temporary tree laid out like the repository, changes one of them, and runs
-the checker there as CI does.
+and setup-rust actions into a temporary tree laid out like the repository, changes one of
+them, and runs the checker there as CI does.
 """
 
 import json
@@ -19,6 +19,7 @@ FILES = [
     ".github/scripts/check_ci_cache_pins.py",
     ".github/ci-cache/pins.json",
     ".github/actions/install-cargo-deny/action.yml",
+    ".github/actions/setup-rust/action.yml",
     "rust-toolchain.toml",
 ]
 
@@ -68,6 +69,44 @@ class CheckCiCachePinsTest(unittest.TestCase):
         result = self.run_check()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("rust-toolchain.toml names Rust 1.0.0", result.stdout)
+
+    def test_the_repository_pins_rustup_init_for_every_mac_setup_rust_maps(self):
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r"rustup-init \d+\.\d+\.\d+\.")
+
+    def test_every_mac_host_setup_rust_maps_must_have_a_rustup_init_pin(self):
+        self.edit_pins(lambda pins: pins["rustup-init"]["sha256"].pop("x86_64-apple-darwin"))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("rustup-init.sha256 has no pin for x86_64-apple-darwin", result.stdout)
+        self.assertIn("/x86_64-apple-darwin/rustup-init.sha256", result.stdout)
+
+    def test_a_missing_rustup_init_entry_fails(self):
+        self.edit_pins(lambda pins: pins.pop("rustup-init"))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("has no rustup-init entry", result.stdout)
+
+    def test_a_malformed_rustup_init_pin_fails(self):
+        def change(pins):
+            pins["rustup-init"]["version"] = "latest"
+            pins["rustup-init"]["url"] = "https://sh.rustup.rs/{version}/{target}"
+            pins["rustup-init"]["sha256"]["aarch64-apple-darwin"] = "ABC"
+
+        self.edit_pins(change)
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("rustup-init.version 'latest' is not a release version.", result.stdout)
+        self.assertIn("rustup-init.url must start with https://static.rust-lang.org/rustup/archive/", result.stdout)
+        self.assertIn("rustup-init.sha256.aarch64-apple-darwin is not a lowercase hex SHA-256.", result.stdout)
+
+    def test_a_setup_rust_with_no_mac_arms_fails(self):
+        action = self.tmp / ".github/actions/setup-rust/action.yml"
+        action.write_text("name: Sets up the Rust toolchain\nruns:\n  using: composite\n  steps: []\n")
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Found no `Darwin-<arch>) host_triple=<triple> ;;` arm", result.stdout)
 
 
 if __name__ == "__main__":

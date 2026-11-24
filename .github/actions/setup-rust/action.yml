@@ -79,6 +79,98 @@ runs:
       run: |
         set -euo pipefail
 
+        # The Rust host this runner is, for the pinned downloads below.
+        case "$(uname -s)-$(uname -m)" in
+          Linux-x86_64) host_triple=x86_64-unknown-linux-gnu ;;
+          Linux-aarch64) host_triple=aarch64-unknown-linux-gnu ;;
+          Darwin-arm64) host_triple=aarch64-apple-darwin ;;
+          Darwin-x86_64) host_triple=x86_64-apple-darwin ;;
+          *) host_triple='' ;;
+        esac
+
+        # A self-hosted Mac keeps its disk between jobs, and all of its runner instances run
+        # as one user, so any job there can write ~/.cargo and ~/.rustup: a pull request job
+        # could replace rustup, a toolchain or a crate source that a later trunk job runs.
+        # So a job there gets its own CARGO_HOME and RUSTUP_HOME under RUNNER_TEMP, which the
+        # runner empties when a job starts and again when it ends, and never reads ~/.cargo
+        # or ~/.rustup. Its rustup comes from the rustup-init that
+        # .github/ci-cache/pins.json pins, and its toolchain from the verified mirror below.
+        # The cargo registry and git checkouts live in CARGO_HOME, and sccache's local
+        # directory goes next to it, so no job reuses another's crate sources. Any Mac that
+        # is not GitHub-hosted counts, so one whose runner does not say is isolated too.
+        # GitHub-hosted runners and the Linux pods start each job empty and are unchanged.
+        per_job_home=false
+        if [ "${RUNNER_OS:-}" = macOS ] && [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]; then
+          per_job_home=true
+          rust_home="${RUNNER_TEMP:?RUNNER_TEMP is not set}/rust-home"
+          export CARGO_HOME="$rust_home/cargo" RUSTUP_HOME="$rust_home/rustup"
+          mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$rust_home/sccache"
+          {
+            echo "CARGO_HOME=$CARGO_HOME"
+            echo "RUSTUP_HOME=$RUSTUP_HOME"
+            echo "SCCACHE_DIR=$rust_home/sccache"
+          } >> "$GITHUB_ENV"
+
+          # cargo also reads .cargo/config.toml (and .cargo/config) in every directory above
+          # the one it runs in, whatever CARGO_HOME is, and on these hosts the directories
+          # above the checkout belong to that same user. A file there could set the compiler,
+          # a linker or a crate source for this job, so the job stops instead.
+          found=''
+          add_configs_above() {
+            local dir
+            case "$1" in /*) dir="$(dirname "$1")" ;; *) return 0 ;; esac
+            while :; do
+              for config in "$dir/.cargo/config" "$dir/.cargo/config.toml"; do
+                if { [ -e "$config" ] || [ -L "$config" ]; } && [[ " $found " != *" $config "* ]]; then
+                  found="$found $config"
+                fi
+              done
+              [ "$dir" = / ] && return 0
+              dir="$(dirname "$dir")"
+            done
+          }
+          for start in "${GITHUB_WORKSPACE:-$PWD}" "$RUNNER_TEMP"; do
+            add_configs_above "$start"
+            add_configs_above "$(cd "$start" 2>/dev/null && pwd -P)"
+          done
+          if [ -n "$found" ]; then
+            echo "::error::cargo would read${found}: cargo configuration above this job's checkout, which any job on this host can write, and which can set the compiler, a linker or a crate source. Remove it from the host."
+            exit 1
+          fi
+
+          # As install-cargo-deny does, downloads are kept in a host directory for the next
+          # job here. cached_fetch.sh checks every copy it reads from it against the pin.
+          export CI_CACHE_DIR="${CI_CACHE_DIR:-$HOME/Library/Caches/spice-ci/downloads}"
+          rustup_version='' rustup_sha256='' rustup_url=''
+          rustup_pin="$(python3 -I -c '
+        import json, sys
+        pin = json.load(open(sys.argv[1]))["rustup-init"]
+        print(pin["version"])
+        print(pin["sha256"].get(sys.argv[2], ""))
+        print(pin["url"].format(version=pin["version"], target=sys.argv[2]))
+        ' "$GITHUB_ACTION_PATH/../../ci-cache/pins.json" "$host_triple")" || rustup_pin=''
+          { read -r rustup_version; read -r rustup_sha256; read -r rustup_url; } <<<"$rustup_pin" || true
+          if [ -z "$host_triple" ] || [ -z "$rustup_sha256" ] || [ -z "$rustup_url" ]; then
+            echo "::error::.github/ci-cache/pins.json pins no rustup-init for $(uname -s) $(uname -m)${host_triple:+ ($host_triple)}, so this job cannot install its own rustup. It does not fall back to the host's ~/.cargo or an unpinned installer."
+            exit 1
+          fi
+          rustup_init="$rust_home/rustup-init"
+          fetch_status=0
+          bash "$GITHUB_ACTION_PATH/../../scripts/cached_fetch.sh" "$rustup_sha256" "$rustup_init" "$rustup_url" ||
+            fetch_status=$?
+          if [ "$fetch_status" -ne 0 ]; then
+            echo "::error::Could not get rustup-init $rustup_version for $host_triple at its pinned SHA-256 (cached_fetch.sh exited $fetch_status; the error above says why). This job does not fall back to the host's ~/.cargo or an unpinned installer."
+            exit 1
+          fi
+          chmod 0755 "$rustup_init"
+          "$rustup_init" --no-modify-path -y --default-toolchain none
+          rm -f "$rustup_init"
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            echo "::error::rustup-init $rustup_version did not install rustup in $CARGO_HOME/bin."
+            exit 1
+          fi
+        fi
+
         cargo_home="${CARGO_HOME:-$HOME/.cargo}"
         echo "$cargo_home/bin" >> "$GITHUB_PATH"
         export PATH="$cargo_home/bin:$PATH"
@@ -96,8 +188,9 @@ runs:
           toolchain='stable'
         fi
 
-        # Several Actions runner services on one Mac share this user's RUSTUP_HOME.
-        # Two jobs installing the same toolchain race: cargo can land first, the
+        # Runner instances that share a RUSTUP_HOME (the self-hosted Macs did, before
+        # each of their jobs got its own above) race when two jobs install the same
+        # toolchain at once: cargo can land first, the
         # other job skips install, then `rustup which rustc` tries to recover a
         # half-written tree and dies with "Directory not empty" (os error 66).
         # One lock covers the whole home. A toolchain counts as present only when
@@ -152,12 +245,13 @@ runs:
             ;;
         esac
 
-        # With a CI cache (CI_CACHE_URL, set by the workflow), install the toolchain from a
-        # local mirror of its pinned release before anything below asks rustup for it:
-        # `rustup show` installs the toolchain rust-toolchain.toml names from
-        # static.rust-lang.org when it is missing, which every fresh runner pod pays. The
-        # mirror is built by .github/scripts/rust_dist_mirror.py from the CI cache, or from
-        # static.rust-lang.org for any file the cache lacks, and every file is checked
+        # With a CI cache (CI_CACHE_URL, set by the workflow), and in a self-hosted Mac job's
+        # own homes, install the toolchain from a local mirror of its pinned release before
+        # anything below asks rustup for it: `rustup show` installs the toolchain
+        # rust-toolchain.toml names from static.rust-lang.org when it is missing, which
+        # every fresh runner pod and every such Mac job pays. The mirror is built by
+        # .github/scripts/rust_dist_mirror.py from the host's CI_CACHE_DIR or the CI cache,
+        # or from static.rust-lang.org for any file they lack, and every file is checked
         # against the manifest pinned in .github/ci-cache/pins.json; rustup checks the
         # component hashes again. RUSTUP_DIST_SERVER points at the mirror for this install
         # only, so a later `rustup target add` still reaches static.rust-lang.org. If any
@@ -169,14 +263,8 @@ runs:
         # the settings or the bound they were refused under, so the step fails instead:
         # wrong download settings such as a malformed CI_FETCH_MAX_BYTES (exit 2), and a
         # file larger than CI_FETCH_MAX_BYTES (exit 4).
-        if [ -n "${CI_CACHE_URL:-}" ]; then
-          case "$(uname -s)-$(uname -m)" in
-            Linux-x86_64) cache_host=x86_64-unknown-linux-gnu ;;
-            Linux-aarch64) cache_host=aarch64-unknown-linux-gnu ;;
-            Darwin-arm64) cache_host=aarch64-apple-darwin ;;
-            Darwin-x86_64) cache_host=x86_64-apple-darwin ;;
-            *) cache_host='' ;;
-          esac
+        if [ -n "${CI_CACHE_URL:-}" ] || [ "$per_job_home" = true ]; then
+          cache_host="$host_triple"
           cache_tool_dir="$rustup_home/toolchains/${toolchain}-${cache_host}"
           if [ -n "$cache_host" ] && ! { [ -x "$cache_tool_dir/bin/rustc" ] && [ -x "$cache_tool_dir/bin/cargo" ]; }; then
             mirror="${RUNNER_TEMP:-/tmp}/rust-dist-${toolchain}"

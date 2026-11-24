@@ -42,6 +42,17 @@ download the same file with no bound.
   before.
 - **`cargo-deny`**: the release archive for each target, installed by the
   `install-cargo-deny` action.
+- **`rustup-init`**: one rustup release, with the SHA-256 of `rustup-init` for each macOS
+  host. On a self-hosted Mac, `setup-rust` gives each job its own `CARGO_HOME` and
+  `RUSTUP_HOME` under `RUNNER_TEMP`, which the runner empties when a job starts and ends,
+  and never reads the host's shared `~/.cargo` or `~/.rustup`, which any job there can
+  write. It fetches `rustup-init` through `cached_fetch.sh`, runs it with
+  `--no-modify-path -y --default-toolchain none`, and installs the toolchain from the
+  mirror above. A missing or mismatched `rustup-init` fails the job; there is no
+  unpinned fallback. To bump it, take each host's line from
+  `https://static.rust-lang.org/rustup/archive/<version>/<host>/rustup-init.sha256`
+  and check it against a download. `check_ci_cache_pins.py` fails a macOS host
+  `setup-rust` maps that has no pin.
 
 ## How the cache is filled
 

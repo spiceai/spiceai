@@ -23,5 +23,13 @@
       "aarch64-apple-darwin": "1eca0934ec7bf12d8b9a8303335e1fff8bcc0767476947a50d3357858eded222",
       "x86_64-apple-darwin": "2526753e4f10ce8a0c9c45ba634e59d7c07e4aace9a21304a0fa86fb089b7039"
     }
+  },
+  "rustup-init": {
+    "version": "1.29.3",
+    "url": "https://static.rust-lang.org/rustup/archive/{version}/{target}/rustup-init",
+    "sha256": {
+      "aarch64-apple-darwin": "63752a1919a3a4793173ec70f8f212621a7ce38ba6a246095984482f4de20f9f",
+      "x86_64-apple-darwin": "bc107f1fb0228de7fa32413c89c1b305cea9cd256e94b01150cd054128145429"
+    }
   }
 }

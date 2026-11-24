@@ -104,11 +104,13 @@ jobs:
         with:
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
+      # Into the job's own CARGO_HOME (setup-rust), where `cargo install` below puts it
+      # too, not the Mac's shared ~/.cargo/bin.
       - name: Cache cargo-hack binary
         id: cache-cargo-hack
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/.cargo/bin/cargo-hack
+          path: ${{ env.CARGO_HOME || '~/.cargo' }}/bin/cargo-hack
           key: cargo-hack-${{ runner.os }}-${{ runner.arch }}-0.6.31
 
       - name: Install cargo-hack
