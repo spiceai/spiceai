@@ -545,6 +545,23 @@ class CheckCiRoleJobsTest(unittest.TestCase):
         with self.subTest(gated=True):
             cond = "        if: env.CI_CACHE_READ_ONLY != 'true'\n"
             self.assertEqual(self.problems(steps + upload.format(cond=cond)), [])
+        with self.subTest(wrapper=True):
+            wrapped = "      - name: Upload\n        run: bash .github/scripts/mc_cp.sh out/x spice-minio/artifacts/x\n"
+            self.assertEqual(len(self.problems(steps + wrapped)), 1)
+
+    def test_a_repository_write_is_not_gated_by_the_environment_flag(self):
+        # Any earlier step can rewrite CI_CACHE_READ_ONLY through GITHUB_ENV; the step output cannot change.
+        write = (
+            "      - name: Push snapshots\n        if: env.CI_CACHE_READ_ONLY != 'true'\n"
+            "        uses: ./.github/actions/push-snap-changes\n"
+        )
+        problems = self.problems(CHOOSE + ASSUME.format(role=CHOSEN) + write)
+        self.assertEqual(len(problems), 1, problems)
+        script = (
+            "      - name: Open the pull request\n        uses: actions/github-script@v9\n"
+            "        with:\n          script: require('child_process').execSync('git push origin x')\n"
+        )
+        self.assertEqual(len(self.problems(CHOOSE + ASSUME.format(role=CHOSEN) + script)), 1)
 
     def test_an_image_input_goes_to_images_not_builds(self):
         document = REUSABLE_CI_ROLE.replace(

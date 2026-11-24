@@ -196,13 +196,17 @@ ROLE_CHOICE = re.compile(
     r"\$\{\{\s*steps\.ci-role\.outputs\.full\s*==\s*'true'\s*&&\s*secrets\.(CI_(?:NEW_)?AWS_[A-Z0-9_]*ROLE_ARN)"
     r"\s*\|\|\s*secrets\.CI_AWS_PULL_REQUEST_ROLE_ARN\s*\}\}"
 )
-# Steps that write to shared state: a snapshot branch or pull request, or the artifact store.
-# An `mc` copy counts when its destination, the argument after the source, is the store.
-REPOSITORY_WRITES = re.compile(
-    r"push-snap-changes|\bgh\s+pr\s+create\b|\bgit\s+push\b|upload-to-minio"
-    r"|\bmc\s+(?:cp|mirror|put)\s+(?:-\S+\s+)*(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s\"']+)\s+[\"']?spice-minio/"
+# Steps that write to the repository: a snapshot branch or pull request. Only the role step's
+# `full` output may gate them, which no later step can change.
+REPOSITORY_WRITES = re.compile(r"push-snap-changes|\bgh\s+pr\s+create\b|\bgit\s+push\b")
+FULL_ROLE = re.compile(r"steps\.ci-role\.outputs\.full\s*==\s*'true'")
+# Uploads to the artifact store, directly or through mc_cp.sh, which counts when the
+# destination, the argument after the source, is the store. These may also be gated on the
+# read-only flag the role step sets.
+STORE_WRITES = re.compile(
+    r"upload-to-minio"
+    r"|\b(?:mc\s+(?:cp|mirror|put)|mc_cp\.sh)\s+(?:-\S+\s+)*(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s\"']+)\s+[\"']?spice-minio/"
 )
-# What a write may be gated on: the full roles, or the read-only flag the role step sets.
 WRITE_GATE = re.compile(r"steps\.ci-role\.outputs\.full\s*==\s*'true'|env\.CI_CACHE_READ_ONLY\s*!=\s*'true'")
 # Inputs that name a build other than the run's own commit, which a job has to hand to the
 # role step: commits and refs as `builds`, which keep the full roles only for trunk's, and
@@ -286,13 +290,16 @@ def check_ci_role_jobs(document: dict) -> list[str]:
                         "`${{ steps.ci-role.outputs.full == 'true' && secrets.<ROLE> || "
                         "secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}`"
                     )
-            elif REPOSITORY_WRITES.search(f"{step.get('uses', '')}\n{step.get('run', '')}") and not WRITE_GATE.search(
-                str(step.get("if", ""))
-            ):
-                problems.append(
-                    f"job `{name}` step `{label}` writes to shared state without "
-                    "`steps.ci-role.outputs.full == 'true'` in its `if:`, so it would write off trunk too"
-                )
+            else:
+                body = f"{step.get('uses', '')}\n{step.get('run', '')}\n{yaml.safe_dump(step.get('with') or {})}"
+                condition = str(step.get("if", ""))
+                if (REPOSITORY_WRITES.search(body) and not FULL_ROLE.search(condition)) or (
+                    STORE_WRITES.search(body) and not WRITE_GATE.search(condition)
+                ):
+                    problems.append(
+                        f"job `{name}` step `{label}` writes to shared state without "
+                        "`steps.ci-role.outputs.full == 'true'` in its `if:`, so it would write off trunk too"
+                    )
     return problems
 
 
