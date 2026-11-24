@@ -19,12 +19,12 @@ limitations under the License.
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-/// The ordered map a table's growing collections are kept in: a persistent
+/// The ordered map the dataset state's collections are kept in: a persistent
 /// map, so a copy of the state shares it and a change copies only the path
 /// to what it changes. Readers keep copies of the state while it changes.
-pub type SharedMap<K, V> = im::OrdMap<K, V>;
+pub type SharedMap<K, V> = imbl::OrdMap<K, V>;
 /// The ordered set kept like [`SharedMap`].
-pub type SharedSet<T> = im::OrdSet<T>;
+pub type SharedSet<T> = imbl::OrdSet<T>;
 
 /// A data file's key in a table: `(snapshot, path)`. Shared strings, so copying
 /// a map node copies pointers.
@@ -140,9 +140,9 @@ pub struct TableState {
     /// Deletion vectors by id.
     pub delete_files: SharedMap<String, DvEntry>,
     pub stats: Option<TableStats>,
-    pub cold: BTreeMap<String, ColdEntry>,
+    pub cold: SharedMap<String, ColdEntry>,
     pub pk_index: Option<(String, ObjRef)>,
-    pub index_runs: BTreeMap<(String, String), (u64, u64)>,
+    pub index_runs: SharedMap<(String, String), (u64, u64)>,
     pub inlined_data: SharedMap<String, Inlined>,
     pub inlined_deletes: SharedMap<String, InlinedDel>,
     pub insert_records: SharedMap<Vec<u8>, i64>,
@@ -240,12 +240,12 @@ impl TableState {
 /// The state of every table one metastore holds, plus source positions.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct DatasetState {
-    pub tables: BTreeMap<String, TableState>,
-    pub positions: BTreeMap<(String, String), Vec<u8>>,
+    pub tables: SharedMap<String, TableState>,
+    pub positions: SharedMap<(String, String), Vec<u8>>,
     /// Tables an unconverted mutation touched: their state here is unknown.
     pub unknown: BTreeSet<String>,
     /// Unresolved transactions across datasets, by id.
-    pub prepared: BTreeMap<String, Prepared>,
+    pub prepared: SharedMap<String, Prepared>,
 }
 
 /// A transaction's `Prepare` on this dataset, held until its `Resolve`.
@@ -696,8 +696,12 @@ impl DatasetState {
             }
             Kind::ClearColdFiles(a) => self.table(name, &a.table_id)?.cold.clear(),
             Kind::ClearColdStats(a) => {
-                for file in self.table(name, &a.table_id)?.cold.values_mut() {
-                    file.stats = Some(ObjRef::of(&[]));
+                let cold = &mut self.table(name, &a.table_id)?.cold;
+                let urls: Vec<String> = cold.keys().cloned().collect();
+                for url in urls {
+                    if let Some(file) = cold.get_mut(&url) {
+                        file.stats = Some(ObjRef::of(&[]));
+                    }
                 }
             }
             Kind::SetPkIndex(a) => {

@@ -2711,12 +2711,18 @@ async fn a_statistics_row_read_across_a_schema_widening_is_not_used() {
     create_append_table(&fixture, name, std::slice::from_ref(&(1..ROWS + 1))).await;
 
     // A cold scan persists the file's row; its blob is the one object it adds
-    // under the catalog's blobs.
+    // under the dataset's blobs. A shared bucket holds other tests' datasets.
+    let dataset_blobs = format!("/datasets/{name}-");
     let blobs = || async {
         faults
             .list(None)
             .map_ok(|meta| meta.location)
-            .try_filter(|path| futures::future::ready(path.as_ref().contains("/objects/blobs/")))
+            .try_filter(|path| {
+                let path = path.as_ref();
+                futures::future::ready(
+                    path.contains(&dataset_blobs) && path.contains("/objects/blobs/"),
+                )
+            })
             .try_collect::<std::collections::BTreeSet<_>>()
             .await
             .expect("list blobs")
