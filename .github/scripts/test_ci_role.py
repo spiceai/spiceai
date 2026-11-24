@@ -140,7 +140,8 @@ class CiRoleTest(unittest.TestCase):
             with self.subTest(builds=builds):
                 self.assert_role(*self.choose("workflow_dispatch", "refs/heads/trunk", builds), full=True)
 
-    def test_a_build_off_trunk_gets_the_read_only_role(self):
+    def test_a_build_off_trunk_fails_a_trunk_run(self):
+        # The job's token still names trunk, so it must not run a build from elsewhere at all.
         for builds, named in (
             (f"spiced_commit={self.feature}", f"spiced_commit is {self.feature}"),
             (f"spiced_commit={self.nowhere}", f"spiced_commit is {self.nowhere}"),
@@ -150,8 +151,8 @@ class CiRoleTest(unittest.TestCase):
         ):
             with self.subTest(builds=builds):
                 proc, output, env = self.choose("workflow_dispatch", "refs/heads/trunk", builds)
-                self.assert_role(proc, output, env, full=False)
-                self.assertIn(f"::notice::{named}, which is not trunk or a commit on trunk", proc.stdout)
+                self.assertEqual((proc.returncode, output, env), (1, "", ""), proc.stdout)
+                self.assertIn(f"::error::{named}, which is not trunk or a commit on trunk", proc.stdout)
 
     def test_any_image_gets_the_read_only_role(self):
         # A tag names no commit, and can be published from any branch, even `trunk` or a SHA.
@@ -168,11 +169,6 @@ class CiRoleTest(unittest.TestCase):
 
     def test_empty_images_keep_the_full_roles(self):
         self.assert_role(*self.choose("push", "refs/heads/trunk", images="custom_image_tag=\nec2_images=\n"), full=True)
-
-    def test_a_build_off_trunk_without_the_read_only_role_fails(self):
-        proc, output, _ = self.choose("push", "refs/heads/trunk", f"spiced_commit={self.feature}", pull_request_role=False)
-        self.assertEqual((proc.returncode, output), (1, ""))
-        self.assertIn(f"::error::spiced_commit is {self.feature}", proc.stdout)
 
     def test_trunk_that_cannot_be_fetched_fails_rather_than_guessing(self):
         proc, output, _ = self.choose(

@@ -197,6 +197,7 @@ ROLE_CHOICE = re.compile(
 # Steps that write to the repository: a snapshot branch or pull request. Only the role step's
 # `full` output may gate them, which no later step can change.
 REPOSITORY_WRITES = re.compile(r"push-snap-changes|\bgh\s+pr\s+create\b|\bgit\s+push\b")
+ROLE_PRESENCE = re.compile(r"secrets\.CI_(?:NEW_)?AWS_[A-Z0-9_]*ROLE_ARN\s*!=\s*''")
 FULL_ROLE = re.compile(r"steps\.ci-role\.outputs\.full\s*==\s*'true'")
 # Uploads to the artifact store, directly or through mc_cp.sh, which counts when the
 # destination, the argument after the source, is the store. These may also be gated on the
@@ -289,6 +290,23 @@ def check_ci_role_jobs(document: dict) -> list[str]:
                     f"job `{name}` takes input `{build}`, which names another build, but does not give it to "
                     f"the `ci-role` step's `{key}`, so it would get the full roles for a build off trunk"
                 )
+        # `role-to-assume` has its own rule below; everything else is checked here.
+        others = dict(document["jobs"][name])
+        others["steps"] = [
+            {k: ({kk: vv for kk, vv in v.items() if kk != "role-to-assume"} if k == "with" and isinstance(v, dict) else v)
+             for k, v in s.items()}
+            for s in steps
+        ]
+        for whole, inner in _expansions(yaml.safe_dump(others, width=10**6)):
+            if not any(role != PULL_REQUEST_ROLE for role in CI_ROLE_SECRET.findall(inner)):
+                continue
+            if ROLE_CHOICE.fullmatch(whole.strip()) or ROLE_PRESENCE.fullmatch(inner.strip()):
+                continue
+            problems.append(
+                f"job `{name}` uses `{whole.strip()}`; a CI role ARN may appear only in the role choice "
+                "(`steps.ci-role.outputs.full == 'true' && secrets.<ROLE> || secrets.CI_AWS_PULL_REQUEST_ROLE_ARN`) "
+                "or as a test that it is set (`secrets.<ROLE> != ''`)"
+            )
         for position, step in enumerate(steps, start=1):
             label = step.get("name") or f"step {position}"
             if STORE_DOWNLOAD.search(str(step.get("run", ""))):

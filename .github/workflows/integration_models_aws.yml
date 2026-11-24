@@ -75,9 +75,9 @@ jobs:
       # no build-cache endpoint can reach the STS call.
       - name: Check for the Bedrock role
         env:
-          CI_AWS_BEDROCK_ROLE_ARN: ${{ secrets.CI_AWS_BEDROCK_ROLE_ARN }}
+          BEDROCK_ROLE_SET: ${{ secrets.CI_AWS_BEDROCK_ROLE_ARN != '' }}
         run: |
-          if [ -z "$CI_AWS_BEDROCK_ROLE_ARN" ]; then
+          if [ "$BEDROCK_ROLE_SET" != true ]; then
             echo "::error::CI_AWS_BEDROCK_ROLE_ARN is not set in the ci environment, so the Bedrock tests cannot authenticate. Create the IAM role that trusts this repository's GitHub OIDC tokens and set the secret to its ARN."
             exit 1
           fi
@@ -111,7 +111,7 @@ jobs:
           machine: ${{ runner.name }}
 
       - name: Download test archive from spiceio
-        if: env.HAS_SPICEIO_SECRET == 'true' && steps.ci-role.outputs.full != 'true' && github.ref != 'refs/heads/trunk'
+        if: steps.setup-spiceio.outputs.endpoint != '' && github.ref != 'refs/heads/trunk'
         env:
           SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
         run: |
@@ -122,7 +122,7 @@ jobs:
           curl --fail --silent --show-error --output ./integration_test/integration.tar.zst "$archive_url"
 
       - name: Download test archive
-        if: env.HAS_SPICEIO_SECRET != 'true' || steps.ci-role.outputs.full == 'true' || github.ref == 'refs/heads/trunk'
+        if: steps.setup-spiceio.outputs.endpoint == '' || github.ref == 'refs/heads/trunk'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ai-integration-test-archive
@@ -165,7 +165,7 @@ jobs:
       - name: Run a Bedrock test with web identity credentials
         if: ${{ !cancelled() }}
         env:
-          AWS_ROLE_ARN: ${{ secrets.CI_AWS_BEDROCK_ROLE_ARN }}
+          AWS_ROLE_ARN: ${{ steps.ci-role.outputs.full == 'true' && secrets.CI_AWS_BEDROCK_ROLE_ARN || secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}
           AWS_ROLE_SESSION_NAME: gha-bedrock-web-identity-${{ github.run_id }}
         run: |
           set -euo pipefail

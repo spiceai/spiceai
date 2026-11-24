@@ -619,6 +619,20 @@ class CheckCiRoleJobsTest(unittest.TestCase):
         as_image = CHOOSE + "          images: |\n            custom_image_tag=${{ inputs.custom_image_tag }}\n"
         self.assertEqual(self.problems(as_image + ASSUME.format(role=CHOSEN), document), [])
 
+    def test_a_role_arn_outside_the_choice_is_reported(self):
+        env_step = "      - name: Run\n        env:\n          AWS_ROLE_ARN: {value}\n        run: make test\n"
+        steps = CHOOSE + ASSUME.format(role=CHOSEN)
+        with self.subTest(case="raw ARN"):
+            problems = self.problems(steps + env_step.format(value="${{ secrets.CI_AWS_BEDROCK_ROLE_ARN }}"))
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("a CI role ARN may appear only in the role choice", problems[0])
+        with self.subTest(case="chosen ARN"):
+            value = "${{ steps.ci-role.outputs.full == 'true' && secrets.CI_AWS_BEDROCK_ROLE_ARN || secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}"
+            self.assertEqual(self.problems(steps + env_step.format(value=value)), [])
+        with self.subTest(case="presence test"):
+            value = "${{ secrets.CI_AWS_BEDROCK_ROLE_ARN != '' }}"
+            self.assertEqual(self.problems(steps + env_step.format(value=value)), [])
+
     def test_a_build_input_the_role_step_is_not_given_is_reported(self):
         steps = CHOOSE.replace("          builds: |\n            spiced_commit=${{ inputs.spiced_commit }}\n", "")
         problems = self.problems(steps + ASSUME.format(role=CHOSEN))

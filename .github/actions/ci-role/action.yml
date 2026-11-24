@@ -5,7 +5,8 @@ description: >-
   roles go only to a run on trunk (`refs/heads/trunk`; a merge-queue run is not one) that runs
   nothing but trunk's code: each other build the job runs (`builds`) must be `trunk` or a commit
   on trunk, checked with `git merge-base --is-ancestor` against trunk itself. Anything else gets
-  the read-only pull request role (`full` is `false`), and the job skips the steps that write:
+  the read-only pull request role (`full` is `false`), except that a trunk run naming a build off
+  trunk fails instead (its token still names trunk), and the job skips the steps that write:
   this action sets CI_CACHE_READ_ONLY=true for the rest of the job, which setup-rust,
   setup-sccache and the build actions read. With the full roles it sets CI_ROLE_FULL=true
   instead: the build actions then build their tools from the checkout rather than download them,
@@ -120,9 +121,10 @@ runs:
             if [[ "$value" =~ ^[0-9a-f]{40}$ ]] && on_trunk "$value"; then
               continue
             fi
-            full=false
-            reason="$name is $value, which is not trunk or a commit on trunk"
-            break
+            # The job's token still names trunk, so a build off trunk could assume a full role
+            # itself: refuse it rather than run it with the read-only one.
+            echo "::error::$name is $value, which is not trunk or a commit on trunk. A trunk run runs only trunk's builds; dispatch from the branch that holds it instead."
+            exit 1
           done <<<"$BUILDS"
         fi
 
