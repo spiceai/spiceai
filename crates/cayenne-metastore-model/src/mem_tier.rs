@@ -179,12 +179,12 @@ pub(crate) struct State {
     pruned_floor: usize,
     floor_raised_tag: bool,
     rewrite: Option<Rewrite>,
-    rewrite_used: bool,
+    rewrites: u8,
     rewritten: bool,
     rewrite_interleaved: bool,
     rewrite_preserved: bool,
     crashed: bool,
-    crash_used: bool,
+    crashes: u8,
     replay: Option<usize>,
     flushed_checkpoint: bool,
     crashed_stage: bool,
@@ -364,6 +364,12 @@ impl Protocol {
     }
     fn has(&self, flag: &str) -> bool {
         self.mode.contains(flag)
+    }
+    /// Crashes and full rewrites per path: one by default, two in a `deep` run.
+    /// A second of each is reachable and multiplies the graph about elevenfold,
+    /// so the default run keeps one and the `-deep` runs check two.
+    fn repeats(&self) -> u8 {
+        if self.has("deep") { 2 } else { 1 }
     }
     /// The pruned-delete floor a bake's tag starts from; zero when the control
     /// removes it.
@@ -583,12 +589,12 @@ impl Model for Protocol {
             pruned_floor: 0,
             floor_raised_tag: false,
             rewrite: None,
-            rewrite_used: false,
+            rewrites: 0,
             rewritten: false,
             rewrite_interleaved: false,
             rewrite_preserved: false,
             crashed: false,
-            crash_used: false,
+            crashes: 0,
             replay: None,
             flushed_checkpoint: false,
             crashed_stage: false,
@@ -616,14 +622,14 @@ impl Model for Protocol {
         }
         // A table flush is idempotent, including after an early publication.
         actions.push(Action::Flush);
-        if !state.crash_used {
+        if state.crashes < self.repeats() {
             actions.push(Action::Crash);
         }
         if state.rewrite.is_some() {
             actions.push(Action::FullRewrite);
         }
         if state.rewrite.is_none()
-            && !state.rewrite_used
+            && state.rewrites < self.repeats()
             && state.capture.is_none()
             && state.replay.is_none()
             && state.tier.is_empty()
@@ -868,7 +874,7 @@ impl Model for Protocol {
                 }
             }
             Action::FullRewriteCapture => {
-                next.rewrite_used = true;
+                next.rewrites += 1;
                 let min_sequence = next
                     .snapshots
                     .iter()
@@ -907,7 +913,7 @@ impl Model for Protocol {
                     .as_ref()
                     .is_some_and(|c| c.checkpoint && c.phase == 3);
                 next.crashed = true;
-                next.crash_used = true;
+                next.crashes += 1;
                 next.pruned_floor = 0;
                 next.pending.clear();
                 next.tier.clear();
@@ -1218,6 +1224,8 @@ impl Model for Protocol {
                 "bake tag raised to the pruned-delete floor",
                 |_, s: &State| s.floor_raised_tag,
             ),
+            Property::sometimes("second crash", |_, s: &State| s.crashes >= 2),
+            Property::sometimes("second full rewrite", |_, s: &State| s.rewrites >= 2),
             Property::sometimes("full rewrite committed", |_, s: &State| s.rewritten),
             Property::sometimes("full rewrite interleaves apply", |_, s: &State| {
                 s.rewritten && s.rewrite_interleaved

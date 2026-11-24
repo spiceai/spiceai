@@ -1080,10 +1080,20 @@ from the RAM index while its vector stays in the catalog, and a key upserted
 again after that delete writes no tombstone of its own. With one bake,
 `no-pruned-floor` has nothing to break (#16706). Six threads and the shared 540-second watchdog apply.
 
+`mem-tier-seal-delete-only-deep` and `mem-tier-seal-delete-only-sqlite-deep` run
+the same protocols with two crash/recoveries and two full-rewrite attempts. A
+second of each is reachable, and each alone multiplies the graph several times
+over: together about 169 million states in 211 s and 45 million in 54 s on an
+M-series Mac, against 14 million in 19 s and 4 million in 5 s for the default
+runs. They are not in `quick`, so a pull request does not run them; `all` (the
+scheduled run) does. Each must reach `second crash` and `second full rewrite`.
+
 ```sh
 nice -n 10 cargo build --release -p cayenne-metastore-model
 EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-current-3-exhaust
 nice -n 10 target/release/cayenne-metastore-model run mem-tier-seal-delete-only
+EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-seal-delete-only-deep
+EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-seal-delete-only-sqlite-deep
 EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-no-one-call
 EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-no-insert-records
 EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-no-capture-reservation

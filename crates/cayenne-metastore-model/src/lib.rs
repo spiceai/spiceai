@@ -209,6 +209,22 @@ pub fn runs() -> Vec<Run> {
             failure: "",
         },
         Run {
+            name: "mem-tier-seal-delete-only-deep",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only-deep",
+            bound: 3,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "mem-tier-seal-delete-only-sqlite-deep",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only-sqlite-deep",
+            bound: 3,
+            seed: None,
+            failure: "",
+        },
+        Run {
             name: "mem-tier-no-one-call",
             family: "mem-tier",
             mode: "mem-tier-seal-delete-only-no-one-call",
@@ -3197,6 +3213,10 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
                     | "full rewrite interleaves apply"
                     | "full rewrite retains later protected snapshot"
             ))
+        || (run.family == "mem-tier"
+            && run.failure.is_empty()
+            && run.mode.contains("deep")
+            && matches!(name, "second crash" | "second full rewrite"))
         || intent_required
         || added_required
         || standby_required
