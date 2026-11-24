@@ -44,7 +44,8 @@ use super::delete::{
 use super::inlined_cache::{self, InlinedCache, InlinedDurableCommit, InlinedViewEntry};
 use super::maintenance::{
     OutstandingLiveRowsDelta, PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT, PostWriteMaintenance,
-    PostWriteMaintenanceState, PublishedLiveRowsDelta, RetentionFailureAction, RetentionPass,
+    PostWriteMaintenanceHold, PostWriteMaintenanceState, PublishedLiveRowsDelta, QueuedStatistics,
+    RetentionFailureAction, RetentionPass,
     SnapshotMaintenanceTrigger, duration_millis_saturating, protected_snapshot_maintenance_trigger,
 };
 use super::maintenance_metrics::{
@@ -26416,37 +26417,38 @@ impl CayenneTableProvider {
 
         {
             let mut maintenance_state = self.post_write_maintenance.state.lock();
-            // Published before an overwrite that has since replaced its rows:
-            // the overwrite's count already describes the table without them.
+            // Published before an overwrite that has since replaced its rows, or
+            // before a full rewrite that has since counted them: the persisted
+            // count already describes the table with this commit's rows.
+            let statistics_epoch = published.statistics_epoch();
             let (stats, live_rows_delta) =
-                if published.statistics_epoch() == self.post_write_maintenance.statistics_epoch() {
-                    (stats, live_rows_delta)
-                } else {
+                if statistics_epoch < self.post_write_maintenance.counted_below_epoch() {
                     (None, 0)
-                };
-            if let Some(stats) = stats {
-                if let Some(existing) = &maintenance_state.stats {
-                    existing.merge_from(&stats);
                 } else {
-                    maintenance_state.stats = Some(stats);
-                }
-            }
+                    (stats, live_rows_delta)
+                };
             maintenance_state.refresh_listing |= refresh_listing;
             maintenance_state.retention_requested |= retention_requested;
-            maintenance_state.live_rows_delta = maintenance_state
-                .live_rows_delta
-                .saturating_add(live_rows_delta);
+            if stats.is_some() || live_rows_delta != 0 {
+                maintenance_state
+                    .statistics
+                    .entry(statistics_epoch)
+                    .or_default()
+                    .merge(QueuedStatistics {
+                        stats,
+                        live_rows_delta,
+                        live_rows_delta_count: u64::from(live_rows_delta != 0),
+                    });
+            }
             if live_rows_delta == 0 {
                 // This commit's rows left the net live count where it was, so
                 // there is no delta to persist and nothing would ever retire
                 // the claim.
                 published.release();
             } else {
-                // Count this delta under the same lock that folds it in, so
+                // Counted under the same lock that folds it in, so
                 // `has_unapplied_live_rows_delta` reports this write until the
                 // persist that folds it into `num_rows` lands.
-                maintenance_state.live_rows_delta_count =
-                    maintenance_state.live_rows_delta_count.saturating_add(1);
                 published.queue();
             }
         }
@@ -26558,15 +26560,11 @@ impl CayenneTableProvider {
                 .retention_backoff
                 .lock()
                 .retry_owed();
-            let (mut state, statistics_epoch) = self.post_write_maintenance.take_state();
+            let mut state = self.post_write_maintenance.take_state();
             state.retention_requested |= retention_owed;
             if !state.is_empty() {
-                self.run_maintenance_state(
-                    state,
-                    statistics_epoch,
-                    RetentionFailureAction::ReturnError,
-                )
-                .await?;
+                self.run_maintenance_state(state, RetentionFailureAction::ReturnError)
+                    .await?;
                 continue;
             }
             if !self
@@ -26606,11 +26604,10 @@ impl CayenneTableProvider {
     async fn run_maintenance_state(
         &self,
         state: PostWriteMaintenanceState,
-        statistics_epoch: u64,
         retention_failure_action: RetentionFailureAction,
     ) -> CatalogResult<()> {
-        let had_stats = state.stats.is_some();
-        if let Some(stats) = state.stats {
+        let had_stats = state.statistics.values().any(|queued| queued.stats.is_some());
+        if !state.statistics.is_empty() {
             #[cfg(test)]
             {
                 let hook = self.test_pre_maintenance_statistics_hook.lock().take();
@@ -26636,28 +26633,14 @@ impl CayenneTableProvider {
             // `COUNT(*)` as `Exact`.
             let delta_is_exact =
                 self.table_metadata.on_conflict.is_none() && !state.retention_requested;
-            let persisted = self
-                .persist_queued_table_stats(
-                    &stats,
-                    RowCountUpdate::Delta {
-                        delta: state.live_rows_delta,
-                        exact: delta_is_exact,
-                    },
-                    statistics_epoch,
-                )
+            let counted = self
+                .persist_queued_table_stats(state.statistics, delta_is_exact)
                 .await;
-            if persisted {
-                // Only now does the persisted count describe these rows. Until
-                // this point the exactness gate must serve `Inexact`, because
-                // the rows have been visible to scans since their commit.
-                //
-                // Retire only what this drain persisted. A drain that lands
-                // here with `persisted == false` abandoned its delta, and
-                // leaving it outstanding is what stops the *next* drain's
-                // success from declaring the count exact over that gap.
-                self.post_write_maintenance
-                    .retire_applied_live_rows_deltas(state.live_rows_delta_count);
-            }
+            // Only now does the persisted count describe these rows. Until this
+            // point the exactness gate must serve `Inexact`, because the rows
+            // have been visible to scans since their commit.
+            self.post_write_maintenance
+                .retire_applied_live_rows_deltas(counted);
         }
 
         let mut retention_deleted = 0_u64;
@@ -26900,10 +26883,10 @@ impl CayenneTableProvider {
         loop {
             tokio::time::sleep(POST_WRITE_MAINTENANCE_DEBOUNCE).await;
 
-            let (state, statistics_epoch) = self.post_write_maintenance.take_state();
+            let state = self.post_write_maintenance.take_state();
 
             if let Err(e) = self
-                .run_maintenance_state(state, statistics_epoch, RetentionFailureAction::Requeue)
+                .run_maintenance_state(state, RetentionFailureAction::Requeue)
                 .await
             {
                 tracing::error!(
@@ -28871,9 +28854,10 @@ impl CayenneTableProvider {
         // is the ordered one: executing it executes the scan, so the rewrite
         // pins its inputs exactly where the fenced scan does.
 
-        let (stream, scope, generation_before, snapshot_id_before, rewrite_plan): (
+        let (stream, scope, generation_before, input_epoch, snapshot_id_before, rewrite_plan): (
             SendableRecordBatchStream,
             RewriteScope,
+            u64,
             u64,
             String,
             Arc<dyn ExecutionPlan>,
@@ -28891,7 +28875,7 @@ impl CayenneTableProvider {
                 self.checkpoint_inlined_data().await?;
             }
             let folded_before = self.protected_snapshot_ids();
-            let (stream, generation_before, rewrite_plan) =
+            let (stream, generation_before, input_epoch, rewrite_plan) =
                 self.visible_file_stream_for_rewrite(&ctx, &order).await?;
             if folded_before != self.protected_snapshot_ids() {
                 tracing::debug!(
@@ -28913,11 +28897,12 @@ impl CayenneTableProvider {
                     folded: folded_before,
                 },
                 generation_before,
+                input_epoch,
                 snapshot_id_before,
                 rewrite_plan,
             )
         } else {
-            let (scan_view, scope, generation_before, snapshot_id_before) = {
+            let (scan_view, scope, generation_before, input_epoch, snapshot_id_before) = {
                 let _capture_guard = self.write_lock_arc().lock_owned().await;
                 #[cfg(test)]
                 let capture_probe = self.test_rewrite_capture_probe.lock().take().map(
@@ -28965,7 +28950,8 @@ impl CayenneTableProvider {
                 // plan is built after the lock is released, from the view alone, as a
                 // query's plan is, so writers wait for the capture but not for the plan
                 // build, which under load took most of the time this held the lock.
-                let (scan_view, generation_before) = self.rewrite_scan_view(&ctx).await?;
+                let (scan_view, generation_before, input_epoch) =
+                    self.rewrite_scan_view(&ctx, false).await?;
                 let cutoff = self.sequence_high_water().await;
                 #[cfg(test)]
                 if let Some(captured) = capture_probe {
@@ -28996,6 +28982,7 @@ impl CayenneTableProvider {
                         folded: folded_before,
                     },
                     generation_before,
+                    input_epoch,
                     snapshot_id_before,
                 )
             };
@@ -29015,6 +29002,7 @@ impl CayenneTableProvider {
                 stream,
                 scope,
                 generation_before,
+                input_epoch,
                 snapshot_id_before,
                 rewrite_plan,
             )
@@ -29520,7 +29508,7 @@ impl CayenneTableProvider {
 
             // Persist accumulated stats from the rewrite — keeps DataFusion's
             // synchronous statistics path consistent with the new snapshot.
-            self.persist_table_stats_after_snapshot_rewrite(&stats_acc)
+            self.persist_table_stats_after_snapshot_rewrite(&stats_acc, input_epoch)
                 .await;
         };
 
@@ -29597,17 +29585,44 @@ impl CayenneTableProvider {
     /// `refresh_mode: changes` dataset lets a query serve a view up to a second
     /// old, and a rewrite reading such a view would fold, and drop, a protected
     /// snapshot published after it without that snapshot's rows in its output.
-    async fn rewrite_scan_view(&self, ctx: &SessionContext) -> Result<(Arc<ScanView>, u64)> {
+    ///
+    /// Also returns the statistics epoch started for the view: every write
+    /// stamped below it has its rows in the view, and none stamped with it
+    /// does. The caller holds `write_lock`; `publications_held` says whether it
+    /// also holds the visibility lock, which is otherwise taken here around the
+    /// epoch and the capture. A write publishes its rows and stamps its delta
+    /// under one of the two, so none can land between them.
+    async fn rewrite_scan_view(
+        &self,
+        ctx: &SessionContext,
+        publications_held: bool,
+    ) -> Result<(Arc<ScanView>, u64, u64)> {
+        let generation_before = self.prepare_rewrite_scan(ctx).await?;
+        // Taken after the inline flush, which waits for held publishes that need
+        // this lock.
+        let _publications = if publications_held {
+            None
+        } else {
+            Some(self.visibility_lock_arc().lock_owned().await)
+        };
+        let input_epoch = self
+            .post_write_maintenance
+            .start_statistics_epoch_for_rewrite();
+        let scan_view = self
+            .scan_view_at_current_input(ScanViewReuse::WithinLag(Duration::ZERO))
+            .await?;
+        Ok((scan_view, generation_before, input_epoch))
+    }
+
+    /// Flush the inline memtable and prepare the scan a rewrite captures, and
+    /// return the current-dir generation sampled between the two.
+    async fn prepare_rewrite_scan(&self, ctx: &SessionContext) -> Result<u64> {
         if self.cached_inlined_row_count() > 0 {
             self.checkpoint_inlined_data().await?;
         }
         let generation_before = self.current_dir_generation.load(Ordering::Relaxed);
-        let state = ctx.state();
-        self.prepare_scan(&state, &[]).await?;
-        let scan_view = self
-            .scan_view_at_current_input(ScanViewReuse::WithinLag(Duration::ZERO))
-            .await?;
-        Ok((scan_view, generation_before))
+        self.prepare_scan(&ctx.state(), &[]).await?;
+        Ok(generation_before)
     }
 
     /// The rewrite's stream over `scan_view` (see [`Self::rewrite_scan_view`]), in
@@ -29618,40 +29633,53 @@ impl CayenneTableProvider {
         order: &RewriteOrder,
         scan_view: Arc<ScanView>,
     ) -> Result<(SendableRecordBatchStream, Arc<dyn ExecutionPlan>)> {
-        let state = ctx.state();
-        let plan = self
-            .plan_scan_from_view(&state, None, &[], None, scan_view, TombstonePushdown::Skip)
-            .await?;
-        let task_ctx = ctx.task_ctx();
-        let ordered = self.order_rewrite_plan(plan, order, &task_ctx)?;
-        let stream = datafusion_physical_plan::execute_stream(Arc::clone(&ordered), task_ctx)?;
-        Ok((stream, ordered))
-    }
-
-    async fn visible_file_stream_for_rewrite(
-        &self,
-        ctx: &SessionContext,
-        order: &RewriteOrder,
-    ) -> Result<(SendableRecordBatchStream, u64, Arc<dyn ExecutionPlan>)> {
-        let (plan, generation_before) = self.rewrite_scan_plan(ctx).await?;
+        let plan = self.rewrite_plan_from_view(ctx, scan_view).await?;
         let task_ctx = ctx.task_ctx();
         let ordered = self.order_rewrite_plan(plan, order, &task_ctx)?;
         // Executing the ordered plan executes the scan beneath it (each
         // operator executes its input when it is executed), so the stream
         // pins the same scan inputs, at the same point, as the scan alone did.
         let stream = datafusion_physical_plan::execute_stream(Arc::clone(&ordered), task_ctx)?;
-        Ok((stream, generation_before, ordered))
+        Ok((stream, ordered))
     }
 
-    /// The scan plan [`Self::visible_file_stream_for_rewrite`] reads, and the
-    /// current-dir generation sampled before it listed its files. Flushes the
-    /// inline memtable first, so the plan covers every visible row.
+    /// The rewrite's stream when the caller holds `write_lock` and the
+    /// visibility lock for the whole pass, with the current-dir generation and
+    /// the statistics epoch from [`Self::rewrite_scan_view`].
+    async fn visible_file_stream_for_rewrite(
+        &self,
+        ctx: &SessionContext,
+        order: &RewriteOrder,
+    ) -> Result<(SendableRecordBatchStream, u64, u64, Arc<dyn ExecutionPlan>)> {
+        let (scan_view, generation_before, input_epoch) =
+            self.rewrite_scan_view(ctx, true).await?;
+        let (stream, ordered) = self.rewrite_stream_from_view(ctx, order, scan_view).await?;
+        Ok((stream, generation_before, input_epoch, ordered))
+    }
+
+    /// The full visible scan plan of the datalake move, and the current-dir
+    /// generation sampled before it listed its files. Flushes the inline
+    /// memtable first, so the plan covers every visible row. Starts no
+    /// statistics epoch.
     async fn rewrite_scan_plan(
         &self,
         ctx: &SessionContext,
     ) -> Result<(Arc<dyn ExecutionPlan>, u64)> {
-        let (scan_view, generation_before) = self.rewrite_scan_view(ctx).await?;
-        let plan = self
+        let generation_before = self.prepare_rewrite_scan(ctx).await?;
+        let scan_view = self
+            .scan_view_at_current_input(ScanViewReuse::WithinLag(Duration::ZERO))
+            .await?;
+        let plan = self.rewrite_plan_from_view(ctx, scan_view).await?;
+        Ok((plan, generation_before))
+    }
+
+    /// The unordered scan plan of a rewrite over `scan_view`.
+    async fn rewrite_plan_from_view(
+        &self,
+        ctx: &SessionContext,
+        scan_view: Arc<ScanView>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(self
             .plan_scan_from_view(
                 &ctx.state(),
                 None,
@@ -29660,8 +29688,7 @@ impl CayenneTableProvider {
                 scan_view,
                 TombstonePushdown::Skip,
             )
-            .await?;
-        Ok((plan, generation_before))
+            .await?)
     }
 
     /// Order `plan` for a rewrite, as one output partition when ordered.
@@ -34873,6 +34900,26 @@ impl CayenneTableProvider {
         self.visibility_lock_arc().lock_owned().await
     }
 
+    /// Keep post-write maintenance from starting until the returned guard
+    /// drops, so writes' statistics stay queued. Waits for a running pass to
+    /// finish first. Exposed for tests of what another operation does while
+    /// statistics are queued; drop the guard before draining maintenance, and
+    /// drain it after, since a write made while held does not start a pass.
+    #[doc(hidden)]
+    pub async fn hold_post_write_maintenance(&self) -> impl Drop + Send + Sync + use<> {
+        while self
+            .post_write_maintenance
+            .scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        PostWriteMaintenanceHold {
+            maintenance: Arc::clone(&self.post_write_maintenance),
+        }
+    }
+
     /// Get the current snapshot ID.
     ///
     /// This returns the live snapshot ID which may differ from `table_metadata.current_snapshot_id`
@@ -35756,23 +35803,51 @@ impl CayenneTableProvider {
             .await
     }
 
-    /// [`Self::persist_table_stats`] for statistics a maintenance pass took
-    /// from the queue under `statistics_epoch`. Returns `true` without
-    /// persisting when an overwrite has started a new epoch since: the rows
-    /// these statistics describe were replaced, and the overwrite's count
-    /// already describes the table without them.
+    /// Persist the statistics a maintenance pass took from the queue, adding
+    /// their net row delta to the count, and return how many queued deltas
+    /// the persisted count now includes.
+    ///
+    /// Statistics stamped below
+    /// [`PostWriteMaintenance::counted_below_epoch`] are dropped: an overwrite
+    /// has replaced their rows or a full rewrite has counted them since the
+    /// pass took them, so adding them would count those rows again. They are
+    /// included in the returned count. The rest are persisted, and included
+    /// only when the persist lands: a drain that abandons its delta leaves it
+    /// outstanding, which is what stops the next drain's success from
+    /// declaring the count exact over that gap.
     async fn persist_queued_table_stats(
         &self,
-        accumulator: &ColumnStatsAccumulator,
-        num_rows_update: RowCountUpdate,
-        statistics_epoch: u64,
-    ) -> bool {
+        queued: BTreeMap<u64, QueuedStatistics>,
+        delta_is_exact: bool,
+    ) -> u64 {
         let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
-        if self.post_write_maintenance.statistics_epoch() != statistics_epoch {
-            return true;
+        let counted_below = self.post_write_maintenance.counted_below_epoch();
+        let mut counted = 0_u64;
+        let mut pending = QueuedStatistics::default();
+        for (statistics_epoch, queued) in queued {
+            if statistics_epoch < counted_below {
+                counted = counted.saturating_add(queued.live_rows_delta_count);
+            } else {
+                pending.merge(queued);
+            }
         }
-        self.persist_table_stats_locked(accumulator, num_rows_update, false)
-            .await
+        let Some(stats) = pending.stats else {
+            return counted;
+        };
+        let persisted = self
+            .persist_table_stats_locked(
+                &stats,
+                RowCountUpdate::Delta {
+                    delta: pending.live_rows_delta,
+                    exact: delta_is_exact,
+                },
+                false,
+            )
+            .await;
+        if persisted {
+            counted = counted.saturating_add(pending.live_rows_delta_count);
+        }
+        counted
     }
 
     /// Replace the aggregate entirely with the overwrite's accumulator and reset
@@ -35835,9 +35910,16 @@ impl CayenneTableProvider {
     /// A survivor's delta is persisted under the same persistence lock this takes,
     /// after its publish: one published before the check below is seen by it, and
     /// one published after lands its delta on top of the count written here.
+    ///
+    /// `input_epoch` is the statistics epoch the rewrite started when it captured
+    /// its input. Every write stamped below it has its rows in `accumulator`, but
+    /// its delta may still be queued or held by a maintenance pass; once the count
+    /// is written those deltas are dropped, or they would count the rows again.
+    /// Survivors are stamped with `input_epoch` or later and keep theirs.
     pub(crate) async fn persist_table_stats_after_snapshot_rewrite(
         &self,
         accumulator: &ColumnStatsAccumulator,
+        input_epoch: u64,
     ) {
         let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
         let new_rows = accumulator.row_count();
@@ -35848,8 +35930,12 @@ impl CayenneTableProvider {
         } else {
             RowCountUpdate::Estimate(new_rows)
         };
-        self.persist_table_stats_locked(accumulator, num_rows_update, measured_every_live_row)
-            .await;
+        if self
+            .persist_table_stats_locked(accumulator, num_rows_update, measured_every_live_row)
+            .await
+        {
+            self.post_write_maintenance.count_below_epoch(input_epoch);
+        }
     }
 
     /// Abandon a statistics update, arming the row-count taint on the way out.
@@ -66791,7 +66877,7 @@ mod tests {
         // A full rewrite materializes exactly the live rows, so it — and only it —
         // may re-baseline.
         reopened
-            .persist_table_stats_after_snapshot_rewrite(&accumulator)
+            .persist_table_stats_after_snapshot_rewrite(&accumulator, reopened.statistics_epoch())
             .await;
         assert!(
             reopened.table_statistics.read().count_exact,
@@ -66886,7 +66972,7 @@ mod tests {
         let accumulator = ColumnStatsAccumulator::new(&schema).expect("supported schema");
         accumulator.update(&make_listing_parity_batch(Arc::clone(&schema), 0, 16));
         provider
-            .persist_table_stats_after_snapshot_rewrite(&accumulator)
+            .persist_table_stats_after_snapshot_rewrite(&accumulator, provider.statistics_epoch())
             .await;
         assert!(
             provider
@@ -74242,6 +74328,180 @@ mod tests {
         );
     }
 
+    /// Run a full rewrite that must commit.
+    async fn full_rewrite(provider: &CayenneTableProvider) {
+        assert!(
+            provider
+                .rewrite_current_snapshot_for_compaction()
+                .await
+                .expect("full rewrite"),
+            "the full rewrite commits"
+        );
+    }
+
+    /// A full rewrite counts the rows it read. A write whose rows it read but
+    /// whose delta is still queued must not add them again once maintenance
+    /// runs. Position-delete scope, which holds `write_lock` for the whole pass.
+    #[tokio::test]
+    async fn full_rewrite_drops_the_queued_delta_of_rows_it_read() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_append_only_table("rewrite_queued_delta", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, 4),
+        )
+        .await;
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("persist the first insert's statistics");
+
+        let held = provider.hold_post_write_maintenance().await;
+        insert_batch(&provider, id_value_batch_for_range(schema, 4, 3)).await;
+        assert!(
+            provider.post_write_maintenance.has_unapplied_live_rows_delta(),
+            "precondition: the second insert's delta is queued"
+        );
+        full_rewrite(&provider).await;
+        drop(held);
+
+        assert_eq!(
+            drained_row_counts(&provider, &catalog).await,
+            ((7, true), DFPrecision::Exact(7))
+        );
+    }
+
+    /// The fenced shape of the test above: a key-delete table, whose rewrite
+    /// holds `write_lock` only while it captures its input.
+    #[tokio::test]
+    async fn full_rewrite_drops_the_queued_delta_of_rows_it_read_on_a_key_delete_table() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) = seeded_key_rewrite_table("key_rewrite_queued_delta", &ctx).await;
+        let catalog = Arc::clone(&provider.catalog);
+
+        let held = provider.hold_post_write_maintenance().await;
+        insert_batch(
+            &provider,
+            id_value_batch(provider.table_schema(), &[3], &[30]),
+        )
+        .await;
+        full_rewrite(&provider).await;
+        drop(held);
+
+        assert_eq!(
+            drained_row_counts(&provider, &catalog).await,
+            ((4, true), DFPrecision::Exact(4))
+        );
+    }
+
+    /// A maintenance pass that took a write's statistics before a full rewrite
+    /// read that write's rows, and persists them after the rewrite's count,
+    /// must drop them.
+    #[tokio::test]
+    async fn full_rewrite_drops_the_delta_held_by_an_in_flight_maintenance_pass() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_append_only_table("rewrite_in_flight_maintenance", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, 4),
+        )
+        .await;
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("persist the first insert's statistics");
+
+        let (hook, entered, release) = parking_hook();
+        *provider.test_pre_maintenance_statistics_hook.lock() = Some(hook);
+        insert_batch(&provider, id_value_batch_for_range(schema, 4, 3)).await;
+        tokio::time::timeout(Duration::from_secs(30), entered)
+            .await
+            .expect("maintenance takes the insert's statistics")
+            .expect("maintenance reports the take");
+        full_rewrite(&provider).await;
+        release.send(()).expect("release maintenance");
+
+        assert_eq!(
+            drained_row_counts(&provider, &catalog).await,
+            ((7, true), DFPrecision::Exact(7))
+        );
+    }
+
+    /// A pipelined staged append that published its rows before a full rewrite
+    /// read them, and queues its delta after the rewrite's count, must not add
+    /// them again.
+    #[tokio::test]
+    async fn full_rewrite_drops_the_delta_of_a_staged_append_published_before_it() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_append_only_table("rewrite_staged_append", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let staged = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch_for_range(schema, 0, 3)),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("staged CDC append prepares");
+        assert!(staged.has_pending_finalize(), "the append owes a publish");
+
+        let (hook, entered, release) = parking_hook();
+        *provider.test_post_staged_publish_hook.lock() = Some(hook);
+        let race = async {
+            tokio::time::timeout(Duration::from_secs(30), entered)
+                .await
+                .expect("the append publishes its rows")
+                .expect("the append reports its publish");
+            full_rewrite(&provider).await;
+            release.send(()).expect("release the append");
+        };
+        let (finished, ()) = tokio::join!(staged.finish(), race);
+        assert_eq!(finished.expect("the append finishes"), 3);
+
+        assert_eq!(
+            drained_row_counts(&provider, &catalog).await,
+            ((3, true), DFPrecision::Exact(3))
+        );
+    }
+
+    /// A write that lands during a key-delete rewrite's re-encode is not in
+    /// the rows it read, so its queued delta must survive the rewrite's count.
+    /// The commit retains the write's protected snapshot, so the count is
+    /// recorded inexact.
+    #[tokio::test]
+    async fn full_rewrite_keeps_the_queued_delta_of_a_write_during_its_re_encode() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) = seeded_key_rewrite_table("key_rewrite_late_delta", &ctx).await;
+        let catalog = Arc::clone(&provider.catalog);
+
+        let held = provider.hold_post_write_maintenance().await;
+        {
+            let provider_in_hook = provider.clone_for_write();
+            *provider.test_pre_rewrite_commit_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let schema = provider_in_hook.table_schema();
+                    insert_batch(&provider_in_hook, id_value_batch(schema, &[99], &[990])).await;
+                })
+            }));
+        }
+        full_rewrite(&provider).await;
+        assert!(
+            !provider.protected_snapshots.load().is_empty(),
+            "precondition: the commit retains the late write's snapshot"
+        );
+        drop(held);
+
+        assert_eq!(
+            drained_row_counts(&provider, &catalog).await,
+            ((4, false), DFPrecision::Inexact(4))
+        );
+    }
+
     /// A commit must claim its live-row delta *before* it publishes the rows
     /// that delta describes, not after.
     ///
@@ -74806,11 +75066,7 @@ mod tests {
             ..PostWriteMaintenanceState::default()
         };
         provider
-            .run_maintenance_state(
-                queued,
-                provider.statistics_epoch(),
-                RetentionFailureAction::Requeue,
-            )
+            .run_maintenance_state(queued, RetentionFailureAction::Requeue)
             .await
             .expect("a deferred background pass is not an error");
         assert!(
@@ -74835,11 +75091,7 @@ mod tests {
             ..PostWriteMaintenanceState::default()
         };
         provider
-            .run_maintenance_state(
-                queued,
-                provider.statistics_epoch(),
-                RetentionFailureAction::ReturnError,
-            )
+            .run_maintenance_state(queued, RetentionFailureAction::ReturnError)
             .await
             .expect_err("a deferred synchronous drain must report, not spin");
 
@@ -74937,11 +75189,7 @@ mod tests {
             ..PostWriteMaintenanceState::default()
         };
         provider
-            .run_maintenance_state(
-                requested(),
-                provider.statistics_epoch(),
-                RetentionFailureAction::Requeue,
-            )
+            .run_maintenance_state(requested(), RetentionFailureAction::Requeue)
             .await
             .expect("a failed background pass is logged, not returned");
         assert_eq!(backoff().consecutive_failures(), 1);
@@ -74958,11 +75206,7 @@ mod tests {
 
         // A write landing inside the window queues retention again; the pass skips it.
         provider
-            .run_maintenance_state(
-                requested(),
-                provider.statistics_epoch(),
-                RetentionFailureAction::Requeue,
-            )
+            .run_maintenance_state(requested(), RetentionFailureAction::Requeue)
             .await
             .expect("a skipped pass is not an error");
         assert_eq!(

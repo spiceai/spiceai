@@ -39,6 +39,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 // ============================================================================
 
 test_on_data_store!(test_stats_correct_after_overwrite);
+test_on_data_store!(test_stats_correct_after_full_rewrite_with_a_queued_delta);
 
 // ============================================================================
 // Data Inlining Edge Cases
@@ -213,6 +214,59 @@ async fn test_stats_correct_after_overwrite(fixture: common::TestFixture) -> Tes
             usize::try_from(expected_rows)?
         );
     }
+
+    Ok(())
+}
+
+/// A full rewrite counts the rows it read, which include those of a write whose
+/// statistics are still queued for maintenance; once maintenance runs, that
+/// write must not be counted a second time.
+async fn test_stats_correct_after_full_rewrite_with_a_queued_delta(
+    fixture: common::TestFixture,
+) -> TestResult {
+    const TABLE: &str = "stats_rewrite_queued_delta";
+    let (table, ctx) = create_table_no_pk(&fixture, TABLE, simple_schema()).await;
+    let handle = table.clone_for_write_operations();
+    let table_id = fixture.catalog.get_table(TABLE).await?.table_id;
+    ctx.register_table(TABLE, Arc::new(table))?;
+
+    // Both writes are above the inline row cap, so they are written to data files.
+    ctx.sql(&format!(
+        "INSERT INTO {TABLE} SELECT v AS id, v AS value FROM (SELECT UNNEST(range(0, 2000)) AS v)"
+    ))
+    .await?
+    .collect()
+    .await?;
+    handle.drain_in_flight_maintenance().await?;
+    let held = handle.hold_post_write_maintenance().await;
+    ctx.sql(&format!(
+        "INSERT INTO {TABLE} SELECT v AS id, v AS value FROM (SELECT UNNEST(range(2000, 3500)) AS v)"
+    ))
+    .await?
+    .collect()
+    .await?;
+    assert!(
+        handle.force_full_compaction().await?,
+        "the full rewrite commits"
+    );
+    drop(held);
+    handle.drain_in_flight_maintenance().await?;
+
+    let stats = fixture
+        .catalog
+        .get_table_statistics(&table_id)
+        .await?
+        .expect("stats after the rewrite");
+    assert_eq!(
+        (stats.num_rows, stats.num_rows_exact),
+        (3500, true),
+        "the rewrite's count already includes the second write"
+    );
+    let optimizer = handle
+        .optimizer_table_statistics()
+        .expect("optimizer statistics");
+    assert_eq!(optimizer.num_rows, Precision::Exact(3500));
+    assert_eq!(query_count(&ctx, TABLE).await, 3500);
 
     Ok(())
 }
