@@ -5040,6 +5040,7 @@ impl DataFusion {
         if let Some(role) = writer_role {
             accelerated_table.attach_task(self.io_runtime.spawn(watch_writer_role(
                 role,
+                !replica,
                 dataset.name.clone(),
                 self.writer_role_changes.clone(),
             )));
@@ -7797,16 +7798,21 @@ pub fn is_schema_mismatch(error: &runtime_query_engine::query_engine::Error) -> 
 
 /// Ask for `dataset` to be reloaded once this instance starts or stops
 /// writing its acceleration: a takeover reopens it from the committed state
-/// and starts its refresh, a handover stops it.
+/// and starts its refresh, a handover stops it. `built_as_writer` is the role
+/// the table was built for, so a change between reading the role and starting
+/// this watch reloads it too.
 async fn watch_writer_role(
     mut role: data_accelerator_api::WriterRole,
+    built_as_writer: bool,
     dataset: TableReference,
     reloads: tokio::sync::mpsc::UnboundedSender<String>,
 ) {
-    let writes = *role.borrow_and_update();
-    while role.changed().await.is_ok() {
-        if *role.borrow_and_update() != writes {
+    loop {
+        if *role.borrow_and_update() != built_as_writer {
             let _ = reloads.send(dataset.to_string());
+            return;
+        }
+        if role.changed().await.is_err() {
             return;
         }
     }

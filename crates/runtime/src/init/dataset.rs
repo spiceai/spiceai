@@ -1963,7 +1963,22 @@ impl Runtime {
             else {
                 continue;
             };
-            Arc::clone(&self).update_dataset(dataset).await;
+            // A reload that unregistered the dataset and then failed to load it
+            // again is retried as an added dataset's load is, rather than wait
+            // for another change of writer that may never come.
+            if let Some(bootstrap) = Arc::clone(&self)
+                .update_dataset(Arc::clone(&dataset))
+                .await
+            {
+                let runtime = Arc::clone(&self);
+                let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
+                let load = self.dataset_loads.begin(&dataset.name);
+                tokio::spawn(async move {
+                    runtime
+                        .load_dataset(dataset, bootstrap, load_semaphore, load)
+                        .await;
+                });
+            }
         }
     }
 

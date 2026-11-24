@@ -1508,7 +1508,9 @@ impl Builder {
             self.retention
         };
 
-        if let Some(retention) = retention {
+        // Retention deletes rows: the instance that writes the acceleration
+        // runs it, and a replica serves what that instance kept.
+        if let Some(retention) = retention.filter(|_| !self.replica) {
             let retention_check_handle = tokio::spawn(AcceleratedTable::start_retention_check(
                 self.dataset_name.clone(),
                 Arc::clone(&self.accelerator),
