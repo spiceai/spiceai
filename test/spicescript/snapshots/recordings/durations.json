@@ -1,4 +1,5 @@
 {
+  "cayenne-snapshot-position-deletes-moved-dir": 15,
   "snapshots": 5,
   "snapshots-append-restore": 12,
   "snapshots-cross-bucket-replication": 215,
