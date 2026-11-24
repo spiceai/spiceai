@@ -2288,12 +2288,6 @@ impl AcceleratedTable {
             storage_filters.push(nf);
         }
         storage_filters.extend(identity_filters);
-        if is_caching_mode {
-            storage_filters.extend(caching::request_entry_filters(
-                filters,
-                &self.accelerator.schema(),
-            ));
-        }
         let scan_filters: &[Expr] = if is_caching_mode {
             &storage_filters
         } else {
@@ -2352,6 +2346,15 @@ impl AcceleratedTable {
                 })?;
                 // Neither reads the accelerator before the origin answers, so the
                 // scan is planned only if a failing fetch needs it.
+                // Apply row limits above the entry restriction so unrelated
+                // candidate entries cannot hide matching rows.
+                let cache_scan_limit = if caching::RequestEntryRestriction::new(filters)
+                    .is_active(&self.accelerator.schema())
+                {
+                    None
+                } else {
+                    limit
+                };
                 let input = if caching::uses_source_first(
                     filters,
                     self.cache_ttl,
@@ -2375,7 +2378,7 @@ impl AcceleratedTable {
                             state,
                             scan_projection,
                             scan_filters,
-                            limit,
+                            cache_scan_limit,
                         ),
                         filters_to_reapply,
                         schema,
@@ -2386,7 +2389,7 @@ impl AcceleratedTable {
                     batch_write_tx = batch_write_tx.observe_cache_scan();
                     let input = self
                         .accelerator
-                        .scan(state, scan_projection, scan_filters, limit)
+                        .scan(state, scan_projection, scan_filters, cache_scan_limit)
                         .await?;
                     caching::CachingScanInput::Planned(wrap_with_filter(
                         input,

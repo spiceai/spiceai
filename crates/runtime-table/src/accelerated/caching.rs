@@ -22,9 +22,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicI64;
 use std::time::{Duration, SystemTime};
 
-use arrow::array::StringArray;
 use arrow::array::{Array, ArrayRef, RecordBatch, TimestampNanosecondArray};
-use arrow::compute::cast;
+use arrow::array::{BooleanArray, StringArray};
+use arrow::compute::{cast, filter_record_batch};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_tools::format::SchemaDisplay;
 use data_components::http::provider::{HttpTableProvider, RequestPages};
@@ -440,7 +440,7 @@ impl UncoalescedFetch<'_> {
                 // `Err` arm.
                 if !cache::batches_cacheable(&batches)
                     && let Some(stale) = match expired_batches {
-                        Some(fallback) => fallback.read().await,
+                        Some(fallback) => fallback.read(filters).await,
                         None => None,
                     }
                 {
@@ -471,7 +471,7 @@ impl UncoalescedFetch<'_> {
             )),
             Err(e) => {
                 if let Some(batches) = match expired_batches {
-                    Some(fallback) => fallback.read().await,
+                    Some(fallback) => fallback.read(filters).await,
                     None => None,
                 } {
                     let staleness = staleness_past_max_age(&batches, max_age, fetch_started_at);
@@ -671,28 +671,62 @@ fn lookup_entry_keys(filters: &[Expr]) -> Option<Vec<String>> {
         .collect()
 }
 
-/// Restrict a storage lookup to the responses fetched for its own requests.
-/// Noncanonical scans cannot name discrete origin requests, so retain their
-/// dimension-based behavior. Legacy tables retain that behavior for all scans.
-pub(super) fn request_entry_filters(
-    filters: &[Expr],
-    schema: &arrow::datatypes::Schema,
-) -> Vec<Expr> {
-    if schema.column_with_name(CACHE_REQUEST_COLUMN).is_none() {
-        return Vec::new();
+/// Restrict candidate rows to the responses fetched for this lookup's requests.
+/// Noncanonical request scans accept any tagged entry; scans without request
+/// predicates and legacy tables without entry tags retain every row.
+pub(super) struct RequestEntryRestriction {
+    keys: Option<HashSet<String>>,
+    requires_tag: bool,
+}
+
+impl RequestEntryRestriction {
+    pub(super) fn new(filters: &[Expr]) -> Self {
+        Self {
+            keys: lookup_entry_keys(filters).map(|keys| keys.into_iter().collect()),
+            requires_tag: filters.iter().flat_map(Expr::column_refs).any(|column| {
+                REQUEST_KEY_COLUMNS.contains(&column.name.as_str())
+                    || column.name == "request_headers"
+            }),
+        }
     }
-    match lookup_entry_keys(filters) {
-        Some(keys) => {
-            vec![col(CACHE_REQUEST_COLUMN).in_list(keys.into_iter().map(lit).collect(), false)]
+
+    pub(super) fn is_active(&self, schema: &arrow::datatypes::Schema) -> bool {
+        (self.keys.is_some() || self.requires_tag)
+            && schema.column_with_name(CACHE_REQUEST_COLUMN).is_some()
+    }
+
+    fn apply(&self, batch: RecordBatch) -> DataFusionResult<RecordBatch> {
+        if !self.is_active(&batch.schema()) {
+            return Ok(batch);
         }
-        // Untagged rows cannot establish that any origin response is cached.
-        None if filters.iter().flat_map(Expr::column_refs).any(|column| {
-            REQUEST_KEY_COLUMNS.contains(&column.name.as_str()) || column.name == "request_headers"
-        }) =>
-        {
-            vec![col(CACHE_REQUEST_COLUMN).is_not_null()]
+        let Some(column) = batch.column_by_name(CACHE_REQUEST_COLUMN) else {
+            return Ok(batch);
+        };
+        let keys = column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!("{CACHE_REQUEST_COLUMN} must be Utf8"))
+            })?;
+        let mask = BooleanArray::from_iter(keys.iter().map(|key| {
+            Some(key.is_some_and(|key| self.keys.as_ref().is_none_or(|keys| keys.contains(key))))
+        }));
+        if mask.true_count() == batch.num_rows() {
+            return Ok(batch);
         }
-        None => Vec::new(),
+        Ok(filter_record_batch(&batch, &mask)?)
+    }
+
+    fn restrict_stream(&self, stream: SendableRecordBatchStream) -> SendableRecordBatchStream {
+        let restriction = Self {
+            keys: self.keys.clone(),
+            requires_tag: self.requires_tag,
+        };
+        let schema = stream.schema();
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream.map(move |batch| restriction.apply(batch?)),
+        ))
     }
 }
 
@@ -2215,7 +2249,7 @@ enum CacheFallback {
 }
 
 impl CacheFallback {
-    async fn read(self) -> Option<Vec<RecordBatch>> {
+    async fn read(self, filters: &[Expr]) -> Option<Vec<RecordBatch>> {
         let batches = match self {
             Self::Loaded(batches) => batches,
             Self::Deferred {
@@ -2235,7 +2269,13 @@ impl CacheFallback {
                 .inspect_err(|error| tracing::debug!(%error, "Cache fallback collection failed"))
                 .ok()?,
         };
+        let restriction = RequestEntryRestriction::new(filters);
         let batches: Vec<RecordBatch> = batches
+            .into_iter()
+            .map(|batch| restriction.apply(batch))
+            .collect::<DataFusionResult<Vec<_>>>()
+            .inspect_err(|error| tracing::debug!(%error, "Cache fallback restriction failed"))
+            .ok()?
             .into_iter()
             .filter(|batch| batch.num_rows() > 0)
             .collect();
@@ -3466,7 +3506,6 @@ impl CacheRefreshHelper {
     ) -> DataFusionResult<bool> {
         let mut filters = request.to_vec();
         filters.extend(request_identity_filters(request, &accelerator.schema()));
-        filters.extend(request_entry_filters(request, &accelerator.schema()));
         if accelerator
             .schema()
             .column_with_name(CACHE_NAMESPACE_COLUMN)
@@ -3474,10 +3513,13 @@ impl CacheRefreshHelper {
         {
             filters.push(namespace_filter_expr(namespace_id));
         }
-        let plan = TableScanParams::new(session_state, None, &filters, Some(1))
+        // A candidate from another entry must not consume a scan limit before
+        // the entry restriction can see the remaining rows.
+        let plan = TableScanParams::new(session_state, None, &filters, None)
             .scan_and_optimize(accelerator.as_ref(), &filters)
             .await?;
-        let mut stream = plan.execute(0, context)?;
+        let restriction = RequestEntryRestriction::new(request);
+        let mut stream = restriction.restrict_stream(plan.execute(0, context)?);
         while let Some(batch) = stream.try_next().await? {
             if batch.num_rows() > 0 {
                 return Ok(false);
@@ -3796,7 +3838,7 @@ impl CacheRefreshHelper {
                 // origin's error body instead of the cached response.
                 if !batches_cacheable
                     && let Some(stale) = match expired_batches {
-                        Some(fallback) => fallback.read().await,
+                        Some(fallback) => fallback.read(filters).await,
                         None => None,
                     }
                 {
@@ -3919,7 +3961,7 @@ impl CacheRefreshHelper {
             Err(e) => {
                 // Check if we should serve stale (expired) data on error
                 if let Some(batches) = match expired_batches {
-                    Some(fallback) => fallback.read().await,
+                    Some(fallback) => fallback.read(filters).await,
                     None => None,
                 } {
                     let staleness = staleness_past_max_age(&batches, max_age, fetch_started_at);
@@ -4636,7 +4678,10 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 "A cache-first read requires a planned accelerator input".to_string(),
             ));
         };
-        let accelerator_stream = input.execute(partition, Arc::clone(&context))?;
+        // Restrict each batch before collection, cache decisions, or a direct
+        // streamed hit can observe rows belonging to another entry.
+        let accelerator_stream = RequestEntryRestriction::new(&self.filters)
+            .restrict_stream(input.execute(partition, Arc::clone(&context))?);
 
         // When no filters are provided (e.g., SELECT *), return cached data directly
         // without triggering HTTP requests to the federated source or staleness checks.
@@ -4963,10 +5008,9 @@ mod cache_namespace_column_tests {
         );
     }
 
-    #[tokio::test]
-    async fn caching_entry_lookup_selects_only_its_tagged_rows() {
+    #[test]
+    fn caching_entry_lookup_selects_only_its_tagged_rows() {
         use arrow::datatypes::{DataType, Field, Schema};
-        use datafusion::execution::context::SessionContext;
         let broad = vec![col("request_path").eq(lit("/pages"))];
         let narrow = vec![broad[0].clone(), col("request_query").eq(lit("cursor=2"))];
         let broad_key = request_entry_key(&broad).expect("broad key");
@@ -4990,17 +5034,9 @@ mod cache_namespace_column_tests {
         )
         .expect("stored entries");
         for (filters, expected) in [(&broad, vec!["A", "B", "C"]), (&narrow, vec!["B"])] {
-            let predicate = request_entry_filters(filters, &schema)
-                .pop()
-                .expect("entry filter");
-            let batches = SessionContext::new()
-                .read_batches(vec![batch.clone()])
-                .expect("read")
-                .filter(predicate)
-                .expect("filter")
-                .collect()
-                .await
-                .expect("rows");
+            let batches = [RequestEntryRestriction::new(filters)
+                .apply(batch.clone())
+                .expect("restricted rows")];
             let actual: Vec<_> = batches
                 .iter()
                 .flat_map(|batch| {
@@ -5020,15 +5056,26 @@ mod cache_namespace_column_tests {
             col("request_query").in_list(vec![lit("cursor=2"), lit("cursor=3")], false),
         ];
         assert_eq!(
-            missing_requested_cache_keys(&filters, &[batch]),
+            missing_requested_cache_keys(&filters, std::slice::from_ref(&batch)),
             Some(vec![RequestedCacheKey {
                 path: Some("/pages".into()),
                 query: Some("cursor=3".into()),
                 body: None,
             }])
         );
-        assert_eq!(request_entry_filters(&broad, &Schema::empty()), vec![]);
-        assert_eq!(request_entry_filters(&[], &schema), vec![]);
+        let legacy = batch.project(&[0]).expect("legacy projection");
+        assert_eq!(
+            RequestEntryRestriction::new(&broad)
+                .apply(legacy.clone())
+                .expect("legacy rows"),
+            legacy,
+        );
+        assert_eq!(
+            RequestEntryRestriction::new(&[])
+                .apply(batch.clone())
+                .expect("all rows"),
+            batch,
+        );
     }
 
     #[test]
