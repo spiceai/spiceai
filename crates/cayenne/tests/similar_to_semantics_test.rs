@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![allow(clippy::expect_used)]
-
 //! `SIMILAR TO` is a SQL pattern, not an unanchored regex.
 //!
 //! `DataFusion` 55 handed the pattern to the regex kernel unchanged, so `%` and `_`
