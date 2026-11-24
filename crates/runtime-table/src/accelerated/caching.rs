@@ -2072,6 +2072,24 @@ fn charged_response_stream(
     Box::pin(RecordBatchStreamAdapter::new(schema, stream))
 }
 
+/// Where a fetch's response may be stored: the memory pool its batches are
+/// charged to, and whether the table can group the pages of a paginated
+/// response. The default stores nothing.
+#[derive(Clone, Copy, Default)]
+struct PopulationTarget<'a> {
+    memory_pool: Option<&'a Arc<dyn MemoryPool>>,
+    stores_paginated_responses: bool,
+}
+
+impl<'a> PopulationTarget<'a> {
+    fn of(writer: &'a CacheWriteSender) -> Self {
+        Self {
+            memory_pool: writer.memory_pool(),
+            stores_paginated_responses: writer.stores_paginated_responses(),
+        }
+    }
+}
+
 struct CacheFetch {
     batches: Vec<RecordBatch>,
     /// The pages of a complete fetch, or `None` when the fetch may have
@@ -2328,8 +2346,7 @@ impl CacheRefreshHelper {
                     &source_replay_filters(&row_filters),
                     None,
                     cache_write_tx.task_context(&session_state),
-                    cache_write_tx.memory_pool(),
-                    cache_write_tx.stores_paginated_responses(),
+                    PopulationTarget::of(&cache_write_tx),
                 )
                 .await?;
 
@@ -2471,8 +2488,7 @@ impl CacheRefreshHelper {
             filters,
             None,
             batch_write_tx.task_context(session_state),
-            batch_write_tx.memory_pool(),
-            batch_write_tx.stores_paginated_responses(),
+            PopulationTarget::of(&batch_write_tx),
         )
         .await?;
 
@@ -3299,8 +3315,7 @@ impl CacheRefreshHelper {
             filters,
             limit,
             task_context,
-            None,
-            false,
+            PopulationTarget::default(),
         )
         .await
         .map(|fetch| fetch.batches)
@@ -3313,9 +3328,12 @@ impl CacheRefreshHelper {
         filters: &[Expr],
         limit: Option<usize>,
         task_context: Arc<TaskContext>,
-        memory_pool: Option<&Arc<dyn MemoryPool>>,
-        stores_paginated_responses: bool,
+        target: PopulationTarget<'_>,
     ) -> DataFusionResult<CacheFetch> {
+        let PopulationTarget {
+            memory_pool,
+            stores_paginated_responses,
+        } = target;
         tracing::debug!(
             "Fetching from source for dataset {dataset_name} with {} filters, limit={limit:?}",
             filters.len()
@@ -3560,8 +3578,7 @@ impl CacheRefreshHelper {
             filters,
             limit,
             batch_write_tx.task_context(session_state),
-            batch_write_tx.memory_pool(),
-            batch_write_tx.stores_paginated_responses(),
+            PopulationTarget::of(&batch_write_tx),
         )
         .await
         {
@@ -5453,8 +5470,10 @@ mod pool_tests {
                 &filters,
                 None,
                 state.task_ctx(),
-                Some(&pool),
-                true,
+                PopulationTarget {
+                    memory_pool: Some(&pool),
+                    stores_paginated_responses: true,
+                },
             )
             .await
             .expect("initial HTTP fetch");
