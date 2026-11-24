@@ -1,19 +1,16 @@
-# Known failing (#16625).
+# Regression test for #16625.
 name: postgres-cdc-replay-after-reconnect
 tags: [long]
 description: >
-  When Spice re-establishes a PostgreSQL replication connection while a
-  file-mode Cayenne CDC acceleration (refresh_mode: changes) holds changes it
-  has applied but not yet checkpointed, the source sends those changes again.
-  Spice reconnects when the connection drops, and when a dataset on a shared
-  slot finishes its initial snapshot or a rebuild from the source, as one does
-  after spiced is killed during its initial snapshot. The re-sent changes must
-  not undo later ones: a key inserted, updated and deleted at the source stays
+  Spice re-establishes a PostgreSQL replication connection when it drops, and
+  when a dataset on a shared slot finishes its initial snapshot or a rebuild
+  from the source, as one does after spiced is killed during its initial
+  snapshot. The source then sends again every change since the slot's last
+  acknowledged position, including changes file-mode Cayenne CDC accelerations
+  (refresh_mode: changes) have applied but not yet checkpointed. Those must not
+  undo later changes: a key inserted, updated and deleted at the source stays
   deleted, and a row updated many times keeps its last value, also after a
-  restart. Today a re-sent INSERT or UPDATE can be applied after the DELETE or
-  the later UPDATE that followed it, while the re-sent DELETE or later UPDATE
-  is skipped as already applied, so the deleted key comes back and the updated
-  row goes back to an older value, for good.
+  restart.
 
 sources:
   src: { kind: postgres }
@@ -74,10 +71,9 @@ sources:
 #   kill-in-rebuild         as kill-in-snapshot, and spiced is killed again
 #                           during the rebuild; the next start rebuilds `h`
 #                           again.
-#   kill-after-checkpoint   as kill-in-snapshot, and spiced is killed while the
-#                           changes sent again wait behind `g`, after `v` has
-#                           checkpointed them; the wrong row is already
-#                           durable.
+#   kill-after-checkpoint   as kill-in-snapshot, and spiced is killed once `v`
+#                           and `g` have checkpointed after the rebuild, so a
+#                           wrong row would already be durable.
 # The kills land in `h`'s snapshot, its rebuild, and its catch-up after the
 # rebuild; each phase is checked before the kill.
 matrix:
@@ -85,17 +81,9 @@ matrix:
 
 # The spicepod as written (the SQLite Cayenne metastore), and the same with
 # the prototype object-native metastore.
-#
-# Every variant hands each commit to a dataset on its own rather than folding
-# consecutive commits together, so the 3,000 commits to `g` below fill its
-# queue.
 variants:
-  as-written:
-    env: &env
-      SPICE_POSTGRES_CDC_MAX_ENVELOPE_AGE_MS: '0'
-      SPICE_POSTGRES_CDC_MAX_BACKPRESSURE_ROWS_PER_ENVELOPE: '1'
+  as-written: {}
   object-native:
-    env: *env
     spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
 
 spicepod:
@@ -125,10 +113,10 @@ spicepod:
         primary_key: id
         # Checkpoint, and so acknowledge the source, once a minute rather than
         # every second: what a dataset applies below stays unacknowledged until
-        # Spice reconnects, and is acknowledged while the changes sent again
-        # wait behind `g`.
+        # Spice reconnects, and is acknowledged only after it reconnects.
         params: { cayenne_cdc_mem_tier_checkpoint_interval_ms: '60000' }
-    # Its changes wait while HOLD is held.
+    # Its changes wait while HOLD is held, which holds up whatever the source
+    # sends after them on the shared connection.
     - from: postgres:public.g
       name: g
       params:
@@ -211,18 +199,20 @@ steps:
   - query: SELECT id, n FROM v
     eventually: 60s
 
-  # Insert, update and delete key 5000 of `v`, with 3,000 one-row commits to
-  # `g` between the update and the delete: more than `g` takes in while its
-  # embeddings wait below (its apply loop gathers up to 1,024 changes and its
-  # queue holds 16 more).
+  # Insert, update and delete key 5000 of `v`, with 1,500 commits of a 64 KiB
+  # row to `g` between the update and the delete: about 96 MiB, more than `g`
+  # takes in while its embeddings wait below (its apply loop gathers up to
+  # 8 MiB of changes and its queue holds 32 MiB more). If the source sent these
+  # again, `v`'s copy of the delete would wait behind them, past `v`'s next
+  # checkpoint.
   - source-exec: { src: "INSERT INTO v VALUES (5000, 1)" }
   - source-exec: { src: "UPDATE v SET n = 2 WHERE id = 5000" }
   - source-exec:
       src: |
         DO $$
         BEGIN
-          FOR i IN 1..3000 LOOP
-            UPDATE g SET t = 'HOLD ' || i WHERE id = 0;
+          FOR i IN 1..1500 LOOP
+            UPDATE g SET t = 'HOLD ' || i || ' ' || repeat('g', 65536) WHERE id = 0;
             COMMIT;
           END LOOP;
         END $$;
@@ -232,7 +222,7 @@ steps:
   - query: SELECT id, n FROM v WHERE id = 5000
     expect-empty: true
     eventually: 15s
-  - query: SELECT id, t FROM g WHERE id = 0
+  - query: SELECT id, rtrim(substr(t, 1, 12), ' g') AS t, length(t) AS len FROM g WHERE id = 0
     eventually: 30s
 
   # Hold `g`'s embeddings, then make Spice reconnect.
@@ -247,11 +237,8 @@ steps:
   - assert-log: { contains: 'Dataset h: rebuilt the acceleration from the source; resuming change streaming' }
     eventually: 60s
     when: *killed
-  # The changes sent again to `g` wait on its embeddings, and the source waits
-  # to hand it more.
-  - wait-metric: { name: dataset_postgres_replication_member_send_stalled_seconds_total, above: 0, timeout: 60s }
-  # Meanwhile `v`'s and `g`'s next checkpoints acknowledge what they applied
-  # before Spice reconnected.
+  # `v`'s and `g`'s next checkpoints, after Spice reconnected, acknowledge what
+  # they applied before it.
   - wait-metric: { name: cayenne_mem_tier_checkpoint_tick_total, labels: { table: v }, increases: true, timeout: 90s }
   - wait-metric: { name: cayenne_mem_tier_checkpoint_tick_total, labels: { table: g }, increases: true, timeout: 90s }
   # Killed after `v` checkpoints.
@@ -268,7 +255,7 @@ steps:
     eventually: 30s
   - query: SELECT id, n FROM v
     eventually: 30s
-  - query: SELECT id, t FROM g WHERE id = 0
+  - query: SELECT id, rtrim(substr(t, 1, 12), ' g') AS t, length(t) AS len FROM g WHERE id = 0
     eventually: 30s
   - query: SELECT count(*) AS n FROM h
     eventually: 30s
@@ -279,5 +266,5 @@ steps:
     eventually: 30s
   - query: SELECT id, n FROM v
     eventually: 30s
-  - query: SELECT id, t FROM g WHERE id = 0
+  - query: SELECT id, rtrim(substr(t, 1, 12), ' g') AS t, length(t) AS len FROM g WHERE id = 0
     eventually: 30s
