@@ -1060,8 +1060,8 @@ async fn assert_no_duplicate_pk_under_concurrent_upserts(
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 8))]
-async fn test_concurrent_upsert_scan_no_duplicate_pk_no_inline() -> TestResult<()> {
-    common::run_with_backend(common::BackendType::Sqlite, |fixture| {
+async fn test_concurrent_upsert_scan_no_duplicate_pk_no_inline_on_data_store() -> TestResult<()> {
+    common::run_with_backend(common::BackendType::for_data_store(), |fixture| {
         assert_no_duplicate_pk_under_concurrent_upserts(
             fixture,
             0,
@@ -1072,8 +1072,8 @@ async fn test_concurrent_upsert_scan_no_duplicate_pk_no_inline() -> TestResult<(
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 8))]
-async fn test_concurrent_upsert_scan_no_duplicate_pk_inline() -> TestResult<()> {
-    common::run_with_backend(common::BackendType::Sqlite, |fixture| {
+async fn test_concurrent_upsert_scan_no_duplicate_pk_inline_on_data_store() -> TestResult<()> {
+    common::run_with_backend(common::BackendType::for_data_store(), |fixture| {
         assert_no_duplicate_pk_under_concurrent_upserts(
             fixture,
             DEFAULT_INLINE_MAX_ROWS,
