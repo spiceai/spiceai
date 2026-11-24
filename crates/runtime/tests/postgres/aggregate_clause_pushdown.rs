@@ -19,8 +19,8 @@ limitations under the License.
 //! unless it can be written as `WITHIN GROUP`. A federated `lag(v) IGNORE NULLS`
 //! came back respecting nulls, and `array_agg(id ORDER BY id DESC)` in
 //! `PostgreSQL`'s own order, with no error. Each query here runs against the
-//! federated table and against an Arrow acceleration of the same table, which
-//! `DataFusion` evaluates itself, and must agree with it and with pinned rows.
+//! federated table and against a Cayenne memory acceleration of the same table,
+//! which `DataFusion` evaluates itself, and must agree with it and with pinned rows.
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -57,7 +57,8 @@ fn dataset(port: usize, name: &str, accelerated: bool) -> Dataset {
     if accelerated {
         ds.acceleration = Some(Acceleration {
             enabled: true,
-            engine: Some("arrow".to_string()),
+            engine: Some("cayenne".to_string()),
+            mode: spicepod::acceleration::Mode::Memory,
             refresh_mode: Some(RefreshMode::Full),
             ..Acceleration::default()
         });

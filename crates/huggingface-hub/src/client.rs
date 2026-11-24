@@ -173,8 +173,11 @@ pub enum Error {
         source: Arc<reqwest::Error>,
     },
 
+    /// `message` can quote what the response held, which the endpoint decides, so it prints
+    /// as [`crate::printable`] prints it.
     #[snafu(display(
-        "The Hugging Face Hub returned an unexpected response for {kind} '{repo}': {message}",
+        "The Hugging Face Hub returned an unexpected response for {kind} '{repo}': {}",
+        crate::printable(message),
         kind = repo.kind()
     ))]
     UnexpectedResponse { repo: RepoId, message: String },

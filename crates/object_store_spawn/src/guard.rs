@@ -33,7 +33,10 @@ limitations under the License.
 //!
 //! `reqwest` removes `Authorization` and the other standard credential headers when a redirect
 //! changes the host or port, which covers the only credential these stores send (`http_auth`'s
-//! `Authorization: Basic`); with downgrades refused, a scheme change is an upgrade.
+//! `Authorization: Basic`); with downgrades refused, a scheme change is an upgrade. It removes
+//! them only from the hop that changes the host or port, so a client with default headers
+//! refuses a redirect chain that continues on the host it moved to
+//! ([`http_egress::OnOriginChange::FollowWithCredentials`]).
 //!
 //! The client applies only `allow_http`, `timeout`, `connect_timeout`, `http1_only`,
 //! `user_agent`, and default headers. Building fails if any other client option differs from
@@ -49,7 +52,7 @@ limitations under the License.
 use std::{error::Error as StdError, sync::Arc};
 
 pub use http_egress::{DestinationGuard, DestinationRefused};
-use http_egress::{Egress, RedirectRefused};
+use http_egress::{Egress, OnOriginChange, RedirectRefused};
 use object_store::{
     ClientConfigKey, ClientOptions,
     client::{HttpError, HttpErrorKind},
@@ -122,18 +125,33 @@ pub(crate) fn build_client(
 
     let egress = Egress::new(Some(guard.clone()), MAX_REDIRECTS);
     let policy_egress = egress.clone();
+    // A default header is sent on every request, so a store that sets one (such as the Basic
+    // credentials from a URL's user name and password) carries credentials.
+    let on_origin_change = if options
+        .get_default_headers()
+        .is_some_and(|headers| !headers.is_empty())
+    {
+        OnOriginChange::FollowWithCredentials
+    } else {
+        OnOriginChange::Follow
+    };
     let mut builder = reqwest::Client::builder()
         // Compression changes `Content-Length`, which `object_store` reads as the object size.
         .no_gzip()
         .no_brotli()
         .no_zstd()
         .no_deflate()
-        .redirect(redirect::Policy::custom(move |attempt| match policy_egress
-            .redirect(attempt.previous(), attempt.url())
-        {
-            Ok(_) => attempt.follow(),
-            Err(refused) => attempt.error(refused),
-        }))
+        .redirect(redirect::Policy::custom(
+            move |attempt| match http_egress::follow_redirect(
+                &policy_egress,
+                attempt.previous(),
+                attempt.url(),
+                on_origin_change,
+            ) {
+                Ok(_) => attempt.follow(),
+                Err(refused) => attempt.error(refused),
+            },
+        ))
         .dns_resolver(Arc::new(GuardedResolver { egress }))
         .https_only(!flag(value(ClientConfigKey::AllowHttp))?);
 

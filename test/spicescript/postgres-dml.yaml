@@ -23,6 +23,10 @@ spicepod:
       name: items
       params: ${sources.src.params}
       access: read_write
+    - from: postgres:public.ev
+      name: ev
+      params: ${sources.src.params}
+      access: read_write
 
 defaults:
   # A cluster buckets each acceleration on this column (--cluster).
@@ -32,7 +36,7 @@ defaults:
 
 steps:
   - source-exec:
-      src: CREATE TABLE items (id int PRIMARY KEY, name text NOT NULL, value int NOT NULL, n bigint NOT NULL); INSERT INTO items VALUES (1, 'alpha', 10, 100), (2, 'beta', 20, 200), (3, 'gamma', 30, 300), (4, 'delta', 40, 9223372036854775807);
+      src: CREATE TABLE items (id int PRIMARY KEY, name text NOT NULL, value int NOT NULL, n bigint NOT NULL); INSERT INTO items VALUES (1, 'alpha', 10, 100), (2, 'beta', 20, 200), (3, 'gamma', 30, 300), (4, 'delta', 40, 9223372036854775807); CREATE TABLE ev (id int PRIMARY KEY, ts timestamp NOT NULL, note text NOT NULL); INSERT INTO ev VALUES (0, '2024-01-01 00:00:00', ''), (1, '2024-01-01 00:00:00.000001', ''), (2, '2024-01-01 00:00:00.000002', '')
   - start: {}
 
   - spice-exec: DELETE FROM items WHERE id = 2
@@ -91,3 +95,25 @@ steps:
   - query: SELECT count(*) AS n FROM items
     expect: { rows: [['0']] }
     eventually: 30s
+
+  # A timestamp bound reaches PostgreSQL with every microsecond, a bound
+  # between two microseconds compares exactly (truncated to T+1us, the
+  # DELETE would also remove row 1), and a SET value between two
+  # microseconds is truncated as PostgreSQL stores it. The rows sit at T,
+  # T+1us and T+2us.
+  - spice-exec: UPDATE ev SET note = 'eq' WHERE ts = TIMESTAMP '2024-01-01 00:00:00.000001'
+  - source-query: { src: "SELECT id, note FROM ev ORDER BY id" }
+    expect: { rows: [['0', ''], ['1', eq], ['2', '']] }
+  - spice-exec: DELETE FROM ev WHERE ts >= TIMESTAMP '2024-01-01 00:00:00.000001500'
+  - source-query: { src: "SELECT id FROM ev ORDER BY id" }
+    expect: { rows: [['0'], ['1']] }
+  - spice-exec: UPDATE ev SET ts = TIMESTAMP '2024-01-01 00:00:00.000001500' WHERE id = 0
+  - source-query: { src: "SELECT id, CAST(ts AS text) FROM ev ORDER BY id" }
+    expect: { rows: [['0', '2024-01-01 00:00:00.000001'], ['1', '2024-01-01 00:00:00.000001']] }
+
+  # A pushed-down sort goes after the filter, not into a string literal that
+  # holds the word LIMIT.
+  - source-exec:
+      src: UPDATE ev SET note = 'speed LIMIT 50' WHERE id = 1
+  - query: SELECT id FROM ev WHERE note = 'speed LIMIT 50' ORDER BY id
+    expect: { rows: [['1']] }

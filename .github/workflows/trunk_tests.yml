@@ -7,7 +7,10 @@ name: Trunk tests
 # when its failures go unaddressed. Add a job here, and to `needs` of the
 # `Trunk tests` job at the end, to move a test out of the merge queue.
 #
-# Today it runs spicescript (tools/spicescript):
+# It runs the model integration tests (integration_llms.yml), the nextest tests
+# the gate leaves to after merge (`make nextest-post-merge`,
+# NEXTEST_POST_MERGE_FILTER in the Makefile), and spicescript
+# (tools/spicescript):
 # - every script in test/spicescript, including those tagged `long`, which the
 #   merge queue skips;
 # - test/spicescript/known-failing: scripts that reproduce open bugs. Each must
@@ -16,6 +19,9 @@ name: Trunk tests
 #   re-record) or now shows differently (re-record, or look for a regression);
 # - the DuckDB scripts again on each older DuckDB release;
 # - test/spicescript/live, against real providers.
+#
+# It also checks `spiced` with only its default features (`default-features`),
+# the configuration `make install` builds and no merge-queue job compiles.
 #
 # It tests the binaries the merge queue already built for that commit (E2E Test
 # CI's build_linux_x86_64), and builds them only when no run still holds them.
@@ -37,10 +43,17 @@ on:
         description: 'An E2E Test CI run whose Linux build to test (default: the build of trunk HEAD)'
         required: false
         type: string
+      branch:
+        description: 'A versioned release branch (release/X.Y) whose head to test, with that commit''s own build (default: trunk)'
+        required: false
+        type: string
 
-# One run at a time, never cancelled: each run is a verdict Trunk Health reads.
+run-name: ${{ inputs.branch && format('Trunk tests on {0}', inputs.branch) || 'Trunk tests' }}
+
+# One run per branch at a time, never cancelled: each run is a verdict that
+# Trunk Health (trunk) or a release build (release branches) reads.
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}-${{ inputs.branch || 'trunk' }}
   cancel-in-progress: false
 
 permissions:
@@ -78,9 +91,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_ID: ${{ inputs.run_id }}
+          BRANCH: ${{ inputs.branch }}
           GIVEN_WORKFLOW: ${{ steps.given.outputs.workflow }}
         run: |
           set -euo pipefail
+          if [ -n "$BRANCH" ]; then
+            [ -z "$RUN_ID" ] || { echo "::error::Give run_id or branch, not both"; exit 1; }
+            # The versioned release branches only, the same pattern
+            # check-trusted-run accepts builds from: these jobs hold credentials,
+            # and an arbitrary release/* branch may not be protected.
+            [[ "$BRANCH" =~ ^release/[0-9]+\.[0-9]+(\.[0-9]+)?(-rc\.?[0-9]+)?$ ]] || { echo "::error::branch must be a versioned release branch (release/X.Y), not '$BRANCH'"; exit 1; }
+          fi
           holds_build() {
             gh api "repos/$GITHUB_REPOSITORY/actions/runs/$1/artifacts" \
               -q '.artifacts[] | select(.expired | not) | .name' | grep -qx build_linux_x86_64
@@ -91,14 +112,19 @@ jobs:
             run="$RUN_ID"
             sha=$(gh run view "$RUN_ID" -R "$GITHUB_REPOSITORY" --json headSha -q .headSha)
           else
-            # Trunk, whatever ref a dispatch named: these jobs hold credentials,
-            # and a branch's code gets them only through a trusted run_id. A
+            # Trunk, or a release branch named by `branch`, whatever ref a
+            # dispatch ran from: these jobs hold credentials, and other code
+            # gets them only through a trusted run_id. A
             # scheduled run tests the commit it started at, its own head_sha,
             # so that the next run's commit range starts at the commit this run
             # actually tested; a dispatch tests trunk HEAD. The merge-queue run
             # of a trunk commit built exactly that commit (the queue
             # fast-forwards trunk to it), and so did its push run.
-            if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            if [ -n "$BRANCH" ]; then
+              # A protected release branch's head, read from the API: the
+              # code tested is that branch's, never the dispatching ref's.
+              sha=$(gh api "repos/$GITHUB_REPOSITORY/branches/$BRANCH" -q .commit.sha)
+            elif [ "$GITHUB_EVENT_NAME" = schedule ]; then
               sha="$GITHUB_SHA"
             else
               sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/trunk" -q .sha)
@@ -133,8 +159,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ steps.build.outputs.sha }}
+          BRANCH: ${{ inputs.branch }}
         run: |
           set -euo pipefail
+          if [ -n "$BRANCH" ]; then
+            echo "### Testing $BRANCH at ${SHA}" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           # Scheduled runs test the commit they ran at, so the newest green
           # scheduled run's commit is the last one known good.
           green=$(gh run list -R "$GITHUB_REPOSITORY" -w trunk_tests.yml -b trunk -e schedule \
@@ -155,6 +186,7 @@ jobs:
             > "$RUNNER_TEMP/range/trunk-tests-range.json"
 
       - name: Upload the commit range
+        if: inputs.branch == ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: trunk-tests-range
@@ -316,7 +348,7 @@ jobs:
         if: ${{ matrix.live }}
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
           role-session-name: gha-databricks-delta-${{ github.run_id }}
           aws-region: us-east-1
           output-env-credentials: false
@@ -325,7 +357,7 @@ jobs:
       - name: Run live scripts
         if: ${{ !cancelled() && matrix.live }}
         env:
-          DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
+          DATABRICKS_HOST: ${{ vars.CI_DATABRICKS_HOST }}
           DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
           DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta.outputs.aws-access-key-id }}
@@ -394,17 +426,190 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  # The model integration tests (integration_llms.yml), on the commit this run
+  # tests: local models and the hosted providers. They run here and on pushes
+  # that touch the model crates, not in the merge queue.
+  models:
+    name: Model tests
+    needs: resolve
+    uses: ./.github/workflows/integration_llms.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+    # The called jobs' own permissions, which a caller must grant: the test
+    # job exchanges its OIDC token for provider access tokens.
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    secrets: inherit
+
+  # The nextest tests that sign-off and the merge queue skip: the SF1
+  # result-correctness lanes, which compare Cayenne with standalone DuckDB and
+  # SQLite, and the tuning simulation's report. Built from source at the commit
+  # this run tests, as correctness_chdb.yml builds its lane, since the E2E build
+  # holds no test binaries.
+  nextest:
+    environment: ci
+    name: nextest (post-merge)
+    needs: resolve
+    runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials for the build cache
+    # The lanes took 607s one at a time on a quiet Mac, and the shared runners
+    # have been measured at up to 4.6x slower; the rest is building `cayenne`.
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Restore Cargo registry
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Set up Rust
+        uses: $/.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: $/.github/actions/setup-nextest
+
+      - name: Set up make
+        uses: $/.github/actions/setup-make
+
+      - name: Set up cc
+        uses: $/.github/actions/setup-cc
+
+      - name: Install protoc
+        uses: $/.github/actions/install-protoc
+
+      - name: Get RustFS credentials
+        id: rustfs
+        continue-on-error: true
+        uses: $/.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '7200'
+          export-env: 'false'
+
+      - name: Set up sccache
+        uses: $/.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+
+      # A dispatch can test an older trunk or release commit, from before these
+      # tests left the merge gate. That commit has no `nextest-post-merge`, and
+      # its own merge gate already ran the tests, so there is nothing to run.
+      - name: Run the post-merge nextest tests
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+        run: |
+          set -euo pipefail
+          if ! grep -q '^nextest-post-merge:' Makefile; then
+            echo "::notice::This commit predates make nextest-post-merge; its merge gate ran these tests, so there is nothing to run here."
+            exit 0
+          fi
+          make nextest-post-merge
+
+  # `spiced` with its default features and nothing else: what `make install` builds,
+  # and the one configuration no merge-queue job compiles. Every queue build adds
+  # features (E2E: `tpc-extension`, `models`, `http-functions`, plus `metal` on macOS;
+  # lint and nextest: the gate's feature set), so code behind
+  # `#[cfg(not(feature = "…"))]` for any of them goes unchecked until here.
+  # `--release` keeps release-only `cfg` paths in scope; no `REL_VERSION`, so no
+  # `release` feature either, as `make install` on a developer machine.
+  default-features:
+    environment: ci
+    name: spiced default features (cargo check)
+    needs: resolve
+    runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials for the build cache
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Restore Cargo registry
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Set up Rust
+        uses: $/.github/actions/setup-rust
+
+      - name: Set up make
+        uses: $/.github/actions/setup-make
+
+      - name: Set up cc
+        uses: $/.github/actions/setup-cc
+
+      - name: Install protoc
+        uses: $/.github/actions/install-protoc
+
+      - name: Get RustFS credentials
+        id: rustfs
+        continue-on-error: true
+        uses: $/.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '7200'
+          export-env: 'false'
+
+      - name: Set up sccache
+        uses: $/.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+
+      - name: Check spiced with its default features
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+        run: cargo check --locked --release -p spiced
+
   # The run's one verdict, which Trunk Health reads: it succeeds only if every
   # job above succeeded or was skipped, and names the jobs that did not.
   summary:
     environment: secret-free
     name: Trunk tests
     if: ${{ !cancelled() }}
-    needs: [resolve, build, spicescript]
+    needs: [resolve, build, spicescript, models, nextest, default-features]
     runs-on: spiceai-dev-runners
     timeout-minutes: 5
+    permissions:
+      statuses: write  # the verdict, as a commit status on the tested commit
     steps:
       - name: Verify every job succeeded
+        id: verify
         shell: bash
         env:
           RESULTS: ${{ toJSON(needs) }}
@@ -424,3 +629,75 @@ jobs:
             exit 1
           fi
           echo "Every trunk test job succeeded."
+
+      # The verdict on the exact commit tested, as the `trunk-tests` commit
+      # status. A release build requires it to be `success` on the commit it
+      # builds, and the scheduled fan-out below skips a release branch head
+      # that already has one.
+      - name: Record the verdict on the commit
+        if: ${{ !cancelled() && needs.resolve.outputs.sha != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          OUTCOME: ${{ steps.verify.outcome }}
+        run: |
+          set -euo pipefail
+          state=$([ "$OUTCOME" = success ] && echo success || echo failure)
+          description=$([ "$state" = success ] && echo "Every trunk test passed" || echo "Trunk tests failed")
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
+            -f state="$state" -f context=trunk-tests -f description="$description" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --silent
+          echo "Recorded trunk-tests=$state on $SHA"
+
+  # Release branches get a verdict too, so a release can be built only from a
+  # commit that passed. On each scheduled run, every release branch with a
+  # commit in the last 30 days whose head has no trunk-tests status yet is
+  # tested in a run of its own: one dispatch per branch, so its result stays
+  # out of trunk's scheduled verdict, which Trunk Health reads. A head without
+  # trunk_tests.yml predates the post-merge split: its own merge queue ran the
+  # full suite, so it needs no verdict.
+  release-branches:
+    environment: secret-free
+    name: Test changed release branches
+    if: github.event_name == 'schedule'
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 15
+    # A failure here (the API refused a lookup) shows as a failed job but
+    # leaves the run's conclusion to the test jobs: Trunk Health reads that
+    # conclusion as trunk's verdict.
+    continue-on-error: true
+    permissions:
+      actions: write   # dispatch this workflow for each branch
+      contents: read
+      statuses: read
+    steps:
+      - name: Dispatch a run for each changed release branch head
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cutoff=$(date -u -d '30 days ago' +%s)
+          gh api --paginate "repos/$GITHUB_REPOSITORY/branches?per_page=100" \
+              -q '.[] | select(.name | test("^release/[0-9]+\\.[0-9]+(\\.[0-9]+)?(-rc\\.?[0-9]+)?$")) | "\(.name) \(.commit.sha)"' |
+          while read -r branch sha; do
+            when=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha" -q .commit.committer.date)
+            [ "$(date -u -d "$when" +%s)" -ge "$cutoff" ] || continue
+            # Absence counts only from a listing that succeeded; a lookup that
+            # fails stops the job rather than skipping the branch.
+            if ! workflows=$(gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows?ref=$sha" -q '.[].name'); then
+              echo "::error::Could not list the workflows of $branch at $sha, so cannot tell whether it needs testing"
+              exit 1
+            fi
+            if ! grep -qx trunk_tests.yml <<<"$workflows"; then
+              echo "$branch at ${sha:0:12}: predates the post-merge split; its merge queue ran the full suite"
+              continue
+            fi
+            verdict=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/statuses?per_page=100" \
+              -q '[.[] | select(.context == "trunk-tests" and .creator.login == "github-actions[bot]")] | sort_by(.created_at, .id) | last | .state // ""')
+            if [ -n "$verdict" ]; then
+              echo "$branch at ${sha:0:12}: already tested ($verdict)"
+              continue
+            fi
+            echo "$branch at ${sha:0:12}: dispatching"
+            gh workflow run trunk_tests.yml -R "$GITHUB_REPOSITORY" --ref trunk -f branch="$branch"
+          done

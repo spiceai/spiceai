@@ -240,6 +240,10 @@ impl DataConnector for ElasticsearchFullTextConnector {
         self.inner_connector.initialization()
     }
 
+    fn user_token_client_id(&self) -> Option<&str> {
+        self.inner_connector.user_token_client_id()
+    }
+
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
         self.inner_connector.metrics_provider()
     }

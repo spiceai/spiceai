@@ -116,6 +116,10 @@ impl DataConnector for DrasiConnector {
         self.inner_connector.initialization()
     }
 
+    fn user_token_client_id(&self) -> Option<&str> {
+        self.inner_connector.user_token_client_id()
+    }
+
     fn initialization_for_dataset(&self, dataset: &DatasetSpec) -> ComponentInitialization {
         self.inner_connector.initialization_for_dataset(dataset)
     }

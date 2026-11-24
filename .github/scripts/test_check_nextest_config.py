@@ -65,7 +65,7 @@ FIXED_CONFIG = PRE_FIX_CONFIG + """\
 slow-timeout = { period = "120s", terminate-after = 12 }
 
 [[profile.default.overrides]]
-filter = '(binary_id(=cayenne::integration) & test(/^partition_chunking_test::/)) | (binary_id(=cayenne::integration) & test(/^layout_pruning_ab_test::/))'
+filter = '(binary_id(=cayenne::integration) & test(/^partition_chunking_test::/))'
 slow-timeout = { period = "120s", terminate-after = 12 }
 
 [[profile.default.overrides]]
@@ -426,8 +426,8 @@ class CheckConfigTest(unittest.TestCase):
         """960s is enough for mutation_model_test, so the guard must not ask for more.
 
         Its 107.1s baseline needs 616s at 4.6 x 1.25, which the 960s in
-        FIXED_CONFIG clears — while its two block-mates need 978s and 1425s and
-        so sit at 1440s. Without this, raising the whole block to match the
+        FIXED_CONFIG clears — while partition_chunking_test needs 1425s and so
+        sits at 1440s. Without this, raising the whole block to match the
         slowest member would read as required rather than as a choice, and this
         binary keeps the default retries: every second above what it needs is
         spent once per attempt when a genuine hang is caught.
@@ -439,21 +439,24 @@ class CheckConfigTest(unittest.TestCase):
     def test_rejects_the_lower_ceiling_for_a_binary_that_needs_more(self):
         """The split is per-baseline, not a licence to move any binary down to 960s.
 
-        Demotes layout_pruning_ab_test into the lower block — it needs 978s, so
-        960s no longer clears it. Its name has to leave the 1440s filter as well
-        as join the 960s one: nextest takes the first override a binary matches,
+        Demotes partition_chunking_test into the lower block — it needs 1425s, so
+        960s no longer clears it. Its 1440s block has to go as well as its name
+        joining the 960s one: nextest takes the first override a binary matches,
         which is what makes the earlier block win otherwise.
         """
         config = FIXED_CONFIG.replace(
-            "filter = '(binary_id(=cayenne::integration) & test(/^partition_chunking_test::/)) | (binary_id(=cayenne::integration) & test(/^layout_pruning_ab_test::/))'",
-            "filter = '(binary_id(=cayenne::integration) & test(/^partition_chunking_test::/))'",
+            "[[profile.default.overrides]]\n"
+            "filter = '(binary_id(=cayenne::integration) & test(/^partition_chunking_test::/))'\n"
+            'slow-timeout = { period = "120s", terminate-after = 12 }\n\n',
+            "",
         ).replace(
             "filter = '(binary_id(=cayenne::integration) & test(/^mutation_model_test::/))'",
-            "filter = '(binary_id(=cayenne::integration) & test(/^mutation_model_test::/)) | (binary_id(=cayenne::integration) & test(/^layout_pruning_ab_test::/))'",
+            "filter = '(binary_id(=cayenne::integration) & test(/^mutation_model_test::/)) | (binary_id(=cayenne::integration) & test(/^partition_chunking_test::/))'",
         )
+        self.assertNotIn("test(/^partition_chunking_test::/))'\nslow-timeout = { period = \"120s\", terminate-after = 12 }", config)
         with tempfile.TemporaryDirectory() as tmp:
             problems = check_nextest_config.check_config(write(tmp, config))
-        self.assertIn("layout_pruning_ab_test is killed after 960s", "\n".join(problems))
+        self.assertIn("partition_chunking_test is killed after 960s", "\n".join(problems))
 
     def test_rejects_a_ceiling_that_clears_the_baseline_but_not_contention(self):
         """600s clears the 247.9s baseline but not 247.9 x 4.6 x 1.25."""

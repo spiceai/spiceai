@@ -397,8 +397,18 @@ async fn a_307_or_308_within_the_origin_keeps_a_bodyless_requests_content_header
         assert_eq!(
             body_headers(&sent),
             [
-                ("/data".to_string(), Method::GET, kept.0.clone(), kept.1.clone()),
-                ("/moved".to_string(), Method::GET, kept.0.clone(), kept.1.clone()),
+                (
+                    "/data".to_string(),
+                    Method::GET,
+                    kept.0.clone(),
+                    kept.1.clone()
+                ),
+                (
+                    "/moved".to_string(),
+                    Method::GET,
+                    kept.0.clone(),
+                    kept.1.clone()
+                ),
             ],
             "{status}"
         );
@@ -442,6 +452,109 @@ async fn body_headers_a_redirect_drops_stay_dropped_on_later_hops() {
         ]
     );
     assert_eq!(body_headers(&sent), body_headers(&followed));
+}
+
+/// A server that redirects `/a` to its own `/b` and answers `/b`: the rest of a chain that
+/// continues on the host it moved to.
+async fn chain_target() -> Server {
+    Server::start(|request: &Seen| match request.path.as_str() {
+        "/a" => (StatusCode::FOUND, [(LOCATION, "/b")]).into_response(),
+        _ => "[]".into_response(),
+    })
+    .await
+}
+
+fn paths(server: &Server) -> Vec<String> {
+    server
+        .seen()
+        .into_iter()
+        .map(|request| request.path)
+        .collect()
+}
+
+/// `reqwest` rebuilds every hop from the request's own headers and strips `Authorization` only
+/// when that hop changes the host or port, so it sends the credential again when a chain that
+/// left the origin continues on the host it moved to. A request with credentials refuses that
+/// hop, whether `send` or `reqwest` follows the chain, and the hop is never requested.
+#[tokio::test]
+async fn a_chain_that_continues_on_the_host_it_moved_to_is_refused_with_credentials() {
+    let target = chain_target().await;
+    let origin = Server::redirecting(StatusCode::FOUND, format!("{}/a", target.url)).await;
+    let egress = Egress::default();
+    let client = client(&egress);
+    let error = send(
+        &client,
+        get_with_credentials(&client, &format!("{}/data", origin.url)),
+        &egress,
+        OnOriginChange::FollowWithCredentials,
+    )
+    .await
+    .expect_err("send refuses the chain");
+    let refused = format!(
+        "the redirect chain left {} and continued on {}, and a request that carries credentials \
+         does not follow a redirect chain that continues on another host",
+        origin.url, target.url
+    );
+    assert_eq!(error.to_string(), refused);
+    assert_eq!(paths(&target), ["/a"]);
+
+    let target = chain_target().await;
+    let origin = Server::redirecting(StatusCode::FOUND, format!("{}/a", target.url)).await;
+    let following = reqwest::Client::builder()
+        .redirect(redirect_policy(
+            Egress::default(),
+            OnOriginChange::FollowWithCredentials,
+        ))
+        .build()
+        .expect("the client builds");
+    let error = following
+        .execute(get_with_credentials(
+            &following,
+            &format!("{}/data", origin.url),
+        ))
+        .await
+        .expect_err("reqwest refuses the chain");
+    let refused = format!(
+        "the redirect chain left {} and continued on {}, and a request that carries credentials \
+         does not follow a redirect chain that continues on another host",
+        origin.url, target.url
+    );
+    assert_eq!(
+        http_egress::refused_redirect(&error).map(ToString::to_string),
+        Some(refused)
+    );
+    assert_eq!(paths(&target), ["/a"]);
+}
+
+/// Without credentials the same chain is followed to its end, and `send` carries none of the
+/// request's headers onto either hop off its origin.
+#[tokio::test]
+async fn a_chain_that_continues_on_the_host_it_moved_to_is_followed_without_credentials() {
+    let target = chain_target().await;
+    let origin = Server::redirecting(StatusCode::FOUND, format!("{}/a", target.url)).await;
+    let egress = Egress::default();
+    let client = client(&egress);
+
+    let response = send(
+        &client,
+        get_with_credentials(&client, &format!("{}/data", origin.url)),
+        &egress,
+        OnOriginChange::Follow,
+    )
+    .await
+    .expect("the chain is followed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(paths(&target), ["/a", "/b"]);
+    for request in target.seen() {
+        assert_eq!(
+            request.headers.get("authorization"),
+            None,
+            "{}",
+            request.path
+        );
+        assert_eq!(request.headers.get(API_KEY), None, "{}", request.path);
+    }
 }
 
 /// A token request carries its secret in the body; `OnOriginChange::Refuse` keeps any redirect

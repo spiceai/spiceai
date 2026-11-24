@@ -2243,6 +2243,10 @@ impl Runtime {
             )),
         ));
 
+        if let Some(app) = self.read_app().await {
+            log_refused_components(&app, None);
+        }
+
         let hold_ready_for_warmup = self.df.results_cache_warmup_holds_ready();
         if hold_ready_for_warmup {
             tracing::info!(
@@ -2643,5 +2647,18 @@ impl From<runtime_acceleration::AccelerationParseError> for Error {
         Error::InvalidAccelerationConfiguration {
             source: Box::new(err),
         }
+    }
+}
+
+/// Log each component a Spicepod dependency declared but may not load because
+/// `spicepod.yaml` does not trust it to run programs on the host. Each is
+/// logged once: `previous` is the app already loaded, whose refusals were
+/// logged when it loaded.
+pub(crate) fn log_refused_components(app: &App, previous: Option<&App>) {
+    for refused in &app.refused_components {
+        if previous.is_some_and(|previous| previous.refused_components.contains(refused)) {
+            continue;
+        }
+        tracing::error!("{}", refused.message());
     }
 }

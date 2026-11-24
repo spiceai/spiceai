@@ -245,10 +245,19 @@ impl FromStr for MCPType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        match serde_json::from_str(format!("\"{s}\"").as_str()) {
-            Ok(mcp_type) => Ok(mcp_type),
-            Err(_) => Err(Error::InvalidMCPDirective { id: s.to_string() }),
+        let invalid = || Error::InvalidMCPDirective { id: s.to_string() };
+        let mcp_type: Self =
+            serde_json::from_str(format!("\"{s}\"").as_str()).map_err(|_| invalid())?;
+        // A Spicepod dependency's tool whose target starts no program is loaded
+        // without trust (`spicepod::host_program`). Such a target that is not a
+        // valid URL is refused here, never run as a command, so the trust check
+        // holds.
+        if matches!(mcp_type, Self::Stdio(_))
+            && spicepod::host_program::mcp_target_starts_no_program(s)
+        {
+            return Err(invalid());
         }
+        Ok(mcp_type)
     }
 }
 
@@ -372,6 +381,55 @@ fn parse_custom_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dependency gate (`spicepod::host_program`) and this parser decide
+    /// the same thing about a `from: mcp:<target>` tool. A target the gate
+    /// admits from an untrusted dependency because it starts no program is
+    /// connected to over HTTP or refused, and never started as a program: an
+    /// HTTP-looking target that is not a valid URL is refused, not run.
+    #[test]
+    fn a_tool_the_dependency_gate_admits_as_remote_never_starts_a_program() {
+        use spicepod::component::tool::Tool;
+        use spicepod::host_program::{ComponentRef, host_program};
+
+        // (target, whether the gate sees a program, how the runtime connects:
+        // "stdio", "http", or `None` for a refused directive)
+        let cases: &[(&str, bool, Option<&str>)] = &[
+            ("docker", true, Some("stdio")),
+            ("./bin/server", true, Some("stdio")),
+            ("https://mcp.example.com/mcp", false, Some("http")),
+            ("HTTPS://mcp.example.com/mcp", false, Some("http")),
+            (" https://mcp.example.com/mcp", false, Some("http")),
+            ("http://localhost:3000/mcp", false, Some("http")),
+            ("https://exa mple.com/mcp", false, None),
+            ("https://%zz/server", false, None),
+            ("http://[::1/mcp", false, None),
+            ("https://", false, None),
+            ("", false, None),
+            ("   ", false, None),
+        ];
+        for &(target, gate_sees_program, connects) in cases {
+            let tool: Tool = serde_json::from_value(serde_json::json!({
+                "from": format!("mcp:{target}"),
+                "name": "t",
+            }))
+            .expect("a tool");
+            assert_eq!(
+                host_program(ComponentRef::Tool(&tool)).is_some(),
+                gate_sees_program,
+                "the gate's decision for 'mcp:{target}'"
+            );
+            let parsed = match MCPType::from_str(target) {
+                Ok(MCPType::Stdio(_)) => Some("stdio"),
+                Ok(MCPType::StreamableHttp(_)) => Some("http"),
+                Err(_) => None,
+            };
+            assert_eq!(
+                parsed, connects,
+                "how the runtime connects to 'mcp:{target}'"
+            );
+        }
+    }
 
     /// A directive that does not parse is named without the credentials its URL carries.
     #[test]

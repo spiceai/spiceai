@@ -29,6 +29,13 @@ name: Verus Verification
 # reached by an ordinary cache lookup. Each bound is a Verus postcondition
 # discharged for every key, which is what a test can only sample.
 #
+# `crates/range-rescale/src/lib.rs`: Cayenne rescales every clustering-key
+# column onto the curve's coordinate space with a reciprocal multiply instead of
+# a `u128` division. That the estimate plus one remainder correction equals the
+# exact quotient, that no intermediate overflows, and that the result is
+# monotonic in the key are Verus postconditions discharged for every key and
+# range; a wrong coordinate silently mis-clusters files rather than failing.
+#
 # That is also why the verifier runs in the merge queue rather than on the pull
 # request. A proof is a claim about the tree it was checked against; two
 # individually green changes can combine into one the verifier would reject, and
@@ -51,8 +58,8 @@ name: Verus Verification
 # commit, so a context that no pull-request run reports blocks the PR rather
 # than passing it. The job's `if` skips it on a pull request, which reports
 # `Verify Verus proofs` as skipped and satisfies the required check without
-# running the verifier — the same arrangement `Rust Lint`, `Build and Test`, and
-# `Build (release profile)` use in pr.yml.
+# running the verifier — the same arrangement `Rust Lint` and `Build and Test`
+# use in pr.yml.
 #
 # The workflow carries NO `paths` filter for that same reason: a workflow that
 # never triggers reports nothing at all. The change filter inside the job skips
@@ -91,6 +98,10 @@ permissions:
   contents: read
 
 env:
+  # The CI cache's anonymous read URL (.github/ci-cache/README.md). setup-rust and
+  # install-cargo-deny read pinned downloads from it, falling back to the source; empty
+  # where the repository has no CI object store, which turns the cache off.
+  CI_CACHE_URL: ${{ vars.TEST_MINIO_ENDPOINT && format('{0}/ci-cache', vars.TEST_MINIO_ENDPOINT) || '' }}
   # The verifier and its specification library ship together and are versioned
   # together, so these move as a set. VERUS_VSTD_VERSION must match the `vstd`
   # pin in `[workspace.dependencies]`, which every crate that opted into
@@ -118,7 +129,8 @@ jobs:
     # and stalls every entry behind it (#12717). hash-index alone is ~7 minutes
     # including a cold archive download; cache also compiles its DataFusion
     # graph through the driver, so the bound sits above that combined cost.
-    # sharded-cache adds little: one dependency, and its proofs are arithmetic.
+    # sharded-cache and range-rescale add little: each depends only on vstd
+    # (sharded-cache also on parking_lot), and their proofs are arithmetic.
     timeout-minutes: 40
     env:
       # `cargo verus` runs the verifier as the rustc driver, so no compiler

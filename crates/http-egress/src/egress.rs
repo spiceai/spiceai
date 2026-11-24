@@ -148,6 +148,12 @@ pub enum RedirectRefused {
     CrossOrigin { origin: String, target: String },
 
     #[snafu(display(
+        "the redirect chain left {origin} and continued on {target}, and a request that carries \
+         credentials does not follow a redirect chain that continues on another host"
+    ))]
+    ContinuesOffOrigin { origin: String, target: String },
+
+    #[snafu(display(
         "the server answered {status} to resend the request body to another origin, {target}, \
          and a request body is never sent to an origin other than the one it was meant for"
     ))]
@@ -166,6 +172,23 @@ pub enum RedirectRefused {
 /// query or user information, which can carry a signed token.
 pub(crate) fn origin_label(url: &Url) -> String {
     url.origin().ascii_serialization()
+}
+
+/// Whether a redirect to `next`, after the URLs in `chain` (the request's own URL first), stays on
+/// the host and port of the previous URL when that URL is not on the request's own host and port.
+/// A client that sends credentials refuses such a redirect, so its credentials stay on the
+/// request's origin across a redirect chain ([`crate::OnOriginChange::FollowWithCredentials`]).
+#[must_use]
+pub fn redirect_continues_off_origin(chain: &[Url], next: &Url) -> bool {
+    let same_host_and_port = |a: &Url, b: &Url| {
+        a.host_str() == b.host_str() && a.port_or_known_default() == b.port_or_known_default()
+    };
+    match (chain.first(), chain.last()) {
+        (Some(first), Some(previous)) => {
+            same_host_and_port(previous, next) && !same_host_and_port(first, previous)
+        }
+        _ => false,
+    }
 }
 
 /// `host` as the host map keys it: `example.com.` and `example.com` name the same host.
@@ -594,5 +617,70 @@ mod tests {
             "the server redirected to a `file` URL, and only `http` and `https` redirects are \
              followed"
         );
+    }
+
+    fn chain(urls: &[&str]) -> Vec<Url> {
+        urls.iter()
+            .map(|url| Url::parse(url).expect("valid URL"))
+            .collect()
+    }
+
+    #[test]
+    fn a_redirect_chain_may_not_continue_on_a_host_it_moved_to() {
+        let endpoint = "https://api.example.com/data";
+        for (previous, next) in [
+            (
+                vec![endpoint, "https://cdn.example.net/a"],
+                "https://cdn.example.net/b",
+            ),
+            (
+                vec![endpoint, "https://cdn.example.net/a"],
+                "http://cdn.example.net:443/b",
+            ),
+            (
+                vec![endpoint, "https://api.example.com:8443/a"],
+                "https://api.example.com:8443/b",
+            ),
+            (
+                vec![
+                    endpoint,
+                    "https://cdn.example.net/a",
+                    "https://edge.example.org/x",
+                ],
+                "https://edge.example.org/y",
+            ),
+        ] {
+            let next = Url::parse(next).expect("valid URL");
+            assert!(
+                redirect_continues_off_origin(&chain(&previous), &next),
+                "{previous:?} -> {next} must be refused"
+            );
+        }
+        for (previous, next) in [
+            (vec![endpoint], "https://cdn.example.net/a"),
+            (vec![endpoint], "https://api.example.com/other"),
+            (
+                vec![endpoint, "https://api.example.com/x"],
+                "https://api.example.com:443/y",
+            ),
+            (
+                vec![endpoint, "https://api.example.com/x"],
+                "https://cdn.example.net/a",
+            ),
+            (
+                vec![endpoint, "https://cdn.example.net/a"],
+                "https://edge.example.org/x",
+            ),
+            (
+                vec![endpoint, "https://cdn.example.net/a"],
+                "https://api.example.com/back",
+            ),
+        ] {
+            let next = Url::parse(next).expect("valid URL");
+            assert!(
+                !redirect_continues_off_origin(&chain(&previous), &next),
+                "{previous:?} -> {next} must be followed"
+            );
+        }
     }
 }

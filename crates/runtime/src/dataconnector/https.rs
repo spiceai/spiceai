@@ -1039,6 +1039,46 @@ impl Https {
         Ok((client, egress))
     }
 
+    /// Which redirects off the dataset's origin its requests refuse, for the credentials they
+    /// carry.
+    ///
+    /// `http_headers`, an `OAuth2` token header that `auth_header_name` names other than
+    /// `Authorization`, and enabled header filters (which send the headers a query names) are
+    /// custom credential headers meant only for the dataset's origin, so a redirect that leaves
+    /// it is refused. Credentials in the `Authorization` header (`OAuth2` with the default token
+    /// header, or the dataset URL's user info, sent as Basic credentials) follow a redirect off
+    /// the origin, which carries none of the request's headers, but not a redirect chain that
+    /// continues on the host it moved to.
+    fn on_origin_change(&self, dataset: &DatasetSpec) -> http_egress::OnOriginChange {
+        let sends_custom_header = param_is_set(&self.params, "http_headers")
+            || self
+                .params
+                .get("auth_header_name")
+                .expose()
+                .ok()
+                .map(str::trim)
+                .is_some_and(|name| {
+                    !name.is_empty() && !name.eq_ignore_ascii_case("authorization")
+                })
+            || self
+                .params
+                .get("request_header_filters")
+                .expose()
+                .ok()
+                .is_some_and(util::parse_enabled);
+        if sends_custom_header {
+            return http_egress::OnOriginChange::Refuse;
+        }
+        let sends_credentials = any_oauth_param_set(&self.params)
+            || Url::parse(dataset.from.as_str())
+                .is_ok_and(|url| !url.username().is_empty() || url.password().is_some());
+        if sends_credentials {
+            http_egress::OnOriginChange::FollowWithCredentials
+        } else {
+            http_egress::OnOriginChange::Follow
+        }
+    }
+
     /// Parse `OAuth2` parameters into a config and grant.
     ///
     /// Supports the refresh-token grant (default, RFC 6749 §6) and the
@@ -1287,6 +1327,7 @@ impl Https {
         })?;
 
         let (client, egress) = self.build_http_client(dataset).await?;
+        let on_origin_change = self.on_origin_change(dataset);
 
         let HttpProviderParams {
             file_format,
@@ -1323,7 +1364,7 @@ impl Https {
             file_format,
             acceleration_enabled,
         )
-        .with_egress(egress)
+        .with_egress(egress, on_origin_change)
         .with_table_reference(dataset.name.clone())
         .with_max_retries(max_retries)
         .with_backoff_method(backoff_method)
@@ -4916,5 +4957,169 @@ uGgYIHbi/F+GaiUPzDyqe5p9
 
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Answers `/a` with a redirect to its own `/b`, and every other path with [`OK_RESPONSE`].
+    /// Counts the requests for `/b`, so a request for another path (the endpoint probe) is not
+    /// counted.
+    async fn serve_chain_target() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the test server");
+        let port = listener.local_addr().expect("test server address").port();
+        let second_hops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&second_hops);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let response = if request.starts_with(b"GET /a ") {
+                    "HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    if request.starts_with(b"GET /b ") {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    OK_RESPONSE
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (port, second_hops)
+    }
+
+    /// Parameters that send a custom credential header.
+    const CUSTOM_HEADER_PARAMS: &[(&str, &str)] = &[
+        ("http_headers", "X-Api-Key: test-key"),
+        ("auth_header_name", "X-Api-Token"),
+        ("request_header_filters", "enabled"),
+    ];
+
+    /// A custom credential header refuses every redirect off the dataset's origin, credentials in
+    /// the `Authorization` header refuse a redirect chain that continues on the host it moved to,
+    /// and a dataset without credentials follows both.
+    #[tokio::test]
+    async fn a_datasets_credentials_choose_which_redirects_off_its_origin_are_refused() {
+        use http_egress::OnOriginChange::{Follow, FollowWithCredentials, Refuse};
+
+        const TOKEN_URL: (&str, &str) = ("auth_token_url", "https://example.com/oauth/token");
+        for (userinfo, params, expected) in [
+            ("", &[][..], Follow),
+            ("", &[CUSTOM_HEADER_PARAMS[0]][..], Refuse),
+            ("", &[TOKEN_URL, CUSTOM_HEADER_PARAMS[1]][..], Refuse),
+            ("", &[CUSTOM_HEADER_PARAMS[2]][..], Refuse),
+            ("svc:s3cret@", &[CUSTOM_HEADER_PARAMS[0]][..], Refuse),
+            ("", &[TOKEN_URL][..], FollowWithCredentials),
+            (
+                "",
+                &[TOKEN_URL, ("auth_header_name", "authorization")][..],
+                FollowWithCredentials,
+            ),
+            ("svc:s3cret@", &[][..], FollowWithCredentials),
+            ("svc@", &[][..], FollowWithCredentials),
+        ] {
+            let connector = test_connector_with(params).await;
+            let dataset = test_dataset(
+                &format!("https://{userinfo}api.example.com/data"),
+                RefreshMode::Append,
+                None,
+            )
+            .await;
+            assert_eq!(
+                connector.on_origin_change(&dataset),
+                expected,
+                "{userinfo:?} {params:?}"
+            );
+        }
+    }
+
+    /// Queries a JSON API dataset at `url` with `params` through the connector's own provider
+    /// and returns the number of rows, or the query's error. Query filters make it a JSON API
+    /// dataset rather than a file.
+    async fn query_rows(url: &str, params: &[(&str, &str)]) -> datafusion::error::Result<usize> {
+        let mut all = vec![
+            ("file_format", "json"),
+            ("request_query_filters", "enabled"),
+        ];
+        all.extend_from_slice(params);
+        let connector = test_connector_with(&all).await;
+        let dataset = test_dataset(url, RefreshMode::Append, None).await;
+        let provider = connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
+            .await
+            .expect("build the HTTP provider");
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table("origin", provider)
+            .expect("register the table");
+        let batches = ctx.sql("SELECT * FROM origin").await?.collect().await?;
+        Ok(batches
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum())
+    }
+
+    /// The provider follows its redirects under the dataset's choice: with `http_headers`, a
+    /// redirect to another origin fails the query before the target is resolved; without it,
+    /// the same redirect is followed until the target resolves to loopback. A target that does
+    /// not look internal until it resolves (`localhost.`, with its trailing dot) keeps the two
+    /// refusals apart.
+    #[tokio::test]
+    async fn the_provider_refuses_a_redirect_off_the_origin_for_a_custom_credential_header() {
+        for (params, refused) in [
+            (
+                &[CUSTOM_HEADER_PARAMS[0]][..],
+                "the server redirected to another origin, http://localhost.:{target}, and this \
+                 request carries a credential that is sent only to http://127.0.0.1:{origin}",
+            ),
+            (&[][..], "Refused to connect to localhost."),
+        ] {
+            let (target_port, target_requests) = serve_fixed(OK_RESPONSE.to_string()).await;
+            let (origin_port, origin_requests) = serve_fixed(format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://localhost.:{target_port}/data\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            ))
+            .await;
+            let refused = refused
+                .replace("{target}", &target_port.to_string())
+                .replace("{origin}", &origin_port.to_string());
+
+            let error = query_rows(&format!("http://127.0.0.1:{origin_port}/data"), params)
+                .await
+                .expect_err("the redirect is refused");
+
+            assert!(
+                error.to_string().contains(&refused),
+                "{params:?}: expected {refused:?} in {error}"
+            );
+            assert!(
+                origin_requests.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                "{params:?}: the query reached the origin"
+            );
+            assert_eq!(
+                target_requests.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{params:?}: the redirect target is never requested"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dataset_with_a_custom_credential_header_follows_a_redirect_within_its_origin() {
+        let (port, second_hops) = serve_chain_target().await;
+        let rows = query_rows(
+            &format!("http://127.0.0.1:{port}/a"),
+            &[CUSTOM_HEADER_PARAMS[0]],
+        )
+        .await
+        .expect("the redirect within the origin is followed");
+
+        assert_eq!(rows, 0, "the target answers an empty array");
+        assert_eq!(second_hops.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

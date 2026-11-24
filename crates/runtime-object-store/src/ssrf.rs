@@ -24,7 +24,16 @@ limitations under the License.
 //! a public address, to every later answer for that host. The policy itself is the
 //! `http-egress` crate's, shared by every client that applies these guards.
 
-pub use http_egress::{is_blocked_internal_hostname, is_internal_ip, redirect_target_is_internal};
+pub use http_egress::{
+    is_blocked_internal_hostname, is_internal_ip, redirect_continues_off_origin,
+    redirect_target_is_internal,
+};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    sync::{Arc, Mutex, PoisonError},
+};
+
 use object_store_spawn::DestinationGuard;
 use url::Url;
 
@@ -101,6 +110,58 @@ pub fn connector_redirect_guard(connector: &str) -> DestinationGuard {
             "the {connector} data connector does not follow a redirect to a private, loopback, or link-local address"
         ),
     )
+}
+
+/// `host` as [`RedirectHostResolver`] keys it: `example.com.` and `example.com` name the same host.
+fn redirect_host_key(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Resolves the hosts a server named through a [`DestinationGuard`], so a URL from a response or
+/// a redirect cannot reach an internal address by name. Every other host, such as a proxy's,
+/// resolves unchecked.
+#[derive(Clone, Debug)]
+pub struct RedirectHostResolver {
+    guard: DestinationGuard,
+    redirect_hosts: Arc<Mutex<HashSet<String>>>,
+}
+
+impl RedirectHostResolver {
+    #[must_use]
+    pub fn new(guard: DestinationGuard) -> Self {
+        Self {
+            guard,
+            redirect_hosts: Arc::default(),
+        }
+    }
+
+    /// Checks every later lookup of `host` with the guard.
+    pub fn check_host(&self, host: &str) {
+        self.redirect_hosts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(redirect_host_key(host));
+    }
+}
+
+impl reqwest::dns::Resolve for RedirectHostResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        let checked = self
+            .redirect_hosts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&redirect_host_key(&host));
+        let guard = self.guard.clone();
+        Box::pin(async move {
+            let addresses: Vec<SocketAddr> = if checked {
+                guard.resolve(&host).await?
+            } else {
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect()
+            };
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 #[cfg(test)]

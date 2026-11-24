@@ -28,7 +28,7 @@ use snafu::{OptionExt, ResultExt, Snafu};
 
 use crate::egress::{
     BodyAcrossOriginsSnafu, BodyNotReplayableSnafu, Egress, Hop, InvalidLocationSnafu,
-    RedirectRefused, origin_label,
+    RedirectRefused, origin_label, redirect_continues_off_origin,
 };
 
 /// Headers that describe a request body, dropped with it.
@@ -75,34 +75,57 @@ pub fn configure(builder: ClientBuilder, egress: &Egress) -> ClientBuilder {
 /// its redirects ([`redirect_policy`]) or [`send`] does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OnOriginChange {
-    /// Follow it. Under [`redirect_policy`], only for a client whose credentials are all ones
-    /// `reqwest` removes on an origin change (`Authorization`, `Cookie`,
-    /// `Proxy-Authorization`): a custom header and a `307`/`308` body are carried to the new
-    /// origin. Under [`send`], the new origin receives none of the request's headers and no
-    /// body.
+    /// Follow it, for a request that carries no credential. Under [`redirect_policy`], a custom
+    /// header and a `307`/`308` body are carried to the new origin. Under [`send`], the new
+    /// origin receives none of the request's headers and no body.
     Follow,
+    /// Follow it, but refuse a later redirect that stays on the host and port the chain moved
+    /// to ([`redirect_continues_off_origin`]), for a request whose credentials are all ones
+    /// `reqwest` removes when a redirect changes the host or port (`Authorization`, `Cookie`,
+    /// `Proxy-Authorization`): `reqwest` rebuilds every hop from the request's own headers and
+    /// removes them only when that hop changes the host or port, so it sends them again on such
+    /// a redirect. [`send`] carries no header off the origin, and refuses the same redirect, so
+    /// a request with credentials follows the same chains whichever way it is sent.
+    FollowWithCredentials,
     /// Refuse it, for a request whose credential travels in its body or a custom header and
     /// whose server has no reason to send it elsewhere, such as an OAuth token request.
     Refuse,
 }
 
 /// Whether a redirect to `next` is followed after the URLs in `chain` (the request's own URL
-/// first) were requested: `egress` decides, and then a hop that leaves the request's origin is
-/// refused under [`OnOriginChange::Refuse`].
-fn follow_redirect(
+/// first) were requested: `egress` decides, and then `on_origin_change` refuses a hop that
+/// leaves the request's origin ([`OnOriginChange::Refuse`]) or that continues a chain on the
+/// host it moved to ([`OnOriginChange::FollowWithCredentials`]).
+///
+/// [`redirect_policy`] and [`send`] apply this decision; a client built on another `reqwest`
+/// version applies it in its own redirect policy.
+///
+/// # Errors
+///
+/// Returns why the redirect is refused.
+pub fn follow_redirect(
     egress: &Egress,
     chain: &[url::Url],
     next: &url::Url,
     on_origin_change: OnOriginChange,
 ) -> Result<Hop, RedirectRefused> {
     let hop = egress.redirect(chain, next)?;
-    if hop.left_origin() && on_origin_change == OnOriginChange::Refuse {
-        return Err(RedirectRefused::CrossOrigin {
-            origin: chain.first().map_or_else(String::new, origin_label),
+    let origin = || chain.first().map_or_else(String::new, origin_label);
+    match on_origin_change {
+        OnOriginChange::Refuse if hop.left_origin() => Err(RedirectRefused::CrossOrigin {
+            origin: origin(),
             target: origin_label(next),
-        });
+        }),
+        OnOriginChange::FollowWithCredentials if redirect_continues_off_origin(chain, next) => {
+            Err(RedirectRefused::ContinuesOffOrigin {
+                origin: origin(),
+                target: origin_label(next),
+            })
+        }
+        OnOriginChange::Follow | OnOriginChange::FollowWithCredentials | OnOriginChange::Refuse => {
+            Ok(hop)
+        }
     }
-    Ok(hop)
 }
 
 /// A redirect policy that applies `egress` to a client that lets `reqwest` follow redirects.
@@ -173,9 +196,8 @@ enum Body {
     Streaming,
 }
 
-/// Sends `request` with `client`, following redirects under `egress`, and refusing every
-/// redirect that leaves the request's origin when `on_origin_change` is
-/// [`OnOriginChange::Refuse`].
+/// Sends `request` with `client`, following redirects under `egress` and refusing those that
+/// `on_origin_change` refuses ([`follow_redirect`]).
 ///
 /// `client` must be built with [`configure`] and the same `egress`, so `reqwest` hands every
 /// redirect back here. While the chain stays on the request's origin, each hop carries the
@@ -185,9 +207,9 @@ enum Body {
 /// `POST`, becomes a `GET` as `reqwest` would make it, and drops the body and the headers that
 /// describe it (`Content-Type`, `Content-Length`, `Content-Encoding`, `Transfer-Encoding`) on
 /// that hop and every later one. A `307`/`308` keeps the method, the body and those headers, as
-/// `reqwest` does, and one that would resend a body to another origin is refused. Headers the client sets on every request
-/// (`ClientBuilder::default_headers`, the user agent) are sent on every hop, so a credential
-/// belongs on the request, never on the client.
+/// `reqwest` does, and one that would resend a body to another origin is refused. Headers the
+/// client sets on every request (`ClientBuilder::default_headers`, the user agent) are sent on
+/// every hop, so a credential belongs on the request, never on the client.
 ///
 /// # Errors
 ///
@@ -251,7 +273,7 @@ pub async fn send(
             }
         }
 
-        let mut next_headers = if hop.left_origin() {
+        let next_headers = if hop.left_origin() {
             if !matches!(body, Body::None) {
                 return BodyAcrossOriginsSnafu {
                     status: status.as_u16(),
@@ -350,13 +372,64 @@ mod tests {
         assert!(!hop.left_origin());
     }
 
+    /// A request with credentials follows a redirect that leaves its origin, and a chain that
+    /// moves on to yet another host, but not a redirect that stays on the host and port the
+    /// chain moved to: `reqwest` would send the credentials it stripped there again.
+    #[test]
+    fn following_with_credentials_refuses_a_chain_that_continues_on_the_host_it_moved_to() {
+        let url = |value: &str| Url::parse(value).expect("valid URL");
+        let egress = connector_egress();
+        let endpoint = url("https://api.example.com/graphql");
+        let moved = [endpoint.clone(), url("https://cdn.example.net/a")];
+        let next = url("https://cdn.example.net/b");
+
+        let refused = follow_redirect(
+            &egress,
+            &moved,
+            &next,
+            OnOriginChange::FollowWithCredentials,
+        )
+        .expect_err("the chain must not continue on the host it moved to");
+        assert_eq!(
+            refused.to_string(),
+            "the redirect chain left https://api.example.com and continued on \
+             https://cdn.example.net, and a request that carries credentials does not follow a \
+             redirect chain that continues on another host"
+        );
+        let hop = follow_redirect(&egress, &moved, &next, OnOriginChange::Follow)
+            .expect("a request without credentials follows the chain");
+        assert!(hop.left_origin());
+
+        let request = [endpoint];
+        for (chain, next, left_origin) in [
+            (&request[..], "https://cdn.example.net/a", true),
+            (&moved[..], "https://edge.example.org/x", true),
+            (&moved[..], "https://cdn.example.net:8443/b", true),
+            (&moved[..], "https://api.example.com/back", true),
+            (&request[..], "https://api.example.com/v2/graphql", false),
+        ] {
+            let hop = follow_redirect(
+                &egress,
+                chain,
+                &url(next),
+                OnOriginChange::FollowWithCredentials,
+            )
+            .unwrap_or_else(|refused| panic!("{next} must be followed: {refused}"));
+            assert_eq!(hop.left_origin(), left_origin, "{next}");
+        }
+    }
+
     /// An origin change onto an internal destination is refused for that reason, whichever
     /// way the client treats an origin change.
     #[test]
     fn an_internal_target_is_refused_as_internal_under_either_choice() {
         let chain = [Url::parse("http://api.example.com/graphql").expect("valid URL")];
         let target = Url::parse("http://169.254.169.254/latest/meta-data/").expect("valid URL");
-        for on_origin_change in [OnOriginChange::Follow, OnOriginChange::Refuse] {
+        for on_origin_change in [
+            OnOriginChange::Follow,
+            OnOriginChange::FollowWithCredentials,
+            OnOriginChange::Refuse,
+        ] {
             let refused = follow_redirect(&connector_egress(), &chain, &target, on_origin_change)
                 .expect_err("an internal target must be refused");
             assert_eq!(

@@ -27,8 +27,12 @@ use std::sync::{
 
 use axum::{
     Router,
-    http::{StatusCode, header::LOCATION},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{AUTHORIZATION, LOCATION},
+    },
     response::IntoResponse,
+    routing::get as route_get,
 };
 use object_store::{ClientOptions, ObjectStore, ObjectStoreExt, http::HttpBuilder, path::Path};
 use object_store_spawn::{DestinationGuard, SpawnedReqwestConnector};
@@ -354,4 +358,89 @@ async fn guard_rejects_an_option_it_does_not_apply() {
         ),
         "unexpected error: {message}"
     );
+}
+
+/// A target that redirects `/a` to `/b` on its own host and port, serves [`BODY`] at `/b`, and
+/// counts the requests for `/b`.
+async fn chained_target() -> (u16, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    let port = serve(
+        Router::new()
+            .route(
+                "/a",
+                route_get(|| async { (StatusCode::FOUND, [(LOCATION, "/b")]).into_response() }),
+            )
+            .route(
+                "/b",
+                route_get(move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    async { BODY }
+                }),
+            ),
+    )
+    .await;
+    (port, hits)
+}
+
+/// Reads through an origin that redirects to another port, whose `/a` redirects to its `/b`,
+/// with `headers` as the client's default headers. Returns the result, the requests for `/b`,
+/// and the origin and target ports.
+async fn get_through_a_redirect_chain(
+    headers: HeaderMap,
+) -> (object_store::Result<String>, Arc<AtomicUsize>, u16, u16) {
+    let (target_port, target_hits) = chained_target().await;
+    let (origin_port, _) = redirecting_origin(format!("http://127.0.0.1:{target_port}/a")).await;
+    let connector =
+        SpawnedReqwestConnector::new(Handle::current()).with_destination_guard(port_guard(0));
+    let store: Arc<dyn ObjectStore> = Arc::new(
+        HttpBuilder::new()
+            .with_url(format!("http://127.0.0.1:{origin_port}/"))
+            .with_client_options(
+                ClientOptions::new()
+                    .with_allow_http(true)
+                    .with_default_headers(headers),
+            )
+            .with_http_connector(connector)
+            .build()
+            .expect("the HTTP store builds"),
+    );
+    (get(&store).await, target_hits, origin_port, target_port)
+}
+
+#[tokio::test]
+async fn guard_with_credentials_refuses_a_redirect_chain_that_continues_on_another_host() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+    );
+
+    let (result, target_hits, origin_port, target_port) =
+        get_through_a_redirect_chain(headers).await;
+
+    let message = result
+        .expect_err("the redirect chain is refused")
+        .to_string();
+    assert!(
+        message.contains(&format!(
+            "the redirect chain left http://127.0.0.1:{origin_port} and continued on \
+             http://127.0.0.1:{target_port}, and a request that carries credentials does not \
+             follow a redirect chain that continues on another host"
+        )),
+        "unexpected error: {message}"
+    );
+    assert_eq!(
+        target_hits.load(Ordering::SeqCst),
+        0,
+        "the second hop on the target is never requested"
+    );
+}
+
+#[tokio::test]
+async fn guard_without_credentials_follows_a_redirect_chain_that_continues_on_another_host() {
+    let (result, target_hits, _, _) = get_through_a_redirect_chain(HeaderMap::new()).await;
+
+    assert_eq!(result.expect("the redirect chain is followed"), BODY);
+    assert_eq!(target_hits.load(Ordering::SeqCst), 1);
 }

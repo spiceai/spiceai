@@ -35,7 +35,9 @@ limitations under the License.
 //!   headers `reqwest` strips, and a `307`/`308` that would resend a body there is refused.
 //!   [`redirect_policy`] applies the same decision to a client that lets `reqwest` follow
 //!   redirects, for clients whose only credentials are the ones `reqwest` strips, or that must
-//!   not follow an origin change at all.
+//!   not follow an origin change at all. A request with credentials refuses a redirect chain
+//!   that continues on the host it moved to ([`OnOriginChange::FollowWithCredentials`]),
+//!   because `reqwest` sends the credentials it stripped again on such a hop.
 
 mod client;
 mod egress;
@@ -43,9 +45,9 @@ mod guard;
 mod internal;
 
 pub use client::{
-    OnOriginChange, Resolver, SendError, configure, origin_bound, redirect_policy,
+    OnOriginChange, Resolver, SendError, configure, follow_redirect, origin_bound, redirect_policy,
     refused_redirect, send,
 };
-pub use egress::{Egress, Hop, RedirectRefused};
+pub use egress::{Egress, Hop, RedirectRefused, redirect_continues_off_origin};
 pub use guard::{DestinationGuard, DestinationRefused};
 pub use internal::{is_blocked_internal_hostname, is_internal_ip, redirect_target_is_internal};

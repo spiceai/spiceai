@@ -1,5 +1,6 @@
 {
   "http-caching-known": 61,
+  "http-caching-paginated": 23,
   "http-caching-request-key": 3,
   "http-headers-from-subquery": 34
 }
