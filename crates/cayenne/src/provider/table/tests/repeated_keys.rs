@@ -719,10 +719,18 @@ async fn aggregates_after_an_overwrite_repeating_keys_ignore_superseded_copies()
         )
         .await
         .expect("overwrite repeating keys");
-        for (stage, provider) in [
-            ("after overwrite", provider.clone_for_write()),
-            ("after reopen", reopen(&catalog, &runtime_env).await),
-        ] {
+        for stage in ["after overwrite", "after reopen"] {
+            // The reopen reads the statistics the write's maintenance persists, so it
+            // waits for that maintenance rather than racing it.
+            let provider = if stage == "after overwrite" {
+                provider.clone_for_write()
+            } else {
+                provider
+                    .flush_pending_maintenance()
+                    .await
+                    .expect("flush the write's maintenance");
+                reopen(&catalog, &runtime_env).await
+            };
             let ctx = SessionContext::new();
             ctx.register_table("t", Arc::new(provider))
                 .expect("register");
@@ -817,10 +825,16 @@ async fn sum_and_avg_never_use_a_sum_that_overflowed() {
                 .await
                 .expect("append");
         }
-        for (stage, provider) in [
-            ("after the writes", provider.clone_for_write()),
-            ("after reopen", reopen(&catalog, &runtime_env).await),
-        ] {
+        for stage in ["after the writes", "after reopen"] {
+            let provider = if stage == "after the writes" {
+                provider.clone_for_write()
+            } else {
+                provider
+                    .flush_pending_maintenance()
+                    .await
+                    .expect("flush the writes' maintenance");
+                reopen(&catalog, &runtime_env).await
+            };
             let ctx = SessionContext::new();
             ctx.register_table("t", Arc::new(provider))
                 .expect("register");
@@ -849,7 +863,10 @@ async fn sum_and_avg_never_use_a_sum_that_overflowed() {
             .await
             .expect("append");
     }
-    drop(provider);
+    provider
+        .flush_pending_maintenance()
+        .await
+        .expect("flush the writes' maintenance");
     let ctx = SessionContext::new();
     ctx.register_table("t", Arc::new(reopen(&catalog, &runtime_env).await))
         .expect("register");
