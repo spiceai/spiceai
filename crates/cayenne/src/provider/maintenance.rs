@@ -332,17 +332,18 @@ pub(crate) struct PostWriteMaintenance {
     /// lets a writer mark its delta outstanding before the commit that publishes
     /// its rows and release it again if that commit never happens.
     outstanding_live_rows_deltas: Arc<AtomicU64>,
-    /// Advanced by each overwrite when it replaces the table's rows, under the
-    /// listing fence and the `state` lock. A delta published or a state taken
-    /// under an earlier value describes rows the overwrite replaced.
+    /// Advanced by each overwrite when it replaces the table's rows, while it
+    /// holds `write_lock`, the listing fence, the statistics persistence lock
+    /// and the `state` lock. A delta published or a state taken under an
+    /// earlier value describes rows the overwrite replaced.
     statistics_epoch: AtomicU64,
 }
 
 impl PostWriteMaintenance {
-    /// The current statistics epoch. Every reader compares it under a lock the
-    /// overwrite also holds when it advances it (the `state` lock, the listing
-    /// fence or the statistics persistence lock), so it needs no ordering of
-    /// its own.
+    /// The current statistics epoch. Every reader reads it under a lock the
+    /// overwrite also holds when it advances it (`write_lock`, the listing
+    /// fence, the statistics persistence lock or the `state` lock), so it needs
+    /// no ordering of its own.
     pub(crate) fn statistics_epoch(&self) -> u64 {
         self.statistics_epoch.load(Ordering::Relaxed)
     }
