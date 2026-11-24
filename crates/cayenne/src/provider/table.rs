@@ -7315,6 +7315,7 @@ impl CayenneTableProvider {
     /// [`Self::key_tombstones_wait_for_staged_appends`]). The wait holds
     /// [`Self::append_admission`] so no append stages meanwhile, and not
     /// `write_lock`, which an append into the current snapshot takes to commit.
+    /// `write` names the waiting write in the timeout error.
     ///
     /// # Errors
     ///
@@ -7322,6 +7323,7 @@ impl CayenneTableProvider {
     /// committed within the drain timeout.
     pub(crate) async fn lock_write_after_staged_appends(
         &self,
+        write: &str,
     ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
         let _admission = self.append_admission.write().await;
         if !self
@@ -7331,7 +7333,7 @@ impl CayenneTableProvider {
             return Err(Error::Internal {
                 table: self.table_metadata.table_name.clone(),
                 message: format!(
-                    "A change-stream write did not commit within {} s, so the delete or update was not applied; retry it",
+                    "A change-stream write did not commit within {} s, so {write} was not applied; retry it",
                     STAGED_WRITE_DRAIN_TIMEOUT.as_secs()
                 ),
             });

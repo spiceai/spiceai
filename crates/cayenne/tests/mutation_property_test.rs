@@ -1801,6 +1801,106 @@ async fn reupsert_after_overwrite_delete_is_visible_impl(f: TestFixture) -> Test
 }
 test_on_data_store!(reupsert_after_overwrite_delete_is_visible_impl);
 
+// --- Focused regression: a change-stream write staged before an overwrite ---
+//
+// A change-stream append stages, then publishes later; a keyed one publishes
+// without the write lock. An overwrite that starts in between is ordered after
+// the staged write: it waits for the publish, then replaces it. Published after
+// the overwrite instead, the keyed write's deletes would still target the
+// replaced snapshot, so a key both writes hold (50) would be served twice.
+// Covers both deletion modes and a table without a key.
+async fn staged_cdc_write_is_ordered_before_overwrite_impl(f: TestFixture) -> TestResult<()> {
+    for (label, keyed, mode) in [
+        ("key", true, Mode::Key),
+        ("position", true, Mode::Position),
+        ("unkeyed", false, Mode::Key),
+    ] {
+        let name = format!("staged_before_overwrite_{label}");
+        let opts = CreateTableOptions {
+            table_name: name.clone(),
+            schema: schema(),
+            primary_key: if keyed {
+                vec!["id".to_string()]
+            } else {
+                vec![]
+            },
+            on_conflict: keyed
+                .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+            base_path: f.data_store.base_path(&name),
+            partition_column: None,
+            vortex_config: config(mode, Durability::File, None, None),
+        };
+        let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&f.catalog) as Arc<dyn MetadataCatalog>;
+        let ctx = SessionContext::new();
+        let table = Arc::new(
+            f.data_store
+                .create(catalog, ctx.runtime_env(), opts)
+                .await?,
+        );
+        ctx.register_table(name.as_str(), Arc::clone(&table) as Arc<dyn TableProvider>)?;
+
+        upsert(&table, &[(1, 10), (2, 20)], Durability::File).await?;
+        let staged = table
+            .write_cdc_append_stream(
+                batch_to_stream(rows_to_batch(&[(1, 11), (50, 500), (51, 510)])),
+                &ctx.task_ctx(),
+            )
+            .await?;
+        assert!(
+            staged.has_pending_finalize(),
+            "{label}: the change-stream write must stage before it publishes"
+        );
+
+        let replacement = [(50, 5000), (100, 1000), (101, 1010)];
+        let mut overwrite_task = tokio::spawn({
+            let table = Arc::clone(&table);
+            async move {
+                overwrite(&table, &replacement)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        });
+        // Time is what is under test: the overwrite must still be waiting for
+        // the staged write after a window far longer than it takes to run.
+        let early =
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut overwrite_task).await;
+        let overwrite_waited = early.is_err();
+        let published = staged.finish().await?;
+        match early {
+            Ok(overwritten) => overwritten??,
+            Err(_) => overwrite_task.await??,
+        }
+
+        let model: Model = replacement.into_iter().collect();
+        let message = format!(
+            "{label}: the overwrite replaces the staged write (published {published} rows, \
+             overwrite waited for it: {overwrite_waited})"
+        );
+        assert_converged_no_duplicates(&ctx, &name, &model, &message).await?;
+        assert_eq!(published, 3, "{message}");
+        assert!(overwrite_waited, "{message}");
+
+        let (table, ctx) = reopen_table(&f, &name).await?;
+        assert_converged_no_duplicates(&ctx, &name, &model, &format!("{message}, reopened"))
+            .await?;
+
+        // The next change-stream write resolves its keys against the replacement.
+        let next = [(50, 5001), (102, 1020)];
+        upsert(&table, &next, Durability::Memory).await?;
+        let mut model = model;
+        if keyed {
+            model.extend(next);
+            assert_converged_no_duplicates(&ctx, &name, &model, &format!("{message}, next write"))
+                .await?;
+        } else {
+            let count = scalar_i64(&ctx, &format!("SELECT COUNT(*) FROM {name}")).await?;
+            assert_eq!(count, 5, "{message}, next write appends");
+        }
+    }
+    Ok(())
+}
+test_on_data_store!(staged_cdc_write_is_ordered_before_overwrite_impl);
+
 // --- Concurrent pure-upsert convergence (GREEN control: loss needs deletes) ---
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_upsert_only_key() -> TestResult<()> {
