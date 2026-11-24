@@ -127,11 +127,16 @@ finish() {
   echo "$name: verified from ${origin} (sha256 $sha256)."
 }
 
-# 1. The host's cache directory. The copy is measured before it is copied.
+# 1. The host's cache directory. The entry is read once, through one open file, and no
+# further than one byte past the bound, so another job renaming a larger file over it
+# meanwhile cannot make the copy larger. The copy is then measured and hashed.
 if [ -n "${CI_CACHE_DIR:-}" ] && [ -f "$CI_CACHE_DIR/sha256/$sha256" ]; then
-  cached_size="$(wc -c <"$CI_CACHE_DIR/sha256/$sha256" 2>/dev/null | tr -d ' ')" || cached_size=''
+  cached_size=''
+  if head -c "$((max_bytes + 1))" 2>/dev/null <"$CI_CACHE_DIR/sha256/$sha256" >"$tmp"; then
+    cached_size="$(wc -c <"$tmp" | tr -d ' ')" || cached_size=''
+  fi
   if [[ "$cached_size" =~ ^[0-9]+$ ]] && [ "$cached_size" -le "$max_bytes" ] &&
-    cp "$CI_CACHE_DIR/sha256/$sha256" "$tmp" 2>/dev/null && [ "$(file_sha256 "$tmp")" = "$sha256" ]; then
+    [ "$(file_sha256 "$tmp")" = "$sha256" ]; then
     finish "$CI_CACHE_DIR"
     exit 0
   fi

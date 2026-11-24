@@ -523,7 +523,11 @@ def _tainted_references(document: dict, jobs: dict) -> dict[str, re.Pattern]:
         return re.compile("|".join(terms), re.IGNORECASE)
 
     workflow_env = document.get("env") if isinstance(document.get("env"), dict) else {}
-    for _ in range(12):
+    # Until a pass adds nothing. Each pass can carry the value one job further, so a
+    # chain of jobs declared last-first needs a pass per link; a fixed number of passes
+    # would let a longer chain through. Terms are only added, and there are finitely
+    # many (one per env key, step id and job output), so the loop ends.
+    while True:
         before = (len(global_terms), sum(len(t) for t in job_terms.values()))
         anywhere = pattern("")
         tainted_workflow_env = {

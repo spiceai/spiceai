@@ -329,6 +329,33 @@ class CheckUntrustedExpansionsTest(unittest.TestCase):
         )
         self.assertEqual(len(self.problems("      - run: echo ok", document)), 2)
 
+    def test_a_long_chain_of_job_outputs_declared_last_first_is_followed(self):
+        # Each pass of the fixpoint carries the value one job further when the jobs are
+        # declared after the job that reads them, so the chain needs a pass per link.
+        # Doubled braces twice over: an f-string, then str.format.
+        hops = 20
+        jobs = (
+            "  sink:\n"
+            f"    needs: j{hops}\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    steps:\n"
+            f"      - run: echo ${{{{{{{{ needs.j{hops}.outputs.v }}}}}}}}\n"
+        )
+        for k in range(hops, 0, -1):
+            source = "inputs.spicepod_path" if k == 1 else f"needs.j{k - 1}.outputs.v"
+            jobs += (
+                f"  j{k}:\n"
+                + (f"    needs: j{k - 1}\n" if k > 1 else "")
+                + "    runs-on: ubuntu-24.04\n"
+                "    outputs:\n"
+                f"      v: ${{{{{{{{ {source} }}}}}}}}\n"
+                "    steps:\n"
+                "      - run: echo ok\n"
+            )
+        problems = self.problems("      - run: echo ok", CREDENTIALED + jobs)
+        self.assertEqual(len(problems), 1, "\n".join(problems))
+        self.assertIn("job `sink`", problems[0])
+
     def test_bracket_syntax_and_json_dumps_are_reported(self):
         expressions = ("inputs['spicepod_path']", "github['head_ref']", "toJSON(github.event)", "github.ref")
         for expression in expressions:

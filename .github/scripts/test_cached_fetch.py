@@ -644,6 +644,49 @@ class CachedFetchTest(unittest.TestCase):
         self.assertIn("larger than CI_FETCH_MAX_BYTES (1024 bytes)", proc.stdout)
         self.assertEqual((cache_dir / "sha256" / SHA).read_bytes(), CONTENT)
 
+    def test_a_cache_dir_entry_replaced_while_it_is_read_stays_bounded(self):
+        # Another job renames a larger file over the entry at the worst moment: just after
+        # the script's first command that touches it starts. Reading the entry twice (once
+        # to measure, once to copy) would then copy the larger file in full.
+        cache_dir = self.dir / "host-cache"
+        entry = cache_dir / "sha256" / SHA
+        entry.parent.mkdir(parents=True)
+        entry.write_bytes(CONTENT)
+        larger = self.dir / "larger"
+        larger.write_bytes(b"x" * 1048576)
+        bin_dir = self.dir / "race-bin"
+        bin_dir.mkdir()
+        swapped, hashed = self.dir / "swapped", self.dir / "hashed.log"
+        for tool in ("wc", "cp", "head", "cat", "dd"):
+            real = shutil.which(tool)
+            if real is None:
+                continue
+            wrapper = bin_dir / tool
+            wrapper.write_text(
+                "#!/usr/bin/env bash\n"
+                f"if [ ! -e '{swapped}' ]; then : >'{swapped}'; mv -f '{larger}' '{entry}'; fi\n"
+                f'exec "{real}" "$@"\n'
+            )
+            wrapper.chmod(0o755)
+        for tool in ("sha256sum", "shasum"):
+            real = shutil.which(tool)
+            if real is None:
+                continue
+            wrapper = bin_dir / tool
+            wrapper.write_text(
+                "#!/usr/bin/env bash\n"
+                f'wc -c <"${{@: -1}}" >>\'{hashed}\'\n'
+                f'exec "{real}" "$@"\n'
+            )
+            wrapper.chmod(0o755)
+        self.cache.script[CACHE_PATH] = [CONTENT]
+        proc = self.run_fetch(cache_dir=cache_dir, max_bytes=1024, path=bin_dir)
+        self.assert_fetched(proc)
+        self.assertTrue(swapped.exists(), "the entry was never replaced")
+        sizes = [int(line) for line in hashed.read_text().split()]
+        self.assertTrue(sizes, proc.stdout + proc.stderr)
+        self.assertLessEqual(max(sizes), 1025, proc.stdout + proc.stderr)
+
     # --- the source --------------------------------------------------------------------
 
     def test_source_server_errors_get_three_retries(self):
