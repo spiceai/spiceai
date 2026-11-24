@@ -160,6 +160,13 @@ impl Domain {
                 valid_until,
                 continuous,
             } => {
+                // A lease this process did not hold throughout may have been
+                // held by another instance meanwhile: close the gate before the
+                // new deadline could reopen the tables bound to its current
+                // generation, which were seeded before that instance wrote.
+                if !continuous {
+                    self.data_writes.set(false);
+                }
                 self.data_writes.hold_until(valid_until);
                 if continuous && self.data_writes.allows() {
                     return true;
