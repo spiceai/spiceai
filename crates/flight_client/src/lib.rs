@@ -49,6 +49,7 @@ use tonic::transport::{Channel, Endpoint};
 
 pub mod arrow_flight_factory;
 pub mod cookie;
+pub mod parameterized_ticket;
 pub mod tls;
 pub mod traced_ticket;
 
@@ -194,6 +195,12 @@ pub enum Error {
 
     #[snafu(display("{source}"))]
     SubstraitUnsupported { source: TonicStatusError },
+
+    /// The server does not accept a Substrait plan with parameter bindings
+    /// ([`parameterized_ticket`]): it predates them. The same query still runs
+    /// as a plan with its values inlined, through [`FlightClient::query_substrait`].
+    #[snafu(display("{source}"))]
+    ParameterizedSubstraitUnsupported { source: TonicStatusError },
 
     #[snafu(display("Failed to publish data to flight endpoint. {source}"))]
     UnableToPublish { source: TonicStatusError },
@@ -364,8 +371,6 @@ impl FlightClient {
         timeout: Option<Duration>,
         trace_id: Option<&str>,
     ) -> Result<FlightRecordBatchStream> {
-        let deadline = timeout.and_then(|timeout| std::time::Instant::now().checked_add(timeout));
-        let token = self.authenticate_basic_token().await?;
         let command = CommandStatementSubstraitPlan {
             plan: Some(SubstraitPlan {
                 plan,
@@ -376,6 +381,48 @@ impl FlightClient {
         let ticket = arrow_flight::Ticket {
             ticket: command.as_any().encode_to_vec().into(),
         };
+        self.do_get_substrait(ticket, timeout, trace_id, map_substrait_error)
+            .await
+    }
+
+    /// Executes an encoded Substrait `Plan` whose `parameter_bindings` carry the
+    /// values of its dynamic parameters, as a [`parameterized_ticket`]. The
+    /// upstream decodes each distinct template once and binds the values into
+    /// it, so a sidecar repeating one query shape with different values does
+    /// not pay for a full plan decode per request.
+    ///
+    /// `trace_id` is handled as in [`Self::query_substrait`].
+    ///
+    /// # Errors
+    /// [`Error::ParameterizedSubstraitUnsupported`] when the server does not
+    /// know the ticket, which an upstream that predates it reports as
+    /// `Unimplemented`; the caller can resend the query through
+    /// [`Self::query_substrait`] with its values inlined. Otherwise as
+    /// [`Self::query_substrait`].
+    pub async fn query_substrait_parameterized(
+        &self,
+        plan: Bytes,
+        timeout: Option<Duration>,
+        trace_id: Option<&str>,
+    ) -> Result<FlightRecordBatchStream> {
+        self.do_get_substrait(
+            parameterized_ticket::wrap(plan),
+            timeout,
+            trace_id,
+            map_parameterized_substrait_error,
+        )
+        .await
+    }
+
+    async fn do_get_substrait(
+        &self,
+        ticket: arrow_flight::Ticket,
+        timeout: Option<Duration>,
+        trace_id: Option<&str>,
+        map_error: fn(tonic::Status) -> Error,
+    ) -> Result<FlightRecordBatchStream> {
+        let deadline = timeout.and_then(|timeout| std::time::Instant::now().checked_add(timeout));
+        let token = self.authenticate_basic_token().await?;
         let ticket = match trace_id {
             Some(id) => traced_ticket::wrap(&ticket, id),
             None => ticket,
@@ -390,7 +437,7 @@ impl FlightClient {
             .clone()
             .do_get(request)
             .await
-            .map_err(map_substrait_error)?
+            .map_err(map_error)?
             .into_parts();
         Ok(
             FlightRecordBatchStream::new_from_flight_data(checked_flight_data(stream))
@@ -784,6 +831,16 @@ impl FlightClient {
 fn map_substrait_error(error: tonic::Status) -> Error {
     if error.code() == tonic::Code::Unimplemented {
         Error::SubstraitUnsupported {
+            source: error.into(),
+        }
+    } else {
+        map_tonic_error_to_message(error)
+    }
+}
+
+fn map_parameterized_substrait_error(error: tonic::Status) -> Error {
+    if error.code() == tonic::Code::Unimplemented {
+        Error::ParameterizedSubstraitUnsupported {
             source: error.into(),
         }
     } else {

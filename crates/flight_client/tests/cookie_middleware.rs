@@ -183,6 +183,19 @@ impl FlightService for CookieFlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        // A ticket naming a command this server does not know is refused the
+        // way a Spice upstream that predates it refuses it.
+        if let Ok(any) = <arrow_flight::sql::Any as prost::Message>::decode(
+            request.get_ref().ticket.clone(),
+        ) && let arrow_flight::sql::Command::Unknown(any) =
+            arrow_flight::sql::Command::try_from(any)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?
+        {
+            return Err(Status::unimplemented(format!(
+                "Unknown command type: {}",
+                any.type_url
+            )));
+        }
         if let Some(value) = request.metadata().get("authorization") {
             self.authorization_seen.lock().push(
                 value
@@ -430,5 +443,42 @@ async fn substrait_do_get_refuses_an_implausible_decompressed_size()
         error.contains(&format!("declares {declared} decompressed bytes")),
         "{error}"
     );
+    Ok(())
+}
+
+/// A server that predates parameterized Substrait tickets answers one with
+/// `Unimplemented`; the client reports that as its own variant, distinct from a
+/// plain Substrait refusal, so a caller knows to resend the plan with its values
+/// inlined. The trace envelope must not hide the refusal.
+#[tokio::test]
+async fn parameterized_substrait_unimplemented_is_reported_as_unsupported()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = TestServer::start(CookieFlightService::new(Arc::new(AtomicBool::new(false)))).await;
+    let client = FlightClient::try_new(
+        format!("http://{}", server.addr).into(),
+        Credentials::anonymous(),
+        None,
+        None,
+    )
+    .await?;
+
+    for trace_id in [None, Some("4bf92f3577b34da6a3ce929d0e0e4736")] {
+        let err = client
+            .query_substrait_parameterized(bytes::Bytes::from_static(b"plan"), None, trace_id)
+            .await
+            .expect_err("a server without parameterized tickets must refuse one");
+        assert!(
+            matches!(err, flight_client::Error::ParameterizedSubstraitUnsupported { .. }),
+            "trace id {trace_id:?}: expected ParameterizedSubstraitUnsupported, got {err:?}"
+        );
+    }
+
+    // The plain Substrait command is known to the same server and still runs.
+    drop(
+        client
+            .query_substrait(bytes::Bytes::from_static(b"plan"), None, None)
+            .await?,
+    );
+    server.shutdown().await;
     Ok(())
 }
