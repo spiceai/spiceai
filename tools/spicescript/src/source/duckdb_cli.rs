@@ -157,8 +157,13 @@ async fn download_to_cache(
     Ok(binary.display().to_string())
 }
 
+/// The longest one download of a release may take (curl's `--max-time`).
+const DOWNLOAD_MAX: std::time::Duration = std::time::Duration::from_secs(1800);
+
 /// Removes staging directories of this release that a process killed while
-/// downloading left behind: an hour old, longer than any download takes.
+/// downloading left behind. Only those older than four times the longest a
+/// download may take: a live one is never that old, since its curl would have
+/// given up and its process removed it.
 async fn remove_stale_staging(dir: &std::path::Path, name: &str) {
     let Some(parent) = dir.parent() else {
         return;
@@ -175,7 +180,7 @@ async fn remove_stale_staging(dir: &std::path::Path, name: &str) {
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age > std::time::Duration::from_secs(3600));
+                .is_some_and(|age| age > DOWNLOAD_MAX * 4);
         if stale {
             let _ = tokio::fs::remove_dir_all(entry.path()).await;
         }
@@ -198,6 +203,8 @@ async fn fetch_into(
     let url = format!("https://github.com/duckdb/duckdb/releases/download/v{version}/{asset}");
     let status = tokio::process::Command::new("curl")
         .args(crate::release::CURL_RELEASE_RETRY)
+        // `--retry-max-time` bounds the retries, not one stalled transfer.
+        .args(["--max-time", &DOWNLOAD_MAX.as_secs().to_string()])
         .args(["-fsSL", "-o"])
         .arg(&archive)
         .arg(&url)
