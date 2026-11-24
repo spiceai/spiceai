@@ -305,6 +305,20 @@ impl DatasetInitialization {
                             Some(Ok(bootstrap)) => bootstrap.restore_once().await,
                             Some(Err(err)) => {
                                 if !is_permanent_load_failure(&err) {
+                                    // `initialize_accelerator` revokes the previous owner
+                                    // before `init` can fail. Keep an owned reinitialization
+                                    // intent so the next retry does not skip to `borrow` on
+                                    // that revoked bootstrap; if a newer configuration already
+                                    // holds the slot, the dummy is revoked and `borrow` still
+                                    // rejects the superseded plan.
+                                    let bootstrap_status =
+                                        if bootstrap_status.needs_reinitialization() {
+                                            bootstrap_status
+                                        } else {
+                                            runtime.df.awaiting_accelerator_reinitialization(
+                                                &dataset.name,
+                                            )
+                                        };
                                     *retry = Some(Box::new(Self {
                                         dataset: Arc::clone(&dataset),
                                         runtime: Arc::clone(&runtime),
@@ -497,8 +511,11 @@ fn arrow_schemas_equal(a: &SchemaRef, b: &SchemaRef) -> bool {
 mod tests {
     use crate::component::dataset::Dataset;
     use crate::component::dataset::DatasetSpec;
+    use crate::component::dataset::acceleration::{Acceleration, Engine};
     use std::any::Any;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use async_trait::async_trait;
@@ -507,11 +524,16 @@ mod tests {
 
     use super::{DatasetInitialization, LazyConnectorBuilder};
     use crate::component::dataset::builder::DatasetBuilder;
-    use crate::dataaccelerator::BootstrapStatus;
+    use crate::dataaccelerator::arrow::ArrowAccelerator;
+    use crate::dataaccelerator::{AccelerationSource, BootstrapStatus, DataAccelerator};
     use crate::dataconnector::{
         ConnectorComponent, DataConnector, DataConnectorError, DataConnectorResult,
     };
     use runtime_status::ComponentStatus;
+
+    /// Hang guard: accelerator init and table construction can take several seconds
+    /// when many test processes start at once.
+    const ACCELERATOR_RETRY_HANG_GUARD: Duration = Duration::from_secs(60);
 
     /// Where the deferred bring-up fails.
     #[derive(Clone, Copy)]
@@ -899,5 +921,378 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         provider.ensure_ready().await.expect_err("kept");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Arrow accelerator whose `init` fails a configured number of times after
+    /// `generation_lock` has already revoked the previous owner.
+    struct FlakyInitAccelerator {
+        inner: ArrowAccelerator,
+        remaining_init_failures: AtomicUsize,
+        init_calls: AtomicUsize,
+    }
+
+    impl FlakyInitAccelerator {
+        fn new() -> Self {
+            Self {
+                inner: ArrowAccelerator::new(),
+                remaining_init_failures: AtomicUsize::new(0),
+                init_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn fail_next_init(&self) {
+            self.remaining_init_failures.store(1, Ordering::SeqCst);
+        }
+
+        fn init_calls(&self) -> usize {
+            self.init_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Decrement `counter` if it is still positive. Sequential tests use this instead of
+    /// the deprecated `AtomicUsize::fetch_update`.
+    fn consume_one(counter: &AtomicUsize) -> bool {
+        loop {
+            let current = counter.load(Ordering::SeqCst);
+            if current == 0 {
+                return false;
+            }
+            if counter
+                .compare_exchange_weak(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DataAccelerator for FlakyInitAccelerator {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+
+        fn prefix(&self) -> &'static str {
+            self.inner.prefix()
+        }
+
+        fn parameters(&self) -> &'static [runtime_parameters::ParameterSpec] {
+            self.inner.parameters()
+        }
+
+        async fn create_external_table(
+            &self,
+            cmd: datafusion::logical_expr::CreateExternalTable,
+            source: Option<&dyn AccelerationSource>,
+            partition_by: Vec<runtime_table_partition::expression::PartitionedBy>,
+            runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
+        ) -> std::result::Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            self.inner
+                .create_external_table(cmd, source, partition_by, runtime_env)
+                .await
+        }
+
+        async fn sidecar(
+            &self,
+            source: &dyn AccelerationSource,
+            open_option: runtime_acceleration::sidecar::OpenOption,
+        ) -> std::result::Result<
+            Arc<dyn runtime_acceleration::sidecar::AcceleratorSidecar>,
+            runtime_checkpoint_api::CheckpointError,
+        > {
+            self.inner.sidecar(source, open_option).await
+        }
+
+        async fn validate_init(
+            &self,
+            source: &dyn AccelerationSource,
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.inner.validate_init(source).await
+        }
+
+        async fn init(
+            &self,
+            source: &dyn AccelerationSource,
+        ) -> std::result::Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>>
+        {
+            self.init_calls.fetch_add(1, Ordering::SeqCst);
+            if consume_one(&self.remaining_init_failures) {
+                return Err("accelerator unavailable".into());
+            }
+            self.inner.init(source).await
+        }
+    }
+
+    /// Serves `other_schema`, and fails accelerator setup until `fail_setup` is used up
+    /// so a first accelerated bring-up consumes its bootstrap generation.
+    #[derive(Debug)]
+    struct ServingConnector {
+        fail_setup: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl DataConnector for ServingConnector {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        async fn read_provider(
+            &self,
+            _context: &dyn crate::dataconnector::ConnectorContext,
+            _dataset: &DatasetSpec,
+        ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+            let table = MemTable::try_new(other_schema(), vec![vec![]])
+                .expect("MemTable from a single-field schema");
+            Ok(Arc::new(table))
+        }
+
+        async fn on_accelerator_setup(
+            &self,
+            _dataset: &DatasetSpec,
+            _accelerator: &mut dyn data_connector_api::accelerated::AcceleratorSetup,
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if consume_one(&self.fail_setup) {
+                return Err("controlled transient setup failure".into());
+            }
+            Ok(())
+        }
+    }
+
+    async fn accelerated_deferred_dataset(
+        name: &str,
+    ) -> (Arc<crate::Runtime>, Arc<Dataset>, Arc<FlakyInitAccelerator>) {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let accelerator = Arc::new(FlakyInitAccelerator::new());
+        runtime
+            .accelerator_engine_registry()
+            .register_accelerator_engine(
+                Engine::Arrow,
+                Arc::clone(&accelerator) as Arc<dyn DataAccelerator>,
+            )
+            .await;
+
+        let spicepod_dataset = spicepod::component::dataset::Dataset::new("test:source", name);
+        let app = app::AppBuilder::new("deferred_accelerator_retry")
+            .with_dataset(spicepod_dataset.clone())
+            .build();
+        let mut builder = DatasetBuilder::try_from(spicepod_dataset)
+            .expect("valid dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::clone(&runtime));
+        builder.acceleration = Some(Acceleration {
+            engine: Engine::Arrow,
+            ..Acceleration::default()
+        });
+        let dataset = Arc::new(builder.build().expect("valid dataset"));
+        runtime
+            .status
+            .update_dataset(&dataset.name, ComponentStatus::Ready);
+        (runtime, dataset, accelerator)
+    }
+
+    fn serving_builder(fail_setup: usize) -> LazyConnectorBuilder {
+        let connector = Arc::new(ServingConnector {
+            fail_setup: AtomicUsize::new(fail_setup),
+        });
+        Box::new(move || {
+            let connector = Arc::clone(&connector);
+            Box::pin(async move { Ok(connector as Arc<dyn DataConnector>) })
+        })
+    }
+
+    async fn owned_bootstrap(
+        runtime: &Arc<crate::Runtime>,
+        dataset: &Arc<Dataset>,
+    ) -> crate::datafusion::AcceleratorBootstrap {
+        let accelerator = runtime
+            .accelerator_engine_registry()
+            .get_accelerator_engine(Engine::Arrow)
+            .await
+            .expect("the flaky Arrow engine is registered");
+        runtime
+            .df
+            .initialize_accelerator(Arc::clone(dataset), accelerator)
+            .await
+            .expect("the first accelerator init succeeds")
+    }
+
+    async fn plan_after_consumed_generation(
+        runtime: &Arc<crate::Runtime>,
+        dataset: &Arc<Dataset>,
+        bootstrap: crate::datafusion::AcceleratorBootstrap,
+    ) -> DatasetInitialization {
+        let plan = DatasetInitialization::plan_deferred(
+            Arc::clone(dataset),
+            Arc::clone(runtime),
+            serving_builder(1),
+            other_schema(),
+            bootstrap,
+            None,
+        );
+        let Err(failure) = plan.initialize_retriable().await else {
+            panic!("the first accelerated bring-up must fail in accelerator setup");
+        };
+        let retry = failure
+            .retry
+            .expect("a transient setup failure hands the plan back");
+        assert!(
+            retry.bootstrap().needs_reinitialization(),
+            "a failed accelerated build consumes the generation so the retry reinitializes"
+        );
+        *retry
+    }
+
+    /// Replacement accelerator `init` fails after `generation_lock` revokes the old
+    /// owner. The next retry must still reinitialize once the accelerator recovers.
+    #[tokio::test]
+    async fn replacement_accelerator_init_failure_retries_after_the_accelerator_recovers() {
+        tokio::time::timeout(ACCELERATOR_RETRY_HANG_GUARD, async {
+            let (runtime, dataset, accelerator) =
+                accelerated_deferred_dataset("deferred_reinit_retry").await;
+            let bootstrap = owned_bootstrap(&runtime, &dataset).await;
+            assert_eq!(accelerator.init_calls(), 1);
+            let retry = plan_after_consumed_generation(&runtime, &dataset, bootstrap).await;
+            assert_eq!(accelerator.init_calls(), 1);
+
+            accelerator.fail_next_init();
+            let Err(failure) = retry.initialize_retriable().await else {
+                panic!("replacement accelerator init must fail");
+            };
+            let retry = failure.retry.expect("a failed accelerator init is retriable");
+            assert!(
+                retry.bootstrap().needs_reinitialization(),
+                "after replacement init fails, the retry must still reinitialize, not keep the revoked bootstrap"
+            );
+            assert_eq!(accelerator.init_calls(), 2);
+
+            if let Err(failure) = retry.initialize_retriable().await {
+                panic!(
+                    "the accelerator recovered, so reinitialization must succeed: {}",
+                    failure.error
+                );
+            }
+            assert_eq!(
+                accelerator.init_calls(),
+                3,
+                "the recovering retry must call accelerator init again"
+            );
+        })
+        .await
+        .expect("accelerator reinit retry must finish");
+    }
+
+    /// A newer dataset configuration that takes the generation must still be
+    /// rejected: the superseded plan must not reinitialize over it.
+    #[tokio::test]
+    async fn a_bootstrap_superseded_by_a_newer_dataset_configuration_is_rejected() {
+        tokio::time::timeout(ACCELERATOR_RETRY_HANG_GUARD, async {
+            let (runtime, dataset, accelerator) =
+                accelerated_deferred_dataset("deferred_superseded").await;
+            let bootstrap = owned_bootstrap(&runtime, &dataset).await;
+            let retry = plan_after_consumed_generation(&runtime, &dataset, bootstrap).await;
+            assert_eq!(accelerator.init_calls(), 1);
+
+            let newer = owned_bootstrap(&runtime, &dataset).await;
+            assert_eq!(accelerator.init_calls(), 2);
+            assert!(
+                !retry.bootstrap().needs_reinitialization(),
+                "generation_lock for the newer configuration revokes the old owner"
+            );
+
+            let Err(failure) = retry.initialize_retriable().await else {
+                panic!("a superseded bootstrap must not initialize over the newer configuration");
+            };
+            let message = failure.error.to_string();
+            assert!(
+                message.contains("consumed or superseded"),
+                "the superseded plan must fail in borrow, got: {message}"
+            );
+            assert_eq!(
+                accelerator.init_calls(),
+                2,
+                "a superseded plan must not call accelerator init again"
+            );
+
+            if let Err(failure) = DatasetInitialization::plan_deferred(
+                Arc::clone(&dataset),
+                Arc::clone(&runtime),
+                serving_builder(0),
+                other_schema(),
+                newer,
+                None,
+            )
+            .initialize()
+            .await
+            {
+                panic!("the newer configuration's bootstrap still initializes: {failure}");
+            }
+            assert_eq!(accelerator.init_calls(), 2);
+        })
+        .await
+        .expect("superseded bootstrap rejection must finish");
+    }
+
+    /// After replacement `init` fails, a newer configuration that takes the
+    /// generation must still be rejected: the failed retry must not steal it.
+    #[tokio::test]
+    async fn a_failed_replacement_init_does_not_reinitialize_over_a_newer_configuration() {
+        tokio::time::timeout(ACCELERATOR_RETRY_HANG_GUARD, async {
+            let (runtime, dataset, accelerator) =
+                accelerated_deferred_dataset("deferred_failed_then_superseded").await;
+            let bootstrap = owned_bootstrap(&runtime, &dataset).await;
+            let retry = plan_after_consumed_generation(&runtime, &dataset, bootstrap).await;
+
+            accelerator.fail_next_init();
+            let Err(failure) = retry.initialize_retriable().await else {
+                panic!("replacement accelerator init must fail");
+            };
+            let retry = failure
+                .retry
+                .expect("a failed accelerator init is retriable");
+            assert_eq!(accelerator.init_calls(), 2);
+
+            let newer = owned_bootstrap(&runtime, &dataset).await;
+            assert_eq!(accelerator.init_calls(), 3);
+            assert!(
+                !retry.bootstrap().needs_reinitialization(),
+                "the newer configuration must revoke the failed retry's reinitialization intent"
+            );
+
+            let Err(failure) = retry.initialize_retriable().await else {
+                panic!("a superseded bootstrap must not initialize over the newer configuration");
+            };
+            let message = failure.error.to_string();
+            assert!(
+                message.contains("consumed or superseded"),
+                "the superseded plan must fail in borrow, got: {message}"
+            );
+            assert_eq!(
+                accelerator.init_calls(),
+                3,
+                "a superseded plan must not call accelerator init again"
+            );
+
+            if let Err(failure) = DatasetInitialization::plan_deferred(
+                Arc::clone(&dataset),
+                Arc::clone(&runtime),
+                serving_builder(0),
+                other_schema(),
+                newer,
+                None,
+            )
+            .initialize()
+            .await
+            {
+                panic!("the newer configuration's bootstrap still initializes: {failure}");
+            }
+            assert_eq!(accelerator.init_calls(), 3);
+        })
+        .await
+        .expect("failed-then-superseded rejection must finish");
     }
 }

@@ -3781,6 +3781,37 @@ impl DataFusion {
         })
     }
 
+    /// An owned bootstrap that still needs [`Self::initialize_accelerator`], for a retry
+    /// whose replacement init revoked the previous owner and then failed.
+    ///
+    /// Unowned [`BootstrapStatus::None`] would also reinitialize, but
+    /// [`Self::generation_lock`] treats an unowned bootstrap as license to revoke
+    /// whoever currently holds the slot — including a newer dataset configuration
+    /// that took ownership after this failure. Registering a dummy owner keeps the
+    /// retry as the slot's occupant until then; if the slot already has a live
+    /// owner, the dummy is revoked so [`AcceleratorBootstrap::borrow`] rejects the
+    /// superseded retry.
+    pub(crate) fn awaiting_accelerator_reinitialization(
+        &self,
+        name: &TableReference,
+    ) -> AcceleratorBootstrap {
+        let owner = Arc::new(BootstrapOwner::default());
+        let mut owners = self.bootstrap_owners.lock();
+        let resolved = resolve_table_reference(name.clone());
+        if owners.get(&resolved).and_then(Weak::upgrade).is_some() {
+            owner.revoke();
+            return AcceleratorBootstrap {
+                owner: Some(owner),
+                unowned: BootstrapStatus::None,
+            };
+        }
+        owners.insert(resolved, Arc::downgrade(&owner));
+        AcceleratorBootstrap {
+            owner: Some(owner),
+            unowned: BootstrapStatus::None,
+        }
+    }
+
     async fn generation_lock(&self, name: &TableReference) -> Result<GenerationPermit> {
         if let Some(owner) = self
             .bootstrap_owners
