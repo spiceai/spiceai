@@ -187,6 +187,12 @@ jobs:
           fi
           grep -n 'cayenne_datalake_location:' "${SPICEPOD}"
 
+      # The fixed `cayenne-cold-sf*` locations for this run (.github/actions/ci-store-prefix).
+      - name: Choose the CI store prefix
+        uses: $/.github/actions/ci-store-prefix
+        with:
+          spicepod: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+
       - name: Get RustFS credentials
         id: rustfs
         uses: $/.github/actions/rustfs-credentials
@@ -633,7 +639,7 @@ jobs:
           fi
           prefixes=("cayenne-datalake/${GITHUB_RUN_ID}")
           case "${SPICEPOD}" in
-            *-cold*) prefixes+=(cayenne-cold-sf1000 cayenne-cold-sf10) ;;
+            *-cold*) prefixes+=("${CI_STORE_PREFIX:-}cayenne-cold-sf1000" "${CI_STORE_PREFIX:-}cayenne-cold-sf10") ;;
           esac
           # Non-fatal: a cleanup miss must never fail the benchmark run, so every mc call is guarded
           # with `|| true`. We print a one-line size/count summary per prefix (mc du) before deleting.

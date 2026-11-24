@@ -1,11 +1,21 @@
 name: CI store prefix
 description: >-
   The key prefix for this run's reads and writes in the CI object store's shared buckets
-  (`sccache`, `artifacts`, `build`). Only a run on trunk uses the shared keys. Any other run (a
+  (`sccache`, `artifacts`, `build`, and the fixed `benchmarks/cold_start`,
+  `benchmarks/cayenne-cold-sf10` and `benchmarks/cayenne-cold-sf1000` prefixes). Only a run on
+  trunk uses the shared keys. Any other run (a
   pull request, the merge queue, a feature or release branch) uses `untrusted/<github.ref>/`,
   the only keys the store lets it write, and reads its own writes there. Sets CI_STORE_PREFIX
   (empty on trunk, ending in `/` elsewhere) for the rest of the job and outputs it. Every
-  writer and reader of those buckets takes the prefix from here.
+  writer and reader of those buckets takes the prefix from here. Given `spicepod`, it also
+  rewrites that file's `s3://benchmarks/<fixed prefix>/` locations to the run's own, so spiced
+  reads and writes where this run may.
+
+inputs:
+  spicepod:
+    description: A spicepod file whose fixed `s3://benchmarks/...` locations to rewrite in place.
+    required: false
+    default: ''
 
 outputs:
   prefix:
@@ -18,6 +28,8 @@ runs:
     - name: Choose the CI store prefix
       id: prefix
       shell: bash
+      env:
+        SPICEPOD: ${{ inputs.spicepod }}
       run: |
         set -euo pipefail
         case "$GITHUB_REF" in
@@ -31,3 +43,8 @@ runs:
         echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
         echo "CI_STORE_PREFIX=$prefix" >> "$GITHUB_ENV"
         echo "CI store prefix: '${prefix}'"
+        if [ -n "$SPICEPOD" ] && [ -n "$prefix" ]; then
+          sed -i.bak -E "s#s3://benchmarks/(cold_start|cayenne-cold-sf10|cayenne-cold-sf1000)/#s3://benchmarks/${prefix}\1/#g" "$SPICEPOD"
+          rm -f "${SPICEPOD}.bak"
+          grep -n 's3://benchmarks/' "$SPICEPOD" || true
+        fi

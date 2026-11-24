@@ -4,22 +4,28 @@ description: |
   loads and uploads it to MinIO, unless it is already there. Requires `setup-minio` first.
   The `_SEEDED` object at the table root marks a completed upload; without it, any
   partial upload is removed and the table is seeded again. Run it from one job at a
-  time: concurrent seeds would interleave their Delta logs.
+  time: concurrent seeds would interleave their Delta logs. A run off trunk seeds and reads its
+  own copy under the bucket's `untrusted/<github.ref>/` (.github/actions/ci-store-prefix).
 inputs:
   prefix:
-    description: 'MinIO path of the table, under the `spice-minio` alias'
+    description: 'MinIO path of the table, `<bucket>/<path>` under the `spice-minio` alias; the CI store prefix goes after the bucket'
     required: false
     default: 'benchmarks/cold_start/audit_events_3m'
 runs:
   using: 'composite'
   steps:
+    - name: Choose the CI store prefix
+      uses: $/.github/actions/ci-store-prefix
+
     - name: Check for the fixture
       id: fixture
       shell: bash
       env:
         INPUT_PREFIX: ${{ inputs.prefix }}
       run: |
-        if mc stat "spice-minio/${INPUT_PREFIX}/_SEEDED" >/dev/null 2>&1; then
+        table="${INPUT_PREFIX%%/*}/${CI_STORE_PREFIX?}${INPUT_PREFIX#*/}"
+        echo "table=${table}" >> "$GITHUB_OUTPUT"
+        if mc stat "spice-minio/${table}/_SEEDED" >/dev/null 2>&1; then
           echo "present=true" >> "$GITHUB_OUTPUT"
         else
           echo "present=false" >> "$GITHUB_OUTPUT"
@@ -42,7 +48,7 @@ runs:
       if: steps.fixture.outputs.present != 'true'
       shell: bash
       env:
-        INPUT_PREFIX: ${{ inputs.prefix }}
+        INPUT_PREFIX: ${{ steps.fixture.outputs.table }}
       run: |
         python -m pip install 'pyspark==3.5.5' 'delta-spark==3.3.2'
         python test/scripts/cold_start_delta_fixture.py --out "${RUNNER_TEMP}/cold_start_fixture" \

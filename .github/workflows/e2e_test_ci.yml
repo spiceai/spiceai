@@ -1196,17 +1196,26 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
+      # The fixture's location for this run, in the spicepod spiced runs (.github/actions/ci-store-prefix).
+      - name: Prepare the spicepod
+        run: |
+          mkdir -p cold_start_app
+          cp 'test/spicepods/cold_start/delta_lake-cayenne[file]-append_unkeyed_sorted.yaml' cold_start_app/spicepod.yaml
+
+      - name: Choose the CI store prefix
+        uses: $/.github/actions/ci-store-prefix
+        with:
+          spicepod: cold_start_app/spicepod.yaml
+
       - name: Check for the fixture
         run: |
-          if ! mc stat spice-minio/benchmarks/cold_start/audit_events_3m/_SEEDED >/dev/null 2>&1; then
+          if ! mc stat "spice-minio/benchmarks/${CI_STORE_PREFIX?}cold_start/audit_events_3m/_SEEDED" >/dev/null 2>&1; then
             echo "The cold-start fixture is missing from MinIO; run the 'testoperator run cold-start' workflow once to seed it."
             exit 1
           fi
 
       - name: Start spiced
         run: |
-          mkdir -p cold_start_app
-          cp 'test/spicepods/cold_start/delta_lake-cayenne[file]-append_unkeyed_sorted.yaml' cold_start_app/spicepod.yaml
           cd cold_start_app
           spiced --cpu-cores 2 --metrics 127.0.0.1:9095 &> spice.log &
         env:

@@ -30,6 +30,7 @@ on:
       - '.github/scripts/test_rust_dist_mirror.py'
       - '.github/scripts/test_ci_role.py'
       - '.github/scripts/test_verify_attestation.py'
+      - '.github/scripts/test_ci_store_prefix.py'
       - '.github/scripts/check_ci_cache_pins.py'
       - '.github/scripts/test_check_ci_cache_pins.py'
       - '.github/ci-cache/**'
@@ -60,6 +61,7 @@ on:
       - '.github/scripts/test_rust_dist_mirror.py'
       - '.github/scripts/test_ci_role.py'
       - '.github/scripts/test_verify_attestation.py'
+      - '.github/scripts/test_ci_store_prefix.py'
       - '.github/scripts/check_ci_cache_pins.py'
       - '.github/scripts/test_check_ci_cache_pins.py'
       - '.github/ci-cache/**'
@@ -116,6 +118,7 @@ jobs:
           python .github/scripts/test_rust_dist_mirror.py -v
           python .github/scripts/test_ci_role.py -v
           python .github/scripts/test_verify_attestation.py -v
+          python .github/scripts/test_ci_store_prefix.py -v
           python .github/scripts/test_check_ci_cache_pins.py -v
           python .github/scripts/test_mssql_tpch_restore.py -v
           python .github/scripts/test_extract_snapshot_archives.py -v
