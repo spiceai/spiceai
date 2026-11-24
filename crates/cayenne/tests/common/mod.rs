@@ -526,40 +526,49 @@ impl TestFixture {
         backend: BackendType,
         store: Option<Arc<dyn object_store::ObjectStore>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::with_location(backend, store, |store| store).await
-    }
-
-    /// An object-native fixture in the store `CAYENNE_TEST_DATA_STORE` names,
-    /// with every request to it going through `wrap`'s store.
-    pub async fn object_native_wrapped(
-        wrap: impl FnOnce(Arc<dyn object_store::ObjectStore>) -> Arc<dyn object_store::ObjectStore>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::with_location(BackendType::ObjectNative, None, wrap).await
-    }
-
-    async fn with_location(
-        backend: BackendType,
-        store: Option<Arc<dyn object_store::ObjectStore>>,
-        wrap: impl FnOnce(Arc<dyn object_store::ObjectStore>) -> Arc<dyn object_store::ObjectStore>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = Arc::new(TempDir::new()?);
+        match (backend, store) {
+            (BackendType::Sqlite, Some(_)) => Err(UNSUPPORTED_PAIRING.into()),
+            (BackendType::Sqlite, None) => Self::build(temp_dir, backend, None).await,
+            (BackendType::ObjectNative, store) => {
+                let location = match store {
+                    Some(store) => ObjectNativeLocation::new(store, "cayenne-test", ""),
+                    None => FixtureDataStore::location_from_env(temp_dir.path())?,
+                };
+                Self::build(temp_dir, backend, Some(location)).await
+            }
+        }
+    }
+
+    /// An object-native fixture in the store `CAYENNE_TEST_DATA_STORE` names, with
+    /// the catalog and every table going through `wrap(store)`. Returns the fixture
+    /// and the unwrapped store, for reading and writing objects outside Cayenne.
+    pub async fn object_native_through(
+        wrap: impl FnOnce(Arc<dyn object_store::ObjectStore>) -> Arc<dyn object_store::ObjectStore>,
+    ) -> Result<(Self, Arc<dyn object_store::ObjectStore>), Box<dyn std::error::Error>> {
+        let temp_dir = Arc::new(TempDir::new()?);
+        let mut location = FixtureDataStore::location_from_env(temp_dir.path())?;
+        let raw = Arc::clone(&location.store);
+        location.store = wrap(Arc::clone(&raw));
+        let fixture = Self::build(temp_dir, BackendType::ObjectNative, Some(location)).await?;
+        Ok((fixture, raw))
+    }
+
+    async fn build(
+        temp_dir: Arc<TempDir>,
+        backend: BackendType,
+        location: Option<ObjectNativeLocation>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let data_path = temp_dir.path().join("data");
         std::fs::create_dir_all(&data_path)?;
         let db_path = temp_dir.path().join("test.db");
 
-        let (catalog, data_store): (Arc<FixtureCatalog>, FixtureDataStore) = match (backend, store)
-        {
-            (BackendType::Sqlite, Some(_)) => return Err(UNSUPPORTED_PAIRING.into()),
-            (BackendType::Sqlite, None) => (
+        let (catalog, data_store): (Arc<FixtureCatalog>, FixtureDataStore) = match location {
+            None => (
                 fixture_catalog(format!("sqlite://{}", db_path.to_string_lossy())).await?,
                 FixtureDataStore::local(&data_path),
             ),
-            (BackendType::ObjectNative, store) => {
-                let mut location = match store {
-                    Some(store) => ObjectNativeLocation::new(store, "cayenne-test", ""),
-                    None => FixtureDataStore::location_from_env(temp_dir.path())?,
-                };
-                location.store = wrap(location.store);
+            Some(location) => {
                 let catalog = location.open().await?;
                 let data_store = location.data_store(&catalog)?;
                 OBJECT_NATIVE_LOCATIONS

@@ -7374,6 +7374,16 @@ impl CayenneTableProvider {
         &self.staging_may_have_files
     }
 
+    /// Records that the staged append `staging_snapshot_id` may leave files
+    /// under `_staging/`, so the next write or open looks there. An append at
+    /// its final keys ([`Self::is_final_key_write`]) stages nothing and records
+    /// nothing.
+    pub(crate) fn mark_staging_may_have_files(&self, staging_snapshot_id: &str) {
+        if !self.is_final_key_write(staging_snapshot_id) {
+            self.staging_may_have_files.store(true, Ordering::Release);
+        }
+    }
+
     pub(crate) fn publication_outcome_unknown(&self) -> &AtomicBool {
         &self.publication_outcome_unknown
     }
@@ -7520,9 +7530,9 @@ impl CayenneTableProvider {
     /// Atomically commit a snapshot rewrite to the catalog, clearing exactly the
     /// state the rewrite materialized (see [`RewriteScope`]).
     ///
-    /// The commit also removes the files of the delete-file rows it clears, once
-    /// it succeeds: no row names them afterwards, and nothing else would. A scope
-    /// that clears every row excludes writers, so the rows read before the commit
+    /// Once the commit succeeds, the files of the delete-file rows it clears go
+    /// to [`super::delete::remove_dropped_deletion_vector_files`]. A scope that
+    /// clears every row excludes writers, so the rows read before the commit
     /// are the rows it clears. A fenced scope clears the rows at or below its
     /// cutoff, and no write straddles that cutoff (see
     /// `rewrite_current_snapshot_for_compaction`), so every such row is committed
@@ -7587,11 +7597,7 @@ impl CayenneTableProvider {
             )
             .await;
         if committed.is_ok() {
-            super::delete::remove_dropped_deletion_vector_files(
-                cleared_delete_files,
-                Arc::clone(&self.file_deletion_fence),
-                self.dataset_storage.clone(),
-            );
+            self.remove_dropped_deletion_vector_files(cleared_delete_files);
         }
         committed
     }
@@ -11744,7 +11750,7 @@ impl CayenneTableProvider {
         staging_snapshot_id: &str,
         target_partitions: usize,
     ) -> Result<u64> {
-        self.staging_may_have_files().store(true, Ordering::Release);
+        self.mark_staging_may_have_files(staging_snapshot_id);
         let (row_count, _writer_ops, _stats_acc) = self
             .write_to_snapshot(
                 stream,
@@ -12253,7 +12259,14 @@ impl CayenneTableProvider {
             persisted_hi,
         }));
 
-        let force_staging_probe_on_startup = dataset_storage.is_some();
+        // A store-backed table's staging is only found by listing it, so its open
+        // lists `_staging/` for a write a crash left there. A table in the
+        // object-native location never stages: every write puts its files at
+        // their final keys, and what an unfinished one left is the orphan
+        // sweep's. Any other store-backed table may still stage a partitioned
+        // append (`begin_deferred_snapshot_append`) and recover it from here.
+        let force_staging_probe_on_startup = dataset_storage.is_some()
+            && !crate::metastore_layout::is_object_native_data_path(&table_metadata.path);
         // A replacement inherits the replaced instance's pins; any other
         // instance starts with none.
         let snapshot_dir_pins = snapshot_dir_pins.unwrap_or_default();
@@ -20597,7 +20610,12 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Delete the files of deletion vectors a committed change replaced.
+    /// Reclaim the files of deletion vectors a committed change replaced or
+    /// cleared. See [`super::delete::remove_dropped_deletion_vector_files`].
+    ///
+    /// Where the commit retired them instead, this schedules the retirement
+    /// sweep: a retired file's retention starts only when a sweep observes it,
+    /// so without one a table that takes no further write would keep them.
     pub(crate) fn remove_dropped_deletion_vector_files(
         &self,
         replaced: Vec<crate::metadata::DeleteFile>,
@@ -20610,6 +20628,9 @@ impl CayenneTableProvider {
             Arc::clone(&self.file_deletion_fence),
             self.dataset_storage.clone(),
         );
+        if self.reclaims_retired_files() {
+            self.schedule_retired_file_sweep();
+        }
     }
 
     pub(crate) fn publish_inlined_rewrite(&self, rewrite: &InlinedDataRewrite) {
@@ -23599,8 +23620,8 @@ impl CayenneTableProvider {
     /// acquires it blockingly, and it is not reentrant.
     ///
     // Subset rewrite (P1 write-amp): when the picker selects a proper subset of
-    // current-snapshot files, re-encode ONLY those and hard-link (local) /
-    // `CopyObject` (S3) the un-picked settled files into the new dir — see
+    // current-snapshot files, re-encode ONLY those and carry the un-picked
+    // settled files into the new snapshot — see
     // [`Self::rewrite_current_snapshot_small_file_subset`]. Falls back to full
     // rewrite when position deletes, protected snapshots to fold, or the
     // candidate covers every current file (no amp to save).
@@ -24130,10 +24151,11 @@ impl CayenneTableProvider {
         )
     }
 
-    /// Re-encode only the picker's small-file subset and hard-link/copy the
-    /// remaining settled current-snapshot files into a fresh snapshot, then
-    /// flip the current pointer. Leaves deletion indexes intact (unpicked files
-    /// may still need merge-on-read filtering).
+    /// Re-encode only the picker's small-file subset and carry the remaining
+    /// settled current-snapshot files into a fresh snapshot (named in place in
+    /// the object-native location, otherwise hard-linked locally or copied with
+    /// `CopyObject` on S3), then flip the current pointer. Leaves deletion
+    /// indexes intact (unpicked files may still need merge-on-read filtering).
     ///
     /// Callers must hold `compaction_lock` and satisfy
     /// [`Self::can_subset_rewrite_current_small_files`]. Returns `Ok(false)` when
@@ -27679,15 +27701,11 @@ impl CayenneTableProvider {
         tag: ManifestSequenceTag,
         carried: Vec<SnapshotFile>,
     ) -> CatalogResult<Vec<(String, u64)>> {
-        let table_id = self.table_metadata.table_id.clone();
         let (files, replacement) = self
             .snapshot_manifest_rows(snapshot_id, tag, carried)
             .await?;
-        self.catalog
-            .replace_snapshot_files(&table_id, snapshot_id, &replacement)
+        self.record_snapshot_manifest(snapshot_id, &replacement)
             .await?;
-        self.uncommitted_files.forget(snapshot_id);
-
         Ok(files)
     }
 
@@ -27900,25 +27918,41 @@ impl CayenneTableProvider {
             .await
     }
 
-    /// Author one snapshot's manifest with a single uniform commit-seq range
-    /// (`[min, max]` on every file). The `pub(crate)` entry the overwrite path
-    /// uses to record its `[S, S]` range without depending on the private
-    /// [`ManifestSequenceTag`]. Returns the listing on success (discarded by
-    /// callers that only need the side effect).
-    pub(crate) async fn author_uniform_snapshot_manifest(
+    /// Records `rows` as the complete manifest of `snapshot_id`. Its files are
+    /// then named by a commit, so the writer stops tracking them as uncommitted.
+    pub(crate) async fn record_snapshot_manifest(
+        &self,
+        snapshot_id: &str,
+        rows: &[SnapshotFile],
+    ) -> CatalogResult<()> {
+        self.catalog
+            .replace_snapshot_files(&self.table_metadata.table_id, snapshot_id, rows)
+            .await?;
+        self.uncommitted_files.forget(snapshot_id);
+        Ok(())
+    }
+
+    /// The manifest rows of `snapshot_id` with a single uniform commit-sequence
+    /// range (`[min, max]` on every file), without recording them. The
+    /// `pub(crate)` entry the overwrite path uses for its `[S, S]` range without
+    /// depending on the private [`ManifestSequenceTag`].
+    pub(crate) async fn uniform_snapshot_manifest_rows(
         &self,
         snapshot_id: &str,
         min_sequence: i64,
         max_sequence: i64,
-    ) -> CatalogResult<Vec<(String, u64)>> {
-        self.upsert_snapshot_manifest_from_files(
-            snapshot_id,
-            ManifestSequenceTag::Uniform {
-                min: min_sequence,
-                max: max_sequence,
-            },
-        )
-        .await
+    ) -> CatalogResult<Vec<SnapshotFile>> {
+        let (_, rows) = self
+            .snapshot_manifest_rows(
+                snapshot_id,
+                ManifestSequenceTag::Uniform {
+                    min: min_sequence,
+                    max: max_sequence,
+                },
+                Vec::new(),
+            )
+            .await?;
+        Ok(rows)
     }
 
     /// Fold the manifest of every snapshot in `snapshot_ids` into one
@@ -47196,6 +47230,17 @@ impl CayenneTableProvider {
         // own files.
         let protected_lookup_selection = lookup_selection.clone();
         let protected_pinned_lookup_index = pinned_lookup_index.clone();
+        // The file and protected-snapshot branches are wrapped in a key-deletion
+        // filter built from this scan's captured deletions, which include CDC
+        // deletes still held in the in-memory tier. A limit handed to those
+        // branches would cap the raw rows read (the Vortex scan limit, and the
+        // listing's truncation by file row counts) before the filter removes
+        // deleted ones, so the scan could return fewer rows than `limit` while more
+        // live rows exist. The branch builder's own guard reads only the durable
+        // deletion state, which does not see the in-memory tier. Keep the limit
+        // out of both branches whenever this scan applies a key-deletion filter;
+        // the `GlobalLimitExec` below still applies it over live rows.
+        let branch_limit = if need_pk_deletion { None } else { limit };
         let listing_scan_start = Instant::now();
         let main_plan_result = self
             .create_snapshot_scan_plan_with_config(
@@ -47203,7 +47248,7 @@ impl CayenneTableProvider {
                 &current_snapshot_id,
                 effective_projection.as_ref(),
                 scan_filters,
-                limit,
+                branch_limit,
                 scan_listing_config,
                 allow_sorted_ordering,
                 Some(Arc::clone(&read_schema)),
@@ -47234,7 +47279,7 @@ impl CayenneTableProvider {
                 state,
                 projection: effective_projection.as_ref(),
                 filters: scan_filters,
-                limit,
+                limit: branch_limit,
                 pk_indices_in_projection: &pk_indices_in_projection,
                 protected_snapshots: protected_map,
                 protected_files,
@@ -48474,7 +48519,7 @@ impl CayenneTableProvider {
         .with_publication_outcome_fence(Arc::clone(&self.publication_outcome_unknown))
         .with_scan_input_version(Arc::clone(&self.scan_input_version))
         .with_capture_locks(capture_locks)
-        .with_file_deletion_fence(Arc::clone(&self.file_deletion_fence))
+        .with_owner(self.clone_for_write())
         .with_exact_count(source.requires_exact_count())
         .with_committed_files(committed_files.then(|| Arc::clone(&self.current_snapshot_id)));
 
@@ -48623,7 +48668,7 @@ impl CayenneTableProvider {
         )
         .with_publication_outcome_fence(Arc::clone(&self.publication_outcome_unknown))
         .with_scan_input_version(Arc::clone(&self.scan_input_version))
-        .with_file_deletion_fence(Arc::clone(&self.file_deletion_fence));
+        .with_owner(self.clone_for_write());
 
         let deleted = sink
             .delete_by_key_hash_probe(&ctx, &all_tables, matched_keys, key_columns)

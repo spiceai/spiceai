@@ -194,11 +194,6 @@ jobs:
             layouts: >-
               primary_key,indexes sort,time_column primary_key,cluster
               primary_key,indexes,sort,time_column
-          - engine: arrow
-            mode: memory
-            layouts: >-
-              primary_key indexes sort partition
-              primary_key,indexes,sort,time_column,partition
           # The parquet files federated, with no acceleration to lay out.
           - engine: none
             mode: file
