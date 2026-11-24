@@ -1856,13 +1856,13 @@ impl Step {
             common::insert_batch(&process.table, batch(0..KEYS, |id| id * 1000 + 4))
                 .await
                 .expect("inline upsert");
-            assert!(
+            assert_eq!(
                 process
                     .catalog
                     .get_inlined_data_count(process.table.table_id())
                     .await
-                    .expect("inline rows")
-                    > 0,
+                    .expect("inline rows"),
+                KEYS,
                 "the upsert is held inline"
             );
             return (location, process);
@@ -2363,6 +2363,48 @@ async fn a_kill_at_any_storage_request_of_an_append_leaves_only_orphans() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kill_at_any_storage_request_of_an_upsert_leaves_only_orphans() {
     kill_at_every_request(Step::Upsert).await;
+}
+
+/// A transaction that aborts deletes the files its keyed write staged: the
+/// writer holds them from the orphan sweep, so nothing else would before a
+/// restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aborted_transaction_deletes_the_files_it_staged() {
+    let (location, process) = Step::TransactionUpsert.start().await;
+    let before = location.data_files().await;
+    let table = &process.table;
+    let txn = cayenne::CayenneTransaction::new();
+    let token = table.transaction_write_token().await;
+    txn.register(
+        table.table_id().to_string(),
+        token,
+        table.clone_for_write_operations(),
+    );
+    let staged = table
+        .begin_staged_upsert_occ(
+            token,
+            common::single_batch_stream(batch(0..KEYS, |id| id * 1000 + 4)),
+            1,
+        )
+        .await
+        .expect("stage the upsert");
+    let written = location
+        .data_files()
+        .await
+        .into_keys()
+        .filter(|key| !before.contains_key(key))
+        .count();
+    assert_ne!(written, 0, "the upsert staged its files");
+    txn.set_staged(table.table_id(), staged);
+    txn.abort().await;
+    assert_eq!(
+        location.data_files().await,
+        before,
+        "the abort deletes the {written} files the upsert staged"
+    );
+    let mut rows = process.rows("orders").await;
+    rows.sort_unstable();
+    assert_eq!(rows, upserted(4), "the abort changes no row");
 }
 
 #[tokio::test(flavor = "multi_thread")]

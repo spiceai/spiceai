@@ -596,10 +596,22 @@ impl CayenneTableProvider {
 /// Best-effort removal of an unreferenced staged snapshot directory.
 ///
 /// The catalog never referenced the directory (no `cayenne_snapshot_sequence`
-/// row, `current_snapshot_id` unchanged), so leaving it is safe; object stores
-/// (S3) have no atomic "remove dir" and are left to the next successful
-/// snapshot-cleanup cycle, mirroring [`super::overwrite::PreparedOverwrite::rollback`].
+/// row, `current_snapshot_id` unchanged), so leaving it is safe. A table in the
+/// object-native location deletes the staged files by name: its writer holds
+/// them from the orphan sweep until a commit names them or they are discarded.
+/// Other object stores (S3) have no atomic "remove dir" and are left to the next
+/// successful snapshot-cleanup cycle, mirroring
+/// [`super::overwrite::PreparedOverwrite::rollback`].
 pub(super) async fn cleanup_orphan_snapshot_dir(table: &CayenneTableProvider, snapshot_id: &str) {
+    if table.data_in_object_native_location() {
+        if let Err(e) = table.clear_snapshot_dir(snapshot_id).await {
+            tracing::warn!(
+                "Failed to delete the files of a discarded write to dataset '{}', so they stay in storage until the dataset is next loaded. Cause: {e}",
+                table.table_name()
+            );
+        }
+        return;
+    }
     if table.data_in_store() {
         return;
     }
