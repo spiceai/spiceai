@@ -238,7 +238,9 @@ async fn test_stats_correct_after_full_rewrite_with_a_queued_delta(
     .collect()
     .await?;
     handle.drain_in_flight_maintenance().await?;
-    let held = handle.hold_post_write_maintenance().await;
+    let held = handle
+        .hold_post_write_maintenance()
+        .expect("no maintenance pass is scheduled");
     ctx.sql(&format!(
         "INSERT INTO {TABLE} SELECT v AS id, v AS value FROM (SELECT UNNEST(range(2000, 3500)) AS v)"
     ))

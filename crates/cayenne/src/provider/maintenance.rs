@@ -389,6 +389,8 @@ impl PostWriteMaintenance {
     /// input, and return it. Call it holding `write_lock` and the visibility
     /// lock until the capture is taken: every write stamped below the returned
     /// epoch then has its rows in the input, and none stamped with it does.
+    /// Nothing is dropped until the rewrite writes its count and calls
+    /// [`Self::count_below_epoch`].
     pub(crate) fn start_statistics_epoch_for_rewrite(&self) -> u64 {
         let _state = self.state.lock();
         self.statistics_epoch.fetch_add(1, Ordering::Relaxed) + 1

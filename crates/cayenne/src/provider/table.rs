@@ -45,8 +45,8 @@ use super::inlined_cache::{self, InlinedCache, InlinedDurableCommit, InlinedView
 use super::maintenance::{
     OutstandingLiveRowsDelta, PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT, PostWriteMaintenance,
     PostWriteMaintenanceHold, PostWriteMaintenanceState, PublishedLiveRowsDelta, QueuedStatistics,
-    RetentionFailureAction, RetentionPass,
-    SnapshotMaintenanceTrigger, duration_millis_saturating, protected_snapshot_maintenance_trigger,
+    RetentionFailureAction, RetentionPass, SnapshotMaintenanceTrigger, duration_millis_saturating,
+    protected_snapshot_maintenance_trigger,
 };
 use super::maintenance_metrics::{
     self, CompactionKind, CompactionOutcome, CompactionTrigger, MaintenanceOp, MaintenanceOutcome,
@@ -26606,8 +26606,9 @@ impl CayenneTableProvider {
         state: PostWriteMaintenanceState,
         retention_failure_action: RetentionFailureAction,
     ) -> CatalogResult<()> {
-        let had_stats = state.statistics.values().any(|queued| queued.stats.is_some());
-        if !state.statistics.is_empty() {
+        let had_stats = if state.statistics.is_empty() {
+            false
+        } else {
             #[cfg(test)]
             {
                 let hook = self.test_pre_maintenance_statistics_hook.lock().take();
@@ -26633,7 +26634,7 @@ impl CayenneTableProvider {
             // `COUNT(*)` as `Exact`.
             let delta_is_exact =
                 self.table_metadata.on_conflict.is_none() && !state.retention_requested;
-            let counted = self
+            let (counted, persisted_stats) = self
                 .persist_queued_table_stats(state.statistics, delta_is_exact)
                 .await;
             // Only now does the persisted count describe these rows. Until this
@@ -26641,7 +26642,8 @@ impl CayenneTableProvider {
             // have been visible to scans since their commit.
             self.post_write_maintenance
                 .retire_applied_live_rows_deltas(counted);
-        }
+            persisted_stats
+        };
 
         let mut retention_deleted = 0_u64;
         // After a failed background pass the retry is owned by the timer that
@@ -29588,7 +29590,8 @@ impl CayenneTableProvider {
     ///
     /// Also returns the statistics epoch started for the view: every write
     /// stamped below it has its rows in the view, and none stamped with it
-    /// does. The caller holds `write_lock`; `publications_held` says whether it
+    /// does. The epoch drops nothing until the rewrite writes its count; a
+    /// rewrite that aborts leaves those deltas queued. The caller holds `write_lock`; `publications_held` says whether it
     /// also holds the visibility lock, which is otherwise taken here around the
     /// epoch and the capture. A write publishes its rows and stamps its delta
     /// under one of the two, so none can land between them.
@@ -29651,8 +29654,7 @@ impl CayenneTableProvider {
         ctx: &SessionContext,
         order: &RewriteOrder,
     ) -> Result<(SendableRecordBatchStream, u64, u64, Arc<dyn ExecutionPlan>)> {
-        let (scan_view, generation_before, input_epoch) =
-            self.rewrite_scan_view(ctx, true).await?;
+        let (scan_view, generation_before, input_epoch) = self.rewrite_scan_view(ctx, true).await?;
         let (stream, ordered) = self.rewrite_stream_from_view(ctx, order, scan_view).await?;
         Ok((stream, generation_before, input_epoch, ordered))
     }
@@ -34901,23 +34903,21 @@ impl CayenneTableProvider {
     }
 
     /// Keep post-write maintenance from starting until the returned guard
-    /// drops, so writes' statistics stay queued. Waits for a running pass to
-    /// finish first. Exposed for tests of what another operation does while
-    /// statistics are queued; drop the guard before draining maintenance, and
-    /// drain it after, since a write made while held does not start a pass.
+    /// drops, so writes' statistics stay queued. `None` when a pass is already
+    /// scheduled or running, so call it after draining maintenance. Exposed for
+    /// tests of what another operation does while statistics are queued; drop
+    /// the guard and then drain maintenance, since a write made while held
+    /// starts no pass.
     #[doc(hidden)]
-    pub async fn hold_post_write_maintenance(&self) -> impl Drop + Send + Sync + use<> {
-        while self
-            .post_write_maintenance
+    #[must_use = "maintenance starts again once the hold is dropped"]
+    pub fn hold_post_write_maintenance(&self) -> Option<impl Drop + Send + Sync + use<>> {
+        self.post_write_maintenance
             .scheduled
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        PostWriteMaintenanceHold {
-            maintenance: Arc::clone(&self.post_write_maintenance),
-        }
+            .ok()
+            .map(|_| PostWriteMaintenanceHold {
+                maintenance: Arc::clone(&self.post_write_maintenance),
+            })
     }
 
     /// Get the current snapshot ID.
@@ -35804,8 +35804,8 @@ impl CayenneTableProvider {
     }
 
     /// Persist the statistics a maintenance pass took from the queue, adding
-    /// their net row delta to the count, and return how many queued deltas
-    /// the persisted count now includes.
+    /// their net row delta to the count. Returns how many queued deltas the
+    /// persisted count now includes, and whether any statistics were persisted.
     ///
     /// Statistics stamped below
     /// [`PostWriteMaintenance::counted_below_epoch`] are dropped: an overwrite
@@ -35819,7 +35819,7 @@ impl CayenneTableProvider {
         &self,
         queued: BTreeMap<u64, QueuedStatistics>,
         delta_is_exact: bool,
-    ) -> u64 {
+    ) -> (u64, bool) {
         let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
         let counted_below = self.post_write_maintenance.counted_below_epoch();
         let mut counted = 0_u64;
@@ -35832,7 +35832,7 @@ impl CayenneTableProvider {
             }
         }
         let Some(stats) = pending.stats else {
-            return counted;
+            return (counted, false);
         };
         let persisted = self
             .persist_table_stats_locked(
@@ -35847,7 +35847,7 @@ impl CayenneTableProvider {
         if persisted {
             counted = counted.saturating_add(pending.live_rows_delta_count);
         }
-        counted
+        (counted, persisted)
     }
 
     /// Replace the aggregate entirely with the overwrite's accumulator and reset
@@ -74358,10 +74358,14 @@ mod tests {
             .await
             .expect("persist the first insert's statistics");
 
-        let held = provider.hold_post_write_maintenance().await;
+        let held = provider
+            .hold_post_write_maintenance()
+            .expect("no maintenance pass is scheduled");
         insert_batch(&provider, id_value_batch_for_range(schema, 4, 3)).await;
         assert!(
-            provider.post_write_maintenance.has_unapplied_live_rows_delta(),
+            provider
+                .post_write_maintenance
+                .has_unapplied_live_rows_delta(),
             "precondition: the second insert's delta is queued"
         );
         full_rewrite(&provider).await;
@@ -74381,7 +74385,9 @@ mod tests {
         let (provider, _tmp) = seeded_key_rewrite_table("key_rewrite_queued_delta", &ctx).await;
         let catalog = Arc::clone(&provider.catalog);
 
-        let held = provider.hold_post_write_maintenance().await;
+        let held = provider
+            .hold_post_write_maintenance()
+            .expect("no maintenance pass is scheduled");
         insert_batch(
             &provider,
             id_value_batch(provider.table_schema(), &[3], &[30]),
@@ -74479,7 +74485,9 @@ mod tests {
         let (provider, _tmp) = seeded_key_rewrite_table("key_rewrite_late_delta", &ctx).await;
         let catalog = Arc::clone(&provider.catalog);
 
-        let held = provider.hold_post_write_maintenance().await;
+        let held = provider
+            .hold_post_write_maintenance()
+            .expect("no maintenance pass is scheduled");
         {
             let provider_in_hook = provider.clone_for_write();
             *provider.test_pre_rewrite_commit_hook.lock() = Some(Box::new(move || {
