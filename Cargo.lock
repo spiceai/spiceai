@@ -3678,6 +3678,7 @@ dependencies = [
  "parking_lot",
  "paste",
  "prost 0.14.3",
+ "range-rescale",
  "roaring",
  "rstest 0.26.1",
  "runtime-datafusion",
@@ -6403,6 +6404,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.4",
  "runtime-checkpoint-api",
+ "runtime-object-store",
  "runtime-rate-control",
  "runtime-request-context",
  "runtime-udfs-api",
@@ -10440,7 +10442,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28#f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=9aaad84db93327729964c647345a91da0d1d5943#9aaad84db93327729964c647345a91da0d1d5943"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -10499,7 +10501,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28#f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=9aaad84db93327729964c647345a91da0d1d5943#9aaad84db93327729964c647345a91da0d1d5943"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10514,7 +10516,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28#f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=9aaad84db93327729964c647345a91da0d1d5943#9aaad84db93327729964c647345a91da0d1d5943"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -10537,7 +10539,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28#f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=9aaad84db93327729964c647345a91da0d1d5943#9aaad84db93327729964c647345a91da0d1d5943"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10553,7 +10555,7 @@ dependencies = [
 [[package]]
 name = "iceberg-property-macro"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28#f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=9aaad84db93327729964c647345a91da0d1d5943#9aaad84db93327729964c647345a91da0d1d5943"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10563,7 +10565,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28#f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=9aaad84db93327729964c647345a91da0d1d5943#9aaad84db93327729964c647345a91da0d1d5943"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10582,7 +10584,7 @@ dependencies = [
 [[package]]
 name = "iceberg_test_utils"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28#f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=9aaad84db93327729964c647345a91da0d1d5943#9aaad84db93327729964c647345a91da0d1d5943"
 dependencies = [
  "iceberg",
  "tracing-subscriber",
@@ -11915,6 +11917,7 @@ dependencies = [
  "tracing-subscriber",
  "util",
  "wiremock",
+ "yaml",
 ]
 
 [[package]]
@@ -16562,6 +16565,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f97cdb2a36ed4183de61b2f824cc45c9f1037f28afe0a322e9fff4c108b5aaa"
 dependencies = [
  "rand_core 0.6.4",
+]
+
+[[package]]
+name = "range-rescale"
+version = "2.5.0-unstable"
+dependencies = [
+ "vstd",
 ]
 
 [[package]]

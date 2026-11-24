@@ -17,7 +17,7 @@ limitations under the License.
 //! A `SQLite` acceleration that a statement only filters must still contribute
 //! its matching rows.
 //!
-//! When the select list is a scalar subquery over an Arrow acceleration, as in
+//! When the select list is a scalar subquery over a Cayenne acceleration, as in
 //! TPC-DS q9, the outer table is read for nothing but its filter, so it is
 //! federated on its own as a scan with an empty projection. The unparser renders that as `SELECT 1 FROM … WHERE …`, because
 //! `SQLite` has no empty select list, and it answers with that one
@@ -80,7 +80,7 @@ async fn check(engine: &str, mode: &Mode) -> anyhow::Result<()> {
     std::fs::write(dir.path().join("items.csv"), "label\na\nb\n")?;
     std::fs::write(dir.path().join("flags.csv"), "id\n1\n2\n3\n4\n")?;
     let app = AppBuilder::new("empty_projection_scan")
-        .with_dataset(dataset(dir.path(), "items", "arrow", &Mode::Memory))
+        .with_dataset(dataset(dir.path(), "items", "cayenne", &Mode::Memory))
         .with_dataset(dataset(dir.path(), "flags", engine, mode))
         .build();
     configure_test_datafusion();

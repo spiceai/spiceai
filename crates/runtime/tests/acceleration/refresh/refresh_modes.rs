@@ -1268,43 +1268,6 @@ fn text_cells(name: &str, array: &ArrayRef) -> Result<Vec<Cell>, anyhow::Error> 
 // Test variants for each accelerator engine
 // ============================================================================
 
-// Arrow (always available)
-#[tokio::test]
-async fn test_acceleration_refresh_arrow_append_variant() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_append_for_engine("arrow").await
-}
-
-#[tokio::test]
-async fn test_acceleration_refresh_arrow_append_timestamp() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_time_format_for_engine("arrow", TimeFormatCase::Timestamp).await
-}
-
-#[tokio::test]
-async fn test_acceleration_refresh_arrow_append_unix_seconds() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_time_format_for_engine("arrow", TimeFormatCase::UnixSeconds).await
-}
-
-#[tokio::test]
-async fn test_acceleration_refresh_arrow_append_iso8601() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_time_format_for_engine("arrow", TimeFormatCase::Iso8601).await
-}
-
-#[tokio::test]
-async fn test_acceleration_refresh_arrow_append_upsert_history() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_upsert_history_for_engine("arrow").await
-}
-
-#[tokio::test]
-async fn test_acceleration_refresh_arrow_full_variant() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_full_for_engine("arrow").await
-}
-
 // Cayenne memory-mode refreshes
 #[tokio::test]
 async fn test_acceleration_refresh_cayenne_memory_append_variant() -> Result<(), anyhow::Error> {

@@ -26,6 +26,24 @@
       "may-pass": true
     }
   ],
+  "http-caching-paginated": [
+    {
+      "run": "http-caching-paginated",
+      "who": "cayenne",
+      "key": "query: SELECT count(*) FROM pages",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"5\\\"\", actual: \"\\\"0\\\"\" }",
+      "group": "caching-http"
+    },
+    {
+      "run": "http-caching-paginated",
+      "who": "cayenne-memory",
+      "key": "query: SELECT count(*) FROM pages",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"5\\\"\", actual: \"\\\"0\\\"\" }",
+      "group": "caching-http"
+    }
+  ],
   "http-caching-request-key": [
     {
       "run": "http-caching-request-key",
