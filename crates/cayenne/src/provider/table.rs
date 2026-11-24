@@ -7533,9 +7533,9 @@ impl CayenneTableProvider {
     /// Atomically commit a snapshot rewrite to the catalog, clearing exactly the
     /// state the rewrite materialized (see [`RewriteScope`]).
     ///
-    /// The commit also removes the files of the delete-file rows it clears, once
-    /// it succeeds: no row names them afterwards, and nothing else would. A scope
-    /// that clears every row excludes writers, so the rows read before the commit
+    /// Once the commit succeeds, the files of the delete-file rows it clears go
+    /// to [`super::delete::remove_dropped_deletion_vector_files`]. A scope that
+    /// clears every row excludes writers, so the rows read before the commit
     /// are the rows it clears. A fenced scope clears the rows at or below its
     /// cutoff, and no write straddles that cutoff (see
     /// `rewrite_current_snapshot_for_compaction`), so every such row is committed
@@ -7600,11 +7600,7 @@ impl CayenneTableProvider {
             )
             .await;
         if committed.is_ok() {
-            super::delete::remove_dropped_deletion_vector_files(
-                cleared_delete_files,
-                Arc::clone(&self.file_deletion_fence),
-                self.dataset_storage.clone(),
-            );
+            self.remove_dropped_deletion_vector_files(cleared_delete_files);
         }
         committed
     }
@@ -20619,7 +20615,12 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Delete the files of deletion vectors a committed change replaced.
+    /// Reclaim the files of deletion vectors a committed change replaced or
+    /// cleared. See [`super::delete::remove_dropped_deletion_vector_files`].
+    ///
+    /// Where the commit retired them instead, this schedules the retirement
+    /// sweep: a retired file's retention starts only when a sweep observes it,
+    /// so without one a table that takes no further write would keep them.
     pub(crate) fn remove_dropped_deletion_vector_files(
         &self,
         replaced: Vec<crate::metadata::DeleteFile>,
@@ -20632,6 +20633,9 @@ impl CayenneTableProvider {
             Arc::clone(&self.file_deletion_fence),
             self.dataset_storage.clone(),
         );
+        if self.reclaims_retired_files() {
+            self.schedule_retired_file_sweep();
+        }
     }
 
     pub(crate) fn publish_inlined_rewrite(&self, rewrite: &InlinedDataRewrite) {
@@ -23621,8 +23625,8 @@ impl CayenneTableProvider {
     /// acquires it blockingly, and it is not reentrant.
     ///
     // Subset rewrite (P1 write-amp): when the picker selects a proper subset of
-    // current-snapshot files, re-encode ONLY those and hard-link (local) /
-    // `CopyObject` (S3) the un-picked settled files into the new dir — see
+    // current-snapshot files, re-encode ONLY those and carry the un-picked
+    // settled files into the new snapshot — see
     // [`Self::rewrite_current_snapshot_small_file_subset`]. Falls back to full
     // rewrite when position deletes, protected snapshots to fold, or the
     // candidate covers every current file (no amp to save).
@@ -24152,10 +24156,11 @@ impl CayenneTableProvider {
         )
     }
 
-    /// Re-encode only the picker's small-file subset and hard-link/copy the
-    /// remaining settled current-snapshot files into a fresh snapshot, then
-    /// flip the current pointer. Leaves deletion indexes intact (unpicked files
-    /// may still need merge-on-read filtering).
+    /// Re-encode only the picker's small-file subset and carry the remaining
+    /// settled current-snapshot files into a fresh snapshot (named in place in
+    /// the object-native location, otherwise hard-linked locally or copied with
+    /// `CopyObject` on S3), then flip the current pointer. Leaves deletion
+    /// indexes intact (unpicked files may still need merge-on-read filtering).
     ///
     /// Callers must hold `compaction_lock` and satisfy
     /// [`Self::can_subset_rewrite_current_small_files`]. Returns `Ok(false)` when
@@ -48562,7 +48567,7 @@ impl CayenneTableProvider {
         .with_publication_outcome_fence(Arc::clone(&self.publication_outcome_unknown))
         .with_scan_input_version(Arc::clone(&self.scan_input_version))
         .with_capture_locks(capture_locks)
-        .with_file_deletion_fence(Arc::clone(&self.file_deletion_fence))
+        .with_owner(self.clone_for_write())
         .with_exact_count(source.requires_exact_count())
         .with_committed_files(committed_files.then(|| Arc::clone(&self.current_snapshot_id)));
 
@@ -48711,7 +48716,7 @@ impl CayenneTableProvider {
         )
         .with_publication_outcome_fence(Arc::clone(&self.publication_outcome_unknown))
         .with_scan_input_version(Arc::clone(&self.scan_input_version))
-        .with_file_deletion_fence(Arc::clone(&self.file_deletion_fence));
+        .with_owner(self.clone_for_write());
 
         let deleted = sink
             .delete_by_key_hash_probe(&ctx, &all_tables, matched_keys, key_columns)
