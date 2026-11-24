@@ -1848,22 +1848,20 @@ fn negative_values() -> Expr {
 }
 const RETENTION_ROW: (i64, i64) = (1_000, -1);
 
+/// Upsert `row` and run the maintenance it triggers to completion. Not
+/// `settle`: that also runs the test-only full current-snapshot rewrite, which
+/// would fold the protected snapshots the merge-fence tests depend on.
+async fn upsert_and_drain(table: &Arc<CayenneTableProvider>, row: (i64, i64)) -> TestResult<()> {
+    upsert(table, &[row], Durability::File).await?;
+    table.flush_pending_maintenance().await?;
+    table.drain_in_flight_maintenance().await?;
+    Ok(())
+}
+
 async fn reupsert_survives_bake_merge_and_reload(
     f: TestFixture,
     reload: DeletionReload,
 ) -> TestResult<()> {
-    // Not `settle`: that also runs the test-only full current-snapshot rewrite,
-    // which would fold the protected snapshots this sequence depends on.
-    async fn upsert_and_drain(
-        table: &Arc<CayenneTableProvider>,
-        row: (i64, i64),
-    ) -> TestResult<()> {
-        upsert(table, &[row], Durability::File).await?;
-        table.flush_pending_maintenance().await?;
-        table.drain_in_flight_maintenance().await?;
-        Ok(())
-    }
-
     let name = format!("reupsert_bake_merge_{reload:?}");
     let retention = match reload {
         DeletionReload::Reopen => Vec::new(),
@@ -1975,6 +1973,72 @@ async fn reupsert_survives_bake_merge_and_retention_pass_impl(f: TestFixture) ->
     reupsert_survives_bake_merge_and_reload(f, DeletionReload::RetentionPass).await
 }
 test_on_data_store!(reupsert_survives_bake_merge_and_retention_pass_impl);
+
+// A prune at a cutoff above every recorded deletion (`i64::MAX`) must not lift
+// the merge tag above deletions written after it: a protected snapshot applies
+// only the deletions above its tag, so a delete of a merged row would never
+// apply. The delete runs after the merge; one before it would drop the row from
+// the merged output and pass either way.
+async fn delete_after_max_cutoff_prune_and_merge_applies_impl(f: TestFixture) -> TestResult<()> {
+    let name = "delete_after_max_cutoff_prune_and_merge";
+    let (table, ctx) = create_table(&f, name, Mode::Key, Durability::File, None, false).await?;
+    let table_id = table.metadata().table_id.clone();
+
+    let mut model = Model::new();
+    for key in 1..4 {
+        upsert_and_drain(&table, (key, key * 10)).await?;
+        model.insert(key, key * 10);
+    }
+    // A key no row holds: its tombstone hides nothing, so pruning it leaves
+    // every row as the model has it.
+    let absent_key = col("id").in_list(vec![lit(99_i64)], false);
+    assert!(
+        table.delete_from_cdc_fast(&[absent_key]).await?.is_some(),
+        "the key-delete path must record the tombstone"
+    );
+    assert_eq!(
+        table.deletion_index_len(),
+        1,
+        "premise: the prune must run on a nonempty deletion index"
+    );
+    table.prune_deletion_index_at_or_below(i64::MAX);
+    assert_eq!(
+        table.deletion_index_len(),
+        0,
+        "the prune must empty the index"
+    );
+
+    let merge_trigger = VortexConfig::default().compaction_trigger_protected_snapshots;
+    let protected = f.catalog.get_all_snapshot_sequences(&table_id).await?.len();
+    for key in 4..4 + i64::try_from(merge_trigger - protected)? {
+        upsert_and_drain(&table, (key, key * 10)).await?;
+        model.insert(key, key * 10);
+    }
+    let thresholds = f.catalog.get_all_snapshot_sequences(&table_id).await?;
+    assert_eq!(
+        thresholds.len(),
+        1,
+        "the size-tier merge must fold every protected snapshot into one"
+    );
+
+    delete_key(&table, 2, Durability::File).await?;
+    model.remove(&2);
+    assert_converged(
+        &read_rows(&ctx, name).await?,
+        &model,
+        "after deleting a merged row",
+    );
+
+    let (reopened, reopened_ctx) = reopen_table(&f, name).await?;
+    assert_converged(
+        &read_rows(&reopened_ctx, name).await?,
+        &model,
+        "after reopen",
+    );
+    reopened.drain_in_flight_maintenance().await?;
+    Ok(())
+}
+test_on_data_store!(delete_after_max_cutoff_prune_and_merge_applies_impl);
 
 // --- Concurrent pure-upsert convergence (GREEN control: loss needs deletes) ---
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
