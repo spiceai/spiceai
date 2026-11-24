@@ -879,9 +879,11 @@ fn aggregate_stats_from_stats_set(stats: &StatsSet, dtype: &DType) -> AggregateS
 /// [`StatsSet`]s and return the merged, serialized blob.
 ///
 /// Uses Vortex's commutative `merge_unordered` per column so the caller does
-/// not need to worry about ordering. If the existing blob cannot be
-/// deserialized, or if the column counts do not match, `None` is returned so
-/// callers can fall back to writing the new stats alone.
+/// not need to worry about ordering. `None` is returned, so callers can fall
+/// back to writing the new stats alone, when the existing blob cannot be read
+/// against `schema` (a blob written for a different set of columns, such as one
+/// from before a column was added, does not deserialize against it), or when
+/// `new_column_stats` does not hold one entry per `schema` column.
 ///
 /// This preserves data correctness across multi-write sequences: once a row's
 /// min/max/null-count has been incorporated it stays incorporated, and the
@@ -917,12 +919,11 @@ pub(crate) fn merge_serialized_stats(
         .map(|(set, _)| set)
         .collect();
 
-    if existing_sets.len() != new_column_stats.len() {
+    if new_column_stats.len() != schema.fields().len() {
         tracing::warn!(
-            "merge_serialized_stats: existing column count {} != new count {}; \
-             skipping merge (schema may have changed)",
-            existing_sets.len(),
+            "merge_serialized_stats: new stats cover {} columns, the schema {}; skipping merge",
             new_column_stats.len(),
+            schema.fields().len(),
         );
         return None;
     }
@@ -1092,6 +1093,80 @@ mod tests {
                 .expect("serialize");
         let restored = deserialize_file_statistics(&blob, &schema).expect("deserialize");
         check(&restored, "restored");
+    }
+
+    /// A stored blob merges with a write's statistics when both describe the table's columns,
+    /// and is not merged when it was written for other columns, here before one was added:
+    /// it does not deserialize against the current schema, so the caller falls back.
+    #[test]
+    fn a_stored_blob_merges_only_against_the_columns_it_was_written_for() {
+        let column = |min: i64, max: i64, nulls: usize| ColumnStatistics {
+            null_count: DfPrecision::Exact(nulls),
+            min_value: DfPrecision::Exact(ScalarValue::Int64(Some(min))),
+            max_value: DfPrecision::Exact(ScalarValue::Int64(Some(max))),
+            sum_value: DfPrecision::Absent,
+            distinct_count: DfPrecision::Absent,
+            byte_size: DfPrecision::Absent,
+        };
+        let stored_for = |schema: &Schema, columns: Vec<ColumnStatistics>| {
+            statistics_to_persisted_blob(
+                &Statistics {
+                    num_rows: DfPrecision::Exact(2),
+                    total_byte_size: DfPrecision::Absent,
+                    column_statistics: columns,
+                },
+                schema,
+            )
+            .expect("stored blob")
+        };
+        let dtypes = |schema: &Schema| -> Vec<DType> {
+            schema
+                .fields()
+                .iter()
+                .map(|field| ARROW_SESSION.from_arrow_field(field).expect("dtype"))
+                .collect()
+        };
+        let before = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
+        let after = Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]);
+        let new_sets: Vec<StatsSet> = [column(3, 9, 1), column(10, 20, 0)]
+            .iter()
+            .map(column_stats_to_stats_set)
+            .collect();
+
+        let same = stored_for(&after, vec![column(1, 5, 0), column(12, 30, 2)]);
+        let merged = merge_serialized_stats(&same, &new_sets, &dtypes(&after), &after)
+            .expect("a blob for the same columns merges");
+        let merged = restore_persisted_statistics(&merged, &after, 4)
+            .expect("restore")
+            .statistics;
+        let [a, b] = merged.column_statistics.as_slice() else {
+            panic!("two columns");
+        };
+        assert_eq!(a.min_value, DfPrecision::Exact(ScalarValue::Int64(Some(1))));
+        assert_eq!(a.max_value, DfPrecision::Exact(ScalarValue::Int64(Some(9))));
+        assert_eq!(a.null_count, DfPrecision::Exact(1));
+        assert_eq!(
+            b.min_value,
+            DfPrecision::Exact(ScalarValue::Int64(Some(10)))
+        );
+        assert_eq!(
+            b.max_value,
+            DfPrecision::Exact(ScalarValue::Int64(Some(30)))
+        );
+        assert_eq!(b.null_count, DfPrecision::Exact(2));
+
+        let narrower = stored_for(&before, vec![column(1, 5, 0)]);
+        assert!(
+            merge_serialized_stats(&narrower, &new_sets, &dtypes(&after), &after).is_none(),
+            "a blob written before b was added is not merged"
+        );
+        assert!(
+            merge_serialized_stats(&same, &new_sets[..1], &dtypes(&after)[..1], &after).is_none(),
+            "statistics for only some of the columns are not merged"
+        );
     }
 
     /// An inexact statistic stays inexact through the per-file blob a scan persists from a

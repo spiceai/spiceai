@@ -1767,42 +1767,48 @@ mod tests {
         Ok(stats.column_statistics[0].sum_value.clone())
     }
 
-    /// A column sum that overflows `BIGINT` is never reported as exact: not for the file
-    /// whose own rows overflow it, nor for two files whose sums fit alone and overflow
-    /// together, right after the write or once the footers are read back from storage.
-    /// `DataFusion` answers `SUM` from an exact sum, so `SUM` and `AVG` over the table have
-    /// to answer as they do over the same rows in memory.
+    /// A column sum that overflows `BIGINT` is never reported as exact: not for a file whose
+    /// own rows overflow it (`own`), nor for two files whose sums fit alone and overflow
+    /// together (`pair`), right after the write or once the footers are read back from
+    /// storage. Two files whose sums fit together (`fits`) do report their exact sum, so the
+    /// `pair` check is not passing on sums that are never combined. `DataFusion` answers
+    /// `SUM` from an exact sum, so `SUM` and `AVG` over each table have to answer as they do
+    /// over the same rows in memory.
     #[tokio::test]
     async fn an_overflowing_column_sum_is_never_reported_exact() -> anyhow::Result<()> {
+        use datafusion_common::stats::Precision;
         use object_store::{ObjectStore as _, ObjectStoreExt as _};
 
         const COLUMNS: &str = "(n BIGINT NOT NULL)";
+        // One statement per file.
+        let tables: [(&str, &[&str]); 3] = [
+            ("own", &["(9223372036854775807), (1)"]),
+            ("pair", &["(9223372036854775000)", "(1000)"]),
+            ("fits", &["(5)", "(7)"]),
+        ];
+        let create = |session: &TestSessionContext, table: &str| {
+            let sql = format!(
+                "CREATE EXTERNAL TABLE {table} {COLUMNS} STORED AS vortex LOCATION '/{table}/'"
+            );
+            let session = session.session.clone();
+            async move { session.sql(&sql).await?.collect().await }
+        };
         let ctx = TestSessionContext::new(true);
-        ctx.session
-            .sql(&format!(
-                "CREATE EXTERNAL TABLE big {COLUMNS} STORED AS vortex LOCATION '/big/'"
-            ))
-            .await?
-            .collect()
-            .await?;
-        ctx.session
-            .sql(&format!("CREATE TABLE m {COLUMNS}"))
-            .await?
-            .collect()
-            .await?;
-        // One statement per file: one whose rows overflow, and two whose sums overflow
-        // only together.
-        for values in [
-            "(9223372036854775807), (1)",
-            "(9223372036854775000)",
-            "(1000)",
-        ] {
-            for table in ["big", "m"] {
-                ctx.session
-                    .sql(&format!("INSERT INTO {table} VALUES {values}"))
-                    .await?
-                    .collect()
-                    .await?;
+        for (table, files) in tables {
+            create(&ctx, table).await?;
+            ctx.session
+                .sql(&format!("CREATE TABLE m_{table} {COLUMNS}"))
+                .await?
+                .collect()
+                .await?;
+            for values in files {
+                for target in [table.to_string(), format!("m_{table}")] {
+                    ctx.session
+                        .sql(&format!("INSERT INTO {target} VALUES {values}"))
+                        .await?
+                        .collect()
+                        .await?;
+                }
             }
         }
 
@@ -1814,29 +1820,35 @@ mod tests {
             let bytes = ctx.store.get(&meta.location).await?.bytes().await?;
             reopened.store.put(&meta.location, bytes.into()).await?;
         }
-        reopened
-            .session
-            .sql(&format!(
-                "CREATE EXTERNAL TABLE big {COLUMNS} STORED AS vortex LOCATION '/big/'"
-            ))
-            .await?
-            .collect()
-            .await?;
-
-        for (stage, session) in [("after the write", &ctx), ("read back", &reopened)] {
-            let sum = reported_sum(session, "big").await?;
-            assert!(
-                !matches!(sum, datafusion_common::stats::Precision::Exact(_)),
-                "{stage}: an overflowing sum is reported as {sum:?}"
-            );
+        for (table, _) in tables {
+            create(&reopened, table).await?;
         }
 
-        for aggregate in ["SUM(n)", "AVG(n)"] {
-            let oracle = rendered_answer(&ctx, &format!("SELECT {aggregate} AS x FROM m")).await;
+        for (table, _) in tables {
             for (stage, session) in [("after the write", &ctx), ("read back", &reopened)] {
-                let observed =
-                    rendered_answer(session, &format!("SELECT {aggregate} AS x FROM big")).await;
-                assert_eq!(observed, oracle, "{stage}: {aggregate}");
+                let sum = reported_sum(session, table).await?;
+                if table == "fits" {
+                    assert_eq!(
+                        sum,
+                        Precision::Exact(ScalarValue::Int64(Some(12))),
+                        "{stage}: {table}"
+                    );
+                } else {
+                    assert!(
+                        !matches!(sum, Precision::Exact(_)),
+                        "{stage}: {table}: an overflowing sum is reported as {sum:?}"
+                    );
+                }
+            }
+            for aggregate in ["SUM(n)", "AVG(n)"] {
+                let oracle =
+                    rendered_answer(&ctx, &format!("SELECT {aggregate} AS x FROM m_{table}")).await;
+                for (stage, session) in [("after the write", &ctx), ("read back", &reopened)] {
+                    let observed =
+                        rendered_answer(session, &format!("SELECT {aggregate} AS x FROM {table}"))
+                            .await;
+                    assert_eq!(observed, oracle, "{stage}: {table}: {aggregate}");
+                }
             }
         }
         Ok(())
