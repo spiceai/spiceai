@@ -1,4 +1,5 @@
 name: mysql-cdc-parity
+duration: 370s
 description: >
   MySQL binlog CDC converges to the source after inserts, updates, deletes, key
   changes and large transactions, across a clean stop and a kill: Cayenne

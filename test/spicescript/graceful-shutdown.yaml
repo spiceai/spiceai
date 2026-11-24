@@ -1,4 +1,5 @@
 name: graceful-shutdown
+duration: 49s
 tags: [long]
 description: >
   Under query load, with the source rewriting its rows every second and append

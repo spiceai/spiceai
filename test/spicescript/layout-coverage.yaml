@@ -1,4 +1,5 @@
 name: layout-coverage
+duration: 217s
 tags: [long]
 description: >
   How an acceleration lays data out never changes an answer: Cayenne

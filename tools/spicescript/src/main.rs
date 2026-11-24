@@ -109,8 +109,8 @@ struct Cli {
     #[arg(long, default_value_t = 1, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     runs_per_script: u32,
 
-    /// Record each script's run time in `recordings/durations.json` beside
-    /// it, the estimate `--jobs` orders scripts by; scripts without one may
+    /// Record each script's run time in its `duration` line, the estimate
+    /// `--partition` and `--jobs` order scripts by; scripts without one may
     /// run. Times from a `--jobs 1` run are the least disturbed by neighbours.
     #[arg(long = "record-durations")]
     record_durations: bool,
@@ -509,19 +509,8 @@ async fn run(cli: Cli) -> Result<bool> {
         );
     }
     if cli.record_durations {
-        // By directory: each script's duration goes in a file beside it.
-        let mut by_dir: std::collections::BTreeMap<
-            std::path::PathBuf,
-            Vec<(String, std::time::Duration)>,
-        > = std::collections::BTreeMap::new();
         for (script, took, _, _) in &timings {
-            by_dir
-                .entry(script.dir.clone())
-                .or_default()
-                .push((script.file_stem.clone(), *took));
-        }
-        for (dir, took) in &by_dir {
-            script::Script::record_durations(dir, took)?;
+            script::Script::record_duration(&script.path, *took)?;
         }
         println!("recorded the duration of {} script(s)", timings.len());
     }

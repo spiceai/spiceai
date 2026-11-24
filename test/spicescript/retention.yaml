@@ -1,4 +1,5 @@
 name: retention
+duration: 9s
 description: >
   Time retention keeps rows newer than `retention_period` by the time column,
   and rows with no time, which the refresh window that `retention_period` implies

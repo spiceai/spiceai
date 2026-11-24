@@ -1,4 +1,5 @@
 name: memory-limit-spill
+duration: 106s
 description: >
   Known failing (#15541). Under a small `runtime.query.memory_limit`, work that can
   spill is refused instead: at 64 MiB, a global sort, distinct counts, a

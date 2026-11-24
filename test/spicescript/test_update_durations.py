@@ -55,26 +55,32 @@ class Medians(unittest.TestCase):
 
 
 class WriteDurations(unittest.TestCase):
-    def test_each_script_is_rewritten_in_its_own_file(self):
+    def test_each_script_is_rewritten_in_its_duration_line(self):
         with tempfile.TemporaryDirectory() as d:
-            durations = Path(d) / "test/spicescript/recordings/durations"
-            durations.mkdir(parents=True)
-            (durations / "full-refresh-chaos").write_text("100\n")
-            (durations / "auth").write_text("4\n")
+            scripts = Path(d) / "test/spicescript"
+            scripts.mkdir(parents=True)
+            (scripts / "full-refresh-chaos.yaml").write_text("name: full-refresh-chaos\nduration: 100s\nsteps: []\n")
+            (scripts / "auth.yaml").write_text("name: auth\nduration: 4s\nsteps: []\n")
+            (scripts / "j.yaml").write_text('{\n  "name": "j",\n  "duration": "3s",\n  "steps": []\n}\n')
             changed = update_durations.write_durations(Path(d), {
                 SCRIPT: 458,
                 "test/spicescript/auth.yaml": 4,
+                "test/spicescript/j.yaml": 12,
             })
-            self.assertEqual(changed, 1)
-            self.assertEqual((durations / "full-refresh-chaos").read_text(), "458\n")
-            self.assertEqual((durations / "auth").read_text(), "4\n")
+            self.assertEqual(changed, 2)
+            self.assertEqual((scripts / "full-refresh-chaos.yaml").read_text(),
+                             "name: full-refresh-chaos\nduration: 458s\nsteps: []\n")
+            self.assertEqual((scripts / "auth.yaml").read_text(), "name: auth\nduration: 4s\nsteps: []\n")
+            self.assertEqual((scripts / "j.yaml").read_text(), '{\n  "name": "j",\n  "duration": "12s",\n  "steps": []\n}\n')
 
     def test_a_script_without_a_recorded_duration_gets_none(self):
         with tempfile.TemporaryDirectory() as d:
-            durations = Path(d) / "test/spicescript/recordings/durations"
-            durations.mkdir(parents=True)
+            scripts = Path(d) / "test/spicescript"
+            scripts.mkdir(parents=True)
+            text = "name: full-refresh-chaos\nsteps:\n  - load: { duration: 30s }\n"
+            (scripts / "full-refresh-chaos.yaml").write_text(text)
             self.assertEqual(update_durations.write_durations(Path(d), {SCRIPT: 458}), 0)
-            self.assertEqual(list(durations.iterdir()), [])
+            self.assertEqual((scripts / "full-refresh-chaos.yaml").read_text(), text)
 
 
 if __name__ == "__main__":

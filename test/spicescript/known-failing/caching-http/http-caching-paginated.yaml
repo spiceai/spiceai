@@ -2,6 +2,7 @@
 # API returns every page but caches none of them, in file and memory mode, and
 # logs nothing; a one-page response holding several rows is cached.
 name: http-caching-paginated
+duration: 23s
 description: >
   A caching-mode acceleration over an HTTP API caches a paginated response's
   rows from every page, as it caches a one-page response holding one row or

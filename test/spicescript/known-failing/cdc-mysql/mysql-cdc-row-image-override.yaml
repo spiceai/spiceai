@@ -2,6 +2,7 @@
 # table, and a restart does not recover it.
 # Move this script to test/spicescript/ once it passes.
 name: mysql-cdc-row-image-override
+duration: 141s
 description: >
   Spice requires binlog_row_image=FULL and checks it at startup, but one writer
   session can still override it. A partial row image must never be applied as

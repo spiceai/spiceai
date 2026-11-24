@@ -1,4 +1,5 @@
 name: debezium-direct
+duration: 55s
 tags: [long]
 description: >
   Debezium Server reading PostgreSQL posts its change events straight to

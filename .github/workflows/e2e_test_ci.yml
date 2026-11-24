@@ -3212,7 +3212,8 @@ jobs:
       # live scripts need the provider tokens only trunk_tests.yml mints. A
       # changed known-failing ledger (a re-record) runs its whole group against
       # the new ledger. An edit to a script's `tags:` line alone changes which
-      # run it belongs to, not what it does, so it selects nothing here.
+      # run it belongs to, not what it does, and its `duration:` line is a
+      # recorded run time, so an edit to those lines alone selects nothing here.
       - name: Find changed scripts
         id: changed
         if: ${{ matrix.changed }}
@@ -3227,9 +3228,11 @@ jobs:
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
           # Scripts without `tags: [long]` run in the script shards from this
           # same commit, so only the changed `long` ones run again here.
-          passing=$(git diff --name-only --diff-filter=AMR -I'^tags:' "$BASE_SHA" HEAD -- \
+          # `--numstat`, not `--name-only`: `--name-only` lists a file whose
+          # changed lines all match `-I`.
+          passing=$(git diff --numstat --no-renames --diff-filter=AM -I'^tags:' -I'^duration:' -I'^  "duration":' "$BASE_SHA" HEAD -- \
             ':(glob)test/spicescript/*.yaml' ':(exclude)test/spicescript/variants.yaml' |
-            while read -r script; do
+            cut -f3 | while read -r script; do
               if grep -qE '^tags:.*[^a-z_-]long([^a-z_-]|$)' "$script"; then echo "$script"; fi
             done | xargs)
           groups=$(git diff --name-only --diff-filter=AMRD "$BASE_SHA" HEAD -- \
@@ -3241,8 +3244,8 @@ jobs:
             done | sort -u)
           known=$( {
             echo "$groups"
-            git diff --name-only --diff-filter=AMR -I'^tags:' "$BASE_SHA" HEAD -- \
-              ':(glob)test/spicescript/known-failing/*/*.yaml' | while read -r script; do
+            git diff --numstat --no-renames --diff-filter=AM -I'^tags:' -I'^duration:' -I'^  "duration":' "$BASE_SHA" HEAD -- \
+              ':(glob)test/spicescript/known-failing/*/*.yaml' | cut -f3 | while read -r script; do
                 # A script whose whole group already runs is not listed again.
                 grep -qx "$(dirname "$script")" <<<"$groups" || echo "$script"
               done

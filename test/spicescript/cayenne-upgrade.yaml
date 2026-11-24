@@ -1,4 +1,5 @@
 name: cayenne-upgrade
+duration: 8s
 description: >
   Cayenne state written by each of the last two releases is served by the
   binary under test: a partitioned file acceleration, an append acceleration that keeps appending after the

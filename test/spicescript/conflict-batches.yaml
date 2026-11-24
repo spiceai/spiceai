@@ -1,4 +1,5 @@
 name: conflict-batches
+duration: 43s
 tags: [long]
 description: >
   Cayenne keeps one row per primary key, the version that arrived last, for a

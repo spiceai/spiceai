@@ -1,4 +1,5 @@
 name: snapshots-reader-removed-engine
+duration: 6s
 description: >
   A `file_format: snapshot` dataset whose snapshots a release published with
   a removed engine, `turso` or `duckdb`, fails to load on a build that no

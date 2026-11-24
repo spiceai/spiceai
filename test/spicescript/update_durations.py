@@ -8,8 +8,7 @@ the times the scripts take on the CI runners, at the `--jobs` CI uses, not on a
 developer's machine. This reads the `spicescript-results-*` artifacts of the
 given runs (by default the newest successful E2E Test CI merge-queue runs and
 trunk tests runs), takes each script's median, and writes it to the script's
-`recordings/durations/<script>` file. A script no run reached keeps its
-recorded duration.
+`duration` line. A script no run reached keeps its recorded duration.
 
     python3 test/spicescript/update_durations.py            # newest runs
     python3 test/spicescript/update_durations.py 123 456    # these runs
@@ -21,13 +20,16 @@ import collections
 import json
 import math
 from pathlib import Path
+import re
 import statistics
 import subprocess
 import tempfile
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-# Beside the scripts: one file per script, named for it, holding its whole seconds.
-DURATIONS_DIR = Path("recordings/durations")
+# A script's duration is one line after its name, `duration: 458s`, or
+# `  "duration": "458s",` in a JSON script; the runner requires that form.
+YAML_LINE = re.compile(r"^duration: *\d+s *$", re.M)
+JSON_LINE = re.compile(r'^  "duration": *"\d+s",$', re.M)
 # The workflows whose runs carry spicescript results, and the event of the runs to read.
 SOURCES = [("e2e_test_ci.yml", "merge_group"), ("trunk_tests.yml", "schedule")]
 
@@ -52,19 +54,34 @@ def medians(result_files):
     return {file: math.ceil(statistics.median(seconds)) for file, seconds in times.items()}
 
 
-def write_durations(root, measured):
-    """Writes each measured script's seconds to its duration file under `root`; returns how many changed.
+def set_duration(text, seconds):
+    """`text` with its `duration` line recording `seconds`; unchanged if it has none."""
+    if text.lstrip().startswith("{"):
+        return JSON_LINE.sub(f'  "duration": "{seconds}s",', text, count=1)
+    return YAML_LINE.sub(f"duration: {seconds}s", text, count=1)
 
-    Only a script that already has a recorded duration is rewritten: the
-    runner records a new script's first one (`--record-durations`).
+
+def get_duration_line(text):
+    """The script's `duration` line, or None."""
+    m = (JSON_LINE if text.lstrip().startswith("{") else YAML_LINE).search(text)
+    return m.group(0) if m else None
+
+
+def write_durations(root, measured):
+    """Writes each measured script's seconds to its `duration` line under `root`; returns how many changed.
+
+    Only a script that already records a duration is rewritten: the runner
+    records a new script's first one (`--record-durations`).
     """
     changed = 0
     for file, seconds in sorted(measured.items()):
-        file = Path(file)
-        path = root / file.parent / DURATIONS_DIR / file.stem
-        text = f"{seconds}\n"
-        if path.exists() and path.read_text() != text:
-            path.write_text(text)
+        path = root / file
+        if not path.exists():
+            continue
+        text = path.read_text()
+        new = set_duration(text, seconds)
+        if new != text:
+            path.write_text(new)
             changed += 1
     return changed
 

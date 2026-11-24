@@ -1,4 +1,5 @@
 name: cayenne-vnext-recreate
+duration: 11s
 description: >
   Upgrades two Cayenne datasets from SQLite to `runtime.params.cayenne_vnext`
   with a `mode: file_create` start, then recreates one of them. Each recreate

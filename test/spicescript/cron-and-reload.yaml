@@ -1,4 +1,5 @@
 name: cron-and-reload
+duration: 29s
 description: >
   refresh_cron refreshes a Cayenne acceleration on its schedule: a full
   refresh, an append and an accelerated view each follow the source with no

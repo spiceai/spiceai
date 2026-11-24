@@ -1,4 +1,5 @@
 name: postgres-cdc-random-queries
+duration: 275s
 tags: [long]
 description: >
   Random queries (as in random-queries.yaml) over PostgreSQL CDC accelerations

@@ -1,4 +1,5 @@
 name: append-upsert-same-time
+duration: 7s
 description: >
   Known failing (#15542): an append refresh into an acceleration that upserts on a
   primary key alternates between two versions of a key that share one time. The

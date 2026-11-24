@@ -1,4 +1,5 @@
 name: databricks-static-token
+duration: 3s
 description: >
   A Databricks dataset (mode: delta_lake) authenticates with a static
   `databricks_token` read through `${secrets:…}`, and returns the table's row.

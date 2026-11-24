@@ -1,4 +1,5 @@
 name: clickhouse-literals
+duration: 59s
 tags: [long]
 description: >
   Every column of a ClickHouse table of edge values compared with each edge
