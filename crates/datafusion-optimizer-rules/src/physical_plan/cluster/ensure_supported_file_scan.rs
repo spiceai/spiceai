@@ -67,11 +67,29 @@ impl EnsureSupportedFileScan {
             );
         }
 
-        if concrete!(data_source_exec.data_source(), FileScanConfig).is_none() {
+        let Some(file_scan_config) = concrete!(data_source_exec.data_source(), FileScanConfig)
+        else {
             return plan_err!(
                 "{}: does not support {} scans",
                 Self::name(),
                 std::any::type_name_of_val(data_source_exec.data_source().as_ref())
+            );
+        };
+
+        // A file's extensions, such as the rows a Delta Lake deletion vector
+        // removes, are not serialized: an executor would read the whole file.
+        if let Some(file) = file_scan_config
+            .file_groups
+            .iter()
+            .flat_map(datafusion_datasource::file_groups::FileGroup::iter)
+            .find(|file| !file.extensions.is_empty())
+        {
+            let store: &url::Url = file_scan_config.object_store_url.as_ref();
+            return plan_err!(
+                "Distributed queries cannot read the file '{}://{}/{}': a per-file row filter, such as a Delta Lake deletion vector, removes some of its rows, and executors cannot apply it. Run the query through /v1/sql instead of the async queries API.",
+                store.scheme(),
+                store.host_str().unwrap_or_default(),
+                file.object_meta.location
             );
         }
 
@@ -316,6 +334,51 @@ mod tests {
 
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]))
+    }
+
+    fn parquet_scan(
+        file: datafusion::datasource::listing::PartitionedFile,
+    ) -> Arc<dyn ExecutionPlan> {
+        use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
+        use datafusion::execution::object_store::ObjectStoreUrl;
+        DataSourceExec::from_data_source(
+            FileScanConfigBuilder::new(
+                ObjectStoreUrl::local_filesystem(),
+                Arc::new(ParquetSource::new(test_schema())),
+            )
+            .with_file(file)
+            .build(),
+        )
+    }
+
+    /// A file that carries the rows to skip, as a Delta Lake deletion vector
+    /// attaches them, cannot be sent to executors, which would read every row.
+    #[test]
+    fn a_file_with_rows_to_skip_is_not_distributed() {
+        use datafusion::datasource::listing::PartitionedFile;
+        use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
+
+        let rule = EnsureSupportedFileScan::new();
+        let config = ConfigOptions::default();
+
+        rule.optimize(
+            parquet_scan(PartitionedFile::new("t.parquet", 100)),
+            &config,
+        )
+        .expect("a plain file scan is distributed");
+
+        let error = rule
+            .optimize(
+                parquet_scan(
+                    PartitionedFile::new("t.parquet", 100)
+                        .with_extension(ParquetAccessPlan::new_all(1)),
+                ),
+                &config,
+            )
+            .expect_err("a file with rows to skip must not be distributed");
+        let message = error.to_string();
+        assert!(message.contains("deletion vector"), "{message}");
+        assert!(message.contains("'file:///t.parquet'"), "{message}");
     }
 
     #[test]
