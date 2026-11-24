@@ -1952,7 +1952,15 @@ impl Runtime {
         self: Arc<Self>,
         mut changes: tokio::sync::mpsc::UnboundedReceiver<TableReference>,
     ) {
-        while let Some(name) = changes.recv().await {
+        let mut queued = std::collections::VecDeque::new();
+        loop {
+            let name = match queued.pop_front() {
+                Some(name) => name,
+                None => match changes.recv().await {
+                    Some(name) => name,
+                    None => return,
+                },
+            };
             let Some(app) = self.read_app().await else {
                 continue;
             };
@@ -1975,6 +1983,15 @@ impl Runtime {
                         .load_dataset(dataset, bootstrap, load_semaphore, load)
                         .await;
                 });
+            }
+            // Requests for this dataset that arrived during its reload were
+            // made by the table it replaced (a table still serving the wrong
+            // role asks again), so they are answered; a table that still
+            // serves the wrong role asks again later.
+            while let Ok(next) = changes.try_recv() {
+                if next != name && !queued.contains(&next) {
+                    queued.push_back(next);
+                }
             }
         }
     }

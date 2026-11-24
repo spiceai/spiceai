@@ -7826,11 +7826,18 @@ async fn shared_initial_load_record(
     })
 }
 
+/// How often a table that serves the wrong writer role asks again for its
+/// dataset to be reloaded, after a reload that did not replace it.
+const WRITER_ROLE_RELOAD_RETRY: Duration = Duration::from_secs(15);
+
 /// Ask for `dataset` to be reloaded once this instance starts or stops
 /// writing its acceleration: a takeover reopens it from the committed state
 /// and starts its refresh, a handover stops it. `built_as_writer` is the role
 /// the table was built for, so a change between reading the role and starting
-/// this watch reloads it too.
+/// this watch reloads it too. The task belongs to the table: while the table
+/// still serves the wrong role, because a reload failed (its source could not
+/// be reached, say), it asks again, and a reload that replaces the table ends
+/// it.
 async fn watch_writer_role(
     mut role: data_accelerator_api::WriterRole,
     built_as_writer: bool,
@@ -7838,12 +7845,22 @@ async fn watch_writer_role(
     reloads: tokio::sync::mpsc::UnboundedSender<TableReference>,
 ) {
     loop {
-        if *role.borrow_and_update() != built_as_writer {
-            let _ = reloads.send(dataset);
+        if *role.borrow_and_update() == built_as_writer {
+            if role.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+        if reloads.send(dataset.clone()).is_err() {
             return;
         }
-        if role.changed().await.is_err() {
-            return;
+        tokio::select! {
+            changed = role.changed() => {
+                if changed.is_err() {
+                    tokio::time::sleep(WRITER_ROLE_RELOAD_RETRY).await;
+                }
+            }
+            () = tokio::time::sleep(WRITER_ROLE_RELOAD_RETRY) => {}
         }
     }
 }

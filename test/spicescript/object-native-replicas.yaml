@@ -6,7 +6,8 @@ description: >
   The replica follows the writer's changes. When the writer is killed, the
   replica takes over once its lease lapses and resumes the same slot from the
   last commit, with no change missing or applied twice; the killed instance,
-  started again, follows the new writer. A dataset the writer has not loaded
+  started again, follows the new writer, and takes the dataset over again
+  while the source is down, ingesting once it is back. A dataset the writer has not loaded
   yet is not served from the replica's empty acceleration: the replica serves it
   from the source until the writer records its load. Every answer is checked
   against the source.
@@ -152,4 +153,23 @@ steps:
     only: a
   - source-query: { src: "SELECT count(*) AS slots FROM pg_replication_slots WHERE database = current_database()" }
     expect: { rows: [['1']] }
+    only: a
+
+  # B dies while the source is down. A takes the dataset over but cannot reach
+  # the source to start ingesting; once the source is back, A ingests without
+  # a restart.
+  - kill-spiced: {}
+    only: b
+  - stop-source: src
+    only: a
+  - assert-log: { contains: "is now written by this instance" }
+    eventually: 120s
+    only: a
+  - start-source: src
+    only: a
+  - source-exec:
+      src: "INSERT INTO orders SELECT i, 'R', i * 1.25 FROM generate_series(2001, 2100) AS i"
+    only: a
+  - query: SELECT o_status, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_status ORDER BY o_status
+    eventually: 180s
     only: a
