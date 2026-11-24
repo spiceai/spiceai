@@ -266,6 +266,142 @@ impl Model for Protocol {
         canonical(&mut next, self.s);
         Some(next)
     }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Tick => "the clock ticks".into(),
+            Action::Commit => "the writer completes a commit".into(),
+            Action::Send => "the reader sends a head GET".into(),
+            Action::Deliver(i) => format!("GET response {i} arrives"),
+            Action::Start(q) => format!("query {q} starts"),
+            Action::Serve(q) => format!("query {q} is answered from the cache"),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        Some(crate::explorer::summary(&[
+            format!(
+                "staleness bound S = {} tick(s); times are tick.order",
+                self.s
+            ),
+            format!("clock {}", s.clock),
+            crate::explorer::flags(&[
+                ("answered from cache", s.cached_answer),
+                ("one GET answered two queries", s.shared),
+                ("late response ignored", s.late_ignored),
+                ("commit completed while a GET was in flight", s.overtaken),
+            ]),
+        ]))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{Event, Timeline, Tone, state_and_trace, steps};
+        let t = |time: Time| format!("{}.{}", time.0, time.1);
+        let last = path.last_state().clone();
+        let completed: Vec<String> = last
+            .completed
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("commit {} at {}", i + 1, t(*c)))
+            .collect();
+        let mut boxes = vec![
+            (
+                format!("HEAD (commit {}, clock {})", last.head, last.clock),
+                if completed.is_empty() {
+                    vec!["no commits".into()]
+                } else {
+                    completed
+                },
+                Tone::Live,
+            ),
+            (
+                "READER CACHE".into(),
+                vec![
+                    format!("commit {}", last.cache.commit),
+                    format!(
+                        "GET sent {} received {}",
+                        t(last.cache.sent),
+                        t(last.cache.received)
+                    ),
+                ],
+                Tone::Actor,
+            ),
+        ];
+        if !last.gets.is_empty() {
+            boxes.push((
+                "GETS IN FLIGHT".into(),
+                last.gets
+                    .iter()
+                    .map(|(c, sent)| format!("observed commit {c}, sent {}", t(*sent)))
+                    .collect(),
+                Tone::Staged,
+            ));
+        }
+        for (q, query) in last.queries.iter().enumerate() {
+            if let Some(query) = query {
+                let mut lines = vec![format!(
+                    "started {} (own write: commit {})",
+                    t(query.start),
+                    query.token
+                )];
+                lines.push(match query.served {
+                    Some(c) => format!("answered with commit {c}"),
+                    None => "waiting".into(),
+                });
+                if let Some(from) = query.from {
+                    lines.push(format!("from a GET sent {}", t(from.sent)));
+                }
+                boxes.push((format!("QUERY {q}"), lines, Tone::Actor));
+            }
+        }
+        let (writer, head, reader) = (0, 1, 2);
+        let mut lanes = vec![
+            "writer".to_string(),
+            "head".to_string(),
+            "reader cache".to_string(),
+        ];
+        lanes.extend((0..QUERIES).map(|q| format!("query {q}")));
+        let mut events = vec![];
+        for (before, action, after) in steps(path) {
+            let event = match action {
+                Action::Tick => {
+                    Event::on(writer, format!("clock -> {}", after.clock)).tone(Tone::Gone)
+                }
+                Action::Commit => {
+                    Event::on(writer, format!("commit {} completes", after.head)).to(head)
+                }
+                Action::Send => {
+                    Event::on(reader, format!("GET sent; observes commit {}", before.head))
+                        .to(head)
+                        .tone(Tone::Staged)
+                }
+                Action::Deliver(i) => {
+                    let (c, _) = before.gets[i];
+                    // The rule `next_state` applies: a response older than the
+                    // cache is ignored. Comparing whole caches misreads an accepted
+                    // response for the cached commit, since `canonical` renumbers
+                    // the times it would change.
+                    if c < before.cache.commit {
+                        Event::on(
+                            head,
+                            format!("response (commit {c}) ignored: older than cache"),
+                        )
+                        .to(reader)
+                        .tone(Tone::Gone)
+                    } else {
+                        Event::on(head, format!("response: cache now commit {c}")).to(reader)
+                    }
+                }
+                Action::Start(q) => Event::on(3 + q, "start").tone(Tone::Actor),
+                Action::Serve(q) => {
+                    let served = after.queries[q].and_then(|x| x.served).unwrap_or(0);
+                    Event::on(reader, format!("answers query {q} with commit {served}"))
+                        .to(3 + q)
+                        .tone(Tone::Actor)
+                }
+            };
+            events.push(event.breaking(&crate::explorer::broken(self, &before, &after)));
+        }
+        Some(state_and_trace(&boxes, &Timeline { lanes, events }))
+    }
     fn properties(&self) -> Vec<Property<Self>> {
         let mut p = vec![
             Property::always(
@@ -325,5 +461,25 @@ impl Model for Protocol {
             ));
         }
         p
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::{Action, Protocol};
+    use stateright::{Model, Path};
+
+    /// An accepted response for the commit the cache already holds leaves the
+    /// cache's canonical state unchanged; the timeline must still call it
+    /// accepted, as `next_state` does.
+    #[test]
+    fn same_commit_response_is_drawn_as_accepted() {
+        let model = Protocol::new("reads", 1);
+        let init = model.init_states().remove(0);
+        let actions = [Action::Send, Action::Start(0), Action::Deliver(0)];
+        let path = Path::from_actions(&model, init, &actions).expect("enabled trace");
+        let svg = model.as_svg(path).expect("reads draws");
+        assert!(svg.contains("response: cache now commit 0"), "{svg}");
+        assert!(!svg.contains("ignored"), "{svg}");
     }
 }
