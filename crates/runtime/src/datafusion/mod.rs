@@ -416,6 +416,19 @@ pub enum Error {
     #[snafu(display("The schema {schema} is not registered."))]
     SchemaMissing { schema: String },
 
+    #[snafu(display(
+        "{}. Spice tries again on the next request that carries a token for it.",
+        source.to_string().trim_end_matches('.')
+    ))]
+    UnableToLoadDeferredCatalog {
+        source: Box<crate::catalogconnector::Error>,
+    },
+
+    #[snafu(display("{source}"))]
+    InvalidDeferredCatalog {
+        source: Box<crate::catalogconnector::Error>,
+    },
+
     #[snafu(display("The catalog {catalog} does not support partition metadata lookups."))]
     CatalogNotPartitionAware { catalog: String },
 
@@ -1355,6 +1368,12 @@ fn remove_if_same<V>(
     }
 }
 
+/// Whether a component that user tokens for `client_id` load is loaded by a request that
+/// carries tokens for `client_ids`.
+fn loads_with(client_id: Option<&str>, client_ids: &[String]) -> bool {
+    client_id.is_some_and(|client_id| client_ids.iter().any(|id| id == client_id))
+}
+
 struct DeferredTableRegistration {
     dataset: Arc<Dataset>,
     connector: Arc<dyn DataConnector>,
@@ -2022,6 +2041,7 @@ impl DataFusion {
                 catalog
             };
 
+            self.remove_deferred_catalog(name).await;
             self.ctx.register_catalog(name, catalog_to_register);
             self.set_catalog_access(name, access)?;
         }
@@ -3161,21 +3181,100 @@ impl DataFusion {
         }
     }
 
-    pub async fn load_deferred_catalog(&self, name: &str, access: &AccessMode) -> Result<()> {
-        let deferred_catalogs = self.deferred_catalogs.read().await;
-        if let Some(catalog) = deferred_catalogs.get(name) {
-            if let Ok(provider) = catalog.get_catalog_provider().await {
-                self.ctx.register_catalog(name, Arc::clone(&provider));
-                self.set_catalog_access(name, access)?;
-            }
-
-            drop(deferred_catalogs);
-
-            let mut deferred_catalogs = self.deferred_catalogs.write().await;
-            deferred_catalogs.remove(name);
+    /// Loads a deferred catalog. It stays deferred until a load succeeds, so a later
+    /// request loads a catalog whose load failed, for example on an expired token. A
+    /// configuration error ends it instead. One load of a catalog runs at a time, and a
+    /// load whose catalog a Spicepod reload replaced or removed registers nothing.
+    pub async fn load_deferred_catalog(&self, name: &str) -> Result<()> {
+        let Some(catalog) = self
+            .deferred_catalogs
+            .read()
+            .await
+            .get(name)
+            .map(Arc::clone)
+        else {
+            return Ok(());
+        };
+        let ended_loads = catalog.ended_loads();
+        let _loading = catalog.lock_load().await;
+        let is_current = |deferred_catalogs: &HashMap<String, Arc<DeferredCatalogProvider>>| {
+            deferred_catalogs
+                .get(name)
+                .is_some_and(|current| Arc::ptr_eq(current, &catalog))
+        };
+        // Another request's load ended while this one waited: it loaded the catalog, or it
+        // failed and a later request tries again.
+        if catalog.ended_loads() != ended_loads
+            || !is_current(&*self.deferred_catalogs.read().await)
+        {
+            return Ok(());
         }
 
+        let provider = match catalog.get_catalog_provider().await {
+            Ok(provider) => provider,
+            Err(source) if source.is_configuration_error() => {
+                let err = Error::InvalidDeferredCatalog {
+                    source: Box::new(source),
+                };
+                let mut deferred_catalogs = self.deferred_catalogs.write().await;
+                if !is_current(&deferred_catalogs) {
+                    return Ok(());
+                }
+                deferred_catalogs.remove(name);
+                self.runtime_status.update_catalog(
+                    name,
+                    status::ComponentStatus::error_with_message(err.to_string()),
+                );
+                return Err(err);
+            }
+            Err(source) => {
+                return Err(Error::UnableToLoadDeferredCatalog {
+                    source: Box::new(source),
+                });
+            }
+        };
+
+        let mut deferred_catalogs = self.deferred_catalogs.write().await;
+        if is_current(&deferred_catalogs) {
+            self.ctx.register_catalog(name, provider);
+            self.set_catalog_access(name, catalog.access())?;
+            deferred_catalogs.remove(name);
+        }
         Ok(())
+    }
+
+    /// The deferred catalogs that user tokens for one of `client_ids` load.
+    pub async fn deferred_catalogs_for(&self, client_ids: &[String]) -> Vec<String> {
+        self.deferred_catalogs
+            .read()
+            .await
+            .iter()
+            .filter(|(_, catalog)| loads_with(catalog.user_token_client_id(), client_ids))
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// The deferred datasets that user tokens for one of `client_ids` load.
+    pub async fn deferred_datasets_for(&self, client_ids: &[String]) -> Vec<TableReference> {
+        self.deferred_tables
+            .read()
+            .await
+            .values()
+            .filter(|registration| {
+                loads_with(registration.connector.user_token_client_id(), client_ids)
+            })
+            .map(|registration| registration.dataset.name.clone())
+            .collect()
+    }
+
+    /// Forgets a deferred catalog, so no later request loads it.
+    pub async fn remove_deferred_catalog(&self, name: &str) {
+        self.deferred_catalogs.write().await.remove(name);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn is_deferred_catalog(&self, name: &str) -> bool {
+        self.deferred_catalogs.read().await.contains_key(name)
     }
 
     async fn ensure_sink_dataset(
@@ -8741,7 +8840,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "sqlite", feature = "snapshots"))]
+    #[cfg(feature = "snapshots")]
     mod build_snapshot_creation_config_tests {
         use super::*;
         use crate::component::dataset::Dataset;
@@ -8751,6 +8850,14 @@ mod tests {
         use spicepod::component::snapshot::Snapshots;
         use std::sync::Arc;
         use tempfile::TempDir;
+
+        /// The Cayenne snapshot engine production passes as the override; without it a
+        /// Cayenne archive would be unrestorable and no config is built at all (see
+        /// `cayenne_does_not_publish_without_its_snapshot_engine`).
+        fn test_snapshot_engine() -> Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>
+        {
+            Arc::new(runtime_acceleration::snapshot::engine::DefaultSnapshotEngine)
+        }
 
         async fn create_test_dataset(time_column: Option<String>) -> Dataset {
             let runtime = crate::Runtime::builder().build().await;
@@ -8823,7 +8930,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::Sqlite,
+                Engine::Cayenne,
                 None,
                 None,
                 &dataset.runtime().secrets(),
@@ -8836,7 +8943,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -8902,7 +9009,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::RefreshComplete),
                 None,
                 &dataset.runtime().secrets(),
@@ -8915,7 +9022,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Snapshot,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -8930,7 +9037,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("not-a-valid-batch-count".to_string()),
                 &dataset.runtime().secrets(),
@@ -8943,7 +9050,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Snapshot,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -8960,7 +9067,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("25".to_string()),
                 &dataset.runtime().secrets(),
@@ -8973,7 +9080,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -8998,7 +9105,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("25".to_string()),
                 &dataset.runtime().secrets(),
@@ -9011,7 +9118,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Changes,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9036,7 +9143,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 None,
                 &dataset.runtime().secrets(),
@@ -9049,7 +9156,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9069,7 +9176,7 @@ mod tests {
             let dataset = create_test_dataset(Some("created_at".to_string())).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 None,
                 &dataset.runtime().secrets(),
@@ -9082,7 +9189,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9102,7 +9209,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 None,
                 &dataset.runtime().secrets(),
@@ -9115,7 +9222,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9135,7 +9242,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("-10".to_string()),
                 &dataset.runtime().secrets(),
@@ -9148,7 +9255,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9164,7 +9271,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("0".to_string()),
                 &dataset.runtime().secrets(),
@@ -9177,7 +9284,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9193,7 +9300,7 @@ mod tests {
             let dataset = create_test_dataset(Some("ts".to_string())).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::TimeInterval),
                 Some(String::new()),
                 &dataset.runtime().secrets(),
@@ -9206,7 +9313,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9225,7 +9332,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some(String::new()),
                 &dataset.runtime().secrets(),
@@ -9238,7 +9345,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Changes,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 

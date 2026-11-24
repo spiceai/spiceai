@@ -145,6 +145,19 @@ async fn reopen(
         .expect("reopen")
 }
 
+/// Reopen the table as the runtime does when it replaces a dataset: quiesce the
+/// old instance first. Its maintenance holds its own `compaction_lock`, so a pass
+/// it spawned after a write would otherwise commit under the new instance's
+/// passes and make them abort.
+async fn hand_over(
+    old: CayenneTableProvider,
+    catalog: &Arc<dyn MetadataCatalog>,
+    runtime_env: &Arc<RuntimeEnv>,
+) -> CayenneTableProvider {
+    old.quiesce().await;
+    reopen(catalog, runtime_env).await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn streaming_append_resolves_copies_through_reopen_and_compaction() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
@@ -177,19 +190,19 @@ async fn streaming_append_resolves_copies_through_reopen_and_compaction() {
             assert_eq!(actual, expected, "{label} {stage}");
         };
         check("after append", visible(&provider).await);
-        let provider = reopen(&catalog, &runtime_env).await;
+        let provider = hand_over(provider, &catalog, &runtime_env).await;
         check("after reopen", visible(&provider).await);
         provider
             .compact_protected_snapshots_subset(8)
             .await
             .expect("merge");
         check("after protected merge", visible(&provider).await);
-        provider
-            .sort_and_rewrite_data(64 * 1024 * 1024)
-            .await
-            .expect("rewrite");
+        assert!(
+            provider.force_full_compaction().await.expect("rewrite"),
+            "the full compaction must commit"
+        );
         check("after full rewrite", visible(&provider).await);
-        let provider = reopen(&catalog, &runtime_env).await;
+        let provider = hand_over(provider, &catalog, &runtime_env).await;
         check("after second reopen", visible(&provider).await);
     }
 }
@@ -263,19 +276,19 @@ async fn streaming_append_into_a_drop_table_keeps_the_last_copy() {
             7,
         );
         assert_eq!(visible(&provider).await, expected);
-        let provider = reopen(&catalog, &runtime_env).await;
+        let provider = hand_over(provider, &catalog, &runtime_env).await;
         assert_eq!(visible(&provider).await, expected);
         provider
             .compact_protected_snapshots_subset(8)
             .await
             .expect("merge");
         assert_eq!(visible(&provider).await, expected);
-        provider
-            .sort_and_rewrite_data(64 * 1024 * 1024)
-            .await
-            .expect("rewrite");
+        assert!(
+            provider.force_full_compaction().await.expect("rewrite"),
+            "the full compaction must commit"
+        );
         assert_eq!(visible(&provider).await, expected);
-        let provider = reopen(&catalog, &runtime_env).await;
+        let provider = hand_over(provider, &catalog, &runtime_env).await;
         assert_eq!(visible(&provider).await, expected);
     }
 }
@@ -325,7 +338,7 @@ async fn overwrite_resolves_copies_across_batches_through_its_lifecycle() {
             visible(&provider).await,
             provider.protected_snapshot_ids().len(),
         );
-        let provider = reopen(&catalog, &runtime_env).await;
+        let provider = hand_over(provider, &catalog, &runtime_env).await;
         check(
             "after reopen",
             visible(&provider).await,
@@ -340,16 +353,19 @@ async fn overwrite_resolves_copies_across_batches_through_its_lifecycle() {
             visible(&provider).await,
             provider.protected_snapshot_ids().len(),
         );
-        provider
-            .sort_and_rewrite_data(64 * 1024 * 1024)
-            .await
-            .expect("full rewrite");
+        assert!(
+            provider
+                .force_full_compaction()
+                .await
+                .expect("full rewrite"),
+            "the full compaction must commit"
+        );
         check(
             "after full rewrite",
             visible(&provider).await,
             provider.protected_snapshot_ids().len(),
         );
-        let provider = reopen(&catalog, &runtime_env).await;
+        let provider = hand_over(provider, &catalog, &runtime_env).await;
         check(
             "after second reopen",
             visible(&provider).await,

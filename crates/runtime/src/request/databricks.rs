@@ -16,16 +16,14 @@ limitations under the License.
 
 use app::App;
 use async_trait::async_trait;
-use datafusion::common::TableReference;
 use http::HeaderMap;
 use runtime_request_context::Extension;
 use secrecy::SecretString;
-use spicepod::param::ParamValue;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::{component::access::AccessMode, datafusion::DataFusion};
+use crate::datafusion::DataFusion;
 
 const SPICE_DATABRICKS_HEADER: &str = "spice-databricks-auth";
 
@@ -115,71 +113,40 @@ impl DatabricksAuthExtension {
         self.tokens.get(client_id).cloned()
     }
 
+    /// Loads the deferred datasets and catalogs that the request's user tokens
+    /// authenticate. Each is matched on the client ID it resolved, which a Spicepod may
+    /// give as a secret reference.
     pub async fn load_u2m_components(&self) {
-        if let (Some(app), Some(df)) = (self.app.clone(), self.df.clone()) {
-            let client_ids = self.tokens.keys().cloned().collect::<Vec<_>>();
+        let Some(df) = self.df.clone() else {
+            return;
+        };
+        let client_ids = self.tokens.keys().cloned().collect::<Vec<_>>();
 
-            let dataset_futures = app
-                .datasets
-                .iter()
-                .filter_map(|dataset| {
-                    let params = dataset.params.as_ref()?;
-                    let Some(ParamValue::String(client_id)) =
-                        params.data.get("databricks_client_id")
-                    else {
-                        return None;
-                    };
-
-                    if !client_ids.contains(client_id) {
-                        return None;
-                    }
-
-                    if df.table_exists(&TableReference::from(&dataset.name)) {
-                        return None;
-                    }
-
-                    Some(dataset.clone())
-                })
-                .map(|ds| {
-                    let df = Arc::clone(&df);
-                    let tr = TableReference::from(ds.name.clone());
-                    Box::pin(async move {
-                        if let Err(err) = df.load_deferred_dataset(tr.clone()).await {
-                            tracing::warn!("Failed to load dataset {}: {}", ds.name, err);
-                        }
-                    }) as Pin<Box<dyn Future<Output = ()> + Send>>
-                });
-
-            let catalog_futures = app
-                .catalogs
-                .iter()
-                .filter_map(|catalog| {
-                    let params = catalog.params.as_ref()?;
-                    let Some(ParamValue::String(client_id)) =
-                        params.data.get("databricks_client_id")
-                    else {
-                        return None;
-                    };
-
-                    if !client_ids.contains(client_id) {
-                        return None;
-                    }
-
-                    Some(catalog.clone())
-                })
-                .map(|catalog| {
-                    let df = Arc::clone(&df);
-                    let name = catalog.name.clone();
-                    let access = AccessMode::from(catalog.access);
-                    Box::pin(async move {
-                        if let Err(err) = df.load_deferred_catalog(name.as_str(), &access).await {
-                            tracing::warn!("Failed to load catalog {}: {}", name, err);
-                        }
-                    }) as Pin<Box<dyn Future<Output = ()> + Send>>
-                });
-
-            let all_futures: Vec<_> = dataset_futures.chain(catalog_futures).collect();
-            futures::future::join_all(all_futures).await;
+        let mut loads: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::new();
+        for table in df.deferred_datasets_for(&client_ids).await {
+            if df.table_exists(&table) {
+                continue;
+            }
+            let df = Arc::clone(&df);
+            loads.push(Box::pin(async move {
+                if let Err(err) = df.load_deferred_dataset(table.clone()).await {
+                    tracing::warn!("Failed to load dataset {table}: {err}");
+                }
+            }));
         }
+        for name in df.deferred_catalogs_for(&client_ids).await {
+            let df = Arc::clone(&df);
+            loads.push(Box::pin(async move {
+                match df.load_deferred_catalog(name.as_str()).await {
+                    Ok(()) => {}
+                    Err(err @ crate::datafusion::Error::InvalidDeferredCatalog { .. }) => {
+                        tracing::error!("Failed to load catalog {name}: {err}");
+                        runtime_metrics::catalogs::LOAD_ERROR.add(1, &[]);
+                    }
+                    Err(err) => tracing::warn!("Failed to load catalog {name}: {err}"),
+                }
+            }));
+        }
+        futures::future::join_all(loads).await;
     }
 }

@@ -467,7 +467,7 @@ pub(crate) fn resolve(
     resolve_with_state(
         backend,
         instance_dir,
-        &PinnedConfigDir::unlocked(config_dir),
+        &PinnedConfigDir::unlocked(runtime_cloud_connect::state_dir::state_dir(config_dir)),
         config_dir,
     )
 }
@@ -684,7 +684,7 @@ pub(crate) fn install(
         backend,
         instance_dir,
         config_dir,
-        &PinnedConfigDir::unlocked(config_dir),
+        &PinnedConfigDir::unlocked(runtime_cloud_connect::state_dir::state_dir(config_dir)),
         spiced_path,
         runtime_version,
         health_url,
@@ -1017,7 +1017,7 @@ pub(crate) fn uninstall(
     uninstall_with_state(
         backend,
         instance_dir,
-        &PinnedConfigDir::unlocked(config_dir),
+        &PinnedConfigDir::unlocked(runtime_cloud_connect::state_dir::state_dir(config_dir)),
         config_dir,
     )
 }
@@ -1718,7 +1718,9 @@ mod tests {
         assert_eq!(manifest.runtime_version, "v2.2.0");
         assert_eq!(
             ServiceManifest::load(
-                &PinnedConfigDir::unlocked(&config_dir),
+                &PinnedConfigDir::unlocked(runtime_cloud_connect::state_dir::state_dir(
+                    &config_dir
+                )),
                 &instance_dir,
                 &fake
             )
@@ -1781,7 +1783,12 @@ mod tests {
         assert!(message.contains(&first.name));
         assert!(message.contains(&first_dir.display().to_string()));
         assert_eq!(fake.calls(), vec!["install".to_string()]);
-        assert!(!ServiceManifest::path_in(&second_config_dir).exists());
+        assert!(
+            !ServiceManifest::path_in(&runtime_cloud_connect::state_dir::state_dir(
+                &second_config_dir
+            ))
+            .exists()
+        );
     }
 
     #[test]
@@ -1845,7 +1852,8 @@ mod tests {
         );
         assert!(fake.calls().is_empty(), "nothing may be installed");
         assert!(
-            !ServiceManifest::path_in(&config_dir).exists(),
+            !ServiceManifest::path_in(&runtime_cloud_connect::state_dir::state_dir(&config_dir))
+                .exists(),
             "no manifest may be written"
         );
     }
@@ -2002,8 +2010,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let instance_dir = dir.path().join("edge-1");
         let config_dir = instance_dir.join(".spice");
-        std::fs::create_dir_all(&config_dir).expect("create config dir");
-        std::fs::write(ServiceManifest::path_in(&config_dir), "{").expect("write manifest");
+        std::fs::create_dir_all(runtime_cloud_connect::state_dir::state_dir(&config_dir))
+            .expect("create state dir");
+        std::fs::write(
+            ServiceManifest::path_in(&runtime_cloud_connect::state_dir::state_dir(&config_dir)),
+            "{",
+        )
+        .expect("write manifest");
 
         let fake = FakeBackend::new(dir.path());
         let status = status(&fake, &instance_dir, &config_dir);
@@ -2057,7 +2070,10 @@ mod tests {
             .expect("uninstall")
             .expect("a service was installed");
         assert_eq!(removed.name, fake.name_for_dir(&instance_dir));
-        assert!(!ServiceManifest::path_in(&config_dir).exists());
+        assert!(
+            !ServiceManifest::path_in(&runtime_cloud_connect::state_dir::state_dir(&config_dir))
+                .exists()
+        );
         assert_eq!(fake.calls(), vec!["uninstall".to_string()]);
 
         // Running it again changes nothing and does not call the back end.
@@ -2087,7 +2103,8 @@ mod tests {
             "{error}"
         );
         assert!(
-            ServiceManifest::path_in(&config_dir).exists(),
+            ServiceManifest::path_in(&runtime_cloud_connect::state_dir::state_dir(&config_dir))
+                .exists(),
             "the manifest must survive a failed uninstall"
         );
     }
@@ -2097,7 +2114,9 @@ mod tests {
     /// supervisor.
     fn write_manifest_for(backend: &FakeBackend, instance_dir: &Path, config_dir: &Path) {
         manifest_for(backend, instance_dir)
-            .write(&PinnedConfigDir::unlocked(config_dir))
+            .write(&PinnedConfigDir::unlocked(
+                runtime_cloud_connect::state_dir::state_dir(config_dir),
+            ))
             .expect("write manifest");
     }
 
@@ -2133,22 +2152,23 @@ mod tests {
         let fake = FakeBackend::new(dir.path());
         write_manifest_for(&fake, &instance_dir, &config_dir);
 
+        let state_dir = runtime_cloud_connect::state_dir::state_dir(&config_dir);
         let mutation_lock = runtime_cloud_connect::MutationLock::acquire(
-            &config_dir,
+            &state_dir,
             "service-uninstall-path-replacement-test",
         )
         .await
         .expect("acquire mutation lock");
         let state_config_dir = PinnedConfigDir::locked(
-            config_dir.clone(),
+            state_dir.clone(),
             mutation_lock
                 .pinned_directory()
                 .expect("retain the locked directory"),
         );
         let moved_config_dir = instance_dir.join("locked-spice");
         std::fs::rename(&config_dir, &moved_config_dir).expect("rename locked directory");
-        std::fs::create_dir_all(&config_dir).expect("create replacement directory");
-        let replacement_manifest = ServiceManifest::path_in(&config_dir);
+        std::fs::create_dir_all(&state_dir).expect("create replacement directory");
+        let replacement_manifest = ServiceManifest::path_in(&state_dir);
         std::fs::write(&replacement_manifest, b"replacement manifest")
             .expect("write replacement manifest");
 
@@ -2157,7 +2177,10 @@ mod tests {
             .expect("the locked manifest is installed");
 
         assert!(
-            !ServiceManifest::path_in(&moved_config_dir).exists(),
+            !ServiceManifest::path_in(&runtime_cloud_connect::state_dir::state_dir(
+                &moved_config_dir
+            ))
+            .exists(),
             "the manifest in the locked directory must be removed"
         );
         assert_eq!(

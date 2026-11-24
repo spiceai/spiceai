@@ -113,7 +113,6 @@ pub struct SearchTestCase {
 #[serde(rename_all = "snake_case")]
 enum AccelerationOptions {
     NoAcceleration,
-    Arrow,
     CayenneMemory,
     Cayenne,
     /// Cayenne acceleration with `on_zero_results: use_source`, so a warm search
@@ -125,7 +124,6 @@ impl fmt::Display for AccelerationOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             AccelerationOptions::NoAcceleration => "no_acceleration",
-            AccelerationOptions::Arrow => "arrow",
             AccelerationOptions::CayenneMemory => "cayenne_memory",
             AccelerationOptions::Cayenne => "cayenne",
             AccelerationOptions::CayenneWithZeroResults => "cayenne_with_zero_results",
@@ -143,11 +141,6 @@ impl AccelerationOptions {
         match self {
             AccelerationOptions::NoAcceleration => Acceleration {
                 enabled: false,
-                ..Default::default()
-            },
-            AccelerationOptions::Arrow => Acceleration {
-                enabled: true,
-                engine: Some("arrow".to_string()),
                 ..Default::default()
             },
             AccelerationOptions::CayenneMemory => Acceleration {
@@ -347,7 +340,6 @@ async fn test_megascience_permutations(
     text_engine: TextEngineOptions,
     #[values(
         AccelerationOptions::NoAcceleration,
-        AccelerationOptions::Arrow,
         AccelerationOptions::CayenneMemory,
         AccelerationOptions::Cayenne,
         AccelerationOptions::CayenneWithZeroResults
@@ -581,9 +573,7 @@ fn validate_combination(
             (&table_option, &acceleration_opt),
             (
                 megascience::TableOptions::Dataset,
-                AccelerationOptions::Arrow
-                    | AccelerationOptions::CayenneMemory
-                    | AccelerationOptions::Cayenne
+                AccelerationOptions::CayenneMemory | AccelerationOptions::Cayenne
             )
         )
     {

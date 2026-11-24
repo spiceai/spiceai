@@ -616,7 +616,8 @@ async fn a_dataset_changed_while_its_source_is_down_loads_once_the_source_is_rea
         let mut dataset = SpicepodDataset::new(format!("{}://orders", source.prefix), "orders");
         dataset.acceleration = Some(spicepod::acceleration::Acceleration {
             enabled: true,
-            engine: Some("arrow".to_string()),
+            engine: Some("cayenne".to_string()),
+            mode: spicepod::acceleration::Mode::Memory,
             refresh_check_interval: Some(refresh_check_interval.to_string()),
             ..Default::default()
         });
@@ -1246,7 +1247,7 @@ mod served_from_acceleration {
             let mut orders = SpicepodDataset::new(format!("{}://orders", source.prefix), "orders");
             orders.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("arrow".to_string()),
+                engine: Some("cayenne".to_string()),
                 mode: Mode::Memory,
                 ..Default::default()
             });
@@ -1959,7 +1960,8 @@ mod served_from_acceleration {
         let mut child = SpicepodDataset::new("localpod:orders", "child");
         child.acceleration = Some(Acceleration {
             enabled: true,
-            engine: Some("arrow".to_string()),
+            engine: Some("cayenne".to_string()),
+            mode: spicepod::acceleration::Mode::Memory,
             refresh_mode: Some(RefreshMode::Full),
             refresh_check_interval: child_interval.map(str::to_string),
             refresh_jitter_enabled: false,
@@ -2090,7 +2092,8 @@ mod served_from_acceleration {
                 );
                 dataset.acceleration = Some(Acceleration {
                     enabled: true,
-                    engine: Some("arrow".to_string()),
+                    engine: Some("cayenne".to_string()),
+                    mode: spicepod::acceleration::Mode::Memory,
                     refresh_check_interval: Some("1h".to_string()),
                     ..Acceleration::default()
                 });
