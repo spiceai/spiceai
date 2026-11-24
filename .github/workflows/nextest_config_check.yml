@@ -25,6 +25,7 @@ on:
       # check_nextest_config.py): a change to a step's timeout-minutes alone
       # has to run the guard too.
       - '.github/workflows/integration.yml'
+      - '.github/workflows/integration_aws.yml'
   push:
     branches:
       - trunk
@@ -39,6 +40,7 @@ on:
       # check_nextest_config.py): a change to a step's timeout-minutes alone
       # has to run the guard too.
       - '.github/workflows/integration.yml'
+      - '.github/workflows/integration_aws.yml'
   workflow_dispatch:
 
 concurrency:

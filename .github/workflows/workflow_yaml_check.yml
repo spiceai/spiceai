@@ -188,7 +188,9 @@ jobs:
           git -C "$copy" init --quiet
           find "$copy/.github" -type f \( -name '*.yml' -o -name '*.yaml' \) \
             -exec sed -i -E 's#\$/\.github/#./.github/#g' {} +
-          if grep -rqF '$/.github/' "$copy/.github"; then
+          # Only the YAML files, which are what sed rewrote and actionlint reads: a script or the
+          # bytecode a test step above left behind can hold the text without being a call.
+          if grep -rqF --include='*.yml' --include='*.yaml' '$/.github/' "$copy/.github"; then
             echo "::error::A \`uses: \$/\` call was left in the copy, so its inputs would go unchecked."
             exit 1
           fi

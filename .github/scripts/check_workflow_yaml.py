@@ -186,9 +186,7 @@ EXPRESSION_TOKEN = re.compile(r"\s*\[\s*'((?:[^']|'')*)'\s*\]|'(?:[^']|'')*'")
 # job may fall back to, so it alone does not make a job a CI role job.
 CI_ROLE_SECRET = re.compile(r"secrets\.(CI_(?:NEW_)?AWS_[A-Z0-9_]*ROLE_ARN)\b")
 PULL_REQUEST_ROLE = "CI_AWS_PULL_REQUEST_ROLE_ARN"
-# Spelled in two parts so the `$/`-to-`./` copy workflow_yaml_check.yml lints finds no
-# `$/` call left in this file.
-CI_ROLE_ACTION = "$/" + ".github/actions/ci-role"
+CI_ROLE_ACTION = "$/.github/actions/ci-role"
 # The one `role-to-assume` a CI role job may write: the full role only when the first step
 # chose it, else the read-only one. `&&`/`||` with the full role first, so an unset full
 # role falls back to the read-only one and never the other way.
