@@ -102,13 +102,9 @@ impl MetadataCatalog for Domain {
     fn data_write_gate(&self, _table_id: &str) -> crate::catalog::DataWriteGate {
         self.data_writes.clone()
     }
-    async fn follow_commits(&self, _table_id: &str) -> CatalogResult<bool> {
-        // The instance that writes the log is always current, and learns that
-        // without taking the log's lock on every query: its gate is open
-        // exactly while it writes the log.
-        if self.data_writes.allows() {
-            return Ok(false);
-        }
+    async fn follow_commits(&self, _table_id: &str) -> CatalogResult<u64> {
+        // Only a table that may not write asks: a replica's, or one opened
+        // before this instance last became the writer.
         self.inner.take().await.follow().await
     }
     async fn init(&self) -> CatalogResult<()> {

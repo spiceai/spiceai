@@ -2616,9 +2616,9 @@ impl MetadataCatalog for CayenneCatalog {
         crate::catalog::DataWriteGate::open()
     }
 
-    async fn follow_commits(&self, _table_id: &str) -> CatalogResult<bool> {
+    async fn follow_commits(&self, _table_id: &str) -> CatalogResult<u64> {
         // One process writes a SQLite metastore; its state is always current.
-        Ok(false)
+        Ok(0)
     }
 
     async fn init(&self) -> CatalogResult<()> {

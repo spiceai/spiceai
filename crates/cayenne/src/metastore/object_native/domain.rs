@@ -41,14 +41,25 @@ use tokio::sync::Notify;
 
 /// What [`WriterLease::acquire`] found this instance may do with a log.
 pub(super) enum LeaseRole {
-    /// It holds the writer lease.
-    Holder,
+    /// It holds the writer lease until `valid_until` unless it renews it.
+    /// `continuous` when this process renewed a lease it already held; a
+    /// lease it created or took over may have lapsed, and been held by
+    /// another instance, since this process last wrote the log.
+    Holder {
+        valid_until: std::time::Instant,
+        continuous: bool,
+    },
     /// Another instance, `holder` when the lease names it, holds a live one.
     Standby { holder: Option<String> },
 }
 
 impl WriterLease {
-    fn new(store: &Arc<dyn ObjectStore>, prefix: &Path, settings: super::LeaseSettings) -> Self {
+    fn new(
+        store: &Arc<dyn ObjectStore>,
+        prefix: &Path,
+        settings: super::LeaseSettings,
+        dataset: &str,
+    ) -> Self {
         let identity: Arc<str> = Arc::from(
             settings
                 .identity
@@ -60,13 +71,19 @@ impl WriterLease {
             lease: object_store_occ::lease::Lease::new(holder, settings.duration),
             path: super::WriteUnit::Dataset.lease_path(prefix),
             store: Arc::clone(store),
+            dataset: Arc::from(dataset),
         }
     }
 
     /// Create, renew or take over the lease, or stand by while another
     /// instance holds a live one. The lease generation only counts holders;
     /// the generation in the head is what fences a former writer.
-    async fn acquire(&self, dataset: &str) -> CatalogResult<LeaseRole> {
+    async fn acquire(&self) -> CatalogResult<LeaseRole> {
+        let dataset = self.dataset.as_ref();
+        // Another instance judges the lease lapsed only once the version this
+        // call writes has stayed unchanged for the lease's duration since it
+        // received it, which is after this call started.
+        let started = std::time::Instant::now();
         let role = self
             .lease
             .acquire(
@@ -87,7 +104,13 @@ impl WriterLease {
                 ))
             })?;
         Ok(match role {
-            object_store_occ::lease::Role::Holder { .. } => LeaseRole::Holder,
+            object_store_occ::lease::Role::Holder { acquired, .. } => LeaseRole::Holder {
+                valid_until: started + self.lease.duration(),
+                continuous: acquired
+                    == object_store_occ::lease::Acquired::Renewed {
+                        by_other_process: false,
+                    },
+            },
             object_store_occ::lease::Role::Standby { holder, .. } => LeaseRole::Standby { holder },
             object_store_occ::lease::Role::Unsupported => {
                 return Err(invalid(format!(
@@ -119,43 +142,69 @@ impl Domain {
         let Some(lease) = &self.lease else {
             return false;
         };
-        let mut inner = self.inner.take().await;
-        let dataset = Arc::clone(&inner.dataset);
-        let role = match lease.acquire(&dataset).await {
+        // The lease is read and written without the log's state: a slow lease
+        // request delays no query or commit.
+        let role = match lease.acquire().await {
             Ok(role) => role,
             Err(error) => {
-                // Safety never depends on the lease: a writer that cannot renew
-                // keeps writing until the head fences it.
+                // The gate closes at the lease's deadline by itself, so a
+                // writer that cannot renew sends no data write once another
+                // instance could take over; its commits are fenced by the head.
                 tracing::warn!("{error}");
                 return true;
             }
         };
-        match (&inner.head, role) {
-            (Head::Replica(_), LeaseRole::Holder) => match inner.become_writer().await {
-                Ok(()) => {
-                    tracing::info!("{}", super::took_over_message(&dataset, &inner.location()));
+        let dataset = &lease.dataset;
+        match role {
+            LeaseRole::Holder {
+                valid_until,
+                continuous,
+            } => {
+                self.data_writes.hold_until(valid_until);
+                if continuous && self.data_writes.allows() {
+                    return true;
                 }
-                Err(error) => tracing::warn!(
-                    "{} holds its writer lease but could not take the dataset over, so it keeps serving queries as a replica and retries. Cause: {error}",
-                    subject(&dataset)
-                ),
-            },
-            (Head::Writer(_), LeaseRole::Standby { holder }) => {
+                let mut inner = self.inner.take().await;
+                let took_over = match inner.head {
+                    Head::Replica(_) => true,
+                    // A lease this process did not hold throughout, or a gate
+                    // a failed takeover left closed: write on only from the
+                    // committed state, under a head generation of its own.
+                    Head::Writer(_) => {
+                        self.data_writes.set(false);
+                        !continuous
+                    }
+                };
+                match inner.become_writer().await {
+                    Ok(()) if took_over => {
+                        tracing::info!("{}", super::took_over_message(dataset, &inner.location()));
+                    }
+                    Ok(()) => {}
+                    Err(error) => tracing::warn!(
+                        "{} holds its writer lease but could not take the dataset over, so it keeps serving queries as a replica and retries. Cause: {error}",
+                        subject(dataset)
+                    ),
+                }
+            }
+            LeaseRole::Standby { holder } => {
+                let mut inner = self.inner.take().await;
+                if !matches!(inner.head, Head::Writer(_)) {
+                    return true;
+                }
                 match inner.reload_committed().await {
                     Ok(()) => tracing::info!(
                         "{}",
-                        super::handed_over_message(&dataset, holder.as_deref())
+                        super::handed_over_message(dataset, holder.as_deref())
                     ),
                     Err(error) => {
                         inner.stop = Some(Stop::Fenced { reloaded: false });
                         tracing::warn!(
                             "{} {error}",
-                            super::handed_over_message(&dataset, holder.as_deref())
+                            super::handed_over_message(dataset, holder.as_deref())
                         );
                     }
                 }
             }
-            _ => {}
         }
         true
     }
@@ -337,13 +386,19 @@ impl Domain {
         // Under a writer lease, the lease decides whether this instance opens
         // the log as its writer or as a replica.
         let lease = match config.access {
-            Access::Leased(settings) => Some(WriterLease::new(&store, &prefix, settings)),
+            Access::Leased(settings) => Some(WriterLease::new(&store, &prefix, settings, dataset)),
             Access::Writer | Access::Replica => None,
         };
         let mut config = config;
+        let mut valid_until = None;
         if let Some(lease) = &lease {
-            config.access = match lease.acquire(dataset).await? {
-                LeaseRole::Holder => Access::Writer,
+            config.access = match lease.acquire().await? {
+                LeaseRole::Holder {
+                    valid_until: until, ..
+                } => {
+                    valid_until = Some(until);
+                    Access::Writer
+                }
                 LeaseRole::Standby { .. } => Access::Replica,
             };
         }
@@ -351,6 +406,9 @@ impl Domain {
             Access::Writer => crate::catalog::DataWriteGate::open(),
             Access::Replica | Access::Leased(_) => crate::catalog::DataWriteGate::closed(),
         };
+        if let Some(until) = valid_until {
+            data_writes.hold_until(until);
+        }
         let (inner, opened) = Inner::open(
             store,
             prefix,
@@ -547,6 +605,7 @@ impl Inner {
         // Applied without a copy of the state. A refused record is a guard this
         // catalog's own checks should have caught, and leaves the state partly
         // changed, so the log stops until the process restarts.
+        self.revision += 1;
         if let Err(error) = self.reader.state.apply_in_place(&record) {
             self.stop = Some(Stop::Refused);
             let message = refused_change_message(&self.dataset, &error.to_string());
@@ -1144,6 +1203,7 @@ impl Inner {
                 .map_err(invalid)?;
         let replayed = replay_state(opened)?;
         self.reader.state = replayed.state;
+        self.revision += 1;
         self.floor_state = replayed.floor_state;
         self.since_floor = replayed.since_floor;
         self.pending.clear();
@@ -1171,6 +1231,7 @@ impl Inner {
         .await?;
         let mut writer = writer;
         writer.data_writes = self.data_writes.clone();
+        writer.revision = self.revision + 1;
         *self = writer;
         self.resolve_decided_transactions().await?;
         // Data writes are allowed only once the head is this instance's.
@@ -1237,6 +1298,8 @@ impl Inner {
                 ))),
                 reader: DatasetStateReader::from_state(state, store, prefix).with_anchor(anchor),
                 head,
+                revision: 0,
+                reread: false,
                 data_writes: crate::catalog::DataWriteGate::closed(),
                 stop,
                 recovering: false,
@@ -1276,42 +1339,64 @@ impl Inner {
     }
 
     /// On a replica, apply the commits the writer made since this log last
-    /// read its head: one conditional GET when nothing changed. Returns whether
-    /// the state moved. The writer's own state is always current.
-    pub(super) async fn follow(&mut self) -> CatalogResult<bool> {
+    /// read its head: one conditional GET when nothing changed. Returns the
+    /// log's revision afterwards. The writer's own state is always current.
+    pub(super) async fn follow(&mut self) -> CatalogResult<u64> {
         let Head::Replica(reader) = &mut self.head else {
-            return Ok(false);
+            return Ok(self.revision);
         };
-        match reader.poll().await.map_err(invalid)? {
-            Poll::Unchanged => Ok(false),
+        let poll = if self.reread {
+            Poll::Reopen
+        } else {
+            reader.poll().await.map_err(invalid)?
+        };
+        match poll {
+            Poll::Unchanged => {}
             Poll::Records(entries) => {
-                let moved = !entries.is_empty();
-                for entry in entries {
-                    for payload in Group::decode(entry.record.payload)
-                        .map_err(invalid)?
-                        .payloads
-                    {
-                        let record = Record::decode(payload).map_err(invalid)?;
-                        self.reader.state.apply(&record).map_err(invalid)?;
-                    }
+                if entries.is_empty() {
+                    return Ok(self.revision);
                 }
-                Ok(moved)
+                self.revision += 1;
+                if let Err(error) = Self::apply_followed(&mut self.reader.state, entries) {
+                    self.reread = true;
+                    return Err(error);
+                }
             }
             Poll::Reopen => {
                 // The writer checkpointed past this replica's cursor and the
-                // records in between may be collected: read the log again.
+                // records in between may be collected, or a batch failed to
+                // apply after changing part of the state: read the log again.
                 let (reader, opened) =
                     Reader::open(Arc::clone(&self.reader.store), self.reader.prefix.clone())
                         .await
                         .map_err(invalid)?;
                 let replayed = replay_state(opened)?;
                 self.reader.state = replayed.state;
+                self.revision += 1;
+                self.reread = false;
                 self.floor_state = replayed.floor_state;
                 self.since_floor = replayed.since_floor;
                 self.head = Head::Replica(Box::new(reader));
-                Ok(true)
             }
         }
+        Ok(self.revision)
+    }
+
+    /// Apply records followed from the writer, in order.
+    fn apply_followed(
+        state: &mut DatasetState,
+        entries: Vec<object_store_occ::headlog::RecordWithCommit>,
+    ) -> CatalogResult<()> {
+        for entry in entries {
+            for payload in Group::decode(entry.record.payload)
+                .map_err(invalid)?
+                .payloads
+            {
+                let record = Record::decode(payload).map_err(invalid)?;
+                state.apply(&record).map_err(invalid)?;
+            }
+        }
+        Ok(())
     }
 }
 

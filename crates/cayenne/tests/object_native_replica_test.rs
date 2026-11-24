@@ -553,3 +553,69 @@ async fn a_replica_of_a_table_invalidated_by_writes_follows_within_the_default_l
         "a query confirmed the head to show A's commit"
     );
 }
+
+/// A replica whose reload fails after it applied the writer's records (here,
+/// reading a deletion vector) reloads again at its next query, even though the
+/// head has not moved since: it never serves the new file set with the old
+/// deletes, or keeps the old caches for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replica_retries_a_reload_that_failed_after_following() {
+    let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let replica_requests = Arc::new(FaultStore::new(Arc::clone(&objects)));
+    let replica_store: Arc<dyn ObjectStore> = Arc::clone(&replica_requests) as Arc<dyn ObjectStore>;
+
+    let (a, data_url) = Instance::open(&objects, Access::Writer).await;
+    let table = a
+        .builder(&objects, &data_url)
+        .create(CreateTableOptions {
+            table_name: TABLE.to_string(),
+            schema: schema(),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+            base_path: data_url.clone(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                inline_max_rows: 0,
+                inline_max_bytes: 0,
+                ..VortexConfig::default()
+            },
+        })
+        .await
+        .expect("create the table on A");
+    a.register(table);
+    a.insert(1, 100).await.expect("A writes 1..=100");
+
+    let (b, _) = Instance::open(&replica_store, Access::Replica).await;
+    let table = b
+        .builder(&replica_store, &data_url)
+        .open(TABLE)
+        .await
+        .expect("open the table on B");
+    b.register(table);
+    assert_eq!(b.count_and_sum().await, expected(1..=100), "B before");
+
+    a.run(&format!("DELETE FROM {TABLE} WHERE id <= 50"))
+        .await
+        .expect("A deletes 1..=50");
+    assert_eq!(a.count_and_sum().await, expected(51..=100), "A");
+
+    // B's reload cannot read the new deletion vector.
+    for op in [Op::Get, Op::Head] {
+        replica_requests.fail_while(op, |path| path.as_ref().contains("/deletions/"));
+    }
+    let failed = b
+        .ctx
+        .sql(&format!("SELECT count(*) FROM {TABLE}"))
+        .await
+        .expect("plan")
+        .collect()
+        .await;
+    eprintln!("B's query while its reload fails: {:?}", failed.as_ref().map(|_| "rows"));
+    replica_requests.clear_rules();
+
+    assert_eq!(
+        b.count_and_sum().await,
+        expected(51..=100),
+        "once B can read it, B's next query leaves A's deleted rows out"
+    );
+}

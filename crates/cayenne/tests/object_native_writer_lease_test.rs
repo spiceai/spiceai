@@ -29,7 +29,7 @@ use cayenne::metastore::object_native::{
 use cayenne::{CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store_sim::Op;
@@ -430,4 +430,124 @@ async fn a_graceful_shutdown_hands_over_before_the_lease_lapses() {
         "B took over {waited:?} after A handed the lease back, no sooner than a lapse"
     );
     assert_eq!(b.count_and_sum().await, expected(1..=200));
+}
+
+/// A writer that can no longer renew its lease stops writing data once the
+/// lease could have lapsed, before another instance can take over: it deletes
+/// nothing its successor commits. Here A still reaches the data and the log
+/// but not its lease object, as on a partial network failure; B takes over and
+/// commits rows A never read. A's orphan sweep, which deletes what A's own
+/// state does not name, must not remove B's files.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_that_cannot_renew_its_lease_deletes_nothing_its_successor_commits() {
+    // One clock for the location, which both instances' requests reach.
+    let clock = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let objects: Arc<dyn ObjectStore> = Arc::clone(&clock) as Arc<dyn ObjectStore>;
+    let a = Instance::start(&objects, "a", LEASE).await;
+    let a_table = Arc::new(
+        a.builder(&a.data_url)
+            .create(CreateTableOptions {
+                table_name: TABLE.to_string(),
+                schema: schema(),
+                primary_key: Vec::new(),
+                on_conflict: None,
+                base_path: a.data_url.clone(),
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    inline_max_rows: 0,
+                    inline_max_bytes: 0,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("create the table"),
+    );
+    a.ctx
+        .register_table(TABLE, Arc::clone(&a_table) as Arc<dyn datafusion::datasource::TableProvider>)
+        .expect("register");
+    let data_url = a.data_url.clone();
+    a.insert(1, 100).await.expect("A writes");
+
+    let b = Instance::start(&objects, "b", LEASE).await;
+    b.open_table(&data_url).await;
+    assert_eq!(b.count_and_sum().await, expected(1..=100));
+
+    // A's lease requests fail from now on; everything else still reaches the store.
+    let is_lease = |path: &Path| path.as_ref().contains("/leases/");
+    for op in [Op::Get, Op::GetConditional, Op::Head, Op::Put] {
+        a.requests.fail_while(op, is_lease);
+    }
+    b.insert_once_writer(&data_url, 101, 200).await;
+    assert_eq!(b.count_and_sum().await, expected(1..=200), "B took over");
+
+    // Two hours pass on the store's clock, and B commits again: B's first
+    // files are past the orphan sweep's age floor.
+    clock.advance_clock(Duration::from_secs(2 * 3600));
+    b.insert(201, 300).await.expect("B writes again");
+    assert_eq!(b.count_and_sum().await, expected(1..=300));
+    let swept = a_table.sweep_orphan_files_now().await;
+    eprintln!("A's orphan sweep: {swept:?}");
+
+    assert_eq!(
+        b.count_and_sum().await,
+        expected(1..=300),
+        "B still reads every row it committed after A's sweep"
+    );
+    // Every data file B uploaded is still in the store: B committed each one
+    // in an acknowledged insert (none of them was retired since).
+    for request in b.requests.log() {
+        if request.op == Op::MultipartComplete && request.path.as_ref().ends_with(".vortex") {
+            assert!(
+                objects.head(&request.path).await.is_ok(),
+                "B's committed data file {} is gone from the store",
+                request.path
+            );
+        }
+    }
+    let deletes: Vec<String> = a
+        .requests
+        .log()
+        .into_iter()
+        .filter(|request| request.op == Op::Delete && request.path.as_ref().contains("/data/"))
+        .map(|request| format!("{:?} {}", request.op, request.path))
+        .collect();
+    assert_eq!(deletes, Vec::<String>::new(), "A deletes no data once its lease could have lapsed");
+}
+
+/// A writer whose lease requests fail stops writing at the lease's deadline,
+/// and writes again, from the same table, once a renewal succeeds while no
+/// other instance has taken over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_whose_lease_requests_recover_writes_again() {
+    let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let a = Instance::start(&objects, "a", LEASE).await;
+    a.create().await;
+    a.insert(1, 100).await.expect("A writes");
+
+    let is_lease = |path: &Path| path.as_ref().contains("/leases/");
+    for op in [Op::Get, Op::GetConditional, Op::Head, Op::Put] {
+        a.requests.fail_while(op, is_lease);
+    }
+    tokio::time::sleep(LEASE * 2).await;
+    let refused = a
+        .insert(101, 200)
+        .await
+        .expect_err("past its lease's deadline, A sends no write");
+    assert!(
+        refused.to_string().contains("accepts no change from this table"),
+        "{refused}"
+    );
+
+    a.requests.clear_rules();
+    let deadline = Instant::now() + LEASE * 10;
+    loop {
+        match a.insert(101, 200).await {
+            Ok(()) => break,
+            Err(error) => {
+                assert!(Instant::now() < deadline, "A never wrote again: {error}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+    assert_eq!(a.count_and_sum().await, expected(1..=200));
 }

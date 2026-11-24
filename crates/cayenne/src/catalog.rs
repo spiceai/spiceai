@@ -310,6 +310,11 @@ pub struct SnapshotSequenceCommit {
 /// the metastore log that decides it, so the table sees a change of writer at
 /// once. See [`MetadataCatalog::data_write_gate`].
 ///
+/// Under a writer lease the gate also closes by itself at the lease's
+/// deadline ([`Self::hold_until`]): an instance that cannot renew its lease
+/// sends no data write once another instance could judge the lease lapsed and
+/// take over, even if it never learns it was replaced.
+///
 /// Each time the instance becomes the writer again the gate's generation
 /// rises. A table binds the generation it opened at ([`Self::for_table`]), so
 /// a table whose state was seeded before another instance wrote the dataset
@@ -326,6 +331,9 @@ pub struct DataWriteGate {
 struct GateState {
     allowed: std::sync::atomic::AtomicBool,
     generation: std::sync::atomic::AtomicU64,
+    /// Writes are refused from this instant on, as nanoseconds since
+    /// [`gate_clock_epoch`]; `u64::MAX` for no deadline.
+    valid_until_ns: std::sync::atomic::AtomicU64,
     /// Whether writes are allowed, for whoever waits for a change of writer.
     changes: tokio::sync::watch::Sender<bool>,
 }
@@ -336,6 +344,7 @@ impl DataWriteGate {
             state: std::sync::Arc::new(GateState {
                 allowed: std::sync::atomic::AtomicBool::new(allowed),
                 generation: std::sync::atomic::AtomicU64::new(0),
+                valid_until_ns: std::sync::atomic::AtomicU64::new(u64::MAX),
                 changes: tokio::sync::watch::Sender::new(allowed),
             }),
             bound: None,
@@ -392,6 +401,20 @@ impl DataWriteGate {
                         .generation
                         .load(std::sync::atomic::Ordering::Acquire)
             })
+            && gate_clock_ns(std::time::Instant::now())
+                < self
+                    .state
+                    .valid_until_ns
+                    .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Refuse writes from `deadline` on, until a later call moves it: the
+    /// instant a writer lease could lapse unless renewed.
+    pub fn hold_until(&self, deadline: std::time::Instant) {
+        self.state.valid_until_ns.store(
+            gate_clock_ns(deadline),
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     /// Allow or refuse writes from now on. Allowing them again after a refusal
@@ -413,6 +436,20 @@ impl DataWriteGate {
                 .send_if_modified(|allowed| std::mem::replace(allowed, false));
         }
     }
+}
+
+/// Process-local origin of [`GateState::valid_until_ns`].
+fn gate_clock_epoch() -> std::time::Instant {
+    static EPOCH: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    *EPOCH
+}
+
+/// `at` as nanoseconds since [`gate_clock_epoch`]; an instant before the epoch
+/// counts as the epoch.
+fn gate_clock_ns(at: std::time::Instant) -> u64 {
+    u64::try_from(at.saturating_duration_since(gate_clock_epoch()).as_nanos())
+        .unwrap_or(u64::MAX - 1)
 }
 
 /// The durable effects of one mem-tier seal or checkpoint.
@@ -802,12 +839,16 @@ pub trait MetadataCatalog: Send + Sync {
     /// Bring this instance's view of `table_id` up to the commits another
     /// instance made to it: on a replica of an object-native location, one
     /// conditional read of the dataset head, and the records after it when it
-    /// moved. Returns whether the committed state changed. A metastore this
-    /// instance alone writes is always current and returns `false`.
+    /// moved. Returns the revision of the committed state afterwards, which
+    /// changes whenever that state does: a table reloads what it caches from
+    /// the catalog when the revision differs from the one it last loaded at,
+    /// so a reload that failed, or another table's follow, is caught up by the
+    /// next call. A metastore this instance alone writes is always current and
+    /// returns a constant.
     ///
     /// No default: a wrapper must forward it, or its replica never sees new
     /// commits.
-    async fn follow_commits(&self, table_id: &str) -> CatalogResult<bool>;
+    async fn follow_commits(&self, table_id: &str) -> CatalogResult<u64>;
 
     /// Whether this instance may write `table_id`'s data to its location: open
     /// while it writes the table, closed while another instance does. Every

@@ -2875,6 +2875,10 @@ pub struct CayenneTableProvider {
     /// while queries use the table; its own view requests do not count.
     /// Shared across all clones for the same table.
     last_query_ns: Arc<AtomicU64>,
+    /// The catalog revision this table last reloaded its caches at
+    /// ([`Self::confirm_head`]); `u64::MAX` until it has. Shared across all
+    /// clones for the same table.
+    loaded_revision: Arc<AtomicU64>,
     /// The dataset's store, for a table whose data path is an object-store URL:
     /// `url` is `cayenne://<table id>/` and `store` is [`Self::dataset_storage`]'s
     /// store, registered under that URL in each `RuntimeEnv` the table uses.
@@ -12477,6 +12481,7 @@ impl CayenneTableProvider {
             scan_state_lock: Arc::new(tokio::sync::RwLock::new(())),
             table_writes,
             last_query_ns: Arc::new(AtomicU64::new(u64::MAX)),
+            loaded_revision: Arc::new(AtomicU64::new(u64::MAX)),
             object_store_config,
             dataset_storage,
             data_root,
@@ -14931,6 +14936,7 @@ impl CayenneTableProvider {
             scan_state_lock: Arc::clone(&self.scan_state_lock),
             table_writes: self.table_writes.clone(),
             last_query_ns: Arc::clone(&self.last_query_ns),
+            loaded_revision: Arc::clone(&self.loaded_revision),
             object_store_config: self.object_store_config.clone(),
             dataset_storage: self.dataset_storage.clone(),
             data_root: Arc::clone(&self.data_root),
@@ -35223,7 +35229,10 @@ impl CayenneTableProvider {
 
     /// Bring this table up to the commits the instance that writes it has
     /// made: one conditional read of the dataset head, and a reload of what
-    /// the table caches from the catalog when the head moved. Called while
+    /// the table caches from the catalog whenever the catalog's revision
+    /// differs from the one the table last loaded at: after the head moved,
+    /// after a reload of its own that failed, and after another table on the
+    /// same log followed the writer or the log was handed over. Called while
     /// building a scan view, under its build admission, so concurrent queries
     /// share one read.
     ///
@@ -35231,16 +35240,19 @@ impl CayenneTableProvider {
     ///
     /// Returns an error when the head cannot be read or the reload fails; the
     /// query then fails rather than answer from a state it could not confirm.
+    ///
+    /// The caller holds `write_lock`, taken before the scan view's build
+    /// admission: a rewrite takes them in that order too.
     async fn confirm_head(&self) -> Result<()> {
-        let moved = self
+        let revision = self
             .catalog
             .follow_commits(&self.table_metadata.table_id)
             .await
             .map_err(|source| Error::Catalog { source })?;
-        if moved {
-            let _write_guard = self.write_lock.lock().await;
+        if self.loaded_revision.load(Ordering::Acquire) != revision {
             self.reload_from_catalog().await?;
             self.reload_cached_statistics_and_inline_state().await?;
+            self.loaded_revision.store(revision, Ordering::Release);
         }
         Ok(())
     }
@@ -38510,6 +38522,13 @@ impl CayenneTableProvider {
         // first such scan admitted rebuilds once, and because that capture
         // happens after every scan still queued arrived, they are served by it
         // rather than each rebuilding in turn.
+        // A reload takes `write_lock`, which a rewrite holds while it waits
+        // for build admission: take it first, in the same order.
+        let reload_guard = if confirm_head {
+            Some(self.write_lock.lock().await)
+        } else {
+            None
+        };
         let build_permit = Arc::clone(&self.scan_view_cache.build_lock)
             .lock_owned()
             .await;
@@ -38518,11 +38537,12 @@ impl CayenneTableProvider {
         }
         // Stamped before the read is sent: the view holds at least every
         // commit the head named by then.
-        let confirmed_at = if confirm_head {
+        let confirmed_at = if let Some(reload_guard) = reload_guard {
             let sent_at = Instant::now();
             self.confirm_head()
                 .await
                 .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            drop(reload_guard);
             Some(sent_at)
         } else {
             None

@@ -199,6 +199,7 @@ impl Inner {
         let record = Record {
             actions: vec![action],
         };
+        self.revision += 1;
         self.reader.state.apply(&record).map_err(invalid)?;
         self.publish_buffers(vec![Pending {
             tables: std::collections::BTreeSet::new(),
