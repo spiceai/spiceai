@@ -7,8 +7,8 @@ description: >
   objects are under the location's path as written (`state dir/`), never under
   a percent-encoded copy of it (`state%20dir/`, `state%2520dir/`). A path
   written with escapes is decoded once: `state%2Ddir/` keeps the objects under
-  `state-dir/`. A path with a literal `%` is in
-  `known-failing/cayenne/location-literal-percent.yaml`.
+  `state-dir/`. A path with a literal `%` or a `~` is in
+  `known-failing/cayenne/location-special-characters.yaml`.
 
 sources:
   src: { kind: postgres }
