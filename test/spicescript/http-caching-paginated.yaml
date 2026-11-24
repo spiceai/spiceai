@@ -35,17 +35,17 @@ spicepod:
       name: pages
       params: &paged { file_format: json, allowed_request_paths: '/*', max_retries: '0', response_cache_max_size_bytes: '0', pagination: enabled, pagination_next_pointer: /next_cursor, pagination_token_param: cursor, pagination_data_pointer: /data, pagination_max_pages: '10' }
       acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 1h } }
-    # One item: holding the paginated response and another, a sweep must
-    # evict one of them whole. A 30s TTL sweeps every 30s; the
-    # stale-while-revalidate window keeps expiry from evicting both first.
+    # Three rows: the paginated response's five do not fit, so a sweep evicts
+    # it. Evicted page by page (2, 2 and 1 rows), the first page it kept would
+    # always fit, leaving part of the response. A 30s TTL sweeps every 30s;
+    # the stale-while-revalidate window keeps expiry out of the way.
     - from: ${sources.api.url}/v1
       name: budget
       params: *paged
-      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 30s, caching_stale_while_revalidate_ttl: 1h, caching_max_items: '1' } }
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 30s, caching_stale_while_revalidate_ttl: 1h, caching_max_items: '3' } }
 
 steps:
-  # Three pages under /v1/pages, linked by `next_cursor`, and a one-page
-  # response under /v1/solo.
+  # Three pages under /v1/pages, linked by `next_cursor`.
   - source-exec:
       api:
         - "{ path: /v1/a, headers: { content-type: application/json }, body: '[{\"k\": \"a\", \"v\": 1}]' }"
@@ -53,7 +53,6 @@ steps:
         - "{ path: /v1/pages, headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"item-0\"}, {\"item\": \"item-1\"}], \"next_cursor\": 2}' }"
         - "{ path: /v1/pages, query: 'cursor=2', headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"item-2\"}, {\"item\": \"item-3\"}], \"next_cursor\": 3}' }"
         - "{ path: /v1/pages, query: 'cursor=3', headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"item-4\"}], \"next_cursor\": null}' }"
-        - "{ path: /v1/solo, headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"solo\"}], \"next_cursor\": null}' }"
   - start: {}
 
   # A one-page response holding one row is cached, and the cache answers.
@@ -96,19 +95,17 @@ steps:
   - query: SELECT count(*) FROM information_schema.columns WHERE table_name = 'pages' AND column_name IN ('__spice_cache_request', '__spice_cache_namespace')
     expect: { rows: [['0']] }
 
-  # Over budget, a sweep evicts an entry: the three-page response whole, or
-  # the one-page response, never some of the pages.
+  # Over budget, a sweep evicts the paginated response whole, never some of
+  # its pages, and the next lookup fetches all of it again.
   - query: SELECT content FROM budget WHERE request_path = '/pages' ORDER BY content
     expect: { rows: [['{"item":"item-0"}'], ['{"item":"item-1"}'], ['{"item":"item-2"}'], ['{"item":"item-3"}'], ['{"item":"item-4"}']] }
-  - query: SELECT content FROM budget WHERE request_path = '/solo'
-    expect: { rows: [['{"item":"solo"}']] }
   - query: SELECT count(*) FROM budget
-    expect: { rows: [['6']] }
+    expect: { rows: [['5']] }
     eventually: 10s
-  - query: SELECT count(*) < 6 FROM budget
+  - query: SELECT count(*) < 5 FROM budget
     expect: { rows: [['true']] }
     eventually: 90s
-  - query: SELECT sum(CASE WHEN request_path = '/pages' THEN 1 ELSE 0 END) IN (0, 5) FROM budget
-    expect: { rows: [['true']] }
+  - query: SELECT count(*) FROM budget
+    expect: { rows: [['0']] }
   - query: SELECT content FROM budget WHERE request_path = '/pages' ORDER BY content
     expect: { rows: [['{"item":"item-0"}'], ['{"item":"item-1"}'], ['{"item":"item-2"}'], ['{"item":"item-3"}'], ['{"item":"item-4"}']] }
