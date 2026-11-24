@@ -2875,11 +2875,22 @@ async fn a_statistics_row_read_across_a_schema_widening_is_not_used() {
     create_append_table(&fixture, name, std::slice::from_ref(&(1..ROWS + 1))).await;
 
     // A cold scan persists the file's row; its blob is the one object it adds
-    // under the dataset's blobs. A shared bucket holds other tests' datasets.
+    // under the dataset's blobs. A shared bucket holds other tests' datasets, and
+    // a local location's store is keyed by absolute paths, so the listing stays
+    // under the catalog's dataset folders.
+    let datasets = Path::from(
+        fixture
+            .data_store
+            .config
+            .as_ref()
+            .expect("an object-native data store")
+            .url
+            .path(),
+    );
     let dataset_blobs = format!("/datasets/{name}-");
     let blobs = || async {
         faults
-            .list(None)
+            .list(Some(&datasets))
             .map_ok(|meta| meta.location)
             .try_filter(|path| {
                 let path = path.as_ref();
