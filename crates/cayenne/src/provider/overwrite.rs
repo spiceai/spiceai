@@ -606,8 +606,9 @@ impl CayenneTableProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error if the snapshot directory cannot be created, the
-    /// stream write fails, or directory sync fails.
+    /// Returns an error if the appends staged before this call have not
+    /// published within the drain timeout, the snapshot directory cannot be
+    /// created, the stream write fails, or directory sync fails.
     pub async fn begin_overwrite(
         &self,
         data: SendableRecordBatchStream,
@@ -619,7 +620,7 @@ impl CayenneTableProvider {
         let routing = self.overwrite_range_plan(target_partitions).await;
 
         let write_guard = self
-            .lock_write_after_staged_appends("the overwrite")
+            .lock_write_after_staged_appends("the full refresh or INSERT OVERWRITE")
             .await?;
         // Also hold `mem_checkpoint_lock` until the overwrite is published or
         // rolled back. A checkpoint or seal of the in-memory CDC tier takes only
