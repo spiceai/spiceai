@@ -67,7 +67,7 @@ that does not run on `pull_request`: never to a job in `secret-free`, which hold
 credential and can be dispatched on any branch, and never to one that runs pull request
 code. The store takes a write only from a run on `trunk`; a run elsewhere that holds a
 token reads the cache and warns that its write was refused. A job that assumes a CI AWS
-role off trunk and the trunk merge queue does not try: its `Choose the CI role` step
+role off trunk (the merge queue included) does not try: its `Choose the CI role` step
 (`.github/actions/ci-role`) sets `CI_CACHE_READ_ONLY=true`, and `cached_fetch.sh` then reads
 and logs one line, as setup-sccache and the build actions skip their cache and store writes.
 A reader never trusts the writer either way: no reader uses bytes that do not match its pin,

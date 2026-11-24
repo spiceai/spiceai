@@ -23,6 +23,9 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    - name: Choose the CI store prefix
+      uses: $/.github/actions/ci-store-prefix
+
     - name: Locate the binary
       id: paths
       shell: bash
@@ -41,11 +44,13 @@ runs:
         sha="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
         dir=$([ "${INPUT_PROFILE}" = dev ] && echo debug || echo release)
         features="${INPUT_FEATURES}"
-        echo "object=spice-minio/artifacts/${INPUT_PACKAGE}/${os}-$(uname -m)/${INPUT_PROFILE}/${sha}${features:+-${features//,/_}}/${INPUT_PACKAGE}" >> "$GITHUB_OUTPUT"
+        echo "object=spice-minio/artifacts/${CI_STORE_PREFIX}${INPUT_PACKAGE}/${os}-$(uname -m)/${INPUT_PROFILE}/${sha}${features:+-${features//,/_}}/${INPUT_PACKAGE}" >> "$GITHUB_OUTPUT"
         echo "path=$GITHUB_WORKSPACE/target/$dir/${INPUT_PACKAGE}" >> "$GITHUB_OUTPUT"
 
     - name: Download from MinIO
       id: download
+      # Not with the full CI roles, which build from the checkout rather than run a download.
+      if: env.CI_ROLE_FULL != 'true'
       shell: bash
       env:
         PATHS_OBJECT: ${{ steps.paths.outputs.object }}
@@ -84,8 +89,7 @@ runs:
         cargo build -p "${INPUT_PACKAGE}" --profile "${INPUT_PROFILE}" ${features:+--features "$features"}
 
     - name: Upload to MinIO
-      # Not on a read-only run (a CI AWS role job off trunk; see .github/actions/ci-role).
-      if: steps.download.outputs.found != 'true' && env.CI_CACHE_READ_ONLY != 'true'
+      if: steps.download.outputs.found != 'true'
       shell: bash
       env:
         PATHS_PATH: ${{ steps.paths.outputs.path }}

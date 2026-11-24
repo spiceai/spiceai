@@ -2,12 +2,14 @@ name: Choose the CI role
 description: >-
   Says which CI AWS role a job that assumes one gets, as the first step of every such job (they
   live in the `*_aws.yml` reusable workflows; check_workflow_yaml.py keeps them there). The full
-  roles go only to a run on trunk, or a merge_group run of the trunk merge queue, that runs
+  roles go only to a run on trunk (`refs/heads/trunk`; a merge-queue run is not one) that runs
   nothing but trunk's code: each other build the job runs (`builds`) must be `trunk` or a commit
   on trunk, checked with `git merge-base --is-ancestor` against trunk itself. Anything else gets
   the read-only pull request role (`full` is `false`), and the job skips the steps that write:
   this action sets CI_CACHE_READ_ONLY=true for the rest of the job, which setup-rust,
-  setup-sccache and the build actions read. The roles' AWS trust policies make the same split by
+  setup-sccache and the build actions read. With the full roles it sets CI_ROLE_FULL=true
+  instead: the build actions then build their tools from the checkout rather than download them,
+  and setup-spiced and the test-archive downloads verify the file's build attestation. The roles' AWS trust policies make the same split by
   `job_workflow_ref` and `ref`; this only asks for the role AWS would grant. A job that runs a
   container image (`images`) always gets the read-only role: an image tag can be published from
   any branch, so it names no trunk commit. A run that needs the read-only role fails here when
@@ -55,11 +57,11 @@ runs:
       run: |
         set -euo pipefail
         full=true
-        case "$GITHUB_EVENT_NAME:$GITHUB_REF" in
-          *:refs/heads/trunk | merge_group:refs/heads/gh-readonly-queue/trunk/*) ;;
+        case "$GITHUB_REF" in
+          refs/heads/trunk) ;;
           *)
             full=false
-            reason="$GITHUB_REF is not trunk or the trunk merge queue"
+            reason="$GITHUB_REF is not trunk"
             ;;
         esac
 
@@ -130,6 +132,7 @@ runs:
         fi
         echo "full=$full" >> "$GITHUB_OUTPUT"
         if [ "$full" = true ]; then
+          echo "CI_ROLE_FULL=true" >> "$GITHUB_ENV"
           echo "$GITHUB_REF runs only trunk's code: this job assumes the full CI roles."
         else
           echo "CI_CACHE_READ_ONLY=true" >> "$GITHUB_ENV"

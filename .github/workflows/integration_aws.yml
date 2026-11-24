@@ -1,8 +1,8 @@
 ---
 # The jobs of integration.yml that assume a CI AWS role.
 # integration.yml calls this file with `./`, so the merge queue tests a change to it.
-# A job here assumes the full roles only on trunk or in the trunk merge queue and the
-# read-only pull request role anywhere else, and skips its writes there (the `Choose
+# A job here assumes the full roles only on trunk (a merge-queue run is not trunk) and
+# the read-only pull request role anywhere else, and skips its writes there (the `Choose
 # the CI role` step). check_workflow_yaml.py keeps every such job in a file like this.
 name: integration tests (CI AWS role jobs)
 
@@ -106,6 +106,9 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
+      - name: Choose the CI store prefix
+        uses: $/.github/actions/ci-store-prefix
+
       - name: Download test archive from local MinIO
         if: inputs.needs_check_changes_relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         env:
@@ -114,7 +117,15 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download integration test archive}"
           mkdir -p ./integration_tests
-          bash .github/scripts/mc_cp.sh "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          bash .github/scripts/mc_cp.sh "spice-minio/build/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/}" ./integration_tests/integration_tests.tar.zst
+
+      # With the full CI roles, the archive runs only if integration.yml attested it on trunk.
+      - name: Verify the test archive's build attestation
+        if: env.CI_ROLE_FULL == 'true' && (inputs.needs_check_changes_relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true')
+        uses: $/.github/actions/verify-attestation
+        with:
+          file: ./integration_tests/integration_tests.tar.zst
+          signer-workflow: .github/workflows/integration.yml
 
       - name: Download test archive
         if: inputs.needs_check_changes_relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS != 'true'
@@ -239,6 +250,7 @@ jobs:
         # branch. A timeout is a failure by that measure, which is the behaviour we want.
         timeout-minutes: 40
         env:
+          ROLE_FULL: ${{ steps.ci-role.outputs.full }}
           AWS_EC2_METADATA_DISABLED: true
           INSTA_UPDATE: ${{ inputs.update_snapshots }}
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
@@ -285,10 +297,19 @@ jobs:
           # `adbc::` runs in `ADBC Integration Tests` (integration_adbc.yml), the one job that
           # installs the SQLite ADBC driver those tests load; the `adbc` feature in this
           # archive is here for the `duckdb:` and DuckLake source tests.
+          #
+          # Off trunk (the merge queue included) the job has the read-only CI role, so the tests
+          # that write to AWS are left out here and run on trunk: the Iceberg INSERT and DELETE
+          # tests, the distributed-acceleration tests that keep scheduler state in S3, and the
+          # Cayenne datalake-tier test. One `-E`, since nextest runs the union of several.
+          writes=''
+          if [ "${ROLE_FULL}" != true ]; then
+            writes=' - (test(/^iceberg::write::/) | test(/^iceberg::delete::/) | test(/^cluster::distributed_acceleration::test_/) | test(=cayenne::test_cayenne_datalake_tier_e2e))'
+          fi
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(/^github::/) - test(/^adbc::/)'
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E "binary_id(=runtime::integration) - test(/^github::/) - test(/^adbc::/)${writes}"
           else
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(spiceai_integration_test) - test(/^github::/) - test(/^adbc::/)'
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E "binary_id(=runtime::integration) - test(spiceai_integration_test) - test(/^github::/) - test(/^adbc::/)${writes}"
           fi
 
       - name: Configure apt mirrors for the retention OOM test
@@ -390,6 +411,9 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
+      - name: Choose the CI store prefix
+        uses: $/.github/actions/ci-store-prefix
+
       - name: Download AWS SDK test archive from local MinIO
         if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
@@ -398,7 +422,15 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download AWS SDK test archive}"
           mkdir -p ./integration_tests
-          bash .github/scripts/mc_cp.sh "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          bash .github/scripts/mc_cp.sh "spice-minio/build/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/}" ./integration_tests/integration_tests.tar.zst
+
+      # With the full CI roles, the archive runs only if integration.yml attested it on trunk.
+      - name: Verify the test archive's build attestation
+        if: env.CI_ROLE_FULL == 'true' && (env.HAS_RUSTFS_ACCESS == 'true')
+        uses: $/.github/actions/verify-attestation
+        with:
+          file: ./integration_tests/integration_tests.tar.zst
+          signer-workflow: .github/workflows/integration.yml
 
       - name: Download AWS SDK test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -474,6 +506,9 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
+      - name: Choose the CI store prefix
+        uses: $/.github/actions/ci-store-prefix
+
       - name: Download snapshot refresh test archive from local MinIO
         if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
@@ -482,7 +517,15 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download snapshot refresh test archive}"
           mkdir -p ./integration_tests
-          bash .github/scripts/mc_cp.sh "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          bash .github/scripts/mc_cp.sh "spice-minio/build/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/}" ./integration_tests/integration_tests.tar.zst
+
+      # With the full CI roles, the archive runs only if integration.yml attested it on trunk.
+      - name: Verify the test archive's build attestation
+        if: env.CI_ROLE_FULL == 'true' && (env.HAS_RUSTFS_ACCESS == 'true')
+        uses: $/.github/actions/verify-attestation
+        with:
+          file: ./integration_tests/integration_tests.tar.zst
+          signer-workflow: .github/workflows/integration.yml
 
       - name: Download snapshot refresh test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -494,9 +537,10 @@ jobs:
       - name: Set up Nextest
         uses: $/.github/actions/setup-nextest
 
+      # Every test here writes to the snapshot bucket, so it runs only with the full CI roles.
       - name: Assume the Iceberg role
         id: aws-iceberg
-        if: env.HAS_RUSTFS_ACCESS == 'true'
+        if: steps.ci-role.outputs.full == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ steps.ci-role.outputs.full == 'true' && secrets.CI_AWS_ICEBERG_ROLE_ARN || secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}
@@ -506,6 +550,7 @@ jobs:
           output-credentials: true
 
       - name: Run snapshot refresh integration tests
+        if: steps.ci-role.outputs.full == 'true'
         env:
           AWS_EC2_METADATA_DISABLED: true
           AWS_SNAPSHOT_KEY: ${{ steps.aws-iceberg.outputs.aws-access-key-id }}

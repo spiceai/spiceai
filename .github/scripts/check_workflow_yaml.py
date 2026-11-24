@@ -205,6 +205,16 @@ STORE_WRITES = re.compile(
     r"upload-to-minio"
     r"|\b(?:mc\s+(?:cp|mirror|put)|mc_cp\.sh)\s+(?:-\S+\s+)*(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s\"']+)\s+[\"']?spice-minio/"
 )
+# A download of a binary or archive from the CI object store (or the build bucket's spiceio
+# mirror), which a job with the full roles must verify before it runs it: the store takes
+# writes from more than trunk. `actions/download-artifact` is the same file's fallback in the
+# same step pair. setup-spiced verifies inside the action, and the build actions build their
+# tools from the checkout with the full roles, so neither counts.
+STORE_DOWNLOAD = re.compile(
+    r"(?:\bmc\s+cp|mc_cp\.sh)\s+(?:-\S+\s+)*[\"']?spice-minio/(?:build|artifacts)/"
+    r"|ARCHIVE_S3_URI|TEST_BINARY_OBJECT_KEY"
+)
+VERIFY_ACTION = "$/.github/actions/verify-attestation"
 WRITE_GATE = re.compile(r"steps\.ci-role\.outputs\.full\s*==\s*'true'|env\.CI_CACHE_READ_ONLY\s*!=\s*'true'")
 # Inputs that name a build other than the run's own commit, which a job has to hand to the
 # role step: commits and refs as `builds`, which keep the full roles only for trunk's, and
@@ -223,7 +233,7 @@ TRUNK_CALL = re.compile(r"spiceai/spiceai/\.github/workflows/([\w.-]+\.ya?ml)@tr
 LOCAL_CALL = re.compile(r"\./\.github/workflows/([\w.-]+\.ya?ml)")
 # The two callers whose runs are required merge-queue checks. A `@trunk` call there would
 # test trunk's copy of the called jobs, never the pull request's, so they call theirs with
-# `./`, and the roles also trust that file at the trunk merge queue's ref.
+# `./`. A queue run gets the read-only role; only their trunk runs get the full roles.
 LOCAL_CI_ROLE_CALLERS = {"e2e_test_ci.yml": "e2e_test_ci_aws.yml", "integration.yml": "integration_aws.yml"}
 
 
@@ -280,6 +290,19 @@ def check_ci_role_jobs(document: dict) -> list[str]:
                 )
         for position, step in enumerate(steps, start=1):
             label = step.get("name") or f"step {position}"
+            if STORE_DOWNLOAD.search(str(step.get("run", ""))):
+                rest = steps[position:]
+                while rest and (
+                    "actions/download-artifact" in str(rest[0].get("uses", ""))
+                    or STORE_DOWNLOAD.search(str(rest[0].get("run", "")))
+                ):
+                    rest = rest[1:]
+                if not rest or rest[0].get("uses") != VERIFY_ACTION:
+                    problems.append(
+                        f"job `{name}` step `{label}` downloads from the CI object store, and the next step "
+                        f"does not verify it with `{VERIFY_ACTION}`, so a full-role job would run a file "
+                        "the store took from off trunk"
+                    )
             if "aws-actions/configure-aws-credentials" in str(step.get("uses", "")):
                 role = str((step.get("with") or {}).get("role-to-assume", ""))
                 if not ROLE_CHOICE.fullmatch(role.strip()):

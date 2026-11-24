@@ -38,6 +38,9 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    - name: Choose the CI store prefix
+      uses: $/.github/actions/ci-store-prefix
+
     - name: Detect OS
       id: detect-os
       shell: bash
@@ -79,7 +82,7 @@ runs:
         echo "sha=$sha" >> $GITHUB_OUTPUT
 
     - name: Download spicepod-validator from MinIO
-      if: inputs.download_from_minio == 'true' && inputs.force_rebuild != 'true'
+      if: inputs.download_from_minio == 'true' && inputs.force_rebuild != 'true' && env.CI_ROLE_FULL != 'true'
       id: minio-download
       shell: bash
       env:
@@ -87,10 +90,10 @@ runs:
         COMMIT_SHA_SHA: ${{ steps.commit-sha.outputs.sha }}
         DETECT_OS_EXT: ${{ steps.detect-os.outputs.ext }}
       run: |
-        if mc stat "spice-minio/artifacts/spicepod-validator/${DETECT_OS_OS}-x86_64/${COMMIT_SHA_SHA}/spicepod-validator${DETECT_OS_EXT}"; then
+        if mc stat "spice-minio/artifacts/${CI_STORE_PREFIX}spicepod-validator/${DETECT_OS_OS}-x86_64/${COMMIT_SHA_SHA}/spicepod-validator${DETECT_OS_EXT}"; then
           echo "Found spicepod-validator in MinIO"
           mkdir -p target/release
-          mc cp "spice-minio/artifacts/spicepod-validator/${DETECT_OS_OS}-x86_64/${COMMIT_SHA_SHA}/spicepod-validator${DETECT_OS_EXT}" "target/release/spicepod-validator${DETECT_OS_EXT}"
+          mc cp "spice-minio/artifacts/${CI_STORE_PREFIX}spicepod-validator/${DETECT_OS_OS}-x86_64/${COMMIT_SHA_SHA}/spicepod-validator${DETECT_OS_EXT}" "target/release/spicepod-validator${DETECT_OS_EXT}"
           chmod +x "target/release/spicepod-validator${DETECT_OS_EXT}"
           echo "found=true" >> $GITHUB_OUTPUT
         else
@@ -99,7 +102,7 @@ runs:
         fi
 
     - name: Cache spicepod-validator binary
-      if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true'
+      if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true' && env.CI_ROLE_FULL != 'true'
       id: cache-validator
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
@@ -169,14 +172,14 @@ runs:
         key: spicepod-validator-${{ steps.detect-os.outputs.os }}-${{ steps.commit-sha.outputs.sha }}
 
     - name: Upload spicepod-validator to MinIO
-      if: inputs.download_from_minio == 'true' && steps.minio-download.outputs.found != 'true' && (inputs.force_rebuild == 'true' || steps.cache-validator.outputs.cache-hit != 'true') && env.CI_CACHE_READ_ONLY != 'true'
+      if: inputs.download_from_minio == 'true' && steps.minio-download.outputs.found != 'true' && (inputs.force_rebuild == 'true' || steps.cache-validator.outputs.cache-hit != 'true')
       shell: bash
       env:
         DETECT_OS_EXT: ${{ steps.detect-os.outputs.ext }}
         DETECT_OS_OS: ${{ steps.detect-os.outputs.os }}
         COMMIT_SHA_SHA: ${{ steps.commit-sha.outputs.sha }}
       run: |
-        mc cp "target/release/spicepod-validator${DETECT_OS_EXT}" "spice-minio/artifacts/spicepod-validator/${DETECT_OS_OS}-x86_64/${COMMIT_SHA_SHA}/spicepod-validator${DETECT_OS_EXT}"
+        mc cp "target/release/spicepod-validator${DETECT_OS_EXT}" "spice-minio/artifacts/${CI_STORE_PREFIX}spicepod-validator/${DETECT_OS_OS}-x86_64/${COMMIT_SHA_SHA}/spicepod-validator${DETECT_OS_EXT}"
 
     - name: Install spicepod-validator to system path (Linux/macOS)
       if: inputs.install_to_system_path == 'true' && steps.detect-os.outputs.os != 'windows'

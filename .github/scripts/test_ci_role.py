@@ -87,7 +87,7 @@ class CiRoleTest(unittest.TestCase):
     def assert_role(self, proc, output, env, full):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(output, f"full={'true' if full else 'false'}\n")
-        self.assertEqual(env, "" if full else "CI_CACHE_READ_ONLY=true\n")
+        self.assertEqual(env, "CI_ROLE_FULL=true\n" if full else "CI_CACHE_READ_ONLY=true\n")
         self.assertNotIn("a-token", proc.stdout + proc.stderr)
 
     # --- the run's own ref --------------------------------------------------------------
@@ -97,11 +97,9 @@ class CiRoleTest(unittest.TestCase):
             with self.subTest(event=event):
                 self.assert_role(*self.choose(event, "refs/heads/trunk"), full=True)
 
-    def test_the_trunk_merge_queue_gets_the_full_roles(self):
-        self.assert_role(*self.choose("merge_group", QUEUE_REF), full=True)
-
-    def test_a_queue_named_branch_that_is_not_a_merge_group_run_gets_the_read_only_role(self):
-        for event in ("push", "workflow_dispatch"):
+    def test_the_merge_queue_gets_the_read_only_role(self):
+        # A queue run tests a pull request that is not on trunk yet.
+        for event in ("merge_group", "push", "workflow_dispatch"):
             with self.subTest(event=event):
                 self.assert_role(*self.choose(event, QUEUE_REF), full=False)
 
@@ -117,13 +115,13 @@ class CiRoleTest(unittest.TestCase):
             with self.subTest(ref=ref):
                 proc, output, env = self.choose(event, ref)
                 self.assert_role(proc, output, env, full=False)
-                self.assertIn(f"::notice::{ref} is not trunk or the trunk merge queue", proc.stdout)
+                self.assertIn(f"::notice::{ref} is not trunk", proc.stdout)
 
     def test_the_read_only_role_unset_fails_clearly(self):
         proc, output, env = self.choose("workflow_dispatch", "refs/heads/feature", pull_request_role=False)
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(output, "")
-        self.assertIn("::error::refs/heads/feature is not trunk or the trunk merge queue", proc.stdout)
+        self.assertIn("::error::refs/heads/feature is not trunk,", proc.stdout)
         self.assertIn("CI_AWS_PULL_REQUEST_ROLE_ARN secret is not set", proc.stdout)
 
     def test_trunk_needs_no_read_only_role(self):

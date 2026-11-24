@@ -263,6 +263,7 @@ jobs:
       contents: read
       actions: read
       id-token: write
+      attestations: write  # the build job attests the test binary
     secrets: inherit
 
   # The nextest tests that sign-off and the merge queue skip: the SF1

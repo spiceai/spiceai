@@ -115,6 +115,7 @@ workflows:
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4'
     '.github/workflows/integration.yml':
+        - 'actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8'
         - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333'
@@ -137,6 +138,7 @@ workflows:
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d'
     '.github/workflows/integration_llms.yml':
+        - 'actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
@@ -149,6 +151,7 @@ workflows:
     '.github/workflows/integration_management_api.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
     '.github/workflows/integration_models.yml':
+        - 'actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8'
         - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333'

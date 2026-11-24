@@ -154,6 +154,10 @@ jobs:
     name: Build Test Binary
     runs-on: spiceai-macos
     environment: ci
+    permissions:
+      contents: read
+      id-token: write  # signs the test binary's attestation
+      attestations: write  # which the full-role test job verifies before running it
     # Slowest observed success in the 2026-07-25..08-08 window: 17 min, but
     # every sample had a warm sccache. Sized against the other macOS workspace
     # builds (pr.yml peaks at 117 min) so a cold cache cannot turn a passing
@@ -196,6 +200,17 @@ jobs:
           otel-region: us-west-2
           instance-id: ci-${{ github.run_id }}-${{ github.job }}
           machine: ${{ runner.name }}
+
+      - name: Choose the CI store prefix
+        uses: $/.github/actions/ci-store-prefix
+
+      # On trunk the test binary carries this workflow's attestation, which the full-role test job
+      # verifies before running it.
+      - name: Attest the test binary
+        if: env.CI_STORE_PREFIX == ''
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ./llms_integration_test
 
       - name: Upload test binary to spiceio
         if: env.HAS_SPICEIO_SECRET == 'true'

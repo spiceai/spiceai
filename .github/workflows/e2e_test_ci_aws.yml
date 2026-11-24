@@ -1,8 +1,8 @@
 ---
 # The jobs of e2e_test_ci.yml that assume a CI AWS role.
 # e2e_test_ci.yml calls this file with `./`, so the merge queue tests a change to it.
-# A job here assumes the full roles only on trunk or in the trunk merge queue and the
-# read-only pull request role anywhere else, and skips its writes there (the `Choose
+# A job here assumes the full roles only on trunk (a merge-queue run is not trunk) and
+# the read-only pull request role anywhere else, and skips its writes there (the `Choose
 # the CI role` step). check_workflow_yaml.py keeps every such job in a file like this.
 name: E2E Test CI (CI AWS role jobs)
 

@@ -2,8 +2,8 @@
 # The jobs of testoperator_run_data_consistency.yml that assume a CI AWS role.
 # testoperator_run_data_consistency.yml calls this file at `@trunk`, so whichever ref it runs on, the definition
 # that chooses the role is trunk's.
-# A job here assumes the full roles only on trunk or in the trunk merge queue and the
-# read-only pull request role anywhere else, and skips its writes there (the `Choose
+# A job here assumes the full roles only on trunk (a merge-queue run is not trunk) and
+# the read-only pull request role anywhere else, and skips its writes there (the `Choose
 # the CI role` step). check_workflow_yaml.py keeps every such job in a file like this.
 name: data consistency tests (CI AWS role jobs)
 

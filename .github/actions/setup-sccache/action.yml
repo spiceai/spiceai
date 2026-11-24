@@ -26,14 +26,19 @@ inputs:
       step sets.
     required: false
 
-# A run with CI_CACHE_READ_ONLY=true (a CI AWS role job off trunk and the trunk merge queue;
-# see the `Choose the CI role` step) leaves rustc unwrapped: the compiler cache is written
-# to as well as read, so such a run does not use it.
+# Only a run on trunk reads and writes the cache's shared keys. Any other run keeps its cache
+# under `untrusted/<github.ref>/` (.github/actions/ci-store-prefix), the only keys the store
+# lets it write, so it cannot plant an object a trunk build would use. sccache 0.9.1 has no
+# read-only mode for S3 (`rw_mode` is for its disk and GCS caches), so such a run starts from
+# its own keys rather than reading trunk's.
 runs:
   using: 'composite'
   steps:
+    - name: Choose the CI store prefix
+      uses: $/.github/actions/ci-store-prefix
+
     - name: Set sccache environment variables
-      if: (inputs.minio_endpoint != '' || (runner.os == 'macOS' && inputs.spiceio_endpoint != '')) && env.CI_CACHE_READ_ONLY != 'true'
+      if: inputs.minio_endpoint != '' || (runner.os == 'macOS' && inputs.spiceio_endpoint != '')
       shell: bash
       # Read through `env` rather than interpolating `${{ }}` into the script, so a value
       # containing shell metacharacters stays a value.
@@ -122,11 +127,11 @@ runs:
         fi
 
     - name: Configure apt mirrors (Linux)
-      if: (runner.os == 'Linux' && inputs.minio_endpoint != '') && env.CI_CACHE_READ_ONLY != 'true'
+      if: runner.os == 'Linux' && inputs.minio_endpoint != ''
       uses: $/.github/actions/configure-apt
 
     - name: Set up sccache (Linux)
-      if: (runner.os == 'Linux' && inputs.minio_endpoint != '') && env.CI_CACHE_READ_ONLY != 'true'
+      if: runner.os == 'Linux' && inputs.minio_endpoint != ''
       shell: bash
       env:
         INPUT_MINIO_ENDPOINT: ${{ inputs.minio_endpoint }}
@@ -138,10 +143,10 @@ runs:
         echo "SCCACHE_CACHE_SIZE=4T" >> $GITHUB_ENV
         : "${SCCACHE_CONF:=${RUNNER_TEMP}/sccache/config}"
         mkdir -p "$(dirname "${SCCACHE_CONF}")"
-        printf '[cache.s3]\nbucket = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = false\nregion = "us-east-1"\n' "${INPUT_MINIO_ENDPOINT}" > "${SCCACHE_CONF}"
+        printf '[cache.s3]\nbucket = "sccache"\nkey_prefix = "%s"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = false\nregion = "us-east-1"\n' "${CI_STORE_PREFIX%/}" "${INPUT_MINIO_ENDPOINT}" > "${SCCACHE_CONF}"
 
     - name: Set up sccache (macOS)
-      if: (runner.os == 'macOS' && (inputs.minio_endpoint != '' || inputs.spiceio_endpoint != '')) && env.CI_CACHE_READ_ONLY != 'true'
+      if: runner.os == 'macOS' && (inputs.minio_endpoint != '' || inputs.spiceio_endpoint != '')
       shell: bash
       env:
         INPUT_SPICEIO_ENDPOINT: ${{ inputs.spiceio_endpoint }}
@@ -175,10 +180,10 @@ runs:
 
         : "${SCCACHE_CONF:=${RUNNER_TEMP}/sccache/config}"
         mkdir -p "$(dirname "${SCCACHE_CONF}")"
-        printf '[cache.s3]\nbucket = "sccache"\nkey_prefix = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = %s\nregion = "%s"\n' "$SCCACHE_ENDPOINT" "$SCCACHE_NO_CREDS" "$SCCACHE_REGION" > "${SCCACHE_CONF}"
+        printf '[cache.s3]\nbucket = "sccache"\nkey_prefix = "%ssccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = %s\nregion = "%s"\n' "${CI_STORE_PREFIX}" "$SCCACHE_ENDPOINT" "$SCCACHE_NO_CREDS" "$SCCACHE_REGION" > "${SCCACHE_CONF}"
 
     - name: Set up sccache (Windows)
-      if: (runner.os == 'Windows' && inputs.minio_endpoint != '') && env.CI_CACHE_READ_ONLY != 'true'
+      if: runner.os == 'Windows' && inputs.minio_endpoint != ''
       shell: pwsh
       env:
         INPUT_MINIO_ENDPOINT: ${{ inputs.minio_endpoint }}
@@ -209,11 +214,11 @@ runs:
         }
         $configDir = Split-Path $configPath -Parent
         New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-        $config = "[cache.s3]`nbucket = `"sccache`"`nendpoint = `"${env:INPUT_MINIO_ENDPOINT}`"`nuse_ssl = false`nserver_side_encryption = false`nno_credentials = false`nregion = `"us-east-1`""
+        $config = "[cache.s3]`nbucket = `"sccache`"`nkey_prefix = `"$($env:CI_STORE_PREFIX.TrimEnd('/'))`"`nendpoint = `"${env:INPUT_MINIO_ENDPOINT}`"`nuse_ssl = false`nserver_side_encryption = false`nno_credentials = false`nregion = `"us-east-1`""
         $config | Out-File -FilePath $configPath -Encoding utf8
 
     - name: Confirm the compiler cache answers before wrapping rustc
-      if: ((runner.os == 'Linux' && inputs.minio_endpoint != '') || (runner.os == 'macOS' && (inputs.minio_endpoint != '' || inputs.spiceio_endpoint != ''))) && env.CI_CACHE_READ_ONLY != 'true'
+      if: (runner.os == 'Linux' && inputs.minio_endpoint != '') || (runner.os == 'macOS' && (inputs.minio_endpoint != '' || inputs.spiceio_endpoint != ''))
       shell: bash
       # Invoked through `bash` rather than as `./…` so the step does not depend on
       # the script's executable bit surviving a checkout on every platform. The probe
@@ -229,7 +234,7 @@ runs:
         bash "$GITHUB_ACTION_PATH/verify_compiler_cache.sh"
 
     - name: Confirm the compiler cache answers before wrapping rustc (Windows)
-      if: (runner.os == 'Windows' && inputs.minio_endpoint != '') && env.CI_CACHE_READ_ONLY != 'true'
+      if: runner.os == 'Windows' && inputs.minio_endpoint != ''
       shell: pwsh
       run: |
         # `--zero-stats` goes through sccache's connect_or_start_server, so it fails

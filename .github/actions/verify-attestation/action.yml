@@ -1,0 +1,43 @@
+name: Verify a build attestation
+description: >-
+  Fails unless the file carries a build provenance attestation that this repository's
+  `signer-workflow` made on trunk (`gh attestation verify --repo <this repository>
+  --signer-workflow <it> --source-ref refs/heads/trunk`). A job with the full CI roles runs it on
+  every binary or archive it downloads from the CI object store, before running it: anything
+  built off trunk, or not attested at all, fails here.
+
+inputs:
+  file:
+    description: The downloaded file.
+    required: true
+  signer-workflow:
+    description: The workflow that builds and attests it on trunk, e.g. `.github/workflows/build_release.yml`.
+    required: true
+  token:
+    description: A token that can read this repository's attestations.
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Verify the build attestation
+      shell: bash
+      env:
+        FILE: ${{ inputs.file }}
+        SIGNER_WORKFLOW: ${{ inputs.signer-workflow }}
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        if [ ! -f "$FILE" ]; then
+          echo "::error::$FILE does not exist, so its attestation cannot be verified."
+          exit 1
+        fi
+        signer="${GITHUB_REPOSITORY}/${SIGNER_WORKFLOW#./}"
+        if ! out="$(gh attestation verify "$FILE" --repo "$GITHUB_REPOSITORY" \
+          --signer-workflow "$signer" --source-ref refs/heads/trunk 2>&1)"; then
+          printf '%s\n' "$out"
+          echo "::error::$FILE has no build attestation from $signer on trunk; not running it."
+          exit 1
+        fi
+        echo "$FILE: attested by $signer on trunk."

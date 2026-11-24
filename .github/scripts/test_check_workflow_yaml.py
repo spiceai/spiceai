@@ -536,6 +536,8 @@ class CheckCiRoleJobsTest(unittest.TestCase):
         upload = (
             "      - name: Upload\n{cond}        run: mc cp target/release/x \"spice-minio/artifacts/x/$SHA/x\"\n"
             "      - name: Download\n        run: mc cp \"spice-minio/artifacts/x/$SHA/x\" target/x\n"
+            f"      - name: Verify\n        uses: {check_workflow_yaml.VERIFY_ACTION}\n"
+            "        with:\n          file: target/x\n          signer-workflow: .github/workflows/x.yml\n"
         )
         steps = CHOOSE + ASSUME.format(role=CHOSEN)
         with self.subTest(gated=False):
@@ -562,6 +564,24 @@ class CheckCiRoleJobsTest(unittest.TestCase):
             "        with:\n          script: require('child_process').execSync('git push origin x')\n"
         )
         self.assertEqual(len(self.problems(CHOOSE + ASSUME.format(role=CHOSEN) + script)), 1)
+
+    def test_a_store_download_must_be_verified_before_it_runs(self):
+        download = (
+            "      - name: Download\n"
+            "        run: bash .github/scripts/mc_cp.sh \"spice-minio/build/${CI_STORE_PREFIX?}x.tar.zst\" ./x.tar.zst\n"
+            "      - name: Fallback\n        uses: actions/download-artifact@v8\n"
+        )
+        verify = (
+            "      - name: Verify\n        if: env.CI_ROLE_FULL == 'true'\n"
+            f"        uses: {check_workflow_yaml.VERIFY_ACTION}\n"
+            "        with:\n          file: ./x.tar.zst\n          signer-workflow: .github/workflows/x.yml\n"
+        )
+        run = "      - name: Run\n        run: tar -xf x.tar.zst && ./x\n"
+        steps = CHOOSE + ASSUME.format(role=CHOSEN)
+        self.assertEqual(self.problems(steps + download + verify + run), [])
+        problems = self.problems(steps + download + run + verify)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("step `Download` downloads from the CI object store", problems[0])
 
     def test_an_image_input_goes_to_images_not_builds(self):
         document = REUSABLE_CI_ROLE.replace(

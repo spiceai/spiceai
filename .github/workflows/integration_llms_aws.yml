@@ -2,8 +2,8 @@
 # The jobs of integration_llms.yml that assume a CI AWS role.
 # integration_llms.yml calls this file at `@trunk`, so whichever ref it runs on, the definition
 # that chooses the role is trunk's.
-# A job here assumes the full roles only on trunk or in the trunk merge queue and the
-# read-only pull request role anywhere else, and skips its writes there (the `Choose
+# A job here assumes the full roles only on trunk (a merge-queue run is not trunk) and
+# the read-only pull request role anywhere else, and skips its writes there (the `Choose
 # the CI role` step). check_workflow_yaml.py keeps every such job in a file like this.
 name: integration tests (llms) (CI AWS role jobs)
 
@@ -134,6 +134,14 @@ jobs:
         with:
           name: llms-integration-test-binary
           path: ./integration_test
+
+      # With the full CI roles, it runs only if the build job attested it on trunk.
+      - name: Verify the test binary's build attestation
+        if: env.CI_ROLE_FULL == 'true'
+        uses: $/.github/actions/verify-attestation
+        with:
+          file: ./integration_test/llms_integration_test
+          signer-workflow: .github/workflows/integration_llms.yml
 
       - name: Mark test binary as executable
         run: chmod +x ./integration_test/llms_integration_test
