@@ -3358,11 +3358,21 @@ impl CacheRefreshHelper {
                     })
                     .ok()
             });
+        // A table that cannot group a response's pages (one created before
+        // `__spice_cache_request`) keeps caching what it always has: a response
+        // that read one page, stored under that page's path, query and body.
         let complete = completion
             .as_ref()
-            .and_then(data_components::http::provider::HttpFetchCompletion::complete_request)
-            .filter(|_| memory_pool.is_none() || charge.is_some())
-            .filter(|pages| *pages == RequestPages::Single || stores_paginated_responses);
+            .and_then(|completion| {
+                if stores_paginated_responses {
+                    completion.complete_request()
+                } else {
+                    completion
+                        .is_complete_single_request()
+                        .then_some(RequestPages::Single)
+                }
+            })
+            .filter(|_| memory_pool.is_none() || charge.is_some());
 
         tracing::debug!(
             "Federated source returned {} batches for dataset={}",

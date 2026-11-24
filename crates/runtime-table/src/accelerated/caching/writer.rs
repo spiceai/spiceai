@@ -608,8 +608,8 @@ impl CacheWriteSender {
     /// [`CACHE_REQUEST_COLUMN`]: without it, eviction and refresh would treat
     /// each page as its own entry and could leave part of the response to be
     /// served as though it were whole. A table created before the column was
-    /// introduced therefore caches only responses from sources that do not
-    /// paginate.
+    /// introduced therefore caches only responses that read one page, scoped
+    /// by that page as before.
     #[must_use]
     pub fn stores_paginated_responses(&self) -> bool {
         match self {
