@@ -222,6 +222,8 @@ impl Domain {
                 reserved: std::sync::atomic::AtomicBool::new(false),
                 inner: Mutex::new(Some(inner)),
                 published: arc_swap::ArcSwapOption::empty(),
+                #[cfg(test)]
+                before_load: Mutex::new(None),
             }),
         })
     }

@@ -37,7 +37,13 @@ pub(super) struct StateSlot {
     /// whose commit is still in flight: a commit applies its record to the
     /// lease's state, which is published only when the lease is returned.
     pub(super) published: ArcSwapOption<DatasetStateReader>,
+    /// Runs in [`Self::published`] between its reservation check and its load,
+    /// so a test can take a reservation there.
+    #[cfg(test)]
+    pub(super) before_load: Mutex<Option<BeforeLoad>>,
 }
+#[cfg(test)]
+pub(super) type BeforeLoad = Box<dyn FnOnce(&StateSlot) + Send>;
 pub(super) struct StateLease<'a> {
     slot: &'a Arc<StateSlot>,
     inner: Option<Inner>,
@@ -75,14 +81,25 @@ impl StateSlot {
 
     /// The published state, unless a transaction across datasets holds the
     /// reservation: its tables are read once it resolves, as every other caller
-    /// waits for it. A read that loaded the state just before a reservation
-    /// began sees the state from before the transaction's `Prepare`, which is
-    /// the state of a read ordered before the transaction.
+    /// waits for it. The reservation is checked again after the load, because
+    /// one taken in between may already have published this dataset's resolved
+    /// state while the transaction still holds its other participants. A state
+    /// published under a reservation is stored after the reservation is taken,
+    /// so a load that returns it sees the reservation on the second check.
     pub(super) fn published(&self) -> Option<Arc<DatasetStateReader>> {
-        if self.reserved.load(std::sync::atomic::Ordering::Acquire) {
+        use std::sync::atomic::Ordering;
+        if self.reserved.load(Ordering::Acquire) {
             return None;
         }
-        self.published.load_full()
+        #[cfg(test)]
+        if let Some(hook) = self.before_load.lock().take() {
+            hook(self);
+        }
+        let published = self.published.load_full();
+        if self.reserved.load(Ordering::Acquire) {
+            return None;
+        }
+        published
     }
 
     /// Publish `inner`'s state for reads, or withdraw it while the log serves
@@ -226,4 +243,49 @@ fn recovery_retry_message(dataset: &str, cause: &str, wait: std::time::Duration)
         subject(dataset),
         wait.as_millis()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ArcSwapOption, DatasetStateReader, Mutex, Notify, StateSlot};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn reader() -> Arc<DatasetStateReader> {
+        Arc::new(DatasetStateReader::from_state(
+            cayenne_metastore_actions::state::DatasetState::default(),
+            Arc::new(object_store::memory::InMemory::new()),
+            object_store::path::Path::from("catalog"),
+        ))
+    }
+
+    /// A reservation taken after a read checked for one, which publishes this
+    /// dataset's resolved state before the read loads it, keeps the read from
+    /// returning that state until the reservation is released.
+    #[test]
+    fn a_read_does_not_return_a_state_published_under_a_reservation() {
+        let before = reader();
+        let resolved = reader();
+        let slot = StateSlot {
+            inner: Mutex::new(None),
+            available: Notify::new(),
+            reserved: AtomicBool::new(false),
+            published: ArcSwapOption::from(Some(Arc::clone(&before))),
+            before_load: Mutex::new(None),
+        };
+        let published = Arc::clone(&resolved);
+        *slot.before_load.lock() = Some(Box::new(move |slot: &StateSlot| {
+            slot.reserved.store(true, Ordering::Release);
+            slot.published.store(Some(published));
+        }));
+        assert!(
+            slot.published().is_none(),
+            "a read that loaded the state while a reservation was held returned it"
+        );
+        slot.release();
+        let after = slot
+            .published()
+            .expect("the state once the reservation is released");
+        assert!(Arc::ptr_eq(&after, &resolved));
+    }
 }
