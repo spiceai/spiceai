@@ -51,7 +51,7 @@ use datafusion_table_providers::util::{
 test_on_data_store!(position_mode_deletion_index_reaches_bounded_steady_state);
 test_on_data_store!(key_mode_deletion_index_still_reclaims);
 test_with_backends!(default_mode_small_table_reclaims_by_rewriting_itself);
-test_on_data_store!(default_mode_table_past_its_bound_reclaims_through_the_bake);
+test_with_backends!(default_mode_table_past_its_bound_reclaims_through_the_bake);
 test_on_data_store!(small_write_profile_deletion_index_reclaims_through_the_bake);
 test_with_backends!(empty_table_reclaim_clears_tombstones_and_survives_reopen);
 

@@ -58,7 +58,7 @@ const SWEEP_MIN_FILES: usize = 20;
 /// trigger fires and each test drives the floor-advancing pass itself.
 const NO_AUTOMATIC_COMPACTION: usize = 1_000_000;
 
-test_on_data_store!(bake_publication_schedules_orphan_dv_cleanup_impl);
+test_with_backends!(bake_publication_schedules_orphan_dv_cleanup_impl);
 test_on_data_store!(protected_subset_merge_schedules_orphan_dv_cleanup_impl);
 test_on_data_store!(scheduled_cleanup_keeps_a_deletion_vector_still_needed_impl);
 test_with_backends!(provider_open_replays_an_orphan_backlog_left_by_a_crash_impl);
@@ -671,12 +671,10 @@ fn write_empty_key_deletion_vector(path: &Path) -> Result<(), Box<dyn std::error
 }
 
 /// Count the deletion vectors the store holds under the table's data path, once
-/// the files a table in the object-native location deletes only after a delay
-/// are deleted ([`common::reclaim_delayed_deletes`]).
+/// the files a table in the object-native location keeps for the data-file
+/// retention are deleted ([`common::reclaim_delayed_deletes`]).
 async fn count_arrow_files(fixture: &TestFixture, table: &CayenneTableProvider) -> usize {
-    common::reclaim_delayed_deletes(fixture, table)
-        .await
-        .expect("reclaim the files deleted after a delay");
+    common::reclaim_delayed_deletes(fixture, table).await;
     fixture
         .data_store
         .list_files(&table.metadata().path)

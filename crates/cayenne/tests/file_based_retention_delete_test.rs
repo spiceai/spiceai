@@ -841,15 +841,13 @@ async fn assert_table_contents(
 }
 
 /// The files the data store holds under `table`'s data path, once the files a
-/// table in the object-native location deletes only after a delay are deleted
-/// ([`common::reclaim_delayed_deletes`]).
+/// table in the object-native location keeps for the data-file retention are
+/// deleted ([`common::reclaim_delayed_deletes`]).
 async fn stored_files(
     fixture: &TestFixture,
     table: &CayenneTableProvider,
 ) -> Vec<common::StoredFile> {
-    common::reclaim_delayed_deletes(fixture, table)
-        .await
-        .expect("reclaim the files deleted after a delay");
+    common::reclaim_delayed_deletes(fixture, table).await;
     fixture
         .data_store
         .list_files(&table.metadata().path)
@@ -859,10 +857,11 @@ async fn stored_files(
 
 /// Count the table's `.vortex` data files in the store, outside staging.
 async fn count_vortex_files(fixture: &TestFixture, table: &CayenneTableProvider) -> usize {
+    let table_dir = format!("{}/", table.metadata().table_id);
     stored_files(fixture, table)
         .await
         .iter()
-        .filter(|file| file.is_data_file())
+        .filter(|file| file.is_data_file() && file.relative.starts_with(&table_dir))
         .count()
 }
 
@@ -955,7 +954,7 @@ async fn test_orphaned_key_dv_cleaned_after_retention_impl(fixture: TestFixture)
     let table_id = table.metadata().table_id.clone();
     // Deletion-vector `.arrow` files are written under the base table path
     // (`<base>/<snapshot_id>/deletions/`), a sibling of the `table_id` data
-    // directory, so walk the whole base path to find them.
+    // directory, which is why `stored_files` lists the whole data path.
 
     let now_us = chrono::Utc::now().timestamp_micros();
 

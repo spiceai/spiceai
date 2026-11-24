@@ -1309,6 +1309,7 @@ async fn test_writer_wal_survives_inline_compaction_impl(
         stored_staging_wals(&fixture, &table).await.is_empty(),
         "writer's WAL must be removed after successful commit across compaction boundary"
     );
+    assert_no_staged_files(&fixture, &table).await;
 
     Ok(())
 }
@@ -1808,24 +1809,62 @@ fn assert_staging_empty(staging: &std::path::Path) {
 }
 
 /// Assert that the table has nothing staged: on a local table, that `_staging/`
-/// is empty; in an object store, that no stored file is in a staging area.
+/// is empty. A table in an object store stages nothing: a write puts its files
+/// at their final keys and deletes them if it does not commit. So there, once
+/// the data-file retention of retired files has ended, every data file the
+/// store holds under the table must be one a snapshot of the table names.
 async fn assert_no_staged_files(fixture: &common::TestFixture, table: &CayenneTableProvider) {
     if fixture.data_store.config.is_none() {
         assert_staging_empty(&staging_dir(table));
         return;
     }
-    let staged: Vec<String> = fixture
+    common::reclaim_delayed_deletes(fixture, table).await;
+    let data_path = table.metadata().path.clone();
+    let metadata = fixture
+        .catalog
+        .get_table(&table.metadata().table_name)
+        .await
+        .expect("read the table from the catalog");
+    let mut snapshot_ids: std::collections::BTreeSet<String> = fixture
+        .catalog
+        .get_all_snapshot_sequences(&metadata.table_id)
+        .await
+        .expect("read the table's snapshots")
+        .into_keys()
+        .collect();
+    snapshot_ids.insert(metadata.current_snapshot_id.clone());
+    let snapshot_ids: Vec<String> = snapshot_ids.into_iter().collect();
+    let named: std::collections::BTreeSet<String> = fixture
         .data_store
-        .list_files(&table.metadata().path)
+        .snapshot_data_files(
+            fixture.catalog.as_ref(),
+            &metadata.table_id,
+            &data_path,
+            &snapshot_ids,
+        )
+        .await
+        .expect("list the files the table's snapshots name")
+        .into_iter()
+        .map(|file| file.relative)
+        .collect();
+    let table_dir = format!("{}/", metadata.table_id);
+    let unnamed: Vec<String> = fixture
+        .data_store
+        .list_files(&data_path)
         .await
         .expect("list the table's data path")
         .into_iter()
-        .filter(common::StoredFile::is_staged)
+        .filter(|file| {
+            file.is_staged()
+                || (file.is_data_file()
+                    && file.relative.starts_with(&table_dir)
+                    && !named.contains(&file.relative))
+        })
         .map(|file| file.relative)
         .collect();
     assert!(
-        staged.is_empty(),
-        "Expected no staged files but found {staged:?}"
+        unnamed.is_empty(),
+        "Expected every stored data file to be named by a snapshot, but found {unnamed:?}"
     );
 }
 

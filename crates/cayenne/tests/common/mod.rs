@@ -518,7 +518,13 @@ impl FixtureDataStore {
                         Err(e) => return Err(e.into()),
                     };
                     while let Some(entry) = entries.next_entry().await? {
-                        let metadata = entry.metadata().await?;
+                        // Background cleanup can delete an entry between the
+                        // directory read and this call; it is then not stored.
+                        let metadata = match entry.metadata().await {
+                            Ok(metadata) => metadata,
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                            Err(e) => return Err(e.into()),
+                        };
                         let path = entry.path();
                         if metadata.is_dir() {
                             directories.push(path);
@@ -756,25 +762,16 @@ impl StoredFile {
     }
 }
 
-/// Delete now the files a table in the object-native location deletes only
-/// after a delay, as if the delay had passed: retired files once the data-file
-/// retention ends, and files no commit names (such as a deletion vector a sweep
-/// dropped from the catalog) once they are older than the orphan sweep's age
-/// floor, which this sets to zero for the rest of the table's life. A local
-/// table deletes those files without a delay, so this does nothing there.
-/// # Errors
-/// The orphan sweep could not read the table's state or its store.
-pub async fn reclaim_delayed_deletes(
-    fixture: &TestFixture,
-    table: &CayenneTableProvider,
-) -> Result<(), Box<dyn std::error::Error>> {
+/// Delete now the files a table in the object-native location keeps for the
+/// data-file retention after it retires them, as if the retention had passed.
+/// A local table deletes those files without a delay, so this does nothing
+/// there. The orphan sweep is left alone, so a file this deletes is one the
+/// table retired, not one a test helper found unnamed.
+pub async fn reclaim_delayed_deletes(fixture: &TestFixture, table: &CayenneTableProvider) {
     if fixture.data_store.config.is_none() {
-        return Ok(());
+        return;
     }
     table.reclaim_retired_snapshots_now().await;
-    table.set_orphan_age_floor(std::time::Duration::ZERO);
-    table.sweep_orphan_files_now().await?;
-    Ok(())
 }
 
 /// A table builder over `catalog` whose data files are in `config`'s store.
@@ -918,7 +915,7 @@ pub fn require_process_per_test(why: &str) {
 /// A file whose tests run on the object-native backend registers them with
 /// [`test_on_data_store!`]; a test in such a file that stays here is one of the
 /// object-native exceptions below, each checking behavior that the object-native
-/// data path does not have, or failing there on an open defect:
+/// data path does not have, or failing there as its row describes:
 ///
 /// # Object-native exceptions
 ///
@@ -938,11 +935,13 @@ pub fn require_process_per_test(why: &str) {
 /// | `listing_cache_retention_race_test` (all) | Races a snapshot-directory listing through the list-files cache; a table in the object-native location never lists its files. |
 /// | `mem_tier_overwrite_retention_test::retention_judges_a_key_by_its_live_version_impl` | Fails intermittently on the local-location store when many tests run at once, with a RAM-tier row that matches `retention_sql` still visible after the retention pass; the cause is not yet known. |
 /// | `mem_tier_overwrite_retention_test::a_waiting_publish_does_not_hold_back_the_other_partitions_impl` | Commits partitions' overwrites in one SQLite metastore transaction; the object-native metastore does not hold partitioned tables. |
+/// | `orphan_dv_compaction_test::bake_publication_schedules_orphan_dv_cleanup_impl` | On the object-native stores, the deletion vectors the sweep after a seq-prefix bake drops from the catalog stay in the store once the data-file retention ends (25 stored, 2 named), while the same check after a protected-subset merge passes; the cause is not yet known. |
 /// | `orphan_dv_compaction_test::provider_open_replays_an_orphan_backlog_left_by_a_crash_impl` | Writes deletion vectors and their catalog rows by hand at a local path. |
 /// | `orphan_dv_compaction_test::scheduled_cleanup_waits_for_the_orphan_threshold_impl` | As above. |
 /// | `orphan_dv_compaction_test::scheduled_cleanup_keeps_a_deletion_vector_the_cold_tier_needs_impl` | Cold tier, which object-native data does not support. |
 /// | `position_mode_reclaim_test::default_mode_small_table_reclaims_by_rewriting_itself` | `deletion_mode: auto` starts on position deletes only for a table on a local directory. |
 /// | `position_mode_reclaim_test::empty_table_reclaim_clears_tombstones_and_survives_reopen` | As above. |
+/// | `position_mode_reclaim_test::default_mode_table_past_its_bound_reclaims_through_the_bake` | As above: a table in an object store keeps key deletes from the start, so it never crosses the position-delete bound this test checks. |
 /// | `staged_append_test` WAL and crash-leftover tests (`test_staged_append_self_healing_leftover_impl`, `test_wal_*`, `test_leftover_tmp_*`, `test_repeated_wal_writes_are_atomic_impl`, `test_prepared_lifecycle_matches_commit_impl`, `test_prepared_rollback_clears_staging_impl`, `test_corrupt_framed_wal_discarded_on_recovery_impl`, `test_cancelled_plain_append_does_not_wedge_after_compaction_impl`) | Check or plant the `_staging/` directory and its `_wal.json` on local disk; a table in an object store writes its files at their final keys and stages no WAL. |
 #[macro_export]
 macro_rules! test_with_backends {

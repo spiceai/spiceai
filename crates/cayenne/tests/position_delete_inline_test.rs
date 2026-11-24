@@ -212,7 +212,7 @@ async fn wait_for_vector_files_to_match_catalog(
     let table_id = table.table_id();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        common::reclaim_delayed_deletes(fixture, table).await?;
+        common::reclaim_delayed_deletes(fixture, table).await;
         let referenced = catalog_vector_files(fixture, table_id).await?;
         let (_, stored) = stored_files(fixture, table).await?;
         if stored == referenced {
@@ -592,6 +592,9 @@ async fn no_pk_mutations_match_a_row_model(fixture: common::TestFixture) -> Test
                 5..=8 => {
                     deletes_meeting_inline_rows +=
                         usize::from(fixture.catalog.get_inlined_data_count(&table_id).await? > 0);
+                    // A table in the object-native location keeps retired files
+                    // for the data-file retention; only live files count here.
+                    common::reclaim_delayed_deletes(&fixture, &table).await;
                     deletes_meeting_file_rows +=
                         usize::from(!stored_files(&fixture, &table).await?.0.is_empty());
                     let (predicate, matches) = random_delete(&mut rng, next_id);
