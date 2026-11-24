@@ -1172,8 +1172,10 @@ impl Script {
             );
         }
         ensure!(
-            script.defaults.single_node.is_none() || script.defaults.cluster.is_none(),
-            "`defaults.single-node` and `defaults.cluster` contradict each other; keep one"
+            script.defaults.single_node.is_none()
+                || (script.defaults.cluster.is_none() && script.defaults.executor_args.is_none()),
+            "`defaults.single-node` contradicts `defaults.cluster` and `defaults.executor-args`, \
+             which run the script with executors; keep one"
         );
         for name in &script.requires_env {
             ensure!(

@@ -139,56 +139,108 @@ async fn download_to_cache(
         // place: runners that share a home directory (several runner instances
         // on one macOS host) must never load a library or run a CLI another is
         // still writing.
-        let staging = dir.with_file_name(format!(
-            "{}.tmp-{}",
-            dir.file_name()
-                .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
-            std::process::id()
-        ));
-        if staging.exists() {
-            tokio::fs::remove_dir_all(&staging).await?;
-        }
-        tokio::fs::create_dir_all(&staging).await?;
-        let archive = staging.join(asset);
-        let url = format!("https://github.com/duckdb/duckdb/releases/download/v{version}/{asset}");
-        let status = tokio::process::Command::new("curl")
-            .args(crate::release::CURL_RELEASE_RETRY)
-            .args(["-fsSL", "-o"])
-            .arg(&archive)
-            .arg(&url)
-            .status()
-            .await
-            .context("Failed to run curl")?;
-        if !status.success() {
-            bail!("Failed to download the DuckDB {version} {file} from {url}; set {override_var}");
-        }
-        let mut unpack = if asset.ends_with(".tar.gz") {
-            let mut tar = tokio::process::Command::new("tar");
-            tar.arg("-xzf").arg(&archive).arg("-C").arg(&staging);
-            tar
-        } else {
-            let mut unzip = tokio::process::Command::new("unzip");
-            unzip
-                .args(["-o", "-q"])
-                .arg(&archive)
-                .arg("-d")
-                .arg(&staging);
-            unzip
+        let name = dir
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        remove_stale_staging(&dir, &name).await;
+        let staging = dir.with_file_name(format!("{name}.tmp-{}", std::process::id()));
+        let fetched = fetch_into(&staging, version, asset, file, override_var).await;
+        // Fetched or not, the staging directory goes: the next run gets
+        // another process id and would never reuse it.
+        let published = match fetched {
+            Ok(()) => publish(&staging.join(file), &dir, &binary).await,
+            Err(e) => Err(e),
         };
-        let status = unpack.status().await.context("Failed to unpack")?;
-        if !status.success() || !staging.join(file).is_file() {
-            bail!(
-                "Failed to unpack the DuckDB {version} {file} from {}",
-                archive.display()
-            );
-        }
-        // One file renamed into the shared directory: atomic within a
-        // filesystem, and replacing an identical copy another process put there.
-        tokio::fs::create_dir_all(&dir).await?;
-        tokio::fs::rename(staging.join(file), &binary).await?;
-        tokio::fs::remove_dir_all(&staging).await?;
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        published?;
     }
     Ok(binary.display().to_string())
+}
+
+/// Removes staging directories of this release that a process killed while
+/// downloading left behind: an hour old, longer than any download takes.
+async fn remove_stale_staging(dir: &std::path::Path, name: &str) {
+    let Some(parent) = dir.parent() else {
+        return;
+    };
+    let Ok(mut entries) = tokio::fs::read_dir(parent).await else {
+        return;
+    };
+    let prefix = format!("{name}.tmp-");
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let stale = entry.file_name().to_string_lossy().starts_with(&prefix)
+            && entry
+                .metadata()
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > std::time::Duration::from_secs(3600));
+        if stale {
+            let _ = tokio::fs::remove_dir_all(entry.path()).await;
+        }
+    }
+}
+
+/// Downloads `asset` into `staging` and unpacks it there, leaving `file` in it.
+async fn fetch_into(
+    staging: &std::path::Path,
+    version: &str,
+    asset: &str,
+    file: &str,
+    override_var: &str,
+) -> Result<()> {
+    if staging.exists() {
+        tokio::fs::remove_dir_all(staging).await?;
+    }
+    tokio::fs::create_dir_all(staging).await?;
+    let archive = staging.join(asset);
+    let url = format!("https://github.com/duckdb/duckdb/releases/download/v{version}/{asset}");
+    let status = tokio::process::Command::new("curl")
+        .args(crate::release::CURL_RELEASE_RETRY)
+        .args(["-fsSL", "-o"])
+        .arg(&archive)
+        .arg(&url)
+        .status()
+        .await
+        .context("Failed to run curl")?;
+    if !status.success() {
+        bail!("Failed to download the DuckDB {version} {file} from {url}; set {override_var}");
+    }
+    let mut unpack = if asset.ends_with(".tar.gz") {
+        let mut tar = tokio::process::Command::new("tar");
+        tar.arg("-xzf").arg(&archive).arg("-C").arg(staging);
+        tar
+    } else {
+        let mut unzip = tokio::process::Command::new("unzip");
+        unzip
+            .args(["-o", "-q"])
+            .arg(&archive)
+            .arg("-d")
+            .arg(staging);
+        unzip
+    };
+    let status = unpack.status().await.context("Failed to unpack")?;
+    if !status.success() || !staging.join(file).is_file() {
+        bail!(
+            "Failed to unpack the DuckDB {version} {file} from {}",
+            archive.display()
+        );
+    }
+    Ok(())
+}
+
+/// Renames the unpacked `file` into the shared directory: atomic within a
+/// filesystem, and replacing an identical copy another process put there.
+async fn publish(
+    unpacked: &std::path::Path,
+    dir: &std::path::Path,
+    binary: &std::path::Path,
+) -> Result<()> {
+    tokio::fs::create_dir_all(dir).await?;
+    tokio::fs::rename(unpacked, binary)
+        .await
+        .with_context(|| format!("Failed to put {} in {}", unpacked.display(), dir.display()))
 }
 
 /// `sql` as a COPY to standard output in the convention PostgreSQL's COPY uses

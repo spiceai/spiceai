@@ -275,6 +275,21 @@ async fn run(cli: Cli) -> Result<bool> {
     if cli.check {
         return check(&paths, &scripts);
     }
+    if cli.cluster {
+        // Before any source starts: a script that cannot run distributed
+        // should not fail on a source it would never use.
+        (paths, scripts) = paths
+            .into_iter()
+            .zip(scripts)
+            .filter_map(|(path, script)| match &script.defaults.single_node {
+                Some(reason) => {
+                    println!("skip {} under --cluster: {reason}", script.name);
+                    None
+                }
+                None => Some((path, script)),
+            })
+            .unzip();
+    }
     let not_run: Vec<results::NotRun>;
     (paths, scripts, not_run) = without_missing_env(paths, scripts);
     for script in &not_run {

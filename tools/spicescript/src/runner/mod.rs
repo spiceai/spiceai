@@ -1227,10 +1227,6 @@ async fn create_instances(
             if cluster {
                 // The cluster run gives the instance its scheduler role, which
                 // replaces the default `--role server` but no other role.
-                if let Some(reason) = &script.defaults.single_node {
-                    say!("   skip {label:<20} {reason}");
-                    continue;
-                }
                 match role_arg(&spiced_args) {
                     Some("server") => strip_role_arg(&mut spiced_args),
                     Some(role) => {
