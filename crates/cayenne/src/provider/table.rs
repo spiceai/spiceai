@@ -34141,13 +34141,18 @@ impl CayenneTableProvider {
         }
     }
 
-    /// The deletion fence to tag a freshly-merged protected snapshot with — the
-    /// just-loaded durable deletion-index max, CAPPED strictly below the smallest
-    /// still-pending mem-tier delete — plus that pending floor itself, so ONE
-    /// coherent floor load drives both the cap and the caller's input-eligibility
-    /// rule (fold only inputs at or below the fence while a floor exists).
+    /// The deletion fence to tag a freshly-merged protected snapshot with —
+    /// `uncapped_fence`, CAPPED strictly below the smallest still-pending mem-tier
+    /// delete — plus that pending floor itself, so ONE coherent floor load drives
+    /// both the cap and the caller's input-eligibility rule (fold only inputs at or
+    /// below the fence while a floor exists).
     ///
-    /// The uncapped durable max over-claims. Under N>1 off-fence CDC a later
+    /// `uncapped_fence` is [`Self::protected_merge_delete_fence`]: the just-loaded
+    /// durable deletion-index max, raised to the pruned-delete floor. The cap
+    /// applies after that floor, so a pending delete below the floor still lowers
+    /// the fence.
+    ///
+    /// The uncapped fence over-claims. Under N>1 off-fence CDC a later
     /// apply's delete can fold into the durable index ahead of an earlier apply's
     /// (cross-shard / commit reorder), so the durable max can sit ABOVE a delete
     /// that is still pending in the mem tier and therefore was NEVER baked into
@@ -34161,17 +34166,12 @@ impl CayenneTableProvider {
     /// apply, so its reinsert row is ALSO pending (never in these durable merged
     /// files). Lowering the fence can only apply MORE deletes to the old rows the
     /// merge carried, never hide a reinsert that was baked in. The cap fires only
-    /// when a pending delete sits below the durable max (the reorder gap); with no
-    /// pending mem-tier delete it is the durable max unchanged.
+    /// when a pending delete sits below the uncapped fence (the reorder gap); with
+    /// no pending mem-tier delete it is the uncapped fence unchanged.
     #[must_use]
-    fn protected_snapshot_merge_fence_and_floor(
-        &self,
-        durable_max_delete_seq: i64,
-    ) -> (i64, Option<i64>) {
+    fn protected_snapshot_merge_fence_and_floor(&self, uncapped_fence: i64) -> (i64, Option<i64>) {
         let pending_floor = self.min_pending_mem_tier_delete_sequence();
-        let fence = pending_floor.map_or(durable_max_delete_seq, |floor| {
-            durable_max_delete_seq.min(floor - 1)
-        });
+        let fence = pending_floor.map_or(uncapped_fence, |floor| uncapped_fence.min(floor - 1));
         (fence, pending_floor)
     }
 
