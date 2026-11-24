@@ -7237,10 +7237,6 @@ impl DataFusion {
             None
         };
 
-        let generation = session
-            .config()
-            .get_extension::<PlansGeneration>()
-            .map(|generation| generation.0);
         let (plan, placeholders) = self.create_logical_plan(session, sql, parameters).await?;
 
         // A plan is not cached when it holds substituted table-function parameters,
@@ -7253,13 +7249,43 @@ impl DataFusion {
             && !matches!(plan, LogicalPlan::Ddl(_))
         {
             tracing::trace!("caching plan for {sql}");
-            let current = self.plans_generation.read().await;
-            if generation == Some(*current) {
-                cache.put_raw_key(&cache_key.as_u64(), plan.clone()).await;
-            }
+            self.put_plan_planned_in(cache.as_ref(), session, cache_key, &plan)
+                .await;
         }
 
         Ok(plan)
+    }
+
+    /// Stores `plan`, planned against `session`, in the plans cache under `key`,
+    /// unless the cache has been cleared since `session` was copied: such a plan
+    /// may hold a definition the clear retired (see `plans_generation`).
+    pub(crate) async fn cache_plan_planned_in(
+        &self,
+        session: &SessionState,
+        key: &RawCacheKey,
+        plan: &LogicalPlan,
+    ) {
+        if let Some(cache) = self.plans_cache_provider() {
+            self.put_plan_planned_in(cache.as_ref(), session, key, plan)
+                .await;
+        }
+    }
+
+    async fn put_plan_planned_in(
+        &self,
+        cache: &(dyn TabledCacheProvider<LogicalPlan> + Send + Sync),
+        session: &SessionState,
+        key: &RawCacheKey,
+        plan: &LogicalPlan,
+    ) {
+        let generation = session
+            .config()
+            .get_extension::<PlansGeneration>()
+            .map(|generation| generation.0);
+        let current = self.plans_generation.read().await;
+        if generation == Some(*current) {
+            cache.put_raw_key(&key.as_u64(), plan.clone()).await;
+        }
     }
 
     /// Route SQL through the planner, which intercepts DDL extensions and

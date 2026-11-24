@@ -21,7 +21,7 @@ limitations under the License.
 //! it to a `DataFusion` [`LogicalPlan`] via `datafusion-substrait`, and then runs
 //! it through the same execution path as a SQL statement.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::datafusion::flight_session_extension::FlightSessionExtension;
 use arrow_flight::{
@@ -29,17 +29,21 @@ use arrow_flight::{
     flight_service_server::FlightService,
     sql::{self, ProstMessageExt},
 };
+use bytes::Bytes;
+use datafusion::common::{ParamValues, ScalarValue};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion_substrait::extensions::Extensions;
-use datafusion_substrait::logical_plan::consumer::from_substrait_plan_with_consumer;
-use datafusion_substrait::substrait::proto::Plan;
+use datafusion_substrait::logical_plan::consumer::{
+    SubstraitConsumer, from_substrait_plan_with_consumer,
+};
+use datafusion_substrait::substrait::proto::{DynamicParameterBinding, Plan};
 use prost::Message;
 use tonic::{Request, Response, Status};
 
 use super::substrait_consumer::SpiceSubstraitConsumer;
-use crate::datafusion::query::QueryBuilder;
+use crate::datafusion::query::{Query, QueryBuilder};
 use crate::datafusion::request_context_extension::get_current_datafusion;
 use crate::datafusion::sql_validator::validate_sql_query_read_only;
 use crate::flight::{
@@ -50,7 +54,7 @@ use crate::flight::{
 };
 use crate::{datafusion::DataFusion, flight::handle_query_error};
 use runtime_request_context::{AsyncMarker, RequestContext};
-use telemetry::timing::TimedStream;
+use telemetry::timing::{TimeMeasurement, TimedStream};
 
 /// Decodes the Substrait protobuf payload out of a
 /// [`sql::CommandStatementSubstraitPlan`] and computes a stable cache key for
@@ -83,21 +87,29 @@ async fn decode_plan(
     datafusion: &Arc<DataFusion>,
 ) -> Result<(LogicalPlan, String, SessionState), Status> {
     let (proto, cache_key) = decode_plan_proto(cmd)?;
-
     let session = datafusion.ctx.state();
+    let plan = lower_plan(&proto, &session).await?;
+    Ok((plan, cache_key, session))
+}
+
+/// The extensions `proto` declares, refusing any the consumer cannot honour.
+fn plan_extensions(proto: &Plan) -> Result<Extensions, Status> {
     let extensions = Extensions::try_from(&proto.extensions).map_err(map_substrait_error)?;
-    // `from_substrait_plan` refuses these too; the consumer below cannot see them.
+    // `from_substrait_plan` refuses these too; the consumer cannot see them.
     if !extensions.type_variations.is_empty() {
         return Err(map_substrait_error(DataFusionError::NotImplemented(
             "Type variation extensions are not supported".to_string(),
         )));
     }
-    let consumer = SpiceSubstraitConsumer::new(&extensions, &session);
-    let plan = from_substrait_plan_with_consumer(&consumer, &proto)
-        .await
-        .map_err(map_substrait_error)?;
+    Ok(extensions)
+}
 
-    Ok((plan, cache_key, session))
+async fn lower_plan(proto: &Plan, session: &SessionState) -> Result<LogicalPlan, Status> {
+    let extensions = plan_extensions(proto)?;
+    let consumer = SpiceSubstraitConsumer::new(&extensions, session);
+    from_substrait_plan_with_consumer(&consumer, proto)
+        .await
+        .map_err(map_substrait_error)
 }
 
 /// Decodes `cmd` for a request. A sessionless request also returns the session
@@ -195,33 +207,261 @@ pub(crate) async fn do_get(
     let datafusion = get_current_datafusion(&context);
 
     let (plan, cache_key, session) = decode_request(&cmd, &context, &datafusion).await?;
+    stream_plan(plan, cache_key, session, &context, &datafusion, start).await
+}
 
-    if is_auth_read_only(&context) {
-        validate_sql_query_read_only(&plan)
-            .map_err(|e| Status::permission_denied(format!("Write access denied. {e}")))?;
-    }
+/// Execute a parameterized Substrait plan
+/// ([`flight_client::parameterized_ticket`]) and stream the results.
+pub(crate) async fn do_get_parameterized(
+    payload: Bytes,
+) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
+    let start = track_flight_request("do_get", Some("statement_substrait_plan_parameterized")).await;
+    set_flightsql_protocol().await;
 
-    let query_result =
-        QueryBuilder::from_substrait_plan(plan, cache_key, session, Arc::clone(&datafusion))
-            .build()
-            .run()
-            .await
-            .map_err(handle_query_error)?;
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let datafusion = get_current_datafusion(&context);
 
-    let ipc_write_options = Service::ipc_write_options_for_context(&context)?;
+    let (plan, cache_key, session, _) =
+        decode_parameterized_request(&payload, &context, &datafusion).await?;
+    stream_plan(plan, cache_key, session, &context, &datafusion, start).await
+}
+
+async fn stream_plan(
+    plan: LogicalPlan,
+    cache_key: String,
+    session: Option<SessionState>,
+    context: &Arc<RequestContext>,
+    datafusion: &Arc<DataFusion>,
+    start: TimeMeasurement,
+) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
+    let query_result = run_plan(plan, cache_key, session, context, datafusion).await?;
+
+    let ipc_write_options = Service::ipc_write_options_for_context(context)?;
     let (output, from_cache) = Service::query_result_to_flight_stream(
         query_result,
         ipc_write_options,
         datafusion.cpu_runtime().cloned(),
         &datafusion.ctx.runtime_env().memory_pool,
-        Arc::clone(&context),
+        Arc::clone(context),
     );
     let timed_output = TimedStream::new(output, move || start);
 
     let mut response =
         Response::new(Box::pin(timed_output) as <Service as FlightService>::DoGetStream);
-    attach_cache_metadata(&mut response, from_cache, &context);
+    attach_cache_metadata(&mut response, from_cache, context);
     Ok(response)
+}
+
+async fn run_plan(
+    plan: LogicalPlan,
+    cache_key: String,
+    session: Option<SessionState>,
+    context: &RequestContext,
+    datafusion: &Arc<DataFusion>,
+) -> Result<cache::result::query::QueryResult, Status> {
+    if is_auth_read_only(context) {
+        validate_sql_query_read_only(&plan)
+            .map_err(|e| Status::permission_denied(format!("Write access denied. {e}")))?;
+    }
+
+    QueryBuilder::from_substrait_plan(plan, cache_key, session, Arc::clone(datafusion))
+        .build()
+        .run()
+        .await
+        .map_err(handle_query_error)
+}
+
+/// A parameterized plan split into its template and the values bound to it.
+struct ParameterizedPlan {
+    /// The plan with its `parameter_bindings` cleared.
+    template: Plan,
+    /// Names the template: the same template has the same digest whatever
+    /// values a request binds to it.
+    template_digest: String,
+    /// Sorted by anchor; no anchor appears twice.
+    bindings: Vec<DynamicParameterBinding>,
+    /// The results-cache key: the template digest and the bound values, so two
+    /// requests share a cached result only when both match.
+    results_key: String,
+}
+
+/// Where a parameterized request's template plan came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TemplateSource {
+    /// Found in the plans cache, decoded by an earlier request.
+    Cached,
+    Decoded,
+}
+
+fn decode_parameterized_proto(payload: &[u8]) -> Result<ParameterizedPlan, Status> {
+    if payload.is_empty() {
+        return Err(Status::invalid_argument(
+            "The parameterized Substrait plan must not be empty",
+        ));
+    }
+    let mut template = Plan::decode(payload)
+        .map_err(|e| Status::invalid_argument(format!("Failed to decode Substrait plan: {e}")))?;
+    let mut bindings = std::mem::take(&mut template.parameter_bindings);
+    bindings.sort_by_key(|binding| binding.parameter_anchor);
+    if let Some(pair) = bindings
+        .windows(2)
+        .find(|pair| pair[0].parameter_anchor == pair[1].parameter_anchor)
+    {
+        return Err(Status::invalid_argument(format!(
+            "The Substrait plan binds parameter ${} more than once",
+            u64::from(pair[0].parameter_anchor) + 1
+        )));
+    }
+
+    // Re-encoded rather than hashed as received: the payload holds the values,
+    // and the template's digest must not change with them.
+    let template_digest = sha256_hex(&template.encode_to_vec());
+    // Each binding's own encoding names its anchor, type and value; distinct
+    // values therefore never share a key. An equal value written two ways only
+    // costs a cache miss.
+    let mut values = Vec::new();
+    for binding in &bindings {
+        binding.encode_length_delimited(&mut values).map_err(|e| {
+            Status::internal(format!("Failed to encode a Substrait parameter binding: {e}"))
+        })?;
+    }
+    let results_key = format!(
+        "substrait-params:{template_digest}:{}",
+        sha256_hex(&values)
+    );
+
+    Ok(ParameterizedPlan {
+        template,
+        template_digest,
+        bindings,
+        results_key,
+    })
+}
+
+/// Decodes a parameterized plan for a request and binds its values. The
+/// template is lowered once per digest and kept in the plans cache, under a key
+/// SQL text cannot produce; the values are bound per request.
+///
+/// As for [`decode_request`], a sessionless request also returns the session
+/// snapshot the values were read against, for execution to reuse.
+async fn decode_parameterized_request(
+    payload: &[u8],
+    context: &RequestContext,
+    datafusion: &Arc<DataFusion>,
+) -> Result<(LogicalPlan, String, Option<SessionState>, TemplateSource), Status> {
+    let parameterized = decode_parameterized_proto(payload)?;
+    let session = datafusion.ctx.state();
+
+    // `None` for a stateful Flight session, whose plans stay off the shared
+    // cache (see `Query::shared_plans_cache_key`).
+    let plan_key = Query::shared_plans_cache_key(
+        datafusion,
+        &format!("substrait-template:{}", parameterized.template_digest),
+        context,
+    );
+    let cached = match (plan_key.as_ref(), datafusion.plans_cache_provider()) {
+        (Some(key), Some(plans)) => plans.get_raw_key(&key.as_u64()).await,
+        _ => None,
+    };
+    let (template, source) = match cached {
+        Some(plan) => (Arc::unwrap_or_clone(plan), TemplateSource::Cached),
+        None => {
+            let plan = lower_plan(&parameterized.template, &session).await?;
+            if let Some(key) = plan_key.as_ref()
+                && !matches!(plan, LogicalPlan::Ddl(_))
+            {
+                datafusion.cache_plan_planned_in(&session, key, &plan).await;
+            }
+            (plan, TemplateSource::Decoded)
+        }
+    };
+
+    let values = binding_values(&parameterized, &session).await?;
+    let plan = bind_values(template, values)?;
+    let session = context
+        .extension::<FlightSessionExtension>()
+        .is_none()
+        .then_some(session);
+    Ok((plan, parameterized.results_key, session, source))
+}
+
+/// Reads each binding's literal the way the plan's own literals are read.
+async fn binding_values(
+    parameterized: &ParameterizedPlan,
+    session: &SessionState,
+) -> Result<Vec<(u32, ScalarValue)>, Status> {
+    let extensions = plan_extensions(&parameterized.template)?;
+    let consumer = SpiceSubstraitConsumer::new(&extensions, session);
+    let mut values = Vec::with_capacity(parameterized.bindings.len());
+    for binding in &parameterized.bindings {
+        let id = u64::from(binding.parameter_anchor) + 1;
+        let literal = binding.value.as_ref().ok_or_else(|| {
+            Status::invalid_argument(format!("The binding for parameter ${id} has no value"))
+        })?;
+        match consumer
+            .consume_literal(literal)
+            .await
+            .map_err(map_substrait_error)?
+        {
+            Expr::Literal(value, _) => values.push((binding.parameter_anchor, value)),
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "The binding for parameter ${id} is not a literal: {other}"
+                )));
+            }
+        }
+    }
+    Ok(values)
+}
+
+/// Binds `values` to `template`'s placeholders, refusing a set that does not
+/// match them exactly: `LogicalPlan::with_param_values` ignores a value no
+/// placeholder names, and a value of another type than its placeholder
+/// declares would be coerced rather than compared as sent.
+fn bind_values(
+    template: LogicalPlan,
+    values: Vec<(u32, ScalarValue)>,
+) -> Result<LogicalPlan, Status> {
+    let fields = template
+        .get_parameter_fields()
+        .map_err(map_substrait_error)?;
+    let mut bound = HashMap::with_capacity(values.len());
+    for (anchor, value) in values {
+        let name = (u64::from(anchor) + 1).to_string();
+        let Some(field) = fields.get(&format!("${name}")) else {
+            return Err(Status::invalid_argument(format!(
+                "The Substrait plan binds parameter ${name}, but has no such parameter"
+            )));
+        };
+        if let Some(field) = field
+            && field.data_type() != &value.data_type()
+        {
+            return Err(Status::invalid_argument(format!(
+                "The Substrait plan declares parameter ${name} as {}, but binds a {} value to it",
+                field.data_type(),
+                value.data_type()
+            )));
+        }
+        bound.insert(name, value);
+    }
+    let mut unbound: Vec<_> = fields
+        .keys()
+        .filter(|id| !bound.contains_key(id.trim_start_matches('$')))
+        .cloned()
+        .collect();
+    if !unbound.is_empty() {
+        unbound.sort();
+        return Err(Status::invalid_argument(format!(
+            "The Substrait plan has no binding for parameter {}",
+            unbound.join(", ")
+        )));
+    }
+    if bound.is_empty() {
+        return Ok(template);
+    }
+    template
+        .with_param_values(ParamValues::from(bound))
+        .map_err(map_substrait_error)
 }
 
 #[cfg(test)]
@@ -625,6 +865,227 @@ mod tests {
         })))
         .expect("decode");
         assert_eq!(key, key2);
+    }
+
+    /// A runtime with the results cache keyed by plan, as a `plan` cache key
+    /// configures it, and a plans cache.
+    fn cached_runtime() -> Result<Arc<DataFusion>, anyhow::Error> {
+        use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use cache::{Caching, QueryResultsCacheProvider, SimpleCache};
+        use datafusion::datasource::MemTable;
+        use spicepod::component::caching::{CacheKeyType, SQLResultsCacheConfig};
+
+        let results = QueryResultsCacheProvider::try_new(
+            &SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                cache_key_type: CacheKeyType::Plan,
+                ..Default::default()
+            },
+            Box::new([]),
+        )?;
+        let plans = Arc::new(SimpleCache::new(
+            512,
+            std::time::Duration::from_hours(1),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
+        ));
+        let df = Arc::new(
+            DataFusion::builder(
+                crate::status::RuntimeStatus::new(),
+                Arc::new(crate::dataaccelerator::AcceleratorEngineRegistry::default()),
+                tokio::runtime::Handle::current(),
+            )
+            .with_caching(Arc::new(
+                Caching::new()
+                    .with_results_cache(Arc::new(results))
+                    .with_plans_cache(plans),
+            ))
+            .build(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["one", "two", "three"])),
+            ],
+        )?;
+        df.ctx
+            .register_table("t", Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))?;
+        Ok(df)
+    }
+
+    /// The Substrait template of `sql`, planned unbound, so each `$N` is a
+    /// dynamic parameter typed by inference.
+    async fn template_of(df: &DataFusion, sql: &str) -> Result<Plan, anyhow::Error> {
+        use datafusion_substrait::logical_plan::producer::to_substrait_plan;
+        let plan = df.ctx.sql(sql).await?.into_unoptimized_plan();
+        Ok(*to_substrait_plan(&plan, &df.ctx.state())?)
+    }
+
+    fn payload(
+        df: &DataFusion,
+        template: &Plan,
+        values: &[datafusion::common::ScalarValue],
+    ) -> Result<Vec<u8>, anyhow::Error> {
+        let mut plan = template.clone();
+        data_components::flight::substrait_parameters::bind_parameters(
+            &mut plan,
+            values,
+            &df.ctx.state(),
+        )?;
+        Ok(plan.encode_to_vec())
+    }
+
+    fn plan_keyed_context() -> Arc<RequestContext> {
+        use runtime_request_context::{CacheControl, CacheKeyType, Protocol};
+        Arc::new(
+            RequestContext::builder(Protocol::FlightSQL)
+                .with_cache_control(CacheControl::Cache(CacheKeyType::Default))
+                .build(),
+        )
+    }
+
+    /// Runs `payload` as `do_get_parameterized` runs it, and returns its rows,
+    /// how the results cache answered, and where its template came from.
+    async fn run_parameterized(
+        df: &Arc<DataFusion>,
+        payload: &[u8],
+    ) -> Result<(String, cache::result::CacheStatus, TemplateSource), anyhow::Error> {
+        let context = plan_keyed_context();
+        Arc::clone(&context)
+            .scope(async {
+                let (plan, key, session, source) =
+                    decode_parameterized_request(payload, &context, df).await?;
+                let result = run_plan(plan, key, session, &context, df).await?;
+                let status = result.cache_status;
+                let batches = result.collect_batches().await?;
+                Ok::<_, anyhow::Error>((
+                    arrow::util::pretty::pretty_format_batches(&batches)?.to_string(),
+                    status,
+                    source,
+                ))
+            })
+            .await
+    }
+
+    /// One template sent with different values returns each value's rows, with
+    /// the results cache on: were the values left out of its key, the second
+    /// value would be served the first value's cached rows. The template is
+    /// lowered once and then served from the plans cache.
+    #[tokio::test]
+    async fn parameterized_plan_binds_each_requests_values() -> Result<(), anyhow::Error> {
+        use cache::result::CacheStatus;
+        use datafusion::common::ScalarValue;
+
+        let df = cached_runtime()?;
+        let template = template_of(&df, "SELECT v FROM t WHERE k = $1 LIMIT 1").await?;
+        let one = "+-----+\n| v   |\n+-----+\n| one |\n+-----+";
+        let two = "+-----+\n| v   |\n+-----+\n| two |\n+-----+";
+
+        let a = payload(&df, &template, &[ScalarValue::Int64(Some(1))])?;
+        let b = payload(&df, &template, &[ScalarValue::Int64(Some(2))])?;
+        assert_eq!(
+            run_parameterized(&df, &a).await?,
+            (one.to_string(), CacheStatus::CacheMiss, TemplateSource::Decoded)
+        );
+        assert_eq!(
+            run_parameterized(&df, &b).await?,
+            (two.to_string(), CacheStatus::CacheMiss, TemplateSource::Cached)
+        );
+        // The results cache is in use: the first value's rows are now a hit.
+        assert_eq!(
+            run_parameterized(&df, &a).await?,
+            (one.to_string(), CacheStatus::CacheHit, TemplateSource::Cached)
+        );
+
+        // A different template is decoded, not served the first one's plan.
+        let other = template_of(&df, "SELECT v FROM t WHERE k > $1 ORDER BY k").await?;
+        let c = payload(&df, &other, &[ScalarValue::Int64(Some(2))])?;
+        assert_eq!(
+            run_parameterized(&df, &c).await?,
+            (
+                "+-------+\n| v     |\n+-------+\n| three |\n+-------+".to_string(),
+                CacheStatus::CacheMiss,
+                TemplateSource::Decoded
+            )
+        );
+        Ok(())
+    }
+
+    /// The bindings must cover the plan's parameters exactly, with the types it
+    /// declares; anything else is refused rather than run.
+    #[tokio::test]
+    async fn parameterized_plan_refuses_bindings_that_do_not_match_its_parameters()
+    -> Result<(), anyhow::Error> {
+        use datafusion::common::ScalarValue;
+
+        let df = cached_runtime()?;
+        let two_params = template_of(&df, "SELECT v FROM t WHERE k = $1 OR k = $2").await?;
+        let one_param = template_of(&df, "SELECT v FROM t WHERE k = $1").await?;
+        let mut duplicated = one_param.clone();
+        data_components::flight::substrait_parameters::bind_parameters(
+            &mut duplicated,
+            &[ScalarValue::Int64(Some(1))],
+            &df.ctx.state(),
+        )?;
+        duplicated
+            .parameter_bindings
+            .push(duplicated.parameter_bindings[0].clone());
+
+        let cases = [
+            (
+                payload(&df, &two_params, &[ScalarValue::Int64(Some(1))])?,
+                "The Substrait plan has no binding for parameter $2",
+            ),
+            (
+                payload(
+                    &df,
+                    &one_param,
+                    &[ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(2))],
+                )?,
+                "The Substrait plan binds parameter $2, but has no such parameter",
+            ),
+            (
+                payload(&df, &one_param, &[ScalarValue::Utf8(Some("1".to_string()))])?,
+                "The Substrait plan declares parameter $1 as Int64, but binds a Utf8 value to it",
+            ),
+            (
+                duplicated.encode_to_vec(),
+                "The Substrait plan binds parameter $1 more than once",
+            ),
+        ];
+        for (payload, expected) in cases {
+            let context = plan_keyed_context();
+            let status = decode_parameterized_request(&payload, &context, &df)
+                .await
+                .map(|_| ())
+                .expect_err(expected);
+            assert_eq!(status.code(), Code::InvalidArgument, "{expected}");
+            assert_eq!(status.message(), expected);
+        }
+        Ok(())
+    }
+
+    /// An upstream that predates the parameterized ticket finds no Flight SQL
+    /// command in it and answers `Unimplemented` from `Command::Unknown`, which
+    /// is what a client falls back on. `do_get` must recognise the ticket before
+    /// that dispatch for the same reason.
+    #[test]
+    fn parameterized_ticket_is_not_a_flight_sql_command() {
+        use arrow_flight::sql::{Any, Command};
+        use flight_client::parameterized_ticket::PARAMETERIZED_SUBSTRAIT_PLAN_TYPE_URL;
+        let any = Any {
+            type_url: PARAMETERIZED_SUBSTRAIT_PLAN_TYPE_URL.to_string(),
+            value: Bytes::from_static(b"plan"),
+        };
+        assert!(matches!(
+            Command::try_from(any),
+            Ok(Command::Unknown(any)) if any.type_url == PARAMETERIZED_SUBSTRAIT_PLAN_TYPE_URL
+        ));
     }
 
     #[test]
