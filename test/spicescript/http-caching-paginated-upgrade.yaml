@@ -22,8 +22,15 @@ spicepod:
   datasets:
     - from: ${sources.api.url}/v1
       name: pages
-      params: { file_format: json, allowed_request_paths: '/*', max_retries: '0', response_cache_max_size_bytes: '0', pagination: enabled, pagination_next_pointer: /next_cursor, pagination_token_param: cursor, pagination_data_pointer: /data, pagination_max_pages: '10' }
+      params: &paged { file_format: json, allowed_request_paths: '/*', max_retries: '0', response_cache_max_size_bytes: '0', pagination: enabled, pagination_next_pointer: /next_cursor, pagination_token_param: cursor, pagination_data_pointer: /data, pagination_max_pages: '10' }
       acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 1h } }
+    - from: ${sources.api.url}/v2
+      name: parent
+      params: *paged
+      acceleration: { enabled: true, engine: cayenne, mode: memory, refresh_mode: caching, params: { caching_ttl: 1h } }
+    - from: localpod:parent
+      name: child
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 30s, caching_stale_while_revalidate_ttl: 1h, caching_max_items: '3' } }
 
 steps:
   - source-exec:
@@ -32,12 +39,24 @@ steps:
         - "{ path: /v1/other, headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"other\"}], \"next_cursor\": null}' }"
         - "{ path: /v1/pages, headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"item-0\"}, {\"item\": \"item-1\"}], \"next_cursor\": 2}' }"
         - "{ path: /v1/pages, query: 'cursor=2', headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"item-2\"}], \"next_cursor\": null}' }"
+        - "{ path: /v2/solo, headers: { content-type: application/json }, body: '{\"data\":[{\"item\":\"solo\"}],\"next_cursor\":null}' }"
+        - "{ path: /v2/sweep, headers: { content-type: application/json }, body: '{\"data\":[{\"item\":\"s0\"},{\"item\":\"s1\"},{\"item\":\"s2\"},{\"item\":\"s3\"}],\"next_cursor\":null}' }"
+        - "{ path: /v2/pages, headers: { content-type: application/json }, body: '{\"data\":[{\"item\":\"A\"},{\"item\":\"B\"}],\"next_cursor\":2}' }"
+        - "{ path: /v2/pages, query: 'cursor=2', headers: { content-type: application/json }, body: '{\"data\":[{\"item\":\"C\"},{\"item\":\"D\"}],\"next_cursor\":3}' }"
+        - "{ path: /v2/pages, query: 'cursor=3', headers: { content-type: application/json }, body: '{\"data\":[{\"item\":\"E\"}],\"next_cursor\":null}' }"
   - start: {}
 
   # The release caches a one-page response.
   - query: SELECT content FROM pages WHERE request_path = '/solo'
     expect: { rows: [['{"item":"solo"}']] }
   - query: SELECT count(*) FROM pages
+    expect: { rows: [['1']] }
+    eventually: 10s
+
+  # Persist the synchronized child's release-era table before upgrading.
+  - query: SELECT content FROM parent WHERE request_path = '/solo'
+    expect: { rows: [['{"item":"solo"}']] }
+  - query: SELECT count(*) FROM child
     expect: { rows: [['1']] }
     eventually: 10s
 
@@ -66,6 +85,27 @@ steps:
     expect: { rows: [['4']] }
   - query: SELECT count(*) FROM pages
     expect: { rows: [['2']] }
+
+  # A new parent can group pages, but its release-era child cannot. Admission
+  # must decline this fanout. Force a child sweep with a one-page entry that
+  # exceeds its budget, then keep querying across another sweep interval so
+  # an asynchronous child write cannot hide a partial response.
+  - query: SELECT content FROM parent WHERE request_path = '/pages' ORDER BY content
+    expect: { rows: [['{"item":"A"}'], ['{"item":"B"}'], ['{"item":"C"}'], ['{"item":"D"}'], ['{"item":"E"}']] }
+  - query: SELECT count(*) FROM parent WHERE content <> '{"item":"solo"}'
+    expect: { rows: [['5']] }
+    eventually: 10s
+  - query: SELECT content FROM child WHERE request_path = '/sweep' ORDER BY content
+    expect: { rows: [['{"item":"s0"}'], ['{"item":"s1"}'], ['{"item":"s2"}'], ['{"item":"s3"}']] }
+  - query: SELECT count(*) >= 4 FROM child
+    expect: { rows: [['true']] }
+    eventually: 10s
+  - query: SELECT count(*) <= 3 FROM child
+    expect: { rows: [['true']] }
+    eventually: 90s
+  - query: SELECT content FROM child WHERE request_path = '/pages' ORDER BY content
+    expect: { rows: [['{"item":"A"}'], ['{"item":"B"}'], ['{"item":"C"}'], ['{"item":"D"}'], ['{"item":"E"}']] }
+    consistently: 35s
 
   # With the cached data dropped, the table starts over with the column and
   # caches the paginated response.

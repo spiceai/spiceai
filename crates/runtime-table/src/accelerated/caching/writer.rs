@@ -58,8 +58,8 @@ use tokio_util::task::TaskTracker;
 use super::{
     CACHE_NAMESPACE_COLUMN, CACHE_REQUEST_COLUMN, CACHE_WRITE_CHANNEL_CAPACITY,
     CACHE_WRITE_FLUSH_INTERVAL_MS, CacheKeyClaim, CacheRefreshHelper, CacheWriteHealth,
-    CacheWriteRequest, InFlightRevalidations, REQUEST_BODY_COLUMN, REQUEST_KEY_COLUMNS,
-    encode_request_key, namespace_filter_expr, stamp_namespace_column,
+    CacheWriteRequest, InFlightRevalidations, REQUEST_KEY_COLUMNS, namespace_filter_expr,
+    request_entry_key, stamp_namespace_column,
 };
 
 /// Maximum time a cache fill waits for its writer's queue admission.
@@ -725,11 +725,30 @@ impl CacheSinkWriter {
             })
             .collect::<Result<Vec<_>>>()?;
         let canonical = canonical_request_filters(&request.filters);
-        if request.pages == RequestPages::Paginated {
-            return self.prepare_paginated(
+        let entry_key = self
+            .schema
+            .column_with_name(CACHE_REQUEST_COLUMN)
+            .and_then(|_| request_entry_key(&request.filters));
+        let batches = self.stamp_request_key(entry_key.as_deref(), batches, reservation)?;
+        let batches = if request.pages == RequestPages::Paginated {
+            let filters = canonical.as_ref().ok_or_else(|| {
+                DataFusionError::Plan(
+                    "A cache fill from a paginated source requires filters that name one request"
+                        .into(),
+                )
+            })?;
+            self.select_paginated_rows(filters, batches, reservation)?
+        } else {
+            batches
+        };
+        if let Some(key) = entry_key {
+            // The same entry key scopes appends, replacements and empty
+            // replacements. Dimensional overlap between responses cannot make
+            // one entry's publication delete another entry's pages.
+            return self.scoped_batch(
+                vec![col(CACHE_REQUEST_COLUMN).eq(lit(key))],
                 &request.namespace_id,
                 request.replaces_existing,
-                canonical,
                 batches,
                 reservation,
             );
@@ -745,8 +764,8 @@ impl CacheSinkWriter {
         let mut filters = canonical
             .map(|filters| self.stored_columns_only(filters))
             .unwrap_or(request.filters);
-        // Include omitted request dimensions from the response so replacing one
-        // query/body does not delete other responses stored under the same path.
+        // Untagged writes use the response's dimensions to complete their
+        // replacement scope, including omitted query and body dimensions.
         if let Some(first) = batches.iter().find(|batch| batch.num_rows() > 0) {
             filters.extend(CacheRefreshHelper::extract_filters_from_row(first, 0)?);
         } else {
@@ -761,35 +780,17 @@ impl CacheSinkWriter {
         )
     }
 
-    /// The scoped write for a response from a paginated source.
-    ///
-    /// Each row stores the path and query of the page it came from, so the
-    /// first row's request key does not name the rows of the other pages, now
-    /// or in the response being replaced, and scoping to it would leave those
-    /// rows behind on replacement. A lookup for the request reads every stored row its own
-    /// request predicates select, with the request's body (see
-    /// [`super::request_identity_filters`]); the write is scoped to exactly
-    /// that set, so a replacement removes everything the lookup could read
-    /// and a fresh fill appends only where its lookup found nothing. Rows of a
-    /// page the request's predicates do not select are never read by
-    /// that lookup, and the query's own filter drops them from its answer, so
-    /// they are not stored.
-    fn prepare_paginated(
+    /// Keep only the pages selected by the request predicates. Each page
+    /// carries its own path and query; the lookup's SQL predicates also select
+    /// these dimensions when reading the response.
+    fn select_paginated_rows(
         &self,
-        namespace_id: &str,
-        replaces_existing: bool,
-        canonical: Option<Vec<Expr>>,
+        canonical: &[Expr],
         batches: Vec<RecordBatch>,
         reservation: &MemoryReservation,
-    ) -> Result<ChangeBatch> {
-        let Some(canonical) = canonical else {
-            return Err(DataFusionError::Plan(
-                "A cache fill from a paginated source requires filters that name one request"
-                    .into(),
-            ));
-        };
-        let mut filters = self.stored_columns_only(canonical);
-        let batches = batches
+    ) -> Result<Vec<RecordBatch>> {
+        let filters = self.stored_columns_only(canonical.to_vec());
+        batches
             .into_iter()
             .map(|batch| {
                 let selected = rows_matching(&batch, &filters)?;
@@ -798,58 +799,28 @@ impl CacheSinkWriter {
                 }
                 Ok(selected)
             })
-            .collect::<Result<Vec<_>>>()?;
-        let names_body = filters
-            .iter()
-            .flat_map(Expr::column_refs)
-            .any(|column| column.name == REQUEST_BODY_COLUMN);
-        if !names_body && self.schema.column_with_name(REQUEST_BODY_COLUMN).is_some() {
-            // Every page is fetched with the request's body.
-            let body = match batches.iter().find(|batch| batch.num_rows() > 0) {
-                Some(first) => {
-                    let column = first.column_by_name(REQUEST_BODY_COLUMN).ok_or_else(|| {
-                        DataFusionError::Internal("A cached row has no request body column".into())
-                    })?;
-                    ScalarValue::try_from_array(column, 0)?
-                }
-                None => ScalarValue::Utf8(Some(String::new())),
-            };
-            filters.push(if body.is_null() {
-                col(REQUEST_BODY_COLUMN).is_null()
-            } else {
-                col(REQUEST_BODY_COLUMN).eq(lit(body))
-            });
-        }
-        self.scoped_batch(
-            filters,
-            namespace_id,
-            replaces_existing,
-            batches,
-            reservation,
-        )
+            .collect()
     }
 
-    /// Sets [`CACHE_REQUEST_COLUMN`] on every row to the request key of the
-    /// write's scope, so the rows of one response, every page of it, share one
-    /// value. Batches are returned unchanged when the table does not store the
-    /// column. A scope that is not a request key leaves it NULL.
+    /// Stamp every response row with the same key used by its write scope,
+    /// including after decoding it for refresh or child initialization.
     fn stamp_request_key(
         &self,
-        scope: &[Expr],
+        key: Option<&str>,
         batches: Vec<RecordBatch>,
         reservation: &MemoryReservation,
     ) -> Result<Vec<RecordBatch>> {
         let Ok(index) = self.schema.index_of(CACHE_REQUEST_COLUMN) else {
             return Ok(batches);
         };
-        let Some(key) = encode_request_key(scope) else {
+        let Some(key) = key else {
             return Ok(batches);
         };
         batches
             .into_iter()
             .map(|batch| {
                 let stamp: ArrayRef = Arc::new(arrow::array::StringArray::from_iter_values(
-                    std::iter::repeat_n(key.as_str(), batch.num_rows()),
+                    std::iter::repeat_n(key, batch.num_rows()),
                 ));
                 reservation.try_grow(stamp.get_array_memory_size())?;
                 let mut columns = batch.columns().to_vec();
@@ -891,7 +862,6 @@ impl CacheSinkWriter {
                     .into(),
             ));
         }
-        let batches = self.stamp_request_key(&filters, batches, reservation)?;
         if self
             .schema
             .column_with_name(CACHE_NAMESPACE_COLUMN)
@@ -923,6 +893,19 @@ impl CacheSinkWriter {
         claim: Option<CacheKeyClaim>,
         completed: Option<oneshot::Sender<Result<()>>>,
     ) -> Result<()> {
+        if request.pages == RequestPages::Paginated
+            && self.schema.column_with_name(CACHE_REQUEST_COLUMN).is_none()
+        {
+            tracing::debug!(
+                "Declining paginated cache population: the destination has no request grouping column"
+            );
+            // A decline owns no storage work. Dropping the claim releases it,
+            // and synchronous observers must receive the same successful no-op.
+            if let Some(completed) = completed {
+                let _ = completed.send(Ok(()));
+            }
+            return Ok(());
+        }
         let mut claim = claim.ok_or_else(|| {
             DataFusionError::Internal(
                 "Native cache writes require exclusive scope ownership".into(),
@@ -1019,9 +1002,9 @@ pub(super) fn prepare_source_fetch(
 }
 
 /// Accept only request-key predicates that describe one request. This does not
-/// infer omitted dimensions or normalize HTTP metadata; a response row supplies
-/// them to the storage scope, or [`unsent_request_key_filters`] when the
-/// response is empty. Response predicates cannot authorize replacement.
+/// infer omitted dimensions or normalize HTTP metadata. These predicates
+/// identify the request for entry-key encoding and page selection. Response
+/// predicates cannot authorize replacement.
 pub(super) fn canonical_request_filters(filters: &[Expr]) -> Option<Vec<Expr>> {
     let mut values: BTreeMap<usize, Option<&str>> = BTreeMap::new();
     let mut pending: Vec<_> = filters.iter().collect();
@@ -1083,11 +1066,11 @@ pub(super) fn canonical_request_filters(filters: &[Expr]) -> Option<Vec<Expr>> {
     )
 }
 
-/// The request-key columns a response row would have supplied, for a response
-/// with no rows: each column `schema` stores and `filters` leave open is pinned
-/// to `''`, which the HTTP connector stores for a request part it sends no value
-/// for. A single-page fill's rows store the request's own path, query and
-/// body, so these complete the key its rows are stored under.
+/// Complete an untagged write's dimensional scope for a response with no rows:
+/// each column `schema` stores and `filters` leave open is pinned to `''`,
+/// which the HTTP connector stores for a request part it sends no value for. A
+/// single-page fill's rows store the request's own path, query and body, so
+/// these complete the key its rows are stored under.
 fn unsent_request_key_filters(filters: &[Expr], schema: &Schema) -> Vec<Expr> {
     REQUEST_KEY_COLUMNS
         .into_iter()
@@ -1203,8 +1186,8 @@ type TrackedHttpPlan = (Arc<dyn ExecutionPlan>, HttpFetchCompletion, bool);
 fn tracked_http_plan(plan: &Arc<dyn ExecutionPlan>) -> Result<Option<TrackedHttpPlan>> {
     if let Some(http) = plan.downcast_ref::<HttpExec>() {
         // The completion token also records whether the source paginates, whose
-        // rows store each page's own path and query; the writer scopes such a
-        // response by the request instead (see `CacheSinkWriter::prepare_paginated`).
+        // rows store each page's own path and query. The writer selects the
+        // pages matching the request and stamps them with one entry key.
         let eligible = http.limit().is_none() && http.partitions().len() == 1;
         let (plan, completion) = http.for_cache_fetch();
         return Ok(Some((Arc::new(plan), completion, eligible)));
@@ -1624,6 +1607,125 @@ mod tests {
             _claim: claim,
             _reservation: MemoryConsumer::new("cache publication test").register(&pool),
         }
+    }
+
+    #[tokio::test]
+    async fn caching_keyed_write_scopes_match_stamps_for_every_write_shape() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::Field;
+        use runtime_acceleration::change_sink::ChangeSinkContext;
+        use runtime_acceleration::change_sink::provider::ProviderChangeSinkBackend;
+
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, false),
+            Field::new("request_query", DataType::Utf8, false),
+            Field::new("request_body", DataType::Utf8, false),
+            Field::new("content", DataType::Utf8, false),
+        ]));
+        let storage_schema = Arc::new(
+            super::super::extend_schema_with_cache_request(
+                "scope_test",
+                &super::super::extend_schema_with_cache_namespace("scope_test", &source_schema)
+                    .expect("namespace schema"),
+            )
+            .expect("entry schema"),
+        );
+        let accelerator: Arc<dyn TableProvider> = Arc::new(
+            data_components::arrow::write::MemTable::try_new(
+                Arc::clone(&storage_schema),
+                vec![vec![]],
+            )
+            .expect("storage"),
+        );
+        let dataset = TableReference::bare("scope_test");
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let sink = ChangeSink::new(
+            Arc::new(
+                ProviderChangeSinkBackend::new(ChangeSinkContext::new(
+                    dataset.clone(),
+                    accelerator,
+                ))
+                .with_ordered_replacement(),
+            ),
+            SessionContext::new(),
+            &Handle::current(),
+            8,
+        );
+        let sender = CacheWriteSender::from_sink(
+            sink.clone(),
+            Arc::clone(&storage_schema),
+            dataset,
+            RuntimeStatus::new(),
+            Arc::new(AtomicI64::new(0)),
+            Arc::clone(&pool),
+        );
+        let CacheWriteSender::Sink(writer) = sender else {
+            panic!("native writer");
+        };
+        let filters = vec![col("request_path").eq(lit("/pages"))];
+        // The request omits query; the response's first page names cursor=2.
+        let key = r#"{"request_body":"","request_path":"/pages"}"#;
+        let expected_scope = vec![
+            namespace_filter_expr("public"),
+            col(CACHE_REQUEST_COLUMN).eq(lit(key)),
+        ];
+        for pages in [RequestPages::Single, RequestPages::Paginated] {
+            for replaces_existing in [false, true] {
+                for empty in [false, true] {
+                    let batch = if empty {
+                        RecordBatch::new_empty(Arc::clone(&source_schema))
+                    } else {
+                        RecordBatch::try_new(
+                            Arc::clone(&source_schema),
+                            vec![
+                                Arc::new(StringArray::from(vec!["/pages"])),
+                                Arc::new(StringArray::from(vec!["cursor=2"])),
+                                Arc::new(StringArray::from(vec![""])),
+                                Arc::new(StringArray::from(vec!["B"])),
+                            ],
+                        )
+                        .expect("response")
+                    };
+                    let reservation = MemoryConsumer::new("scope test").register(&pool);
+                    let prepared = writer
+                        .prepare(
+                            CacheWriteRequest {
+                                batches: vec![batch],
+                                filters: filters.clone(),
+                                cache_key: "scope".into(),
+                                namespace_id: "public".into(),
+                                replaces_existing,
+                                pages,
+                            },
+                            &reservation,
+                            false,
+                        )
+                        .expect("prepare");
+                    let rows = match &prepared {
+                        ChangeBatch::Replace { rows, .. } if replaces_existing => rows,
+                        ChangeBatch::AppendScoped { rows, .. } if !replaces_existing => rows,
+                        other => panic!("unexpected write: {other:?}"),
+                    };
+                    assert_eq!(rows.scope().filters(), expected_scope);
+                    assert_eq!(prepared.num_rows(), usize::from(!empty));
+                    for batch in rows.rows().batches() {
+                        let keys = batch
+                            .column_by_name(CACHE_REQUEST_COLUMN)
+                            .expect("entry column")
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .expect("entry strings");
+                        assert_eq!(
+                            keys.iter().collect::<Vec<_>>(),
+                            if empty { vec![] } else { vec![Some(key)] }
+                        );
+                    }
+                }
+            }
+        }
+        sink.close(Duration::from_secs(5))
+            .await
+            .expect("close sink");
     }
 
     fn foreign_buffer(buffer: Buffer, owners: &mut Vec<Weak<Buffer>>) -> Buffer {

@@ -43,6 +43,18 @@ spicepod:
       name: budget
       params: *paged
       acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 30s, caching_stale_while_revalidate_ttl: 1h, caching_max_items: '3' } }
+    - from: ${sources.api.url}/v1
+      name: query_one
+      params: *api
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 1h } }
+    - from: ${sources.api.url}/v1
+      name: query_pages
+      params: &query_paged { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0', pagination: enabled, pagination_next_pointer: /next_cursor, pagination_token_param: cursor, pagination_data_pointer: /data, pagination_max_pages: '10' }
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 1h } }
+    - from: ${sources.api.url}/v2
+      name: overlap_pages
+      params: *query_paged
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 1h } }
 
 steps:
   # Three pages under /v1/pages, linked by `next_cursor`.
@@ -53,6 +65,14 @@ steps:
         - "{ path: /v1/pages, headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"item-0\"}, {\"item\": \"item-1\"}], \"next_cursor\": 2}' }"
         - "{ path: /v1/pages, query: 'cursor=2', headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"item-2\"}, {\"item\": \"item-3\"}], \"next_cursor\": 3}' }"
         - "{ path: /v1/pages, query: 'cursor=3', headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"item-4\"}], \"next_cursor\": null}' }"
+        - "{ path: /v1/items, headers: { content-type: application/json }, body: '[{\"item\":\"broad\"}]' }"
+        - "{ path: /v1/items, query: 'x=1', headers: { content-type: application/json }, body: '[{\"item\":\"narrow\"}]' }"
+        - "{ path: /v1/query-pages, headers: { content-type: application/json }, body: '{\"data\":[{\"item\":\"A\"}],\"next_cursor\":2}' }"
+        - "{ path: /v1/query-pages, query: 'cursor=2', headers: { content-type: application/json }, body: '{\"data\":[{\"item\":\"B\"}],\"next_cursor\":3}' }"
+        - "{ path: /v1/query-pages, query: 'cursor=3', headers: { content-type: application/json }, body: '{\"data\":[{\"item\":\"C\"}],\"next_cursor\":null}' }"
+        - "{ path: /v2/pages, headers: { content-type: application/json }, body: '{\"data\":[{\"item\":\"A\"}],\"next_cursor\":2}' }"
+        - "{ path: /v2/pages, query: 'cursor=2', headers: { content-type: application/json }, body: '{\"data\":[{\"item\":\"B\"}],\"next_cursor\":3}' }"
+        - "{ path: /v2/pages, query: 'cursor=3', headers: { content-type: application/json }, body: '{\"data\":[{\"item\":\"C\"}],\"next_cursor\":null}' }"
   - start: {}
 
   # A one-page response holding one row is cached, and the cache answers.
@@ -109,3 +129,78 @@ steps:
     expect: { rows: [['0']] }
   - query: SELECT content FROM budget WHERE request_path = '/pages' ORDER BY content
     expect: { rows: [['{"item":"item-0"}'], ['{"item":"item-1"}'], ['{"item":"item-2"}'], ['{"item":"item-3"}'], ['{"item":"item-4"}']] }
+
+  # A narrower cached request must not answer an omitted query dimension.
+  - query: SELECT content FROM query_one WHERE request_path = '/items' AND request_query = 'x=1'
+    expect: { rows: [['{"item":"narrow"}']] }
+  - query: SELECT count(*) FROM query_one
+    expect: { rows: [['1']] }
+    eventually: 10s
+  - source-query: { api: count /v1/items }
+    expect: { rows: [['1']] }
+  - query: SELECT content FROM query_one WHERE request_path = '/items'
+    expect: { rows: [['{"item":"broad"}']] }
+  - source-query: { api: count /v1/items }
+    expect: { rows: [['2']] }
+  - query: SELECT count(*) FROM query_one
+    expect: { rows: [['2']] }
+    eventually: 10s
+  - query: SELECT content FROM query_one WHERE request_path = '/items'
+    expect: { rows: [['{"item":"broad"}']] }
+  - source-query: { api: count /v1/items }
+    expect: { rows: [['2']] }
+
+  # Cursor 2 stores only B; the broader request must fetch A, B and C.
+  - query: SELECT content FROM query_pages WHERE request_path = '/query-pages' AND request_query = 'cursor=2'
+    expect: { rows: [['{"item":"B"}']] }
+  - query: SELECT count(*) FROM query_pages
+    expect: { rows: [['1']] }
+    eventually: 10s
+  - source-query: { api: count /v1/query-pages }
+    expect: { rows: [['2']] }
+  - query: SELECT content FROM query_pages WHERE request_path = '/query-pages' ORDER BY content
+    expect: { rows: [['{"item":"A"}'], ['{"item":"B"}'], ['{"item":"C"}']] }
+  - source-query: { api: count /v1/query-pages }
+    expect: { rows: [['5']] }
+  - query: SELECT count(*) FROM query_pages
+    expect: { rows: [['4']] }
+    eventually: 10s
+  - query: SELECT content FROM query_pages WHERE request_path = '/query-pages' ORDER BY content
+    expect: { rows: [['{"item":"A"}'], ['{"item":"B"}'], ['{"item":"C"}']] }
+  - source-query: { api: count /v1/query-pages }
+    expect: { rows: [['5']] }
+
+  # A response-filter miss replaces only the narrow entry. The broad response
+  # must retain its original B, even after the origin changes B to B2.
+  - query: SELECT content FROM overlap_pages WHERE request_path = '/pages' ORDER BY content
+    expect: { rows: [['{"item":"A"}'], ['{"item":"B"}'], ['{"item":"C"}']] }
+  - query: SELECT count(*) FROM overlap_pages
+    expect: { rows: [['3']] }
+    eventually: 10s
+  - source-query: { api: count /v2/pages }
+    expect: { rows: [['3']] }
+  - query: SELECT content FROM overlap_pages WHERE request_path = '/pages' AND request_query = 'cursor=2'
+    expect: { rows: [['{"item":"B"}']] }
+  - query: SELECT count(*) FROM overlap_pages
+    expect: { rows: [['4']] }
+    eventually: 10s
+  - source-query: { api: count /v2/pages }
+    expect: { rows: [['5']] }
+  - source-exec:
+      api: "{ path: /v2/pages, query: 'cursor=2', headers: { content-type: application/json }, body: '{\"data\":[{\"item\":\"B2\"}],\"next_cursor\":3}' }"
+  - query: SELECT content FROM overlap_pages WHERE request_path = '/pages' AND request_query = 'cursor=2' AND content = '{"item":"B2"}'
+    expect: { rows: [['{"item":"B2"}']] }
+  - source-query: { api: count /v2/pages }
+    expect: { rows: [['7']] }
+  # Poll the stored rows, without another request, until replacement publishes.
+  - query: SELECT content FROM overlap_pages ORDER BY content
+    expect: { rows: [['{"item":"A"}'], ['{"item":"B"}'], ['{"item":"B2"}'], ['{"item":"C"}']] }
+    eventually: 10s
+  - query: SELECT content FROM overlap_pages WHERE request_path = '/pages' ORDER BY content
+    expect: { rows: [['{"item":"A"}'], ['{"item":"B"}'], ['{"item":"C"}']] }
+  - source-query: { api: count /v2/pages }
+    expect: { rows: [['7']] }
+  - query: SELECT content FROM overlap_pages WHERE request_path = '/pages' AND request_query = 'cursor=2'
+    expect: { rows: [['{"item":"B2"}']] }
+  - source-query: { api: count /v2/pages }
+    expect: { rows: [['7']] }

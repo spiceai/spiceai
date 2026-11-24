@@ -2288,6 +2288,12 @@ impl AcceleratedTable {
             storage_filters.push(nf);
         }
         storage_filters.extend(identity_filters);
+        if is_caching_mode {
+            storage_filters.extend(caching::request_entry_filters(
+                filters,
+                &self.accelerator.schema(),
+            ));
+        }
         let scan_filters: &[Expr] = if is_caching_mode {
             &storage_filters
         } else {
@@ -2954,6 +2960,7 @@ fn extend_projection_for_caching(
     for col in [
         caching::CACHE_REFRESHED_AT_COLUMN,
         caching::CACHE_NAMESPACE_COLUMN,
+        caching::CACHE_REQUEST_COLUMN,
     ] {
         let Ok(idx) = schema.index_of(col) else {
             continue;
