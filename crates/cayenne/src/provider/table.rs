@@ -35786,6 +35786,22 @@ impl CayenneTableProvider {
         live_rows: Option<u64>,
     ) {
         let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
+        if accumulator.row_count() == 0 {
+            // The overwrite's commit cleared the record, but a maintenance pass for
+            // the replaced rows can write one again between that commit and the
+            // flip that starts the new epoch. With no rows there is no record to
+            // write over it, so clear it again.
+            if let Err(e) = self
+                .catalog
+                .clear_table_statistics(&self.table_metadata.table_id)
+                .await
+            {
+                self.abandon_table_stats_update(&format!(
+                    "the statistics record of the replaced rows could not be cleared: {e}"
+                ));
+            }
+            return;
+        }
         // The accumulator counts every row written; an overwrite that hid some of
         // them with position deletes passes the rows that stay live.
         let new_rows = live_rows.map_or_else(
@@ -74101,6 +74117,90 @@ mod tests {
             drained_row_counts(&provider, &catalog).await,
             ((2, true), DFPrecision::Exact(2))
         );
+    }
+
+    /// A maintenance pass that persists a write's statistics after an overwrite
+    /// commits but before its in-memory flip must not leave the replaced rows'
+    /// count in the metastore, where a reopen serves it as exact.
+    #[tokio::test]
+    async fn overwrite_replaces_statistics_persisted_between_its_commit_and_flip() {
+        for (overwrite_rows, expected) in [(0_i64, None), (2, Some((2, true)))] {
+            let table_name = format!("overwrite_commit_flip_window_{overwrite_rows}");
+            let ctx = SessionContext::new();
+            let (provider, catalog, _tmp) =
+                create_append_only_table(&table_name, ctx.runtime_env()).await;
+            let table_id = provider.table_metadata.table_id.clone();
+            let schema = Arc::clone(&provider.table_metadata.schema);
+
+            let (hook, entered, release) = parking_hook();
+            *provider.test_pre_maintenance_statistics_hook.lock() = Some(hook);
+            insert_batch(
+                &provider,
+                id_value_batch_for_range(Arc::clone(&schema), 0, 3),
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(30), entered)
+                .await
+                .expect("maintenance takes the insert's statistics")
+                .expect("maintenance reports the take");
+
+            let prepared = provider
+                .begin_overwrite(
+                    single_batch_stream(id_value_batch_for_range(schema, 100, overwrite_rows)),
+                    1,
+                )
+                .await
+                .expect("begin the overwrite");
+            prepared
+                .apply_owned_txn()
+                .await
+                .expect("commit the overwrite");
+            release.send(()).expect("release maintenance");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let persisted = catalog
+                    .get_table_statistics(&table_id)
+                    .await
+                    .expect("read table statistics");
+                if persisted.is_some() {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "maintenance never persisted the insert's statistics, so the window \
+                     this test exists to cover never opened"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            prepared.finish().await.expect("publish the overwrite");
+            provider
+                .drain_in_flight_maintenance()
+                .await
+                .expect("drain post-write maintenance");
+
+            let persisted = catalog
+                .get_table_statistics(&table_id)
+                .await
+                .expect("read table statistics")
+                .map(|stats| (stats.num_rows, stats.num_rows_exact));
+            assert_eq!(persisted, expected, "overwrite with {overwrite_rows} rows");
+            drop(provider);
+            let reopened =
+                CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+                    .open(&table_name)
+                    .await
+                    .expect("reopen the table");
+            let served = reopened
+                .optimizer_table_statistics()
+                .map(|stats| stats.num_rows);
+            let expected_served = expected.map(|(rows, _)| {
+                DFPrecision::Exact(usize::try_from(rows).expect("row count fits"))
+            });
+            assert_eq!(
+                served, expected_served,
+                "reopened after an overwrite with {overwrite_rows} rows"
+            );
+        }
     }
 
     /// A pipelined staged append that published its rows before an overwrite
