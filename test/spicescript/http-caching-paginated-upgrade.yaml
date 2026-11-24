@@ -1,0 +1,85 @@
+name: http-caching-paginated-upgrade
+description: >
+  A Cayenne file caching acceleration written by a release, whose table has no
+  column grouping the pages of a response, is served by the binary under test
+  without a schema warning: its cached entries still answer, new one-page
+  responses are cached into it, and a paginated response is answered whole
+  but not cached, since that table cannot evict its pages together. Dropping
+  the cached data lets the dataset start over with the grouping column, and
+  the paginated response is then cached.
+
+from: 2.4.x
+
+sources:
+  api: { kind: mock-http }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: http-caching-paginated-upgrade
+  runtime:
+    caching: { sql_results: { enabled: false } }
+  datasets:
+    - from: ${sources.api.url}/v1
+      name: pages
+      params: { file_format: json, allowed_request_paths: '/*', max_retries: '0', response_cache_max_size_bytes: '0', pagination: enabled, pagination_next_pointer: /next_cursor, pagination_token_param: cursor, pagination_data_pointer: /data, pagination_max_pages: '10' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 1h } }
+
+steps:
+  - source-exec:
+      api:
+        - "{ path: /v1/solo, headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"solo\"}], \"next_cursor\": null}' }"
+        - "{ path: /v1/other, headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"other\"}], \"next_cursor\": null}' }"
+        - "{ path: /v1/pages, headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"item-0\"}, {\"item\": \"item-1\"}], \"next_cursor\": 2}' }"
+        - "{ path: /v1/pages, query: 'cursor=2', headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"item-2\"}], \"next_cursor\": null}' }"
+  - start: {}
+
+  # The release caches a one-page response.
+  - query: SELECT content FROM pages WHERE request_path = '/solo'
+    expect: { rows: [['{"item":"solo"}']] }
+  - query: SELECT count(*) FROM pages
+    expect: { rows: [['1']] }
+    eventually: 10s
+
+  - upgrade: {}
+  - assert-log: { lacks: ["keeps the schema its existing acceleration was built with"] }
+
+  # The release's entry still answers, without a request.
+  - query: SELECT content FROM pages WHERE request_path = '/solo'
+    expect: { rows: [['{"item":"solo"}']] }
+  - source-query: { api: count /v1/solo }
+    expect: { rows: [['1']] }
+
+  # A new one-page response is cached into the release's table.
+  - query: SELECT content FROM pages WHERE request_path = '/other'
+    expect: { rows: [['{"item":"other"}']] }
+  - query: SELECT count(*) FROM pages
+    expect: { rows: [['2']] }
+    eventually: 10s
+
+  # A paginated response is answered whole, and not cached into that table.
+  - query: SELECT content FROM pages WHERE request_path = '/pages' ORDER BY content
+    expect: { rows: [['{"item":"item-0"}'], ['{"item":"item-1"}'], ['{"item":"item-2"}']] }
+  - query: SELECT content FROM pages WHERE request_path = '/pages' ORDER BY content
+    expect: { rows: [['{"item":"item-0"}'], ['{"item":"item-1"}'], ['{"item":"item-2"}']] }
+  - source-query: { api: count /v1/pages }
+    expect: { rows: [['4']] }
+  - query: SELECT count(*) FROM pages
+    expect: { rows: [['2']] }
+
+  # With the cached data dropped, the table starts over with the column and
+  # caches the paginated response.
+  - stop: {}
+  - wipe-instance-dir: {}
+  - start: {}
+  - query: SELECT content FROM pages WHERE request_path = '/pages' ORDER BY content
+    expect: { rows: [['{"item":"item-0"}'], ['{"item":"item-1"}'], ['{"item":"item-2"}']] }
+  - query: SELECT count(*) FROM pages
+    expect: { rows: [['3']] }
+    eventually: 10s
+  - restart: {}
+  - assert-log: { lacks: ["keeps the schema its existing acceleration was built with"] }
+  - query: SELECT content FROM pages WHERE request_path = '/pages' ORDER BY content
+    expect: { rows: [['{"item":"item-0"}'], ['{"item":"item-1"}'], ['{"item":"item-2"}']] }
+  - source-query: { api: count /v1/pages }
+    expect: { rows: [['6']] }

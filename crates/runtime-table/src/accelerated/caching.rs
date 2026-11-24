@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -537,6 +538,120 @@ pub const CACHE_NAMESPACE_COLUMN: &str = "__spice_cache_namespace";
 #[must_use]
 pub fn is_reserved_caching_column(name: &str) -> bool {
     name.eq_ignore_ascii_case(CACHE_NAMESPACE_COLUMN)
+        || name.eq_ignore_ascii_case(CACHE_REQUEST_COLUMN)
+}
+
+/// Storage-only column naming the request a cached row was fetched for, so
+/// every row of one response shares a value even when pagination stored each
+/// page under its own path and query. Eviction, retention and the scheduled
+/// refresh treat the rows that share it as one entry, so none of them can
+/// leave part of a response to be served as though it were whole.
+///
+/// It holds the request's key as [`encode_request_key`] writes it. Nullable:
+/// a row written by a runtime that does not stamp it reads as NULL, and is
+/// kept and evicted as before. Hidden from the user-facing schema, like
+/// [`CACHE_NAMESPACE_COLUMN`].
+pub const CACHE_REQUEST_COLUMN: &str = "__spice_cache_request";
+
+/// The request-key predicates in `filters`, `column = 'value'` or
+/// `column IS NULL` over [`REQUEST_KEY_COLUMNS`], encoded as a JSON object
+/// with the columns in a fixed order and `null` for `IS NULL`. `None` when a
+/// filter is anything else, so such a write stores no key.
+#[must_use]
+pub fn encode_request_key(filters: &[Expr]) -> Option<String> {
+    let mut key = BTreeMap::<&str, Option<String>>::new();
+    for filter in filters {
+        let (column, value) = match filter {
+            Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Eq => {
+                match (binary.left.as_ref(), binary.right.as_ref()) {
+                    (
+                        Expr::Column(column),
+                        Expr::Literal(
+                            ScalarValue::Utf8(Some(value))
+                            | ScalarValue::LargeUtf8(Some(value))
+                            | ScalarValue::Utf8View(Some(value)),
+                            _,
+                        ),
+                    ) => (column, Some(value.clone())),
+                    _ => return None,
+                }
+            }
+            Expr::IsNull(inner) => match inner.as_ref() {
+                Expr::Column(column) => (column, None),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let name = REQUEST_KEY_COLUMNS
+            .into_iter()
+            .find(|name| *name == column.name)?;
+        if let Some(previous) = key.insert(name, value.clone())
+            && previous != value
+        {
+            return None;
+        }
+    }
+    if key.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&key).ok()
+}
+
+/// The predicates [`encode_request_key`] encoded, or `None` for a value it
+/// did not write.
+#[must_use]
+pub fn decode_request_key(encoded: &str) -> Option<Vec<Expr>> {
+    let key: BTreeMap<String, Option<String>> = serde_json::from_str(encoded).ok()?;
+    if key.is_empty() {
+        return None;
+    }
+    key.into_iter()
+        .map(|(name, value)| {
+            let name = REQUEST_KEY_COLUMNS
+                .into_iter()
+                .find(|known| *known == name)?;
+            Some(match value {
+                Some(value) => col(name).eq(lit(value)),
+                None => col(name).is_null(),
+            })
+        })
+        .collect()
+}
+
+/// Appends [`CACHE_REQUEST_COLUMN`] to a caching accelerator's storage schema,
+/// after any [`CACHE_NAMESPACE_COLUMN`].
+///
+/// # Errors
+///
+/// Returns a `DataFusionError` if `schema` already defines a column whose name
+/// matches [`CACHE_REQUEST_COLUMN`] ignoring case.
+pub fn extend_schema_with_cache_request(
+    dataset_name: &str,
+    schema: &arrow::datatypes::Schema,
+) -> DataFusionResult<arrow::datatypes::Schema> {
+    use arrow::datatypes::Field;
+    if schema
+        .fields()
+        .iter()
+        .any(|f| f.name().eq_ignore_ascii_case(CACHE_REQUEST_COLUMN))
+    {
+        return Err(DataFusionError::Plan(format!(
+            "dataset `{dataset_name}` declares a column named `{CACHE_REQUEST_COLUMN}` (case-insensitive match), which is reserved by the caching accelerator. Rename the source column to avoid this name.",
+        )));
+    }
+    let mut fields: Vec<Field> = schema.fields().iter().map(|f| (**f).clone()).collect();
+    fields.push(
+        Field::new(CACHE_REQUEST_COLUMN, arrow::datatypes::DataType::Utf8, true).with_metadata(
+            HashMap::from([(
+                arrow_tools::metadata_keys::OPTIONAL_TRAILING_COLUMN_METADATA_KEY.to_string(),
+                "true".to_string(),
+            )]),
+        ),
+    );
+    Ok(arrow::datatypes::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
 }
 
 /// Returns a copy of `batch` with [`CACHE_NAMESPACE_COLUMN`] appended,
@@ -1865,6 +1980,11 @@ fn as_timestamp_nanosecond_array(array: &ArrayRef) -> DataFusionResult<ArrayRef>
 struct StaleCacheEntry {
     filters: Vec<Expr>,
     namespace: Option<String>,
+    /// The stored [`CACHE_REQUEST_COLUMN`] value the filters were decoded
+    /// from: the entry is every row carrying it, possibly several pages. `None`
+    /// for rows stored without it, whose entry is their own path, query and
+    /// body.
+    request_key: Option<String>,
 }
 
 /// What a revalidation learned about the source.
@@ -2171,6 +2291,7 @@ impl CacheRefreshHelper {
             let StaleCacheEntry {
                 filters: row_filters,
                 namespace,
+                request_key: _,
             } = entry;
 
             async move {
@@ -2208,6 +2329,7 @@ impl CacheRefreshHelper {
                     None,
                     cache_write_tx.task_context(&session_state),
                     cache_write_tx.memory_pool(),
+                    cache_write_tx.stores_paginated_responses(),
                 )
                 .await?;
 
@@ -2350,6 +2472,7 @@ impl CacheRefreshHelper {
             None,
             batch_write_tx.task_context(session_state),
             batch_write_tx.memory_pool(),
+            batch_write_tx.stores_paginated_responses(),
         )
         .await?;
 
@@ -2453,9 +2576,27 @@ impl CacheRefreshHelper {
 
         for batch in batches {
             let namespaces = batch.column_by_name(CACHE_NAMESPACE_COLUMN);
+            let request_keys = batch.column_by_name(CACHE_REQUEST_COLUMN);
 
             for row_idx in 0..batch.num_rows() {
-                let filters = Self::extract_filters_from_row(batch, row_idx)?;
+                // A response's rows share the request they were fetched for,
+                // which may span pages stored under their own path and query;
+                // replay that request once rather than each page's.
+                let stored_key = match request_keys {
+                    Some(array) => match ScalarValue::try_from_array(array, row_idx)? {
+                        ScalarValue::Utf8(Some(value))
+                        | ScalarValue::LargeUtf8(Some(value))
+                        | ScalarValue::Utf8View(Some(value)) => {
+                            decode_request_key(&value).map(|filters| (value, filters))
+                        }
+                        _ => None,
+                    },
+                    None => None,
+                };
+                let (request_key, filters) = match stored_key {
+                    Some((key, filters)) => (Some(key), filters),
+                    None => (None, Self::extract_filters_from_row(batch, row_idx)?),
+                };
                 let namespace = match namespaces {
                     Some(array) => match ScalarValue::try_from_array(array, row_idx)? {
                         ScalarValue::Utf8(Some(value))
@@ -2476,7 +2617,11 @@ impl CacheRefreshHelper {
                     None => compute_cache_key_from_filters(&filters),
                 };
                 if seen_filter_keys.insert(cache_key) {
-                    entries.push(StaleCacheEntry { filters, namespace });
+                    entries.push(StaleCacheEntry {
+                        filters,
+                        namespace,
+                        request_key,
+                    });
                 }
             }
         }
@@ -3072,6 +3217,16 @@ impl CacheRefreshHelper {
                 {
                     filters.push(namespace_filter_expr(namespace_id));
                 }
+                // The group is the rows stored for one request, which other
+                // entries' predicates may also select.
+                if let Some(key) = &entry.request_key
+                    && batches[0]
+                        .schema()
+                        .column_with_name(CACHE_REQUEST_COLUMN)
+                        .is_some()
+                {
+                    filters.push(col(CACHE_REQUEST_COLUMN).eq(lit(key.as_str())));
+                }
                 let predicate = combine_exprs_balanced(filters, Expr::and).ok_or_else(|| {
                     DataFusionError::Plan("A cached group requires a replacement predicate".into())
                 })?;
@@ -3087,8 +3242,13 @@ impl CacheRefreshHelper {
                 cache_key: claim.key().to_string(),
                 namespace_id: namespace_id.into(),
                 replaces_existing: true,
-                // Each group is one stored path, query and body.
-                pages: RequestPages::Single,
+                // A group stored under a request key may span pages; one
+                // stored without it is one path, query and body.
+                pages: if entry.request_key.is_some() {
+                    RequestPages::Paginated
+                } else {
+                    RequestPages::Single
+                },
             };
             child.writer.send_claimed_and_wait(request, claim).await?;
         }
@@ -3140,6 +3300,7 @@ impl CacheRefreshHelper {
             limit,
             task_context,
             None,
+            false,
         )
         .await
         .map(|fetch| fetch.batches)
@@ -3153,6 +3314,7 @@ impl CacheRefreshHelper {
         limit: Option<usize>,
         task_context: Arc<TaskContext>,
         memory_pool: Option<&Arc<dyn MemoryPool>>,
+        stores_paginated_responses: bool,
     ) -> DataFusionResult<CacheFetch> {
         tracing::debug!(
             "Fetching from source for dataset {dataset_name} with {} filters, limit={limit:?}",
@@ -3199,7 +3361,8 @@ impl CacheRefreshHelper {
         let complete = completion
             .as_ref()
             .and_then(data_components::http::provider::HttpFetchCompletion::complete_request)
-            .filter(|_| memory_pool.is_none() || charge.is_some());
+            .filter(|_| memory_pool.is_none() || charge.is_some())
+            .filter(|pages| *pages == RequestPages::Single || stores_paginated_responses);
 
         tracing::debug!(
             "Federated source returned {} batches for dataset={}",
@@ -3388,6 +3551,7 @@ impl CacheRefreshHelper {
             limit,
             batch_write_tx.task_context(session_state),
             batch_write_tx.memory_pool(),
+            batch_write_tx.stores_paginated_responses(),
         )
         .await
         {
@@ -3464,7 +3628,7 @@ impl CacheRefreshHelper {
                     let native = batch_write_tx.requires_complete_fetch();
                     if native && complete.is_none() {
                         tracing::debug!(
-                            "Not caching the response for dataset '{dataset_name}': the fetch is not proven to hold the whole response of one request (a row limit, several requests, a page cap, or an uncharged response)"
+                            "Not caching the response for dataset '{dataset_name}': the fetch is not proven to hold the whole response of one request (a row limit, several requests, a page cap, an uncharged response, or a paginated response the table cannot group)"
                         );
                     }
                     if (native && complete.is_some() && (total_rows > 0 || !response_filtered))
@@ -5280,6 +5444,7 @@ mod pool_tests {
                 None,
                 state.task_ctx(),
                 Some(&pool),
+                true,
             )
             .await
             .expect("initial HTTP fetch");

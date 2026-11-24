@@ -1,0 +1,114 @@
+# Regression test for #16676: a Cayenne caching acceleration over a paginated
+# HTTP API cached none of a paginated response.
+name: http-caching-paginated
+description: >
+  A Cayenne caching acceleration over a paginated HTTP API caches every page
+  of a response, as it caches a one-page response holding one row or several,
+  and answers a repeated lookup from the cache. Eviction under
+  caching_max_items takes a paginated response whole: the cache never holds
+  some of its pages without the others, which a lookup would serve as though
+  it were the whole response.
+
+sources:
+  api: { kind: mock-http }
+
+variants:
+  cayenne: cayenne-file
+  cayenne-memory: cayenne-memory
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: http-caching-paginated
+  runtime:
+    caching: { sql_results: { enabled: false } }
+  datasets:
+    - from: ${sources.api.url}/v1
+      name: one
+      params: &api { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0' }
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 1h } }
+    - from: ${sources.api.url}/v1
+      name: many
+      params: *api
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 1h } }
+    - from: ${sources.api.url}/v1
+      name: pages
+      params: &paged { file_format: json, allowed_request_paths: '/*', max_retries: '0', response_cache_max_size_bytes: '0', pagination: enabled, pagination_next_pointer: /next_cursor, pagination_token_param: cursor, pagination_data_pointer: /data, pagination_max_pages: '10' }
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 1h } }
+    # One item: holding the paginated response and another, a sweep must
+    # evict one of them whole. A 30s TTL sweeps every 30s; the
+    # stale-while-revalidate window keeps expiry from evicting both first.
+    - from: ${sources.api.url}/v1
+      name: budget
+      params: *paged
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 30s, caching_stale_while_revalidate_ttl: 1h, caching_max_items: '1' } }
+
+steps:
+  # Three pages under /v1/pages, linked by `next_cursor`, and a one-page
+  # response under /v1/solo.
+  - source-exec:
+      api:
+        - "{ path: /v1/a, headers: { content-type: application/json }, body: '[{\"k\": \"a\", \"v\": 1}]' }"
+        - "{ path: /v1/m, headers: { content-type: application/json }, body: '[{\"k\": \"m\", \"v\": 1}, {\"k\": \"m\", \"v\": 2}, {\"k\": \"m\", \"v\": 3}]' }"
+        - "{ path: /v1/pages, headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"item-0\"}, {\"item\": \"item-1\"}], \"next_cursor\": 2}' }"
+        - "{ path: /v1/pages, query: 'cursor=2', headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"item-2\"}, {\"item\": \"item-3\"}], \"next_cursor\": 3}' }"
+        - "{ path: /v1/pages, query: 'cursor=3', headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"item-4\"}], \"next_cursor\": null}' }"
+        - "{ path: /v1/solo, headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"solo\"}], \"next_cursor\": null}' }"
+  - start: {}
+
+  # A one-page response holding one row is cached, and the cache answers.
+  - query: SELECT content FROM one WHERE request_path = '/a'
+    expect: { rows: [['{"k":"a","v":1}']] }
+  - query: SELECT count(*) FROM one
+    expect: { rows: [['1']] }
+    eventually: 10s
+  - query: SELECT content FROM one WHERE request_path = '/a'
+    expect: { rows: [['{"k":"a","v":1}']] }
+  - source-query: { api: count /v1/a }
+    expect: { rows: [['1']] }
+
+  # So is one holding three rows under one request key.
+  - query: SELECT content FROM many WHERE request_path = '/m' ORDER BY content
+    expect: { rows: [['{"k":"m","v":1}'], ['{"k":"m","v":2}'], ['{"k":"m","v":3}']] }
+  - query: SELECT count(*) FROM many
+    expect: { rows: [['3']] }
+    eventually: 10s
+  - source-query: { api: count /v1/m }
+    expect: { rows: [['1']] }
+
+  # A paginated response returns every page's rows; they are cached too, each
+  # with the path and query of its own page, and a repeated lookup is answered
+  # from the cache without asking the origin again.
+  - query: SELECT content FROM pages WHERE request_path = '/pages' ORDER BY content
+    expect: { rows: [['{"item":"item-0"}'], ['{"item":"item-1"}'], ['{"item":"item-2"}'], ['{"item":"item-3"}'], ['{"item":"item-4"}']] }
+  - query: SELECT count(*) FROM pages
+    expect: { rows: [['5']] }
+    eventually: 10s
+  - query: SELECT request_query, count(*) FROM pages GROUP BY request_query ORDER BY request_query
+    expect: { rows: [['', '2'], ['cursor=2', '2'], ['cursor=3', '1']] }
+  - source-query: { api: count /v1/pages }
+    expect: { rows: [['3']] }
+  - query: SELECT content FROM pages WHERE request_path = '/pages' ORDER BY content
+    expect: { rows: [['{"item":"item-0"}'], ['{"item":"item-1"}'], ['{"item":"item-2"}'], ['{"item":"item-3"}'], ['{"item":"item-4"}']] }
+  - source-query: { api: count /v1/pages }
+    expect: { rows: [['3']] }
+  # The storage-only request column stays out of the dataset's columns.
+  - query: SELECT count(*) FROM information_schema.columns WHERE table_name = 'pages' AND column_name IN ('__spice_cache_request', '__spice_cache_namespace')
+    expect: { rows: [['0']] }
+
+  # Over budget, a sweep evicts an entry: the three-page response whole, or
+  # the one-page response, never some of the pages.
+  - query: SELECT content FROM budget WHERE request_path = '/pages' ORDER BY content
+    expect: { rows: [['{"item":"item-0"}'], ['{"item":"item-1"}'], ['{"item":"item-2"}'], ['{"item":"item-3"}'], ['{"item":"item-4"}']] }
+  - query: SELECT content FROM budget WHERE request_path = '/solo'
+    expect: { rows: [['{"item":"solo"}']] }
+  - query: SELECT count(*) FROM budget
+    expect: { rows: [['6']] }
+    eventually: 10s
+  - query: SELECT count(*) < 6 FROM budget
+    expect: { rows: [['true']] }
+    eventually: 90s
+  - query: SELECT sum(CASE WHEN request_path = '/pages' THEN 1 ELSE 0 END) IN (0, 5) FROM budget
+    expect: { rows: [['true']] }
+  - query: SELECT content FROM budget WHERE request_path = '/pages' ORDER BY content
+    expect: { rows: [['{"item":"item-0"}'], ['{"item":"item-1"}'], ['{"item":"item-2"}'], ['{"item":"item-3"}'], ['{"item":"item-4"}']] }

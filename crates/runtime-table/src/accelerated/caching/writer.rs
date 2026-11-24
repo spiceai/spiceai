@@ -56,9 +56,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::task::TaskTracker;
 
 use super::{
-    CACHE_NAMESPACE_COLUMN, CACHE_WRITE_CHANNEL_CAPACITY, CACHE_WRITE_FLUSH_INTERVAL_MS,
-    CacheKeyClaim, CacheRefreshHelper, CacheWriteHealth, CacheWriteRequest, InFlightRevalidations,
-    REQUEST_BODY_COLUMN, REQUEST_KEY_COLUMNS, namespace_filter_expr, stamp_namespace_column,
+    CACHE_NAMESPACE_COLUMN, CACHE_REQUEST_COLUMN, CACHE_WRITE_CHANNEL_CAPACITY,
+    CACHE_WRITE_FLUSH_INTERVAL_MS, CacheKeyClaim, CacheRefreshHelper, CacheWriteHealth,
+    CacheWriteRequest, InFlightRevalidations, REQUEST_BODY_COLUMN, REQUEST_KEY_COLUMNS,
+    encode_request_key, namespace_filter_expr, stamp_namespace_column,
 };
 
 /// Maximum time a cache fill waits for its writer's queue admission.
@@ -601,6 +602,25 @@ impl CacheWriteSender {
         matches!(self, Self::Sink(_))
     }
 
+    /// Whether this writer may store a response from a paginated source.
+    ///
+    /// A native writer stores one only into a table that keeps
+    /// [`CACHE_REQUEST_COLUMN`]: without it, eviction and refresh would treat
+    /// each page as its own entry and could leave part of the response to be
+    /// served as though it were whole. A table created before the column was
+    /// introduced therefore caches only responses from sources that do not
+    /// paginate.
+    #[must_use]
+    pub fn stores_paginated_responses(&self) -> bool {
+        match self {
+            Self::Sink(writer) => writer
+                .schema
+                .column_with_name(CACHE_REQUEST_COLUMN)
+                .is_some(),
+            Self::Batched(_) => true,
+        }
+    }
+
     /// Send to a batched cache consumer. Native writes require `send_claimed`
     /// so exclusive scope ownership spans observation, fetch and publication.
     ///
@@ -705,8 +725,8 @@ impl CacheSinkWriter {
             })
             .collect::<Result<Vec<_>>>()?;
         let canonical = canonical_request_filters(&request.filters);
-        if request.pages == RequestPages::Followed {
-            return self.prepare_followed_pages(
+        if request.pages == RequestPages::Paginated {
+            return self.prepare_paginated(
                 &request.namespace_id,
                 request.replaces_existing,
                 canonical,
@@ -741,20 +761,20 @@ impl CacheSinkWriter {
         )
     }
 
-    /// The scoped write for a response that followed further pages.
+    /// The scoped write for a response from a paginated source.
     ///
     /// Each row stores the path and query of the page it came from, so the
-    /// first row's request key does not name the rows of the others, and
-    /// scoping to it would leave the other pages' earlier rows behind on
-    /// replacement. A lookup for the request reads every stored row its own
+    /// first row's request key does not name the rows of the other pages, now
+    /// or in the response being replaced, and scoping to it would leave those
+    /// rows behind on replacement. A lookup for the request reads every stored row its own
     /// request predicates select, with the request's body (see
     /// [`super::request_identity_filters`]); the write is scoped to exactly
     /// that set, so a replacement removes everything the lookup could read
     /// and a fresh fill appends only where its lookup found nothing. Rows of a
-    /// followed page the request's predicates do not select are never read by
+    /// page the request's predicates do not select are never read by
     /// that lookup, and the query's own filter drops them from its answer, so
     /// they are not stored.
-    fn prepare_followed_pages(
+    fn prepare_paginated(
         &self,
         namespace_id: &str,
         replaces_existing: bool,
@@ -764,7 +784,8 @@ impl CacheSinkWriter {
     ) -> Result<ChangeBatch> {
         let Some(canonical) = canonical else {
             return Err(DataFusionError::Plan(
-                "A cache fill that followed pages requires filters that name one request".into(),
+                "A cache fill from a paginated source requires filters that name one request"
+                    .into(),
             ));
         };
         let mut filters = self.stored_columns_only(canonical);
@@ -808,6 +829,41 @@ impl CacheSinkWriter {
         )
     }
 
+    /// Sets [`CACHE_REQUEST_COLUMN`] on every row to the request key of the
+    /// write's scope, so the rows of one response, every page of it, share one
+    /// value. Batches are returned unchanged when the table does not store the
+    /// column. A scope that is not a request key leaves it NULL.
+    fn stamp_request_key(
+        &self,
+        scope: &[Expr],
+        batches: Vec<RecordBatch>,
+        reservation: &MemoryReservation,
+    ) -> Result<Vec<RecordBatch>> {
+        let Ok(index) = self.schema.index_of(CACHE_REQUEST_COLUMN) else {
+            return Ok(batches);
+        };
+        let Some(key) = encode_request_key(scope) else {
+            return Ok(batches);
+        };
+        batches
+            .into_iter()
+            .map(|batch| {
+                let stamp: ArrayRef = Arc::new(arrow::array::StringArray::from_iter_values(
+                    std::iter::repeat_n(key.as_str(), batch.num_rows()),
+                ));
+                reservation.try_grow(stamp.get_array_memory_size())?;
+                let mut columns = batch.columns().to_vec();
+                let target = columns.get_mut(index).ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "A cache write has no '{CACHE_REQUEST_COLUMN}' column"
+                    ))
+                })?;
+                *target = arrow::compute::cast(&stamp, target.data_type())?;
+                Ok(RecordBatch::try_new(batch.schema(), columns)?)
+            })
+            .collect()
+    }
+
     /// Request predicates on columns this accelerator stores.
     fn stored_columns_only(&self, filters: Vec<Expr>) -> Vec<Expr> {
         filters
@@ -835,6 +891,7 @@ impl CacheSinkWriter {
                     .into(),
             ));
         }
+        let batches = self.stamp_request_key(&filters, batches, reservation)?;
         if self
             .schema
             .column_with_name(CACHE_NAMESPACE_COLUMN)
@@ -1145,10 +1202,9 @@ type TrackedHttpPlan = (Arc<dyn ExecutionPlan>, HttpFetchCompletion, bool);
 
 fn tracked_http_plan(plan: &Arc<dyn ExecutionPlan>) -> Result<Option<TrackedHttpPlan>> {
     if let Some(http) = plan.downcast_ref::<HttpExec>() {
-        // The completion token also records whether execution followed another
-        // page, whose rows store that page's own path and query; the writer
-        // scopes such a response by the request instead (see
-        // `CacheSinkWriter::prepare_followed_pages`).
+        // The completion token also records whether the source paginates, whose
+        // rows store each page's own path and query; the writer scopes such a
+        // response by the request instead (see `CacheSinkWriter::prepare_paginated`).
         let eligible = http.limit().is_none() && http.partitions().len() == 1;
         let (plan, completion) = http.for_cache_fetch();
         return Ok(Some((Arc::new(plan), completion, eligible)));

@@ -81,6 +81,15 @@ pub const ACCELERATION_PRIMARY_KEY_METADATA_KEY: &str = "spice.acceleration_prim
 /// `[{ "columns": ["email"], "unique": true }]`.
 pub const INFERRED_INDEXES_METADATA_KEY: &str = "spice.inferred_indexes";
 
+/// Field-level metadata key marking a nullable column appended at the end of an
+/// acceleration's storage schema that a table created without it may lack.
+///
+/// The value is `"true"`. An accelerator opening an existing table whose stored
+/// schema is the requested one without such trailing columns keeps the stored
+/// schema, without reporting a schema change: the caller detects the column's
+/// absence from the opened table and works without it.
+pub const OPTIONAL_TRAILING_COLUMN_METADATA_KEY: &str = "spice.optional_trailing_column";
+
 /// Schema-level metadata key for inferred sort/clustering columns (schema inference).
 ///
 /// The value is a JSON array of objects in sort order, each with a direction:

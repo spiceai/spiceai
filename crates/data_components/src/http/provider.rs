@@ -2649,6 +2649,11 @@ impl HttpExec {
     #[must_use]
     pub fn for_cache_fetch(&self) -> (Self, HttpFetchCompletion) {
         let completion = HttpFetchCompletion::new(self.partitions.len());
+        let completion = if self.provider.is_paginated() {
+            completion.for_paginated_source()
+        } else {
+            completion
+        };
         let mut plan = self.clone();
         plan.completion = Some(completion.clone());
         plan.metrics = ExecutionPlanMetricsSet::new();
