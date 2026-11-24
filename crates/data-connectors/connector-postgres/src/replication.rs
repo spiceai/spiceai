@@ -199,8 +199,7 @@ pub(crate) async fn load_write_back_xid_registry(
     context: &dyn ConnectorContext,
 ) -> Result<Arc<XidRegistry>, Box<dyn std::error::Error + Send + Sync>> {
     let dataset_name = dataset.name.to_string();
-    let shared_location =
-        data_connector_api::shared_location::shared_state_location(context, dataset);
+    let shared_location = context.shared_location_id(dataset).await?;
     let repl_params = replication_params_from_connector_params(
         params,
         &dataset_name,
@@ -421,8 +420,9 @@ async fn resolve_applied_lsn(
     dataset: &DatasetSpec,
     context: &dyn ConnectorContext,
 ) -> u64 {
-    let shared_location =
-        data_connector_api::shared_location::shared_state_location(context, dataset);
+    let Ok(shared_location) = context.shared_location_id(dataset).await else {
+        return 0;
+    };
     let Ok(repl_params) = replication_params_from_connector_params(
         params,
         &dataset.name.to_string(),
@@ -459,8 +459,15 @@ pub async fn build_changes_stream(
     let dataset_name = dataset.name.to_string();
     let (schema_name, table_name) = split_schema_table(&dataset.from);
 
-    let shared_location =
-        data_connector_api::shared_location::shared_state_location(context, dataset);
+    let shared_location = match context.shared_location_id(dataset).await {
+        Ok(shared_location) => shared_location,
+        Err(e) => {
+            let msg = format!("postgres replication: {e}");
+            return Box::pin(futures::stream::once(async move {
+                Err(StreamError::External(msg))
+            }));
+        }
+    };
     let mut params_for_stream = match replication_params_from_connector_params(
         params,
         &dataset_name,

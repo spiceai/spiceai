@@ -35,7 +35,6 @@ pub mod federated;
 pub mod listing;
 pub mod parameters;
 pub mod schema_projection;
-pub mod shared_location;
 pub mod write_back;
 
 pub use connector::{

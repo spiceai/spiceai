@@ -37,6 +37,9 @@ pub(super) const REGISTRY: &str = "cayenne:datasets";
 /// The object in a dropped dataset's folder whose time is when it was dropped.
 pub(super) const DROPPED: &str = "dropped";
 
+/// The registry's bookkeeping key holding [`ObjectNativeCatalog::location_id`].
+const LOCATION_ID_KEY: &str = "spice_sys_location_id";
+
 /// The name registry and every dataset's log.
 pub struct ObjectNativeCatalog {
     pub(super) store: Arc<dyn ObjectStore>,
@@ -695,6 +698,11 @@ impl ObjectNativeCatalog {
         tracing::info!(
             "{verb} the Cayenne object-native metastore at '{location}': {datasets} datasets with {tables} tables, plus {replayed} commits after their checkpoints, writing as lease {lease}"
         );
+        // The instance that writes the registry records the location's identity
+        // now, so the others can read it whether or not this one ever asks.
+        if catalog.registry.data_writes.allows() {
+            catalog.location_id().await?;
+        }
         Ok(catalog)
     }
     async fn open_at(
@@ -797,6 +805,37 @@ impl ObjectNativeCatalog {
             }
             tokio::time::sleep((lease / 6).max(std::time::Duration::from_millis(50))).await;
         }
+    }
+
+    /// This location's identity: a UUID recorded once in the registry by the
+    /// instance that writes it, the first time it is asked. Every instance on
+    /// the location reads the same one, whatever URL or endpoint it reaches the
+    /// location by, and another location never does, so a change source's
+    /// consumer named for it is shared by exactly the instances that share the
+    /// acceleration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read or written, or on an
+    /// instance that does not write the registry while the instance that does
+    /// has not recorded the identity yet.
+    pub async fn location_id(&self) -> CatalogResult<String> {
+        let recorded = self
+            .registry
+            .sidecar_value_or_record(LOCATION_ID_KEY, || {
+                uuid::Uuid::now_v7().to_string().into_bytes()
+            })
+            .await?;
+        let Some(bytes) = recorded else {
+            return Err(crate::catalog::CatalogError::InvalidOperationNoSource {
+                message: "The state location has no identity yet: the Spice instance that writes it records one when it starts. Retry once that instance is running.".to_string(),
+            });
+        };
+        String::from_utf8(bytes).map_err(|error| {
+            crate::catalog::CatalogError::InvalidOperationNoSource {
+                message: format!("The state location's recorded identity is not text: {error}"),
+            }
+        })
     }
 
     /// Follow whether this instance writes dataset `name`: `true` while it

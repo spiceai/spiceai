@@ -103,6 +103,23 @@ pub trait ConnectorContext: Send + Sync {
     /// checkpoint cannot be read.
     async fn accelerated_checkpoint_schema(&self, dataset: &DatasetSpec) -> Option<SchemaRef>;
 
+    /// The identity of the location through which this dataset's acceleration
+    /// is shared with other instances, when it is (see
+    /// `DataAccelerator::shared_location_id`): a change source's consumer named
+    /// for it is shared by exactly those instances, and only the one writing
+    /// the dataset consumes it. `None` when this instance alone writes the
+    /// acceleration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the location's identity cannot be read; the
+    /// caller fails rather than name a consumer that other instances may not
+    /// share.
+    async fn shared_location_id(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>;
+
     /// The **blob** checkpoint store over this dataset's accelerator, writing into the
     /// sidecar `table_name`.
     ///

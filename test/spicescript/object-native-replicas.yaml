@@ -6,8 +6,10 @@ description: >
   The replica follows the writer's changes. When the writer is killed, the
   replica takes over once its lease lapses and resumes the same slot from the
   last commit, with no change missing or applied twice; the killed instance,
-  started again, follows the new writer. Every answer is checked against the
-  source.
+  started again, follows the new writer. A dataset the writer has not loaded
+  yet is not served from the replica's empty acceleration: the replica serves it
+  from the source until the writer records its load. Every answer is checked
+  against the source.
 
 sources:
   # One database for both instances: they share its replication slot.
@@ -48,6 +50,18 @@ spicepod:
           # Commit the in-memory CDC tier on every tick, so the replica sees
           # each change soon after the writer applies it.
           cayenne_cdc_mem_tier_min_flush_bytes: '0'
+    # The writer creates this acceleration but never loads it: its refresh fails
+    # at execution. Until a load is recorded, a query is served by the source.
+    - from: postgres:public.unloaded
+      name: unloaded
+      params: ${sources.src.params}
+      ready_state: on_registration
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        refresh_sql: SELECT * FROM unloaded WHERE u_id / (u_id - u_id) = 1
 
 defaults:
   # The instances work together, so they run side by side; each answers from
@@ -61,6 +75,8 @@ steps:
       src: |
         CREATE TABLE orders (o_id bigint PRIMARY KEY, o_status char(1), o_total numeric(15, 2));
         INSERT INTO orders SELECT i, 'O', i * 1.25 FROM generate_series(1, 1000) AS i;
+        CREATE TABLE unloaded (u_id bigint PRIMARY KEY, u_v bigint);
+        INSERT INTO unloaded SELECT i, i * 10 FROM generate_series(1, 300) AS i;
     only: a
 
   # A starts first and writes the dataset.
@@ -80,6 +96,10 @@ steps:
   - source-query: { src: "SELECT count(*) AS slots FROM pg_replication_slots WHERE database = current_database()" }
     expect: { rows: [['1']] }
     only: a
+  # A never loaded `unloaded`, so B answers it from the source rather than from
+  # its empty acceleration.
+  - query: SELECT count(*) AS n, sum(u_v) AS total FROM unloaded
+    only: b
 
   # Changes A applies reach B.
   - source-exec:

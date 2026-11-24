@@ -86,9 +86,6 @@ impl Instance {
                 store: Arc::clone(store),
             },
         )
-        // Strict reads: every query confirms the dataset head, so a query sees
-        // each commit acknowledged before it started.
-        .with_scan_view_reuse(cayenne::ScanViewReuse::WithinLag(std::time::Duration::ZERO))
     }
 
     fn register(&self, table: impl TableProvider + 'static) {
@@ -389,17 +386,11 @@ async fn concurrent_replica_queries_share_one_head_read_sent_after_they_start() 
 }
 
 /// A writer and a replica of an unkeyed table with rows 1..=100, the replica's
-/// table built with `lag` and its requests recorded.
-async fn writer_and_lagging_replica(
-    lag: std::time::Duration,
-) -> (Instance, Instance, Arc<CayenneTableProvider>, Arc<FaultStore>) {
-    writer_and_replica_with(ScanViewReuse::WithinLag(lag)).await
-}
-
-/// A writer and a replica of an unkeyed table with rows 1..=100, the replica's
-/// table built with `reuse` and its requests recorded.
+/// table built with `reuse`, serving views up to `lag` old (`None`: the
+/// default), its requests recorded.
 async fn writer_and_replica_with(
     reuse: ScanViewReuse,
+    lag: Option<std::time::Duration>,
 ) -> (Instance, Instance, Arc<CayenneTableProvider>, Arc<FaultStore>) {
     let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let replica_requests = Arc::new(FaultStore::new(Arc::clone(&objects)));
@@ -430,6 +421,9 @@ async fn writer_and_replica_with(
             .await
             .expect("open the table on B"),
     );
+    if let Some(lag) = lag {
+        table.set_replica_view_lag(lag);
+    }
     b.ctx
         .register_table(TABLE, Arc::clone(&table) as Arc<dyn TableProvider>)
         .expect("register");
@@ -452,7 +446,7 @@ fn head_polls(requests: &FaultStore, from: usize) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_replica_serves_its_view_for_its_lag_then_confirms_the_head() {
     let lag = std::time::Duration::from_secs(2);
-    let (a, b, _table, requests) = writer_and_lagging_replica(lag).await;
+    let (a, b, _table, requests) = writer_and_replica_with(ScanViewReuse::UntilInvalidated, Some(lag)).await;
     let first_confirmed = std::time::Instant::now();
     assert_eq!(b.count_and_sum().await, expected(1..=100), "B's first query");
 
@@ -494,7 +488,7 @@ async fn a_replica_serves_its_view_for_its_lag_then_confirms_the_head() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_replica_refreshes_its_view_in_the_background_while_queried() {
     let lag = std::time::Duration::from_secs(6);
-    let (a, b, table, requests) = writer_and_lagging_replica(lag).await;
+    let (a, b, table, requests) = writer_and_replica_with(ScanViewReuse::UntilInvalidated, Some(lag)).await;
     table.init_scan_view_cache();
     assert_eq!(b.count_and_sum().await, expected(1..=100), "B's first query");
 
@@ -523,99 +517,70 @@ async fn a_replica_refreshes_its_view_in_the_background_while_queried() {
     );
 }
 
-/// A table whose own views last until a write invalidates them (a `full` or
-/// `append` refresh, a writable table) sees no write of the replica's own, so
-/// on a replica its views are reused for the default lag and then confirm the
-/// head again: a commit by the writer shows within that lag.
+/// A replica is strict by default, whatever view lag the table allows its
+/// writer: a query serves every commit acknowledged before it started.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_replica_of_a_table_invalidated_by_writes_follows_within_the_default_lag() {
-    let (a, b, _table, requests) =
-        writer_and_replica_with(ScanViewReuse::UntilInvalidated).await;
-    assert_eq!(b.count_and_sum().await, expected(1..=100), "B's first query");
-
-    a.insert(101, 200).await.expect("A writes 101..=200");
-    let from = requests.log().len();
-    let committed = std::time::Instant::now();
-    loop {
-        let answer = b.count_and_sum().await;
-        if answer == expected(1..=200) {
-            break;
-        }
-        assert!(
-            committed.elapsed() < std::time::Duration::from_secs(10),
-            "B still serves {answer:?} {:?} after A's commit",
-            committed.elapsed()
+async fn a_replica_serves_every_commit_acknowledged_before_a_query_by_default() {
+    for reuse in [
+        ScanViewReuse::UntilInvalidated,
+        ScanViewReuse::WithinLag(std::time::Duration::from_secs(3_600)),
+    ] {
+        let (a, b, _table, requests) = writer_and_replica_with(reuse, None).await;
+        assert_eq!(b.count_and_sum().await, expected(1..=100), "{reuse:?}: B before");
+        a.insert(101, 200).await.expect("A writes 101..=200");
+        let from = requests.log().len();
+        assert_eq!(
+            b.count_and_sum().await,
+            expected(1..=200),
+            "{reuse:?}: B's next query returns A's commit"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(head_polls(&requests, from), 1, "{reuse:?}: after one read of the head");
     }
-    assert!(
-        head_polls(&requests, from) >= 1,
-        "a query confirmed the head to show A's commit"
-    );
 }
 
-/// A replica whose reload fails after it applied the writer's records (here,
-/// reading a deletion vector) reloads again at its next query, even though the
-/// head has not moved since: it never serves the new file set with the old
-/// deletes, or keeps the old caches for good.
+/// A location's identity is recorded once in the location: instances that
+/// reach it by different spellings of its URL read the same one, a replica
+/// reads the one its writer recorded, and another location has its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_replica_retries_a_reload_that_failed_after_following() {
-    let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let replica_requests = Arc::new(FaultStore::new(Arc::clone(&objects)));
-    let replica_store: Arc<dyn ObjectStore> = Arc::clone(&replica_requests) as Arc<dyn ObjectStore>;
-
-    let (a, data_url) = Instance::open(&objects, Access::Writer).await;
-    let table = a
-        .builder(&objects, &data_url)
-        .create(CreateTableOptions {
-            table_name: TABLE.to_string(),
-            schema: schema(),
-            primary_key: vec!["id".to_string()],
-            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
-            base_path: data_url.clone(),
-            partition_column: None,
-            vortex_config: VortexConfig {
-                inline_max_rows: 0,
-                inline_max_bytes: 0,
-                ..VortexConfig::default()
+async fn a_location_has_one_identity_however_it_is_reached() {
+    let open = |store: Arc<dyn ObjectStore>, location: &'static str, access: Access| async move {
+        ObjectNativeCatalog::open_or_create_at_with_config(
+            store,
+            Path::from(crate::common::LOCATION_CATALOG),
+            location,
+            NativeCatalogConfig {
+                access,
+                ..NativeCatalogConfig::default()
             },
-        })
+        )
         .await
-        .expect("create the table on A");
-    a.register(table);
-    a.insert(1, 100).await.expect("A writes 1..=100");
-
-    let (b, _) = Instance::open(&replica_store, Access::Replica).await;
-    let table = b
-        .builder(&replica_store, &data_url)
-        .open(TABLE)
-        .await
-        .expect("open the table on B");
-    b.register(table);
-    assert_eq!(b.count_and_sum().await, expected(1..=100), "B before");
-
-    a.run(&format!("DELETE FROM {TABLE} WHERE id <= 50"))
-        .await
-        .expect("A deletes 1..=50");
-    assert_eq!(a.count_and_sum().await, expected(51..=100), "A");
-
-    // B's reload cannot read the new deletion vector.
-    for op in [Op::Get, Op::Head] {
-        replica_requests.fail_while(op, |path| path.as_ref().contains("/deletions/"));
-    }
-    let failed = b
-        .ctx
-        .sql(&format!("SELECT count(*) FROM {TABLE}"))
-        .await
-        .expect("plan")
-        .collect()
-        .await;
-    eprintln!("B's query while its reload fails: {:?}", failed.as_ref().map(|_| "rows"));
-    replica_requests.clear_rules();
-
+        .expect("open the object-native catalog")
+    };
+    let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let writer = open(Arc::clone(&objects), LOCATION, Access::Writer).await;
+    let replica = open(
+        Arc::clone(&objects),
+        "s3://bucket/state/cayenne/v1/",
+        Access::Replica,
+    )
+    .await;
+    let id = writer.location_id().await.expect("the writer's identity");
+    assert!(uuid::Uuid::parse_str(&id).is_ok(), "a UUID: {id}");
     assert_eq!(
-        b.count_and_sum().await,
-        expected(51..=100),
-        "once B can read it, B's next query leaves A's deleted rows out"
+        replica.location_id().await.expect("the replica's identity"),
+        id,
+        "the replica reads the identity its writer recorded"
+    );
+    assert_eq!(
+        writer.location_id().await.expect("asked again"),
+        id,
+        "recorded once"
+    );
+
+    let elsewhere = open(Arc::new(InMemory::new()), LOCATION, Access::Writer).await;
+    assert_ne!(
+        elsewhere.location_id().await.expect("another location's identity"),
+        id,
+        "another location at the same URL has an identity of its own"
     );
 }

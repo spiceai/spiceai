@@ -399,6 +399,13 @@ impl DataAccelerator for SqliteAccelerator {
         None
     }
 
+    async fn shared_location_id(
+        &self,
+        _source: &dyn AccelerationSource,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

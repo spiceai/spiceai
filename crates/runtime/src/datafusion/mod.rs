@@ -4873,7 +4873,19 @@ impl DataFusion {
         };
         let replica = writer_role.as_ref().is_some_and(|role| !*role.borrow());
         if replica {
-            accelerated_table_builder.replica();
+            // The writer records the dataset's checkpoint once it has loaded
+            // the acceleration; the replica is ready from then on.
+            let checkpoint = dataset_checkpointer(
+                dataset,
+                self.accelerator_engine_registry(),
+                OpenOption::OpenExisting,
+                acceleration_settings.snapshot_behavior.clone(),
+            )
+            .await
+            .map_err(|source| Error::AccelerationRegistration {
+                source: Box::new(source),
+            })?;
+            accelerated_table_builder.replica(checkpoint);
             // Never polled: the refresh that would consume it does not start.
             match refresh_mode {
                 RefreshMode::Changes => {

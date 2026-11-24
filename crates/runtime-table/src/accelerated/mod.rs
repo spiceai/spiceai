@@ -475,6 +475,28 @@ pub enum SnapshotCreateTrigger {
 
 /// The decision behind [`AcceleratedTable::scan_readiness`], as a function of
 /// only the state it depends on so it can be exercised exhaustively.
+/// How often a replica checks whether the instance that writes its
+/// acceleration has loaded it.
+const REPLICA_LOAD_POLL: Duration = Duration::from_secs(1);
+
+/// Mark a replica's dataset ready once the instance that writes its
+/// acceleration has loaded it: that instance records the dataset's checkpoint
+/// in the shared location after its load. Until then the replica's scans are
+/// refused (`ready_state: on_load`) or served by the source, as a load in
+/// progress is, rather than answered from a partial acceleration.
+async fn wait_for_writer_load(
+    checkpoint: Arc<dyn DatasetCheckpointer>,
+    refresher: Arc<refresh::Refresher>,
+    runtime_status: Arc<status::RuntimeStatus>,
+    dataset_name: TableReference,
+) {
+    while !checkpoint.exists().await {
+        tokio::time::sleep(REPLICA_LOAD_POLL).await;
+    }
+    refresher.set_initial_load_completed(true);
+    runtime_status.update_dataset(&dataset_name, status::ComponentStatus::Ready);
+}
+
 fn scan_readiness_for(
     cluster_role: Option<&ClusterRole>,
     initial_load_completed: bool,
@@ -572,8 +594,9 @@ pub struct Builder {
     acceleration_layout: Option<runtime_acceleration::snapshot::AccelerationLayout>,
     cluster_role: Option<ClusterRole>,
     /// Another instance writes this acceleration: this one serves its queries
-    /// from the shared location and runs no refresh.
-    replica: bool,
+    /// from the shared location and runs no refresh. Holds the dataset's
+    /// checkpoint, which says when the writer has finished loading it.
+    replica: Option<Arc<dyn DatasetCheckpointer>>,
     user_facing_schema: Option<SchemaRef>,
     accelerator_write_mutex: Arc<Mutex<()>>,
     /// Per-dataset `cdc_*` overrides drawn from `dataset.acceleration.params`.
@@ -643,7 +666,7 @@ impl Builder {
             is_s3_express_acceleration: false,
             engine_type_rewrites: &[],
             cluster_role: None,
-            replica: false,
+            replica: None,
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
             user_facing_schema: None,
             cdc_param_overrides: None,
@@ -686,8 +709,10 @@ impl Builder {
     /// Another instance writes this acceleration (see
     /// `DataAccelerator::writer_role`): serve its queries from what that
     /// instance committed, and start no refresh, which would write it too.
-    pub fn replica(&mut self) -> &mut Self {
-        self.replica = true;
+    /// The dataset becomes ready once `checkpoint` exists: the writer records
+    /// it when it has loaded the acceleration.
+    pub fn replica(&mut self, checkpoint: Arc<dyn DatasetCheckpointer>) -> &mut Self {
+        self.replica = Some(checkpoint);
         self
     }
 
@@ -1388,15 +1413,11 @@ impl Builder {
             None
         };
 
-        let (refresh_handle, refresh_trigger) = if self.replica {
+        let (refresh_handle, refresh_trigger) = if self.replica.is_some() {
             // The instance that writes the acceleration refreshes it; this one
-            // serves what it committed, so its rows are ready to query now:
-            // scans read the accelerator instead of waiting on a load that
-            // only the writer performs.
-            refresher.set_initial_load_completed(true);
+            // serves what it committed, and is ready once that instance has
+            // loaded it (see `wait_for_writer_load`).
             refresh_completion.close();
-            self.runtime_status
-                .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
             (None, None)
         } else if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
             // Accelerated tables aren't loaded locally on the scheduler —
@@ -1435,6 +1456,14 @@ impl Builder {
         let refresher = Arc::new(refresher);
         if let Some(refresh_handle) = refresh_handle {
             handlers.push(refresh_handle);
+        }
+        if let Some(checkpoint) = &self.replica {
+            handlers.push(tokio::spawn(wait_for_writer_load(
+                Arc::clone(checkpoint),
+                Arc::clone(&refresher),
+                Arc::clone(&self.runtime_status),
+                self.dataset_name.clone(),
+            )));
         }
 
         // In caching mode, `on_zero_results` is effectively a no-op: the
@@ -1510,7 +1539,7 @@ impl Builder {
 
         // Retention deletes rows: the instance that writes the acceleration
         // runs it, and a replica serves what that instance kept.
-        if let Some(retention) = retention.filter(|_| !self.replica) {
+        if let Some(retention) = retention.filter(|_| self.replica.is_none()) {
             let retention_check_handle = tokio::spawn(AcceleratedTable::start_retention_check(
                 self.dataset_name.clone(),
                 Arc::clone(&self.accelerator),

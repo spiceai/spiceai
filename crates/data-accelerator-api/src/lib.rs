@@ -593,10 +593,10 @@ impl AcceleratorEngineRegistry {
     }
 }
 
-/// A `DataAccelerator` knows how to read, write and create new tables.
 /// Whether this instance writes an acceleration; see [`DataAccelerator::writer_role`].
 pub type WriterRole = tokio::sync::watch::Receiver<bool>;
 
+/// A `DataAccelerator` knows how to read, write and create new tables.
 #[async_trait]
 pub trait DataAccelerator: Send + Sync {
     fn as_any(&self) -> &dyn Any;
@@ -932,6 +932,24 @@ pub trait DataAccelerator: Send + Sync {
     /// `None` when this instance always writes the acceleration (it is the
     /// only one that can). No default, so every engine states which it is.
     async fn writer_role(&self, source: &dyn AccelerationSource) -> Option<WriterRole>;
+
+    /// The identity of the location through which `source`'s acceleration is
+    /// shared with other instances, when it is: the same for every instance on
+    /// that location however it reaches it, and different for any other
+    /// location. A change source's consumer (a `PostgreSQL` replication slot) is
+    /// named for it, so the instances sharing the acceleration share exactly
+    /// one consumer, which only the writer consumes. `None` when this instance
+    /// alone writes the acceleration. Decided by where the engine places the
+    /// acceleration, not by whether it is open yet. No default, so every engine
+    /// states which it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the location's identity cannot be read.
+    async fn shared_location_id(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// Factory that re-runs the `create_accelerator_table` registry flow to

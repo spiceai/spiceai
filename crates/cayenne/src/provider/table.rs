@@ -2879,6 +2879,10 @@ pub struct CayenneTableProvider {
     /// ([`Self::confirm_head`]); `u64::MAX` until it has. Shared across all
     /// clones for the same table.
     loaded_revision: Arc<AtomicU64>,
+    /// How long a replica's scan view serves queries, in nanoseconds: zero
+    /// (strict) unless set ([`Self::set_replica_view_lag`]). Shared across all
+    /// clones for the same table.
+    replica_view_lag_ns: Arc<AtomicU64>,
     /// The dataset's store, for a table whose data path is an object-store URL:
     /// `url` is `cayenne://<table id>/` and `store` is [`Self::dataset_storage`]'s
     /// store, registered under that URL in each `RuntimeEnv` the table uses.
@@ -12482,6 +12486,7 @@ impl CayenneTableProvider {
             table_writes,
             last_query_ns: Arc::new(AtomicU64::new(u64::MAX)),
             loaded_revision: Arc::new(AtomicU64::new(u64::MAX)),
+            replica_view_lag_ns: Arc::new(AtomicU64::new(0)),
             object_store_config,
             dataset_storage,
             data_root,
@@ -14937,6 +14942,7 @@ impl CayenneTableProvider {
             table_writes: self.table_writes.clone(),
             last_query_ns: Arc::clone(&self.last_query_ns),
             loaded_revision: Arc::clone(&self.loaded_revision),
+            replica_view_lag_ns: Arc::clone(&self.replica_view_lag_ns),
             object_store_config: self.object_store_config.clone(),
             dataset_storage: self.dataset_storage.clone(),
             data_root: Arc::clone(&self.data_root),
@@ -35216,15 +35222,22 @@ impl CayenneTableProvider {
         self.data_in_object_native_location() && !self.table_writes.allows()
     }
 
-    /// How long a replica's scan view serves queries before the next query, or
-    /// the background refresh, confirms the head again: the table's own
-    /// [`ScanViewReuse::WithinLag`] lag, else [`Self::REPLICA_SCAN_VIEW_LAG`].
-    /// A zero lag confirms the head for every query.
+    /// How long a replica's scan view serves queries before a query confirms
+    /// the head again. Zero by default: every query serves at least each commit
+    /// acknowledged before it started, waiting for the first view whose head
+    /// read was sent after it arrived and sharing it with the queries around it.
     fn replica_view_lag(&self) -> Duration {
-        match self.scan_view_reuse {
-            ScanViewReuse::WithinLag(lag) => lag,
-            ScanViewReuse::UntilInvalidated => Self::REPLICA_SCAN_VIEW_LAG,
-        }
+        Duration::from_nanos(self.replica_view_lag_ns.load(Ordering::Relaxed))
+    }
+
+    /// Let a replica's queries serve a scan view up to `lag` old, rather than
+    /// confirm the head for each round of queries.
+    #[doc(hidden)]
+    pub fn set_replica_view_lag(&self, lag: Duration) {
+        self.replica_view_lag_ns.store(
+            u64::try_from(lag.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     /// Bring this table up to the commits the instance that writes it has
@@ -38258,9 +38271,10 @@ impl CayenneTableProvider {
     /// Tick period of the background [`Self::run_scan_view_evictor`] sweep.
     /// Also the idle window for [`ScanViewReuse::UntilInvalidated`].
     const SCAN_VIEW_EVICTION_INTERVAL: Duration = Duration::from_secs(5);
-    /// How long a replica's scan view serves queries when the table sets no
-    /// lag of its own: the default lag of a read-only `changes` dataset.
-    const REPLICA_SCAN_VIEW_LAG: Duration = Duration::from_secs(1);
+    /// How often a strict replica refreshes its scan view in the background
+    /// while queries use it, so a query's own read of the head usually finds
+    /// it unchanged and the view already built.
+    const REPLICA_STRICT_REFRESH_PERIOD: Duration = Duration::from_secs(1);
     /// The shortest period between a replica's background view refreshes.
     const REPLICA_VIEW_REFRESH_MIN_PERIOD: Duration = Duration::from_millis(100);
 
@@ -38282,30 +38296,34 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Background refresh of a replica's scan view: while queries use the view,
-    /// it confirms the head and rebuilds the view every half lag, so a query
-    /// finds a view younger than half its lag plus one build, and waits for no
-    /// read of the location. A
-    /// view no query has used within the idle window is left to the evictor,
-    /// so an idle replica sends no request; its next query confirms the head
-    /// itself. A zero lag confirms the head for every query, so there is
-    /// nothing to refresh ahead of them. Holds only a `Weak<Self>` and exits
-    /// after the table is torn down; a table that writes the dataset skips
-    /// each round, and refreshes again once it serves another writer.
+    /// Background refresh of a replica's scan view: while queries use the
+    /// table, it confirms the head and rebuilds the view every half lag (every
+    /// [`Self::REPLICA_STRICT_REFRESH_PERIOD`] for a strict replica). A lagging
+    /// replica's queries then find a view within their lag and read nothing
+    /// themselves; a strict replica's queries still confirm the head, but
+    /// usually find it unchanged and the view already built. A table no query
+    /// has used within the idle window sends no request. Holds only a
+    /// `Weak<Self>` and exits after the table is torn down; a table that
+    /// writes the dataset skips each round, and refreshes again once it
+    /// serves another writer.
     async fn run_replica_view_refresh(weak: std::sync::Weak<Self>) {
         loop {
             let period = {
                 let Some(provider) = weak.upgrade() else {
                     return;
                 };
-                (provider.replica_view_lag() / 2).max(Self::REPLICA_VIEW_REFRESH_MIN_PERIOD)
+                let lag = provider.replica_view_lag();
+                if lag.is_zero() {
+                    Self::REPLICA_STRICT_REFRESH_PERIOD
+                } else {
+                    (lag / 2).max(Self::REPLICA_VIEW_REFRESH_MIN_PERIOD)
+                }
             };
             tokio::time::sleep(period).await;
             let Some(provider) = weak.upgrade() else {
                 return;
             };
             if provider.serves_from_writer()
-                && !provider.replica_view_lag().is_zero()
                 && provider.queried_recently(Instant::now())
                 // Rebuilt every round unless a query rebuilt it within the last
                 // half period: rounds and builds drift against each other, and

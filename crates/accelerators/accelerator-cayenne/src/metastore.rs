@@ -52,6 +52,13 @@ pub(super) struct OpenedCatalog {
     native: Option<Arc<ObjectNativeCatalog>>,
 }
 
+impl OpenedCatalog {
+    /// The object-native catalog, when the dataset is in the state location.
+    pub(super) fn native(&self) -> Option<&Arc<ObjectNativeCatalog>> {
+        self.native.as_ref()
+    }
+}
+
 const OBJECT_NATIVE_DIR: &str = "object_native";
 
 /// `runtime.params` key that puts new file-mode Cayenne datasets on the

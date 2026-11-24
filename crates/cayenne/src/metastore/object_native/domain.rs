@@ -641,11 +641,15 @@ impl Inner {
 
 impl Domain {
     /// The runtime's bookkeeping value under `key` (a CDC position, a dataset
-    /// checkpoint), kept in the catalog beside the data it describes.
+    /// checkpoint), kept in the catalog beside the data it describes. On a
+    /// replica, the value as of the writer's latest commit: the log follows
+    /// the writer first.
     /// # Errors
-    /// Returns an error when the catalog must be reopened.
+    /// Returns an error when the catalog must be reopened, or a replica cannot
+    /// read the writer's commits.
     pub async fn sidecar_value(&self, key: &str) -> CatalogResult<Option<Vec<u8>>> {
-        let inner = self.read().await?;
+        let mut inner = self.read().await?;
+        inner.follow().await?;
         Ok(inner
             .reader
             .state
@@ -740,6 +744,40 @@ impl Domain {
             return Ok(());
         }
         inner.commit(actions).await
+    }
+
+    /// The bookkeeping value under `key`, recording `make()` first when there
+    /// is none, so concurrent callers all get the one value that was recorded.
+    /// On a replica, the value the writer recorded, which may be `None`.
+    /// # Errors
+    /// Returns an error when the catalog must be reopened, or the commit is
+    /// not accepted.
+    pub async fn sidecar_value_or_record(
+        &self,
+        key: &str,
+        make: impl FnOnce() -> Vec<u8>,
+    ) -> CatalogResult<Option<Vec<u8>>> {
+        let mut inner = self.read().await?;
+        inner.follow().await?;
+        let position = (key.to_string(), String::new());
+        if let Some(value) = inner.reader.state.positions.get(&position) {
+            return Ok(Some(value.clone()));
+        }
+        if !matches!(inner.head, Head::Writer(_)) {
+            return Ok(None);
+        }
+        let value = make();
+        inner
+            .commit(vec![Action::new(Kind::AdvanceSourcePosition(
+                proto::AdvanceSourcePosition {
+                    source: key.to_string(),
+                    partition: String::new(),
+                    position: value.clone(),
+                    clear: false,
+                },
+            ))])
+            .await?;
+        Ok(Some(value))
     }
 
     /// Set (`Some`) or remove (`None`) the bookkeeping value under `key`. Setting

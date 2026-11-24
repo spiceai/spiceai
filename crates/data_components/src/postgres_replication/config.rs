@@ -436,14 +436,16 @@ pub fn default_slot_name(dataset_name: &str) -> String {
 }
 
 /// The default slot name for `dataset_name` whose acceleration instances share
-/// through `shared_location`, when they do: one slot for every instance on the
-/// location, consumed by whichever writes the dataset, so adding a replica adds
-/// no slot and a takeover resumes the slot its predecessor consumed. Without a
-/// shared location, [`default_slot_name`]: a slot for this instance.
+/// through the location identified by `shared_location_id`, when they do: one
+/// slot for every instance on that location, consumed by whichever writes the
+/// dataset, so adding a replica adds no slot and a takeover resumes the slot
+/// its predecessor consumed. The identity is recorded in the location itself,
+/// so every spelling of its URL names the same slot and another location never
+/// does. Without one, [`default_slot_name`]: a slot for this instance.
 #[must_use]
-pub fn default_slot_name_on(dataset_name: &str, shared_location: Option<&str>) -> String {
-    match shared_location {
-        Some(location) => slot_name_for(dataset_name, &format!("location:{location}")),
+pub fn default_slot_name_on(dataset_name: &str, shared_location_id: Option<&str>) -> String {
+    match shared_location_id {
+        Some(location_id) => slot_name_for(dataset_name, &format!("location:{location_id}")),
         None => default_slot_name(dataset_name),
     }
 }

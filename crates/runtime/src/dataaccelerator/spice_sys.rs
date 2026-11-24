@@ -68,6 +68,29 @@ pub async fn sidecar_for(
     accelerator.sidecar(source, open_option).await
 }
 
+/// The identity of the location `dataset`'s acceleration is shared through,
+/// when it is (see `DataAccelerator::shared_location_id`).
+///
+/// # Errors
+///
+/// Returns an error when the accelerator cannot read the location's identity.
+pub async fn shared_location_id(
+    dataset: &crate::component::dataset::Dataset,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(acceleration) = dataset.acceleration() else {
+        return Ok(None);
+    };
+    let Some(accelerator) = dataset
+        .runtime
+        .accelerator_engine_registry()
+        .get_accelerator_engine(acceleration.engine)
+        .await
+    else {
+        return Ok(None);
+    };
+    accelerator.shared_location_id(dataset).await
+}
+
 /// The dataset's sidecar, resolved from the runtime handle it carries.
 async fn dataset_sidecar(
     dataset: &crate::component::dataset::Dataset,

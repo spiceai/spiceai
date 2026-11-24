@@ -6462,6 +6462,13 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             None
         }
 
+        async fn shared_location_id(
+            &self,
+            _source: &dyn AccelerationSource,
+        ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(None)
+        }
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
