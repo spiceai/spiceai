@@ -2607,6 +2607,180 @@ mod tests {
         }
     }
 
+    /// Stores the schema of the last checkpoint and counts the writes.
+    #[derive(Default)]
+    struct StoringCheckpointer {
+        schema: parking_lot::Mutex<Option<SchemaRef>>,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StoringCheckpointer {
+        fn stored(&self) -> Option<SchemaRef> {
+            self.schema.lock().clone()
+        }
+
+        fn writes(&self) -> usize {
+            self.writes.load(Ordering::Acquire)
+        }
+    }
+
+    #[async_trait]
+    impl DatasetCheckpointer for StoringCheckpointer {
+        async fn exists(&self) -> bool {
+            self.schema.lock().is_some()
+        }
+
+        async fn checkpoint(
+            &self,
+            schema: &SchemaRef,
+            _refresh_sql: Option<&str>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            *self.schema.lock() = Some(Arc::clone(schema));
+            self.writes.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        async fn get_schema(
+            &self,
+        ) -> Result<Option<SchemaRef>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.stored())
+        }
+
+        async fn set_schema(
+            &self,
+            schema: &SchemaRef,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            *self.schema.lock() = Some(Arc::clone(schema));
+            Ok(())
+        }
+
+        async fn last_checkpoint_time(
+            &self,
+        ) -> Result<Option<SystemTime>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(None)
+        }
+
+        async fn get_refresh_sql(
+            &self,
+        ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(None)
+        }
+
+        async fn delete(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            *self.schema.lock() = None;
+            Ok(())
+        }
+    }
+
+    fn changes_checkpoint_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Utf8, true),
+        ]))
+    }
+
+    fn record_changes_loaded_task(
+        checkpointer: &Arc<StoringCheckpointer>,
+        completion: &RefreshCompletion,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(record_changes_loaded(
+            Arc::clone(checkpointer) as Arc<dyn DatasetCheckpointer>,
+            completion.clone(),
+            None,
+            changes_checkpoint_schema(),
+            Arc::new(Mutex::new(())),
+            TableReference::bare("orders"),
+            Arc::new(AtomicI64::new(0)),
+            status::RuntimeStatus::new(),
+        ))
+    }
+
+    /// The checkpoint that lets a CDC dataset be served before its source answers
+    /// is written only once its change stream has reported it ready, and carries
+    /// the mark only that write sets.
+    #[tokio::test]
+    async fn a_change_stream_records_its_acceleration_as_loaded_only_once_ready() {
+        let checkpointer = Arc::new(StoringCheckpointer::default());
+        let completion = RefreshCompletion::new();
+        let task = record_changes_loaded_task(&checkpointer, &completion);
+
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task.is_finished(),
+            "the task must wait for the ready signal"
+        );
+        assert_eq!(checkpointer.writes(), 0, "no checkpoint before ready");
+
+        completion.record_untriggered();
+        timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the task finishes once the stream is ready")
+            .expect("the task does not panic");
+
+        let stored = checkpointer.stored().expect("a checkpoint after ready");
+        assert!(super::super::checkpoint_primary_key::records_changes_loaded(&stored));
+        assert_eq!(stored.fields(), changes_checkpoint_schema().fields());
+        assert_eq!(checkpointer.writes(), 1);
+    }
+
+    /// A table that will never refresh here (a cluster scheduler's) records nothing.
+    #[tokio::test]
+    async fn a_change_stream_that_never_loads_records_no_checkpoint() {
+        let checkpointer = Arc::new(StoringCheckpointer::default());
+        let completion = RefreshCompletion::new();
+        let task = record_changes_loaded_task(&checkpointer, &completion);
+
+        completion.close();
+        timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the task finishes once the signal closes")
+            .expect("the task does not panic");
+
+        assert_eq!(checkpointer.writes(), 0);
+        assert!(checkpointer.stored().is_none());
+    }
+
+    /// A dataset no longer served from its acceleration drops a mark left by a run
+    /// that was, and leaves an unmarked checkpoint alone.
+    #[tokio::test]
+    async fn a_dataset_not_served_from_its_acceleration_clears_the_loaded_mark() {
+        let schema = changes_checkpoint_schema();
+        let checkpointer = Arc::new(StoringCheckpointer::default());
+        let clear = |checkpointer: &Arc<StoringCheckpointer>| {
+            clear_changes_loaded(
+                Arc::clone(checkpointer) as Arc<dyn DatasetCheckpointer>,
+                Arc::clone(&schema),
+                Arc::new(Mutex::new(())),
+                TableReference::bare("orders"),
+                Arc::new(AtomicI64::new(0)),
+            )
+        };
+
+        clear(&checkpointer).await;
+        assert_eq!(
+            checkpointer.writes(),
+            0,
+            "nothing to clear without a checkpoint"
+        );
+
+        *checkpointer.schema.lock() = Some(
+            super::super::checkpoint_primary_key::with_changes_loaded(&schema),
+        );
+        clear(&checkpointer).await;
+        let stored = checkpointer.stored().expect("the checkpoint is rewritten");
+        assert!(!super::super::checkpoint_primary_key::records_changes_loaded(&stored));
+        assert_eq!(checkpointer.writes(), 1);
+
+        clear(&checkpointer).await;
+        assert_eq!(
+            checkpointer.writes(),
+            1,
+            "an unmarked checkpoint is left alone"
+        );
+    }
+
     /// Regression test for #14178. Results-cache warmup polls
     /// `initial_load_completed`; that flag must stay down until
     /// invalidation finishes so a store cannot be evicted by this

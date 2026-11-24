@@ -168,3 +168,19 @@ steps:
   - assert-status: { dataset: items, ready: true }
     eventually: 30s
     only: [on-load, object-native]
+
+  # A column added at the source while the runtime is down: the CDC dataset is
+  # served on its registered columns, and applies the changes made after it once
+  # the source answers.
+  - stop: {}
+  - source-exec: { src: "ALTER TABLE items ADD COLUMN extra integer" }
+  - start: { ready: false }
+  - source-exec:
+      src: |
+        UPDATE items SET name = 'after alter', extra = 1 WHERE id = 2;
+        INSERT INTO items VALUES (7000, 'new after alter', 3.00, 5);
+  - query: SELECT * FROM items_cdc
+    oracle-sql: SELECT id, name, price FROM items
+    eventually: 60s
+  - assert-status: { dataset: items_cdc, status: Ready }
+    eventually: 30s

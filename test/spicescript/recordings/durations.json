@@ -166,7 +166,7 @@
   "search": 11,
   "search-hybrid": 15,
   "secret-redaction": 23,
-  "served-while-source-down": 30,
+  "served-while-source-down": 33,
   "settings-evolution": 76,
   "sidecar-append-stream": 35,
   "sidecar-append-stream-keyed": 6,

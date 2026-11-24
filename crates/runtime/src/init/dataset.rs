@@ -1284,7 +1284,10 @@ impl Runtime {
         } else if ds.source() == crate::dataconnector::file::FILE_DATACONNECTOR {
             "the `file` connector".to_string()
         } else if refresh_mode == RefreshMode::Changes
-            && let Some(reason) = changes_wait_reason(ds.source(), acceleration)
+            && let Some(reason) = changes_wait_reason(
+                crate::dataconnector::connector_resumes_changes_after_restart(ds.source()),
+                acceleration,
+            )
         {
             reason.to_string()
         } else if refresh_mode == RefreshMode::Caching {
@@ -3999,13 +4002,18 @@ pub(crate) fn resumes_changes_after_restart(ds: &Dataset) -> bool {
     ds.acceleration.as_ref().is_some_and(|acceleration| {
         acceleration.enabled
             && acceleration.refresh_mode == Some(RefreshMode::Changes)
-            && changes_wait_reason(ds.source(), acceleration).is_none()
+            && changes_wait_reason(
+                crate::dataconnector::connector_resumes_changes_after_restart(ds.source()),
+                acceleration,
+            )
+            .is_none()
     })
 }
 
-/// Why a `refresh_mode: changes` dataset of the connector `source` waits for its
-/// source instead of being served from its existing acceleration, named the way
-/// the user wrote it, or `None` when it is served.
+/// Why a `refresh_mode: changes` dataset waits for its source instead of being
+/// served from its existing acceleration, named the way the user wrote it, or
+/// `None` when it is served. `connector_resumes` is whether its connector resumes
+/// its change stream after a restart.
 ///
 /// Its change stream must resume from a position the connector records. A dataset
 /// partitioned across executors scopes its stream to this executor's partitions
@@ -4013,8 +4021,11 @@ pub(crate) fn resumes_changes_after_restart(ds: &Dataset) -> bool {
 /// written before the stream has loaded the acceleration. `on_zero_results:
 /// use_source` reads the source's provider, which is not held to the
 /// acceleration's schema while the stream runs.
-fn changes_wait_reason(source: &str, acceleration: &Acceleration) -> Option<&'static str> {
-    if !crate::dataconnector::connector_resumes_changes_after_restart(source) {
+fn changes_wait_reason(
+    connector_resumes: bool,
+    acceleration: &Acceleration,
+) -> Option<&'static str> {
+    if !connector_resumes {
         Some("`refresh_mode: changes`")
     } else if !acceleration.partition_by.is_empty() {
         Some("`refresh_mode: changes` with `partition_by`")
@@ -4166,6 +4177,61 @@ mod tests {
             ),
             "Dataset 'orders' waits for its source before serving because it uses `refresh_mode: changes`. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
         );
+    }
+
+    /// Each configuration that keeps a resuming connector's CDC dataset waiting for
+    /// its source is named, in the order it is checked, and nothing else waits.
+    #[tokio::test]
+    async fn a_changes_dataset_waits_for_its_source_only_for_a_named_reason() {
+        use runtime_acceleration::snapshot::SnapshotBehavior;
+
+        let eligible = super::Acceleration::default();
+        let partitioned = super::Acceleration {
+            partition_by: vec![spicepod::partitioning::PartitionedBy {
+                name: "bucket".to_string(),
+                expression: "bucket(4, id)".to_string(),
+            }],
+            ..super::Acceleration::default()
+        };
+        let snapshots = super::Acceleration {
+            snapshot_behavior: SnapshotBehavior::BootstrapOnly(
+                std::sync::Arc::new(spicepod::component::snapshot::Snapshots::default()),
+                std::sync::Weak::new(),
+                tokio::runtime::Handle::current(),
+            ),
+            ..super::Acceleration::default()
+        };
+        let use_source = super::Acceleration {
+            on_zero_results: super::ZeroResultsAction::UseSource,
+            ..super::Acceleration::default()
+        };
+
+        for (connector_resumes, acceleration, expected) in [
+            (true, &eligible, None),
+            (false, &eligible, Some("`refresh_mode: changes`")),
+            (false, &partitioned, Some("`refresh_mode: changes`")),
+            (
+                true,
+                &partitioned,
+                Some("`refresh_mode: changes` with `partition_by`"),
+            ),
+            (
+                true,
+                &snapshots,
+                Some("`refresh_mode: changes` with `snapshots`"),
+            ),
+            (
+                true,
+                &use_source,
+                Some("`refresh_mode: changes` with `on_zero_results: use_source`"),
+            ),
+        ] {
+            assert_eq!(
+                super::changes_wait_reason(connector_resumes, acceleration),
+                expected,
+                "connector_resumes={connector_resumes}, acceleration={acceleration:?}"
+            );
+        }
     }
 
     #[test]
