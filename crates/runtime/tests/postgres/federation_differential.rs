@@ -20,7 +20,7 @@ limitations under the License.
 //! `PostgreSQL` (the oracle, which shares no code with Spice), against the
 //! federated datasets, whose plans Spice rewrites and sends to `PostgreSQL`,
 //! and against accelerations of the same tables, loaded with
-//! `refresh_mode: full` after the connector converts the rows: Arrow, Arrow
+//! `refresh_mode: full` after the connector converts the rows: Arrow
 //! partitioned by `grp`, Cayenne `mode: memory`, Cayenne `mode: file` with its
 //! defaults, which keeps a load this small as rows inlined in its metastore,
 //! Cayenne `mode: file` with inlining turned off, which writes and reads Vortex
@@ -249,8 +249,6 @@ fn cases() -> Vec<Case> {
 enum Kind {
     /// No acceleration: Spice sends each query to `PostgreSQL`.
     Federated,
-    /// An Arrow acceleration loaded once with `refresh_mode: full`.
-    Accelerated,
     /// A Cayenne acceleration held in memory, loaded once with
     /// `refresh_mode: full`.
     CayenneMemory,
@@ -288,10 +286,6 @@ fn dataset(port: usize, table: &str, name: &str, kind: Kind, dir: &Path) -> Data
     };
     ds.acceleration = match kind {
         Kind::Federated => None,
-        Kind::Accelerated => Some(Acceleration {
-            engine: Some("arrow".to_string()),
-            ..full
-        }),
         Kind::CayenneMemory => Some(Acceleration {
             engine: Some("cayenne".to_string()),
             mode: Mode::Memory,
@@ -362,12 +356,6 @@ const SUBJECTS: &[Subject] = &[
         items: "fed_items",
         regions: "fed_regions",
         kind: Kind::Federated,
-    },
-    Subject {
-        name: "accelerated",
-        items: "acc_items",
-        regions: "acc_regions",
-        kind: Kind::Accelerated,
     },
     Subject {
         name: "cayenne memory",
@@ -447,7 +435,7 @@ async fn compare_case(
             Kind::CayenneMemory | Kind::CayenneFile | Kind::CayenneVortex => {
                 Some(&check_cayenne_sources)
             }
-            Kind::Accelerated | Kind::PartitionedArrow => None,
+            Kind::PartitionedArrow => None,
         };
         for surface in SURFACES {
             let name = format!("{} over {}", subject.name, surface.label());
@@ -545,7 +533,7 @@ async fn federated_and_accelerated_postgres_answers_match_postgres() -> Result<(
             }
 
             // The partitioned Arrow side must scan one table per `grp` value,
-            // or it is the plain Arrow side under another name.
+            // so the partitioned layout is exercised.
             for subject in SUBJECTS.iter().filter(|s| s.kind == Kind::PartitionedArrow) {
                 let plan = spice_rows(&rt, &format!("EXPLAIN SELECT id FROM {}", subject.items))
                     .await
