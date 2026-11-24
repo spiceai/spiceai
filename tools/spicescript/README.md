@@ -275,7 +275,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 
 | Step | Does |
 | --- | --- |
-| `start: {}` | Start `spiced` and wait for `/v1/ready` and the Flight port (`ready-timeout:` to change the wait). Fails early if a dataset stays in `Error` while not ready. `{ ready: false }` waits only for HTTP, for datasets expected to fail. `patch:` (shaped like a variant) changes the spicepod for this and every later start. |
+| `start: {}` | Start `spiced` and wait for `/v1/ready` and the Flight port (`ready-timeout:` to change the wait). Fails early if a dataset stays in `Error` while not ready. `{ ready: false }` waits only for HTTP, for datasets expected to fail. `{ wait: false }` waits for nothing, for a `spiced` expected not to serve yet; a later `wait-ready` waits for it. `patch:` (shaped like a variant) changes the spicepod for this and every later start. |
 | `stop: {}` | SIGTERM, then SIGKILL after 45 s; fails if the shutdown wasn't clean. |
 | `kill-spiced: {}` | SIGKILL; `{ signal: STOP-then-KILL }` freezes it first. |
 | `restart: {}` | Stop (or `{ kill: KILL }`) and start again; takes `start`'s options. |
@@ -292,7 +292,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `spice-exec: <sql>` | Run a statement through `/v1/sql` (accepts `BEGIN; …; COMMIT;`); `expect-error`. |
 | `flight-put: { dataset, rows \| from-source }` | Write rows with Flight `DoPut`; `times: n` repeats it. |
 | `flight-exec: <sql>` | Flight SQL `ExecuteUpdate`; `count: n` affected rows. |
-| `http: { path, method, query, headers, body, api-key }` | One request; `query:` maps URL parameters, which are encoded and appended to `path`. `expect: { status, headers, lacks-headers, body-contains, body-matches, body-lacks, json }`; `json` checks the body as JSON (see [JSON responses](#json-responses)). |
+| `http: { path, method, query, headers, body, api-key }` | One request; `query:` maps URL parameters, which are encoded and appended to `path`. `expect: { status, headers, lacks-headers, body-contains, body-matches, body-lacks, json }`; `json` checks the body as JSON (see [JSON responses](#json-responses)). `expect: { refused: true }` requires that nothing accepts the connection. |
 | `spice: [args…]` | Run the `spice` CLI against the instance; `output-contains`, `expect-error`. |
 | `refresh: <dataset>` | Trigger a refresh and wait for it to finish; `expect-error`; `wait: false` only triggers it. |
 | `explain: <sql>` | `EXPLAIN` (`analyze: true`), requiring `contains:` fragments or the absence of `omits:` ones. |

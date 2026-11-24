@@ -128,6 +128,7 @@
   "ordering-window-join-semantics": 5,
   "parquet-struct-map-key": 3,
   "partitioning": 20,
+  "pods-watcher-start-auth": 4,
   "postgres-catalog": 64,
   "postgres-catalog-cdc": 24,
   "postgres-cdc-atomicity": 73,
