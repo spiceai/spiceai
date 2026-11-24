@@ -116,7 +116,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `9721a509dcb8f1a4743cffe5e5348f3a4e677556` | `lukim/similar-to-anchored` (TEMPORARY: spiceai/datafusion#306) |
+| [datafusion](#datafusion) | `de1c731731d882d1f597a819d50dad440a3cbd29` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `6e7a8775a6deb99c2ebf924f1ff5b3111d38e615` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `c5f1094e4f5aa7bc0cb5d3bf0f7753a33e5fc39d` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `b0464de933ba5e0cf5e8847f5b4341b75908667f` | `spiceai-55` |
@@ -249,7 +249,9 @@ merges upstream `55.3.0` (apache/datafusion@7941823cf077678fef337a29f8307e5d721d
 stream. #311 backports upstream's correlated count-bug fixes for aggregates without `GROUP BY`, #310 gives
 the column of an `ANY`/`ALL` subquery a name of its own, #309 quotes the qualifier of a wildcard inside an
 expression, and #308 keeps a regex that matches a backslash from becoming `LIKE`; none of these changes a
-manifest. #306 ports apache/datafusion#23188 so `SIMILAR TO` is an anchored SQL pattern; the pin is the head of #306.
+manifest. On top of #308, #312 compares with the one row of a groupless aggregate in `ANY`/`ALL`, and #306
+ports apache/datafusion#23188 so `SIMILAR TO` is an anchored SQL pattern; the pin is #306's merge commit
+(`de1c731731d882d1f597a819d50dad440a3cbd29`).
 Outside the six files #298 resolved by hand, every Spice patch's diff against `55.3.0` is line for line
 its diff against `55.2.0`. Of those six, #251 keeps its empty-file rule beside upstream's null-partition
 statistics (apache/datafusion#26310), and #277's ordered *partial* path is replaced by upstream's
