@@ -1087,7 +1087,8 @@ async fn test_view_follows_a_replaced_or_removed_dataset() -> Result<(), anyhow:
             let accelerated = |mut dataset: Dataset| {
                 dataset.acceleration = Some(Acceleration {
                     enabled: true,
-                    engine: Some("arrow".to_string()),
+                    engine: Some("cayenne".to_string()),
+                    mode: spicepod::acceleration::Mode::Memory,
                     refresh_mode: Some(RefreshMode::Full),
                     ..Acceleration::default()
                 });
