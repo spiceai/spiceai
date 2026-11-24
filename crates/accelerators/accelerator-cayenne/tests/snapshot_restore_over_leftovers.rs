@@ -312,7 +312,7 @@ async fn a_restart_over_a_partial_restore_serves_the_full_newer_snapshot() {
     overwrite(&writer, 0..OLD_ROWS).await;
     let writer_manager = manager(&writer_accelerator, &writer_source, &location, &secrets).await;
     publish(&writer_manager, OLD_ROWS).await;
-    let (reader_accelerator, _reader_registry) = process().await;
+    let (reader_accelerator, reader_registry) = process().await;
     let old = manager(&reader_accelerator, &reader_source, &location, &secrets)
         .await
         .download_latest_snapshot()
@@ -333,21 +333,33 @@ async fn a_restart_over_a_partial_restore_serves_the_full_newer_snapshot() {
         .filter(|file| file.extension().is_some_and(|ext| ext == "vortex"))
         .collect();
     assert!(!new_files.is_empty(), "N+1 has data files");
-    let leftover_dir = PathBuf::from(
-        reader_accelerator
-            .cayenne_data_dir(&reader_source)
-            .expect("the reader's data dir"),
-    )
-    .join(&relative);
+    let reader_data_dir = reader_accelerator
+        .cayenne_data_dir(&reader_source)
+        .expect("the reader's data dir");
+    let leftover_dir = PathBuf::from(&reader_data_dir).join(&relative);
     for file in &new_files[..new_files.len().div_ceil(2)] {
         let target = leftover_dir.join(file.strip_prefix(&new_snapshot_dir).expect("under N+1"));
         std::fs::create_dir_all(target.parent().expect("parent")).expect("leftover parent");
         std::fs::copy(file, target).expect("copy a leftover file");
     }
 
+    // A process restart has no live instance claiming the reader's directories.
+    // Drop both Arcs so this instance releases them; leaving it alive would
+    // isolate the next accelerator to `{dir}-instance-{id}` and it would open
+    // an empty table instead of the restored snapshot.
+    drop(reader_accelerator);
+    drop(reader_registry);
+
     // The restart: the initial provider serves N and reclaims what it does not
     // reference, the leftover directory included.
     let (accelerator, registry) = process().await;
+    assert_eq!(
+        accelerator
+            .cayenne_data_dir(&reader_source)
+            .expect("the restarted reader's data dir"),
+        reader_data_dir,
+        "a restart must reopen the directory the previous instance restored into"
+    );
     let initial = open(&registry, &reader_source)
         .await
         .expect("open the reader");
