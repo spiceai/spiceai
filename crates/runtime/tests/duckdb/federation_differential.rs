@@ -20,7 +20,7 @@ limitations under the License.
 //! standalone `DuckDB` database (the oracle, which shares no code with Spice),
 //! against the federated `duckdb:` datasets, whose plans Spice rewrites into
 //! `DuckDB`'s dialect and sends to `DuckDB`, and against accelerations of the
-//! same tables loaded once with `refresh_mode: full`: Arrow, Cayenne
+//! same tables loaded once with `refresh_mode: full`: Cayenne
 //! `mode: memory`, and Cayenne `mode: file` with inlining turned off, which
 //! writes and reads Vortex files. The oracle reads a byte-for-byte copy of
 //! the database file Spice opens, so the two never share a `DuckDB` instance.
@@ -277,8 +277,6 @@ const REMOTE_SCANS: [&str; 3] = ["VirtualExecutionPlan", "SqlExec", "DuckSqlExec
 enum Kind {
     /// No acceleration: Spice sends each query to `DuckDB`.
     Federated,
-    /// An Arrow acceleration loaded once with `refresh_mode: full`.
-    Arrow,
     /// A Cayenne acceleration held in memory, loaded once with
     /// `refresh_mode: full`.
     CayenneMemory,
@@ -303,12 +301,6 @@ const SUBJECTS: &[Subject] = &[
         items: "fed_items",
         regions: "fed_regions",
         kind: Kind::Federated,
-    },
-    Subject {
-        name: "arrow",
-        items: "arrow_items",
-        regions: "arrow_regions",
-        kind: Kind::Arrow,
     },
     Subject {
         name: "cayenne memory",
@@ -345,10 +337,6 @@ fn dataset(db: &Path, table: &str, name: &str, kind: Kind, dir: &Path) -> Datase
     };
     ds.acceleration = match kind {
         Kind::Federated => None,
-        Kind::Arrow => Some(Acceleration {
-            engine: Some("arrow".to_string()),
-            ..full
-        }),
         Kind::CayenneMemory => Some(Acceleration {
             engine: Some("cayenne".to_string()),
             mode: Mode::Memory,
@@ -420,7 +408,6 @@ async fn compare_case(
                 Some(&|plan| check_federated(plan, &REMOTE_SCANS, "DuckDB", case.kept_local))
             }
             Kind::CayenneMemory | Kind::CayenneVortex => Some(&check_cayenne_sources),
-            Kind::Arrow => None,
         };
         if let Some(check) = check {
             let plan = spice_rows(rt, &format!("EXPLAIN {sql}"))

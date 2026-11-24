@@ -1,0 +1,71 @@
+# Known failing (#16676): a Cayenne caching acceleration over a paginated HTTP
+# API returns every page but caches none of them, in file and memory mode, and
+# logs nothing; a one-page response holding several rows is cached.
+name: http-caching-paginated
+description: >
+  A caching-mode acceleration over an HTTP API caches a paginated response's
+  rows from every page, as it caches a one-page response holding one row or
+  several.
+
+sources:
+  api: { kind: mock-http }
+
+variants:
+  cayenne: cayenne-file
+  cayenne-memory: cayenne-memory
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: http-caching-paginated
+  datasets:
+    - from: ${sources.api.url}/v1
+      name: one
+      params: &api { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0' }
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 1h } }
+    - from: ${sources.api.url}/v1
+      name: many
+      params: *api
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 1h } }
+    - from: ${sources.api.url}/v1
+      name: pages
+      params: { file_format: json, allowed_request_paths: '/*', max_retries: '0', response_cache_max_size_bytes: '0', pagination: enabled, pagination_next_pointer: /next_cursor, pagination_token_param: cursor, pagination_data_pointer: /data, pagination_max_pages: '10' }
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 1h } }
+
+steps:
+  # Three pages under /v1/pages, linked by `next_cursor`.
+  - source-exec:
+      api:
+        - "{ path: /v1/a, headers: { content-type: application/json }, body: '[{\"k\": \"a\", \"v\": 1}]' }"
+        - "{ path: /v1/m, headers: { content-type: application/json }, body: '[{\"k\": \"m\", \"v\": 1}, {\"k\": \"m\", \"v\": 2}, {\"k\": \"m\", \"v\": 3}]' }"
+        - "{ path: /v1/pages, headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"item-0\"}, {\"item\": \"item-1\"}], \"next_cursor\": 2}' }"
+        - "{ path: /v1/pages, query: 'cursor=2', headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"item-2\"}, {\"item\": \"item-3\"}], \"next_cursor\": 3}' }"
+        - "{ path: /v1/pages, query: 'cursor=3', headers: { content-type: application/json }, body: '{\"data\": [{\"item\": \"item-4\"}], \"next_cursor\": null}' }"
+  - start: {}
+
+  # A one-page response holding one row is cached, and the cache answers.
+  - query: SELECT content FROM one WHERE request_path = '/a'
+    expect: { rows: [['{"k":"a","v":1}']] }
+  - query: SELECT count(*) FROM one
+    expect: { rows: [['1']] }
+    eventually: 10s
+  - query: SELECT content FROM one WHERE request_path = '/a'
+    expect: { rows: [['{"k":"a","v":1}']] }
+  - source-query: { api: count /v1/a }
+    expect: { rows: [['1']] }
+
+  # So is one holding three rows under one request key.
+  - query: SELECT content FROM many WHERE request_path = '/m' ORDER BY content
+    expect: { rows: [['{"k":"m","v":1}'], ['{"k":"m","v":2}'], ['{"k":"m","v":3}']] }
+  - query: SELECT count(*) FROM many
+    expect: { rows: [['3']] }
+    eventually: 10s
+  - source-query: { api: count /v1/m }
+    expect: { rows: [['1']] }
+
+  # A paginated response returns every page's rows; they are cached too.
+  - query: SELECT content FROM pages WHERE request_path = '/pages' ORDER BY content
+    expect: { rows: [['{"item":"item-0"}'], ['{"item":"item-1"}'], ['{"item":"item-2"}'], ['{"item":"item-3"}'], ['{"item":"item-4"}']] }
+  - query: SELECT count(*) FROM pages
+    expect: { rows: [['5']] }
+    eventually: 10s

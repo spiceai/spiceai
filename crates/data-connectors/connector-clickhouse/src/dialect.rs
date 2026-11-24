@@ -299,8 +299,12 @@ impl Dialect for ClickHouseDialect {
         self.inner.supports_empty_select_list()
     }
 
+    /// `ClickHouse` reads `\` as an escape character in every string literal,
+    /// so each one is written twice. The SQL printer doubles each `'`.
     fn string_literal_to_sql(&self, s: &str) -> Option<ast::Expr> {
-        self.inner.string_literal_to_sql(s)
+        Some(ast::Expr::value(ast::Value::SingleQuotedString(
+            s.replace('\\', "\\\\"),
+        )))
     }
 
     fn group_by_matches_select_subexpressions(&self) -> bool {
@@ -309,5 +313,105 @@ impl Dialect for ClickHouseDialect {
 
     fn range_window_default_nulls_first(&self, asc: bool) -> Option<bool> {
         self.inner.range_window_default_nulls_first(asc)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::common::ScalarValue;
+    use datafusion::logical_expr::{Expr, col};
+    use datafusion::sql::sqlparser::ast::{self, BinaryOperator, SetExpr, Statement, Value};
+    use datafusion::sql::sqlparser::dialect::ClickHouseDialect as ClickHouseParser;
+    use datafusion::sql::sqlparser::parser::Parser;
+    use datafusion::sql::unparser::Unparser;
+
+    use super::ClickHouseDialect;
+
+    const VALUES: &[&str] = &[
+        "a\\'b",
+        "a\\\\'b",
+        "trail\\",
+        "C:\\new",
+        "x'y",
+        "it''s",
+        "\\N",
+        "\\x41",
+        "nul\0byte",
+        "日本\\語",
+    ];
+
+    /// The `WHERE` clause of `SELECT 1 FROM t WHERE <condition>` as a
+    /// backslash-escaping engine reads it.
+    fn read_where(condition: &str) -> ast::Expr {
+        let sql = format!("SELECT 1 FROM t WHERE {condition}");
+        let statements =
+            Parser::parse_sql(&ClickHouseParser {}, &sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let [Statement::Query(query)] = statements.as_slice() else {
+            panic!("{sql}: not one query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("{sql}: not a select");
+        };
+        let mut selection = select.selection.clone().expect("a WHERE clause");
+        while let ast::Expr::Nested(inner) = selection {
+            selection = *inner;
+        }
+        selection
+    }
+
+    fn string_value(expr: &ast::Expr) -> &str {
+        match expr {
+            ast::Expr::Value(value) => match &value.value {
+                Value::SingleQuotedString(s) => s,
+                other => panic!("not a string literal: {other:?}"),
+            },
+            other => panic!("not a literal: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clickhouse_reads_back_each_string_value() {
+        let dialect = ClickHouseDialect::new();
+        let unparser = Unparser::new(&dialect);
+        for value in VALUES {
+            for scalar in [
+                ScalarValue::Utf8(Some((*value).to_string())),
+                ScalarValue::LargeUtf8(Some((*value).to_string())),
+                ScalarValue::Utf8View(Some((*value).to_string())),
+                ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::Utf8(Some((*value).to_string()))),
+                ),
+            ] {
+                let condition = unparser
+                    .expr_to_sql(&col("s").eq(Expr::Literal(scalar, None)))
+                    .expect("unparse")
+                    .to_string();
+                let ast::Expr::BinaryOp { op, right, .. } = read_where(&condition) else {
+                    panic!("{condition}: not one comparison");
+                };
+                assert_eq!(op, BinaryOperator::Eq, "{condition}");
+                assert_eq!(string_value(&right), *value, "{condition}");
+            }
+        }
+    }
+
+    #[test]
+    fn clickhouse_reads_back_each_in_list_value() {
+        let dialect = ClickHouseDialect::new();
+        let list = VALUES
+            .iter()
+            .map(|value| Expr::Literal(ScalarValue::Utf8(Some((*value).to_string())), None))
+            .collect();
+        let condition = Unparser::new(&dialect)
+            .expr_to_sql(&col("s").in_list(list, false))
+            .expect("unparse")
+            .to_string();
+        let ast::Expr::InList { list, .. } = read_where(&condition) else {
+            panic!("{condition}: not one IN list");
+        };
+        let read: Vec<&str> = list.iter().map(string_value).collect();
+        assert_eq!(read, VALUES, "{condition}");
     }
 }

@@ -1,0 +1,29 @@
+name: cluster-nan-literal
+description: >
+  On a cluster, a filter comparing a float column with
+  `CAST('NaN' AS DOUBLE PRECISION)` answers as PostgreSQL does (#15538): the
+  SQL sent to the executors writes the NaN literal as a value, not as a
+  quoted identifier. On one spiced: edge-values.yaml.
+
+tags: [long]
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-nan-literal
+  datasets:
+    - { from: postgres:public.e, name: e, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: file } }
+
+defaults:
+  cluster: { executors: 1 }
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+
+steps:
+  - source-exec: { src: "CREATE TABLE e (id int PRIMARY KEY, f double precision); INSERT INTO e VALUES (1, 1.5), (2, 'NaN'), (3, NULL)" }
+  - start: {}
+  - query: SELECT id FROM e WHERE f = CAST('NaN' AS DOUBLE PRECISION)
+  - query: SELECT id FROM e WHERE f <> CAST('NaN' AS DOUBLE PRECISION)
