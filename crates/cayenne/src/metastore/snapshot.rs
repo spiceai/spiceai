@@ -43,8 +43,7 @@ limitations under the License.
 //! describes what the slice carries: [`SLICE_FORMAT_VERSION`] for a slice an
 //! older reader can restore in full, and [`SLICE_FORMAT_VERSION_FULL_CLEANUP`]
 //! for one carrying rows a [`SLICE_FORMAT_VERSION`] import does not clear before
-//! inserting, and [`SLICE_FORMAT_VERSION_RELATIVE_POSITION_SOURCES`] for relative
-//! position-delete source keys. A reader accepts all three and refuses anything above.
+//! inserting. A reader accepts either and refuses anything above.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -67,8 +66,8 @@ use crate::catalog::{CatalogError, CatalogResult};
 pub const SLICE_FORMAT_VERSION: u32 = 1;
 
 /// The version a slice is written at when it carries rows a
-/// [`SLICE_FORMAT_VERSION`] import does **not** clear before inserting.
-/// It requires complete cleanup on import.
+/// [`SLICE_FORMAT_VERSION`] import does **not** clear before inserting, and the
+/// highest this build reads.
 ///
 /// That import clears the parent `cayenne_table` row — whose `ON DELETE
 /// CASCADE` reaches every dependent table that keys `table_id` as text — plus
@@ -98,12 +97,6 @@ pub const SLICE_FORMAT_VERSION: u32 = 1;
 /// and an older reader keeps restoring it.
 pub const SLICE_FORMAT_VERSION_FULL_CLEANUP: u32 = 2;
 
-/// Position-delete source keys use a `./` prefix for paths relative to the
-/// data-directory anchor. Object-store keys have no dot components, so the
-/// prefix distinguishes rewritten sources from out-of-anchor keys kept intact.
-/// Readers predating this version do not re-root those keys on import.
-pub const SLICE_FORMAT_VERSION_RELATIVE_POSITION_SOURCES: u32 = 3;
-
 /// The one table outside `cayenne_table`'s cascade that a
 /// [`SLICE_FORMAT_VERSION`] import clears by hand. Naming it here is what lets
 /// [`DatasetMetastoreSlice::rows_an_older_import_cannot_clear`] derive the rest
@@ -124,7 +117,7 @@ pub const SLICE_ENGINE: &str = "cayenne";
 /// caller is not the one being edited. `unsupported_version_message` is pure so
 /// the wording is asserted in a test rather than only read.
 fn ensure_supported_format_version(version: u32) -> CatalogResult<()> {
-    if (SLICE_FORMAT_VERSION..=SLICE_FORMAT_VERSION_RELATIVE_POSITION_SOURCES).contains(&version) {
+    if (SLICE_FORMAT_VERSION..=SLICE_FORMAT_VERSION_FULL_CLEANUP).contains(&version) {
         return Ok(());
     }
     Err(CatalogError::Database {
@@ -135,7 +128,7 @@ fn ensure_supported_format_version(version: u32) -> CatalogResult<()> {
 /// The message a slice this build cannot read is refused with.
 fn unsupported_version_message(version: u32) -> String {
     format!(
-        "refusing the metastore slice: unsupported format_version {version} (this build reads {SLICE_FORMAT_VERSION} to {SLICE_FORMAT_VERSION_RELATIVE_POSITION_SOURCES}); upgrade the runtime that reads this snapshot"
+        "refusing the metastore slice: unsupported format_version {version} (this build reads {SLICE_FORMAT_VERSION} to {SLICE_FORMAT_VERSION_FULL_CLEANUP}); upgrade the runtime that reads this snapshot"
     )
 }
 
@@ -204,8 +197,12 @@ pub type SliceRow = Vec<SliceValue>;
 /// Versioned, dataset-scoped slice of the Cayenne metastore.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatasetMetastoreSlice {
-    /// The lowest format version describing this payload: version 1 for base
-    /// rows, version 2 for complete cleanup, or version 3 for position sources.
+    /// Slice format version: [`SLICE_FORMAT_VERSION`], or
+    /// [`SLICE_FORMAT_VERSION_FULL_CLEANUP`] when the slice carries anything
+    /// [`Self::rows_an_older_import_cannot_clear`] names — partition child
+    /// tables, *or* the blob-keyed marker rows an unpartitioned dataset can
+    /// carry on its own. A build reads both and writes the lower of the two
+    /// whenever the payload allows it.
     pub format_version: u32,
     /// Engine identifier; must equal [`SLICE_ENGINE`] (`"cayenne"`).
     pub engine: String,
@@ -316,63 +313,68 @@ fn source_key_anchor(anchor: &Path) -> CatalogResult<String> {
         })
 }
 
-/// Re-root only keys whose interpretation is known. Old slices retain writer
-/// keys and carry no original anchor; a foreign key cannot safely be shortened
-/// by guessing which matching suffix identifies the table.
+/// Locate the writer's table directory by its relative path followed by its
+/// table id. Exactly one match is required so an anchor that contains the same
+/// directory names cannot make a source refer to a different file.
 fn import_source_key(
     source: &str,
     row: &SliceRow,
     slice: &DatasetMetastoreSlice,
     anchor: &Path,
 ) -> CatalogResult<String> {
-    if slice.format_version >= SLICE_FORMAT_VERSION_RELATIVE_POSITION_SOURCES
-        && let Some(relative) = source.strip_prefix("./")
-    {
-        // Only explicitly relative sources are re-rooted. Opaque object keys
-        // can share a table's relative prefix while naming files elsewhere.
-        let owner = text_at(row, table_id_column_index("cayenne_delete_file"));
-        let portable = owner.is_some_and(|owner| {
-            slice_rows(slice, "cayenne_table").iter().any(|table| {
-                text_at(table, table_id_column_index("cayenne_table")) == Some(owner)
-                    && text_at(table, CAYENNE_TABLE_PATH_INDEX).is_some_and(|root| {
-                        !Path::new(root).is_absolute()
-                            && Path::new(relative)
-                                .strip_prefix(Path::new(root).join(owner))
-                                .is_ok()
-                            && Path::new(relative)
-                                .components()
-                                .all(|part| matches!(part, std::path::Component::Normal(_)))
-                    })
-            })
-        });
-        if portable {
-            return source_key_anchor(&anchor.join(relative));
-        }
-    }
-    let owner = text_at(row, table_id_column_index("cayenne_delete_file"));
-    for table in slice_rows(slice, "cayenne_table") {
-        if let Some(id) = text_at(table, table_id_column_index("cayenne_table"))
-            && Some(id) == owner
-            && let Some(root) = text_at(table, CAYENNE_TABLE_PATH_INDEX)
-        {
-            let restored_root = make_absolute(root, anchor);
-            let restored_key = source_key_anchor(&Path::new(&restored_root).join(id))?;
-            if Path::new(source).strip_prefix(restored_key).is_ok() {
-                return Ok(source.to_string());
-            }
-        }
-    }
-    let reason = if slice.format_version < SLICE_FORMAT_VERSION_RELATIVE_POSITION_SOURCES {
-        "the snapshot was written from a different data directory by an older runtime"
-    } else {
-        "the snapshot carries a position-delete source outside its data directory"
-    };
-    Err(CatalogError::Database {
+    let refuse = || CatalogError::Database {
         message: format!(
-            "refusing the metastore slice for dataset '{}': {reason} and its deletes cannot be applied here; restore to the original `cayenne_file_path` or re-take the snapshot with this version",
+            "refusing the metastore slice for dataset '{}': a position-delete source in the snapshot does not belong to its table, so its deletes cannot be applied; the import was not applied",
             slice.dataset_name
         ),
-    })
+    };
+    let owner = text_at(row, table_id_column_index("cayenne_delete_file")).ok_or_else(refuse)?;
+    let table = slice_rows(slice, "cayenne_table")
+        .iter()
+        .find(|table| text_at(table, table_id_column_index("cayenne_table")) == Some(owner))
+        .ok_or_else(refuse)?;
+    let root = text_at(table, CAYENNE_TABLE_PATH_INDEX).ok_or_else(refuse)?;
+    let (_, relative_index) = path_columns_for_table("cayenne_table").ok_or_else(refuse)?;
+    if !matches!(table.get(relative_index), Some(SliceValue::Bool(true))) {
+        let key = source_key_anchor(&Path::new(root).join(owner))?;
+        return if Path::new(root).is_absolute() && Path::new(source).strip_prefix(key).is_ok() {
+            Ok(source.to_string())
+        } else {
+            Err(refuse())
+        };
+    }
+
+    let table_parts: Vec<_> = Path::new(root).components().collect();
+    if table_parts
+        .iter()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(refuse());
+    }
+    let source_parts: Vec<_> = Path::new(source).components().collect();
+    let mut matches = source_parts
+        .windows(table_parts.len() + 1)
+        .enumerate()
+        .filter(|(_, parts)| {
+            parts[..table_parts.len()] == table_parts
+                && parts[table_parts.len()] == std::path::Component::Normal(owner.as_ref())
+        });
+    let (position, _) = matches.next().ok_or_else(refuse)?;
+    if matches.next().is_some() {
+        return Err(refuse());
+    }
+    let rest = &source_parts[position + table_parts.len() + 1..];
+    if rest
+        .iter()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(refuse());
+    }
+    let mut restored = Path::new(&make_absolute(root, anchor)).join(owner);
+    for part in rest {
+        restored.push(part.as_os_str());
+    }
+    source_key_anchor(&restored)
 }
 
 /// Lookup `table_id` for the given dataset, returning `None` if not found.
@@ -487,7 +489,6 @@ pub async fn export_dataset(
         .collect();
 
     let mut tables: BTreeMap<String, Vec<SliceRow>> = BTreeMap::new();
-    let key_anchor = source_key_anchor(data_dir_anchor)?;
 
     for expected in EXPECTED_TABLES {
         let sql = format!(
@@ -515,19 +516,6 @@ pub async fn export_dataset(
             }
         }
 
-        if expected.name == "cayenne_delete_file" {
-            for row in &mut rows {
-                if let Some(SliceValue::Text(source)) = row.get_mut(CAYENNE_DELETE_SOURCE_INDEX) {
-                    let under_anchor = Path::new(source).strip_prefix(&key_anchor).is_ok();
-                    let relative = make_relative(source, Path::new(&key_anchor));
-                    *source = if under_anchor {
-                        format!("./{relative}")
-                    } else {
-                        relative
-                    };
-                }
-            }
-        }
         tables.insert(expected.name.to_string(), rows);
     }
 
@@ -544,13 +532,6 @@ pub async fn export_dataset(
     // things a slice can now carry that an older import cannot clear.
     if slice.rows_an_older_import_cannot_clear().is_some() {
         slice.format_version = SLICE_FORMAT_VERSION_FULL_CLEANUP;
-    }
-
-    if slice_rows(&slice, "cayenne_delete_file")
-        .iter()
-        .any(|row| text_at(row, CAYENNE_DELETE_SOURCE_INDEX).is_some())
-    {
-        slice.format_version = SLICE_FORMAT_VERSION_RELATIVE_POSITION_SOURCES;
     }
 
     // Refuse to *write* a slice the reader would refuse. A partition whose
@@ -1255,7 +1236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn position_sources_export_relative_and_import_under_new_anchor() {
+    async fn position_sources_export_unchanged_and_import_under_new_anchor() {
         let (ms_a, tmp_a) = fresh_metastore().await;
         insert_dataset(&ms_a, "trips", tmp_a.path(), &[]).await;
         let relative = "trips.dir/tid-trips/snapshot/data.vortex";
@@ -1264,27 +1245,28 @@ mod tests {
         let slice = export_dataset(ms_a.as_ref(), "trips", tmp_a.path())
             .await
             .expect("export");
-        assert_eq!(
-            slice.format_version,
-            SLICE_FORMAT_VERSION_RELATIVE_POSITION_SOURCES
-        );
+        assert_eq!(slice.format_version, SLICE_FORMAT_VERSION);
         assert_eq!(
             text_at(
                 &slice.tables["cayenne_delete_file"][0],
                 CAYENNE_DELETE_SOURCE_INDEX
             ),
-            Some(format!("./{relative}").as_str())
+            Some(original.as_str())
         );
         let parsed =
             DatasetMetastoreSlice::from_json_bytes(&slice.to_json_bytes().expect("serialize"))
-                .expect("parse version 3");
+                .expect("parse version 1");
         let (ms_b, tmp_b) = fresh_metastore().await;
         import_dataset(ms_b.as_ref(), &parsed, tmp_b.path())
             .await
             .expect("import moved");
         assert_eq!(
             stored_position_source(&ms_b).await,
-            Some(source_key_anchor(&tmp_b.path().join(relative)).expect("new key"))
+            Some(
+                format!("{}/{relative}", tmp_b.path().display())
+                    .trim_start_matches('/')
+                    .to_string()
+            )
         );
         import_dataset(ms_b.as_ref(), &parsed, tmp_a.path())
             .await
@@ -1308,107 +1290,160 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_position_sources_require_the_original_anchor() {
-        let (ms_a, tmp_a) = fresh_metastore().await;
-        insert_dataset(&ms_a, "trips", tmp_a.path(), &[]).await;
-        let original = source_key_anchor(
-            &tmp_a
-                .path()
-                .join("trips.dir/tid-trips/snapshot/data.vortex"),
-        )
-        .expect("key");
-        insert_position_source(&ms_a, tmp_a.path(), Some(original.clone())).await;
-        let mut slice = export_dataset(ms_a.as_ref(), "trips", tmp_a.path())
+    async fn position_sources_match_the_table_id_after_the_relative_directory() {
+        let (ms, tmp) = fresh_metastore().await;
+        let writer_anchor = tmp.path().join("t/data");
+        insert_dataset(&ms, "trips", &writer_anchor, &[]).await;
+        ms.execute(ExecuteParams {
+            sql: "UPDATE cayenne_table SET path = ? WHERE table_id = 'tid-trips'",
+            params: vec![MetastoreValue::Text(
+                writer_anchor.join("t").to_string_lossy().into_owned(),
+            )],
+        })
+        .await
+        .expect("set table directory");
+        let source = source_key_anchor(&writer_anchor.join("t/tid-trips/snapshot/data.vortex"))
+            .expect("source key");
+        insert_position_source(&ms, &writer_anchor, Some(source.clone())).await;
+        let slice = export_dataset(ms.as_ref(), "trips", &writer_anchor)
             .await
             .expect("export");
-        slice
-            .tables
-            .get_mut("cayenne_delete_file")
-            .expect("delete rows")[0][CAYENNE_DELETE_SOURCE_INDEX] =
-            SliceValue::Text(original.clone());
-        for version in [SLICE_FORMAT_VERSION, SLICE_FORMAT_VERSION_FULL_CLEANUP] {
-            slice.format_version = version;
-            import_dataset(ms_a.as_ref(), &slice, tmp_a.path())
-                .await
-                .expect("old same-directory slice");
-            assert_eq!(stored_position_source(&ms_a).await, Some(original.clone()));
-            let error = import_dataset(ms_a.as_ref(), &slice, Path::new("/different/data"))
-                .await
-                .expect_err("foreign old source must be refused")
-                .to_string();
-            for required in [
-                "trips",
-                "older runtime",
-                "different data directory",
-                "cayenne_file_path",
-                "re-take",
-            ] {
-                assert!(error.contains(required), "{error}");
+        assert_eq!(
+            text_at(&slice.tables["cayenne_table"][0], CAYENNE_TABLE_PATH_INDEX),
+            Some("t")
+        );
+        import_dataset(ms.as_ref(), &slice, &writer_anchor)
+            .await
+            .expect("same anchor");
+        assert_eq!(stored_position_source(&ms).await, Some(source));
+        import_dataset(ms.as_ref(), &slice, Path::new("/reader/data"))
+            .await
+            .expect("moved anchor");
+        assert_eq!(
+            stored_position_source(&ms).await.as_deref(),
+            Some("reader/data/t/tid-trips/snapshot/data.vortex")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_position_sources_refuse_import_and_roll_back() {
+        let (ms, tmp) = fresh_metastore().await;
+        insert_dataset(&ms, "trips", tmp.path(), &[]).await;
+        let original =
+            source_key_anchor(&tmp.path().join("trips.dir/tid-trips/snapshot/data.vortex"))
+                .expect("key");
+        insert_position_source(&ms, tmp.path(), Some(original.clone())).await;
+        let mut slice = export_dataset(ms.as_ref(), "trips", tmp.path())
+            .await
+            .expect("export");
+        let before = export_dataset(ms.as_ref(), "trips", tmp.path())
+            .await
+            .expect("before");
+        for source in [
+            "writer/trips.dir/snapshot/data.vortex",
+            "writer/trips.dir/tid-trips/trips.dir/tid-trips/data.vortex",
+            "writer/trips.dir/tid-trips/../data.vortex",
+        ] {
+            slice
+                .tables
+                .get_mut("cayenne_delete_file")
+                .expect("delete rows")[0][CAYENNE_DELETE_SOURCE_INDEX] =
+                SliceValue::Text(source.to_string());
+            for version in [SLICE_FORMAT_VERSION, SLICE_FORMAT_VERSION_FULL_CLEANUP] {
+                slice.format_version = version;
+                let error = import_dataset(ms.as_ref(), &slice, Path::new("/different/data"))
+                    .await
+                    .expect_err("invalid source must refuse import")
+                    .to_string();
+                for required in [
+                    "dataset 'trips'",
+                    "position-delete source in the snapshot does not belong to its table",
+                    "its deletes cannot be applied",
+                    "the import was not applied",
+                ] {
+                    assert!(error.contains(required), "{error}");
+                }
+                assert!(!error.contains('\n'), "{error}");
+                let after = export_dataset(ms.as_ref(), "trips", tmp.path())
+                    .await
+                    .expect("after refusal");
+                assert_eq!(
+                    before.tables, after.tables,
+                    "refusal rolls back every replaced row"
+                );
+                assert_eq!(stored_position_source(&ms).await, Some(original.clone()));
             }
-            assert!(!error.contains('\n'), "{error}");
-            assert_eq!(
-                stored_position_source(&ms_a).await,
-                Some(original.clone()),
-                "refusal rolls back replacement"
-            );
         }
     }
 
     #[tokio::test]
-    async fn out_of_anchor_position_source_is_preserved_and_refused_on_import() {
+    async fn absolute_table_position_sources_require_their_own_table_root() {
         let (ms, tmp) = fresh_metastore().await;
-        insert_dataset(&ms, "trips", tmp.path(), &[]).await;
-        let foreign = "trips.dir/tid-trips/snapshot/data.vortex";
-        insert_position_source(&ms, tmp.path(), Some(foreign.to_string())).await;
-        let slice = export_dataset(ms.as_ref(), "trips", tmp.path())
+        insert_dataset(&ms, "trips", Path::new("/external/data"), &[]).await;
+        let original = "external/data/trips.dir/tid-trips/snapshot/data.vortex";
+        insert_position_source(&ms, tmp.path(), Some(original.to_string())).await;
+        let mut slice = export_dataset(ms.as_ref(), "trips", tmp.path())
             .await
             .expect("export");
+        assert_eq!(slice.tables["cayenne_table"][0][3], SliceValue::Bool(false));
+        import_dataset(ms.as_ref(), &slice, Path::new("/reader/data"))
+            .await
+            .expect("unchanged absolute table");
+        assert_eq!(stored_position_source(&ms).await.as_deref(), Some(original));
+        slice
+            .tables
+            .get_mut("cayenne_delete_file")
+            .expect("delete rows")[0][CAYENNE_DELETE_SOURCE_INDEX] =
+            SliceValue::Text("external/data/trips.dir/tid-trips-other/data.vortex".to_string());
+        let error = import_dataset(ms.as_ref(), &slice, tmp.path())
+            .await
+            .expect_err("foreign table source")
+            .to_string();
+        assert!(error.contains("dataset 'trips'"), "{error}");
+        assert!(error.contains("does not belong to its table"), "{error}");
+        assert!(!error.contains('\n'), "{error}");
+        assert_eq!(stored_position_source(&ms).await.as_deref(), Some(original));
+    }
+
+    #[tokio::test]
+    async fn partition_child_position_sources_use_their_own_table_rows() {
+        let (ms, tmp) = fresh_metastore().await;
+        insert_dataset(&ms, "trips", tmp.path(), &[("p1", "k1", "trips.dir/k1")]).await;
+        let child = &child_table_name("trips", "k1");
+        let child_id = lookup_table_id(ms.as_ref(), child)
+            .await
+            .expect("lookup child")
+            .expect("child exists");
+        let relative = format!("trips.dir/k1/{child_id}/snapshot/data.vortex");
+        let original = source_key_anchor(&tmp.path().join(&relative)).expect("key");
+        insert_position_source(&ms, tmp.path(), Some(original.clone())).await;
+        ms.execute(ExecuteParams {
+            sql: "UPDATE cayenne_delete_file SET table_id = ? WHERE delete_file_id = 'd1'",
+            params: vec![MetastoreValue::Text(child_id)],
+        })
+        .await
+        .expect("child owns deletion");
+        let slice = export_dataset(ms.as_ref(), "trips", tmp.path())
+            .await
+            .expect("export partitioned slice");
+        assert_eq!(slice.format_version, SLICE_FORMAT_VERSION_FULL_CLEANUP);
         assert_eq!(
             text_at(
                 &slice.tables["cayenne_delete_file"][0],
                 CAYENNE_DELETE_SOURCE_INDEX
             ),
-            Some(foreign)
+            Some(original.as_str())
         );
-        let error = import_dataset(ms.as_ref(), &slice, tmp.path())
+        import_dataset(ms.as_ref(), &slice, tmp.path())
             .await
-            .expect_err("a source outside the restored table must be refused")
-            .to_string();
-        assert!(
-            error.contains("dataset 'trips'")
-                && error.contains("position-delete source outside its data directory"),
-            "{error}"
-        );
-        assert_eq!(stored_position_source(&ms).await.as_deref(), Some(foreign));
-    }
-
-    #[test]
-    fn relative_position_source_takes_precedence_over_matching_anchor_prefix() {
-        let slice = DatasetMetastoreSlice {
-            format_version: SLICE_FORMAT_VERSION_RELATIVE_POSITION_SOURCES,
-            engine: SLICE_ENGINE.to_string(),
-            dataset_name: "trips".to_string(),
-            exported_at_ms: 0,
-            tables: BTreeMap::from([(
-                "cayenne_table".to_string(),
-                vec![
-                    sample_table_row("tid-trips", "trips", "data/trips")
-                        .iter()
-                        .map(SliceValue::from)
-                        .collect(),
-                ],
-            )]),
-        };
-        let row = vec![SliceValue::Null, SliceValue::Text("tid-trips".to_string())];
+            .expect("same anchor");
+        assert_eq!(stored_position_source(&ms).await, Some(original));
+        import_dataset(ms.as_ref(), &slice, Path::new("/reader/data"))
+            .await
+            .expect("moved child");
         assert_eq!(
-            import_source_key(
-                "./data/trips/tid-trips/snap/file.vortex",
-                &row,
-                &slice,
-                Path::new("/data")
-            )
-            .expect("relative source"),
-            "data/data/trips/tid-trips/snap/file.vortex"
+            stored_position_source(&ms).await,
+            Some(format!("reader/data/{relative}"))
         );
     }
 
@@ -2709,7 +2744,7 @@ mod tests {
         assert!(message.contains("format_version 99"), "{message}");
         assert!(
             message.contains(&format!(
-                "reads {SLICE_FORMAT_VERSION} to {SLICE_FORMAT_VERSION_RELATIVE_POSITION_SOURCES}"
+                "reads {SLICE_FORMAT_VERSION} to {SLICE_FORMAT_VERSION_FULL_CLEANUP}"
             )),
             "{message}"
         );
