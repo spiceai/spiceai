@@ -27,7 +27,9 @@ use arrow::array::{BooleanArray, StringArray};
 use arrow::compute::{cast, filter_record_batch};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_tools::format::SchemaDisplay;
-use data_components::http::provider::{HttpTableProvider, RequestPages};
+use data_components::http::provider::{
+    DEFAULT_MAX_REQUEST_PARTITIONS, HttpTableProvider, RequestPages,
+};
 use datafusion::common::{DataFusionError, Result as DataFusionResult, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::TaskContext;
@@ -440,7 +442,7 @@ impl UncoalescedFetch<'_> {
                 // `Err` arm.
                 if !cache::batches_cacheable(&batches)
                     && let Some(stale) = match expired_batches {
-                        Some(fallback) => fallback.read(filters).await,
+                        Some(fallback) => fallback.read().await,
                         None => None,
                     }
                 {
@@ -471,7 +473,7 @@ impl UncoalescedFetch<'_> {
             )),
             Err(e) => {
                 if let Some(batches) = match expired_batches {
-                    Some(fallback) => fallback.read(filters).await,
+                    Some(fallback) => fallback.read().await,
                     None => None,
                 } {
                     let staleness = staleness_past_max_age(&batches, max_age, fetch_started_at);
@@ -646,29 +648,49 @@ fn enumerable_request_predicate(expr: &Expr, under_or: bool) -> bool {
 }
 
 /// Canonical requests represented by a lookup, excluding response predicates.
+#[cfg(test)]
 fn lookup_entry_keys(filters: &[Expr]) -> Option<Vec<String>> {
+    lookup_entry_keys_bounded(filters, DEFAULT_MAX_REQUEST_PARTITIONS).0
+}
+
+fn lookup_entry_keys_bounded(filters: &[Expr], bound: usize) -> (Option<Vec<String>>, bool, bool) {
     let request: Vec<_> = filters
         .iter()
         .flat_map(flatten_and_conjuncts)
         .filter(expr_names_request_key)
         .collect();
+    if bound == 0 {
+        return (None, true, false);
+    }
     if request.is_empty() {
-        return None;
+        return (None, false, false);
     }
     if let Some(key) = request_entry_key(&request) {
-        return Some(vec![key]);
+        return (Some(vec![key]), false, true);
     }
     // Expansion must not discard a noncanonical predicate on a request key.
     if !request
         .iter()
         .all(|expr| enumerable_request_predicate(expr, false))
     {
-        return None;
+        return (None, false, false);
     }
-    let keys = requested_cache_keys(&request)?;
-    keys.iter()
-        .map(|key| key.entry_key_with_predicates(&request))
-        .collect()
+    // Enumerate at most bound + 1 combinations, and encode none until the
+    // entire set fits. The extra combination distinguishes overflow from a
+    // request exactly at the connector's limit.
+    let Some(keys) = requested_cache_keys_bounded(&request, bound.saturating_add(1)) else {
+        return (None, false, false);
+    };
+    if keys.len() > bound {
+        return (None, true, false);
+    }
+    (
+        keys.iter()
+            .map(|key| key.entry_key_with_predicates(&request))
+            .collect(),
+        false,
+        false,
+    )
 }
 
 /// Restrict candidate rows to the responses fetched for this lookup's requests.
@@ -677,17 +699,77 @@ fn lookup_entry_keys(filters: &[Expr]) -> Option<Vec<String>> {
 pub(super) struct RequestEntryRestriction {
     keys: Option<HashSet<String>>,
     requires_tag: bool,
+    over_bound: bool,
+    claim_filters: Vec<Expr>,
+    claim_entry: Option<String>,
+    canonical: bool,
 }
 
 impl RequestEntryRestriction {
+    #[cfg(test)]
     pub(super) fn new(filters: &[Expr]) -> Self {
+        Self::with_bound(filters, DEFAULT_MAX_REQUEST_PARTITIONS)
+    }
+
+    pub(super) fn for_lookup(filters: &[Expr], source: &dyn TableProvider) -> Self {
+        let bound = (source as &dyn std::any::Any)
+            .downcast_ref::<HttpTableProvider>()
+            .map_or(
+                DEFAULT_MAX_REQUEST_PARTITIONS,
+                HttpTableProvider::max_request_partitions,
+            );
+        Self::with_bound(filters, bound)
+    }
+
+    fn with_bound(filters: &[Expr], bound: usize) -> Self {
+        let headers = HttpTableProvider::request_filter_values(filters, "request_headers")
+            .len()
+            .max(1);
+        let (keys, over_bound, canonical) = lookup_entry_keys_bounded(filters, bound / headers);
+        // Only an entirely canonical request may reuse the entry as its claim.
+        let claim_entry = keys
+            .as_ref()
+            .filter(|keys| keys.len() == 1)
+            .and_then(|keys| keys.first())
+            .cloned();
         Self {
-            keys: lookup_entry_keys(filters).map(|keys| keys.into_iter().collect()),
+            keys: keys.map(|keys| keys.into_iter().collect()),
+            over_bound,
+            claim_filters: filters.to_vec(),
+            claim_entry,
+            canonical,
             requires_tag: filters.iter().flat_map(Expr::column_refs).any(|column| {
                 REQUEST_KEY_COLUMNS.contains(&column.name.as_str())
                     || column.name == "request_headers"
             }),
         }
+    }
+
+    fn claim_key(&self, filters: &[Expr], namespace: &str) -> String {
+        if self.canonical
+            && filters == self.claim_filters
+            && self
+                .claim_filters
+                .iter()
+                .flat_map(Expr::column_refs)
+                .all(|column| REQUEST_KEY_COLUMNS.contains(&column.name.as_str()))
+            && let Some(entry) = &self.claim_entry
+        {
+            return format!("{entry}|__ns={namespace}");
+        }
+        compute_cache_key_from_filters_and_namespace(filters, namespace)
+    }
+
+    // Nonempty batches have already passed this restriction, so one matching
+    // entry proves that no request in a single-entry lookup is missing.
+    fn single_tagged_entry(&self, batches: &[RecordBatch]) -> bool {
+        self.keys.as_ref().is_some_and(|keys| keys.len() == 1)
+            && batches.iter().all(|batch| {
+                batch
+                    .schema()
+                    .column_with_name(CACHE_REQUEST_COLUMN)
+                    .is_some()
+            })
     }
 
     pub(super) fn is_active(&self, schema: &arrow::datatypes::Schema) -> bool {
@@ -709,7 +791,12 @@ impl RequestEntryRestriction {
                 DataFusionError::Execution(format!("{CACHE_REQUEST_COLUMN} must be Utf8"))
             })?;
         let mask = BooleanArray::from_iter(keys.iter().map(|key| {
-            Some(key.is_some_and(|key| self.keys.as_ref().is_none_or(|keys| keys.contains(key))))
+            Some(
+                !self.over_bound
+                    && key.is_some_and(|key| {
+                        self.keys.as_ref().is_none_or(|keys| keys.contains(key))
+                    }),
+            )
         }));
         if mask.true_count() == batch.num_rows() {
             return Ok(batch);
@@ -717,11 +804,11 @@ impl RequestEntryRestriction {
         Ok(filter_record_batch(&batch, &mask)?)
     }
 
-    fn restrict_stream(&self, stream: SendableRecordBatchStream) -> SendableRecordBatchStream {
-        let restriction = Self {
-            keys: self.keys.clone(),
-            requires_tag: self.requires_tag,
-        };
+    fn restrict_stream(
+        self: &Arc<Self>,
+        stream: SendableRecordBatchStream,
+    ) -> SendableRecordBatchStream {
+        let restriction = Arc::clone(self);
         let schema = stream.schema();
         Box::pin(RecordBatchStreamAdapter::new(
             schema,
@@ -1062,6 +1149,10 @@ fn owned_request_filter_values(filters: &[Expr], column: &str) -> Vec<String> {
 /// query = 'q')` is skipped: expanding each column independently would invent
 /// the cross product `('/a','q')` and `('/b','p')`.
 fn requested_cache_keys(filters: &[Expr]) -> Option<Vec<RequestedCacheKey>> {
+    requested_cache_keys_bounded(filters, usize::MAX)
+}
+
+fn requested_cache_keys_bounded(filters: &[Expr], bound: usize) -> Option<Vec<RequestedCacheKey>> {
     if filters.iter().any(|filter| {
         rejects_http_cross_column_or(filter) || has_negated_request_key_in_list(filter)
     }) {
@@ -1103,6 +1194,9 @@ fn requested_cache_keys(filters: &[Expr]) -> Option<Vec<RequestedCacheKey>> {
                 };
                 if seen.insert(key.clone()) {
                     keys.push(key);
+                    if keys.len() >= bound {
+                        return Some(keys);
+                    }
                 }
             }
         }
@@ -1116,15 +1210,19 @@ fn requested_cache_keys(filters: &[Expr]) -> Option<Vec<RequestedCacheKey>> {
 /// is the product of each request-key column's distinct values, and each
 /// cached row matches at most one of them. `false` when the filters do not name
 /// a discrete request-key set, the same cases [`requested_cache_keys`] skips.
-fn names_uncached_request_key(filters: &[Expr], cached_batches: &[RecordBatch]) -> bool {
+fn names_uncached_request_key(
+    filters: &[Expr],
+    cached_batches: &[RecordBatch],
+    restriction: &RequestEntryRestriction,
+) -> bool {
     if cached_batches.iter().any(|batch| {
         batch
             .schema()
             .column_with_name(CACHE_REQUEST_COLUMN)
             .is_some()
-    }) && lookup_entry_keys(filters).is_some()
+    }) && restriction.keys.is_some()
     {
-        return missing_requested_cache_keys(filters, cached_batches).is_some();
+        return missing_requested_cache_keys(filters, cached_batches, restriction).is_some();
     }
     if filters.iter().any(|filter| {
         rejects_http_cross_column_or(filter) || has_negated_request_key_in_list(filter)
@@ -1217,13 +1315,13 @@ enum CachedLookupKeys {
 }
 
 impl CachedLookupKeys {
-    fn of(filters: &[Expr], batches: &[RecordBatch]) -> Self {
+    fn of(restriction: &RequestEntryRestriction, batches: &[RecordBatch]) -> Self {
         if batches.iter().any(|batch| {
             batch
                 .schema()
                 .column_with_name(CACHE_REQUEST_COLUMN)
                 .is_some()
-        }) && lookup_entry_keys(filters).is_some()
+        }) && restriction.keys.is_some()
         {
             let keys = batches
                 .iter()
@@ -1251,9 +1349,10 @@ impl CachedLookupKeys {
 fn missing_requested_cache_keys(
     filters: &[Expr],
     cached_batches: &[RecordBatch],
+    restriction: &RequestEntryRestriction,
 ) -> Option<Vec<RequestedCacheKey>> {
     let requested = requested_cache_keys(filters)?;
-    let cached = CachedLookupKeys::of(filters, cached_batches);
+    let cached = CachedLookupKeys::of(restriction, cached_batches);
     let missing: Vec<RequestedCacheKey> = requested
         .into_iter()
         .filter(|requested_key| !cached.contains(requested_key, filters))
@@ -1464,9 +1563,10 @@ fn missing_request_key_filter_groups(
     filters: &[Expr],
     cached_batches: &[RecordBatch],
     complete_fetch: bool,
+    restriction: &RequestEntryRestriction,
 ) -> Option<Vec<Vec<Expr>>> {
-    let missing = missing_requested_cache_keys(filters, cached_batches)?;
-    let groups = request_key_filter_groups(filters, &missing, complete_fetch);
+    let missing = missing_requested_cache_keys(filters, cached_batches, restriction)?;
+    let groups = request_key_filter_groups(filters, &missing, complete_fetch, restriction);
     (!groups.is_empty()).then_some(groups)
 }
 
@@ -1480,16 +1580,17 @@ fn present_request_key_filter_groups(
     filters: &[Expr],
     cached_batches: &[RecordBatch],
     complete_fetch: bool,
+    restriction: &RequestEntryRestriction,
 ) -> Vec<Vec<Expr>> {
     let Some(requested) = requested_cache_keys(filters) else {
         return Vec::new();
     };
-    let cached = CachedLookupKeys::of(filters, cached_batches);
+    let cached = CachedLookupKeys::of(restriction, cached_batches);
     let present: Vec<RequestedCacheKey> = requested
         .into_iter()
         .filter(|requested_key| cached.contains(requested_key, filters))
         .collect();
-    request_key_filter_groups(filters, &present, complete_fetch)
+    request_key_filter_groups(filters, &present, complete_fetch, restriction)
 }
 
 /// One filter set per origin scan for `keys`: the non-key conjuncts of
@@ -1499,12 +1600,13 @@ fn request_key_filter_groups(
     filters: &[Expr],
     keys: &[RequestedCacheKey],
     complete_fetch: bool,
+    restriction: &RequestEntryRestriction,
 ) -> Vec<Vec<Expr>> {
     if keys.is_empty() {
         return Vec::new();
     }
     let mut non_key = non_request_key_filters(filters);
-    if complete_fetch && lookup_entry_keys(filters).is_some() {
+    if complete_fetch && restriction.keys.is_some() {
         // Keep canonical dimensions the connector's value enumeration omits.
         non_key.extend(canonical_request_conjuncts(filters));
     }
@@ -2243,33 +2345,40 @@ enum CacheFallback {
     Loaded(Vec<RecordBatch>),
     Deferred {
         input: CachingScanInput,
+        restriction: Arc<RequestEntryRestriction>,
         partition: usize,
         context: Arc<TaskContext>,
     },
 }
 
 impl CacheFallback {
-    async fn read(self, filters: &[Expr]) -> Option<Vec<RecordBatch>> {
+    async fn read(self) -> Option<Vec<RecordBatch>> {
         let batches = match self {
-            Self::Loaded(batches) => batches,
+            Self::Loaded(batches) => return (!batches.is_empty()).then_some(batches),
             Self::Deferred {
                 input,
+                restriction,
                 partition,
                 context,
-            } => input
-                .into_plan()
-                .await
-                .inspect_err(|error| tracing::debug!(%error, "Cache fallback planning failed"))
-                .ok()?
-                .execute(partition, context)
-                .inspect_err(|error| tracing::debug!(%error, "Cache fallback execution failed"))
-                .ok()?
-                .try_collect()
-                .await
-                .inspect_err(|error| tracing::debug!(%error, "Cache fallback collection failed"))
-                .ok()?,
+            } => (
+                restriction,
+                input
+                    .into_plan()
+                    .await
+                    .inspect_err(|error| tracing::debug!(%error, "Cache fallback planning failed"))
+                    .ok()?
+                    .execute(partition, context)
+                    .inspect_err(|error| tracing::debug!(%error, "Cache fallback execution failed"))
+                    .ok()?
+                    .try_collect::<Vec<RecordBatch>>()
+                    .await
+                    .inspect_err(
+                        |error| tracing::debug!(%error, "Cache fallback collection failed"),
+                    )
+                    .ok()?,
+            ),
         };
-        let restriction = RequestEntryRestriction::new(filters);
+        let (restriction, batches) = batches;
         let batches: Vec<RecordBatch> = batches
             .into_iter()
             .map(|batch| restriction.apply(batch))
@@ -3503,6 +3612,7 @@ impl CacheRefreshHelper {
         request: &[Expr],
         namespace_id: &str,
         context: Arc<TaskContext>,
+        restriction: &Arc<RequestEntryRestriction>,
     ) -> DataFusionResult<bool> {
         let mut filters = request.to_vec();
         filters.extend(request_identity_filters(request, &accelerator.schema()));
@@ -3518,7 +3628,6 @@ impl CacheRefreshHelper {
         let plan = TableScanParams::new(session_state, None, &filters, None)
             .scan_and_optimize(accelerator.as_ref(), &filters)
             .await?;
-        let restriction = RequestEntryRestriction::new(request);
         let mut stream = restriction.restrict_stream(plan.execute(0, context)?);
         while let Some(batch) = stream.try_next().await? {
             if batch.num_rows() > 0 {
@@ -3723,6 +3832,7 @@ impl CacheRefreshHelper {
         namespace: CacheNamespace,
         in_flight_revalidations: InFlightRevalidations,
         lookup_started_at: tokio::time::Instant,
+        restriction: Option<&RequestEntryRestriction>,
     ) -> SendableRecordBatchStream {
         // Claimed before the origin is asked, not after: see [`CacheKeyClaim`]
         // for why the window this covers has to include the fetch. A caller that
@@ -3731,7 +3841,10 @@ impl CacheRefreshHelper {
         // unless that fetch asked the origin for fewer rows than this caller
         // needs, in which case it fetches for itself and, holding no claim,
         // does not write.
-        let key = compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id());
+        let key = restriction.map_or_else(
+            || compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id()),
+            |restriction| restriction.claim_key(filters, namespace.storage_id()),
+        );
         let mut claim = match CacheKeyClaim::acquire(&in_flight_revalidations, key.clone(), limit) {
             ClaimOutcome::Leader(claim) => claim,
             ClaimOutcome::Follower(in_flight) => {
@@ -3838,7 +3951,7 @@ impl CacheRefreshHelper {
                 // origin's error body instead of the cached response.
                 if !batches_cacheable
                     && let Some(stale) = match expired_batches {
-                        Some(fallback) => fallback.read(filters).await,
+                        Some(fallback) => fallback.read().await,
                         None => None,
                     }
                 {
@@ -3961,7 +4074,7 @@ impl CacheRefreshHelper {
             Err(e) => {
                 // Check if we should serve stale (expired) data on error
                 if let Some(batches) = match expired_batches {
-                    Some(fallback) => fallback.read(filters).await,
+                    Some(fallback) => fallback.read().await,
                     None => None,
                 } {
                     let staleness = staleness_past_max_age(&batches, max_age, fetch_started_at);
@@ -4122,6 +4235,7 @@ impl CacheRefreshHelper {
         in_flight_revalidations: &InFlightRevalidations,
         batch_write_tx: &CacheWriteSender,
         namespace: &CacheNamespace,
+        restriction: Option<&RequestEntryRestriction>,
     ) -> SendableRecordBatchStream {
         let total_cached_rows: usize = cached_batches.iter().map(RecordBatch::num_rows).sum();
 
@@ -4153,9 +4267,16 @@ impl CacheRefreshHelper {
                     for filters in revalidation_filters {
                         match CacheKeyClaim::acquire(
                             in_flight_revalidations,
-                            compute_cache_key_from_filters_and_namespace(
-                                filters,
-                                namespace.storage_id(),
+                            restriction.map_or_else(
+                                || {
+                                    compute_cache_key_from_filters_and_namespace(
+                                        filters,
+                                        namespace.storage_id(),
+                                    )
+                                },
+                                |restriction| {
+                                    restriction.claim_key(filters, namespace.storage_id())
+                                },
                             ),
                             None,
                         ) {
@@ -4371,6 +4492,7 @@ pub struct CachingAccelerationScanExec {
     dataset_name: String,
     io_runtime: Handle,
     filters: Vec<Expr>,
+    restriction: Arc<RequestEntryRestriction>,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
     /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations
@@ -4396,6 +4518,7 @@ impl CachingAccelerationScanExec {
         accelerator: Arc<dyn TableProvider>,
         dataset_name: String,
         io_runtime: Handle,
+        restriction: Arc<RequestEntryRestriction>,
         filters: Vec<Expr>,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
@@ -4445,6 +4568,7 @@ impl CachingAccelerationScanExec {
             dataset_name,
             io_runtime,
             filters,
+            restriction,
             projection,
             limit,
             accelerator_write_mutex,
@@ -4531,6 +4655,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             Arc::clone(&self.accelerator),
             self.dataset_name.clone(),
             self.io_runtime.clone(),
+            Arc::clone(&self.restriction),
             self.filters.clone(),
             self.projection.clone(),
             self.limit,
@@ -4576,10 +4701,17 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         // A native read that also filters response columns fetches, claims and
         // stores the whole response of its request. The filter above this scan
         // applies the response predicates to the result.
-        let response_filtered = batch_write_tx
-            .requires_complete_fetch()
-            .then(|| writer::response_filtered_request(&self.filters))
-            .flatten();
+        let response_filtered = (batch_write_tx.requires_complete_fetch()
+            && self
+                .filters
+                .iter()
+                .flat_map(Expr::column_refs)
+                .any(|column| {
+                    !REQUEST_KEY_COLUMNS.contains(&column.name.as_str())
+                        && column.name != "request_headers"
+                }))
+        .then(|| writer::response_filtered_request(&self.filters))
+        .flatten();
         let (fill_filters, response_filtered) = match response_filtered {
             Some(request) => (request, true),
             None => (self.filters.clone(), false),
@@ -4631,6 +4763,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             let schema = self.input.schema();
             let stream_schema = Arc::clone(&schema);
             let input = self.input.clone();
+            let restriction = Arc::clone(&self.restriction);
             let federated = Arc::clone(&self.federated);
             let session_state = Arc::clone(&self.session_state);
             let dataset_name = self.dataset_name.clone();
@@ -4657,6 +4790,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     Duration::ZERO,
                     Some(CacheFallback::Deferred {
                         input,
+                        restriction: Arc::clone(&restriction),
                         partition,
                         context,
                     }),
@@ -4666,6 +4800,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     namespace,
                     in_flight_revalidations,
                     lookup_started_at,
+                    Some(&restriction),
                 )
                 .await
             })
@@ -4680,7 +4815,8 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         };
         // Restrict each batch before collection, cache decisions, or a direct
         // streamed hit can observe rows belonging to another entry.
-        let accelerator_stream = RequestEntryRestriction::new(&self.filters)
+        let accelerator_stream = self
+            .restriction
             .restrict_stream(input.execute(partition, Arc::clone(&context))?);
 
         // When no filters are provided (e.g., SELECT *), return cached data directly
@@ -4715,6 +4851,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         );
 
         // Use stream::once pattern to handle cache miss like FallbackOnZeroResultsScanExec
+        let restriction = Arc::clone(&self.restriction);
         let cache_miss_or_stale_stream = futures::stream::once(async move {
             // Capture the originating request's cache namespace once. Every
             // subsequent cache lookup, write, and SWR refresh inherits this
@@ -4796,6 +4933,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                             namespace,
                             Arc::clone(&in_flight_revalidations),
                             lookup_started_at,
+                            Some(&restriction),
                         )
                         .await;
                     }
@@ -4808,7 +4946,8 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 // scans that each pass it on their own. Plan the full set first,
                 // before the keys are expanded, so a partial hit is refused
                 // where a miss is. Planning sends no request.
-                if names_uncached_request_key(&fill_filters, &cached_batches)
+                if !restriction.single_tagged_entry(&cached_batches)
+                    && names_uncached_request_key(&fill_filters, &cached_batches, &restriction)
                     && let Err(e) = federated
                         .scan(session_state.as_ref(), None, &fill_filters, limit)
                         .await
@@ -4823,11 +4962,17 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 // Data is fresh or stale. A hit that returned some rows is not
                 // enough when the query named several request keys: missing
                 // keys must still be fetched from the origin.
-                if let Some(missing_groups) = missing_request_key_filter_groups(
-                    &fill_filters,
-                    &cached_batches,
-                    batch_write_tx.requires_complete_fetch(),
-                ) {
+                let missing_groups = if restriction.single_tagged_entry(&cached_batches) {
+                    None
+                } else {
+                    missing_request_key_filter_groups(
+                        &fill_filters,
+                        &cached_batches,
+                        batch_write_tx.requires_complete_fetch(),
+                        &restriction,
+                    )
+                };
+                if let Some(missing_groups) = missing_groups {
                     tracing::debug!(
                         dataset = %dataset_name,
                         "Partial cache hit: fetching request keys absent from the accelerator"
@@ -4838,6 +4983,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                         &fill_filters,
                         &cached_batches,
                         batch_write_tx.requires_complete_fetch(),
+                        &restriction,
                     );
                     let hit_stream = CacheRefreshHelper::handle_cache_hit(
                         cached_batches,
@@ -4852,6 +4998,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                         &in_flight_revalidations,
                         &batch_write_tx,
                         &namespace,
+                        Some(&restriction),
                     );
                     let mut combined: SendableRecordBatchStream =
                         Box::pin(RecordBatchStreamAdapter::new(
@@ -4877,6 +5024,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                             namespace.clone(),
                             Arc::clone(&in_flight_revalidations),
                             lookup_started_at,
+                            Some(&restriction),
                         )
                         .await;
                         combined = Box::pin(RecordBatchStreamAdapter::new(
@@ -4900,6 +5048,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     &in_flight_revalidations,
                     &batch_write_tx,
                     &namespace,
+                    Some(&restriction),
                 )
             } else {
                 // Cache miss - no data in accelerator - retrieve from source and store in accelerator
@@ -4917,6 +5066,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                         &fill_filters,
                         namespace.storage_id(),
                         context,
+                        &restriction,
                     )
                     .await
                     {
@@ -4952,6 +5102,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     namespace,
                     Arc::clone(&in_flight_revalidations),
                     lookup_started_at,
+                    Some(&restriction),
                 )
                 .await
             }
@@ -5056,7 +5207,11 @@ mod cache_namespace_column_tests {
             col("request_query").in_list(vec![lit("cursor=2"), lit("cursor=3")], false),
         ];
         assert_eq!(
-            missing_requested_cache_keys(&filters, std::slice::from_ref(&batch)),
+            missing_requested_cache_keys(
+                &filters,
+                std::slice::from_ref(&batch),
+                &RequestEntryRestriction::new(&filters),
+            ),
             Some(vec![RequestedCacheKey {
                 path: Some("/pages".into()),
                 query: Some("cursor=3".into()),
@@ -5075,6 +5230,51 @@ mod cache_namespace_column_tests {
                 .apply(batch.clone())
                 .expect("all rows"),
             batch,
+        );
+    }
+
+    #[test]
+    fn entry_restriction_bounds_combinations_before_encoding() {
+        let filters = vec![
+            col("request_path").in_list(vec![lit("/a"), lit("/b")], false),
+            col("request_query").in_list(vec![lit("p"), lit("q")], false),
+        ];
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            CACHE_REQUEST_COLUMN,
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![
+                Some(r#"{"request_body":"","request_path":"/a","request_query":"p"}"#),
+                Some(r#"{"request_body":"","request_path":"/b","request_query":"q"}"#),
+                None,
+            ]))],
+        )
+        .expect("tagged cache rows");
+        let at_bound = RequestEntryRestriction::with_bound(&filters, 4);
+        assert_eq!(
+            at_bound.apply(batch.clone()).expect("at bound").num_rows(),
+            2
+        );
+        let over_bound = RequestEntryRestriction::with_bound(&filters, 3);
+        assert_eq!(
+            over_bound
+                .apply(batch.clone())
+                .expect("over bound")
+                .num_rows(),
+            0
+        );
+        let mut with_headers = filters;
+        with_headers
+            .push(col("request_headers").in_list(vec![lit("{}"), lit(r#"{"x":"1"}"#)], false));
+        assert_eq!(
+            RequestEntryRestriction::with_bound(&with_headers, 7)
+                .apply(batch)
+                .expect("header combinations exceed bound")
+                .num_rows(),
+            0
         );
     }
 
@@ -6373,8 +6573,13 @@ mod tests {
             col("request_path").eq(lit("/v1/items")),
             col("request_query").in_list(vec![lit("cat=p"), lit("cat=q")], false),
         ];
-        let groups =
-            missing_request_key_filter_groups(&filters, &[cached], false).expect("q is absent");
+        let groups = missing_request_key_filter_groups(
+            &filters,
+            &[cached],
+            false,
+            &RequestEntryRestriction::new(&filters),
+        )
+        .expect("q is absent");
         missing_filters_are_connector_safe(&groups);
         assert_eq!(
             groups.len(),
@@ -6403,7 +6608,13 @@ mod tests {
         )
         .expect("both keys");
         assert!(
-            missing_request_key_filter_groups(&filters, &[both], false).is_none(),
+            missing_request_key_filter_groups(
+                &filters,
+                &[both],
+                false,
+                &RequestEntryRestriction::new(&filters),
+            )
+            .is_none(),
             "complete hit should not produce a fetch"
         );
     }
@@ -6426,8 +6637,13 @@ mod tests {
             col("request_path").eq(lit("/v1/items")),
             col("request_query").in_list(vec![lit("cat=p"), lit("cat=q"), lit("cat=r")], false),
         ];
-        let groups = missing_request_key_filter_groups(&filters, &[cached], false)
-            .expect("q and r are absent");
+        let groups = missing_request_key_filter_groups(
+            &filters,
+            &[cached],
+            false,
+            &RequestEntryRestriction::new(&filters),
+        )
+        .expect("q and r are absent");
         missing_filters_are_connector_safe(&groups);
         assert_eq!(
             groups.len(),
@@ -6466,8 +6682,13 @@ mod tests {
             col("request_path").in_list(vec![lit("/v1/items"), lit("/v1/other")], false),
             col("request_query").in_list(vec![lit("cat=p"), lit("cat=q")], false),
         ];
-        let groups = missing_request_key_filter_groups(&filters, &[cached], false)
-            .expect("three combinations are absent");
+        let groups = missing_request_key_filter_groups(
+            &filters,
+            &[cached],
+            false,
+            &RequestEntryRestriction::new(&filters),
+        )
+        .expect("three combinations are absent");
         missing_filters_are_connector_safe(&groups);
         assert!(
             groups.len() >= 2,
@@ -6504,8 +6725,13 @@ mod tests {
                 .in_list(vec![lit("cat=p"), lit("cat=q")], false)
                 .and(col("request_headers").eq(lit(header))),
         ];
-        let groups =
-            missing_request_key_filter_groups(&filters, &[cached], false).expect("q is absent");
+        let groups = missing_request_key_filter_groups(
+            &filters,
+            &[cached],
+            false,
+            &RequestEntryRestriction::new(&filters),
+        )
+        .expect("q is absent");
         missing_filters_are_connector_safe(&groups);
         let rendered: Vec<String> = groups.iter().flatten().map(ToString::to_string).collect();
         assert!(
@@ -6547,9 +6773,13 @@ mod tests {
             col("request_path").eq(lit("/v1/items")),
             col("request_query").eq(lit("cat=q")),
         ];
-        let missing =
-            missing_request_key_filter_groups(&filters, std::slice::from_ref(&cached), true)
-                .expect("q is absent");
+        let missing = missing_request_key_filter_groups(
+            &filters,
+            std::slice::from_ref(&cached),
+            true,
+            &RequestEntryRestriction::new(&filters),
+        )
+        .expect("q is absent");
         assert_eq!(missing.len(), 1, "{missing:?}");
         assert_eq!(
             compute_cache_key_from_filters_and_namespace(&missing[0], "ns"),
@@ -6557,7 +6787,12 @@ mod tests {
             "{missing:?}"
         );
 
-        let present = present_request_key_filter_groups(&filters, &[cached], true);
+        let present = present_request_key_filter_groups(
+            &filters,
+            &[cached],
+            true,
+            &RequestEntryRestriction::new(&filters),
+        );
         let point_lookup_p = vec![
             col("request_path").eq(lit("/v1/items")),
             col("request_query").eq(lit("cat=p")),
@@ -6588,8 +6823,13 @@ mod tests {
             col("request_path").eq(lit("/v1/items")),
             col("request_query").in_list(vec![lit("cat=p"), lit("cat=q"), lit("cat=r")], false),
         ];
-        let groups = missing_request_key_filter_groups(&filters, &[cached], true)
-            .expect("q and r are absent");
+        let groups = missing_request_key_filter_groups(
+            &filters,
+            &[cached],
+            true,
+            &RequestEntryRestriction::new(&filters),
+        )
+        .expect("q and r are absent");
         missing_filters_are_connector_safe(&groups);
         assert_eq!(
             groups.len(),
@@ -7001,6 +7241,10 @@ mod tests {
             accelerator,
             "items".to_string(),
             Handle::current(),
+            Arc::new(RequestEntryRestriction::for_lookup(
+                &filters,
+                source.as_ref(),
+            )),
             filters,
             None,
             None,
@@ -8407,6 +8651,7 @@ mod tests {
             &in_flight_revalidations,
             &batch_write_tx,
             &CacheNamespace::Public,
+            None,
         );
         // `handle_cache_hit` clones the sender it is lent, so dropping this one
         // leaves the background refresh holding the only sender: once it has queued
@@ -8605,6 +8850,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -8648,6 +8894,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -8743,6 +8990,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -8793,6 +9041,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -8897,6 +9146,7 @@ mod tests {
             stale_if_error,
             max_age,
             Some(CacheFallback::Deferred {
+                restriction: Arc::new(RequestEntryRestriction::new(&[])),
                 input,
                 partition: 0,
                 context: Arc::new(TaskContext::default()),
@@ -8907,6 +9157,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -9069,6 +9320,7 @@ mod tests {
             stale_if_error,
             max_age,
             Some(CacheFallback::Deferred {
+                restriction: Arc::new(RequestEntryRestriction::new(&[])),
                 input,
                 partition: 0,
                 context: Arc::new(TaskContext::default()),
@@ -9079,6 +9331,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -9309,6 +9562,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -9406,6 +9660,7 @@ mod tests {
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
                 tokio::time::Instant::now(),
+                None,
             ),
         )
         .await
@@ -9536,6 +9791,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
         let served: Vec<RecordBatch> = stream.map(|batch| batch.expect("stream")).collect().await;
@@ -9616,6 +9872,7 @@ mod tests {
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
                 tokio::time::Instant::now(),
+                None,
             )
         };
 
@@ -9702,6 +9959,7 @@ mod tests {
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
                 tokio::time::Instant::now(),
+                None,
             )
         };
 
@@ -9777,6 +10035,7 @@ mod tests {
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
                 tokio::time::Instant::now(),
+                None,
             )
         };
 
@@ -9878,6 +10137,7 @@ mod tests {
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
                 tokio::time::Instant::now(),
+                None,
             )
             .await,
         )
@@ -10002,6 +10262,7 @@ mod tests {
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
                 tokio::time::Instant::now(),
+                None,
             )
             .await,
         )
@@ -10243,6 +10504,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -10381,6 +10643,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -10585,6 +10848,7 @@ mod tests {
             accelerator,
             "items".to_string(),
             Handle::current(),
+            Arc::new(RequestEntryRestriction::new(&filters)),
             filters,
             None,
             None,
@@ -11056,6 +11320,7 @@ mod tests {
                 accelerator,
                 "http_data".to_string(),
                 Handle::current(),
+                Arc::new(RequestEntryRestriction::new(&filters)),
                 filters.clone(),
                 None,
                 None,
@@ -11126,6 +11391,7 @@ mod tests {
                 stale_if_error: StaleIfError::Enabled,
                 max_age: Duration::ZERO,
                 expired_batches: Some(CacheFallback::Deferred {
+                    restriction: Arc::new(RequestEntryRestriction::new(&filters)),
                     input: input.into(),
                     partition: 0,
                     context: Arc::new(TaskContext::default()),
@@ -11188,6 +11454,7 @@ mod tests {
                 stale_if_error: StaleIfError::Enabled,
                 max_age: Duration::ZERO,
                 expired_batches: Some(CacheFallback::Deferred {
+                    restriction: Arc::new(RequestEntryRestriction::new(&filters)),
                     input: input.into(),
                     partition: 0,
                     context: Arc::new(TaskContext::default()),
@@ -11260,6 +11527,7 @@ mod tests {
                 Arc::clone(&accelerator) as Arc<dyn TableProvider>,
                 "test_dataset".to_string(),
                 Handle::current(),
+                Arc::new(RequestEntryRestriction::new(&filters)),
                 filters,
                 None,
                 None,

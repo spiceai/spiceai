@@ -2348,9 +2348,12 @@ impl AcceleratedTable {
                 // scan is planned only if a failing fetch needs it.
                 // Apply row limits above the entry restriction so unrelated
                 // candidate entries cannot hide matching rows.
-                let cache_scan_limit = if caching::RequestEntryRestriction::new(filters)
-                    .is_active(&self.accelerator.schema())
-                {
+                let federated_provider = self.federated.table_provider().await;
+                let restriction = Arc::new(caching::RequestEntryRestriction::for_lookup(
+                    filters,
+                    federated_provider.as_ref(),
+                ));
+                let cache_scan_limit = if restriction.is_active(&self.accelerator.schema()) {
                     None
                 } else {
                     limit
@@ -2398,7 +2401,6 @@ impl AcceleratedTable {
                     )?)
                 };
 
-                let federated_provider = self.federated.table_provider().await;
                 Arc::new(caching::CachingAccelerationScanExec::new(
                     input,
                     self.cache_ttl,
@@ -2408,6 +2410,7 @@ impl AcceleratedTable {
                     Arc::clone(&self.accelerator),
                     self.dataset_name.to_string(),
                     self.io_runtime.clone(),
+                    restriction,
                     filters.to_vec(),
                     projection.cloned(),
                     limit,
