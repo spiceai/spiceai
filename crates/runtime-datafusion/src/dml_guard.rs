@@ -43,7 +43,7 @@ limitations under the License.
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::logical_expr::{LogicalPlan, WriteOp};
+use datafusion::logical_expr::{DmlStatement, LogicalPlan, WriteOp};
 
 /// How a statement restricts its rows in a way the extracted filters cannot
 /// express, and what the user can do instead.
@@ -120,6 +120,10 @@ fn refusal(verb: &Verb, table: &str, found: &Unrepresentable) -> String {
 /// Refuse a `DELETE`/`UPDATE` whose row condition the planner cannot carry to
 /// the table.
 ///
+/// The statement is found anywhere in the plan, not only at its root: the
+/// optimizer wraps every write in other nodes, such as the cache invalidation
+/// node, before the plan reaches the physical planner.
+///
 /// Returns `Ok(())` for every other plan, including `INSERT` and `TRUNCATE`,
 /// which carry no row condition to lose.
 ///
@@ -128,10 +132,17 @@ fn refusal(verb: &Verb, table: &str, found: &Unrepresentable) -> String {
 /// [`DataFusionError::Plan`] when the statement's input plan restricts rows in
 /// a way the extracted filter list cannot express.
 pub fn ensure_dml_restriction_reaches_the_table(plan: &LogicalPlan) -> Result<()> {
-    let LogicalPlan::Dml(dml) = plan else {
-        return Ok(());
-    };
+    plan.apply(|node| match node {
+        LogicalPlan::Dml(dml) => {
+            ensure_statement_restriction_reaches_the_table(dml)?;
+            Ok(TreeNodeRecursion::Jump)
+        }
+        _ => Ok(TreeNodeRecursion::Continue),
+    })
+    .map(|_| ())
+}
 
+fn ensure_statement_restriction_reaches_the_table(dml: &DmlStatement) -> Result<()> {
     let verb = match dml.op {
         WriteOp::Delete => Verb {
             action: "delete from",
@@ -182,7 +193,10 @@ mod tests {
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::prelude::SessionContext;
-    use std::sync::{Arc, Mutex};
+    use datafusion_optimizer_rules::logical_plan::{
+        CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
+    };
+    use std::sync::{Arc, Mutex, Weak};
 
     /// Records the filter list each DML call receives, so a test can assert not
     /// only that a statement was refused but that nothing reached the table.
@@ -218,7 +232,7 @@ mod tests {
             filters: Vec<Expr>,
         ) -> Result<Arc<dyn ExecutionPlan>> {
             self.seen.lock().expect("record delete").push(filters);
-            Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))))
+            Ok(dml_result())
         }
 
         async fn update(
@@ -228,8 +242,17 @@ mod tests {
             filters: Vec<Expr>,
         ) -> Result<Arc<dyn ExecutionPlan>> {
             self.seen.lock().expect("record update").push(filters);
-            Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))))
+            Ok(dml_result())
         }
+    }
+
+    /// A DML plan returns the count of rows it affected, as every provider's does.
+    fn dml_result() -> Arc<dyn ExecutionPlan> {
+        Arc::new(EmptyExec::new(Arc::new(Schema::new(vec![Field::new(
+            "count",
+            DataType::UInt64,
+            false,
+        )]))))
     }
 
     /// What the table saw when a statement was planned and run.
@@ -270,12 +293,18 @@ mod tests {
         ]));
         let seen = Arc::new(Mutex::new(Vec::new()));
 
-        // The planner under test, wired exactly as the runtime wires it.
+        // The planner under test, wired as the runtime wires it, including the
+        // cache invalidation rule that wraps every write.
         let state = SessionStateBuilder::new()
             .with_default_features()
-            .with_query_planner(Arc::new(ExtensionPlanQueryPlanner::default()))
+            .with_query_planner(Arc::new(
+                ExtensionPlanQueryPlanner::from_extension_planners(vec![Arc::new(
+                    CacheInvalidationExtensionPlanner::new(),
+                )]),
+            ))
             .build();
         let ctx = SessionContext::new_with_state(state);
+        ctx.add_optimizer_rule(Arc::new(CacheInvalidationOptimizerRule::new(Weak::new())));
         ctx.register_table(
             "t",
             Arc::new(Recorder {
@@ -388,6 +417,15 @@ mod tests {
                 "{sql} was not refused for the right reason: {err}"
             );
         }
+    }
+
+    /// `EXPLAIN ANALYZE` runs the statement, so it is refused like the statement.
+    #[tokio::test]
+    async fn an_explain_analyze_of_a_refused_statement_is_refused() {
+        let err = run("EXPLAIN ANALYZE DELETE FROM t WHERE id IN (SELECT id FROM s)")
+            .await
+            .refused();
+        assert!(err.contains("a subquery"), "{err}");
     }
 
     /// The refusal names the table the user asked about.
