@@ -1727,6 +1727,11 @@ impl CayenneAccelerator {
     /// store URLs and a path this instance already claimed are unchanged. A
     /// dropped instance releases its claim, so a later accelerator reopening
     /// the same directories (a restart) finds the original path.
+    ///
+    /// Ownership is keyed without a trailing slash so `/data/orders` and
+    /// `/data/orders/` are the same directory. The returned path keeps the
+    /// caller's trailing slash: data dirs are `{base}/{dataset}/`, and callers
+    /// treat that suffix as part of the path contract.
     fn isolate_local_dir(&self, dir: &str) -> String {
         if !is_local_path(dir) {
             return dir.to_string();
@@ -1740,17 +1745,24 @@ impl CayenneAccelerator {
         }
 
         let trimmed = dir.trim_end_matches('/');
+        let with_dir_slash = |path: String| {
+            if dir.ends_with('/') && !path.ends_with('/') {
+                format!("{path}/")
+            } else {
+                path
+            }
+        };
         let actual = {
             let mut owners = LOCAL_DIR_OWNERS.lock();
             match owners.get(&key).copied() {
                 Some(id) if id != self.instance_id => {
                     let isolated = format!("{trimmed}-instance-{}", self.instance_id);
                     owners.insert(local_dir_key(&isolated), self.instance_id);
-                    isolated
+                    with_dir_slash(isolated)
                 }
                 _ => {
                     owners.insert(key.clone(), self.instance_id);
-                    trimmed.to_string()
+                    dir.to_string()
                 }
             }
         };
