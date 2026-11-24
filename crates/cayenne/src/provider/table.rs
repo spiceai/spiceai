@@ -35777,7 +35777,8 @@ impl CayenneTableProvider {
 
     /// Replace the aggregate entirely with the overwrite's accumulator and reset
     /// the live count to the rewritten row count (the prior data is gone, so the
-    /// old min/max/NDV must not survive — see [`RowCountUpdate`]). The flip in
+    /// old min/max/NDV must not survive — see [`RowCountUpdate`]). An overwrite
+    /// with no rows clears the record instead. The flip in
     /// [`Self::publish_overwrite_snapshot`] has already dropped the statistics
     /// queued for the replaced rows and the cached aggregate.
     pub(crate) async fn reset_table_stats_after_overwrite(
