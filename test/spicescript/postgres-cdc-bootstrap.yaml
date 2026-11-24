@@ -12,9 +12,11 @@ sources:
   src: { kind: postgres }
 
 # `none` lets every snapshot append finish under the writes; `mid-snapshot`
-# kills spiced while big's append runs.
+# kills spiced while big's append runs and the writes continue through the
+# rebuild; `mid-snapshot-quiet` kills it at the same point after stopping the
+# writes, so the rebuilt rows can be compared with the source.
 matrix:
-  kill: [none, mid-snapshot]
+  kill: [none, mid-snapshot, mid-snapshot-quiet]
 
 # The spicepod as written, and the same with the prototype object-native
 # Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite. The
@@ -66,7 +68,7 @@ steps:
         CREATE TABLE big (id bigint PRIMARY KEY, k int NOT NULL, v bigint NOT NULL, seq bigint NOT NULL, pad text NOT NULL);
         CREATE TABLE small (id bigint PRIMARY KEY, v bigint NOT NULL, seq bigint NOT NULL);
         CREATE TABLE solo (id bigint PRIMARY KEY, k int NOT NULL, v bigint NOT NULL, seq bigint NOT NULL, pad text NOT NULL);
-        INSERT INTO big SELECT g, g % 1000, g, 0, repeat(md5(g::text), 2) FROM generate_series(1, 2000000) g;
+        INSERT INTO big SELECT g, g % 1000, g, 0, repeat(md5(g::text), 2) FROM generate_series(1, 6000000) g;
         INSERT INTO small SELECT g, g, 0 FROM generate_series(1, 500) g;
         INSERT INTO solo SELECT g, g % 1000, g, 0, repeat(md5(g::text), 2) FROM generate_series(1, 1000000) g;
 
@@ -80,15 +82,15 @@ steps:
       source-exec:
         src: >
           BEGIN;
-          INSERT INTO big SELECT 3000000 + ${round}::bigint * 20 + g, g, g, ${round}, 'n' FROM generate_series(0, 19) g;
-          UPDATE big SET v = v + 1, seq = ${round} WHERE id IN (SELECT (${round}::bigint * 7919 + g * 104729) % 2000000 + 1 FROM generate_series(0, 9) g);
-          DELETE FROM big WHERE id IN (SELECT (${round}::bigint * 15485863 + g * 32452843) % 2000000 + 1 FROM generate_series(0, 4) g);
-          UPDATE big SET v = v + 1, seq = ${round} WHERE id IN (SELECT 3000000 + (${round}::bigint - 1 - g) * 20 + g FROM generate_series(0, 2) g);
-          DELETE FROM big WHERE id = 3000000 + (${round}::bigint - 3) * 20 + ${round}::bigint % 20;
+          INSERT INTO big SELECT 10000000 + ${round}::bigint * 20 + g, g, g, ${round}, 'n' FROM generate_series(0, 19) g;
+          UPDATE big SET v = v + 1, seq = ${round} WHERE id IN (SELECT (${round}::bigint * 7919 + g * 104729) % 6000000 + 1 FROM generate_series(0, 9) g);
+          DELETE FROM big WHERE id IN (SELECT (${round}::bigint * 15485863 + g * 32452843) % 6000000 + 1 FROM generate_series(0, 4) g);
+          UPDATE big SET v = v + 1, seq = ${round} WHERE id IN (SELECT 10000000 + (${round}::bigint - 1 - g) * 20 + g FROM generate_series(0, 2) g);
+          DELETE FROM big WHERE id = 10000000 + (${round}::bigint - 3) * 20 + ${round}::bigint % 20;
           INSERT INTO small VALUES (1000 + ${round}, ${round}, ${round});
           UPDATE small SET v = v + 1, seq = ${round} WHERE id = ${round}::bigint % 500 + 1;
           DELETE FROM small WHERE id = 1000 + ${round} - 2;
-          INSERT INTO solo SELECT 3000000 + ${round}::bigint * 20 + g, g, g, ${round}, 'n' FROM generate_series(0, 19) g;
+          INSERT INTO solo SELECT 10000000 + ${round}::bigint * 20 + g, g, g, ${round}, 'n' FROM generate_series(0, 19) g;
           UPDATE solo SET v = v + 1, seq = ${round} WHERE id IN (SELECT (${round}::bigint * 7919 + g * 104729) % 1000000 + 1 FROM generate_series(0, 9) g);
           DELETE FROM solo WHERE id IN (SELECT (${round}::bigint * 15485863 + g * 32452843) % 1000000 + 1 FROM generate_series(0, 4) g);
           COMMIT;
@@ -109,29 +111,62 @@ steps:
   - restart: { kill: KILL }
     when: { kill: mid-snapshot }
 
+  - start: { ready: false }
+    when: { kill: mid-snapshot-quiet }
+  - assert-log:
+      contains: ['Starting CDC snapshot bulk append dataset=big']
+    eventually: 120s
+    when: { kill: mid-snapshot-quiet }
+  - stop-background: { id: writes, allow: deadlock detected }
+    when: { kill: mid-snapshot-quiet }
+  - assert-log:
+      lacks: ['Finished CDC snapshot bulk append dataset=big']
+    when: { kill: mid-snapshot-quiet }
+  - restart: { kill: KILL }
+    when: { kill: mid-snapshot-quiet }
+
   # The writes keep running until every dataset is ready, then stop; each
   # dataset must then converge on its source.
   - wait-ready: { timeout: 180s }
   - stop-background: { id: writes, allow: deadlock detected }
+    when: { kill: none }
+  - stop-background: { id: writes, allow: deadlock detected }
+    when: { kill: mid-snapshot }
 
-  # The rows are compared only when nothing was killed: after a kill and a
-  # rebuild under these writes, a deleted row can come back (#16625), which
-  # is a separate defect that is also present without the bulk append.
+  # The rows are not compared in `mid-snapshot`: after a kill and a rebuild
+  # under these writes, a deleted row can come back (#16625), which is a
+  # separate defect that is also present without the bulk append.
+  # `mid-snapshot-quiet` compares them, with the writes stopped before the kill.
   - query: SELECT id, k, v, seq, pad FROM big
     oracle-sql: SELECT id, k, v, seq, pad FROM big
     eventually: 120s
     when: { kill: none }
+  - query: SELECT id, k, v, seq, pad FROM big
+    oracle-sql: SELECT id, k, v, seq, pad FROM big
+    eventually: 120s
+    when: { kill: mid-snapshot-quiet }
   - query: SELECT id, v, seq FROM small
     oracle-sql: SELECT id, v, seq FROM small
+    eventually: 60s
+    when: { kill: none }
+  - query: SELECT id, v, seq FROM small
+    oracle-sql: SELECT id, v, seq FROM small
+    eventually: 60s
+    when: { kill: mid-snapshot-quiet }
+  - query: SELECT id, k, v, seq, pad FROM solo
+    oracle-sql: SELECT id, k, v, seq, pad FROM solo
     eventually: 60s
     when: { kill: none }
   - query: SELECT id, k, v, seq, pad FROM solo
     oracle-sql: SELECT id, k, v, seq, pad FROM solo
     eventually: 60s
-    when: { kill: none }
+    when: { kill: mid-snapshot-quiet }
   - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS sv, sum(seq) AS ss FROM big
     oracle-sql: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS sv, sum(seq) AS ss FROM big
     when: { kill: none }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS sv, sum(seq) AS ss FROM big
+    oracle-sql: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS sv, sum(seq) AS ss FROM big
+    when: { kill: mid-snapshot-quiet }
 
   # Each snapshot was loaded by the bulk append.
   - assert-log:
@@ -152,6 +187,13 @@ steps:
         'Dataset big: rebuilt the acceleration from the source': 1
       lacks: ['panicked at']
     when: { kill: mid-snapshot }
+  - assert-log:
+      count:
+        'Starting CDC snapshot bulk append dataset=big': 1
+        'Finished CDC snapshot bulk append dataset=big': 0
+        'Dataset big: rebuilt the acceleration from the source': 1
+      lacks: ['panicked at']
+    when: { kill: mid-snapshot-quiet }
 
   # The same after a clean restart, which resumes: no new snapshot or rebuild.
   - restart: {}
@@ -160,14 +202,26 @@ steps:
     oracle-sql: SELECT id, k, v, seq, pad FROM big
     eventually: 60s
     when: { kill: none }
+  - query: SELECT id, k, v, seq, pad FROM big
+    oracle-sql: SELECT id, k, v, seq, pad FROM big
+    eventually: 60s
+    when: { kill: mid-snapshot-quiet }
   - query: SELECT id, v, seq FROM small
     oracle-sql: SELECT id, v, seq FROM small
+    eventually: 60s
+    when: { kill: none }
+  - query: SELECT id, v, seq FROM small
+    oracle-sql: SELECT id, v, seq FROM small
+    eventually: 60s
+    when: { kill: mid-snapshot-quiet }
+  - query: SELECT id, k, v, seq, pad FROM solo
+    oracle-sql: SELECT id, k, v, seq, pad FROM solo
     eventually: 60s
     when: { kill: none }
   - query: SELECT id, k, v, seq, pad FROM solo
     oracle-sql: SELECT id, k, v, seq, pad FROM solo
     eventually: 60s
-    when: { kill: none }
+    when: { kill: mid-snapshot-quiet }
   - assert-log:
       count:
         'Starting CDC snapshot bulk append dataset=big': 1
@@ -178,3 +232,8 @@ steps:
         'Starting CDC snapshot bulk append dataset=big': 1
         'Dataset big: rebuilt the acceleration from the source': 1
     when: { kill: mid-snapshot }
+  - assert-log:
+      count:
+        'Starting CDC snapshot bulk append dataset=big': 1
+        'Dataset big: rebuilt the acceleration from the source': 1
+    when: { kill: mid-snapshot-quiet }
