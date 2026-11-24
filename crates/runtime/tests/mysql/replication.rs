@@ -122,7 +122,7 @@ fn stream_input(
         schema_json: Some(schema_json),
         metrics: ReplicationMetricsCollector::new(),
         column_type_changes: ColumnTypeChanges::Keep,
-        acceleration_holds_rows: false,
+        acceleration_may_hold_rows: false,
     }
 }
 
@@ -809,5 +809,37 @@ async fn snapshot_survives_a_writer_stall_past_the_sources_net_write_timeout()
     );
 
     pool.disconnect().await?;
+    Ok(())
+}
+
+/// An acceleration that may already hold rows, with no recorded position to
+/// resume from, is replaced in one atomic rebuild rather than emptied by a
+/// truncate and refilled by a snapshot, since it may be served while it loads.
+#[tokio::test(flavor = "multi_thread")]
+async fn rows_held_without_a_recorded_position_open_with_a_rebuild_not_a_truncate()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
+    let container = common::start_mysql_docker_container().await?;
+    let port = container.host_port(3306)?;
+    let _pool = setup_source_table(port).await?;
+
+    for (may_hold_rows, server_id) in [(true, 200_601), (false, 200_602)] {
+        let store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
+        let mut stream = start_replication_stream(ReplicationStreamInput {
+            acceleration_may_hold_rows: may_hold_rows,
+            ..stream_input(port, server_id, store as Arc<dyn PositionStore>)
+        });
+        let envelope = next_envelope(&mut stream, "the first envelope").await?;
+        if may_hold_rows {
+            assert!(
+                envelope.history_unavailable(),
+                "an acceleration that may hold rows must open with the rebuild signal"
+            );
+            assert_eq!(num_rows(&envelope), 0, "the rebuild signal carries no rows");
+        } else {
+            assert!(!envelope.history_unavailable());
+            assert_eq!(ops_of(&envelope), vec!["t"], "an empty acceleration is snapshotted");
+        }
+    }
     Ok(())
 }

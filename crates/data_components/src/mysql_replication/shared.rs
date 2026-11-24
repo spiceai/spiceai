@@ -1056,7 +1056,7 @@ async fn attach_member(
         schema_json,
         metrics,
         column_type_changes,
-        acceleration_holds_rows,
+        acceleration_may_hold_rows,
     } = input;
     let member_key: MemberKey = (database.clone(), table.clone());
     let connection = source.key.label();
@@ -1149,7 +1149,7 @@ async fn attach_member(
         &database,
         &table,
         use_gtid,
-        acceleration_holds_rows,
+        acceleration_may_hold_rows,
     )
     .await?;
     if let Err(e) = conn.disconnect().await {
@@ -1241,9 +1241,9 @@ async fn attach_member(
             // Clear whatever a crashed earlier load left behind, so the snapshot
             // is a full replace rather than an upsert over rows the source no
             // longer has. Reached only when nothing was persisted for this member
-            // and the acceleration was not observed holding rows, so there is no
-            // completed load to preserve; an acceleration that has one takes the
-            // `Rebuild` arm above.
+            // and the acceleration was observed empty, so there is no completed
+            // load to preserve; any other acceleration takes the `Rebuild` arm
+            // above.
             let truncate = super::truncate_envelope(&schema, &primary_keys, &column_map)?;
             // Built before the snapshot input takes ownership of `dataset_name`.
             //
@@ -1417,7 +1417,7 @@ impl MemberStart {
 /// Neither route uses the snapshot path: a rebuild is a single zero-row signal
 /// the consumer answers with an atomic replacement ([`MemberStart::Rebuild`]).
 ///
-/// An acceleration observed holding rows with no position recorded (its sidecar
+/// An acceleration not observed empty with no position recorded (its sidecar
 /// could not be read, or a save failed) is rebuilt for the same reason when the
 /// table is to be read at all: it may be served while the load runs, and a
 /// snapshot would empty it first.
@@ -1426,13 +1426,13 @@ impl MemberStart {
 fn start_without_usable_position(
     snapshot_mode: InitialSnapshotMode,
     has_recorded_position: bool,
-    acceleration_holds_rows: bool,
+    acceleration_may_hold_rows: bool,
 ) -> MemberStart {
     if has_recorded_position {
         MemberStart::Rebuild
     } else if snapshot_mode == InitialSnapshotMode::Disabled {
         MemberStart::Stream
-    } else if acceleration_holds_rows {
+    } else if acceleration_may_hold_rows {
         MemberStart::Rebuild
     } else {
         MemberStart::Snapshot
@@ -1460,7 +1460,7 @@ async fn resolve_start_position(
     database: &str,
     table: &str,
     use_gtid: bool,
-    acceleration_holds_rows: bool,
+    acceleration_may_hold_rows: bool,
 ) -> Result<(BinlogPosition, GtidSet, MemberStart)> {
     let persisted = position_store
         .load()
@@ -1593,7 +1593,7 @@ async fn resolve_start_position(
     let start = start_without_usable_position(
         params.snapshot_mode,
         has_recorded_position,
-        acceleration_holds_rows,
+        acceleration_may_hold_rows,
     );
     if start.persists_head_before_loading() {
         let initial = PersistedPosition {
@@ -3494,8 +3494,8 @@ mod tests {
 
     #[test]
     fn rows_held_without_a_recorded_position_are_replaced_rather_than_emptied() {
-        // An acceleration that already holds rows can be served while it loads,
-        // so a load that reads the table replaces it atomically. `disabled`
+        // An acceleration not observed empty can be served while it loads, so a
+        // load that reads the table replaces it atomically. `disabled`
         // reads nothing and still streams.
         for mode in [InitialSnapshotMode::Auto, InitialSnapshotMode::Always] {
             assert_eq!(
