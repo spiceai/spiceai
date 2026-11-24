@@ -261,7 +261,8 @@ async fn register_test_table(
         schema,
         None,
         Acceleration {
-            engine: Engine::Arrow,
+            engine: Engine::Cayenne,
+            mode: runtime_acceleration::acceleration::Mode::Memory,
             ..Acceleration::default()
         },
         None,
