@@ -19,9 +19,31 @@ description: >
 
 sources:
   src: { kind: postgres }
+  # The state location of the object-native-s3 variant.
+  lake: { kind: rustfs }
 
 matrix:
   engine: [cayenne, arrow]
+
+variants:
+  as-written: federated
+  # `object-native-s3` (variants.yaml) in file mode, so that retention deletes
+  # from data in an S3 state location: Cayenne in memory mode keeps nothing there.
+  object-native-s3:
+    when: { engine: cayenne }
+    datasets: { '*': { acceleration: { mode: file } } }
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state:
+          location: s3://${sources.lake.bucket}/state/
+          params:
+            s3_endpoint: ${sources.lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.lake.key}
+            s3_secret: ${sources.lake.secret}
+            allow_http: 'true'
 
 spicepod:
   version: v1
@@ -101,6 +123,9 @@ spicepod:
         retention_check_interval: 1s
 
 defaults:
+  # The source's times come from now(), which each instance's writes evaluate
+  # separately; every instance is checked against its own source instead.
+  compare-variants: false
   # A cluster buckets each acceleration on this column (--cluster).
   cluster-partition-by: { '*': id }
   expect: { oracle: src }
@@ -189,3 +214,13 @@ steps:
   - query: SELECT * FROM appended
     oracle-sql: SELECT * FROM widgets WHERE NOT deleted
     eventually: 30s
+
+  # Object-native data: each acceleration's log is in the state location, and
+  # no data file is in the instance's directory. These few rows stay inline in
+  # the log, so there is no `data/` file to require.
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/by_time-, contains: /head, min: 1 }
+    only: object-native-s3
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/iso_window-, contains: /head, min: 1 }
+    only: object-native-s3
+  - assert-files: { lacks: ['(^|/)s3:', '\.vortex$', '\.arrow$'] }
+    only: object-native-s3

@@ -201,6 +201,10 @@ jobs:
     # A backstop above the compile step's own bound below, leaving room for the artifact
     # upload and the post steps.
     timeout-minutes: 200
+    env:
+      # `http-functions` for test/spicescript/secret-redaction.yaml, which registers
+      # remote functions.
+      E2E_SPICED_FEATURES: 'tpc-extension,models,http-functions'
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -259,11 +263,10 @@ jobs:
         # compile — rather than by the job bound, which GitHub renders as the whole job
         # being cancelled.
         timeout-minutes: 150
+        id: build
         uses: $/.github/actions/build-spiced
         with:
-          # `http-functions` for test/spicescript/secret-redaction.yaml, which registers
-          # remote functions.
-          features: 'tpc-extension,models,http-functions'
+          features: ${{ env.E2E_SPICED_FEATURES }}
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_linux_x86_64
@@ -273,6 +276,50 @@ jobs:
           # late run; at the repository's 30-day default each run kept its two
           # builds (~600 MiB) stored for a month.
           artifact_retention_days: '3'
+
+      # The repository's `make install`, `make install-cli` and `make install-spiced`
+      # targets (CONTRIBUTING.md), run on the binaries just built. Each is the same cargo
+      # command as the build above, with the same features, profile and target directory,
+      # so cargo has nothing to compile; a `Compiling` line means the two invocations have
+      # drifted apart and this step would be paying for a second build, so it fails
+      # instead. `HOME` points at a directory of this job's own, so the install does not
+      # replace the `~/.spice/bin` that other runner instances on a shared host use;
+      # `CARGO_HOME` and `RUSTUP_HOME` are pinned first, since they default to `HOME`.
+      - name: Check the make install targets
+        timeout-minutes: 10
+        env:
+          CARGO_TARGET_DIR: ${{ steps.build.outputs.target_dir }}
+          CARGO_INCREMENTAL: 0
+          CARGO_NET_GIT_FETCH_WITH_CLI: true
+          MISTRALRS_METAL_PRECOMPILE: 0
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export HOME="${RUNNER_TEMP:?}/make-install-home"
+          rm -rf "$HOME"
+          mkdir -p "$HOME"
+          log="${RUNNER_TEMP}/make-install.log"
+          : > "$log"
+          for target in install install-cli install-spiced; do
+            echo "::group::make $target"
+            make "$target" SPICED_NON_DEFAULT_FEATURES="$E2E_SPICED_FEATURES" 2>&1 | tee -a "$log"
+            echo "::endgroup::"
+          done
+          if grep -E '^[[:space:]]*Compiling ' "$log"; then
+            echo "::error::make install recompiled the crates above, so its cargo invocation no longer matches the build-spiced action's (features, profile, target directory or environment). Make them match again; otherwise every merge group builds spiced twice."
+            exit 1
+          fi
+          bin="$HOME/.spice/bin"
+          "$bin/spiced" --version
+          "$bin/spice" version --output json | tee "${RUNNER_TEMP}/spice-version.json"
+          python3 - "$bin/spiced" "${RUNNER_TEMP}/spice-version.json" <<'PY'
+          import json, sys
+          want, path = sys.argv[1], sys.argv[2]
+          got = json.load(open(path))
+          if got.get("runtime_path") != want or not got.get("runtime"):
+              sys.exit(f"::error::the installed spice CLI did not find and run the installed spiced at {want}: {got}")
+          PY
 
   build_macos:
     name: Build macOS aarch64 (Apple Silicon) binaries
@@ -293,6 +340,7 @@ jobs:
     # model tests, which exchange one for OpenAI access, run in `test_macos`.
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
+      E2E_SPICED_FEATURES: 'tpc-extension,models,http-functions,metal'
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -342,16 +390,60 @@ jobs:
         # the last ten (74-138); the self-hosted macOS pool puts several runner instances
         # on one host, which is where that factor-of-two spread comes from, so the bound
         # sits well clear of it rather than close to the median.
-        id: build-spiced
         timeout-minutes: 180
+        id: build
         uses: $/.github/actions/build-spiced
         with:
-          features: 'tpc-extension,models,http-functions,metal'
+          features: ${{ env.E2E_SPICED_FEATURES }}
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_darwin_aarch64
           artifact_retention_days: '1'
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+
+      # The repository's `make install`, `make install-cli` and `make install-spiced`
+      # targets (CONTRIBUTING.md), run on the binaries just built. Each is the same cargo
+      # command as the build above, with the same features, profile and target directory,
+      # so cargo has nothing to compile; a `Compiling` line means the two invocations have
+      # drifted apart and this step would be paying for a second build, so it fails
+      # instead. `HOME` points at a directory of this job's own, so the install does not
+      # replace the `~/.spice/bin` that other runner instances on a shared host use;
+      # `CARGO_HOME` and `RUSTUP_HOME` are pinned first, since they default to `HOME`.
+      - name: Check the make install targets
+        timeout-minutes: 10
+        env:
+          CARGO_TARGET_DIR: ${{ steps.build.outputs.target_dir }}
+          CARGO_INCREMENTAL: 0
+          CARGO_NET_GIT_FETCH_WITH_CLI: true
+          MISTRALRS_METAL_PRECOMPILE: 0
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export HOME="${RUNNER_TEMP:?}/make-install-home"
+          rm -rf "$HOME"
+          mkdir -p "$HOME"
+          log="${RUNNER_TEMP}/make-install.log"
+          : > "$log"
+          for target in install install-cli install-spiced; do
+            echo "::group::make $target"
+            make "$target" SPICED_NON_DEFAULT_FEATURES="$E2E_SPICED_FEATURES" 2>&1 | tee -a "$log"
+            echo "::endgroup::"
+          done
+          if grep -E '^[[:space:]]*Compiling ' "$log"; then
+            echo "::error::make install recompiled the crates above, so its cargo invocation no longer matches the build-spiced action's (features, profile, target directory or environment). Make them match again; otherwise every merge group builds spiced twice."
+            exit 1
+          fi
+          bin="$HOME/.spice/bin"
+          "$bin/spiced" --version
+          "$bin/spice" version --output json | tee "${RUNNER_TEMP}/spice-version.json"
+          python3 - "$bin/spiced" "${RUNNER_TEMP}/spice-version.json" <<'PY'
+          import json, sys
+          want, path = sys.argv[1], sys.argv[2]
+          got = json.load(open(path))
+          if got.get("runtime_path") != want or not got.get("runtime"):
+              sys.exit(f"::error::the installed spice CLI did not find and run the installed spiced at {want}: {got}")
+          PY
 
       # spicescript for `test_macos`'s macos-smoke scripts. Built here rather than there:
       # this job holds no OIDC token, while `test_macos` holds OpenAI's, and a build runs
@@ -361,7 +453,7 @@ jobs:
         id: build-spicescript
         timeout-minutes: 30
         env:
-          CARGO_TARGET_DIR: ${{ steps.build-spiced.outputs.target_dir }}
+          CARGO_TARGET_DIR: ${{ steps.build.outputs.target_dir }}
           CARGO_INCREMENTAL: 0
           CARGO_NET_GIT_FETCH_WITH_CLI: true
         run: |
@@ -1269,7 +1361,7 @@ jobs:
       - name: Configure live GitHub smoke test
         run: |
           mkdir -p test_app
-          cp test/github/github-arrow-smoke.yaml test_app/spicepod.yaml
+          cp test/github/github-cayenne-smoke.yaml test_app/spicepod.yaml
 
       - name: Allocate runtime ports
         uses: $/.github/actions/allocate-spice-ports
