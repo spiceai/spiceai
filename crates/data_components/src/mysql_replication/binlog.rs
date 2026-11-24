@@ -244,9 +244,31 @@ pub(super) async fn inherited_net_write_timeout(
 /// A dump opened by [`open_binlog_stream`].
 pub(super) struct OpenedDump {
     pub stream: BinlogStream,
-    /// The source's id for the dump's connection, which names the dump's
-    /// thread in the source's process list.
+    pub identity: DumpIdentity,
+}
+
+/// What names a dump on its source, so the source can later be asked whether
+/// it still runs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DumpIdentity {
+    /// The dump connection's id, which names its thread in the process list.
     pub thread_id: u64,
+    /// The source's `@@server_id`, which tells a failover target apart.
+    pub server_id: u64,
+    pub opened_at: std::time::Instant,
+}
+
+impl DumpIdentity {
+    /// Whether the source's answers show it no longer runs this dump: the
+    /// thread is gone, the answer came from a different server, or the source
+    /// restarted since the dump opened (connection ids start again at 1, so a
+    /// later dump may hold this one's id).
+    pub(super) fn is_gone(&self, server_id: u64, uptime: Duration, dumps_with_id: u64) -> bool {
+        dumps_with_id == 0
+            || server_id != self.server_id
+            // A second of slack: uptime is reported in whole seconds.
+            || uptime + Duration::from_secs(1) < self.opened_at.elapsed()
+    }
 }
 
 /// `connection` is the shared source's `host:port` label, not a dataset: one dump
@@ -260,11 +282,15 @@ pub(super) async fn open_binlog_stream(
     gtid: &GtidSet,
 ) -> std::result::Result<OpenedDump, mysql_async::Error> {
     let mut conn = Conn::new(params.opts.clone()).await?;
-    // The handshake carries only 32 bits of the id, and MariaDB's are 64.
-    let thread_id =
-        mysql_async::prelude::Queryable::query_first::<u64, _>(&mut conn, "SELECT CONNECTION_ID()")
-            .await?
-            .unwrap_or_else(|| u64::from(conn.id()));
+    // `CONNECTION_ID()` rather than the handshake's id, which carries only 32
+    // bits where MariaDB's are 64.
+    let (thread_id, server_id) = mysql_async::prelude::Queryable::query_first::<(u64, u64), _>(
+        &mut conn,
+        "SELECT CONNECTION_ID(), @@server_id",
+    )
+    .await?
+    .ok_or_else(|| mysql_async::Error::Other("the source answered no connection id".into()))?;
+    let opened_at = std::time::Instant::now();
 
     let inherited_timeout = match inherited_net_write_timeout(&mut conn).await {
         Ok(Some(inherited)) => Some(inherited),
@@ -328,7 +354,14 @@ pub(super) async fn open_binlog_stream(
         )
         .await
     }?;
-    Ok(OpenedDump { stream, thread_id })
+    Ok(OpenedDump {
+        stream,
+        identity: DumpIdentity {
+            thread_id,
+            server_id,
+            opened_at,
+        },
+    })
 }
 
 /// Decode a rows event for the subscribed table into the transaction buffer.
@@ -1616,6 +1649,32 @@ mod tests {
                 "{var} must stay a user variable, in nanoseconds"
             );
         }
+    }
+
+    #[test]
+    fn a_dump_is_gone_once_its_thread_ends_or_its_source_changes_or_restarts() {
+        let opened_at = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("the clock is past one minute");
+        let dump = DumpIdentity {
+            thread_id: 7,
+            server_id: 1,
+            opened_at,
+        };
+        let up_for_an_hour = Duration::from_secs(3600);
+        assert!(!dump.is_gone(1, up_for_an_hour, 1), "still running");
+        assert!(dump.is_gone(1, up_for_an_hour, 0), "thread ended");
+        // A failover target answers with its own server id, even when a dump
+        // there holds the same connection id.
+        assert!(dump.is_gone(2, up_for_an_hour, 1), "different server");
+        // Up for less time than the dump has existed: the source restarted, and
+        // a dump holding the id now is a later one.
+        assert!(dump.is_gone(1, Duration::from_secs(30), 1), "restarted");
+        // Whole-second uptime just short of the dump's age is not a restart.
+        assert!(
+            !dump.is_gone(1, Duration::from_secs(60), 1),
+            "uptime rounding"
+        );
     }
 
     #[test]

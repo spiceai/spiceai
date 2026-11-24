@@ -64,7 +64,10 @@ steps:
           DECLARE victims CURSOR FOR
             SELECT id, command
             FROM information_schema.processlist
+            -- Each instance connects with its own database, so concurrent
+            -- instances kill only their own connections.
             WHERE id <> CONNECTION_ID()
+              AND db = DATABASE()
               AND host NOT LIKE '127.0.0.1:%'
               AND host NOT LIKE 'localhost%';
           DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = true;

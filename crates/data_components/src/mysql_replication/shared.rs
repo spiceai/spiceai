@@ -1856,7 +1856,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
 
         let OpenedDump {
             mut stream,
-            thread_id: dump_thread_id,
+            identity: dump_identity,
         } = match open_binlog_stream(&params, &resume, &connection, use_gtid, &resume_gtid).await {
             Ok(opened) => {
                 backoff.reset();
@@ -1962,7 +1962,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                 Err(_idle) => {
                     if silent_since.elapsed() >= silence_limit {
                         let gone = tokio::select! {
-                            gone = dump_thread_gone(&source, &mut side_conn, &params, dump_thread_id) => gone,
+                            gone = dump_gone(&source, &mut side_conn, &params, &dump_identity) => gone,
                             () = crate::cdc::shutdown_signalled(shutdown_epoch) => continue 'recv,
                         };
                         if gone == Some(true) {
@@ -3016,35 +3016,40 @@ async fn side_query<T, E: std::fmt::Display>(
     None
 }
 
-/// Whether the source no longer runs the dump on connection `dump_thread_id`,
-/// or `None` when the source could not be asked.
-///
-/// The thread must still be a binlog dump: after a source restart or failover
-/// the id can belong to an unrelated connection.
-async fn dump_thread_gone(
+/// Whether the source no longer runs the dump `dump`, or `None` when the
+/// source could not be asked.
+async fn dump_gone(
     source: &SharedSource,
     side_conn: &mut Option<Conn>,
     params: &ReplicationParams,
-    dump_thread_id: u64,
+    dump: &super::binlog::DumpIdentity,
 ) -> Option<bool> {
-    // A user always sees their own threads, so no `PROCESS` grant is needed.
-    let running = side_query(
+    side_query(
         source,
         side_conn,
         params,
         "dump liveness query",
         DUMP_LIVENESS_TIMEOUT,
-        async |conn| {
-            conn.exec_first::<u64, _, _>(
-                "SELECT COUNT(*) FROM information_schema.PROCESSLIST \
-                 WHERE ID = ? AND COMMAND LIKE 'Binlog Dump%'",
-                (dump_thread_id,),
-            )
-            .await
+        async |conn| -> std::result::Result<bool, mysql_async::Error> {
+            // A user always sees their own threads, so no `PROCESS` grant is
+            // needed; the command filter skips a reused id held by another kind
+            // of connection.
+            let (server_id, dumps_with_id) = conn
+                .exec_first::<(u64, u64), _, _>(
+                    "SELECT @@server_id, (SELECT COUNT(*) FROM information_schema.PROCESSLIST \
+                     WHERE ID = ? AND COMMAND LIKE 'Binlog Dump%')",
+                    (dump.thread_id,),
+                )
+                .await?
+                .ok_or_else(|| mysql_async::Error::Other("the source answered no row".into()))?;
+            let uptime_secs = conn
+                .query_first::<(String, u64), _>("SHOW GLOBAL STATUS LIKE 'Uptime'")
+                .await?
+                .map_or(u64::MAX, |(_, secs)| secs);
+            Ok(dump.is_gone(server_id, Duration::from_secs(uptime_secs), dumps_with_id))
         },
     )
-    .await;
-    running.map(|count| count == Some(0))
+    .await
 }
 
 /// Poll the source head over a lazily-maintained side connection, publish the
