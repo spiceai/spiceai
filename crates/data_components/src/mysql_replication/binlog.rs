@@ -267,7 +267,7 @@ impl DumpIdentity {
         dumps_with_id == 0
             || server_id != self.server_id
             // A second of slack: uptime is reported in whole seconds.
-            || uptime + Duration::from_secs(1) < self.opened_at.elapsed()
+            || uptime.saturating_add(Duration::from_secs(1)) < self.opened_at.elapsed()
     }
 }
 
@@ -1675,6 +1675,7 @@ mod tests {
             !dump.is_gone(1, Duration::from_secs(60), 1),
             "uptime rounding"
         );
+        assert!(!dump.is_gone(1, Duration::MAX, 1), "largest uptime");
     }
 
     #[test]

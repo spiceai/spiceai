@@ -3045,7 +3045,8 @@ async fn dump_gone(
             let uptime_secs = conn
                 .query_first::<(String, u64), _>("SHOW GLOBAL STATUS LIKE 'Uptime'")
                 .await?
-                .map_or(u64::MAX, |(_, secs)| secs);
+                .map(|(_, secs)| secs)
+                .ok_or_else(|| mysql_async::Error::Other("the source answered no uptime".into()))?;
             Ok(dump.is_gone(server_id, Duration::from_secs(uptime_secs), dumps_with_id))
         },
     )
