@@ -3766,7 +3766,9 @@ impl DataAccelerator for CayenneAccelerator {
             return Ok(None);
         }
         let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
-        if self.metastore_type_for(source, &metadata_dir).await? != metastore::Metastore::ObjectNative {
+        if self.metastore_type_for(source, &metadata_dir).await?
+            != metastore::Metastore::ObjectNative
+        {
             return Ok(None);
         }
         let opened = self

@@ -56,6 +56,8 @@ pub struct ObjectNativeCatalog {
     pub(super) datasets: Path,
     pub(super) transactions: Path,
     routes: RwLock<Routes>,
+    /// [`Self::location_id`], once read: it never changes after it is recorded.
+    location_id: std::sync::OnceLock<String>,
     /// Serializes creating and dropping datasets, and deleting a dropped
     /// dataset's folder.
     pub(super) ddl: Arc<tokio::sync::Mutex<()>>,
@@ -330,6 +332,7 @@ impl ObjectNativeCatalog {
             datasets,
             transactions,
             routes: RwLock::new(routes),
+            location_id: std::sync::OnceLock::new(),
             ddl: Arc::new(tokio::sync::Mutex::new(())),
             dropping: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             deletion_holds: parking_lot::Mutex::new(HashMap::new()),
@@ -820,6 +823,9 @@ impl ObjectNativeCatalog {
     /// instance that does not write the registry while the instance that does
     /// has not recorded the identity yet.
     pub async fn location_id(&self) -> CatalogResult<String> {
+        if let Some(id) = self.location_id.get() {
+            return Ok(id.clone());
+        }
         let recorded = self
             .registry
             .sidecar_value_or_record(LOCATION_ID_KEY, || {
@@ -831,11 +837,12 @@ impl ObjectNativeCatalog {
                 message: "The state location has no identity yet: the Spice instance that writes it records one when it starts. Retry once that instance is running.".to_string(),
             });
         };
-        String::from_utf8(bytes).map_err(|error| {
+        let id = String::from_utf8(bytes).map_err(|error| {
             crate::catalog::CatalogError::InvalidOperationNoSource {
                 message: format!("The state location's recorded identity is not text: {error}"),
             }
-        })
+        })?;
+        Ok(self.location_id.get_or_init(|| id).clone())
     }
 
     /// Follow whether this instance writes dataset `name`: `true` while it

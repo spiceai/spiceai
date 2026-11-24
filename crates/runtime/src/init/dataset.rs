@@ -1950,7 +1950,7 @@ impl Runtime {
     /// committed and starts its refresh, a handover stops its refresh.
     pub(crate) async fn reload_on_writer_changes(
         self: Arc<Self>,
-        mut changes: tokio::sync::mpsc::UnboundedReceiver<String>,
+        mut changes: tokio::sync::mpsc::UnboundedReceiver<TableReference>,
     ) {
         while let Some(name) = changes.recv().await {
             let Some(app) = self.read_app().await else {
@@ -1959,17 +1959,14 @@ impl Runtime {
             let Some(dataset) = Arc::clone(&self)
                 .get_valid_datasets(&app, LogErrors(false))
                 .into_iter()
-                .find(|ds| ds.name.to_string() == name)
+                .find(|ds| ds.name == name)
             else {
                 continue;
             };
             // A reload that unregistered the dataset and then failed to load it
             // again is retried as an added dataset's load is, rather than wait
             // for another change of writer that may never come.
-            if let Some(bootstrap) = Arc::clone(&self)
-                .update_dataset(Arc::clone(&dataset))
-                .await
-            {
+            if let Some(bootstrap) = Arc::clone(&self).update_dataset(Arc::clone(&dataset)).await {
                 let runtime = Arc::clone(&self);
                 let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
                 let load = self.dataset_loads.begin(&dataset.name);

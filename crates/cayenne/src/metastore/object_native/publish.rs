@@ -173,7 +173,7 @@ impl Inner {
             // working once the committed state is reloaded.
             Outcome::Fenced { .. } | Outcome::Rejected => {
                 tracing::info!("{}", fenced_message(&self.dataset));
-                self.stop = Some(Stop::Fenced { reloaded: false });
+                self.stop = Some(Stop::Fenced);
                 if let Err(error) = self.reload_committed().await {
                     tracing::debug!(
                         "{} could not reload its committed state yet, so its queries wait for a background retry: {error}",

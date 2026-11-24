@@ -563,8 +563,8 @@ impl ObjectStore for FaultStore {
         } else {
             Op::Get
         };
-        let gated = op == Op::Get
-            || (op == Op::GetConditional && self.shared.state.lock().gate_polls);
+        let gated =
+            op == Op::Get || (op == Op::GetConditional && self.shared.state.lock().gate_polls);
         if gated {
             self.wait_at_gate(path).await;
         }

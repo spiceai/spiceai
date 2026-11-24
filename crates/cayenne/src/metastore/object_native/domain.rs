@@ -165,16 +165,13 @@ impl Domain {
                     return true;
                 }
                 let mut inner = self.inner.take().await;
-                let took_over = match inner.head {
-                    Head::Replica(_) => true,
-                    // A lease this process did not hold throughout, or a gate
-                    // a failed takeover left closed: write on only from the
-                    // committed state, under a head generation of its own.
-                    Head::Writer(_) => {
-                        self.data_writes.set(false);
-                        !continuous
-                    }
-                };
+                // A lease this process did not hold throughout, or a gate a
+                // failed takeover left closed: write on only from the
+                // committed state, under a head generation of its own.
+                let took_over = matches!(inner.head, Head::Replica(_)) || !continuous;
+                if matches!(inner.head, Head::Writer(_)) {
+                    self.data_writes.set(false);
+                }
                 match inner.become_writer().await {
                     Ok(()) if took_over => {
                         tracing::info!("{}", super::took_over_message(dataset, &inner.location()));
@@ -192,12 +189,11 @@ impl Domain {
                     return true;
                 }
                 match inner.reload_committed().await {
-                    Ok(()) => tracing::info!(
-                        "{}",
-                        super::handed_over_message(dataset, holder.as_deref())
-                    ),
+                    Ok(()) => {
+                        tracing::info!("{}", super::handed_over_message(dataset, holder.as_deref()))
+                    }
                     Err(error) => {
-                        inner.stop = Some(Stop::Fenced { reloaded: false });
+                        inner.stop = Some(Stop::Fenced);
                         tracing::warn!(
                             "{} {error}",
                             super::handed_over_message(dataset, holder.as_deref())
@@ -348,7 +344,7 @@ impl Domain {
     pub(super) async fn read(&self) -> CatalogResult<StateLease<'_>> {
         let inner = self.inner.take().await;
         match inner.stop {
-            None | Some(Stop::Fenced { reloaded: true } | Stop::Replica) => Ok(inner),
+            None | Some(Stop::Replica) => Ok(inner),
             Some(stop) => Err(inner.stopped(stop)),
         }
     }
@@ -768,14 +764,7 @@ impl Domain {
         }
         let value = make();
         inner
-            .commit(vec![Action::new(Kind::AdvanceSourcePosition(
-                proto::AdvanceSourcePosition {
-                    source: key.to_string(),
-                    partition: String::new(),
-                    position: value.clone(),
-                    clear: false,
-                },
-            ))])
+            .commit(vec![super::position(key, "", Some(value.clone()))])
             .await?;
         Ok(Some(value))
     }
@@ -1143,11 +1132,7 @@ impl Inner {
     }
     /// Whether a background task has to bring this log back.
     pub(super) fn needs_recovery(&self) -> bool {
-        !self.recovering
-            && matches!(
-                self.stop,
-                Some(Stop::Unresolved | Stop::Fenced { reloaded: false })
-            )
+        !self.recovering && matches!(self.stop, Some(Stop::Unresolved | Stop::Fenced))
     }
     /// Bring this log back from [`Stop::Unresolved`] by reopening it, or reload
     /// the committed state of a fenced one.
@@ -1181,14 +1166,14 @@ impl Inner {
                     Err(CatalogError::InvalidOperationNoSource { message })
                         if message == FENCED_ON_REOPEN =>
                     {
-                        self.stop = Some(Stop::Fenced { reloaded: false });
+                        self.stop = Some(Stop::Fenced);
                         tracing::info!("{}", fenced_message(&self.dataset));
                         self.reload_committed().await
                     }
                     Err(error) => Err(error),
                 }
             }
-            Some(Stop::Fenced { reloaded: false }) => self.reload_committed().await,
+            Some(Stop::Fenced) => self.reload_committed().await,
             _ => Ok(()),
         }
     }
@@ -1235,17 +1220,8 @@ impl Inner {
         // Another instance writes the log: send no further data write, then
         // follow its commits from what is committed now.
         self.data_writes.set(false);
-        let (reader, opened) =
-            Reader::open(Arc::clone(&self.reader.store), self.reader.prefix.clone())
-                .await
-                .map_err(invalid)?;
-        let replayed = replay_state(opened)?;
-        self.reader.state = replayed.state;
-        self.revision += 1;
-        self.floor_state = replayed.floor_state;
-        self.since_floor = replayed.since_floor;
+        self.reread_as_replica().await?;
         self.pending.clear();
-        self.head = Head::Replica(Box::new(reader));
         self.stop = Some(Stop::Replica);
         self.config.access = Access::Replica;
         Ok(())
@@ -1283,7 +1259,7 @@ impl Inner {
                 "{} is reading its state back after a change whose outcome is unknown, so it accepts no change until that finishes; retry shortly.",
                 subject(&self.dataset)
             ),
-            Stop::Fenced { .. } => fenced_message(&self.dataset),
+            Stop::Fenced => fenced_message(&self.dataset),
             Stop::Refused => refused_change_message(&self.dataset, "see the earlier error"),
             Stop::Replica => replica_change_message(&self.dataset),
         };
@@ -1365,7 +1341,7 @@ impl Inner {
     pub(super) fn writer(&self) -> CatalogResult<&Writer> {
         match &self.head {
             Head::Writer(writer) => Ok(writer),
-            Head::Replica(_) => Err(self.stopped(Stop::Replica)),
+            Head::Replica(_) => Err(replica_error(&self.dataset)),
         }
     }
 
@@ -1404,20 +1380,27 @@ impl Inner {
                 // The writer checkpointed past this replica's cursor and the
                 // records in between may be collected, or a batch failed to
                 // apply after changing part of the state: read the log again.
-                let (reader, opened) =
-                    Reader::open(Arc::clone(&self.reader.store), self.reader.prefix.clone())
-                        .await
-                        .map_err(invalid)?;
-                let replayed = replay_state(opened)?;
-                self.reader.state = replayed.state;
-                self.revision += 1;
+                self.reread_as_replica().await?;
                 self.reread = false;
-                self.floor_state = replayed.floor_state;
-                self.since_floor = replayed.since_floor;
-                self.head = Head::Replica(Box::new(reader));
             }
         }
         Ok(self.revision)
+    }
+
+    /// Read the committed log again from its head and follow it from there as
+    /// a replica.
+    async fn reread_as_replica(&mut self) -> CatalogResult<()> {
+        let (reader, opened) =
+            Reader::open(Arc::clone(&self.reader.store), self.reader.prefix.clone())
+                .await
+                .map_err(invalid)?;
+        let replayed = replay_state(opened)?;
+        self.reader.state = replayed.state;
+        self.revision += 1;
+        self.floor_state = replayed.floor_state;
+        self.since_floor = replayed.since_floor;
+        self.head = Head::Replica(Box::new(reader));
+        Ok(())
     }
 
     /// Apply records followed from the writer, in order.

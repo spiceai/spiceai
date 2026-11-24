@@ -199,12 +199,7 @@ pub(crate) async fn load_write_back_xid_registry(
     context: &dyn ConnectorContext,
 ) -> Result<Arc<XidRegistry>, Box<dyn std::error::Error + Send + Sync>> {
     let dataset_name = dataset.name.to_string();
-    let shared_location = context.shared_location_id(dataset).await?;
-    let repl_params = replication_params_from_connector_params(
-        params,
-        &dataset_name,
-        shared_location.as_deref(),
-    )?;
+    let repl_params = replication_params_for(params, dataset, context).await?;
     let (schema_name, table_name) = split_schema_table(&dataset.from);
     let identity = source_identity(&repl_params, &schema_name, &table_name);
 
@@ -420,14 +415,7 @@ async fn resolve_applied_lsn(
     dataset: &DatasetSpec,
     context: &dyn ConnectorContext,
 ) -> u64 {
-    let Ok(shared_location) = context.shared_location_id(dataset).await else {
-        return 0;
-    };
-    let Ok(repl_params) = replication_params_from_connector_params(
-        params,
-        &dataset.name.to_string(),
-        shared_location.as_deref(),
-    ) else {
+    let Ok(repl_params) = replication_params_for(params, dataset, context).await else {
         return 0;
     };
     let (schema_name, table_name) = split_schema_table(&dataset.from);
@@ -459,20 +447,7 @@ pub async fn build_changes_stream(
     let dataset_name = dataset.name.to_string();
     let (schema_name, table_name) = split_schema_table(&dataset.from);
 
-    let shared_location = match context.shared_location_id(dataset).await {
-        Ok(shared_location) => shared_location,
-        Err(e) => {
-            let msg = format!("postgres replication: {e}");
-            return Box::pin(futures::stream::once(async move {
-                Err(StreamError::External(msg))
-            }));
-        }
-    };
-    let mut params_for_stream = match replication_params_from_connector_params(
-        params,
-        &dataset_name,
-        shared_location.as_deref(),
-    ) {
+    let mut params_for_stream = match replication_params_for(params, dataset, context).await {
         Ok(p) => p,
         Err(e) => {
             let msg = format!("postgres replication: {e}");
@@ -1164,6 +1139,25 @@ fn accelerator_is_ephemeral(
             matches!(acceleration.mode, Mode::Memory | Mode::FileCreate)
         }
     }
+}
+
+/// `dataset`'s replication parameters, its default slot named for the location
+/// its acceleration is shared through when it is (see
+/// `ConnectorContext::shared_location_id`).
+async fn replication_params_for(
+    params: &Parameters,
+    dataset: &DatasetSpec,
+    context: &dyn ConnectorContext,
+) -> std::result::Result<ReplicationParams, String> {
+    let shared_location = context
+        .shared_location_id(dataset)
+        .await
+        .map_err(|error| error.to_string())?;
+    replication_params_from_connector_params(
+        params,
+        &dataset.name.to_string(),
+        shared_location.as_deref(),
+    )
 }
 
 fn replication_params_from_connector_params(

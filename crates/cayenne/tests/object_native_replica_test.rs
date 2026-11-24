@@ -344,9 +344,12 @@ async fn concurrent_replica_queries_share_one_head_read_sent_after_they_start() 
         let b = Arc::clone(&b);
         async move { b.count_and_sum().await }
     });
-    tokio::time::timeout(std::time::Duration::from_secs(30), replica_requests.wait_gated(1))
-        .await
-        .expect("a query on B confirms the head with a read sent after it started");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        replica_requests.wait_gated(1),
+    )
+    .await
+    .expect("a query on B confirms the head with a read sent after it started");
 
     a.insert(101, 200).await.expect("A writes 101..=200");
 
@@ -391,7 +394,12 @@ async fn concurrent_replica_queries_share_one_head_read_sent_after_they_start() 
 async fn writer_and_replica_with(
     reuse: ScanViewReuse,
     lag: Option<std::time::Duration>,
-) -> (Instance, Instance, Arc<CayenneTableProvider>, Arc<FaultStore>) {
+) -> (
+    Instance,
+    Instance,
+    Arc<CayenneTableProvider>,
+    Arc<FaultStore>,
+) {
     let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let replica_requests = Arc::new(FaultStore::new(Arc::clone(&objects)));
     let replica_store: Arc<dyn ObjectStore> = Arc::clone(&replica_requests) as Arc<dyn ObjectStore>;
@@ -446,9 +454,14 @@ fn head_polls(requests: &FaultStore, from: usize) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_replica_serves_its_view_for_its_lag_then_confirms_the_head() {
     let lag = std::time::Duration::from_secs(2);
-    let (a, b, _table, requests) = writer_and_replica_with(ScanViewReuse::UntilInvalidated, Some(lag)).await;
+    let (a, b, _table, requests) =
+        writer_and_replica_with(ScanViewReuse::UntilInvalidated, Some(lag)).await;
     let first_confirmed = std::time::Instant::now();
-    assert_eq!(b.count_and_sum().await, expected(1..=100), "B's first query");
+    assert_eq!(
+        b.count_and_sum().await,
+        expected(1..=100),
+        "B's first query"
+    );
 
     a.insert(101, 200).await.expect("A writes 101..=200");
     let from = requests.log().len();
@@ -488,9 +501,14 @@ async fn a_replica_serves_its_view_for_its_lag_then_confirms_the_head() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_replica_refreshes_its_view_in_the_background_while_queried() {
     let lag = std::time::Duration::from_secs(6);
-    let (a, b, table, requests) = writer_and_replica_with(ScanViewReuse::UntilInvalidated, Some(lag)).await;
+    let (a, b, table, requests) =
+        writer_and_replica_with(ScanViewReuse::UntilInvalidated, Some(lag)).await;
     table.init_scan_view_cache();
-    assert_eq!(b.count_and_sum().await, expected(1..=100), "B's first query");
+    assert_eq!(
+        b.count_and_sum().await,
+        expected(1..=100),
+        "B's first query"
+    );
 
     let from = requests.log().len();
     a.insert(101, 200).await.expect("A writes 101..=200");
@@ -510,11 +528,7 @@ async fn a_replica_refreshes_its_view_in_the_background_while_queried() {
         expected(1..=200),
         "B's next query shows A's commit"
     );
-    assert_eq!(
-        head_polls(&requests, before),
-        0,
-        "and reads nothing itself"
-    );
+    assert_eq!(head_polls(&requests, before), 0, "and reads nothing itself");
 }
 
 /// A replica is strict by default, whatever view lag the table allows its
@@ -526,7 +540,11 @@ async fn a_replica_serves_every_commit_acknowledged_before_a_query_by_default() 
         ScanViewReuse::WithinLag(std::time::Duration::from_secs(3_600)),
     ] {
         let (a, b, _table, requests) = writer_and_replica_with(reuse, None).await;
-        assert_eq!(b.count_and_sum().await, expected(1..=100), "{reuse:?}: B before");
+        assert_eq!(
+            b.count_and_sum().await,
+            expected(1..=100),
+            "{reuse:?}: B before"
+        );
         a.insert(101, 200).await.expect("A writes 101..=200");
         let from = requests.log().len();
         assert_eq!(
@@ -534,7 +552,11 @@ async fn a_replica_serves_every_commit_acknowledged_before_a_query_by_default() 
             expected(1..=200),
             "{reuse:?}: B's next query returns A's commit"
         );
-        assert_eq!(head_polls(&requests, from), 1, "{reuse:?}: after one read of the head");
+        assert_eq!(
+            head_polls(&requests, from),
+            1,
+            "{reuse:?}: after one read of the head"
+        );
     }
 }
 
@@ -579,7 +601,10 @@ async fn a_location_has_one_identity_however_it_is_reached() {
 
     let elsewhere = open(Arc::new(InMemory::new()), LOCATION, Access::Writer).await;
     assert_ne!(
-        elsewhere.location_id().await.expect("another location's identity"),
+        elsewhere
+            .location_id()
+            .await
+            .expect("another location's identity"),
         id,
         "another location at the same URL has an identity of its own"
     );

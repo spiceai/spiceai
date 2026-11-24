@@ -12100,6 +12100,12 @@ impl CayenneTableProvider {
         // its own store, under a URL of its own (see `crate::dataset_storage`).
         // A `file://` table given no store (the `cayenne_vnext` flag off) keeps the
         // local data path, as it always has.
+        // Whether this table may write, bound once to the generation current
+        // now and shared by its data store, its sequence allocator and its
+        // reads (see `serves_from_writer`).
+        let table_writes = catalog
+            .data_write_gate(&table_metadata.table_id)
+            .for_table();
         let (object_store_config, dataset_storage) =
             if crate::is_object_store_path(&table_metadata.path)
                 && (object_store_config.is_some() || !table_metadata.path.starts_with("file://"))
@@ -12117,9 +12123,7 @@ impl CayenneTableProvider {
                     &table_metadata.path,
                     &table_metadata.table_id,
                     config.store,
-                    catalog
-                        .data_write_gate(&table_metadata.table_id)
-                        .for_table(),
+                    table_writes.clone(),
                 )
                 .map_err(|message| Error::Internal {
                     table: table_name.to_string(),
@@ -12284,9 +12288,8 @@ impl CayenneTableProvider {
         let seq_allocator = Arc::new(tokio::sync::Mutex::new(SeqAllocator {
             next: persisted_hi + 1,
             persisted_hi,
-            writes: catalog.data_write_gate(&table_id).for_table(),
+            writes: table_writes.clone(),
         }));
-        let table_writes = catalog.data_write_gate(&table_id).for_table();
 
         let force_staging_probe_on_startup = dataset_storage.is_some();
         // A replacement inherits the replaced instance's pins; any other
@@ -35219,7 +35222,7 @@ impl CayenneTableProvider {
     /// [`Self::confirm_head`]), and are reused for [`Self::replica_view_lag`]
     /// whatever the table's own reuse mode.
     fn serves_from_writer(&self) -> bool {
-        self.data_in_object_native_location() && !self.table_writes.allows()
+        !self.table_writes.allows() && self.data_in_object_native_location()
     }
 
     /// How long a replica's scan view serves queries before a query confirms
@@ -38275,6 +38278,10 @@ impl CayenneTableProvider {
     /// while queries use it, so a query's own read of the head usually finds
     /// it unchanged and the view already built.
     const REPLICA_STRICT_REFRESH_PERIOD: Duration = Duration::from_secs(1);
+    /// How often the background view refresh of a table that writes its
+    /// dataset wakes to notice the table's teardown, while it waits for the
+    /// table to stop writing.
+    const WRITER_REFRESH_RECHECK: Duration = Duration::from_secs(30);
     /// The shortest period between a replica's background view refreshes.
     const REPLICA_VIEW_REFRESH_MIN_PERIOD: Duration = Duration::from_millis(100);
 
@@ -38308,31 +38315,55 @@ impl CayenneTableProvider {
     /// serves another writer.
     async fn run_replica_view_refresh(weak: std::sync::Weak<Self>) {
         loop {
-            let period = {
+            let (period, writes) = {
                 let Some(provider) = weak.upgrade() else {
                     return;
                 };
                 let lag = provider.replica_view_lag();
-                if lag.is_zero() {
+                let period = if lag.is_zero() {
                     Self::REPLICA_STRICT_REFRESH_PERIOD
                 } else {
                     (lag / 2).max(Self::REPLICA_VIEW_REFRESH_MIN_PERIOD)
-                }
+                };
+                (period, provider.table_writes.clone())
             };
+            if writes.allows() {
+                // The writer's table has nothing to refresh: wait until it
+                // stops writing, waking now and then to notice a teardown.
+                let mut role = writes.watch();
+                tokio::select! {
+                    _ = role.wait_for(|allowed| !*allowed) => {}
+                    () = tokio::time::sleep(Self::WRITER_REFRESH_RECHECK) => {}
+                }
+                continue;
+            }
             tokio::time::sleep(period).await;
             let Some(provider) = weak.upgrade() else {
                 return;
             };
-            if provider.serves_from_writer()
-                && provider.queried_recently(Instant::now())
+            if !provider.serves_from_writer() || !provider.queried_recently(Instant::now()) {
+                continue;
+            }
+            let refreshed = if provider.replica_view_lag().is_zero() {
+                // A strict query reuses no view built before it arrived, so
+                // only the read of the head and the reload are done ahead of it.
+                let _reload_guard = provider.write_lock.lock().await;
+                provider
+                    .confirm_head()
+                    .await
+                    .map_err(|error| error.to_string())
+            } else {
                 // Rebuilt every round unless a query rebuilt it within the last
                 // half period: rounds and builds drift against each other, and
                 // a view kept only when younger than a whole period could be
                 // reused at one round and expire before the next.
-                && let Err(error) = provider
+                provider
                     .scan_view_confirming_head(ScanViewReuse::WithinLag(period / 2), true)
                     .await
-            {
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            };
+            if let Err(error) = refreshed {
                 // A query that finds the view past its lag confirms the head
                 // itself, and fails with the error a user can act on.
                 tracing::debug!(
@@ -38341,22 +38372,19 @@ impl CayenneTableProvider {
                     "Did not refresh the replica's scan view; the next query confirms the dataset head itself"
                 );
             }
-            drop(provider);
         }
     }
 
     /// Whether a query planned a scan of this table within the idle window
     /// the evictor keeps a scan view for.
     fn queried_recently(&self, now: Instant) -> bool {
-        let idle_window = self
-            .replica_view_lag()
-            .max(Self::SCAN_VIEW_EVICTION_INTERVAL);
+        let idle_window =
+            Self::scan_view_idle_window(ScanViewReuse::WithinLag(self.replica_view_lag()));
         let last_query_ns = self.last_query_ns.load(Ordering::Relaxed);
         last_query_ns != u64::MAX
             && now.saturating_duration_since(scan_view_instant_from_ns(last_query_ns))
                 <= idle_window
     }
-
 
     /// Background sweep that drops a cached `latest_complete` once it has gone
     /// unserved for the idle window. Keyed on last-access, not age, so a
@@ -38374,13 +38402,19 @@ impl CayenneTableProvider {
         }
     }
 
+    /// How long a cached scan view under `reuse` is kept after it was last
+    /// served.
+    fn scan_view_idle_window(reuse: ScanViewReuse) -> Duration {
+        match reuse {
+            ScanViewReuse::UntilInvalidated => Self::SCAN_VIEW_EVICTION_INTERVAL,
+            ScanViewReuse::WithinLag(lag) => lag.max(Self::SCAN_VIEW_EVICTION_INTERVAL),
+        }
+    }
+
     /// One eviction step: drain completed builds, then drop `latest_complete`
     /// iff it has not been served within the idle window (last-access, not age).
     fn evict_stale_scan_view(&self, now: Instant) {
-        let idle_window = match self.scan_view_reuse {
-            ScanViewReuse::UntilInvalidated => Self::SCAN_VIEW_EVICTION_INTERVAL,
-            ScanViewReuse::WithinLag(lag) => lag.max(Self::SCAN_VIEW_EVICTION_INTERVAL),
-        };
+        let idle_window = Self::scan_view_idle_window(self.scan_view_reuse);
         {
             let mut in_flight = self.scan_view_cache.in_flight.lock();
             self.scan_view_cache.drain_completed(&mut in_flight);
@@ -47127,12 +47161,13 @@ fn i64_eq_literal_on_schema(schema: &SchemaRef, filters: &[Expr]) -> Option<(usi
 
 impl CayenneTableProvider {
     /// What a scan does before it captures its view (see [`Self::plan_scan_from_view`]),
-    /// and how that capture may reuse a cached view.
+    /// how that capture may reuse a cached view, and whether it confirms the
+    /// dataset head first ([`Self::serves_from_writer`], read once per scan).
     async fn prepare_scan(
         &self,
         state: &dyn Session,
         filters: &[Expr],
-    ) -> datafusion_common::Result<ScanViewReuse> {
+    ) -> datafusion_common::Result<(ScanViewReuse, bool)> {
         // F4 default-on layout: record which columns this scan filters on so
         // background compaction can cluster cold files without spicepod setup.
         // Cheap (mutex + HashMap bump); empty filters are a no-op.
@@ -47182,7 +47217,8 @@ impl CayenneTableProvider {
         self.verify_data_file_integrity().await?;
 
         let current = state.config().get_extension::<CurrentScanView>().is_some();
-        Ok(if self.serves_from_writer() {
+        let follows = self.serves_from_writer();
+        let reuse = if follows {
             // No write of this instance invalidates a replica's view: it is
             // reused for the replica's lag, and "as it is now" confirms the head.
             ScanViewReuse::WithinLag(if current {
@@ -47194,7 +47230,8 @@ impl CayenneTableProvider {
             ScanViewReuse::UntilInvalidated
         } else {
             self.scan_view_reuse
-        })
+        };
+        Ok((reuse, follows))
     }
 
     /// A scan's plan over `scan_view`. Everything the plan reads descends from that
@@ -47777,7 +47814,7 @@ impl TableProvider for CayenneTableProvider {
             self.ensure_publication_outcome_known()
                 .map_err(|error| DataFusionError::External(Box::new(error)))?;
         }
-        let reuse = self.prepare_scan(state, filters).await?;
+        let (reuse, confirm_head) = self.prepare_scan(state, filters).await?;
         // Obtain the scan-view bundle from the demand cache. See
         // [`Self::scan_view_at_current_input`]. The KDI merge + visible mem-tier
         // segments are computed OFF the query path (in `spawn_blocking`) and
@@ -47790,7 +47827,6 @@ impl TableProvider for CayenneTableProvider {
         //
         // The fields are cloned out (cheap `Arc` / short-`String` / `im`-HAMT clones)
         // so downstream plan-build owns them exactly as when it captured inline.
-        let confirm_head = self.serves_from_writer();
         if confirm_head {
             self.last_query_ns
                 .store(scan_view_instant_as_ns(Instant::now()), Ordering::Relaxed);

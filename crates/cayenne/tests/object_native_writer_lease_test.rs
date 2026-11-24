@@ -29,9 +29,9 @@ use cayenne::metastore::object_native::{
 use cayenne::{CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
-use object_store::{ObjectStore, ObjectStoreExt};
 use object_store::memory::InMemory;
 use object_store::path::Path;
+use object_store::{ObjectStore, ObjectStoreExt};
 use object_store_sim::Op;
 use object_store_sim::fault::FaultStore;
 
@@ -460,7 +460,10 @@ async fn a_writer_that_cannot_renew_its_lease_deletes_nothing_its_successor_comm
             .expect("create the table"),
     );
     a.ctx
-        .register_table(TABLE, Arc::clone(&a_table) as Arc<dyn datafusion::datasource::TableProvider>)
+        .register_table(
+            TABLE,
+            Arc::clone(&a_table) as Arc<dyn datafusion::datasource::TableProvider>,
+        )
         .expect("register");
     let data_url = a.data_url.clone();
     a.insert(1, 100).await.expect("A writes");
@@ -508,7 +511,11 @@ async fn a_writer_that_cannot_renew_its_lease_deletes_nothing_its_successor_comm
         .filter(|request| request.op == Op::Delete && request.path.as_ref().contains("/data/"))
         .map(|request| format!("{:?} {}", request.op, request.path))
         .collect();
-    assert_eq!(deletes, Vec::<String>::new(), "A deletes no data once its lease could have lapsed");
+    assert_eq!(
+        deletes,
+        Vec::<String>::new(),
+        "A deletes no data once its lease could have lapsed"
+    );
 }
 
 /// A writer whose lease requests fail stops writing at the lease's deadline,
@@ -531,7 +538,9 @@ async fn a_writer_whose_lease_requests_recover_writes_again() {
         .await
         .expect_err("past its lease's deadline, A sends no write");
     assert!(
-        refused.to_string().contains("accepts no change from this table"),
+        refused
+            .to_string()
+            .contains("accepts no change from this table"),
         "{refused}"
     );
 

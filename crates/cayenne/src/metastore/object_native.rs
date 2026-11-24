@@ -272,9 +272,9 @@ enum Stop {
     /// served until a background task reopens the log and resumes from what
     /// committed.
     Unresolved,
-    /// Another instance took the log over. Writes stop; reads serve the
-    /// committed state once it is reloaded (`reloaded`).
-    Fenced { reloaded: bool },
+    /// Another instance took the log over and the committed state could not
+    /// be read back yet. Neither changes nor reads are served until it is.
+    Fenced,
     /// The state refused a change this catalog made, which is a bug: the state
     /// no longer matches the log, so the log stops until the process restarts.
     Refused,

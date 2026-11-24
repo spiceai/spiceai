@@ -1555,9 +1555,9 @@ pub struct DataFusion {
     pub(crate) accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     /// Names of datasets whose writer changed (`DataAccelerator::writer_role`),
     /// for the runtime to reload; see [`Self::take_writer_role_changes`].
-    writer_role_changes: tokio::sync::mpsc::UnboundedSender<String>,
+    writer_role_changes: tokio::sync::mpsc::UnboundedSender<TableReference>,
     writer_role_changes_rx:
-        parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
+        parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<TableReference>>>,
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
     // Bounds concurrently-executing query plans — ordinary queries + DDL/DML +
@@ -1776,7 +1776,9 @@ impl DataFusion {
 
     /// The names of datasets whose writer changed, to reload: taken once, by
     /// the runtime.
-    pub fn take_writer_role_changes(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<String>> {
+    pub fn take_writer_role_changes(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<TableReference>> {
         self.writer_role_changes_rx.lock().take()
     }
 
@@ -4872,11 +4874,17 @@ impl DataFusion {
             None => None,
         };
         let replica = writer_role.as_ref().is_some_and(|role| !*role.borrow());
-        if replica {
+        if writer_role.is_some() {
             // The writer records its completed initial load in the location;
-            // the replica is ready from then on.
+            // a replica is ready from then on.
             let initial_load = shared_initial_load_record(dataset).await?;
-            accelerated_table_builder.replica(initial_load);
+            accelerated_table_builder.shared(if replica {
+                runtime_table::accelerated::SharedAcceleration::Replica { initial_load }
+            } else {
+                runtime_table::accelerated::SharedAcceleration::Writer { initial_load }
+            });
+        }
+        if replica {
             // Never polled: the refresh that would consume it does not start.
             match refresh_mode {
                 RefreshMode::Changes => {
@@ -4887,10 +4895,6 @@ impl DataFusion {
                 }
                 _ => {}
             }
-        }
-
-        if writer_role.is_some() && !replica {
-            accelerated_table_builder.shares_initial_load(shared_initial_load_record(dataset).await?);
         }
 
         if refresh_mode == RefreshMode::Changes && !replica {
@@ -7831,11 +7835,11 @@ async fn watch_writer_role(
     mut role: data_accelerator_api::WriterRole,
     built_as_writer: bool,
     dataset: TableReference,
-    reloads: tokio::sync::mpsc::UnboundedSender<String>,
+    reloads: tokio::sync::mpsc::UnboundedSender<TableReference>,
 ) {
     loop {
         if *role.borrow_and_update() != built_as_writer {
-            let _ = reloads.send(dataset.to_string());
+            let _ = reloads.send(dataset);
             return;
         }
         if role.changed().await.is_err() {

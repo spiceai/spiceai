@@ -475,6 +475,23 @@ pub enum SnapshotCreateTrigger {
 
 /// The decision behind [`AcceleratedTable::scan_readiness`], as a function of
 /// only the state it depends on so it can be exercised exhaustively.
+/// An acceleration shared with other instances through one location: which
+/// role this instance has, and where the writer records its completed initial
+/// load.
+pub enum SharedAcceleration {
+    /// This instance writes the acceleration and records its completed
+    /// initial load in `initial_load` for the replicas.
+    Writer {
+        initial_load: Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>,
+    },
+    /// Another instance writes it: this one serves what that instance
+    /// committed, starts no refresh, and is ready once `initial_load` holds the
+    /// writer's record.
+    Replica {
+        initial_load: Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>,
+    },
+}
+
 /// How often a replica checks whether the instance that writes its
 /// acceleration has loaded it, and the writer whether its initial load has
 /// completed.
@@ -624,13 +641,9 @@ pub struct Builder {
     engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
     acceleration_layout: Option<runtime_acceleration::snapshot::AccelerationLayout>,
     cluster_role: Option<ClusterRole>,
-    /// Another instance writes this acceleration: this one serves its queries
-    /// from the shared location and runs no refresh. Holds the record of the
-    /// writer's completed initial load, which this instance waits for.
-    replica: Option<Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>>,
-    /// This instance writes an acceleration other instances share: it records
-    /// its completed initial load here, for them to wait for.
-    shared_initial_load: Option<Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>>,
+    /// The acceleration is shared with other instances through one location;
+    /// see [`SharedAcceleration`].
+    shared: Option<SharedAcceleration>,
     user_facing_schema: Option<SchemaRef>,
     accelerator_write_mutex: Arc<Mutex<()>>,
     /// Per-dataset `cdc_*` overrides drawn from `dataset.acceleration.params`.
@@ -700,8 +713,7 @@ impl Builder {
             is_s3_express_acceleration: false,
             engine_type_rewrites: &[],
             cluster_role: None,
-            replica: None,
-            shared_initial_load: None,
+            shared: None,
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
             user_facing_schema: None,
             cdc_param_overrides: None,
@@ -741,28 +753,16 @@ impl Builder {
         self
     }
 
-    /// Another instance writes this acceleration (see
-    /// `DataAccelerator::writer_role`): serve its queries from what that
-    /// instance committed, and start no refresh, which would write it too.
-    /// The dataset becomes ready once `initial_load` holds the record the
-    /// writer makes when it has loaded the acceleration.
-    pub fn replica(
-        &mut self,
-        initial_load: Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>,
-    ) -> &mut Self {
-        self.replica = Some(initial_load);
+    /// The acceleration is shared with other instances through one location,
+    /// and this instance is its writer or a replica (see
+    /// `DataAccelerator::writer_role`).
+    pub fn shared(&mut self, shared: SharedAcceleration) -> &mut Self {
+        self.shared = Some(shared);
         self
     }
 
-    /// This instance writes an acceleration other instances share: once its
-    /// initial load completes it records that in `initial_load`, where the
-    /// other instances wait for it (see [`Self::replica`]).
-    pub fn shares_initial_load(
-        &mut self,
-        initial_load: Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>,
-    ) -> &mut Self {
-        self.shared_initial_load = Some(initial_load);
-        self
+    fn is_replica(&self) -> bool {
+        matches!(self.shared, Some(SharedAcceleration::Replica { .. }))
     }
 
     pub fn acceleration_layout(
@@ -1120,6 +1120,7 @@ impl Builder {
     /// stream supplied for a non-`changes` refresh mode, a retention policy without
     /// a time column, or a refresh SQL that does not plan against the schema.
     pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
+        let replica = self.is_replica();
         if self.refresh.mode != RefreshMode::Changes && self.changes_stream.is_some() {
             return ExpectedChangesModeForChangesStreamSnafu.fail();
         }
@@ -1462,13 +1463,13 @@ impl Builder {
             None
         };
 
-        let (refresh_handle, refresh_trigger) = if self.replica.is_some() {
-            // The instance that writes the acceleration refreshes it; this one
-            // serves what it committed, and is ready once that instance has
-            // loaded it (see `wait_for_writer_load`).
-            refresh_completion.close();
-            (None, None)
-        } else if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
+        let (refresh_handle, refresh_trigger) = if replica
+            || matches!(self.cluster_role, Some(ClusterRole::Scheduler))
+        {
+            // A replica starts no refresh: the instance that writes the
+            // acceleration refreshes it, and the replica is ready once that
+            // instance has loaded it (see `wait_for_writer_load`).
+            //
             // Accelerated tables aren't loaded locally on the scheduler —
             // executors do. Don't start a refresh task, and leave the
             // dataset status as `Refreshing` (set by the caller before
@@ -1506,19 +1507,23 @@ impl Builder {
         if let Some(refresh_handle) = refresh_handle {
             handlers.push(refresh_handle);
         }
-        if let Some(initial_load) = &self.replica {
-            handlers.push(tokio::spawn(wait_for_writer_load(
-                Arc::clone(initial_load),
-                Arc::clone(&refresher),
-                Arc::clone(&self.runtime_status),
-                self.dataset_name.clone(),
-            )));
-        } else if let Some(initial_load) = &self.shared_initial_load {
-            handlers.push(tokio::spawn(record_initial_load(
-                Arc::clone(initial_load),
-                Arc::clone(&refresher),
-                self.dataset_name.clone(),
-            )));
+        match &self.shared {
+            Some(SharedAcceleration::Replica { initial_load }) => {
+                handlers.push(tokio::spawn(wait_for_writer_load(
+                    Arc::clone(initial_load),
+                    Arc::clone(&refresher),
+                    Arc::clone(&self.runtime_status),
+                    self.dataset_name.clone(),
+                )));
+            }
+            Some(SharedAcceleration::Writer { initial_load }) => {
+                handlers.push(tokio::spawn(record_initial_load(
+                    Arc::clone(initial_load),
+                    Arc::clone(&refresher),
+                    self.dataset_name.clone(),
+                )));
+            }
+            None => {}
         }
 
         // In caching mode, `on_zero_results` is effectively a no-op: the
@@ -1594,7 +1599,7 @@ impl Builder {
 
         // Retention deletes rows: the instance that writes the acceleration
         // runs it, and a replica serves what that instance kept.
-        if let Some(retention) = retention.filter(|_| self.replica.is_none()) {
+        if let Some(retention) = retention.filter(|_| !replica) {
             let retention_check_handle = tokio::spawn(AcceleratedTable::start_retention_check(
                 self.dataset_name.clone(),
                 Arc::clone(&self.accelerator),
