@@ -99,13 +99,25 @@ impl MetadataCatalog for Domain {
     async fn pending_write_back_count(&self, table_id: &str) -> CatalogResult<i64> {
         self.read().await?.reader.pending_write_back_count(table_id)
     }
+    fn data_write_gate(&self, _table_id: &str) -> crate::catalog::DataWriteGate {
+        self.data_writes.clone()
+    }
+    async fn follow_commits(&self, _table_id: &str) -> CatalogResult<u64> {
+        // Only a table that may not write asks: a replica's, or one opened
+        // before this instance last became the writer.
+        self.inner.take().await.follow().await
+    }
     async fn init(&self) -> CatalogResult<()> {
         self.read().await?;
         Ok(())
     }
     async fn shutdown(&self) -> CatalogResult<()> {
-        let mut inner = self.inner.take().await;
-        inner.flush().await?;
+        {
+            let mut inner = self.inner.take().await;
+            inner.flush().await?;
+        }
+        // Hand the writer lease back, so another instance takes over at once.
+        self.release_lease().await;
         Ok(())
     }
     async fn list_table_names(&self) -> CatalogResult<Vec<String>> {

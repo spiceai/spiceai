@@ -37,6 +37,9 @@ pub(super) const REGISTRY: &str = "cayenne:datasets";
 /// The object in a dropped dataset's folder whose time is when it was dropped.
 pub(super) const DROPPED: &str = "dropped";
 
+/// The registry's bookkeeping key holding [`ObjectNativeCatalog::location_id`].
+const LOCATION_ID_KEY: &str = "spice_sys_location_id";
+
 /// The name registry and every dataset's log.
 pub struct ObjectNativeCatalog {
     pub(super) store: Arc<dyn ObjectStore>,
@@ -53,6 +56,8 @@ pub struct ObjectNativeCatalog {
     pub(super) datasets: Path,
     pub(super) transactions: Path,
     routes: RwLock<Routes>,
+    /// [`Self::location_id`], once read: it never changes after it is recorded.
+    location_id: std::sync::OnceLock<String>,
     /// Serializes creating and dropping datasets, and deleting a dropped
     /// dataset's folder.
     pub(super) ddl: Arc<tokio::sync::Mutex<()>>,
@@ -102,6 +107,24 @@ fn sibling(prefix: &Path, name: &str) -> Path {
     let mut parts: Vec<_> = prefix.parts().collect();
     parts.pop();
     Path::from_iter(parts).join(name)
+}
+
+/// Keep `domain`'s writer lease, under [`super::Access::Leased`], for as long
+/// as the catalog holds the log: renew it, or take over once it lapses.
+fn keep_lease_while_open(domain: &Arc<Domain>) {
+    let Some(every) = domain.lease_interval() else {
+        return;
+    };
+    let domain = Arc::downgrade(domain);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(every).await;
+            let Some(domain) = domain.upgrade() else {
+                break;
+            };
+            domain.keep_lease().await;
+        }
+    });
 }
 
 /// A folder name a person browsing the bucket can match to its dataset.
@@ -254,6 +277,7 @@ impl ObjectNativeCatalog {
         let datasets = sibling(&prefix, "datasets");
         let transactions = sibling(&prefix, "transactions");
         let registry = Arc::new(registry);
+        keep_lease_while_open(&registry);
         let mut routes = Routes::default();
         routes.refresh(&registry, registry.tables().await);
         let entries = registry.positions_under(REGISTRY).await;
@@ -291,10 +315,14 @@ impl ObjectNativeCatalog {
                 continue;
             };
             let domain = Arc::new(domain);
+            keep_lease_while_open(&domain);
             routes.refresh(&domain, domain.tables().await);
             routes.datasets.insert(name, domain);
         }
-        registry.commit_actions(stale).await?;
+        // Only the instance that writes the registry removes its stale entries.
+        if registry.data_writes.allows() {
+            registry.commit_actions(stale).await?;
+        }
         let catalog = Self {
             store,
             data_store: None,
@@ -304,6 +332,7 @@ impl ObjectNativeCatalog {
             datasets,
             transactions,
             routes: RwLock::new(routes),
+            location_id: std::sync::OnceLock::new(),
             ddl: Arc::new(tokio::sync::Mutex::new(())),
             dropping: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             deletion_holds: parking_lot::Mutex::new(HashMap::new()),
@@ -390,6 +419,11 @@ impl ObjectNativeCatalog {
         options: CreateTableOptions,
     ) -> CatalogResult<String> {
         let name = options.table_name.clone();
+        // Another instance writes the registry: it creates the dataset when it
+        // loads it, and this instance opens what it created.
+        if !self.registry.data_writes.allows() && !self.routes.read().by_name.contains_key(&name) {
+            self.wait_for_registration(&name).await?;
+        }
         let (existing, parent) = {
             let routes = self.routes.read();
             let parent = routes
@@ -423,6 +457,7 @@ impl ObjectNativeCatalog {
         .await?;
         domain.folder.clone_from(&folder);
         let domain = Arc::new(domain);
+        keep_lease_while_open(&domain);
         let id = domain.create_table(options).await?;
         // The dataset's bookkeeping kept while it had no log moves to its log,
         // which commits before the registry names it: a crash between leaves a
@@ -666,6 +701,11 @@ impl ObjectNativeCatalog {
         tracing::info!(
             "{verb} the Cayenne object-native metastore at '{location}': {datasets} datasets with {tables} tables, plus {replayed} commits after their checkpoints, writing as lease {lease}"
         );
+        // The instance that writes the registry records the location's identity
+        // now, so the others can read it whether or not this one ever asks.
+        if catalog.registry.data_writes.allows() {
+            catalog.location_id().await?;
+        }
         Ok(catalog)
     }
     async fn open_at(
@@ -703,6 +743,118 @@ impl ObjectNativeCatalog {
     #[must_use]
     pub fn data_store(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(self.data_store.as_ref().unwrap_or(&self.store))
+    }
+    /// Open the logs of datasets the registry names that this catalog has not
+    /// opened yet: datasets another instance created since this one opened.
+    async fn open_new_dataset_logs(&self) -> CatalogResult<()> {
+        for (name, folder) in self.registry.positions_under(REGISTRY).await {
+            if self.routes.read().datasets.contains_key(&name) {
+                continue;
+            }
+            let folder = String::from_utf8(folder).map_err(invalid)?;
+            let prefix = self.datasets.clone().join(folder.as_str());
+            match self.store.head(&prefix.clone().join("head")).await {
+                Ok(_) => {}
+                // Registered, and its log not created yet.
+                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(error) => return Err(invalid(error)),
+            }
+            let mut domain = Domain::open_with_config(
+                Arc::clone(&self.store),
+                prefix,
+                self.config,
+                self.config.commit_each_change,
+                self.anchor.clone(),
+                &name,
+            )
+            .await?;
+            domain.folder = folder;
+            let domain = Arc::new(domain);
+            keep_lease_while_open(&domain);
+            let tables = domain.tables().await;
+            let mut routes = self.routes.write();
+            routes.refresh(&domain, tables);
+            routes.datasets.insert(name, domain);
+        }
+        Ok(())
+    }
+
+    /// Wait until the instance that writes the registry has registered dataset
+    /// `name`, following the registry and opening the logs of the datasets it
+    /// gains; or until this instance writes the registry itself, which then
+    /// creates the dataset. Two instances started together on an empty location
+    /// both load the dataset, and only the one writing the registry creates it.
+    async fn wait_for_registration(&self, name: &str) -> CatalogResult<()> {
+        let lease = match self.config.access {
+            super::Access::Leased(settings) => settings.duration,
+            super::Access::Writer | super::Access::Replica => {
+                super::LeaseSettings::default().duration
+            }
+        };
+        let deadline = tokio::time::Instant::now() + lease * 4;
+        loop {
+            if self.registry.data_writes.allows() {
+                return Ok(());
+            }
+            self.registry.follow_commits("").await?;
+            self.open_new_dataset_logs().await?;
+            if self.routes.read().by_name.contains_key(name) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(invalid(format!(
+                    "Dataset '{name}' (cayenne) is not in the shared state location yet, and another Spice instance writes the location, so this instance waits for that instance to create it rather than create a second copy. Load the dataset on the instance that writes the location, or retry once it has."
+                )));
+            }
+            tokio::time::sleep((lease / 6).max(std::time::Duration::from_millis(50))).await;
+        }
+    }
+
+    /// This location's identity: a UUID recorded once in the registry by the
+    /// instance that writes it, the first time it is asked. Every instance on
+    /// the location reads the same one, whatever URL or endpoint it reaches the
+    /// location by, and another location never does, so a change source's
+    /// consumer named for it is shared by exactly the instances that share the
+    /// acceleration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read or written, or on an
+    /// instance that does not write the registry while the instance that does
+    /// has not recorded the identity yet.
+    pub async fn location_id(&self) -> CatalogResult<String> {
+        if let Some(id) = self.location_id.get() {
+            return Ok(id.clone());
+        }
+        let recorded = self
+            .registry
+            .sidecar_value_or_record(LOCATION_ID_KEY, || {
+                uuid::Uuid::now_v7().to_string().into_bytes()
+            })
+            .await?;
+        let Some(bytes) = recorded else {
+            return Err(crate::catalog::CatalogError::InvalidOperationNoSource {
+                message: "The state location has no identity yet: the Spice instance that writes it records one when it starts. Retry once that instance is running.".to_string(),
+            });
+        };
+        let id = String::from_utf8(bytes).map_err(|error| {
+            crate::catalog::CatalogError::InvalidOperationNoSource {
+                message: format!("The state location's recorded identity is not text: {error}"),
+            }
+        })?;
+        Ok(self.location_id.get_or_init(|| id).clone())
+    }
+
+    /// Follow whether this instance writes dataset `name`: `true` while it
+    /// does, changing when another instance takes it over or this one does.
+    /// `None` when no log holds the dataset.
+    #[must_use]
+    pub fn writer_watch(&self, name: &str) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.routes
+            .read()
+            .datasets
+            .get(name)
+            .map(|domain| domain.data_writes.watch())
     }
     /// The prefix of the dataset folders (`…/cayenne/v1/datasets`) in [`Self::store`].
     #[must_use]

@@ -99,6 +99,8 @@ struct State {
     blocked: Vec<(Path, PutPayload, PutOptions)>,
     /// Plain GETs of matching paths wait here until the gate opens.
     read_gate: Option<Predicate>,
+    /// Whether conditional GETs (`If-None-Match` polls) wait at the gate too.
+    gate_polls: bool,
     /// GETs waiting at the gate now.
     gated: usize,
     /// How far the store's clock runs ahead of the inner store's, in
@@ -335,9 +337,22 @@ impl FaultStore {
         self.shared.state.lock().read_gate = Some(Arc::new(predicate));
     }
 
+    /// Hold conditional GETs (`If-None-Match` polls) of matching paths before
+    /// I/O until [`Self::open_reads`], as [`Self::gate_reads`] holds plain ones,
+    /// so a poll can be caught in flight.
+    pub fn gate_polls(&self, predicate: impl Fn(&Path) -> bool + Send + Sync + 'static) {
+        let mut state = self.shared.state.lock();
+        state.read_gate = Some(Arc::new(predicate));
+        state.gate_polls = true;
+    }
+
     /// Release every GET held at the gate, and stop holding new ones.
     pub fn open_reads(&self) {
-        self.shared.state.lock().read_gate = None;
+        {
+            let mut state = self.shared.state.lock();
+            state.read_gate = None;
+            state.gate_polls = false;
+        }
         self.shared.reads_opened.notify_waiters();
     }
 
@@ -548,7 +563,9 @@ impl ObjectStore for FaultStore {
         } else {
             Op::Get
         };
-        if op == Op::Get {
+        let gated =
+            op == Op::Get || (op == Op::GetConditional && self.shared.state.lock().gate_polls);
+        if gated {
             self.wait_at_gate(path).await;
         }
         if self.shared.fault(op, path).is_some() {
