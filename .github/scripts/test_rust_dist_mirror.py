@@ -478,6 +478,8 @@ class PerJobHomeTest(unittest.TestCase):
         locked.chmod(0)
         read_only.chmod(0o500)
         if platform.system() == "Darwin":
+            # A file whose ACL denies deleting it, inside a directory that is open.
+            subprocess.run(["chmod", "+a", "everyone deny delete", str(read_only / "file")], check=True)
             # The home itself: an ACL that denies listing and deleting, no mode, immutable.
             deny = "everyone deny list,search,add_file,add_subdirectory,delete,delete_child"
             subprocess.run(["chmod", "+a", deny, str(self.rust_home)], check=True)
@@ -496,6 +498,21 @@ class PerJobHomeTest(unittest.TestCase):
         self.assertFalse(locked.exists())
         self.assertFalse(read_only.exists())
         self.assert_shared_homes_untouched(proc)
+
+    @unittest.skipUnless(platform.system() == "Darwin", "needs chflags -h")
+    def test_an_immutable_symlink_left_as_rust_home_is_moved_aside_not_followed(self):
+        elsewhere = self.dir / "elsewhere"
+        (elsewhere / "cargo").mkdir(parents=True)
+        (elsewhere / "cargo" / "config.toml").write_text('[build]\nrustc-wrapper = "/tmp/evil"\n')
+        self.rust_home.symlink_to(elsewhere)
+        subprocess.run(["chflags", "-h", "uchg", str(self.rust_home)], check=True)
+        before = snapshot(elsewhere)
+        proc, calls = self.run_step()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(self.rust_home.is_symlink())
+        self.assertTrue(calls[0].startswith("rustup-init --no-modify-path"), calls)
+        self.assertEqual(snapshot(elsewhere), before)
+        self.assertEqual(list(self.runner_temp.glob("rust-home.leftover.*")), [])
 
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can remove anything")
     def test_a_rust_home_that_cannot_be_removed_fails_closed(self):

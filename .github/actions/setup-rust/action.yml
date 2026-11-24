@@ -160,19 +160,22 @@ runs:
             # there. Nothing in the old one is used; removing it is best-effort.
             if [ -e "$rust_home" ] || [ -L "$rust_home" ]; then
               echo "::warning::Moving aside $rust_home, which an earlier job left behind; nothing in it is used."
+              # Its own flags (a symbolic link's too, with -h), ACL and mode; not its contents.
+              chflags -h nouchg,nouappnd "$rust_home" 2>/dev/null || true
               if [ ! -L "$rust_home" ]; then
-                chflags nouchg,nouappnd "$rust_home" 2>/dev/null || true
                 chmod -N "$rust_home" 2>/dev/null || true
+                chmod u+rwx "$rust_home" 2>/dev/null || true
               fi
-              leftover="$RUNNER_TEMP/rust-home.leftover.$$.$RANDOM"
-              if mv "$rust_home" "$leftover" 2>/dev/null && ! rm -rf "$leftover" 2>/dev/null && [ ! -L "$leftover" ]; then
+              # Into a directory mktemp creates, so no earlier job can have chosen the name.
+              aside="$(mktemp -d "$RUNNER_TEMP/rust-home.leftover.XXXXXX" 2>/dev/null)" || aside=''
+              if [ -n "$aside" ] && mv "$rust_home" "$aside/home" 2>/dev/null && ! rm -rf "$aside" 2>/dev/null; then
                 (
-                  chmod u+rwx "$leftover"
-                  for pass in 1 2 3; do
-                    chflags -R nouchg,nouappnd "$leftover"
-                    find "$leftover" -type d -exec sh -c 'chflags nouchg,nouappnd "$1"; chmod -N "$1"; chmod u+rwx "$1"' sh {} \;
+                  for _ in 1 2 3; do
+                    chflags -R nouchg,nouappnd "$aside"
+                    find "$aside" -type d -exec sh -c 'chflags nouchg,nouappnd "$1"; chmod -N "$1"; chmod u+rwx "$1"' sh {} \;
+                    chmod -R -N "$aside"
                   done
-                  rm -rf "$leftover"
+                  rm -rf "$aside"
                 ) >/dev/null 2>&1 || true
               fi
             fi
