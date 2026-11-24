@@ -1,4 +1,5 @@
 name: mysql-types-acceleration
+tags: [long]
 description: >
   A MySQL table with every common type (bit, unsigned, time, blob, set, JSON
   among them), NULLs in each, answers through Spice exactly as MySQL answers:

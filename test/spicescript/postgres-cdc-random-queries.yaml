@@ -1,4 +1,5 @@
 name: postgres-cdc-random-queries
+tags: [long]
 description: >
   Random queries (as in random-queries.yaml) over PostgreSQL CDC accelerations
   after rounds of randomized changes at the source (updates to values and to

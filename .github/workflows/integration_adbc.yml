@@ -26,6 +26,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # The CI cache's anonymous read URL (.github/ci-cache/README.md). setup-rust and
+  # install-cargo-deny read pinned downloads from it, falling back to the source; empty
+  # where the repository has no CI object store, which turns the cache off.
+  CI_CACHE_URL: ${{ vars.TEST_MINIO_ENDPOINT && format('{0}/ci-cache', vars.TEST_MINIO_ENDPOINT) || '' }}
   CARGO_TERM_COLOR: always
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   CARGO_NET_RETRY: 10

@@ -162,6 +162,7 @@ runtime-async = { path = "../runtime-async" }
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 runtime-checkpoint-sqlite = { path = "../runtime-checkpoint-sqlite", optional = true }
 runtime-component = { path = "../runtime-component" }
+runtime-config = { path = "../runtime-config" }
 runtime-metrics = { path = "../runtime-metrics" }
 runtime-auth = { path = "../runtime-auth" }
 runtime-cluster = { path = "../runtime-cluster" }
@@ -368,7 +369,6 @@ ftp = ["runtime-object-store/ftp"]
 http-functions = ["runtime-datafusion-udfs/http-functions"]
 rate-control = []
 wasm-functions = ["runtime-datafusion-udfs/wasm-functions"]
-wasm-functions-compile = ["runtime-datafusion-udfs/wasm-functions-compile"]
 iceberg-write = []
 imap = []
 kafka = ["data_components/kafka", "runtime-table/kafka"]

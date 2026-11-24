@@ -513,6 +513,26 @@ class CheckConditionContextTest(unittest.TestCase):
         self.assertIn("step `Configure`", problems[0])
         self.assertIn("naming `secrets`", problems[0])
 
+    def test_an_expression_in_an_input_description_is_reported(self):
+        # Every job that used install-spice failed in `Set up job` with "Unrecognized
+        # named-value: 'runner'" when an input's description showed `${{ runner.temp }}`.
+        action = VALID_ACTION.replace(
+            "runs:",
+            "inputs:\n  install-dir:\n    description: 'such as ${{ runner.temp }}/spice/bin'\nruns:",
+            1,
+        )
+        problems = check_workflow_yaml.check_action(action)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("the description of input `install-dir` contains `${{`", problems[0])
+
+    def test_expressions_in_output_values_are_allowed(self):
+        action = VALID_ACTION.replace(
+            "runs:",
+            "outputs:\n  path:\n    description: 'Where it went'\n    value: ${{ steps.x.outputs.path }}\nruns:",
+            1,
+        )
+        self.assertEqual(check_workflow_yaml.check_action(action), [])
+
     def test_a_composite_action_step_may_name_inputs_steps_and_runner(self):
         action = (
             "name: Set up thing\ndescription: d\n\nruns:\n  using: composite\n  steps:\n"
