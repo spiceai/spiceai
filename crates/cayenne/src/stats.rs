@@ -954,6 +954,146 @@ mod tests {
     };
     use std::sync::Arc;
 
+    /// Statistics are found by column name when nested fields come first. The footer stores
+    /// them in post-order over every field, so `n` and `t` are not its second and third
+    /// entries. Each scalar column keeps its min, max, sum and null count, read from a real
+    /// file's footer and again from the blob Cayenne persists and restores, and a column the
+    /// file lacks gets no statistics.
+    #[tokio::test]
+    async fn nested_fields_before_scalar_columns_keep_each_columns_statistics() {
+        use arrow::array::{
+            ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+        };
+        use vortex::array::stream::ArrayStreamAdapter;
+        use vortex::arrow::ArrowSessionExt;
+        use vortex::buffer::ByteBufferMut;
+        use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt};
+
+        let x = Arc::new(Field::new("x", DataType::Int32, false));
+        let y = Arc::new(Field::new("y", DataType::Utf8, false));
+        let nested = StructArray::from(vec![
+            (
+                Arc::clone(&x),
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            ),
+            (
+                Arc::clone(&y),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+            ),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Struct(vec![x, y].into()), false),
+            Field::new("n", DataType::Int64, true),
+            Field::new("t", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(nested),
+                Arc::new(Int64Array::from(vec![Some(10), None, Some(30)])),
+                Arc::new(StringArray::from(vec![Some("p"), Some("q"), None])),
+            ],
+        )
+        .expect("batch");
+
+        // Written as Cayenne writes a file: its session, with the column sums it asks for.
+        let session = crate::provider::delta_encoding::write_session();
+        let arrow = session.arrow();
+        let dtype = arrow.from_arrow_schema(&schema).expect("dtype");
+        let chunk = arrow.from_arrow_record_batch(batch, &schema);
+        drop(arrow);
+        let mut file = ByteBufferMut::empty();
+        session
+            .write_options()
+            .with_additional_file_statistics(Stat::Sum.aggregate_fn().into_iter().collect())
+            .write(
+                &mut file,
+                ArrayStreamAdapter::new(dtype, futures::stream::iter([chunk])),
+            )
+            .await
+            .expect("write");
+        let file = session
+            .open_options()
+            .open_buffer(file.freeze())
+            .expect("open");
+        let footer = file
+            .footer()
+            .statistics()
+            .expect("the file records statistics")
+            .clone();
+
+        let mut fields = schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("missing", DataType::Int64, true)));
+        let read_schema = Schema::new(fields);
+
+        let check = |file_stats: &FileStatistics, stage: &str| {
+            let stats = column_stats_sets_to_df(
+                &column_stats_sets(file_stats, &read_schema),
+                &read_schema,
+                3,
+            );
+            let [_, n, t, missing] = stats.column_statistics.as_slice() else {
+                panic!(
+                    "{stage}: one entry per column, got {}",
+                    stats.column_statistics.len()
+                );
+            };
+            assert_eq!(
+                n.min_value,
+                DfPrecision::Exact(ScalarValue::Int64(Some(10))),
+                "{stage}: n min"
+            );
+            assert_eq!(
+                n.max_value,
+                DfPrecision::Exact(ScalarValue::Int64(Some(30))),
+                "{stage}: n max"
+            );
+            assert_eq!(
+                n.sum_value,
+                DfPrecision::Exact(ScalarValue::Int64(Some(40))),
+                "{stage}: n sum"
+            );
+            assert_eq!(n.null_count, DfPrecision::Exact(1), "{stage}: n nulls");
+            assert_eq!(
+                t.min_value.get_value(),
+                Some(&ScalarValue::Utf8(Some("p".to_string()))),
+                "{stage}: t min"
+            );
+            assert_eq!(
+                t.max_value.get_value(),
+                Some(&ScalarValue::Utf8(Some("q".to_string()))),
+                "{stage}: t max"
+            );
+            assert_eq!(t.null_count, DfPrecision::Exact(1), "{stage}: t nulls");
+            assert_eq!(
+                missing.min_value,
+                DfPrecision::Absent,
+                "{stage}: missing min"
+            );
+            assert_eq!(
+                missing.max_value,
+                DfPrecision::Absent,
+                "{stage}: missing max"
+            );
+            assert_eq!(
+                missing.sum_value,
+                DfPrecision::Absent,
+                "{stage}: missing sum"
+            );
+        };
+        check(&footer, "footer");
+
+        let sets: Vec<StatsSet> = column_stats_sets(&footer, &schema)
+            .into_iter()
+            .map(|(set, _)| set)
+            .collect();
+        let blob =
+            serialize_file_statistics(&build_file_statistics(&sets, &schema).expect("build"))
+                .expect("serialize");
+        let restored = deserialize_file_statistics(&blob, &schema).expect("deserialize");
+        check(&restored, "restored");
+    }
+
     fn restored_column(
         data_type: DataType,
         min: ScalarValue,
