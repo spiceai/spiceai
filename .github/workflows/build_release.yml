@@ -153,7 +153,7 @@ jobs:
             exit 0
           fi
           if [ -z "$status" ]; then
-            problem="Commit $SHA has no trunk-tests result, so it has not been through the full post-merge suite. Run it with: gh workflow run trunk_tests.yml -f branch=$REF, then build again once it passes."
+            problem="Commit $SHA has no trunk-tests result, so it has not been through the full post-merge suite. Run it with: gh workflow run trunk_tests.yml --ref $REF -f branch=$REF, then build again once it passes."
           else
             problem="Commit $SHA failed trunk tests ($state): $url. Fix the failure on $REF, or, if it is a known flake or infrastructure fault, build again with unhealthy_reason set."
           fi

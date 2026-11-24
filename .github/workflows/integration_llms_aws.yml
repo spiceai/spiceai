@@ -90,7 +90,7 @@ jobs:
       # to the test step alone, and are assumed before spiceio starts, so no build-cache endpoint
       # can reach the STS call.
       - name: Assume the Bedrock role
-        if: matrix.target.needs_env && env.HAS_BEDROCK_ROLE == 'true' && contains(format(',{0},', matrix.target.model_allowlist), ',bedrock,')
+        if: matrix.target.needs_env && env.HAS_BEDROCK_ROLE == 'true' && steps.ci-role.outputs.full == 'true' && contains(format(',{0},', matrix.target.model_allowlist), ',bedrock,')
         id: bedrock-role
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
@@ -150,6 +150,7 @@ jobs:
 
       - name: Run integration test
         env:
+          ROLE_FULL: ${{ steps.ci-role.outputs.full }}
           MODEL_ALLOWLIST: ${{ matrix.target.model_allowlist }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
           TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
@@ -163,9 +164,14 @@ jobs:
           # calls to the local build cache instead of AWS.
           unset AWS_ENDPOINT_URL
           # Bedrock runs as the CI role (`CI_AWS_BEDROCK_ROLE_ARN`): until the `ci` environment has
-          # one, the other providers still run, and the run says Bedrock did not.
-          if [[ ",${MODEL_ALLOWLIST}," == *",bedrock,"* && "${HAS_BEDROCK_ROLE}" != "true" ]]; then
-            echo "::warning::CI_AWS_BEDROCK_ROLE_ARN is not set in the ci environment, so this run does not test Bedrock. Create the Bedrock CI role and set the secret."
+          # one, or in a run with the read-only role (off trunk, release branches included), the other
+          # providers still run, and the run says Bedrock did not.
+          if [[ ",${MODEL_ALLOWLIST}," == *",bedrock,"* && ( "${HAS_BEDROCK_ROLE}" != "true" || "${ROLE_FULL}" != "true" ) ]]; then
+            if [ "${HAS_BEDROCK_ROLE}" != "true" ]; then
+              echo "::warning::CI_AWS_BEDROCK_ROLE_ARN is not set in the ci environment, so this run does not test Bedrock. Create the Bedrock CI role and set the secret."
+            else
+              echo "::notice::This run has the read-only CI role, which has no Bedrock access, so it does not test Bedrock; trunk does."
+            fi
             MODEL_ALLOWLIST=$(printf '%s' "$MODEL_ALLOWLIST" | tr ',' '\n' | grep -vx bedrock | paste -sd, - || true)
             if [ -z "$MODEL_ALLOWLIST" ]; then
               echo "::error::This run tests only Bedrock, which needs CI_AWS_BEDROCK_ROLE_ARN."

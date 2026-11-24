@@ -452,5 +452,7 @@ jobs:
               continue
             fi
             echo "$branch at ${sha:0:12}: dispatching"
-            gh workflow run trunk_tests.yml -R "$GITHUB_REPOSITORY" --ref trunk -f branch="$branch"
+            # On the release branch itself, so it runs that branch's own definition and gets that
+            # branch's role decision: a trunk run that names a build off trunk fails at ci-role.
+            gh workflow run trunk_tests.yml -R "$GITHUB_REPOSITORY" --ref "$branch" -f branch="$branch"
           done
