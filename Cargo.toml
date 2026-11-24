@@ -314,7 +314,7 @@ datafusion-proto-common = "55.3.0"
 datafusion-pruning = "55.3.0"
 datafusion-spark = "55.3.0"
 datafusion-substrait = "55.3.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "daa91fe928174edb95473e644059aee9958dca06" } # branch: spiceai-55
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "b0464de933ba5e0cf5e8847f5b4341b75908667f" } # branch: spiceai-55
 delta_kernel = { version = "0.27.1", features = ["arrow-59", "internal-api"] }
 delta_kernel_default_engine = { version = "0.27.1", default-features = false, features = [
     "arrow-59",
@@ -600,41 +600,41 @@ lto = "off"
 adbc_core = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "7caad4ccc7050b0721778a426eef38f0f151fef9" } # branch: spiceai-25 (ADBC 25)
 adbc_driver_manager = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "7caad4ccc7050b0721778a426eef38f0f151fef9" }
 adbc_ffi = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "7caad4ccc7050b0721778a426eef38f0f151fef9" }
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" } # branch: spiceai-55 (DataFusion 55.3.0, SQL semantics fixes for #15538, spiceai/datafusion#275, spiceai/datafusion#277, spiceai/datafusion#280, spiceai/datafusion#281, spiceai/datafusion#282, spiceai/datafusion#276, spiceai/datafusion#285, spiceai/datafusion#283, spiceai/datafusion#287, spiceai/datafusion#286, spiceai/datafusion#288, spiceai/datafusion#274, spiceai/datafusion#295, spiceai/datafusion#296, spiceai/datafusion#300, spiceai/datafusion#301, spiceai/datafusion#297, spiceai/datafusion#303)
-datafusion-catalog = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-catalog-listing = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-common-runtime = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-datasource-arrow = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-datasource-csv = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-datasource-json = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-datasource-parquet = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-doc = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-functions = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-functions-aggregate = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-functions-aggregate-common = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-functions-nested = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-functions-table = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-functions-window = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-functions-window-common = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-macros = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-optimizer = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-physical-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-physical-expr-adapter = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-physical-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-physical-optimizer = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-physical-plan = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-proto = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-proto-common = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-spark = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
-datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev = "47daf0792f4eba6caacf4478d11f3ddbbcac5318" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" } # branch: spiceai-55 (DataFusion 55.3.0, SQL semantics fixes for #15538, spiceai/datafusion#275, spiceai/datafusion#277, spiceai/datafusion#280, spiceai/datafusion#281, spiceai/datafusion#282, spiceai/datafusion#276, spiceai/datafusion#285, spiceai/datafusion#283, spiceai/datafusion#287, spiceai/datafusion#286, spiceai/datafusion#288, spiceai/datafusion#274, spiceai/datafusion#295, spiceai/datafusion#296, spiceai/datafusion#300, spiceai/datafusion#301, spiceai/datafusion#297, spiceai/datafusion#303, spiceai/datafusion#308, spiceai/datafusion#309, spiceai/datafusion#310, spiceai/datafusion#311)
+datafusion-catalog = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-catalog-listing = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-common-runtime = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-datasource-arrow = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-datasource-csv = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-datasource-json = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-datasource-parquet = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-doc = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-functions = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-functions-aggregate = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-functions-aggregate-common = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-functions-nested = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-functions-table = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-functions-window = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-functions-window-common = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-macros = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-optimizer = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-physical-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-physical-expr-adapter = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-physical-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-physical-optimizer = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-physical-plan = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-proto = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-proto-common = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-spark = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
+datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev = "cf0ca3e1de55d985088b88650e02cc1c9324f281" }
 
 # Local vendored fork of `mysql-common-derive` (path: vendor/mysql-common-derive)
 # that drops the unmaintained `proc-macro-error2` dependency (RUSTSEC-2026-0173).

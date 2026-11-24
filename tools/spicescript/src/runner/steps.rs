@@ -30,9 +30,9 @@ use crate::{compare, template};
 
 use super::{
     DEFAULT_READY_TIMEOUT, Instance, POLL, STOP_TIMEOUT, SourceState, Sources, apply_patch,
-    assert_files, assert_log, assert_status, check_error_text, explain, http_step, max_wait,
-    namespace, random_queries, refresh, run_query, run_slt, source_query, spice_cli,
-    start_background, start_executors, stop_background, tlp, wait_metric,
+    assert_files, assert_log, assert_status, check_error_text, explain, http_step, namespace,
+    random_queries, refresh, run_query, run_slt, source_query, spice_cli, start_background,
+    start_executors, stop_background, tlp, wait_metric,
 };
 
 pub(super) fn describe(action: &Action) -> String {
@@ -292,14 +292,15 @@ fn swap_sidecar(instance: &mut Instance) {
     }
 }
 
-/// The readiness wait a start allows when it names none.
+/// The readiness wait a start allows when it names none. `--max-wait` does not
+/// cap it: getting `spiced` ready is setup, not a check a known-failing script
+/// is expected to fail, and a readiness wait that is normally a second can run
+/// past a 30 s cap on a loaded host.
 fn ready_default(script: &Script) -> Duration {
-    max_wait(
-        script
-            .defaults
-            .ready_timeout
-            .unwrap_or(DEFAULT_READY_TIMEOUT),
-    )
+    script
+        .defaults
+        .ready_timeout
+        .unwrap_or(DEFAULT_READY_TIMEOUT)
 }
 
 /// Starts the sidecar unless it is running, once its upstream is up, and
@@ -337,7 +338,7 @@ async fn sidecar_lifecycle(script: &Script, instance: &mut Instance, step: &Step
             wait_ready,
             ..
         } => {
-            let timeout = max_wait(ready_timeout.unwrap_or(ready_default));
+            let timeout = ready_timeout.unwrap_or(ready_default);
             start_sidecar(instance, timeout, *wait_ready).await?;
         }
         Action::Stop => spiced.stop(STOP_TIMEOUT).await.context("the sidecar")?,
@@ -356,7 +357,7 @@ async fn sidecar_lifecycle(script: &Script, instance: &mut Instance, step: &Step
                 None => spiced.stop(STOP_TIMEOUT).await,
             }
             .context("the sidecar")?;
-            let timeout = max_wait(ready_timeout.unwrap_or(ready_default));
+            let timeout = ready_timeout.unwrap_or(ready_default);
             start_sidecar(instance, timeout, *wait_ready).await?;
         }
         Action::WaitReady { timeout } => {
@@ -385,7 +386,7 @@ async fn run_step(
         } => {
             apply_patch(instance, patch.as_ref())?;
             instance.spiced.start(&instance.spicepod_yaml)?;
-            let timeout = max_wait(ready_timeout.unwrap_or(ready_default));
+            let timeout = ready_timeout.unwrap_or(ready_default);
             // A scheduler with accelerations is ready only once an executor
             // has joined and loaded them, so the executor starts first.
             instance.spiced.wait_http(timeout).await?;
@@ -441,7 +442,7 @@ async fn run_step(
             }
             apply_patch(instance, patch.as_ref())?;
             instance.spiced.start(&instance.spicepod_yaml)?;
-            let timeout = max_wait(ready_timeout.unwrap_or(ready_default));
+            let timeout = ready_timeout.unwrap_or(ready_default);
             // A scheduler with accelerations is ready only once an executor
             // has joined and loaded them, so the executor starts first.
             instance.spiced.wait_http(timeout).await?;
