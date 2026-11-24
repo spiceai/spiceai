@@ -64,6 +64,9 @@ pub struct SnapshotInput {
 /// Roughly 1 GiB per reader at PostgreSQL's usual 8 KiB page size amortizes
 /// connection/snapshot setup and avoids fanning out small-table bootstraps.
 const PAGES_PER_READER: u32 = 131_072;
+/// The `tableoid` a parallel range reader selects beside the dataset's columns,
+/// under a name no dataset column is matched against.
+const TABLEOID_COLUMN: &str = "\"__spice_snapshot_tableoid\"";
 /// At most two queued batches per reader; producers await downstream capacity.
 const BATCHES_PER_READER: usize = 2;
 
@@ -72,13 +75,29 @@ const BATCHES_PER_READER: usize = 2;
 pub fn snapshot_stream(
     input: SnapshotInput,
 ) -> Result<impl Stream<Item = std::result::Result<ChangeEnvelope, StreamError>> + Send + use<>> {
-    Ok(snapshot_stream_inner(input, PAGES_PER_READER, None, None))
+    Ok(snapshot_stream_inner(
+        input,
+        PAGES_PER_READER,
+        None,
+        SnapshotTestHooks::default(),
+    ))
 }
 
-/// Awaited by [`snapshot_stream_with_hook_for_test`] after the reader-count
-/// probe and before the snapshot transaction begins.
+/// A test hook awaited at one point of the snapshot read.
 #[doc(hidden)]
-pub type AfterProbeHook = Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+pub type SnapshotHook = Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
+/// Hooks for [`snapshot_stream_with_hooks_for_test`], so a test can commit DDL
+/// at a precise point of the snapshot read.
+#[doc(hidden)]
+#[derive(Default, Clone)]
+pub struct SnapshotTestHooks {
+    /// After the reader-count probe, before the snapshot transaction begins.
+    pub after_probe: Option<SnapshotHook>,
+    /// After the snapshot is taken (and exported, with several readers),
+    /// before any reader runs its scan.
+    pub before_scans: Option<SnapshotHook>,
+}
 
 /// Internal integration-test entry point: exercise heap splitting without a
 /// multi-GiB fixture and observe the actual fan-out without adding a metric.
@@ -92,25 +111,24 @@ pub fn snapshot_stream_for_test(
         input,
         pages_per_reader.get(),
         Some(readers),
-        None,
+        SnapshotTestHooks::default(),
     ))
 }
 
 /// Internal integration-test entry point: like [`snapshot_stream_for_test`],
-/// and awaits `after_probe` between the reader-count probe and the snapshot
-/// transaction, so a test can commit DDL inside that window.
+/// and awaits each of `hooks` at its point of the read.
 #[doc(hidden)]
-pub fn snapshot_stream_with_hook_for_test(
+pub fn snapshot_stream_with_hooks_for_test(
     input: SnapshotInput,
     pages_per_reader: std::num::NonZeroU32,
     readers: Arc<std::sync::atomic::AtomicUsize>,
-    after_probe: AfterProbeHook,
+    hooks: SnapshotTestHooks,
 ) -> Result<impl Stream<Item = std::result::Result<ChangeEnvelope, StreamError>> + Send + use<>> {
     Ok(snapshot_stream_inner(
         input,
         pages_per_reader.get(),
         Some(readers),
-        Some(after_probe),
+        hooks,
     ))
 }
 
@@ -165,7 +183,7 @@ fn snapshot_stream_inner(
     input: SnapshotInput,
     pages_per_reader: u32,
     readers_observer: Option<Arc<std::sync::atomic::AtomicUsize>>,
-    after_probe: Option<AfterProbeHook>,
+    hooks: SnapshotTestHooks,
 ) -> impl Stream<Item = std::result::Result<ChangeEnvelope, StreamError>> + Send + use<> {
     // Keep the existing try_stream envelope/error contract at the WAL boundary.
     try_stream! {
@@ -199,11 +217,12 @@ fn snapshot_stream_inner(
         if let Some(observer) = &readers_observer {
             observer.store(readers, std::sync::atomic::Ordering::Release);
         }
-        if let Some(after_probe) = after_probe {
+        if let Some(after_probe) = &hooks.after_probe {
             after_probe().await;
         }
         holder.client.simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
             .await.context(BootstrapSnafu).map_err(super::err_to_stream)?;
+        let mut expected_oid: Option<u32> = None;
         if readers > 1 {
             // TRUNCATE and rewriting ALTER are not MVCC-safe without a table lock
             // held before the snapshot: https://www.postgresql.org/docs/current/mvcc-caveats.html.
@@ -214,16 +233,33 @@ fn snapshot_stream_inner(
             // the transaction's snapshot, so it sees exactly the children whose
             // rows that snapshot holds; with any, read through the single
             // `SELECT`, which includes them.
-            let has_children: bool = holder.client.query_one(
-                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhparent = $1::text::regclass)",
+            // It also records the locked table's OID, which every parallel
+            // reader checks each row's `tableoid` against: readers resolve the
+            // table by name, and a schema renamed or swapped meanwhile would
+            // otherwise send a reader to a different table's pages.
+            let recheck = holder.client.query_one(
+                "SELECT c.oid, EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhparent = c.oid) FROM pg_catalog.pg_class c WHERE c.oid = $1::text::regclass",
                 &[&relation],
-            ).await.context(BootstrapSnafu).map_err(super::err_to_stream)?
-                .try_get(0).context(BootstrapSnafu).map_err(super::err_to_stream)?;
+            ).await.context(BootstrapSnafu).map_err(super::err_to_stream)?;
+            let oid: u32 = recheck.try_get(0).context(BootstrapSnafu).map_err(super::err_to_stream)?;
+            let has_children: bool = recheck.try_get(1).context(BootstrapSnafu).map_err(super::err_to_stream)?;
             if has_children {
+                // That snapshot predates any lock on the children, and a child
+                // rewritten (TRUNCATE, rewriting ALTER) before the scan locks it
+                // would look empty to it. Start again with the parent and every
+                // child locked before the snapshot is taken.
+                holder.client.simple_query("ROLLBACK")
+                    .await.context(BootstrapSnafu).map_err(super::err_to_stream)?;
+                holder.client.simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+                    .await.context(BootstrapSnafu).map_err(super::err_to_stream)?;
+                holder.client.simple_query(&format!("LOCK TABLE {relation} IN ACCESS SHARE MODE"))
+                    .await.context(BootstrapSnafu).map_err(super::err_to_stream)?;
                 readers = 1;
                 if let Some(observer) = &readers_observer {
                     observer.store(readers, std::sync::atomic::Ordering::Release);
                 }
+            } else {
+                expected_oid = Some(oid);
             }
         }
         tracing::debug!(dataset = %input.dataset_name, readers, pages, "initial snapshot bootstrap readers");
@@ -232,6 +268,9 @@ fn snapshot_stream_inner(
                 .await.context(BootstrapSnafu).map_err(super::err_to_stream)?
                 .try_get(0).context(BootstrapSnafu).map_err(super::err_to_stream)?)
         } else { None };
+        if let Some(before_scans) = &hooks.before_scans {
+            before_scans().await;
+        }
         // Stream rows out of the snapshot transaction. Select exactly the
         // dataset's columns (not `*`): columns outside the dataset schema —
         // whatever their types — are never fetched. Columns whose Arrow type
@@ -284,7 +323,7 @@ fn snapshot_stream_inner(
                 } else {
                     String::new()
                 };
-                format!("SELECT {select_list} FROM ONLY {relation} WHERE ctid >= '({lo},0)'::tid{upper}")
+                format!("SELECT {select_list}, tableoid AS {TABLEOID_COLUMN} FROM ONLY {relation} WHERE ctid >= '({lo},0)'::tid{upper}")
             };
             let holder_connection = if reader == 0 { holder.take() } else { None };
             let input = Arc::clone(&input);
@@ -304,7 +343,7 @@ fn snapshot_stream_inner(
                     connection.client.simple_query(&import).await.context(BootstrapSnafu)?;
                     connection
                 };
-                let result = scan_reader(&connection.client, &input, &sql, &sender).await?;
+                let result = scan_reader(&connection.client, &input, &sql, expected_oid, &sender).await?;
                 if !is_holder {
                     connection.client.simple_query("COMMIT").await.context(BootstrapSnafu)?;
                 }
@@ -378,6 +417,7 @@ async fn scan_reader(
     client: &tokio_postgres::Client,
     input: &SnapshotInput,
     select_sql: &str,
+    expected_oid: Option<u32>,
     sender: &tokio::sync::mpsc::Sender<ChangeBatch>,
 ) -> Result<(ChangeBatch, u64)> {
     let SnapshotInput {
@@ -417,6 +457,18 @@ async fn scan_reader(
         // Buffered rows can otherwise keep conversion running without yielding.
         tokio::task::consume_budget().await;
         let row = row_result.context(BootstrapSnafu)?;
+        if let Some(expected_oid) = expected_oid {
+            // The range query selects `tableoid` last.
+            let tableoid: u32 = row
+                .try_get(row.len().saturating_sub(1))
+                .context(BootstrapSnafu)?;
+            snafu::ensure!(
+                tableoid == expected_oid,
+                super::BootstrapRelationChangedSnafu {
+                    table: format!("{}.{}", input.schema_name, input.table_name),
+                }
+            );
+        }
 
         if column_map.is_none() {
             let map = dataset_schema

@@ -1684,103 +1684,323 @@ fn test_inherited_snapshot_matches_postgres() -> Result<(), anyhow::Error> {
     })
 }
 
+type SnapshotRows = Vec<(i32, Option<String>)>;
+
+/// Run a parallel-eligible snapshot of `schema.table` with `hooks`, returning
+/// the reader count the probe chose and either the rows or the stream's error.
+async fn snapshot_with_hooks(
+    port: u16,
+    schema: &str,
+    table: &str,
+    hooks_for: impl FnOnce(
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) -> data_components::postgres_replication::bootstrap::SnapshotTestHooks,
+) -> Result<(usize, Result<SnapshotRows, String>), anyhow::Error> {
+    use std::num::NonZeroU32;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use data_components::postgres_replication::bootstrap::{
+        SnapshotInput, snapshot_stream_with_hooks_for_test,
+    };
+
+    let readers = Arc::new(AtomicUsize::new(0));
+    let probe_readers = Arc::new(AtomicUsize::new(0));
+    let hooks = hooks_for(Arc::clone(&readers), Arc::clone(&probe_readers));
+    let mut params = params_for(port, "unused_snapshot_slot", "unused_snapshot_publication");
+    params.bootstrap_batch_size = 127;
+    let stream = snapshot_stream_with_hooks_for_test(
+        SnapshotInput {
+            params,
+            schema_name: schema.into(),
+            table_name: table.into(),
+            dataset_schema: dataset_schema(),
+            primary_keys: vec!["id".into()],
+            dataset_name: format!("snapshot_{schema}_{table}"),
+            metrics: ReplicationMetricsCollector::new(),
+        },
+        NonZeroU32::new(8).expect("positive test threshold"),
+        Arc::clone(&readers),
+        hooks,
+    )?;
+    let mut stream = Box::pin(stream);
+    let mut rows: SnapshotRows = Vec::new();
+    let outcome = tokio::time::timeout(Duration::from_secs(60), async {
+        while let Some(envelope) = stream.next().await {
+            let envelope = match envelope {
+                Ok(envelope) => envelope,
+                Err(error) => return Err(error.to_string()),
+            };
+            let batch = envelope
+                .change_batch()
+                .map_err(|e| e.to_string())?
+                .data_batch();
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .expect("id int4");
+            let names = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("name text");
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    ids.value(row),
+                    if names.is_null(row) {
+                        None
+                    } else {
+                        Some(names.value(row).to_string())
+                    },
+                ));
+            }
+        }
+        Ok(())
+    })
+    .await?;
+    rows.sort();
+    Ok((
+        probe_readers.load(Ordering::Acquire),
+        outcome.map(|()| rows),
+    ))
+}
+
+/// A hook that records the reader count the probe chose, then runs `sql`.
+fn probe_then_execute(
+    port: u16,
+    readers: Arc<std::sync::atomic::AtomicUsize>,
+    probe_readers: Arc<std::sync::atomic::AtomicUsize>,
+    sql: &'static str,
+) -> data_components::postgres_replication::bootstrap::SnapshotHook {
+    use std::sync::atomic::Ordering;
+    Arc::new(move || {
+        let readers = Arc::clone(&readers);
+        let probe_readers = Arc::clone(&probe_readers);
+        Box::pin(async move {
+            probe_readers.store(readers.load(Ordering::Acquire), Ordering::Release);
+            let client = common::connect(port).await.expect("connect for the hook");
+            client.batch_execute(sql).await.expect("hook DDL");
+        })
+    })
+}
+
+async fn source_rows(
+    client: &tokio_postgres::Client,
+    sql: &str,
+) -> Result<SnapshotRows, anyhow::Error> {
+    let mut rows: SnapshotRows = client
+        .query(sql, &[])
+        .await?
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    rows.sort();
+    Ok(rows)
+}
+
+fn in_isolated_budget(
+    test_path: &str,
+    body: impl std::future::Future<Output = Result<(), anyhow::Error>>,
+) -> Result<(), anyhow::Error> {
+    if cpu_budget::testing::isolated_budget(test_path).map_err(anyhow::Error::msg)?
+        == cpu_budget::testing::Isolation::Parent
+    {
+        return Ok(());
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(body)
+}
+
+const RACE_TABLES: &str = "CREATE TABLE public.race_parent (id int, name text); CREATE TABLE public.race_child (id int, name text); INSERT INTO public.race_parent SELECT i, CASE WHEN i % 11 = 0 THEN NULL ELSE repeat(md5(i::text), 8) END FROM generate_series(1, 20000) i; INSERT INTO public.race_child SELECT i, 'child' FROM generate_series(100001, 100100) i; ANALYZE public.race_parent";
+
 /// A child attached by `INHERIT` after the reader-count probe saw none, and
 /// committed before the snapshot is taken, belongs to the snapshot: its rows
 /// must be read, as the single-reader `SELECT` reads them.
 #[test]
 fn test_inherit_after_probe_snapshot_matches_postgres() -> Result<(), anyhow::Error> {
-    use std::num::NonZeroU32;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use data_components::postgres_replication::bootstrap::{
-        AfterProbeHook, SnapshotInput, snapshot_stream_with_hook_for_test,
-    };
-
-    if cpu_budget::testing::isolated_budget(
+    in_isolated_budget(
         "postgres::replication::test_inherit_after_probe_snapshot_matches_postgres",
-    )
-    .map_err(anyhow::Error::msg)?
-        == cpu_budget::testing::Isolation::Parent
-    {
-        return Ok(());
-    }
-    tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
-        let container = common::start_postgres_docker_container().await?;
-        let port = container.host_port(5432)?;
-        let client = Arc::new(common::connect(port).await?);
-        client.batch_execute(
-            "CREATE TABLE public.race_parent (id int, name text); CREATE TABLE public.race_child (id int, name text); INSERT INTO public.race_parent SELECT i, CASE WHEN i % 11 = 0 THEN NULL ELSE repeat(md5(i::text), 8) END FROM generate_series(1, 20000) i; INSERT INTO public.race_child SELECT i, 'child' FROM generate_series(100001, 100100) i; ANALYZE public.race_parent"
-        ).await?;
-
-        let readers = Arc::new(AtomicUsize::new(0));
-        let probe_readers = Arc::new(AtomicUsize::new(0));
-        let hook: AfterProbeHook = {
-            let client = Arc::clone(&client);
-            let readers = Arc::clone(&readers);
-            let probe_readers = Arc::clone(&probe_readers);
-            Arc::new(move || {
-                let client = Arc::clone(&client);
-                let readers = Arc::clone(&readers);
-                let probe_readers = Arc::clone(&probe_readers);
-                Box::pin(async move {
-                    probe_readers.store(readers.load(Ordering::Acquire), Ordering::Release);
-                    client
-                        .batch_execute("ALTER TABLE public.race_child INHERIT public.race_parent")
-                        .await
-                        .expect("attach the child between the probe and the snapshot");
+        async {
+            let container = common::start_postgres_docker_container().await?;
+            let port = container.host_port(5432)?;
+            let client = common::connect(port).await?;
+            client.batch_execute(RACE_TABLES).await?;
+            let (probe_readers, rows) =
+                snapshot_with_hooks(port, "public", "race_parent", |readers, probe| {
+                    data_components::postgres_replication::bootstrap::SnapshotTestHooks {
+                        after_probe: Some(probe_then_execute(
+                            port,
+                            readers,
+                            probe,
+                            "ALTER TABLE public.race_child INHERIT public.race_parent",
+                        )),
+                        before_scans: None,
+                    }
                 })
-            })
-        };
-        let mut params = params_for(port, "unused_snapshot_slot", "unused_snapshot_publication");
-        params.bootstrap_batch_size = 127;
-        let stream = snapshot_stream_with_hook_for_test(
-            SnapshotInput {
-                params,
-                schema_name: "public".into(),
-                table_name: "race_parent".into(),
-                dataset_schema: dataset_schema(),
-                primary_keys: vec!["id".into()],
-                dataset_name: "snapshot_race_parent".into(),
-                metrics: ReplicationMetricsCollector::new(),
-            },
-            NonZeroU32::new(8).expect("positive test threshold"),
-            Arc::clone(&readers),
-            hook,
-        )?;
-        let mut stream = Box::pin(stream);
-        let mut actual: Vec<(i32, Option<String>)> = Vec::new();
-        tokio::time::timeout(Duration::from_secs(60), async {
-            while let Some(envelope) = stream.next().await {
-                let envelope = envelope.map_err(|e| anyhow::anyhow!("snapshot failed: {e}"))?;
-                let batch = envelope.change_batch()?.data_batch();
-                let ids = batch.column(0).as_any().downcast_ref::<arrow::array::Int32Array>()
-                    .expect("id int4");
-                let names = batch.column(1).as_any().downcast_ref::<arrow::array::StringArray>()
-                    .expect("name text");
-                for row in 0..batch.num_rows() {
-                    actual.push((ids.value(row), if names.is_null(row) {
-                        None
-                    } else {
-                        Some(names.value(row).to_string())
-                    }));
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        }).await??;
+                .await?;
+            assert!(
+                probe_readers > 1,
+                "the probe must choose parallel readers, got {probe_readers}"
+            );
+            let expected = source_rows(&client, "SELECT id, name FROM public.race_parent").await?;
+            assert_eq!(
+                expected.len(),
+                20_100,
+                "the source reads the attached child's rows"
+            );
+            let rows = rows.map_err(anyhow::Error::msg)?;
+            assert_eq!(rows.len(), expected.len(), "snapshot row count");
+            assert_eq!(
+                rows, expected,
+                "snapshot must match the source rows, including the attached child's"
+            );
+            Ok(())
+        },
+    )
+}
 
-        let probe_readers = probe_readers.load(Ordering::Acquire);
-        assert!(
-            probe_readers > 1,
-            "the probe must choose parallel readers before the child is attached, got {probe_readers}"
-        );
-        let oracle = client.query("SELECT id, name FROM public.race_parent", &[]).await?;
-        let mut expected: Vec<(i32, Option<String>)> =
-            oracle.iter().map(|row| (row.get(0), row.get(1))).collect();
-        assert_eq!(expected.len(), 20_100, "the source reads the attached child's rows");
-        expected.sort();
-        actual.sort();
-        assert_eq!(actual.len(), expected.len(), "snapshot row count");
-        assert_eq!(actual, expected, "snapshot must match the source rows, including the attached child's");
-        Ok(())
-    })
+/// A child attached after the probe sends the load to the single `SELECT`. A
+/// rewrite of that child (here an `ALTER` adding a column with a volatile
+/// default) must not make the child's rows vanish from the snapshot: the child
+/// is locked before the snapshot is taken, so the rewrite waits for the load.
+#[test]
+fn test_child_rewrite_during_snapshot_matches_postgres() -> Result<(), anyhow::Error> {
+    in_isolated_budget(
+        "postgres::replication::test_child_rewrite_during_snapshot_matches_postgres",
+        async {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let container = common::start_postgres_docker_container().await?;
+            let port = container.host_port(5432)?;
+            let client = common::connect(port).await?;
+            client.batch_execute(RACE_TABLES).await?;
+            let rewrite: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+                Arc::default();
+            let rewrite_blocked = Arc::new(AtomicBool::new(false));
+            let before_scans: data_components::postgres_replication::bootstrap::SnapshotHook = {
+                let rewrite = Arc::clone(&rewrite);
+                let rewrite_blocked = Arc::clone(&rewrite_blocked);
+                Arc::new(move || {
+                    let rewrite = Arc::clone(&rewrite);
+                    let rewrite_blocked = Arc::clone(&rewrite_blocked);
+                    Box::pin(async move {
+                        // Start the rewrite on its own connection, then return
+                        // once it has either committed or is waiting on a lock.
+                        let handle = tokio::spawn(async move {
+                            let client = common::connect(port)
+                                .await
+                                .expect("connect for the rewrite");
+                            client.batch_execute(
+                                "ALTER TABLE public.race_child ADD COLUMN z int DEFAULT (random() * 10)::int"
+                            ).await.expect("rewrite the child");
+                        });
+                        let watcher = common::connect(port)
+                            .await
+                            .expect("connect to watch the rewrite");
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+                        loop {
+                            if handle.is_finished() {
+                                break;
+                            }
+                            let waiting: i64 = watcher.query_one(
+                                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'ALTER TABLE public.race_child%'",
+                                &[],
+                            ).await.expect("read pg_stat_activity").get(0);
+                            if waiting > 0 {
+                                rewrite_blocked.store(true, Ordering::Release);
+                                break;
+                            }
+                            assert!(
+                                tokio::time::Instant::now() < deadline,
+                                "the rewrite neither committed nor waited on a lock"
+                            );
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        *rewrite.lock().await = Some(handle);
+                    })
+                })
+            };
+            let (probe_readers, rows) =
+                snapshot_with_hooks(port, "public", "race_parent", |readers, probe| {
+                    data_components::postgres_replication::bootstrap::SnapshotTestHooks {
+                        after_probe: Some(probe_then_execute(
+                            port,
+                            readers,
+                            probe,
+                            "ALTER TABLE public.race_child INHERIT public.race_parent",
+                        )),
+                        before_scans: Some(before_scans),
+                    }
+                })
+                .await?;
+            if let Some(handle) = rewrite.lock().await.take() {
+                handle.await?;
+            }
+            assert!(
+                probe_readers > 1,
+                "the probe must choose parallel readers, got {probe_readers}"
+            );
+            let expected = source_rows(&client, "SELECT id, name FROM public.race_parent").await?;
+            assert_eq!(
+                expected.len(),
+                20_100,
+                "the source reads the attached child's rows"
+            );
+            let rows = rows.map_err(anyhow::Error::msg)?;
+            assert_eq!(rows.len(), expected.len(), "snapshot row count");
+            assert_eq!(
+                rows, expected,
+                "snapshot must match the source rows, including the rewritten child's"
+            );
+            assert!(
+                rewrite_blocked.load(Ordering::Acquire),
+                "the rewrite must wait for the snapshot's lock on the child"
+            );
+            Ok(())
+        },
+    )
+}
+
+/// Swapping schema names after the snapshot is taken must not send the
+/// parallel readers to another table's pages: the load fails instead.
+#[test]
+fn test_schema_swap_during_parallel_snapshot_fails_closed() -> Result<(), anyhow::Error> {
+    in_isolated_budget(
+        "postgres::replication::test_schema_swap_during_parallel_snapshot_fails_closed",
+        async {
+            let container = common::start_postgres_docker_container().await?;
+            let port = container.host_port(5432)?;
+            let client = common::connect(port).await?;
+            client.batch_execute(
+                "CREATE SCHEMA swap_a; CREATE SCHEMA swap_b; CREATE TABLE swap_a.t (id int, name text); CREATE TABLE swap_b.t (id int, name text); INSERT INTO swap_a.t SELECT i, repeat(md5(i::text), 8) FROM generate_series(1, 20000) i; INSERT INTO swap_b.t SELECT i, 'replacement' FROM generate_series(900001, 920000) i; ANALYZE swap_a.t; ANALYZE swap_b.t"
+            ).await?;
+            let (probe_readers, rows) = snapshot_with_hooks(port, "swap_a", "t", |readers, probe| {
+                data_components::postgres_replication::bootstrap::SnapshotTestHooks {
+                    after_probe: None,
+                    before_scans: Some(probe_then_execute(port, readers, probe,
+                        "ALTER SCHEMA swap_a RENAME TO swap_old; ALTER SCHEMA swap_b RENAME TO swap_a")),
+                }
+            }).await?;
+            assert!(
+                probe_readers > 1,
+                "the snapshot must use parallel readers, got {probe_readers}"
+            );
+            match rows {
+                Ok(rows) => panic!(
+                    "the snapshot must fail after the schema swap, but returned {} rows ({} from the replacement table)",
+                    rows.len(),
+                    rows.iter()
+                        .filter(|(_, name)| name.as_deref() == Some("replacement"))
+                        .count()
+                ),
+                Err(error) => assert!(
+                    error.contains("the name now refers to a different table"),
+                    "unexpected error: {error}"
+                ),
+            }
+            Ok(())
+        },
+    )
 }
