@@ -1,0 +1,22 @@
+[package]
+description = "Exact, division-free rescaling of a u128 key range onto the full u64 range, with Verus-checked arithmetic"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "range-rescale"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+# Specification and proof vocabulary for `src/lib.rs`; `cargo verus focus`
+# re-checks the proofs. The workspace pins it to the Verus release CI runs.
+vstd.workspace = true
+
+[lints]
+workspace = true
+
+# Opts this crate into `cargo verus focus`. Without it the verifier compiles the
+# crate and checks nothing, reporting "no crates that opted into verification".
+[package.metadata.verus]
+verify = true

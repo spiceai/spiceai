@@ -73,18 +73,22 @@ removed from the prototype, each reports the broken guarantee instead:
 | mem-tier-seal-delete-only-sqlite.jsonl | mem-tier-seal-delete-only-sqlite | 7 witnesses + 20 walks (seed 42, 40 steps) |
 | mem-tier-current-3-exhaust.jsonl | mem-tier-current-3-exhaust | seal control witnesses |
 | mem-tier-no-one-call.jsonl | mem-tier-no-one-call | split-commit control witnesses |
+| mem-tier-no-capture-reservation.jsonl | mem-tier-no-capture-reservation | late seal reservation control witnesses |
 
 Generated serially from the repository root, starting with absent output files
-(`TRACE_JSON` appends):
+(`TRACE_JSON` appends). One model thread keeps the minimized witnesses the same
+from run to run:
 
 ```sh
 cargo build --release -p cayenne-metastore-model
+export MODEL_THREADS=1
 EXHAUST=1 TRACE_JSON=crates/cayenne/tests/traces/mem-tier-seal-delete-only.jsonl target/release/cayenne-metastore-model run mem-tier-seal-delete-only
 WALK=42:20:40 TRACE_JSON=crates/cayenne/tests/traces/mem-tier-seal-delete-only.jsonl target/release/cayenne-metastore-model run mem-tier-seal-delete-only
 EXHAUST=1 TRACE_JSON=crates/cayenne/tests/traces/mem-tier-seal-delete-only-sqlite.jsonl target/release/cayenne-metastore-model run mem-tier-seal-delete-only-sqlite
 WALK=42:20:40 TRACE_JSON=crates/cayenne/tests/traces/mem-tier-seal-delete-only-sqlite.jsonl target/release/cayenne-metastore-model run mem-tier-seal-delete-only-sqlite
 EXHAUST=1 TRACE_JSON=crates/cayenne/tests/traces/mem-tier-current-3-exhaust.jsonl target/release/cayenne-metastore-model run mem-tier-current-3-exhaust
 EXHAUST=1 TRACE_JSON=crates/cayenne/tests/traces/mem-tier-no-one-call.jsonl target/release/cayenne-metastore-model run mem-tier-no-one-call
+EXHAUST=1 TRACE_JSON=crates/cayenne/tests/traces/mem-tier-no-capture-reservation.jsonl target/release/cayenne-metastore-model run mem-tier-no-capture-reservation
 ```
 
 `provider/table/tests/mem_tier_model_replay.rs` drives the real CDC apply, seal,
@@ -95,7 +99,12 @@ and data directory with the unacknowledged source suffix redelivered.
 
 The control tests take the FAIL witness's schedule but require the candidate
 model's rows. Split-model `*StageRest` actions are omitted only for those control
-schedules because the guarded engine stages once. Positive traces refuse those
+schedules because the guarded engine stages once, and `SealReserve` because the
+engine reserves the seal's sequence inside its capture. Moving that reservation
+after the seal's `SealCapture` boundary fails
+`mem_tier_model_replay_control_capture_reservation`: the durable probe meets a
+sequence the candidate model never reserved and panics as unmapped. With that
+sequence mapped, the recovered rows hold the key twice. Positive traces refuse those
 actions. No production safeguard is disabled in the checked-in replay.
 
 The replay sets `compaction_trigger_protected_snapshots: 2`, giving the real

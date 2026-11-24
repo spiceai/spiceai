@@ -2257,6 +2257,60 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn catalog_vended_redirect_chain_that_continues_on_another_host_is_refused() {
+            let hop = start_redirector("/b").await;
+            let redirector =
+                start_redirector(&format!("http://hop.vended.test:{}/a", hop.port)).await;
+            let _dns = ResolverOverride::set("chain.vended.test", vec![LOOPBACK], true);
+            let _dns_hop = ResolverOverride::set("hop.vended.test", vec![LOOPBACK], true);
+            let endpoint = format!("http://chain.vended.test:{}", redirector.port);
+            let catalog_uri = start_rest_catalog(&vended_config(&endpoint)).await;
+            let err = read_manifest_list(catalog_uri, HashMap::new())
+                .await
+                .expect_err("a redirect chain that continues on another host must not be followed");
+            let expected = format!(
+                "The Iceberg catalog for dataset 't' directs storage requests through a redirect that is not followed: \"http://hop.vended.test:{}/b\" continues a redirect chain on another host, which a signed storage request does not follow, so the request is not sent and the table cannot be read. Configure the redirect target as the storage endpoint in the Spicepod. See: https://spiceai.org/docs/components/data-connectors/iceberg",
+                hop.port
+            );
+            assert!(
+                err.to_string().contains(&expected),
+                "expected the redirect chain refusal in {err}"
+            );
+            let hop_requests = hop.requests.lock().clone();
+            assert_eq!(
+                hop_requests.len(),
+                1,
+                "requests on the hop: {hop_requests:?}"
+            );
+            assert!(
+                hop_requests[0].contains(" /a "),
+                "requests on the hop: {hop_requests:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn catalog_vended_redirect_to_another_public_host_is_followed() {
+            let sentinel = start_sentinel().await;
+            let redirector = start_redirector(&format!(
+                "http://sentinel.vended.test:{}/object",
+                sentinel.port
+            ))
+            .await;
+            let _dns = ResolverOverride::set("follow.vended.test", vec![LOOPBACK], true);
+            let _dns_sentinel = ResolverOverride::set("sentinel.vended.test", vec![LOOPBACK], true);
+            let endpoint = format!("http://follow.vended.test:{}", redirector.port);
+            let catalog_uri = start_rest_catalog(&vended_config(&endpoint)).await;
+            let err = read_manifest_list(catalog_uri, HashMap::new())
+                .await
+                .expect_err("the sentinel answers 404");
+            assert!(
+                !err.to_string().contains("is not allowed"),
+                "the redirect must be followed: {err}"
+            );
+            assert_eq!(sentinel.requests.lock().len(), 1);
+        }
+
+        #[tokio::test]
         async fn operator_endpoint_redirect_to_loopback_is_followed() {
             let sentinel = start_sentinel().await;
             let redirector = start_redirector(&format!("{}/secret", sentinel.endpoint)).await;
