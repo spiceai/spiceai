@@ -514,6 +514,22 @@ class PerJobHomeTest(unittest.TestCase):
         self.assertEqual(snapshot(elsewhere), before)
         self.assertEqual(list(self.runner_temp.glob("rust-home.leftover.*")), [])
 
+    @unittest.skipUnless(platform.system() == "Darwin", "needs macOS ACLs")
+    def test_the_cleanup_does_not_act_through_a_link(self):
+        outside = self.dir / "outside"
+        outside.write_text("x")
+        subprocess.run(["chmod", "+a", "everyone deny write", str(outside)], check=True)
+        acl = subprocess.run(["ls", "-le", str(outside)], capture_output=True, text=True, check=True).stdout
+        # A directory rm cannot empty, so the cleanup runs, holding a link to that file.
+        read_only = self.rust_home / "read-only"
+        read_only.mkdir(parents=True)
+        (read_only / "link").symlink_to(outside)
+        read_only.chmod(0o500)
+        proc, _ = self.run_step()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(list(self.runner_temp.glob("rust-home.leftover.*")), [])
+        self.assertEqual(subprocess.run(["ls", "-le", str(outside)], capture_output=True, text=True).stdout, acl)
+
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can remove anything")
     def test_a_rust_home_that_cannot_be_removed_fails_closed(self):
         self.plant_rust_home()
