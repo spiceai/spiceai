@@ -476,25 +476,56 @@ pub enum SnapshotCreateTrigger {
 /// The decision behind [`AcceleratedTable::scan_readiness`], as a function of
 /// only the state it depends on so it can be exercised exhaustively.
 /// How often a replica checks whether the instance that writes its
-/// acceleration has loaded it.
-const REPLICA_LOAD_POLL: Duration = Duration::from_secs(1);
+/// acceleration has loaded it, and the writer whether its initial load has
+/// completed.
+const SHARED_LOAD_POLL: Duration = Duration::from_secs(1);
 
 /// Mark a replica's dataset ready once the instance that writes its
-/// acceleration has loaded it: that instance records the dataset's checkpoint
-/// in the shared location after its load. Until then the replica's scans are
-/// refused (`ready_state: on_load`) or served by the source, as a load in
-/// progress is, rather than answered from a partial acceleration.
+/// acceleration has recorded its completed initial load in the shared
+/// location. Until then the replica's scans are refused (`ready_state:
+/// on_load`) or served by the source, as during any initial load, rather than
+/// answered from a partial acceleration.
 async fn wait_for_writer_load(
-    checkpoint: Arc<dyn DatasetCheckpointer>,
+    initial_load: Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>,
     refresher: Arc<refresh::Refresher>,
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
 ) {
-    while !checkpoint.exists().await {
-        tokio::time::sleep(REPLICA_LOAD_POLL).await;
+    while !matches!(initial_load.get().await, Ok(Some(_))) {
+        tokio::time::sleep(SHARED_LOAD_POLL).await;
     }
     refresher.set_initial_load_completed(true);
     runtime_status.update_dataset(&dataset_name, status::ComponentStatus::Ready);
+}
+
+/// Record, once this instance has loaded an acceleration other instances
+/// share, that its initial load completed, so they serve the dataset from it.
+async fn record_initial_load(
+    initial_load: Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>,
+    refresher: Arc<refresh::Refresher>,
+    dataset_name: TableReference,
+) {
+    while !refresher.initial_load_completed() {
+        tokio::time::sleep(SHARED_LOAD_POLL).await;
+    }
+    loop {
+        let recorded = match initial_load.get().await {
+            Ok(Some(_)) => return,
+            Ok(None) => initial_load.upsert("loaded").await,
+            Err(error) => Err(error),
+        };
+        match recorded {
+            Ok(()) => return,
+            Err(error) => {
+                tracing::debug!(
+                    dataset = %dataset_name,
+                    %error,
+                    "Did not record the completed initial load for the instances sharing the acceleration; retrying"
+                );
+                tokio::time::sleep(SHARED_LOAD_POLL).await;
+            }
+        }
+    }
 }
 
 fn scan_readiness_for(
@@ -594,9 +625,12 @@ pub struct Builder {
     acceleration_layout: Option<runtime_acceleration::snapshot::AccelerationLayout>,
     cluster_role: Option<ClusterRole>,
     /// Another instance writes this acceleration: this one serves its queries
-    /// from the shared location and runs no refresh. Holds the dataset's
-    /// checkpoint, which says when the writer has finished loading it.
-    replica: Option<Arc<dyn DatasetCheckpointer>>,
+    /// from the shared location and runs no refresh. Holds the record of the
+    /// writer's completed initial load, which this instance waits for.
+    replica: Option<Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>>,
+    /// This instance writes an acceleration other instances share: it records
+    /// its completed initial load here, for them to wait for.
+    shared_initial_load: Option<Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>>,
     user_facing_schema: Option<SchemaRef>,
     accelerator_write_mutex: Arc<Mutex<()>>,
     /// Per-dataset `cdc_*` overrides drawn from `dataset.acceleration.params`.
@@ -667,6 +701,7 @@ impl Builder {
             engine_type_rewrites: &[],
             cluster_role: None,
             replica: None,
+            shared_initial_load: None,
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
             user_facing_schema: None,
             cdc_param_overrides: None,
@@ -709,10 +744,24 @@ impl Builder {
     /// Another instance writes this acceleration (see
     /// `DataAccelerator::writer_role`): serve its queries from what that
     /// instance committed, and start no refresh, which would write it too.
-    /// The dataset becomes ready once `checkpoint` exists: the writer records
-    /// it when it has loaded the acceleration.
-    pub fn replica(&mut self, checkpoint: Arc<dyn DatasetCheckpointer>) -> &mut Self {
-        self.replica = Some(checkpoint);
+    /// The dataset becomes ready once `initial_load` holds the record the
+    /// writer makes when it has loaded the acceleration.
+    pub fn replica(
+        &mut self,
+        initial_load: Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>,
+    ) -> &mut Self {
+        self.replica = Some(initial_load);
+        self
+    }
+
+    /// This instance writes an acceleration other instances share: once its
+    /// initial load completes it records that in `initial_load`, where the
+    /// other instances wait for it (see [`Self::replica`]).
+    pub fn shares_initial_load(
+        &mut self,
+        initial_load: Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>,
+    ) -> &mut Self {
+        self.shared_initial_load = Some(initial_load);
         self
     }
 
@@ -1457,11 +1506,17 @@ impl Builder {
         if let Some(refresh_handle) = refresh_handle {
             handlers.push(refresh_handle);
         }
-        if let Some(checkpoint) = &self.replica {
+        if let Some(initial_load) = &self.replica {
             handlers.push(tokio::spawn(wait_for_writer_load(
-                Arc::clone(checkpoint),
+                Arc::clone(initial_load),
                 Arc::clone(&refresher),
                 Arc::clone(&self.runtime_status),
+                self.dataset_name.clone(),
+            )));
+        } else if let Some(initial_load) = &self.shared_initial_load {
+            handlers.push(tokio::spawn(record_initial_load(
+                Arc::clone(initial_load),
+                Arc::clone(&refresher),
                 self.dataset_name.clone(),
             )));
         }

@@ -4873,19 +4873,10 @@ impl DataFusion {
         };
         let replica = writer_role.as_ref().is_some_and(|role| !*role.borrow());
         if replica {
-            // The writer records the dataset's checkpoint once it has loaded
-            // the acceleration; the replica is ready from then on.
-            let checkpoint = dataset_checkpointer(
-                dataset,
-                self.accelerator_engine_registry(),
-                OpenOption::OpenExisting,
-                acceleration_settings.snapshot_behavior.clone(),
-            )
-            .await
-            .map_err(|source| Error::AccelerationRegistration {
-                source: Box::new(source),
-            })?;
-            accelerated_table_builder.replica(checkpoint);
+            // The writer records its completed initial load in the location;
+            // the replica is ready from then on.
+            let initial_load = shared_initial_load_record(dataset).await?;
+            accelerated_table_builder.replica(initial_load);
             // Never polled: the refresh that would consume it does not start.
             match refresh_mode {
                 RefreshMode::Changes => {
@@ -4896,6 +4887,10 @@ impl DataFusion {
                 }
                 _ => {}
             }
+        }
+
+        if writer_role.is_some() && !replica {
+            accelerated_table_builder.shares_initial_load(shared_initial_load_record(dataset).await?);
         }
 
         if refresh_mode == RefreshMode::Changes && !replica {
@@ -7806,6 +7801,25 @@ pub fn is_schema_mismatch(error: &runtime_query_engine::query_engine::Error) -> 
     inner
         .downcast_ref::<Error>()
         .is_some_and(|e| matches!(e, Error::SchemaMismatch { .. }))
+}
+
+/// Where the instance writing `dataset`'s shared acceleration records its
+/// completed initial load, and the other instances read it.
+async fn shared_initial_load_record(
+    dataset: &Dataset,
+) -> Result<Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>> {
+    crate::dataaccelerator::spice_sys::checkpoint_store(
+        dataset,
+        runtime_checkpoint_api::INITIAL_LOAD_TABLE,
+    )
+    .await
+    .ok_or_else(|| Error::AccelerationRegistration {
+        source: format!(
+            "Dataset '{}' could not open the record of its initial load in the shared state location",
+            dataset.name
+        )
+        .into(),
+    })
 }
 
 /// Ask for `dataset` to be reloaded once this instance starts or stops
