@@ -7358,6 +7358,15 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Whether a key delete or an overwrite holds [`Self::append_admission`]
+    /// while it waits for the appends staged before it, so a test can start a
+    /// write only once that wait has begun. `#[doc(hidden)]`: not a stable API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn append_admission_held_exclusively(&self) -> bool {
+        self.append_admission.try_read().is_err()
+    }
+
     /// Wait for in-flight pipelined Stage-B publishes (staged WALs, staged
     /// inline tombstones, and inline writes waiting for their record's commit)
     /// to drain, up to `timeout`. Returns `false` on timeout — the caller turns

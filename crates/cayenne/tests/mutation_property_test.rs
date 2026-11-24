@@ -1934,12 +1934,9 @@ test_on_data_store!(staged_cdc_write_is_ordered_before_overwrite_impl);
 // only when the record commits, after its last group. An overwrite that starts
 // between two groups waits for that record, so the later groups must still be
 // able to stage and delete: otherwise the batch and the overwrite each wait for
-// the other until the overwrite times out.
+// the other until the overwrite times out. Only the object-native metastore
+// commits a batch as one record, so this runs on it on every lane.
 async fn overwrite_lets_a_waiting_batch_finish_its_groups_impl(f: TestFixture) -> TestResult<()> {
-    if !matches!(f.backend_type, BackendType::ObjectNative) {
-        // Only the object-native metastore commits a batch as one record.
-        return Ok(());
-    }
     let name = "overwrite_waits_for_batch_record".to_string();
     let opts = CreateTableOptions {
         table_name: name.clone(),
@@ -1977,8 +1974,18 @@ async fn overwrite_lets_a_waiting_batch_finish_its_groups_impl(f: TestFixture) -
                     .map_err(|e| e.to_string())
             }
         });
-        // Time is what is under test: let the overwrite start waiting.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // The later groups must start only once the overwrite holds admission
+        // while it waits for this batch's record.
+        let waiting = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !table.append_admission_held_exclusively() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            waiting.is_ok(),
+            "the overwrite starts waiting for the batch's record"
+        );
         let second = table
             .write_cdc_append_stream(batch_to_stream(rows_to_batch(&[(4, 40)])), &ctx.task_ctx())
             .await?;
@@ -2012,7 +2019,13 @@ async fn overwrite_lets_a_waiting_batch_finish_its_groups_impl(f: TestFixture) -
     assert_converged_no_duplicates(&ctx, &name, &model, &message).await?;
     Ok(())
 }
-test_on_data_store!(overwrite_lets_a_waiting_batch_finish_its_groups_impl);
+#[test]
+fn overwrite_lets_a_waiting_batch_finish_its_groups() -> Result<(), String> {
+    common::run_with_backend_blocking(
+        BackendType::ObjectNative,
+        overwrite_lets_a_waiting_batch_finish_its_groups_impl,
+    )
+}
 
 // --- Concurrent pure-upsert convergence (GREEN control: loss needs deletes) ---
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
