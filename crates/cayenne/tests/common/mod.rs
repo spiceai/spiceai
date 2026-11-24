@@ -912,10 +912,10 @@ pub fn require_process_per_test(why: &str) {
 
 /// Run a test on the SQLite backend, with its data files local.
 ///
-/// A file whose tests run on the object-native backend registers them with
-/// [`test_on_data_store!`]; a test in such a file that stays here is one of the
-/// object-native exceptions below, each checking behavior that the object-native
-/// data path does not have, or failing there as its row describes:
+/// A test runs on the object-native backend when it registers with
+/// [`test_on_data_store!`]. The tests below stay here on purpose, each checking
+/// behavior that the object-native data path does not have, or failing there as
+/// its row describes:
 ///
 /// # Object-native exceptions
 ///
