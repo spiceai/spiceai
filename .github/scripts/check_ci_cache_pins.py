@@ -4,8 +4,9 @@
 Without a pin for the toolchain in rust-toolchain.toml, setup-rust installs Rust from
 static.rust-lang.org on every fresh runner instead of from the CI cache. Nothing fails, so
 a toolchain bump that forgets the pin would lose the cache silently; this check fails it.
-It also requires a rustup-init pin for every macOS host setup-rust maps, since a
-self-hosted Mac job installs its own rustup from it and fails without one.
+It also requires a rustup-init pin for every host setup-rust maps: setup-rust installs
+rustup only from that pin, so a host without one fails wherever rustup is missing, and on
+a self-hosted Mac, whose jobs always install their own, every time.
 """
 
 import json
@@ -21,9 +22,9 @@ SHA256 = re.compile(r"[0-9a-f]{64}")
 # The arms of install-cargo-deny's `case "$(uname -s)-$(uname -m)"`, such as
 # `Darwin-arm64) target=aarch64-apple-darwin ;;`: the targets it can ask pins.json for.
 ACTION_TARGET = re.compile(r"^\s*[A-Za-z]+-[A-Za-z0-9_]+\)\s*target=([A-Za-z0-9_.-]+)\s*;;", re.M)
-# setup-rust's macOS arms, such as `Darwin-arm64) host_triple=aarch64-apple-darwin ;;`: a
-# self-hosted Mac job installs its own rustup from the rustup-init pinned for that host.
-SETUP_RUST_MAC_HOST = re.compile(r"^\s*Darwin-[A-Za-z0-9_]+\)\s*host_triple=([A-Za-z0-9_.-]+)\s*;;", re.M)
+# setup-rust's host arms, such as `Darwin-arm64) host_triple=aarch64-apple-darwin ;;`: the
+# hosts it installs rustup for, from the rustup-init pinned for each.
+SETUP_RUST_HOST = re.compile(r"^\s*[A-Za-z]+-[A-Za-z0-9_]+\)\s*host_triple=([A-Za-z0-9_.-]+)\s*;;", re.M)
 RUSTUP_ARCHIVE = "https://static.rust-lang.org/rustup/archive/"
 
 
@@ -76,8 +77,8 @@ def main() -> int:
     rustup = pins.get("rustup-init")
     if rustup is None:
         errors.append(
-            f"{PINS_PATH.relative_to(ROOT)} has no rustup-init entry, so setup-rust cannot give a "
-            "self-hosted Mac job its own rustup."
+            f"{PINS_PATH.relative_to(ROOT)} has no rustup-init entry, so setup-rust cannot install rustup "
+            "anywhere, which a self-hosted Mac job always does."
         )
     else:
         errors.extend(rustup_init_errors(rustup))
@@ -93,7 +94,7 @@ def main() -> int:
 
 
 def rustup_init_errors(rustup: dict) -> list:
-    """The rustup-init pin: a release on static.rust-lang.org, for every Mac host setup-rust names."""
+    """The rustup-init pin: a release on static.rust-lang.org, for every host setup-rust maps."""
     errors = []
     version = rustup.get("version", "")
     url = rustup.get("url", "")
@@ -105,17 +106,17 @@ def rustup_init_errors(rustup: dict) -> list:
     for target, sha256 in hashes.items():
         if not SHA256.fullmatch(sha256):
             errors.append(f"rustup-init.sha256.{target} is not a lowercase hex SHA-256.")
-    hosts = SETUP_RUST_MAC_HOST.findall(SETUP_RUST.read_text())
+    hosts = SETUP_RUST_HOST.findall(SETUP_RUST.read_text())
     if not hosts:
         errors.append(
-            f"Found no `Darwin-<arch>) host_triple=<triple> ;;` arm in {SETUP_RUST.relative_to(ROOT)}, so the "
+            f"Found no `<os>-<arch>) host_triple=<triple> ;;` arm in {SETUP_RUST.relative_to(ROOT)}, so the "
             "rustup-init hosts to require cannot be read; update this check with the action."
         )
     for host in hosts:
         if host not in hashes:
             errors.append(
                 f"rustup-init.sha256 has no pin for {host}, which {SETUP_RUST.relative_to(ROOT)} installs "
-                "rustup for on a self-hosted Mac, so its jobs would fail there. Add the SHA-256 that "
+                "rustup for, so a job there without rustup would fail. Add the SHA-256 that "
                 f"`curl -fsSL {RUSTUP_ARCHIVE}{version}/{host}/rustup-init.sha256` prints, and check it "
                 "against a download."
             )

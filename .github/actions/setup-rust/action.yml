@@ -88,21 +88,87 @@ runs:
           *) host_triple='' ;;
         esac
 
+        # rustup is installed only one way: from the rustup-init that
+        # .github/ci-cache/pins.json pins for this host, fetched through cached_fetch.sh,
+        # which checks it against the pin whether it comes from the host's CI_CACHE_DIR, the
+        # CI cache or static.rust-lang.org. A host without a pin, or a download that does not
+        # match it, fails the step; nothing falls back to an installer piped into a shell.
+        # rustup-init installs into CARGO_HOME and RUSTUP_HOME, or ~/.cargo and ~/.rustup.
+        install_rustup() {
+          local pin='' version='' sha256='' url='' dir='' status=0
+          pin="$(python3 -I -c '
+        import json, sys
+        pin = json.load(open(sys.argv[1]))["rustup-init"]
+        print(pin["version"])
+        print(pin["sha256"].get(sys.argv[2], ""))
+        print(pin["url"].format(version=pin["version"], target=sys.argv[2]))
+        ' "$GITHUB_ACTION_PATH/../../ci-cache/pins.json" "$host_triple")" || pin=''
+          { read -r version; read -r sha256; read -r url; } <<<"$pin" || true
+          if [ -z "$host_triple" ] || [ -z "$sha256" ] || [ -z "$url" ]; then
+            echo "::error::.github/ci-cache/pins.json pins no rustup-init for $(uname -s) $(uname -m)${host_triple:+ ($host_triple)}, and setup-rust installs rustup only from a pinned rustup-init."
+            return 1
+          fi
+          dir="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/rustup-init.XXXXXX")" || return 1
+          bash "$GITHUB_ACTION_PATH/../../scripts/cached_fetch.sh" "$sha256" "$dir/rustup-init" "$url" || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Could not get rustup-init $version for $host_triple at its pinned SHA-256 (cached_fetch.sh exited $status; the error above says why), and setup-rust installs rustup only from a pinned rustup-init."
+            rm -rf "$dir"
+            return 1
+          fi
+          chmod 0755 "$dir/rustup-init"
+          "$dir/rustup-init" --no-modify-path -y --default-toolchain none || status=$?
+          rm -rf "$dir"
+          if [ "$status" -ne 0 ] || [ ! -x "${CARGO_HOME:-$HOME/.cargo}/bin/rustup" ]; then
+            echo "::error::rustup-init $version did not install rustup in ${CARGO_HOME:-$HOME/.cargo}/bin (exit $status)."
+            return 1
+          fi
+          # Keep it the pinned rustup: a later `rustup toolchain install` or `rustup update`
+          # would otherwise replace it with whatever static.rust-lang.org serves.
+          "${CARGO_HOME:-$HOME/.cargo}/bin/rustup" set auto-self-update disable || {
+            echo "::error::Could not turn off rustup's self-update."
+            return 1
+          }
+        }
+
         # A self-hosted Mac keeps its disk between jobs, and all of its runner instances run
         # as one user, so any job there can write ~/.cargo and ~/.rustup: a pull request job
         # could replace rustup, a toolchain or a crate source that a later trunk job runs.
         # So a job there gets its own CARGO_HOME and RUSTUP_HOME under RUNNER_TEMP, which the
         # runner empties when a job starts and again when it ends, and never reads ~/.cargo
-        # or ~/.rustup. Its rustup comes from the rustup-init that
-        # .github/ci-cache/pins.json pins, and its toolchain from the verified mirror below.
+        # or ~/.rustup. Homes it creates get their own rustup, from the pinned rustup-init
+        # (install_rustup), and their toolchain from the verified mirror below.
         # The cargo registry and git checkouts live in CARGO_HOME, and sccache's local
         # directory goes next to it, so no job reuses another's crate sources. Any Mac that
         # is not GitHub-hosted counts, so one whose runner does not say is isolated too.
         # GitHub-hosted runners and the Linux pods start each job empty and are unchanged.
         per_job_home=false
+        fresh_home=false
         if [ "${RUNNER_OS:-}" = macOS ] && [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]; then
           per_job_home=true
           rust_home="${RUNNER_TEMP:?RUNNER_TEMP is not set}/rust-home"
+          if [ "${CARGO_HOME:-}" = "$rust_home/cargo" ] && [ "${RUSTUP_HOME:-}" = "$rust_home/rustup" ] &&
+            [ -d "$rust_home" ] && [ ! -L "$rust_home" ]; then
+            # An earlier setup-rust in this job made these homes, and its GITHUB_ENV named
+            # them; later steps (setup-nextest, cargo) already use them, so they stay.
+            echo "Keeping this job's Rust homes in $rust_home."
+          else
+            # The runner skips what it cannot delete when it empties RUNNER_TEMP, and a
+            # same-user job can flag a file immutable (chflags uchg). So a rust-home found here
+            # is not this job's: clear its flags, remove it, and create the directory anew,
+            # which fails if anything is still there. Nothing in it is then trusted.
+            if [ -e "$rust_home" ] || [ -L "$rust_home" ]; then
+              echo "::warning::Removing $rust_home, which an earlier job left behind."
+              if command -v chflags >/dev/null 2>&1; then
+                chflags -R nouchg,nouappnd "$rust_home" 2>/dev/null || true
+              fi
+              rm -rf "$rust_home" 2>/dev/null || true
+            fi
+            if ! mkdir "$rust_home" 2>/dev/null; then
+              echo "::error::Could not create $rust_home afresh: what an earlier job left there could not be removed, and setup-rust never uses Rust homes it did not create."
+              exit 1
+            fi
+            fresh_home=true
+          fi
           export CARGO_HOME="$rust_home/cargo" RUSTUP_HOME="$rust_home/rustup"
           mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$rust_home/sccache"
           {
@@ -133,42 +199,19 @@ runs:
             add_configs_above "$start"
             add_configs_above "$(cd "$start" 2>/dev/null && pwd -P)"
           done
+          for config in "$CARGO_HOME/config" "$CARGO_HOME/config.toml"; do
+            if [ -e "$config" ] || [ -L "$config" ]; then
+              found="$found $config"
+            fi
+          done
           if [ -n "$found" ]; then
-            echo "::error::cargo would read${found}: cargo configuration above this job's checkout, which any job on this host can write, and which can set the compiler, a linker or a crate source. Remove it from the host."
+            echo "::error::cargo would read${found}: cargo configuration outside this job's checkout, which any job on this host can write, and which can set the compiler, a linker or a crate source. Remove it from the host."
             exit 1
           fi
 
           # As install-cargo-deny does, downloads are kept in a host directory for the next
           # job here. cached_fetch.sh checks every copy it reads from it against the pin.
           export CI_CACHE_DIR="${CI_CACHE_DIR:-$HOME/Library/Caches/spice-ci/downloads}"
-          rustup_version='' rustup_sha256='' rustup_url=''
-          rustup_pin="$(python3 -I -c '
-        import json, sys
-        pin = json.load(open(sys.argv[1]))["rustup-init"]
-        print(pin["version"])
-        print(pin["sha256"].get(sys.argv[2], ""))
-        print(pin["url"].format(version=pin["version"], target=sys.argv[2]))
-        ' "$GITHUB_ACTION_PATH/../../ci-cache/pins.json" "$host_triple")" || rustup_pin=''
-          { read -r rustup_version; read -r rustup_sha256; read -r rustup_url; } <<<"$rustup_pin" || true
-          if [ -z "$host_triple" ] || [ -z "$rustup_sha256" ] || [ -z "$rustup_url" ]; then
-            echo "::error::.github/ci-cache/pins.json pins no rustup-init for $(uname -s) $(uname -m)${host_triple:+ ($host_triple)}, so this job cannot install its own rustup. It does not fall back to the host's ~/.cargo or an unpinned installer."
-            exit 1
-          fi
-          rustup_init="$rust_home/rustup-init"
-          fetch_status=0
-          bash "$GITHUB_ACTION_PATH/../../scripts/cached_fetch.sh" "$rustup_sha256" "$rustup_init" "$rustup_url" ||
-            fetch_status=$?
-          if [ "$fetch_status" -ne 0 ]; then
-            echo "::error::Could not get rustup-init $rustup_version for $host_triple at its pinned SHA-256 (cached_fetch.sh exited $fetch_status; the error above says why). This job does not fall back to the host's ~/.cargo or an unpinned installer."
-            exit 1
-          fi
-          chmod 0755 "$rustup_init"
-          "$rustup_init" --no-modify-path -y --default-toolchain none
-          rm -f "$rustup_init"
-          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
-            echo "::error::rustup-init $rustup_version did not install rustup in $CARGO_HOME/bin."
-            exit 1
-          fi
         fi
 
         cargo_home="${CARGO_HOME:-$HOME/.cargo}"
@@ -231,8 +274,10 @@ runs:
           fi
         fi
 
-        if [ ! -x "$cargo_home/bin/rustup" ]; then
-          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
+        # A runner without rustup gets it from the pinned rustup-init, and so does every
+        # home this step just created on a self-hosted Mac.
+        if [ "$fresh_home" = true ] || [ ! -x "$cargo_home/bin/rustup" ]; then
+          install_rustup || exit 1
           if [ -f "$cargo_home/env" ]; then
             source "$cargo_home/env" || true
           fi
@@ -266,8 +311,13 @@ runs:
         if [ -n "${CI_CACHE_URL:-}" ] || [ "$per_job_home" = true ]; then
           cache_host="$host_triple"
           cache_tool_dir="$rustup_home/toolchains/${toolchain}-${cache_host}"
-          if [ -n "$cache_host" ] && ! { [ -x "$cache_tool_dir/bin/rustc" ] && [ -x "$cache_tool_dir/bin/cargo" ]; }; then
+          # A home this step just created installs from the mirror whatever is in it.
+          if [ -n "$cache_host" ] && { [ "$fresh_home" = true ] ||
+            ! { [ -x "$cache_tool_dir/bin/rustc" ] && [ -x "$cache_tool_dir/bin/cargo" ]; }; }; then
             mirror="${RUNNER_TEMP:-/tmp}/rust-dist-${toolchain}"
+            if [ "$per_job_home" = true ]; then
+              mirror="$rust_home/dist-${toolchain}"
+            fi
             rm -rf "$mirror"
             status=0
             python3 "$GITHUB_ACTION_PATH/../../scripts/rust_dist_mirror.py" \
@@ -345,10 +395,12 @@ runs:
         INPUT_TOOLCHAIN: ${{ inputs.toolchain }}
       run: |
         echo "$env:USERPROFILE\.cargo\bin" >> $env:GITHUB_PATH
+        # GitHub's Windows images ship rustup. setup-rust installs rustup only from a
+        # rustup-init pinned in .github/ci-cache/pins.json, which pins none for Windows, so a
+        # runner without it fails here instead of running an unpinned installer.
         if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
-          Write-Host "Installing Rust..."
-          Invoke-WebRequest -Uri "https://win.rustup.rs" -OutFile "rustup-init.exe"
-          Start-Process -FilePath "rustup-init.exe" -ArgumentList "-q", "-y", "--default-toolchain", "none", "--profile", "default" -Wait
+          Write-Output "::error::rustup is not installed on this Windows runner, and setup-rust installs it only from a rustup-init pinned in .github/ci-cache/pins.json, which pins none for Windows."
+          exit 1
         }
 
         $toolchain = "${env:INPUT_TOOLCHAIN}"

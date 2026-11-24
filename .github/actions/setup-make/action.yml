@@ -19,10 +19,11 @@ runs:
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
-        # use choco to install make
+        # use choco to install make. GitHub's Windows images ship Chocolatey; a runner
+        # without it fails here rather than running Chocolatey's unpinned web installer.
         if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
-          Set-ExecutionPolicy Bypass -Scope Process -Force; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-          echo "C:\ProgramData\Chocolatey\bin" >> $env:GITHUB_PATH
+          Write-Output "::error::Chocolatey is not installed on this Windows runner, and this action does not run its unpinned web installer."
+          exit 1
         }
         choco install make -y
 

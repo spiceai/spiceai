@@ -46,6 +46,12 @@
 # writes to the repository only with the full roles. The roles' AWS trust policies make the
 # same split by `job_workflow_ref` and `ref`; this keeps the workflows asking for what AWS
 # would grant.
+#
+# And no script under `.github/` (a workflow or composite action `run:`, or a `.sh` file)
+# runs a download as code: piped into a shell, read through `<(curl …)`, passed to
+# `sh -c "$(curl …)"`, or given to PowerShell's `iex`, nor names the unpinned rustup
+# installers (sh.rustup.rs, win.rustup.rs). A download is kept as a file, checked against
+# a pinned SHA-256, and then run.
 """Validate the repository's GitHub Actions workflow and composite action YAML."""
 
 from __future__ import annotations
@@ -149,6 +155,28 @@ DROPS_CACHE_ENDPOINT = re.compile(
 # A line whose first non-blank character is `#`. Removed before looking for a
 # runtime invocation, so a command named in a comment does not read as one.
 COMMENT_LINE = re.compile(r"^[ \t]*#[^\n]*$", re.MULTILINE)
+
+# A download run as code without being kept or checked first: piped into a shell (`curl …
+# | sh`, `| sudo -E bash`, `| /bin/bash`), read through a process substitution (`bash
+# <(curl …)`, `source <(curl …)`), handed to `sh -c "$(curl …)"`, or PowerShell's `iex` of
+# one. A cut-off download runs half a script, and nothing pins what ran. The rustup
+# installers are refused by name too: setup-rust installs rustup only from the
+# rustup-init .github/ci-cache/pins.json pins.
+_SHELL = r"(?<![\w.-])(?:/usr/bin/env\s+|/usr/local/bin/|/usr/bin/|/bin/)?(?:ba|da|k|z)?sh\b"
+_PS_DOWNLOAD = r"(?:DownloadString|DownloadFile|Invoke-WebRequest|Invoke-RestMethod|\biwr\b|\birm\b)"
+DOWNLOAD_EXECUTION = re.compile(
+    rf"\|\s*(?:sudo(?:\s+-\S+)*\s+)?{_SHELL}"
+    rf"|(?:{_SHELL}|(?<![\w.-])(?:source|\.))[^\n|;&]*<\(\s*(?:curl|wget)\b"
+    rf"|{_SHELL}\s+-c\s+[\"']?\$\(\s*(?:curl|wget)\b"
+    rf"|\b(?:iex|Invoke-Expression)\b[^\n]*{_PS_DOWNLOAD}"
+    rf"|{_PS_DOWNLOAD}[^\n]*\|\s*(?:iex|Invoke-Expression)\b"
+    r"|\b(?:sh|win)\.rustup\.rs\b",
+    re.IGNORECASE,
+)
+DOWNLOAD_EXECUTION_REMEDY = (
+    "download it to a file, check it against a pinned SHA-256 (cached_fetch.sh does both), and "
+    "run the file; rustup comes only from setup-rust's pinned rustup-init"
+)
 
 
 # A step that runs a test suite. Both spellings reach the same place: a suite
@@ -489,6 +517,7 @@ def check_workflow(text: str) -> list[str]:
         problems.extend(check_untrusted_expansions(document, jobs))
         problems.extend(check_ci_role_jobs(document))
         problems.extend(check_attested_builds(jobs))
+        problems.extend(check_download_execution(jobs))
 
     return problems
 
@@ -921,6 +950,55 @@ def check_action_expansions(document: dict) -> list[str]:
     return problems
 
 
+def download_executions(script: object) -> list[tuple[int, str]]:
+    """The (line number, line) of each line of a script that runs a download as code.
+
+    Whole-line comments are skipped, so a command a comment names does not count.
+    """
+    if not isinstance(script, str):
+        return []
+    found = []
+    for number, line in enumerate(script.splitlines(), start=1):
+        if COMMENT_LINE.fullmatch(line) is None and DOWNLOAD_EXECUTION.search(line):
+            text = line.strip()
+            found.append((number, text if len(text) <= 160 else text[:157] + "..."))
+    return found
+
+
+def _step_download_executions(steps: object, where: str) -> list[str]:
+    if not isinstance(steps, list):
+        return []
+    problems = []
+    for position, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            continue
+        label = step.get("name") or f"step {position}"
+        for _, line in download_executions(step.get("run")):
+            problems.append(f"{where}step `{label}` runs a download as code (`{line}`): {DOWNLOAD_EXECUTION_REMEDY}")
+    return problems
+
+
+def check_download_execution(jobs: dict) -> list[str]:
+    """Report a workflow step that runs a download as code (DOWNLOAD_EXECUTION)."""
+    problems = []
+    for job_name, job in jobs.items():
+        if isinstance(job, dict):
+            problems.extend(_step_download_executions(job.get("steps"), f"job `{job_name}` "))
+    return problems
+
+
+def check_script_downloads(github_dir: Path) -> list[str]:
+    """Report a `.sh` file under the .github directory that runs a download as code."""
+    problems = []
+    for path in sorted(github_dir.rglob("*.sh")):
+        if path.is_file():
+            problems.extend(
+                f"{path}:{number}: runs a download as code (`{line}`): {DOWNLOAD_EXECUTION_REMEDY}"
+                for number, line in download_executions(path.read_text(encoding="utf-8", errors="replace"))
+            )
+    return problems
+
+
 def check_cache_endpoint_isolation(jobs: dict) -> list[str]:
     """Report steps that run the Spice runtime with the compiler cache's S3 endpoint set.
 
@@ -1012,10 +1090,12 @@ def check_action(text: str) -> list[str]:
     if "runs" not in document:
         return ["has no `runs:` block"]
 
+    runs = document["runs"]
     return (
         check_action_descriptions(document)
-        + check_action_conditions(document["runs"])
+        + check_action_conditions(runs)
         + check_action_expansions(document)
+        + _step_download_executions(runs.get("steps") if isinstance(runs, dict) else None, "")
     )
 
 
@@ -1046,6 +1126,7 @@ def check_definitions(github_dir: Path) -> list[str]:
         if document is not None:
             workflows[path.name] = document
     failures.extend(f"{github_dir / 'workflows'}/{problem}" for problem in check_ci_role_calls(workflows))
+    failures.extend(check_script_downloads(github_dir))
     return failures
 
 

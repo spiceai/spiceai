@@ -42,17 +42,23 @@ download the same file with no bound.
   before.
 - **`cargo-deny`**: the release archive for each target, installed by the
   `install-cargo-deny` action.
-- **`rustup-init`**: one rustup release, with the SHA-256 of `rustup-init` for each macOS
-  host. On a self-hosted Mac, `setup-rust` gives each job its own `CARGO_HOME` and
-  `RUSTUP_HOME` under `RUNNER_TEMP`, which the runner empties when a job starts and ends,
-  and never reads the host's shared `~/.cargo` or `~/.rustup`, which any job there can
-  write. It fetches `rustup-init` through `cached_fetch.sh`, runs it with
-  `--no-modify-path -y --default-toolchain none`, and installs the toolchain from the
-  mirror above. A missing or mismatched `rustup-init` fails the job; there is no
-  unpinned fallback. To bump it, take each host's line from
-  `https://static.rust-lang.org/rustup/archive/<version>/<host>/rustup-init.sha256`
-  and check it against a download. `check_ci_cache_pins.py` fails a macOS host
-  `setup-rust` maps that has no pin.
+- **`rustup-init`**: one rustup release, with the SHA-256 of `rustup-init` for each Linux
+  and macOS host `setup-rust` maps. It is the only way `setup-rust` installs rustup: on a
+  runner without one, fetched through `cached_fetch.sh` and run with `--no-modify-path -y
+  --default-toolchain none`, with rustup's self-update then turned off so it stays at the
+  pinned release. A missing or mismatched `rustup-init` fails the job; nothing falls back
+  to an installer piped into a shell (`check_workflow_yaml.py` refuses one anywhere under
+  `.github/`). On Windows, which it pins none for, a runner without rustup fails.
+- **The self-hosted Macs' Rust homes.** There, `setup-rust` gives each job its own
+  `CARGO_HOME` and `RUSTUP_HOME` in `$RUNNER_TEMP/rust-home`, which the runner empties when
+  a job starts and ends, and never reads the host's shared `~/.cargo` or `~/.rustup`, which
+  any job there can write. A `rust-home` an earlier job left behind is removed and the
+  directory created anew, and a new home always gets rustup from the pin above and its
+  toolchain from the mirror. A later `setup-rust` in the same job keeps the job's homes.
+- To bump `rustup-init`, take each host's line from
+  `https://static.rust-lang.org/rustup/archive/<version>/<host>/rustup-init.sha256` and
+  check it against a download. `check_ci_cache_pins.py` fails a host `setup-rust` maps
+  that has no pin.
 
 ## How the cache is filled
 

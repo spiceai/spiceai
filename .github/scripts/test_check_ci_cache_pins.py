@@ -70,17 +70,20 @@ class CheckCiCachePinsTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("rust-toolchain.toml names Rust 1.0.0", result.stdout)
 
-    def test_the_repository_pins_rustup_init_for_every_mac_setup_rust_maps(self):
+    def test_the_repository_pins_rustup_init_for_every_host_setup_rust_maps(self):
         result = self.run_check()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertRegex(result.stdout, r"rustup-init \d+\.\d+\.\d+\.")
 
-    def test_every_mac_host_setup_rust_maps_must_have_a_rustup_init_pin(self):
-        self.edit_pins(lambda pins: pins["rustup-init"]["sha256"].pop("x86_64-apple-darwin"))
-        result = self.run_check()
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("rustup-init.sha256 has no pin for x86_64-apple-darwin", result.stdout)
-        self.assertIn("/x86_64-apple-darwin/rustup-init.sha256", result.stdout)
+    def test_every_host_setup_rust_maps_must_have_a_rustup_init_pin(self):
+        for host in ("x86_64-apple-darwin", "aarch64-unknown-linux-gnu"):
+            with self.subTest(host=host):
+                self.setUp()
+                self.edit_pins(lambda pins: pins["rustup-init"]["sha256"].pop(host))
+                result = self.run_check()
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"rustup-init.sha256 has no pin for {host}", result.stdout)
+                self.assertIn(f"/{host}/rustup-init.sha256", result.stdout)
 
     def test_a_missing_rustup_init_entry_fails(self):
         self.edit_pins(lambda pins: pins.pop("rustup-init"))
@@ -101,12 +104,12 @@ class CheckCiCachePinsTest(unittest.TestCase):
         self.assertIn("rustup-init.url must start with https://static.rust-lang.org/rustup/archive/", result.stdout)
         self.assertIn("rustup-init.sha256.aarch64-apple-darwin is not a lowercase hex SHA-256.", result.stdout)
 
-    def test_a_setup_rust_with_no_mac_arms_fails(self):
+    def test_a_setup_rust_with_no_host_arms_fails(self):
         action = self.tmp / ".github/actions/setup-rust/action.yml"
         action.write_text("name: Sets up the Rust toolchain\nruns:\n  using: composite\n  steps: []\n")
         result = self.run_check()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("Found no `Darwin-<arch>) host_triple=<triple> ;;` arm", result.stdout)
+        self.assertIn("Found no `<os>-<arch>) host_triple=<triple> ;;` arm", result.stdout)
 
 
 if __name__ == "__main__":

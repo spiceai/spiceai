@@ -14,8 +14,8 @@ toolchain bump in the real pins.json changes nothing here. setup-rust's own step
 its action.yml, with HOME, CARGO_HOME and RUSTUP_HOME in a temporary directory and
 stand-ins for rustup, cargo, rustc and the mirror, so nothing is downloaded or installed.
 
-On a self-hosted Mac the step gives the job its own CARGO_HOME and RUSTUP_HOME and
-installs rustup from the pinned rustup-init (PerJobHomeTest). There it runs with the real
+rustup comes only from the pinned rustup-init, and on a self-hosted Mac the step gives the
+job its own CARGO_HOME and RUSTUP_HOME (PerJobHomeTest). There the step runs with the real
 cached_fetch.sh, a stand-in rustup-init served from a file:// URL its own pins file names,
 and shared ~/.cargo and ~/.rustup homes full of stand-ins that log any use.
 """
@@ -52,14 +52,14 @@ esac
 case "$1" in
   show) echo "Default host: $host" ;;
   toolchain)
-    bin="$RUSTUP_HOME/toolchains/$3-$host/bin"
+    bin="${RUSTUP_HOME:-$HOME/.rustup}/toolchains/$3-$host/bin"
     mkdir -p "$bin"
     for tool in rustc cargo rustfmt cargo-clippy; do
       printf '#!/bin/sh\\n' > "$bin/$tool"
       chmod +x "$bin/$tool"
     done
     ;;
-  which) echo "$RUSTUP_HOME/toolchains/$3-$host/bin/rustc" ;;
+  which) echo "${RUSTUP_HOME:-$HOME/.rustup}/toolchains/$3-$host/bin/rustc" ;;
 esac
 """
 
@@ -200,15 +200,17 @@ HOST = {
 RUSTUP_VERSION = "9.9.9"
 
 # Stands in for rustup-init: logs how it was run, then installs the stub rustup and two
-# proxies into CARGO_HOME, as the real one installs rustup and its proxies there.
+# proxies into CARGO_HOME (default ~/.cargo), as the real one installs rustup and its
+# proxies there.
 FAKE_RUSTUP_INIT = """#!/usr/bin/env bash
-echo "rustup-init $* CARGO_HOME=$CARGO_HOME RUSTUP_HOME=$RUSTUP_HOME" >> "$RUSTUP_LOG"
-mkdir -p "$CARGO_HOME/bin" "$RUSTUP_HOME"
-cp "$STUB_RUSTUP" "$CARGO_HOME/bin/rustup"
+echo "rustup-init $* CARGO_HOME=${CARGO_HOME:-} RUSTUP_HOME=${RUSTUP_HOME:-}" >> "$RUSTUP_LOG"
+bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+mkdir -p "$bin" "${RUSTUP_HOME:-$HOME/.rustup}"
+cp "$STUB_RUSTUP" "$bin/rustup"
 for tool in cargo rustc; do
-  printf '#!/bin/sh\\necho "%s from the job home"\\n' "$tool" > "$CARGO_HOME/bin/$tool"
+  printf '#!/bin/sh\\necho "%s from the job home"\\n' "$tool" > "$bin/$tool"
 done
-chmod 755 "$CARGO_HOME/bin/rustup" "$CARGO_HOME/bin/cargo" "$CARGO_HOME/bin/rustc"
+chmod 755 "$bin/rustup" "$bin/cargo" "$bin/rustc"
 """
 # What a pull request job could leave in the shared homes: anything run or sourced from
 # them logs itself.
@@ -304,6 +306,10 @@ class PerJobHomeTest(unittest.TestCase):
         self.base_path = f"{self.shared_bin}{os.pathsep}{os.environ['PATH']}"
 
     def tearDown(self):
+        # Whatever a test flagged immutable or read-only, so the directory can go.
+        if shutil.which("chflags"):
+            subprocess.run(["chflags", "-R", "nouchg", str(self.dir)], check=False)
+        self.runner_temp.chmod(0o755)
         self.tmp.cleanup()
 
     def write_pins(self, hashes):
@@ -360,6 +366,7 @@ class PerJobHomeTest(unittest.TestCase):
             f"CARGO_HOME={cargo_home} RUSTUP_HOME={rustup_home}",
         )
         self.assertTrue(all(call.startswith("rustup ") for call in calls[1:]), calls)
+        self.assertEqual(calls[1], "rustup set auto-self-update disable dist=")
         self.assertIn(f"rustup-init: verified from file://{self.dir}/dist/", proc.stdout)
         # The toolchain came from the mirror, which ran without a CI_CACHE_URL.
         self.assertIn(f"--host {HOST}", self.mirror_log.read_text())
@@ -368,7 +375,7 @@ class PerJobHomeTest(unittest.TestCase):
         self.assertTrue((rustup_home / "toolchains" / f"{TOOLCHAIN}-{HOST}" / "bin" / "rustc").is_file())
         self.assertIn("cargo from the job home", proc.stdout)
         # rustup-init is not left behind, and the verified copy is kept on the host.
-        self.assertFalse((self.rust_home / "rustup-init").exists())
+        self.assertEqual(list(self.runner_temp.glob("rustup-init*")), [])
         kept = self.home / "Library/Caches/spice-ci/downloads/sha256" / sha256(self.rustup_init)
         self.assertEqual(kept.read_bytes(), self.rustup_init)
 
@@ -437,6 +444,59 @@ class PerJobHomeTest(unittest.TestCase):
         self.assertIn(f"::error::cargo would read {planted} {legacy}:", proc.stdout)
         self.assertEqual(calls, [])
 
+    def plant_rust_home(self):
+        """What a job could leave in RUNNER_TEMP: a complete toolchain, a rustup and a config."""
+        planted = self.rust_home
+        toolchain = planted / "rustup" / "toolchains" / f"{TOOLCHAIN}-{HOST}" / "bin"
+        toolchain.mkdir(parents=True)
+        for tool in ("rustc", "cargo", "rustfmt", "cargo-clippy"):
+            (toolchain / tool).write_text(TROJAN)
+            (toolchain / tool).chmod(0o755)
+        (planted / "cargo" / "bin").mkdir(parents=True)
+        (planted / "cargo" / "bin" / "rustup").write_text(TROJAN)
+        (planted / "cargo" / "bin" / "rustup").chmod(0o755)
+        (planted / "cargo" / "config.toml").write_text('[build]\nrustc-wrapper = "/tmp/evil"\n')
+        return toolchain
+
+    def test_a_rust_home_an_earlier_job_left_is_replaced_not_used(self):
+        toolchain = self.plant_rust_home()
+        if shutil.which("chflags"):
+            # Immutable, as the runner's cleanup cannot delete it.
+            subprocess.run(["chflags", "uchg", str(toolchain / "rustc")], check=True)
+        proc, calls = self.run_step()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"::warning::Removing {self.rust_home}, which an earlier job left behind.", proc.stdout)
+        self.assertTrue(calls[0].startswith("rustup-init --no-modify-path"), calls)
+        self.assertIn(f"--host {HOST}", self.mirror_log.read_text())
+        self.assertFalse((self.rust_home / "cargo" / "config.toml").exists())
+        self.assert_shared_homes_untouched(proc)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can remove anything")
+    def test_a_rust_home_that_cannot_be_removed_fails_closed(self):
+        self.plant_rust_home()
+        self.runner_temp.chmod(0o555)
+        proc, calls = self.run_step()
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn(f"::error::Could not create {self.rust_home} afresh", proc.stdout)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.github_env_values(), {})
+        self.assert_shared_homes_untouched(proc)
+
+    def test_a_second_setup_rust_in_the_job_keeps_its_homes(self):
+        proc, _ = self.run_step()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        homes = {key: self.github_env_values()[key] for key in ("CARGO_HOME", "RUSTUP_HOME")}
+        # setup-nextest put cargo-nextest in the job's bin between the two.
+        nextest = self.rust_home / "cargo" / "bin" / "cargo-nextest"
+        nextest.write_text("#!/bin/sh\n")
+        proc, calls = self.run_step(**homes)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"Keeping this job's Rust homes in {self.rust_home}.", proc.stdout)
+        self.assertTrue(nextest.exists())
+        self.assertFalse(any(call.startswith("rustup-init") for call in calls), calls)
+        self.assertEqual(self.mirror_log.read_text(), "")
+        self.assertIn(f"Toolchain {TOOLCHAIN} already available", proc.stdout)
+
     def test_a_mac_runner_that_does_not_say_where_it_runs_is_isolated_too(self):
         proc, calls = self.run_step(RUNNER_ENVIRONMENT=None)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -462,6 +522,35 @@ class PerJobHomeTest(unittest.TestCase):
                 self.assertNotIn("CARGO_HOME", self.github_env_values())
                 self.assertEqual(self.github_path.read_text().splitlines(), [str(own / "cargo" / "bin")])
                 self.assertFalse(self.rust_home.exists())
+
+    def linux_pod(self):
+        """A Linux pod's step: its own empty HOME, no CARGO_HOME or RUSTUP_HOME, no rustup."""
+        pod_home = self.dir / "pod-home"
+        pod_home.mkdir(exist_ok=True)
+        return pod_home, {"RUNNER_OS": "Linux", "HOME": str(pod_home), "CARGO_HOME": None, "RUSTUP_HOME": None}
+
+    def test_a_runner_without_rustup_installs_it_from_the_pinned_rustup_init(self):
+        pod_home, env = self.linux_pod()
+        proc, calls = self.run_step(**env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(calls[0], "rustup-init --no-modify-path -y --default-toolchain none CARGO_HOME= RUSTUP_HOME=")
+        self.assertIn(f"rustup-init: verified from file://{self.dir}/dist/", proc.stdout)
+        self.assertTrue((pod_home / ".cargo" / "bin" / "rustup").is_file())
+        self.assertEqual(self.github_path.read_text().splitlines(), [str(pod_home / ".cargo" / "bin")])
+        self.assertNotIn("CARGO_HOME", self.github_env_values())
+        self.assertFalse(self.rust_home.exists())
+        self.assertNotIn("sh.rustup.rs", proc.stdout + proc.stderr)
+        self.assert_shared_homes_untouched(proc)
+
+    def test_a_runner_without_rustup_fails_closed_on_a_mismatched_pin(self):
+        self.write_pins({HOST: sha256(b"some other rustup-init")})
+        pod_home, env = self.linux_pod()
+        proc, calls = self.run_step(**env)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("does not match the pinned SHA-256 of rustup-init", proc.stdout)
+        self.assertIn("::error::Could not get rustup-init 9.9.9", proc.stdout)
+        self.assertEqual(calls, [])
+        self.assertFalse((pod_home / ".cargo" / "bin" / "rustup").exists())
 
 
 if __name__ == "__main__":

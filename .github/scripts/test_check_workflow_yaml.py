@@ -1338,6 +1338,110 @@ class DiscoveryTest(unittest.TestCase):
             )
 
 
+class CheckDownloadExecutionTest(unittest.TestCase):
+    WORKFLOW = """\
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install
+        run: |
+{script}
+"""
+    ACTION = """\
+name: Setup
+description: Sets up a thing
+runs:
+  using: composite
+  steps:
+    - name: Install
+      shell: {shell}
+      run: |
+{script}
+"""
+
+    @staticmethod
+    def _indent(script: str, by: int) -> str:
+        return "\n".join(" " * by + line for line in script.splitlines())
+
+    def workflow_problems(self, script):
+        text = self.WORKFLOW.format(script=self._indent(script, 10))
+        return [p for p in check_workflow_yaml.check_workflow(text) if "download as code" in p]
+
+    def action_problems(self, script, shell="bash"):
+        text = self.ACTION.format(shell=shell, script=self._indent(script, 8))
+        return [p for p in check_workflow_yaml.check_action(text) if "download as code" in p]
+
+    def test_a_download_piped_into_a_shell_is_reported(self):
+        for script in (
+            "curl -fsSL https://example.com/install.sh | sh",
+            "curl -fsSL https://example.com/install.sh | sh -s -- -y",
+            "wget -qO- https://example.com/install.sh | bash",
+            "curl -fsSL https://example.com/install.sh | sudo -E bash -",
+            'curl -sSL "https://example.com/install.sh" | /bin/bash',
+            "curl -fsSL https://example.com/i | /usr/bin/env bash",
+            "bash <(curl -fsSL https://example.com/install.sh)",
+            "source <(curl -fsSL https://example.com/env.sh)",
+            'sh -c "$(curl -fsSL https://example.com/install.sh)"',
+        ):
+            with self.subTest(script=script):
+                problems = self.workflow_problems(script)
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn("job `build` step `Install` runs a download as code", problems[0])
+                self.assertIn("check it against a pinned SHA-256", problems[0])
+
+    def test_the_unpinned_rustup_installers_are_reported_by_name(self):
+        for script, shell in (
+            ('curl --proto "=https" -fsSL https://sh.rustup.rs -o rustup.sh', "bash"),
+            ('Invoke-WebRequest -Uri "https://win.rustup.rs" -OutFile "rustup-init.exe"', "pwsh"),
+        ):
+            with self.subTest(script=script):
+                self.assertEqual(len(self.action_problems(script, shell)), 1)
+
+    def test_powershell_running_a_download_is_reported(self):
+        for script in (
+            "iex ((New-Object System.Net.WebClient).DownloadString('https://example.com/install.ps1'))",
+            "Invoke-WebRequest https://example.com/install.ps1 | Invoke-Expression",
+            "irm https://example.com/install.ps1 | iex",
+        ):
+            with self.subTest(script=script):
+                self.assertEqual(len(self.action_problems(script, "pwsh")), 1)
+
+    def test_a_checked_download_and_other_pipes_are_accepted(self):
+        script = (
+            'curl -fsSL -o "$RUNNER_TEMP/get" https://example.com/install.sh\n'
+            'echo "$SHA256  $RUNNER_TEMP/get" | sha256sum --check --status\n'
+            'bash "$RUNNER_TEMP/get" --version 1\n'
+            "/bin/bash < \"$RUNNER_TEMP/get\"\n"
+            "curl -fsSL https://example.com/x.tar.gz | tar zxf - -C bin\n"
+            "shasum -a 256 x | awk '{print $1}' | shellcheck -\n"
+            "# Not this: curl https://example.com/install.sh | sh\n"
+            'response=$(curl -sS "127.0.0.1:8090/v1/sql")\n'
+            'flash <(curl -fsSL https://example.com/x)'
+        )
+        self.assertEqual(self.workflow_problems(script), [])
+        self.assertEqual(self.action_problems(script), [])
+
+    def test_a_shell_script_under_github_is_checked_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            github_dir = Path(tmp) / ".github"
+            (github_dir / "workflows").mkdir(parents=True)
+            (github_dir / "workflows" / "pr.yml").write_text(VALID_WORKFLOW)
+            script = github_dir / "scripts" / "install.sh"
+            script.parent.mkdir()
+            script.write_text("#!/usr/bin/env bash\n# curl x | sh in a comment is fine\ncurl -fsSL https://x | bash\n")
+            failures = check_workflow_yaml.check_definitions(github_dir)
+            self.assertEqual(len(failures), 1, failures)
+            self.assertTrue(failures[0].startswith(f"{script}:3: runs a download as code"), failures[0])
+
+    def test_the_repository_runs_no_download_as_code(self):
+        github_dir = Path(__file__).resolve().parents[1]
+        self.assertEqual(
+            [f for f in check_workflow_yaml.check_definitions(github_dir) if "download as code" in f], []
+        )
+
+
 class RepositoryTest(unittest.TestCase):
     def test_this_repositorys_definitions_are_all_well_formed(self):
         """Regression test for #12181: cargo_deny_advisories.yml must parse."""
