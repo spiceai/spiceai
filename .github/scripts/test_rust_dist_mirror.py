@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Tests for how a download over CI_FETCH_MAX_BYTES stops a toolchain install.
+"""Tests for the download failures that stop a toolchain install instead of falling back.
 
-cached_fetch.sh exits 4 when a source offers more than the bound (test_cached_fetch.py).
-rust_dist_mirror.py must pass that on as its own exit 4, and setup-rust must then fail
-rather than install the toolchain with rustup, which would download the same file with no
-bound. Every other failure keeps falling back to rustup, so a first install still works
-when the cache or the network fails.
+cached_fetch.sh exits 4 when a source offers more than CI_FETCH_MAX_BYTES, and 2 when its
+arguments or settings are wrong, such as a malformed CI_FETCH_MAX_BYTES
+(test_cached_fetch.py). rust_dist_mirror.py must pass either on as its own, and
+setup-rust must then fail rather than install the toolchain with rustup, which would
+download the same files without that bound or those settings. Every other failure keeps
+falling back to rustup, so a first install still works when the cache or the network
+fails.
 
-The mirror runs with a stand-in for cached_fetch.sh. setup-rust's own step runs from its
-action.yml, with HOME, CARGO_HOME and RUSTUP_HOME in a temporary directory and stand-ins
-for rustup, cargo, rustc and the mirror, so nothing is downloaded or installed.
+The mirror runs with a stand-in for cached_fetch.sh and a pins file of its own, so a
+toolchain bump in the real pins.json changes nothing here. setup-rust's own step runs from
+its action.yml, with HOME, CARGO_HOME and RUSTUP_HOME in a temporary directory and
+stand-ins for rustup, cargo, rustc and the mirror, so nothing is downloaded or installed.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -24,9 +28,10 @@ import yaml
 
 GITHUB_DIR = Path(__file__).resolve().parent.parent
 MIRROR = GITHUB_DIR / "scripts" / "rust_dist_mirror.py"
-PINS = GITHUB_DIR / "ci-cache" / "pins.json"
 SETUP_RUST = GITHUB_DIR / "actions" / "setup-rust" / "action.yml"
-TOOLCHAIN = "1.99.1"
+# A toolchain no real pin names, so these tests never depend on the one in use.
+TOOLCHAIN = "9.9.9"
+PINS = {"rust": {"components": ["rustc"], "toolchains": {TOOLCHAIN: {"manifest_sha256": "0" * 64}}}}
 
 # Logs every call with the dist server it was given, and does what setup-rust needs.
 FAKE_RUSTUP = """#!/usr/bin/env bash
@@ -55,16 +60,16 @@ esac
 class MirrorExitTest(unittest.TestCase):
     """rust_dist_mirror.py, with cached_fetch.sh replaced by one that exits as told."""
 
-    def run_mirror(self, fetch_status):
+    def run_mirror(self, fetch_status, toolchain=TOOLCHAIN):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "scripts").mkdir()
             (root / "ci-cache").mkdir()
             shutil.copy(MIRROR, root / "scripts" / MIRROR.name)
-            shutil.copy(PINS, root / "ci-cache" / "pins.json")
+            (root / "ci-cache" / "pins.json").write_text(json.dumps(PINS))
             (root / "scripts" / "cached_fetch.sh").write_text(f"exit {fetch_status}\n")
             return subprocess.run(
-                [sys.executable, str(root / "scripts" / MIRROR.name), "--toolchain", TOOLCHAIN,
+                [sys.executable, str(root / "scripts" / MIRROR.name), "--toolchain", toolchain,
                  "--host", "x86_64-unknown-linux-gnu", "--out", str(root / "out")],
                 capture_output=True, text=True, timeout=60,
             )
@@ -72,10 +77,15 @@ class MirrorExitTest(unittest.TestCase):
     def test_a_download_over_the_bound_exits_4(self):
         self.assertEqual(self.run_mirror(4).returncode, 4)
 
-    def test_any_other_failed_download_is_not_exit_4(self):
-        for status in (1, 2):
-            proc = self.run_mirror(status)
-            self.assertNotIn(proc.returncode, (0, 3, 4), (status, proc.stderr))
+    def test_refused_download_settings_exit_2(self):
+        self.assertEqual(self.run_mirror(2).returncode, 2)
+
+    def test_any_other_failed_download_exits_1(self):
+        proc = self.run_mirror(1)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+
+    def test_a_toolchain_without_a_pin_exits_3_before_any_download(self):
+        self.assertEqual(self.run_mirror(4, toolchain="9.9.8").returncode, 3)
 
 
 class SetupRustTest(unittest.TestCase):
@@ -144,10 +154,17 @@ class SetupRustTest(unittest.TestCase):
         self.assertIn("::error::", proc.stdout)
         self.assertEqual(self.installs(calls), [])
 
+    def test_refused_download_settings_fail_the_step_without_rustup(self):
+        proc, calls = self.run_step(2)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("download settings", proc.stdout)
+        self.assertIn("::error::", proc.stdout)
+        self.assertEqual(self.installs(calls), [])
+
     def test_any_other_mirror_failure_still_installs_with_rustup(self):
         proc, calls = self.run_step(1)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("Could not assemble Rust 1.99.1 from its pinned release (exit 1)", proc.stdout)
+        self.assertIn(f"Could not assemble Rust {TOOLCHAIN} from its pinned release (exit 1)", proc.stdout)
         (install,) = self.installs(calls)
         self.assertTrue(install.endswith(" dist="), install)
 
@@ -161,7 +178,7 @@ class SetupRustTest(unittest.TestCase):
     def test_a_mirror_installs_from_the_mirror(self):
         proc, calls = self.run_step(0)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("Installed Rust 1.99.1 from the CI cache's pinned release.", proc.stdout)
+        self.assertIn(f"Installed Rust {TOOLCHAIN} from the CI cache's pinned release.", proc.stdout)
         (install,) = self.installs(calls)
         self.assertIn(" dist=file://", install)
 

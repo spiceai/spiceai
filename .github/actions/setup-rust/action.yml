@@ -164,9 +164,11 @@ runs:
         # of it fails, the install below runs from static.rust-lang.org as before. Only a
         # toolchain without rustc or cargo is installed this way, since it replaces the
         # whole toolchain directory: one that lacks only rustfmt or clippy keeps its
-        # targets and components, and `rustup component add` below adds the two. The one
-        # failure with no fallback is a file larger than CI_FETCH_MAX_BYTES (exit 4): rustup
-        # would download that same file with no bound, so the step fails instead.
+        # targets and components, and `rustup component add` below adds the two. Two
+        # failures have no fallback, because rustup would download the same files without
+        # the settings or the bound they were refused under, so the step fails instead:
+        # wrong download settings such as a malformed CI_FETCH_MAX_BYTES (exit 2), and a
+        # file larger than CI_FETCH_MAX_BYTES (exit 4).
         if [ -n "${CI_CACHE_URL:-}" ]; then
           case "$(uname -s)-$(uname -m)" in
             Linux-x86_64) cache_host=x86_64-unknown-linux-gnu ;;
@@ -195,6 +197,10 @@ runs:
               fi
             elif [ "$status" -eq 4 ]; then
               echo "::error::A file of Rust $toolchain's pinned release is larger than CI_FETCH_MAX_BYTES, so it is not installed from static.rust-lang.org either, where rustup would download it with no bound. If the release really is that large, raise CI_FETCH_MAX_BYTES."
+              rm -rf "$mirror"
+              exit 1
+            elif [ "$status" -eq 2 ]; then
+              echo "::error::The download settings for Rust $toolchain's pinned release were refused (the error above says which), so it is not installed from static.rust-lang.org either, where rustup would ignore them. Fix the setting."
               rm -rf "$mirror"
               exit 1
             elif [ "$status" -ne 3 ]; then

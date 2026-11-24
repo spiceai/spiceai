@@ -12,9 +12,10 @@ Usage:
   rust_dist_mirror.py --toolchain 1.99.1 --host x86_64-unknown-linux-gnu --out DIR
 
 Exit status 3 means the toolchain has no pin, so the caller should install from the
-source as before. Exit status 4 means a file was larger than CI_FETCH_MAX_BYTES, so the
-caller must not install the toolchain some other way: rustup would download the same
-file with no bound.
+source as before. Exit status 2 means cached_fetch.sh refused its arguments or settings,
+such as a malformed CI_FETCH_MAX_BYTES, and 4 that a file was larger than
+CI_FETCH_MAX_BYTES: after either, the caller must not install the toolchain some other
+way, because rustup would download the same files without those settings or that bound.
 """
 
 from __future__ import annotations
@@ -30,16 +31,18 @@ DIST_ROOT = "https://static.rust-lang.org/"
 HERE = Path(__file__).resolve().parent
 PINS = HERE.parent / "ci-cache" / "pins.json"
 FETCH = HERE / "cached_fetch.sh"
-# cached_fetch.sh's exit status for a source that offered more than CI_FETCH_MAX_BYTES,
-# which this script passes on as its own.
+# cached_fetch.sh's exit statuses that rule out installing another way, which this
+# script passes on as its own: its arguments or settings are wrong, or a source offered
+# more than CI_FETCH_MAX_BYTES.
+BAD_SETTINGS = 2
 TOO_LARGE = 4
 
 
 def fetch(sha256: str, dest: Path, url: str) -> None:
     # cached_fetch.sh reports progress on stdout; keep this script's stdout for its result.
     result = subprocess.run(["bash", str(FETCH), sha256, str(dest), url], stdout=sys.stderr)
-    if result.returncode == TOO_LARGE:
-        sys.exit(TOO_LARGE)
+    if result.returncode in (BAD_SETTINGS, TOO_LARGE):
+        sys.exit(result.returncode)
     result.check_returncode()
 
 

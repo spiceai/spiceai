@@ -155,18 +155,21 @@ SNAPSHOT_ACTION = "push-snap-changes"
 # better default — a cancelled run should stop.
 SURVIVES_FAILURE = re.compile(r"(?:!\s*cancelled|always)\s*\(\s*\)")
 
-# Values whoever starts the run chooses: dispatch and call inputs, the branch and
-# ref names, and an event's free text, in dot or bracket syntax or as a whole JSON
-# dump. Inside `${{ }}` in a script they become code; through a step's `env:` they
-# stay values.
+# Values whoever starts the run chooses: dispatch and call inputs (one of them or the
+# whole object), the branch and ref names, an event's free text, and the `github` or
+# `github.event` object as a whole. Matched in an expression after `_expression_text`,
+# so bracket reads count as dot reads and a string literal never matches. Inside
+# `${{ }}` in a script they become code; through a step's `env:` they stay values.
 UNTRUSTED_CONTEXT = re.compile(
-    r"(?<![\w.-])(?:inputs\s*[.\[]|github\s*\[|toJSON\(\s*github\b|github\.event\.inputs\b"
-    r"|github\.(?:head_ref|ref_name|ref|base_ref)\b"
+    r"(?<![\w.-])(?:inputs\b|github\b(?!\s*\.)|github\.event\b(?!\s*\.)|toJSON\(\s*github\b"
+    r"|github\.event\.inputs\b|github\.(?:head_ref|ref_name|ref|base_ref)\b"
     r"|github\.event\.(?:ref|release|merge_group|pull_request|issue|comment|review|review_comment"
     r"|head_commit|commits|pages|workflow_run|discussion|client_payload)\b)",
     re.IGNORECASE,
 )
 EXPANSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
+# A literal-key bracket read, `x['y']`, which reads the same value as `x.y`.
+BRACKET_KEY = re.compile(r"\s*\[\s*'([^'\]]*)'\s*\]")
 
 
 def workflow_files(github_dir: Path) -> list[Path]:
@@ -449,6 +452,22 @@ def _ref(term: str) -> str:
     return rf"(?<![\w.-]){term}"
 
 
+def _expression_text(expression: str) -> str:
+    """An expression as the taint patterns read it.
+
+    `x['y']` becomes `x.y`, so a bracket read matches the pattern its dot form does,
+    then every string literal is emptied, so a literal such as `'github'` never does.
+    A bracket with any other key (`env[matrix.k]`) is kept, and the patterns treat it
+    as reading every member.
+    """
+    return STRING_LITERAL.sub("''", BRACKET_KEY.sub(lambda m: "." + m.group(1), expression))
+
+
+def _expressions(value: object) -> str:
+    """The `${{ }}` expressions in a value, each as `_expression_text` reads it."""
+    return " ".join(_expression_text(m.group(1)) for m in EXPANSION.finditer(str(value or "")))
+
+
 def _tainted_references(document: dict, jobs: dict) -> dict[str, re.Pattern]:
     """Per job, the references whose value carries something the dispatcher chose.
 
@@ -475,34 +494,46 @@ def _tainted_references(document: dict, jobs: dict) -> dict[str, re.Pattern]:
     for _ in range(12):
         before = (len(global_terms), sum(len(t) for t in job_terms.values()))
         anywhere = pattern("")
-        tainted_workflow_env = {key for key, value in workflow_env.items() if anywhere.search(str(value))}
+        tainted_workflow_env = {
+            key for key, value in workflow_env.items() if anywhere.search(_expressions(value))
+        }
         global_terms.update(_ref(rf"env\.{re.escape(key)}\b") for key in tainted_workflow_env)
+        if tainted_workflow_env:
+            global_terms.add(_ref(r"env\s*\["))
         for name, job in jobs.items():
             if not isinstance(job, dict):
                 continue
             here = pattern(name)
             job_env = job.get("env") if isinstance(job.get("env"), dict) else {}
-            tainted_env = tainted_workflow_env | {k for k, v in job_env.items() if here.search(str(v))}
+            tainted_env = tainted_workflow_env | {
+                k for k, v in job_env.items() if here.search(_expressions(v))
+            }
             job_terms[name].update(_ref(rf"env\.{re.escape(key)}\b") for key in tainted_env)
+            if tainted_env:
+                job_terms[name].add(_ref(r"env\s*\["))
             strategy = job.get("strategy")
-            if isinstance(strategy, dict) and here.search(str(strategy.get("matrix", ""))):
-                job_terms[name].add(_ref(r"matrix\."))
+            if isinstance(strategy, dict) and here.search(_expressions(strategy.get("matrix", ""))):
+                job_terms[name].add(_ref(r"matrix\s*[.\[]"))
             for step in job.get("steps") or []:
                 if not isinstance(step, dict) or not step.get("id"):
                     continue
                 if "github-script" in str(step.get("uses", "")):
                     continue
                 step_env = step.get("env") if isinstance(step.get("env"), dict) else {}
-                names = tainted_env | {k for k, v in step_env.items() if here.search(str(v))}
+                names = tainted_env | {k for k, v in step_env.items() if here.search(_expressions(v))}
                 run = str(step.get("run", ""))
                 reads = any(re.search(rf"\$\{{?{re.escape(n)}\b", run) for n in names)
-                if reads or here.search(" ".join(str(step.get(k, "")) for k in ("run", "env", "with"))):
+                read_here = " ".join(_expressions(step.get(k, "")) for k in ("run", "env", "with"))
+                if reads or here.search(read_here):
                     job_terms[name].add(_ref(rf"steps\.{re.escape(str(step['id']))}\.outputs\b"))
+                    job_terms[name].add(_ref(r"steps\s*\["))
             outputs = job.get("outputs") if isinstance(job.get("outputs"), dict) else {}
             here = pattern(name)
             for key, value in outputs.items():
-                if here.search(str(value)):
+                if here.search(_expressions(value)):
                     global_terms.add(_ref(rf"needs\.{re.escape(name)}\.outputs\.{re.escape(key)}\b"))
+                    global_terms.add(_ref(rf"needs\.{re.escape(name)}\.outputs\s*\["))
+                    global_terms.add(_ref(r"needs\s*\["))
         if before == (len(global_terms), sum(len(t) for t in job_terms.values())):
             break
     return {name: pattern(name) for name in jobs}
@@ -514,13 +545,13 @@ def _script_expansions(step: dict, tainted: re.Pattern) -> list[tuple[str, str]]
     if "github-script" in str(step.get("uses", "")) and isinstance(step.get("with"), dict):
         scripts.append(("script", step["with"].get("script")))
     step_env = step.get("env") if isinstance(step.get("env"), dict) else {}
-    local = [_ref(rf"env\.{re.escape(k)}\b") for k, v in step_env.items() if tainted.search(str(v))]
+    local = [_ref(rf"env\.{re.escape(k)}\b") for k, v in step_env.items() if tainted.search(_expressions(v))]
     if local:
-        tainted = re.compile("|".join([tainted.pattern, *local]), re.IGNORECASE)
+        tainted = re.compile("|".join([tainted.pattern, *local, _ref(r"env\s*\[")]), re.IGNORECASE)
     found = []
     for key, script in scripts:
         for match in EXPANSION.finditer(str(script or "")):
-            if tainted.search(match.group(1)):
+            if tainted.search(_expression_text(match.group(1))):
                 found.append((key, match.group(0).strip()))
     return found
 

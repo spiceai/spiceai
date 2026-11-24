@@ -335,6 +335,55 @@ class CheckUntrustedExpansionsTest(unittest.TestCase):
             with self.subTest(expression=expression):
                 self.assertEqual(len(self.problems(f"      - run: echo '${{{{ {expression} }}}}'")), 1)
 
+    def test_a_whole_context_dump_is_reported(self):
+        dumps = ("toJSON(inputs)", "inputs", "toJSON(github.event)", "github.event", "toJSON(github)")
+        for expression in dumps:
+            with self.subTest(expression=expression):
+                self.assertEqual(len(self.problems(f"      - run: printf '%s' '${{{{ {expression} }}}}'")), 1)
+
+    def test_bracket_reads_match_their_dot_forms(self):
+        for expression in (
+            "github.event['inputs'].spicepod_path",
+            "github['event']['inputs']['spicepod_path']",
+            "github['ref_name']",
+            "inputs[matrix.key]",
+        ):
+            with self.subTest(expression=expression):
+                self.assertEqual(len(self.problems(f"      - run: echo \"${{{{ {expression} }}}}\"")), 1)
+
+    def test_bracket_reads_of_tainted_env_steps_needs_and_matrix_are_followed(self):
+        document = CREDENTIALED.replace(
+            "    steps:\n", "    env:\n      CB_PATH: ${{{{ inputs.spicepod_path }}}}\n    steps:\n"
+        ) + (
+            "    outputs:\n"
+            "      p: ${{{{ inputs.spicepod_path }}}}\n"
+            "  use:\n"
+            "    needs: bench\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    strategy:\n"
+            "      matrix:\n"
+            "        p: ${{{{ fromJson(needs['bench'].outputs['p']) }}}}\n"
+            "    steps:\n"
+            "      - run: echo ${{{{ needs['bench'].outputs['p'] }}}}"
+            " ${{{{ needs.bench.outputs[matrix.k] }}}}\n"
+            "      - run: echo ${{{{ matrix['p'] }}}}\n"
+        )
+        steps = (
+            "      - id: set\n"
+            "        run: echo \"p=$CB_PATH\" >> \"$GITHUB_OUTPUT\"\n"
+            "      - run: echo \"${{ env['CB_PATH'] }}\" \"${{ steps['set'].outputs['p'] }}\""
+            " \"${{ env[matrix.k] }}\""
+        )
+        problems = self.problems(steps, document)
+        self.assertEqual(len(problems), 6, "\n".join(problems))
+
+    def test_string_literals_naming_a_context_are_not_a_read(self):
+        steps = (
+            "      - run: echo \"${{ format('github {0} inputs', github.sha) }}\""
+            " \"${{ contains(github.event_name, 'github.event') && 'x' || 'y' }}\""
+        )
+        self.assertEqual(self.problems(steps), [])
+
     def test_a_github_script_step_output_is_not_followed(self):
         steps = (
             "      - id: m\n"
