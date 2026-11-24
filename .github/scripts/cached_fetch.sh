@@ -25,10 +25,11 @@
 # the largest file pinned today, the 80 MiB rustc archive for x86_64 Linux), so a wrong
 # copy cannot fill the runner's disk before its SHA-256 is checked. curl refuses a
 # response that announces a larger size before writing any of it, and from curl 8.4 also
-# stops one that grows past the bound without announcing its size; a CI_CACHE_DIR copy is
-# measured before it is read. A cached copy over the bound is a miss like any other wrong
-# copy. A source copy over it fails with exit status 4, since the pin then needs a larger
-# bound: a caller must not fetch the same file some other way that has no bound.
+# stops one that grows past the bound without announcing its size; a CI_CACHE_DIR entry is
+# read once and no further than one byte past the bound. A cached copy over the bound is a
+# miss like any other wrong copy. A source copy over it fails with exit status 4, since the
+# pin then needs a larger bound: a caller must not fetch the same file some other way that
+# has no bound.
 #
 # The bucket fills itself. When it answered that it lacks the file (404), or held the wrong
 # bytes, the verified download from the source is written back to it so the next job reads
