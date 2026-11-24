@@ -5,10 +5,10 @@ description: |
   The `_SEEDED` object at the table root marks a completed upload; without it, any
   partial upload is removed and the table is seeded again. Run it from one job at a
   time: concurrent seeds would interleave their Delta logs. A run off trunk seeds and reads its
-  own copy under the bucket's `untrusted/<github.ref>/` (.github/actions/ci-store-prefix).
+  own copy under `benchmarks/cold_start/untrusted/<repository id>/<ref>/` (.github/actions/ci-store-prefix).
 inputs:
   prefix:
-    description: 'MinIO path of the table, `<bucket>/<path>` under the `spice-minio` alias; the CI store prefix goes after the bucket'
+    description: 'MinIO path of the table, `<bucket>/<path>` under the `spice-minio` alias; the CI store segment goes after `<bucket>/<prefix>/`'
     required: false
     default: 'benchmarks/cold_start/audit_events_3m'
 runs:
@@ -23,7 +23,9 @@ runs:
       env:
         INPUT_PREFIX: ${{ inputs.prefix }}
       run: |
-        table="${INPUT_PREFIX%%/*}/${CI_STORE_PREFIX?}${INPUT_PREFIX#*/}"
+        # The segment goes after the granted `<bucket>/<prefix>/`.
+        rest="${INPUT_PREFIX#*/}"
+        table="${INPUT_PREFIX%%/*}/${rest%%/*}/${CI_STORE_PREFIX?}${rest#*/}"
         echo "table=${table}" >> "$GITHUB_OUTPUT"
         if mc stat "spice-minio/${table}/_SEEDED" >/dev/null 2>&1; then
           echo "present=true" >> "$GITHUB_OUTPUT"

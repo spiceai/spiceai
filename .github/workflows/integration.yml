@@ -356,7 +356,7 @@ jobs:
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to upload integration test archives}"
-          bash .github/scripts/mc_cp.sh ./integration_tests.tar.zst "spice-minio/build/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/}"
+          bash .github/scripts/mc_cp.sh ./integration_tests.tar.zst "spice-minio/build/test_binaries/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/test_binaries/}"
 
       - name: Upload test archive (artifact fallback)
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS != 'true'
@@ -459,7 +459,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download integration test archive}"
           mkdir -p ./integration_tests
-          bash .github/scripts/mc_cp.sh "spice-minio/build/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/}" ./integration_tests/integration_tests.tar.zst
+          bash .github/scripts/mc_cp.sh "spice-minio/build/test_binaries/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/test_binaries/}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -829,7 +829,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download GitHub test archive}"
           mkdir -p ./integration_tests
-          bash .github/scripts/mc_cp.sh "spice-minio/build/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/}" ./integration_tests/integration_tests.tar.zst
+          bash .github/scripts/mc_cp.sh "spice-minio/build/test_binaries/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/test_binaries/}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download GitHub test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -965,7 +965,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download AWS SDK credential bridge test archive}"
           mkdir -p ./integration_tests
-          bash .github/scripts/mc_cp.sh "spice-minio/build/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/}" ./integration_tests/integration_tests.tar.zst
+          bash .github/scripts/mc_cp.sh "spice-minio/build/test_binaries/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/test_binaries/}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download AWS SDK credential bridge test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -1055,7 +1055,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download data components test archive}"
           mkdir -p ./integration_tests
-          bash .github/scripts/mc_cp.sh "spice-minio/build/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/}" ./integration_tests/integration_tests.tar.zst
+          bash .github/scripts/mc_cp.sh "spice-minio/build/test_binaries/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/test_binaries/}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download data components test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -1128,7 +1128,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download partition table test archive}"
           mkdir -p ./integration_tests
-          bash .github/scripts/mc_cp.sh "spice-minio/build/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/}" ./integration_tests/integration_tests.tar.zst
+          bash .github/scripts/mc_cp.sh "spice-minio/build/test_binaries/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/test_binaries/}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download partition table test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'

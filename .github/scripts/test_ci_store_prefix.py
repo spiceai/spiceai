@@ -35,12 +35,12 @@ class CiStorePrefixTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def prefix(self, ref, spicepod=""):
+    def prefix(self, ref, spicepod="", repository_id="394089041"):
         out, env_file = self.dir / "out", self.dir / "env"
         out.write_text("")
         env_file.write_text("")
         env = {"PATH": os.environ["PATH"], "GITHUB_REF": ref, "GITHUB_OUTPUT": str(out),
-               "GITHUB_ENV": str(env_file), "SPICEPOD": spicepod}
+               "GITHUB_ENV": str(env_file), "SPICEPOD": spicepod, "GITHUB_REPOSITORY_ID": repository_id}
         proc = subprocess.run(["bash", str(self.script)], env=env, capture_output=True, text=True, timeout=30)
         return proc, out.read_text(), env_file.read_text()
 
@@ -54,8 +54,17 @@ class CiStorePrefixTest(unittest.TestCase):
             with self.subTest(ref=ref):
                 proc, out, env = self.prefix(ref)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-                self.assertEqual(out, f"prefix=untrusted/{ref}/\n")
-                self.assertEqual(env, f"CI_STORE_PREFIX=untrusted/{ref}/\n")
+                self.assertEqual(out, f"prefix=untrusted/394089041/{ref}/\n")
+                self.assertEqual(env, f"CI_STORE_PREFIX=untrusted/394089041/{ref}/\n")
+
+    def test_a_missing_or_odd_repository_id_is_refused(self):
+        for repository_id in ("", "spiceai/spiceai", "1/2"):
+            with self.subTest(repository_id=repository_id):
+                proc, out, _ = self.prefix("refs/pull/1/merge", repository_id=repository_id)
+                self.assertEqual((proc.returncode, out), (1, ""))
+
+    def test_trunk_needs_no_repository_id(self):
+        self.assertEqual(self.prefix("refs/heads/trunk", repository_id="")[1], "prefix=\n")
 
     def test_something_that_is_not_a_ref_is_refused(self):
         for ref in ("", "trunk", "../trunk"):
@@ -71,9 +80,9 @@ class CiStorePrefixTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(
             pod.read_text(),
-            SPICEPOD.replace("s3://benchmarks/cold_start/", "s3://benchmarks/untrusted/refs/pull/7/merge/cold_start/")
-            .replace("s3://benchmarks/cayenne-cold-sf10/", "s3://benchmarks/untrusted/refs/pull/7/merge/cayenne-cold-sf10/")
-            .replace("s3://benchmarks/cayenne-cold-sf1000/", "s3://benchmarks/untrusted/refs/pull/7/merge/cayenne-cold-sf1000/"),
+            SPICEPOD.replace("s3://benchmarks/cold_start/", "s3://benchmarks/cold_start/untrusted/394089041/refs/pull/7/merge/")
+            .replace("s3://benchmarks/cayenne-cold-sf10/", "s3://benchmarks/cayenne-cold-sf10/untrusted/394089041/refs/pull/7/merge/")
+            .replace("s3://benchmarks/cayenne-cold-sf1000/", "s3://benchmarks/cayenne-cold-sf1000/untrusted/394089041/refs/pull/7/merge/"),
         )
 
     def test_a_ref_with_replacement_characters_is_written_literally(self):
@@ -81,7 +90,7 @@ class CiStorePrefixTest(unittest.TestCase):
         pod.write_text(SPICEPOD)
         ref = "refs/heads/a&b#c\\d"
         self.assertEqual(self.prefix(ref, str(pod))[0].returncode, 0)
-        self.assertIn(f"s3://benchmarks/untrusted/{ref}/cold_start/audit_events_3m/", pod.read_text())
+        self.assertIn(f"s3://benchmarks/cold_start/untrusted/394089041/{ref}/audit_events_3m/", pod.read_text())
         self.assertIn("s3://benchmarks/cayenne-datalake/123/", pod.read_text())
 
     def test_on_trunk_the_spicepod_is_left_alone(self):

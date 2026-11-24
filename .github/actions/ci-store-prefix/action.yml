@@ -1,13 +1,13 @@
 name: CI store prefix
 description: >-
-  The key prefix for this run's reads and writes in the CI object store's shared buckets
-  (`sccache`, `artifacts`, `build`, and the fixed `benchmarks/cold_start`,
-  `benchmarks/cayenne-cold-sf10` and `benchmarks/cayenne-cold-sf1000` prefixes). Only a run on
-  trunk uses the shared keys. Any other run (a
-  pull request, the merge queue, a feature or release branch) uses `untrusted/<github.ref>/`,
-  the only keys the store lets it write, and reads its own writes there. Sets CI_STORE_PREFIX
-  (empty on trunk, ending in `/` elsewhere) for the rest of the job and outputs it. Every
-  writer and reader of those buckets takes the prefix from here. Given `spicepod`, it also
+  The segment this run nests its keys under in the CI object store, right after each granted
+  prefix: `sccache/<segment>`, `artifacts/<segment>`, `build/test_binaries/<segment>`, and
+  `benchmarks/{cold_start,cayenne-cold-sf10,cayenne-cold-sf1000}/<segment>`. Only a run on trunk
+  uses the shared keys (an empty segment). Any other run (a pull request, the merge queue, a
+  feature or release branch) uses `untrusted/<repository id>/<github.ref>/`, the only keys the
+  store lets it write, and reads its own writes there; the repository id keeps two
+  repositories' refs apart. Sets CI_STORE_PREFIX for the rest of the job and outputs it. Every
+  writer and reader of those keys takes the segment from here. Given `spicepod`, it also
   rewrites that file's `s3://benchmarks/<fixed prefix>/` locations to the run's own, so spiced
   reads and writes where this run may.
 
@@ -34,7 +34,13 @@ runs:
         set -euo pipefail
         case "$GITHUB_REF" in
           refs/heads/trunk) prefix='' ;;
-          refs/*) prefix="untrusted/${GITHUB_REF}/" ;;
+          refs/*)
+            if ! [[ "${GITHUB_REPOSITORY_ID:-}" =~ ^[0-9]+$ ]]; then
+              echo "::error::GITHUB_REPOSITORY_ID is '${GITHUB_REPOSITORY_ID:-}', not a repository id; cannot choose the CI store prefix."
+              exit 1
+            fi
+            prefix="untrusted/${GITHUB_REPOSITORY_ID}/${GITHUB_REF}/"
+            ;;
           *)
             echo "::error::GITHUB_REF is '$GITHUB_REF', not a ref; cannot choose the CI store prefix."
             exit 1
@@ -51,7 +57,7 @@ runs:
           content="${content%x}"
           for fixed in cold_start cayenne-cold-sf10 cayenne-cold-sf1000; do
             from="s3://benchmarks/${fixed}/"
-            to="s3://benchmarks/${prefix}${fixed}/"
+            to="s3://benchmarks/${fixed}/${prefix}"
             content="${content//"$from"/$to}"
           done
           printf '%s' "$content" > "$SPICEPOD"

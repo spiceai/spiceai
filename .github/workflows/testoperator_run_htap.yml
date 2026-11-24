@@ -640,12 +640,12 @@ jobs:
           prefixes=("cayenne-datalake/${GITHUB_RUN_ID}")
           case "${SPICEPOD}" in
             # Only once this run's store prefix is known: an empty one would be trunk's fixtures.
-            *-cold*) [ -n "${CI_STORE_PREFIX+set}" ] && prefixes+=("${CI_STORE_PREFIX}cayenne-cold-sf1000" "${CI_STORE_PREFIX}cayenne-cold-sf10") ;;
+            *-cold*) [ -n "${CI_STORE_PREFIX+set}" ] && prefixes+=("cayenne-cold-sf1000/${CI_STORE_PREFIX%/}" "cayenne-cold-sf10/${CI_STORE_PREFIX%/}") ;;
           esac
           # Non-fatal: a cleanup miss must never fail the benchmark run, so every mc call is guarded
           # with `|| true`. We print a one-line size/count summary per prefix (mc du) before deleting.
           for prefix in "${prefixes[@]}"; do
-            target="spice-minio/benchmarks/${prefix}/"
+            target="spice-minio/benchmarks/${prefix%/}/"
             summary=$(mc du "${target}" 2>/dev/null || true)
             echo "Cleaning ${target} — ${summary:-empty (no promotion ran)}"
             mc rm --recursive --force "${target}" >/dev/null 2>&1 || true

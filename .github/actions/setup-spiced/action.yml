@@ -2,7 +2,7 @@ name: Setup spiced
 description: 'composite action'
 
 # Downloads the most recent spiced build from MinIO, within the last 10 commits. A run off trunk
-# reads the builds of its own ref, under `untrusted/<ref>/` (.github/actions/ci-store-prefix);
+# reads the builds of its own ref, under `artifacts/untrusted/<repository id>/<ref>/` (.github/actions/ci-store-prefix);
 # a job with the full CI roles (`verify`) runs spiced only once build_release.yml's trunk
 # attestation of it, for that commit, verifies.
 #

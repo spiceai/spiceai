@@ -101,8 +101,9 @@ jobs:
           output-credentials: true
 
       - name: Set up spiceio
-        # The compiler cache: written to, so not on a read-only run.
-        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true' && env.CI_CACHE_READ_ONLY != 'true'
+        # The macOS SMB share, which any `ci` job can write: never with the full CI roles, whose
+        # inputs must not come from it. A read-only run may use it. Trunk's own share is planned.
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true' && steps.ci-role.outputs.full != 'true'
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
@@ -118,7 +119,7 @@ jobs:
           machine: ${{ runner.name }}
 
       - name: Download test binary from spiceio
-        if: env.HAS_SPICEIO_SECRET == 'true'
+        if: env.HAS_SPICEIO_SECRET == 'true' && steps.ci-role.outputs.full != 'true'
         env:
           SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
         run: |
@@ -129,7 +130,7 @@ jobs:
           curl --fail --silent --show-error --output ./integration_test/llms_integration_test "$test_binary_url"
 
       - name: Download test binary
-        if: env.HAS_SPICEIO_SECRET != 'true'
+        if: env.HAS_SPICEIO_SECRET != 'true' || steps.ci-role.outputs.full == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: llms-integration-test-binary

@@ -27,9 +27,11 @@ inputs:
     required: false
 
 # Only a run on trunk reads and writes the cache's shared keys. Any other run keeps its cache
-# under `untrusted/<github.ref>/` (.github/actions/ci-store-prefix), the only keys the CI object
-# store lets it write. The macOS spiceio endpoint is a share the store's policy does not cover,
-# so there the prefix separates refs but does not stop one from writing another's keys. sccache 0.9.1 has no
+# under `sccache/untrusted/<repository id>/<ref>/` (.github/actions/ci-store-prefix), the only
+# keys the CI object store lets it write. The macOS spiceio endpoint is an SMB share that store
+# policy does not cover: any `ci` job can write any key there, so the prefix only separates
+# refs. A job with the full CI roles does not mount it (the `Set up spiceio` steps of the
+# `*_aws.yml` workflows); trunk's own share, writable from trunk alone, is planned. sccache 0.9.1 has no
 # read-only mode for S3 (`rw_mode` is for its disk and GCS caches), so such a run starts from
 # its own keys rather than reading trunk's.
 runs:

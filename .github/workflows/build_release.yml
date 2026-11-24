@@ -484,7 +484,7 @@ jobs:
           duration-seconds: '21600'
           export-env: 'false'
 
-      # Off trunk, the store keeps this run's uploads under `untrusted/<ref>/`.
+      # Off trunk, the store keeps this run's uploads under `artifacts/untrusted/<repository id>/<ref>/`.
       - name: Choose the CI store prefix
         if: matrix.target.use_minio
         uses: $/.github/actions/ci-store-prefix

@@ -117,7 +117,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download integration test archive}"
           mkdir -p ./integration_tests
-          bash .github/scripts/mc_cp.sh "spice-minio/build/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/}" ./integration_tests/integration_tests.tar.zst
+          bash .github/scripts/mc_cp.sh "spice-minio/build/test_binaries/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/test_binaries/}" ./integration_tests/integration_tests.tar.zst
 
       # With the full CI roles, the archive runs only if integration.yml attested it on trunk.
       - name: Verify the test archive's build attestation
@@ -423,7 +423,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download AWS SDK test archive}"
           mkdir -p ./integration_tests
-          bash .github/scripts/mc_cp.sh "spice-minio/build/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/}" ./integration_tests/integration_tests.tar.zst
+          bash .github/scripts/mc_cp.sh "spice-minio/build/test_binaries/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/test_binaries/}" ./integration_tests/integration_tests.tar.zst
 
       # With the full CI roles, the archive runs only if integration.yml attested it on trunk.
       - name: Verify the test archive's build attestation
@@ -519,7 +519,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download snapshot refresh test archive}"
           mkdir -p ./integration_tests
-          bash .github/scripts/mc_cp.sh "spice-minio/build/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/}" ./integration_tests/integration_tests.tar.zst
+          bash .github/scripts/mc_cp.sh "spice-minio/build/test_binaries/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/test_binaries/}" ./integration_tests/integration_tests.tar.zst
 
       # With the full CI roles, the archive runs only if integration.yml attested it on trunk.
       - name: Verify the test archive's build attestation
