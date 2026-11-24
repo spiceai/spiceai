@@ -162,7 +162,7 @@ use crate::postgres_replication::pgoutput::RelationId;
 
 /// A resolved route for one relation, cached at `Relation` time. Bundling the
 /// member handle with its ack slot keeps the hot per-commit ack path
-/// (`already_committed` / `deliver` / committer construction) off the
+/// (`already_has` / `deliver` / committer construction) off the
 /// [`AckTable`] lock entirely — a pointer clone, no key hash or map lookup.
 struct Route {
     key: MemberKey,
@@ -552,6 +552,17 @@ struct AckSlot {
     /// Highest commit LSN staged for this member, either in the pump-local eager
     /// coalescer or its mailbox.
     delivered: AtomicU64,
+    /// Highest commit LSN placed in this member's mailbox, which the member then
+    /// applies in order whether or not the pump reconnects.
+    ///
+    /// Unlike [`Self::delivered`] it excludes the eager coalescer, which a
+    /// reconnect discards, and unlike [`Self::committed`] it does not wait for a
+    /// checkpoint. A reconnect replay must skip every commit at or below it (see
+    /// [`Self::already_has`]): sending such a commit again puts an older change
+    /// behind newer ones the member already holds, and once a checkpoint moves
+    /// `committed` past the newer ones, their own resend is skipped, so the older
+    /// change is the last one applied.
+    handed: AtomicU64,
     /// [`LIVE`] | [`SNAPSHOTTING`] | [`STREAMING`] bitflags. Mutated only under
     /// the [`AckTable`] write lock (register/detach/promote/snapshot-finished);
     /// read lock-free everywhere else.
@@ -568,7 +579,7 @@ struct AckSlot {
     /// the premise [`flush_idle_watermarks`] needs before it may carry the position
     /// forward over an interval that contained nothing to apply.
     ///
-    /// Still within the one 64-byte line this type is aligned to (33 of 64 bytes
+    /// Still within the one 64-byte line this type is aligned to (41 of 64 bytes
     /// used), so it adds no false sharing.
     recorded: AtomicU64,
     /// Whether a mid-stream rebuild request is outstanding for this member.
@@ -601,6 +612,7 @@ impl AckSlot {
         Self {
             committed: AtomicU64::new(at),
             delivered: AtomicU64::new(at),
+            handed: AtomicU64::new(at),
             state: AtomicU8::new(LIVE | if snapshotting { SNAPSHOTTING } else { 0 }),
             recorded: AtomicU64::new(0),
             pending: AtomicU64::new(0),
@@ -616,6 +628,7 @@ impl AckSlot {
         Self {
             committed: AtomicU64::new(at),
             delivered: AtomicU64::new(at),
+            handed: AtomicU64::new(at),
             state: AtomicU8::new(0),
             recorded: AtomicU64::new(0),
             pending: AtomicU64::new(0),
@@ -662,7 +675,7 @@ impl AckSlot {
     ///   * **recordable** — the idle carry-forward may extend it
     ///     ([`publish_idle_positions`]), hence `note_recorded`/`note_pending`;
     ///   * **the replay-suppression floor** — a reconnect replay must not
-    ///     re-deliver anything at or below it ([`Self::already_committed`]),
+    ///     re-deliver anything at or below it ([`Self::already_has`]),
     ///     hence `committed`/`delivered`.
     ///
     /// Seeding only the first half loses writes for a durable write-back dataset:
@@ -693,12 +706,25 @@ impl AckSlot {
         advance_monotonic(&self.delivered, lsn);
     }
 
-    /// Whether the member has already durably applied this commit — used to
-    /// suppress re-delivery of envelopes during a reconnect replay (the replay
-    /// always starts at the *minimum* floor, so caught-up members would
-    /// otherwise see every commit since the slowest member's position again).
-    fn already_committed(&self, lsn: u64) -> bool {
-        self.committed.load(Ordering::Acquire) >= lsn
+    /// Record that a commit's changes are in this member's mailbox (monotonic).
+    /// Called by the mailbox under its lock, once the changes are admitted.
+    fn hand(&self, lsn: u64) {
+        advance_monotonic(&self.handed, lsn);
+    }
+
+    /// Whether the member already holds this commit — durably applied, or in its
+    /// mailbox to be applied — so a reconnect replay must not send it again. The
+    /// replay always starts at the *minimum* floor across members, and at or
+    /// below this member's own `committed`, which trails what it has applied
+    /// until a checkpoint.
+    ///
+    /// Checking `committed` alone is not enough: a resent change is applied after
+    /// the newer ones the member already holds, and if a checkpoint moves
+    /// `committed` past those before the replay reaches them, their resend is
+    /// skipped. A key inserted, updated and deleted then keeps the resent update,
+    /// and a row updated twice keeps the older value (#16625).
+    fn already_has(&self, lsn: u64) -> bool {
+        self.committed.load(Ordering::Acquire) >= lsn || self.handed.load(Ordering::Acquire) >= lsn
     }
 
     fn has(&self, flag: u8) -> bool {
@@ -735,10 +761,12 @@ impl AckTable {
         let mut members = write_lock(&self.members);
         match members.get(key) {
             Some(slot) => {
-                // Rejoin: keep the held `committed` floor, reset `delivered` to
-                // it (everything after is about to be replayed), and drop back
-                // to the held (non-streaming) state.
+                // Rejoin: keep the held `committed` floor, reset `delivered` and
+                // `handed` to it (the old mailbox went with the old stream, so
+                // everything after is about to be replayed), and drop back to the
+                // held (non-streaming) state.
                 slot.delivered.store(slot.committed(), Ordering::Release);
+                slot.handed.store(slot.committed(), Ordering::Release);
                 slot.state.store(held, Ordering::Release);
             }
             None => {
@@ -1511,6 +1539,9 @@ impl MemberMailboxSender {
                         self.shared
                             .buffered_bytes
                             .fetch_add(merged_bytes, Ordering::AcqRel);
+                        // A merge requires the same slot, and `flush_to` is now
+                        // the later of the two commits.
+                        current.slot.hand(current.flush_to);
                         return MailboxSendOutcome::Merged;
                     }
                     MergeOutcome::Limited(returned) => {
@@ -1533,6 +1564,7 @@ impl MemberMailboxSender {
 
         let bytes = envelope.rows.encoded_len();
         let wake_receiver = incoming.is_empty();
+        envelope.slot.hand(envelope.flush_to);
         incoming.push(PendingItem::Changes(envelope));
         self.shared.buffered_items.fetch_add(1, Ordering::AcqRel);
         self.shared
@@ -4631,9 +4663,9 @@ async fn deliver_commit(
         if !slot.has(STREAMING) {
             continue;
         }
-        if slot.already_committed(boundary.end_lsn) {
-            // Reconnect replay of a commit this member already durably
-            // applied (replays start at the minimum floor across members).
+        if slot.already_has(boundary.end_lsn) {
+            // Reconnect replay of a commit this member already holds (replays
+            // start at the minimum floor across members).
             continue;
         }
         let Some(rel) = decoder.relation(relation_id) else {
@@ -7396,6 +7428,95 @@ mod tests {
         txn
     }
 
+    /// The rows of every envelope waiting in `receiver`, without blocking.
+    /// Counted in rows rather than envelopes, since the mailbox folds
+    /// consecutive commits into one envelope.
+    fn drain_ready(receiver: &mut MemberMailboxReceiver) -> usize {
+        let mut rows = 0;
+        while let Some(item) = futures::FutureExt::now_or_never(receiver.next()) {
+            rows += item
+                .expect("mailbox still open")
+                .expect("envelope is not an error")
+                .num_rows_hint();
+        }
+        rows
+    }
+
+    /// A reconnect replay must not send a member a commit it already holds.
+    ///
+    /// The member below has applied the insert of a key (LSN 100) and its later
+    /// delete (LSN 300), but checkpointed neither, so the replay that follows a
+    /// reconnect starts below both. If the replay sends the insert again, it is
+    /// applied after the delete; and if the member's checkpoint then acknowledges
+    /// the delete before the replay reaches it, the delete is not sent again, so
+    /// the key stays inserted for good (regression test for #16625). Nothing it
+    /// already holds may be sent again, whatever its checkpoint does meanwhile.
+    #[tokio::test]
+    async fn reconnect_replay_skips_commits_the_member_already_holds() {
+        let (source, decoder, routes, mut receivers) = echo_scenario(None);
+        let t0 = source.ack.slot(&key("t0")).expect("t0 ack slot");
+
+        // First delivery: t0's insert, t1's change, t0's delete. t0 applies both
+        // of its own and checkpoints neither.
+        for (relation_id, end_lsn) in [(100, 100), (101, 200), (100, 300)] {
+            deliver_one_commit(
+                &source,
+                &decoder,
+                &routes,
+                txn_with(&[(relation_id, "x")]),
+                end_lsn,
+                None,
+            )
+            .await;
+        }
+        assert_eq!(drain_ready(&mut receivers[0]), 2, "t0 applied the rows of 100 and 300");
+        assert_eq!(drain_ready(&mut receivers[1]), 1, "t1 applied 200");
+        assert_eq!(t0.committed(), 0, "t0 has checkpointed nothing");
+
+        // The pump reconnects at the floor and the source sends the same commits
+        // again. t0's checkpoint acknowledges the delete partway through.
+        deliver_one_commit(&source, &decoder, &routes, txn_with(&[(100, "x")]), 100, None)
+            .await;
+        t0.commit(300);
+        deliver_one_commit(&source, &decoder, &routes, txn_with(&[(101, "x")]), 200, None)
+            .await;
+        deliver_one_commit(&source, &decoder, &routes, txn_with(&[(100, "x")]), 300, None)
+            .await;
+        assert_eq!(
+            drain_ready(&mut receivers[0]),
+            0,
+            "t0 must not receive its insert again after it applied the delete"
+        );
+        assert_eq!(
+            drain_ready(&mut receivers[1]),
+            0,
+            "t1 must not receive its change again"
+        );
+
+        // A commit staged for t0 but never placed in its mailbox (an eager hold a
+        // reconnect discards) is still sent when the replay reaches it.
+        t0.deliver(400);
+        deliver_one_commit(&source, &decoder, &routes, txn_with(&[(100, "x")]), 400, None)
+            .await;
+        assert_eq!(
+            drain_ready(&mut receivers[0]),
+            1,
+            "a commit t0 never received is sent"
+        );
+
+        // After t0 rejoins with a new stream, everything above its checkpoint is
+        // sent again: its old mailbox went with the old stream.
+        source.ack.register(&key("t0"), false);
+        source.ack.promote_ready_members();
+        deliver_one_commit(&source, &decoder, &routes, txn_with(&[(100, "x")]), 400, None)
+            .await;
+        assert_eq!(
+            drain_ready(&mut receivers[0]),
+            1,
+            "a rejoined member is sent what it held before"
+        );
+    }
+
     /// A registered xid drops only the arbitrated member's changes; a second
     /// member's changes in the same transaction are delivered intact.
     #[tokio::test]
@@ -8071,9 +8192,11 @@ mod tests {
         }
     }
 
-    /// Reconnect replay: replaying the same transaction without an intervening
-    /// `prune_acked` (the slot resends everything after `confirmed_flush` on any
-    /// reconnect) drops the echo again — the ordering regression the design guards.
+    /// Reconnect replay: the slot resends everything after `confirmed_flush` on
+    /// any reconnect. A member that still holds the echo's zero-row ack is not
+    /// sent the transaction again at all; one that rejoined (its old mailbox gone
+    /// with its old stream) is, and without an intervening `prune_acked` it drops
+    /// the echo again — the ordering regression the design guards.
     #[tokio::test]
     async fn reconnect_replay_without_prune_drops_echo_again() {
         let xid = 313u32;
@@ -8104,7 +8227,25 @@ mod tests {
             .expect("first ack")
             .expect("not an error");
 
-        // Reconnect replay of the very same transaction, no prune in between.
+        // Reconnect replay of the very same transaction, no prune in between: t0
+        // already holds its ack, so nothing is sent.
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1")]),
+            end_lsn,
+            Some(xid),
+        )
+        .await;
+        assert!(
+            futures::FutureExt::now_or_never(receivers[0].next()).is_none(),
+            "a member that already holds the commit is not sent it again"
+        );
+
+        // After t0 rejoins, the replay resends it, still with no prune in between.
+        source.ack.register(&key("t0"), false);
+        source.ack.promote_ready_members();
         deliver_one_commit(
             &source,
             &decoder,
