@@ -53,7 +53,7 @@ use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Plan
 // Test 1: Basic staged append — data correct, staging empty after write
 // ============================================================================
 
-test_with_backends!(test_staged_append_basic_impl);
+test_on_data_store!(test_staged_append_basic_impl);
 
 async fn test_staged_append_basic_impl(
     fixture: common::TestFixture,
@@ -75,13 +75,13 @@ async fn test_staged_append_basic_impl(
         ]
     );
 
-    assert_staging_empty(&staging_dir(&table));
+    assert_no_staged_files(&fixture, &table).await;
 
     Ok(())
 }
 
-test_with_backends!(test_cdc_stage_a_does_not_wait_for_prior_finalize_impl);
-test_with_backends!(test_sorted_cdc_stage_a_does_not_wait_for_finalize_impl);
+test_on_data_store!(test_cdc_stage_a_does_not_wait_for_prior_finalize_impl);
+test_on_data_store!(test_sorted_cdc_stage_a_does_not_wait_for_finalize_impl);
 
 async fn test_cdc_stage_a_does_not_wait_for_prior_finalize_impl(
     fixture: common::TestFixture,
@@ -160,7 +160,7 @@ async fn test_sorted_cdc_stage_a_does_not_wait_for_finalize_impl(
     Ok(())
 }
 
-test_with_backends!(test_sort_columns_do_not_rewrite_snapshot_on_write_impl);
+test_on_data_store!(test_sort_columns_do_not_rewrite_snapshot_on_write_impl);
 
 async fn test_sort_columns_do_not_rewrite_snapshot_on_write_impl(
     fixture: common::TestFixture,
@@ -204,7 +204,7 @@ async fn test_sort_columns_do_not_rewrite_snapshot_on_write_impl(
             (3, "C".to_string()),
         ]
     );
-    assert_staging_empty(&staging_dir(&table));
+    assert_no_staged_files(&fixture, &table).await;
 
     Ok(())
 }
@@ -213,7 +213,7 @@ async fn test_sort_columns_do_not_rewrite_snapshot_on_write_impl(
 // Test 2: Stream error — partial writes cleaned up, no data corruption
 // ============================================================================
 
-test_with_backends!(test_staged_append_stream_error_no_partial_data_impl);
+test_on_data_store!(test_staged_append_stream_error_no_partial_data_impl);
 
 async fn test_staged_append_stream_error_no_partial_data_impl(
     fixture: common::TestFixture,
@@ -267,7 +267,7 @@ async fn test_staged_append_stream_error_no_partial_data_impl(
     );
 
     // Verify: staging dir is clean
-    assert_staging_empty(&staging_dir(&table));
+    assert_no_staged_files(&fixture, &table).await;
 
     Ok(())
 }
@@ -319,13 +319,12 @@ async fn test_staged_append_self_healing_leftover_impl(
 // Test 4: Multiple appends accumulate correctly
 // ============================================================================
 
-test_with_backends!(test_staged_append_multi_append_accumulates_impl);
+test_on_data_store!(test_staged_append_multi_append_accumulates_impl);
 
 async fn test_staged_append_multi_append_accumulates_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (table, ctx) = setup_table(&fixture, "staged_multi").await;
-    let staging = staging_dir(&table);
 
     // Append 1
     ctx.sql("INSERT INTO staged_multi VALUES (1, 'A'), (2, 'B'), (3, 'C')")
@@ -333,7 +332,7 @@ async fn test_staged_append_multi_append_accumulates_impl(
         .collect()
         .await?;
     assert_eq!(row_count(&ctx, "staged_multi").await, 3);
-    assert_staging_empty(&staging);
+    assert_no_staged_files(&fixture, &table).await;
 
     // Append 2
     ctx.sql("INSERT INTO staged_multi VALUES (4, 'D'), (5, 'E'), (6, 'F')")
@@ -341,7 +340,7 @@ async fn test_staged_append_multi_append_accumulates_impl(
         .collect()
         .await?;
     assert_eq!(row_count(&ctx, "staged_multi").await, 6);
-    assert_staging_empty(&staging);
+    assert_no_staged_files(&fixture, &table).await;
 
     // Append 3
     ctx.sql("INSERT INTO staged_multi VALUES (7, 'G'), (8, 'H'), (9, 'I')")
@@ -349,7 +348,7 @@ async fn test_staged_append_multi_append_accumulates_impl(
         .collect()
         .await?;
     assert_eq!(row_count(&ctx, "staged_multi").await, 9);
-    assert_staging_empty(&staging);
+    assert_no_staged_files(&fixture, &table).await;
 
     // Verify all data
     let rows = query_all(&ctx, "staged_multi").await;
@@ -549,8 +548,8 @@ async fn test_wal_persists_on_move_failure_impl(
 // ============================================================================
 
 test_with_backends!(test_prepared_lifecycle_matches_commit_impl);
-test_with_backends!(test_prepared_apply_under_barrier_waits_for_write_lock_impl);
-test_with_backends!(test_held_barrier_current_snapshot_requires_write_lock_impl);
+test_on_data_store!(test_prepared_apply_under_barrier_waits_for_write_lock_impl);
+test_on_data_store!(test_held_barrier_current_snapshot_requires_write_lock_impl);
 
 async fn test_prepared_lifecycle_matches_commit_impl(
     fixture: common::TestFixture,
@@ -636,7 +635,7 @@ async fn test_prepared_apply_under_barrier_waits_for_write_lock_impl(
 
     let rows = query_all(&ctx, "lifecycle_write_lock").await;
     assert_eq!(rows, vec![(1, "Alice".to_string())]);
-    assert_staging_empty(&staging_dir(&table));
+    assert_no_staged_files(&fixture, &table).await;
 
     Ok(())
 }
@@ -670,7 +669,7 @@ async fn test_held_barrier_current_snapshot_requires_write_lock_impl(
 
     let rows = query_all(&ctx, "held_barrier_write_lock").await;
     assert_eq!(rows, vec![(1, "Alice".to_string())]);
-    assert_staging_empty(&staging_dir(&table));
+    assert_no_staged_files(&fixture, &table).await;
 
     Ok(())
 }
@@ -1186,7 +1185,7 @@ async fn test_corrupt_framed_wal_discarded_on_recovery_impl(
 // manifest) and verified before the file is first scanned.
 // ============================================================================
 
-test_with_backends!(test_corrupt_data_file_detected_on_read_impl);
+test_on_data_store!(test_corrupt_data_file_detected_on_read_impl);
 
 async fn test_corrupt_data_file_detected_on_read_impl(
     fixture: common::TestFixture,
@@ -1217,20 +1216,29 @@ async fn test_corrupt_data_file_detected_on_read_impl(
         .iter()
         .find(|f| f.digest.is_some())
         .expect("overwrite with integrity on must record a digested data file in the manifest");
-    let vortex_file = PathBuf::from(&meta.path)
-        .join(&meta.table_id)
-        .join(&digested.snapshot_id)
-        .join(&digested.file_path);
-    assert!(
-        vortex_file.exists(),
-        "manifest-listed data file should exist on disk: {}",
-        vortex_file.display()
-    );
+    let stored = fixture
+        .data_store
+        .snapshot_data_files(
+            fixture.catalog.as_ref(),
+            &meta.table_id,
+            &meta.path,
+            std::slice::from_ref(&digested.snapshot_id),
+        )
+        .await?;
+    let vortex_file = stored
+        .iter()
+        .find(|file| file.name() == digested.file_path)
+        .unwrap_or_else(|| {
+            panic!(
+                "manifest-listed data file {} should be in the store: {stored:?}",
+                digested.file_path
+            )
+        });
 
     // Corrupt it in place — silent bit-rot of committed data. Do this BEFORE any
     // scan so the (once-per-process) verification runs against the corrupted
     // bytes rather than a cached pass.
-    flip_middle_byte(&vortex_file)?;
+    flip_middle_byte(&fixture, &vortex_file.path).await?;
 
     // The first read of the corrupted file must FAIL as a detected fault, not
     // return silently-wrong rows.
@@ -1256,8 +1264,8 @@ async fn test_corrupt_data_file_detected_on_read_impl(
 // and potentially triggers old snapshot cleanup.
 // ============================================================================
 
-test_with_backends!(test_writer_wal_survives_inline_compaction_impl);
-test_with_backends!(test_compaction_skips_pending_current_snapshot_finalize_impl);
+test_on_data_store!(test_writer_wal_survives_inline_compaction_impl);
+test_on_data_store!(test_compaction_skips_pending_current_snapshot_finalize_impl);
 
 async fn test_writer_wal_survives_inline_compaction_impl(
     fixture: common::TestFixture,
@@ -1298,9 +1306,10 @@ async fn test_writer_wal_survives_inline_compaction_impl(
 
     // No leftover WAL.
     assert!(
-        staging_wal_paths(&table).is_empty(),
+        stored_staging_wals(&fixture, &table).await.is_empty(),
         "writer's WAL must be removed after successful commit across compaction boundary"
     );
+    assert_no_staged_files(&fixture, &table).await;
 
     Ok(())
 }
@@ -1350,7 +1359,7 @@ async fn test_compaction_skips_pending_current_snapshot_finalize_impl(
 // the pre-recovery audit does not incorrectly refuse a benign pending WAL).
 // ============================================================================
 
-test_with_backends!(test_pending_writer_wal_survives_compaction_trigger_impl);
+test_on_data_store!(test_pending_writer_wal_survives_compaction_trigger_impl);
 
 async fn test_pending_writer_wal_survives_compaction_trigger_impl(
     fixture: common::TestFixture,
@@ -1727,16 +1736,19 @@ fn corrupt_framed_wal_bytes(payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
-/// Flip a byte in the middle of a file on disk to simulate silent bit-rot.
-fn flip_middle_byte(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    let mut bytes = std::fs::read(path)?;
+/// Flip a byte in the middle of a stored file to simulate silent bit-rot.
+async fn flip_middle_byte(
+    fixture: &common::TestFixture,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut bytes = fixture.data_store.read(path).await?.to_vec();
     assert!(
         !bytes.is_empty(),
         "data file to corrupt should not be empty"
     );
     let mid = bytes.len() / 2;
     bytes[mid] ^= 0xFF;
-    std::fs::write(path, bytes)?;
+    fixture.data_store.write(path, bytes.into()).await?;
     Ok(())
 }
 
@@ -1794,6 +1806,88 @@ fn assert_staging_empty(staging: &std::path::Path) {
         "Expected _staging/ to be empty but found {} entries",
         entries.len()
     );
+}
+
+/// Assert that the table has nothing staged: on a local table, that `_staging/`
+/// is empty. A table in an object store stages nothing: a write puts its files
+/// at their final keys and deletes them if it does not commit. So there, once
+/// the data-file retention of retired files has ended, every data file the
+/// store holds under the table must be one a snapshot of the table names.
+async fn assert_no_staged_files(fixture: &common::TestFixture, table: &CayenneTableProvider) {
+    if fixture.data_store.config.is_none() {
+        assert_staging_empty(&staging_dir(table));
+        return;
+    }
+    common::reclaim_delayed_deletes(fixture, table).await;
+    let data_path = table.metadata().path.clone();
+    let metadata = fixture
+        .catalog
+        .get_table(&table.metadata().table_name)
+        .await
+        .expect("read the table from the catalog");
+    let mut snapshot_ids: std::collections::BTreeSet<String> = fixture
+        .catalog
+        .get_all_snapshot_sequences(&metadata.table_id)
+        .await
+        .expect("read the table's snapshots")
+        .into_keys()
+        .collect();
+    snapshot_ids.insert(metadata.current_snapshot_id.clone());
+    let snapshot_ids: Vec<String> = snapshot_ids.into_iter().collect();
+    let named: std::collections::BTreeSet<String> = fixture
+        .data_store
+        .snapshot_data_files(
+            fixture.catalog.as_ref(),
+            &metadata.table_id,
+            &data_path,
+            &snapshot_ids,
+        )
+        .await
+        .expect("list the files the table's snapshots name")
+        .into_iter()
+        .map(|file| file.relative)
+        .collect();
+    let table_dir = format!("{}/", metadata.table_id);
+    let unnamed: Vec<String> = fixture
+        .data_store
+        .list_files(&data_path)
+        .await
+        .expect("list the table's data path")
+        .into_iter()
+        .filter(|file| {
+            file.is_staged()
+                || (file.is_data_file()
+                    && file.relative.starts_with(&table_dir)
+                    && !named.contains(&file.relative))
+        })
+        .map(|file| file.relative)
+        .collect();
+    assert!(
+        unnamed.is_empty(),
+        "Expected every stored data file to be named by a snapshot, but found {unnamed:?}"
+    );
+}
+
+/// The staging WALs the table's data store holds.
+async fn stored_staging_wals(
+    fixture: &common::TestFixture,
+    table: &CayenneTableProvider,
+) -> Vec<String> {
+    if fixture.data_store.config.is_none() {
+        return staging_wal_paths(table)
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+    }
+    fixture
+        .data_store
+        .list_files(&table.metadata().path)
+        .await
+        .expect("list the table's data path")
+        .into_iter()
+        .filter(|file| file.is_staged() && file.name() == STAGING_WAL_FILENAME)
+        .map(|file| file.relative)
+        .collect()
 }
 
 /// Query total row count from a registered table.
@@ -1885,7 +1979,7 @@ async fn setup_table_with_vortex_config(
         schema: test_schema(),
         primary_key: vec![],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config,
     };
@@ -1893,7 +1987,9 @@ async fn setup_table_with_vortex_config(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let table = CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env())
+    let table = fixture
+        .data_store
+        .create(catalog, ctx.runtime_env(), table_options)
         .await
         .expect("create table");
     let table = Arc::new(table);
@@ -1920,7 +2016,7 @@ async fn setup_table_with_context(
         schema: test_schema(),
         primary_key: vec![],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config: vortex_config.clone(),
     };
@@ -1928,9 +2024,11 @@ async fn setup_table_with_context(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let context = cayenne::CayenneContext::new(&vortex_config, ctx.runtime_env(), table_name);
-    let table = cayenne::CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-        .with_context(context)
-        .create(table_options)
+    let table = fixture
+        .data_store
+        .create_with(catalog, ctx.runtime_env(), table_options, |builder| {
+            builder.with_context(context)
+        })
         .await
         .expect("create table with injected context");
     let table = Arc::new(table);

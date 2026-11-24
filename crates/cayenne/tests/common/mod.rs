@@ -493,6 +493,192 @@ impl FixtureDataStore {
         }
     }
 
+    /// Every file stored under `data_path`, a table's data path
+    /// (`metadata().path`), sorted by relative path: a walk of the local
+    /// directory, or a listing of the object store's prefix. The listing reads
+    /// the store itself, never the files the table's commits name, so a test
+    /// that counts or checks files does not take its expected answer from the
+    /// code under test.
+    /// # Errors
+    /// The directory or the store could not be listed.
+    pub async fn list_files(
+        &self,
+        data_path: &str,
+    ) -> Result<Vec<StoredFile>, Box<dyn std::error::Error>> {
+        use futures::TryStreamExt;
+        let root = data_path.trim_end_matches('/');
+        let mut files = Vec::new();
+        match &self.config {
+            None => {
+                let mut directories = vec![std::path::PathBuf::from(root)];
+                while let Some(directory) = directories.pop() {
+                    let mut entries = match tokio::fs::read_dir(&directory).await {
+                        Ok(entries) => entries,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(e.into()),
+                    };
+                    while let Some(entry) = entries.next_entry().await? {
+                        // Background cleanup can delete an entry between the
+                        // directory read and this call; it is then not stored.
+                        let metadata = match entry.metadata().await {
+                            Ok(metadata) => metadata,
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                            Err(e) => return Err(e.into()),
+                        };
+                        let path = entry.path();
+                        if metadata.is_dir() {
+                            directories.push(path);
+                            continue;
+                        }
+                        let relative = path
+                            .strip_prefix(root)?
+                            .components()
+                            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join("/");
+                        files.push(StoredFile {
+                            path: path.to_string_lossy().into_owned(),
+                            relative,
+                            size: metadata.len(),
+                        });
+                    }
+                }
+            }
+            Some(config) => {
+                let url = url::Url::parse(root)?;
+                let prefix = object_store::path::Path::from_url_path(url.path())?;
+                let objects: Vec<object_store::ObjectMeta> =
+                    config.store.list(Some(&prefix)).try_collect().await?;
+                for object in objects {
+                    let Some(parts) = object.location.prefix_match(&prefix) else {
+                        continue;
+                    };
+                    let relative = parts
+                        .map(|part| part.as_ref().to_string())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    files.push(StoredFile {
+                        path: format!("{root}/{relative}"),
+                        relative,
+                        size: object.size,
+                    });
+                }
+            }
+        }
+        files.sort_by(|a, b| a.relative.cmp(&b.relative));
+        Ok(files)
+    }
+
+    /// The stored data files of `snapshot_ids` of table `table_id` at
+    /// `data_path`, sorted by relative path. A local table keeps each snapshot's
+    /// files in a directory of its own, `<table_id>/<snapshot_id>/`, which is
+    /// listed. A table in the object-native location keeps every snapshot's files
+    /// in one directory, so a file is attributed to a snapshot by the snapshot's
+    /// committed manifest, and only a file the store holds is returned: one the
+    /// manifest names but the store lacks is missing from the result.
+    /// # Errors
+    /// The store could not be listed, or the catalog could not be read.
+    pub async fn snapshot_data_files(
+        &self,
+        catalog: &FixtureCatalog,
+        table_id: &str,
+        data_path: &str,
+        snapshot_ids: &[String],
+    ) -> Result<Vec<StoredFile>, Box<dyn std::error::Error>> {
+        let stored = self.list_files(data_path).await?;
+        if self.config.is_none() {
+            return Ok(stored
+                .into_iter()
+                .filter(|file| {
+                    file.is_data_file()
+                        && snapshot_ids.iter().any(|snapshot| {
+                            file.relative
+                                .starts_with(&format!("{table_id}/{snapshot}/"))
+                        })
+                })
+                .collect());
+        }
+        let mut named = std::collections::HashSet::new();
+        for snapshot_id in snapshot_ids {
+            for file in catalog.get_snapshot_files(table_id, snapshot_id).await? {
+                let name = file
+                    .file_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                named.insert(name);
+            }
+        }
+        Ok(stored
+            .into_iter()
+            .filter(|file| file.is_data_file() && named.contains(file.name()))
+            .collect())
+    }
+
+    /// [`statistics_row_key`] for a table at `data_path` in this data store. A
+    /// table in the object-native location keeps every snapshot's files in its
+    /// table directory, so the key carries no snapshot directory.
+    /// # Errors
+    /// `data_path` is not a URL in an object store.
+    pub fn statistics_row_key(
+        &self,
+        data_path: &str,
+        table_id: &str,
+        file: &cayenne::metadata::SnapshotFile,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        if self.config.is_none() {
+            return Ok(statistics_row_key(
+                std::path::Path::new(data_path),
+                table_id,
+                file,
+            ));
+        }
+        let url = url::Url::parse(data_path)?;
+        Ok(format!(
+            "{}/{table_id}/{}",
+            url.path().trim_matches('/'),
+            file.file_path
+        ))
+    }
+
+    /// Replace the stored file at `path`, as [`StoredFile::path`] names it, with
+    /// `bytes`, to simulate a file damaged outside Cayenne.
+    /// # Errors
+    /// The file could not be written.
+    pub async fn write(
+        &self,
+        path: &str,
+        bytes: bytes::Bytes,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use object_store::ObjectStoreExt;
+        match &self.config {
+            None => Ok(tokio::fs::write(path, bytes).await?),
+            Some(config) => {
+                let url = url::Url::parse(path)?;
+                let location = object_store::path::Path::from_url_path(url.path())?;
+                config.store.put(&location, bytes.into()).await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Delete the stored file at `path`, as [`StoredFile::path`] names it, to
+    /// simulate a file lost outside Cayenne.
+    /// # Errors
+    /// The file could not be deleted.
+    pub async fn delete(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        use object_store::ObjectStoreExt;
+        match &self.config {
+            None => Ok(tokio::fs::remove_file(path).await?),
+            Some(config) => {
+                let url = url::Url::parse(path)?;
+                let location = object_store::path::Path::from_url_path(url.path())?;
+                Ok(config.store.delete(&location).await?)
+            }
+        }
+    }
+
     fn builder(
         &self,
         catalog: Arc<dyn MetadataCatalog>,
@@ -526,6 +712,66 @@ impl FixtureDataStore {
         );
         Ok(())
     }
+}
+
+/// A file [`FixtureDataStore::list_files`] found in a data store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredFile {
+    /// The path [`FixtureDataStore::read`] and [`FixtureDataStore::delete`] take:
+    /// a local path, or a URL in the data store.
+    pub path: String,
+    /// The path relative to the listed data path, `/`-separated.
+    pub relative: String,
+    pub size: u64,
+}
+
+impl StoredFile {
+    /// The file's name, its last path segment.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.relative.rsplit('/').next().unwrap_or_default()
+    }
+
+    /// Whether a writer's staging area holds the file, before any commit names it.
+    #[must_use]
+    pub fn is_staged(&self) -> bool {
+        self.relative
+            .split('/')
+            .any(|segment| segment.starts_with("_staging"))
+    }
+
+    /// A Vortex data file outside a staging area.
+    #[must_use]
+    pub fn is_data_file(&self) -> bool {
+        !self.is_staged()
+            && !self.name().starts_with('.')
+            && std::path::Path::new(self.name())
+                .extension()
+                .is_some_and(|extension| extension == "vortex")
+    }
+
+    /// A deletion vector: an Arrow IPC file under a `deletions` directory.
+    #[must_use]
+    pub fn is_deletion_vector(&self) -> bool {
+        self.relative
+            .split('/')
+            .any(|segment| segment == "deletions")
+            && std::path::Path::new(self.name())
+                .extension()
+                .is_some_and(|extension| extension == "arrow")
+    }
+}
+
+/// Delete now the files a table in the object-native location keeps for the
+/// data-file retention after it retires them, as if the retention had passed.
+/// A local table deletes those files without a delay, so this does nothing
+/// there. The orphan sweep is left alone, so a file this deletes is one the
+/// table retired, not one a test helper found unnamed.
+pub async fn reclaim_delayed_deletes(fixture: &TestFixture, table: &CayenneTableProvider) {
+    if fixture.data_store.config.is_none() {
+        return;
+    }
+    table.reclaim_retired_snapshots_now().await;
 }
 
 /// A table builder over `catalog` whose data files are in `config`'s store.
@@ -669,7 +915,7 @@ pub fn require_process_per_test(why: &str) {
 /// A file whose tests run on the object-native backend registers them with
 /// [`test_on_data_store!`]; a test in such a file that stays here is one of the
 /// object-native exceptions below, each checking behavior that the object-native
-/// data path does not have:
+/// data path does not have, or failing there as its row describes:
 ///
 /// # Object-native exceptions
 ///
@@ -681,6 +927,21 @@ pub fn require_process_per_test(why: &str) {
 /// | `mutation_property_test::prop_auto_crossing_observes_position_then_key_switch_impl` | `deletion_mode: auto` starts on position deletes only for a table on a local directory. |
 /// | `mutation_property_test::prop_sequential_auto_crossing_impl` | As above. |
 /// | `scan_view_retention_test::scan_view_selection_during_retention` | Holds a scan's planning on retention's unlink of a data file; a table in the object-native location keeps a retired file for `DATA_FILE_RETENTION`, so the delete unlinks nothing. |
+/// | `file_based_retention_delete_test` (all but `test_loader_errors_on_missing_needed_dv_impl`) | File-based retention (whole-file deletes) runs only for local data files; a table in an object store deletes the expired rows through deletion vectors, so the file counts, deleted-row counts and orphaned deletion vectors these tests assert differ. The two list-files cache tests also need a listing the table never makes. |
+/// | `file_scan_statistics_source_test::concurrent_cold_scans_share_one_footer_read_and_upsert_per_file` | Counts footer reads through the session's `file://` store and upserts through SQLite triggers. |
+/// | `file_scan_statistics_source_test::scan_file_statistics_counters_match_the_store_and_the_metastore` | As above. |
+/// | `integration_test::test_cayenne_catalog_persistence_impl` | Reopens a SQLite catalog file. |
+/// | `listing_cache_retention_race_test` (all) | Races a snapshot-directory listing through the list-files cache; a table in the object-native location never lists its files. |
+/// | `mem_tier_overwrite_retention_test::retention_judges_a_key_by_its_live_version_impl` | Fails intermittently on the local-location store when many tests run at once, with a RAM-tier row that matches `retention_sql` still visible after the retention pass; the cause is not yet known. |
+/// | `mem_tier_overwrite_retention_test::a_waiting_publish_does_not_hold_back_the_other_partitions_impl` | Commits partitions' overwrites in one SQLite metastore transaction; the object-native metastore does not hold partitioned tables. |
+/// | `orphan_dv_compaction_test::bake_publication_schedules_orphan_dv_cleanup_impl` | On the object-native stores, the deletion vectors the sweep after a seq-prefix bake drops from the catalog stay in the store once the data-file retention ends (25 stored, 2 named), while the same check after a protected-subset merge passes; the cause is not yet known. |
+/// | `orphan_dv_compaction_test::provider_open_replays_an_orphan_backlog_left_by_a_crash_impl` | Writes deletion vectors and their catalog rows by hand at a local path. |
+/// | `orphan_dv_compaction_test::scheduled_cleanup_waits_for_the_orphan_threshold_impl` | As above. |
+/// | `orphan_dv_compaction_test::scheduled_cleanup_keeps_a_deletion_vector_the_cold_tier_needs_impl` | Cold tier, which object-native data does not support. |
+/// | `position_mode_reclaim_test::default_mode_small_table_reclaims_by_rewriting_itself` | `deletion_mode: auto` starts on position deletes only for a table on a local directory. |
+/// | `position_mode_reclaim_test::empty_table_reclaim_clears_tombstones_and_survives_reopen` | As above. |
+/// | `position_mode_reclaim_test::default_mode_table_past_its_bound_reclaims_through_the_bake` | As above: a table in an object store keeps key deletes from the start, so it never crosses the position-delete bound this test checks. |
+/// | `staged_append_test` WAL and crash-leftover tests (`test_staged_append_self_healing_leftover_impl`, `test_wal_*`, `test_leftover_tmp_*`, `test_repeated_wal_writes_are_atomic_impl`, `test_prepared_lifecycle_matches_commit_impl`, `test_prepared_rollback_clears_staging_impl`, `test_corrupt_framed_wal_discarded_on_recovery_impl`, `test_cancelled_plain_append_does_not_wedge_after_compaction_impl`) | Check or plant the `_staging/` directory and its `_wal.json` on local disk; a table in an object store writes its files at their final keys and stages no WAL. |
 #[macro_export]
 macro_rules! test_with_backends {
     ($test_fn:ident) => {

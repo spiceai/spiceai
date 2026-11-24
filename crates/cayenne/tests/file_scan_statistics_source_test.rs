@@ -44,7 +44,7 @@ type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 const TABLE: &str = "file_stats_source";
 
-test_with_backends!(file_scan_byte_size_statistics_do_not_depend_on_their_source);
+test_on_data_store!(file_scan_byte_size_statistics_do_not_depend_on_their_source);
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -171,23 +171,25 @@ async fn file_scan_byte_size_statistics_do_not_depend_on_their_source(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            catalog,
-            CreateTableOptions {
-                table_name: TABLE.to_string(),
-                schema: schema(),
-                primary_key: vec!["id".to_string()],
-                on_conflict: None,
-                base_path: fixture.data_path.to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config: VortexConfig {
-                    inline_max_rows: 0,
-                    ..VortexConfig::default()
+        fixture
+            .data_store
+            .create(
+                catalog,
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: TABLE.to_string(),
+                    schema: schema(),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path(TABLE),
+                    partition_column: None,
+                    vortex_config: VortexConfig {
+                        inline_max_rows: 0,
+                        ..VortexConfig::default()
+                    },
                 },
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+            )
+            .await?,
     );
     insert_rows(&table, 0..512).await?;
     table.drain_in_flight_maintenance().await?;
@@ -214,12 +216,14 @@ async fn file_scan_byte_size_statistics_do_not_depend_on_their_source(
     catalog.init().await?;
     let ctx = SessionContext::new();
     let reopened = Arc::new(
-        CayenneTableProviderBuilder::new(
-            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
-            ctx.runtime_env(),
-        )
-        .open(TABLE)
-        .await?,
+        fixture
+            .data_store
+            .open(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+                TABLE,
+            )
+            .await?,
     );
 
     let (blob_total, blob_columns) = scan_statistics(&reopened, &ctx).await?;
@@ -238,7 +242,7 @@ async fn file_scan_byte_size_statistics_do_not_depend_on_their_source(
     Ok(())
 }
 
-test_with_backends!(a_blob_without_byte_sizes_is_re_inferred_from_its_footer);
+test_on_data_store!(a_blob_without_byte_sizes_is_re_inferred_from_its_footer);
 
 /// Build a blob shaped like one written before per-column byte sizes were
 /// persisted: every column's `byte_size` absent, so the restored total is too.
@@ -275,23 +279,25 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            catalog,
-            CreateTableOptions {
-                table_name: TABLE.to_string(),
-                schema: schema(),
-                primary_key: vec!["id".to_string()],
-                on_conflict: None,
-                base_path: fixture.data_path.to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config: VortexConfig {
-                    inline_max_rows: 0,
-                    ..VortexConfig::default()
+        fixture
+            .data_store
+            .create(
+                catalog,
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: TABLE.to_string(),
+                    schema: schema(),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path(TABLE),
+                    partition_column: None,
+                    vortex_config: VortexConfig {
+                        inline_max_rows: 0,
+                        ..VortexConfig::default()
+                    },
                 },
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+            )
+            .await?,
     );
     insert_rows(&table, 0..512).await?;
     table.drain_in_flight_maintenance().await?;
@@ -313,8 +319,12 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
     let table_id = table.table_id().to_string();
     let files = await_manifest_rows(&fixture, &table_id).await?;
     let scan_snapshot_id = files[0].snapshot_id.clone();
+    let data_path = table.metadata().path.clone();
     let stats_key = |file: &cayenne::metadata::SnapshotFile| {
-        common::statistics_row_key(&fixture.data_path, &table_id, file)
+        fixture
+            .data_store
+            .statistics_row_key(&data_path, &table_id, file)
+            .expect("statistics row key")
     };
     for file in &files {
         fixture
@@ -353,12 +363,14 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
     catalog.init().await?;
     let ctx = SessionContext::new();
     let reopened = Arc::new(
-        CayenneTableProviderBuilder::new(
-            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
-            ctx.runtime_env(),
-        )
-        .open(TABLE)
-        .await?,
+        fixture
+            .data_store
+            .open(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+                TABLE,
+            )
+            .await?,
     );
 
     let (migrated_total, _) = scan_statistics(&reopened, &ctx).await?;
@@ -397,7 +409,7 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
     Ok(())
 }
 
-test_with_backends!(a_widened_table_still_serves_its_files_from_the_persisted_blob);
+test_on_data_store!(a_widened_table_still_serves_its_files_from_the_persisted_blob);
 
 const EVOLVED_TABLE: &str = "file_stats_source_evolved";
 
@@ -427,23 +439,25 @@ async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            catalog,
-            CreateTableOptions {
-                table_name: EVOLVED_TABLE.to_string(),
-                schema: schema(),
-                primary_key: vec!["id".to_string()],
-                on_conflict: None,
-                base_path: fixture.data_path.to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config: VortexConfig {
-                    inline_max_rows: 0,
-                    ..VortexConfig::default()
+        fixture
+            .data_store
+            .create(
+                catalog,
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: EVOLVED_TABLE.to_string(),
+                    schema: schema(),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path(EVOLVED_TABLE),
+                    partition_column: None,
+                    vortex_config: VortexConfig {
+                        inline_max_rows: 0,
+                        ..VortexConfig::default()
+                    },
                 },
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+            )
+            .await?,
     );
     insert_rows(&table, 0..512).await?;
     table.drain_in_flight_maintenance().await?;
@@ -477,8 +491,12 @@ async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
     let table_id = table.table_id().to_string();
     let stored_schema = table.schema();
     let files = await_manifest_rows(&fixture, &table_id).await?;
+    let data_path = table.metadata().path.clone();
     let stats_key = |file: &cayenne::metadata::SnapshotFile| {
-        common::statistics_row_key(&fixture.data_path, &table_id, file)
+        fixture
+            .data_store
+            .statistics_row_key(&data_path, &table_id, file)
+            .expect("statistics row key")
     };
     let mut poisoned = 0;
     for file in &files {
@@ -519,12 +537,14 @@ async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
     catalog.init().await?;
     let ctx = SessionContext::new();
     let reopened = Arc::new(
-        CayenneTableProviderBuilder::new(
-            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
-            ctx.runtime_env(),
-        )
-        .open(EVOLVED_TABLE)
-        .await?,
+        fixture
+            .data_store
+            .open(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+                EVOLVED_TABLE,
+            )
+            .await?,
     );
     let (_, blob_columns) = scan_statistics(&reopened, &ctx).await?;
 
@@ -552,6 +572,8 @@ async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
 // and the upserts through triggers on the metastore table, so neither depends on
 // the provider's own accounting.
 
+// These stay on SQLite: they count footer reads through the session's `file://`
+// store, which a table in the object-native location does not read through.
 test_with_backends!(concurrent_cold_scans_share_one_footer_read_and_upsert_per_file);
 test_with_backends!(scan_file_statistics_counters_match_the_store_and_the_metastore);
 

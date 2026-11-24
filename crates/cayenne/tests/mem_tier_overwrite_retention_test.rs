@@ -35,10 +35,7 @@ use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::util::display::array_value_to_string;
 use cayenne::metadata::{CdcDurability, CreateTableOptions, VortexConfig};
-use cayenne::{
-    CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, PreparedOverwrite,
-    SlotAdvancer,
-};
+use cayenne::{CayenneTableProvider, MetadataCatalog, PreparedOverwrite, SlotAdvancer};
 use common::TestFixture;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -72,7 +69,7 @@ fn memory_tier_options(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.join(name).to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(name),
         partition_column: None,
         vortex_config: VortexConfig {
             cdc_durability: CdcDurability::Memory,
@@ -153,12 +150,14 @@ async fn overwrite_replaces_the_in_memory_tier_impl(fixture: TestFixture) -> Tes
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            Arc::clone(&catalog),
-            memory_tier_options(&fixture, NAME, &id_name_schema()),
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                Arc::clone(&catalog),
+                ctx.runtime_env(),
+                memory_tier_options(&fixture, NAME, &id_name_schema()),
+            )
+            .await?,
     );
     table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
 
@@ -195,8 +194,9 @@ async fn overwrite_replaces_the_in_memory_tier_impl(fixture: TestFixture) -> Tes
     // Nothing durable describes the replaced rows: a restart serves the overwrite.
     drop(table);
     let reopened = Arc::new(
-        CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
-            .open(NAME)
+        fixture
+            .data_store
+            .open(Arc::clone(&catalog), ctx.runtime_env(), NAME)
             .await?,
     );
     reopened.install_slot_advancer(Arc::new(NoopSlotAdvancer));
@@ -212,7 +212,7 @@ async fn overwrite_replaces_the_in_memory_tier_impl(fixture: TestFixture) -> Tes
     Ok(())
 }
 
-test_with_backends!(overwrite_replaces_the_in_memory_tier_impl);
+test_on_data_store!(overwrite_replaces_the_in_memory_tier_impl);
 
 fn id_value_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -241,13 +241,15 @@ async fn retention_judges_a_key_by_its_live_version_impl(fixture: TestFixture) -
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table_with_retention(
-            catalog,
-            memory_tier_options(&fixture, NAME, &id_value_schema()),
-            vec![col("value").lt(lit(50_i64))],
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create_with(
+                catalog,
+                ctx.runtime_env(),
+                memory_tier_options(&fixture, NAME, &id_value_schema()),
+                |builder| builder.with_retention_filters(vec![col("value").lt(lit(50_i64))]),
+            )
+            .await?,
     );
     table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
 
@@ -329,13 +331,15 @@ async fn a_cancelled_overwrite_still_applies_retention_impl(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table_with_retention(
-            catalog,
-            memory_tier_options(&fixture, NAME, &id_value_schema()),
-            vec![col("value").lt(lit(50_i64))],
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create_with(
+                catalog,
+                ctx.runtime_env(),
+                memory_tier_options(&fixture, NAME, &id_value_schema()),
+                |builder| builder.with_retention_filters(vec![col("value").lt(lit(50_i64))]),
+            )
+            .await?,
     );
     let advancer = Arc::new(GatedSlotAdvancer {
         entered: Notify::new(),
@@ -376,7 +380,7 @@ async fn a_cancelled_overwrite_still_applies_retention_impl(
     Ok(())
 }
 
-test_with_backends!(a_cancelled_overwrite_still_applies_retention_impl);
+test_on_data_store!(a_cancelled_overwrite_still_applies_retention_impl);
 
 /// A partitioned table's overwrite commits every partition in one transaction and
 /// then publishes each partition's new snapshot. One partition's publish waiting,
@@ -472,6 +476,9 @@ async fn a_waiting_publish_does_not_hold_back_the_other_partitions_impl(
     Ok(())
 }
 
+// Stays on SQLite: it commits the partitions' overwrites in one transaction of the
+// SQLite metastore, which a partitioned table uses and the object-native metastore
+// does not provide.
 test_with_backends!(a_waiting_publish_does_not_hold_back_the_other_partitions_impl);
 
 /// An overwrite's catalog commit and its publish are separate steps. A caller
@@ -489,12 +496,14 @@ async fn an_aborted_overwrite_leaves_the_provider_on_the_catalogs_snapshot_impl(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            Arc::clone(&catalog),
-            memory_tier_options(&fixture, NAME, &id_name_schema()),
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                Arc::clone(&catalog),
+                ctx.runtime_env(),
+                memory_tier_options(&fixture, NAME, &id_name_schema()),
+            )
+            .await?,
     );
     table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
     overwrite(&table, id_name_batch(&[(1, "a")])?).await?;
@@ -535,7 +544,7 @@ async fn an_aborted_overwrite_leaves_the_provider_on_the_catalogs_snapshot_impl(
     Ok(())
 }
 
-test_with_backends!(an_aborted_overwrite_leaves_the_provider_on_the_catalogs_snapshot_impl);
+test_on_data_store!(an_aborted_overwrite_leaves_the_provider_on_the_catalogs_snapshot_impl);
 
 /// Records the highest durable epoch a checkpoint reported.
 #[derive(Default)]
@@ -562,12 +571,14 @@ async fn a_checkpoint_commits_its_metastore_changes_before_acknowledging_impl(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            catalog,
-            memory_tier_options(&fixture, NAME, &id_value_schema()),
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                catalog,
+                ctx.runtime_env(),
+                memory_tier_options(&fixture, NAME, &id_value_schema()),
+            )
+            .await?,
     );
     let advancer = Arc::new(RecordingSlotAdvancer::default());
     table.install_slot_advancer(Arc::clone(&advancer) as Arc<dyn SlotAdvancer>);
@@ -585,8 +596,9 @@ async fn a_checkpoint_commits_its_metastore_changes_before_acknowledging_impl(
     let reopened_catalog = common::fixture_catalog(fixture.connection_string()).await?;
     reopened_catalog.init().await?;
     let reopened = Arc::new(
-        CayenneTableProviderBuilder::new(reopened_catalog, ctx.runtime_env())
-            .open(NAME)
+        fixture
+            .data_store
+            .open(reopened_catalog, ctx.runtime_env(), NAME)
             .await?,
     );
     assert_eq!(
@@ -597,7 +609,7 @@ async fn a_checkpoint_commits_its_metastore_changes_before_acknowledging_impl(
     Ok(())
 }
 
-test_with_backends!(a_checkpoint_commits_its_metastore_changes_before_acknowledging_impl);
+test_on_data_store!(a_checkpoint_commits_its_metastore_changes_before_acknowledging_impl);
 
 /// Saves the position a checkpoint covers through the object-native catalog, as
 /// a source's position store does, and records the epoch it acknowledges.
