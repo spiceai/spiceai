@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Refuses a `DELETE`/`UPDATE` whose row condition cannot reach the table.
+//! Rewrites a `DELETE`/`UPDATE` so that its row condition and new values reach
+//! the table, and refuses one whose row condition cannot.
 //!
 //! A table provider receives the rows to affect as a list of filter
 //! expressions, and an **empty list means every row** — that is the documented
@@ -44,10 +45,10 @@ limitations under the License.
 //! every node in it is one whose restriction the filter list provably carries.
 //! Anything else is refused rather than approximated.
 //!
-//! The filter list also has to name only the table's own columns. When a
-//! condition repeats an expression, the optimizer computes it once in a
-//! projection under the filter and the filter reads the computed column
-//! (`__common_expr_1`), which the table does not have.
+//! The filter list and the assigned values also have to name only the table's
+//! own columns. When a condition or a new value repeats an expression, the
+//! optimizer computes it once in a projection under it and reads the computed
+//! column (`__common_expr_1`), which the table does not have.
 //! [`rewrite_dml_for_the_table`] puts a non-volatile expression back in its
 //! place. A column computed by a volatile expression, such as a model call
 //! placed to run once per row, keeps its name, and the table refuses it.
@@ -155,14 +156,15 @@ pub fn ensure_dml_restriction_reaches_the_table(plan: &LogicalPlan) -> Result<()
     .map(|_| ())
 }
 
-/// Rewrite each `DELETE`/`UPDATE` so that the filter list the planner extracts
-/// from it names only the table's own columns:
+/// Rewrite each `DELETE`/`UPDATE` so that the filter list and the assigned
+/// values the planner extracts from it name only the table's own columns:
 ///
 /// - A statement whose condition selects no row is planned as one that affects
 ///   no row, since its filter list would otherwise be empty, which means every
 ///   row.
-/// - A column that a projection computes under the condition from a
-///   non-volatile expression is replaced by that expression.
+/// - A column that a projection computes from a non-volatile expression,
+///   directly under the filter or projection that reads it, is replaced by
+///   that expression.
 ///
 /// Returns the plan unchanged, without copying it, when it holds no such
 /// statement.
@@ -227,10 +229,10 @@ fn affects_no_row(dml: &DmlStatement) -> Result<LogicalPlan> {
         .build()
 }
 
-/// In a filter or projection, replace each column that the projection below
-/// it computes (looking through filters) from a non-volatile expression by
-/// that expression. That projection then also passes on every column of its
-/// input, since the expression reads columns the projection may have left out.
+/// In a filter or projection, replace each column that the projection directly
+/// below it computes from a non-volatile expression by that expression. That
+/// projection then also passes on every column of its input, since the
+/// expression reads columns the projection may have left out.
 fn inline_computed_columns(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     match node {
         LogicalPlan::Filter(filter) => {
@@ -275,12 +277,11 @@ fn inline_computed_columns(node: LogicalPlan) -> Result<Transformed<LogicalPlan>
     }
 }
 
-/// The columns the nearest projection below `plan` computes from a
-/// non-volatile expression, by name. Filters keep their input's columns, so
-/// they are looked through. `None` when there is no such column.
+/// When `plan` is a projection, the columns it computes from a non-volatile
+/// expression, by name. `None` when `plan` is not a projection or computes no
+/// such column.
 fn computed_columns_below(plan: &LogicalPlan) -> Option<HashMap<String, Expr>> {
     match plan {
-        LogicalPlan::Filter(filter) => computed_columns_below(&filter.input),
         LogicalPlan::Projection(projection) => {
             let computed: HashMap<String, Expr> = projection
                 .schema
@@ -298,14 +299,10 @@ fn computed_columns_below(plan: &LogicalPlan) -> Option<HashMap<String, Expr>> {
     }
 }
 
-/// Rebuild the nearest projection below `plan` (looking through filters) so
-/// that it also passes on each column of its input that it leaves out.
+/// When `plan` is a projection, rebuild it so that it also passes on each
+/// column of its input that it leaves out.
 fn pass_on_input_columns_below(plan: &Arc<LogicalPlan>) -> Result<Arc<LogicalPlan>> {
     match plan.as_ref() {
-        LogicalPlan::Filter(filter) => Ok(Arc::new(LogicalPlan::Filter(Filter::try_new(
-            filter.predicate.clone(),
-            pass_on_input_columns_below(&filter.input)?,
-        )?))),
         LogicalPlan::Projection(projection) => {
             let left_out: Vec<Expr> = projection
                 .input

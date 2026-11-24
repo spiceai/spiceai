@@ -186,7 +186,7 @@ steps:
   - spice-exec: 'UPDATE ev SET v = 0 WHERE FALSE'
   - query: SELECT id, region, name, v, f, ts FROM ev
     oracle-sql: SELECT id, region, name, v, f, ts FROM model
-  # A condition that repeats an expression.
+  # A condition or a new value that repeats an expression.
   - spice-exec: 'UPDATE ev SET v = v * 2 WHERE v * 2 > 300 AND v * 2 < 700'
   - source-exec: { src: 'UPDATE model SET v = v * 2 WHERE v * 2 > 300 AND v * 2 < 700' }
   - spice-exec: 'UPDATE ev SET f = 0 WHERE f * 2 > 3 AND f * 2 < 10'
