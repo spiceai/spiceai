@@ -57,6 +57,7 @@ use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::prelude::*;
 use tokio::sync::OnceCell;
 use util::concat_arrays;
+use util::spice_paths::{absolute_dir, is_local_path};
 
 use crate::metastore::METASTORE_DB_FILE;
 use crate::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
@@ -513,9 +514,15 @@ pub(crate) fn transform_schema_for_vortex(
     }
 }
 
+type FileCatalogCell = Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>;
+
 pub struct CayenneAccelerator {
-    catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
-    /// The object-native catalog, beside [`Self::catalog`]: with
+    /// File-mode catalogs keyed by SQLite connection string (the metadata
+    /// directory). One accelerator may open more than one directory; each
+    /// directory is its own catalog so tables of the same name in different
+    /// directories do not collide.
+    catalogs: parking_lot::Mutex<HashMap<String, FileCatalogCell>>,
+    /// The object-native catalog, beside [`Self::catalogs`]: with
     /// `runtime.params.cayenne_vnext: enabled`, new datasets go here while
     /// datasets already in the SQL metastore stay there.
     native_catalog: Arc<OnceCell<Arc<cayenne::metastore::object_native::ObjectNativeCatalog>>>,
@@ -530,6 +537,11 @@ pub struct CayenneAccelerator {
     /// `memdb` metastore so separate instances (e.g. per-test runtimes) never share
     /// one in-memory database.
     instance_id: u64,
+    /// Local directories this instance has claimed in [`LOCAL_DIR_OWNERS`], so
+    /// [`Drop`] can release them. Keyed by the configured path; value is the
+    /// directory actually used (the configured path, or an instance-suffixed
+    /// sibling when another instance already owned it).
+    isolated_dirs: parking_lot::Mutex<HashMap<String, String>>,
     footer_cache_mb: Option<usize>,
     /// The cluster membership of this process. A scheduler or executor keeps the
     /// SQLite metastore under `cayenne_vnext` (see [`Self::metastore_type_for`]).
@@ -564,6 +576,29 @@ struct InheritedPinsEntry<'a> {
 impl Drop for InheritedPinsEntry<'_> {
     fn drop(&mut self) {
         self.slot.lock().remove(&self.dataset);
+    }
+}
+
+impl Drop for CayenneAccelerator {
+    fn drop(&mut self) {
+        // Collect first so this lock is not held with [`LOCAL_DIR_OWNERS`]:
+        // [`Self::isolate_local_dir`] takes the owners lock, then this map.
+        let claimed: Vec<(String, String)> = self
+            .isolated_dirs
+            .lock()
+            .iter()
+            .map(|(key, actual)| (key.clone(), actual.clone()))
+            .collect();
+        let mut owners = LOCAL_DIR_OWNERS.lock();
+        for (key, actual) in claimed {
+            if owners.get(&key).copied() == Some(self.instance_id) {
+                owners.remove(&key);
+            }
+            let actual_key = local_dir_key(&actual);
+            if owners.get(&actual_key).copied() == Some(self.instance_id) {
+                owners.remove(&actual_key);
+            }
+        }
     }
 }
 
@@ -1624,6 +1659,26 @@ async fn lies_inside(inner: &str, outer: &str) -> std::io::Result<bool> {
 static CAYENNE_ACCELERATOR_INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Which accelerator instance currently owns each local Cayenne directory in
+/// this process. Two instances that would otherwise open the same `cayenne.db`
+/// (the default `.spice/data/metadata`, or a `cayenne_file_path` copied to every
+/// in-process cluster executor) must not share a catalog: tables are unique on
+/// name, so the second instance would serve the first's rows.
+static LOCAL_DIR_OWNERS: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// A stable key for a local directory: absolute, with a `file://` scheme
+/// stripped and no trailing slash. Directories that do not exist yet compare
+/// lexically; existing ones are not canonicalized so a symlink stays as
+/// configured (the same rule [`absolute_dir`] uses).
+fn local_dir_key(dir: &str) -> String {
+    let probed = fs_probe_path(dir);
+    absolute_dir(probed).map_or_else(
+        |_| probed.trim_end_matches('/').to_string(),
+        |path| path.to_string_lossy().trim_end_matches('/').to_string(),
+    )
+}
+
 impl CayenneAccelerator {
     /// Builds the engine with no footer cache configured.
     #[must_use]
@@ -1637,10 +1692,9 @@ impl CayenneAccelerator {
     /// by the time they reach here there is nothing left to reject.
     #[must_use]
     pub fn from_runtime_config(config: &data_accelerator_api::CayenneRuntimeConfig) -> Self {
-        Self {
-            cluster_role: config.cluster_role.clone(),
-            ..Self::with_footer_cache_mb(config.footer_cache_mb)
-        }
+        let mut accelerator = Self::with_footer_cache_mb(config.footer_cache_mb);
+        accelerator.cluster_role.clone_from(&config.cluster_role);
+        accelerator
     }
 
     /// The footer-cache size this engine was configured with.
@@ -1652,18 +1706,62 @@ impl CayenneAccelerator {
     #[must_use]
     pub fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
         Self {
-            catalog: Arc::new(OnceCell::new()),
+            catalogs: parking_lot::Mutex::new(HashMap::new()),
             native_catalog: Arc::new(OnceCell::new()),
             vnext_notices: parking_lot::Mutex::new(HashSet::new()),
             memory_catalog: Arc::new(OnceCell::new()),
             instance_id: CAYENNE_ACCELERATOR_INSTANCE_COUNTER
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            isolated_dirs: parking_lot::Mutex::new(HashMap::new()),
             footer_cache_mb,
             cluster_role: None,
             compaction_semaphore: cayenne::compaction_budget(),
             inherited_snapshot_dir_pins: parking_lot::Mutex::new(HashMap::new()),
             serving_snapshot_providers: Arc::default(),
         }
+    }
+
+    /// The directory this instance should use for `dir`. A local path another
+    /// accelerator instance in this process already opened is placed beside it
+    /// as `{dir}-instance-{id}` so the two catalogs do not share tables. Object
+    /// store URLs and a path this instance already claimed are unchanged. A
+    /// dropped instance releases its claim, so a later accelerator reopening
+    /// the same directories (a restart) finds the original path.
+    fn isolate_local_dir(&self, dir: &str) -> String {
+        if !is_local_path(dir) {
+            return dir.to_string();
+        }
+        let key = local_dir_key(dir);
+        {
+            let isolated = self.isolated_dirs.lock();
+            if let Some(actual) = isolated.get(&key) {
+                return actual.clone();
+            }
+        }
+
+        let trimmed = dir.trim_end_matches('/');
+        let actual = {
+            let mut owners = LOCAL_DIR_OWNERS.lock();
+            match owners.get(&key).copied() {
+                Some(id) if id != self.instance_id => {
+                    let isolated = format!("{trimmed}-instance-{}", self.instance_id);
+                    owners.insert(local_dir_key(&isolated), self.instance_id);
+                    isolated
+                }
+                _ => {
+                    owners.insert(key.clone(), self.instance_id);
+                    trimmed.to_string()
+                }
+            }
+        };
+        self.isolated_dirs.lock().insert(key, actual.clone());
+        actual
+    }
+
+    /// [`Self::resolve_metadata_dir`] after [`Self::isolate_local_dir`], so two
+    /// accelerator instances in one process do not share a catalog file.
+    fn metadata_dir_for(&self, acceleration: Option<&Acceleration>) -> String {
+        self.isolate_local_dir(&Self::resolve_metadata_dir(acceleration))
     }
 
     /// Returns the `Cayenne` data directory path that would be used for a file-based `Cayenne` accelerator from this dataset.
@@ -1686,6 +1784,14 @@ impl CayenneAccelerator {
     /// and [`Error::InvalidConfiguration`] when it is not file-accelerated — a memory-mode
     /// table has no data directory to name.
     pub fn cayenne_data_dir(&self, source: &dyn AccelerationSource) -> Result<String> {
+        Ok(self.isolate_local_dir(&Self::configured_cayenne_data_dir(source)?))
+    }
+
+    /// The data directory the Spicepod names, before this instance isolates it
+    /// from another accelerator in the same process. Hardware detection and S3
+    /// path classification use this so they do not claim the directory as a
+    /// throwaway instance.
+    fn configured_cayenne_data_dir(source: &dyn AccelerationSource) -> Result<String> {
         if !source.is_file_accelerated() {
             return Err(Error::InvalidConfiguration {
                 detail: Arc::from("Dataset is not file accelerated"),
@@ -2004,8 +2110,7 @@ impl CayenneAccelerator {
             // is skipped for object stores. `*_dir` may be a `file://` URI, so
             // strip the scheme before probing the real filesystem path.
             // An object-store data path has no local volume to probe.
-            let data_dir = CayenneAccelerator::new()
-                .cayenne_data_dir(source)
+            let data_dir = Self::configured_cayenne_data_dir(source)
                 .ok()
                 .filter(|dir| !cayenne::is_object_store_path(dir));
             let metadata_dir = CayenneAccelerator::resolve_metadata_dir(Some(acceleration));
@@ -2973,19 +3078,19 @@ impl CayenneAccelerator {
         tracing::debug!("create_cayenne_table_provider: starting for table {table_name}");
 
         let acceleration = source.acceleration();
-        let metadata_dir = Self::resolve_metadata_dir(acceleration);
+        let metadata_dir = self.metadata_dir_for(acceleration);
 
         // Memory mode (`mode: memory`): fully in-RAM — an in-memory `memdb`
         // metastore (nothing on disk) and no metadata directory. File mode creates
         // the metadata dir and uses the shared on-disk catalog as before.
         let memory_mode = !source.is_file_accelerated();
         let catalog = if memory_mode {
-            Self::ensure_supported_metastore(source).await?;
+            self.ensure_supported_metastore(source).await?;
             self.get_or_create_memory_catalog().await?
         } else {
             // Refuse a Turso metastore before the directory is created, so a dataset
             // that fails here leaves nothing behind.
-            Self::ensure_supported_metastore(source).await?;
+            self.ensure_supported_metastore(source).await?;
             tokio::fs::create_dir_all(&metadata_dir)
                 .await
                 .boxed()
@@ -3860,7 +3965,7 @@ impl DataAccelerator for CayenneAccelerator {
             return AccelerationLayout::default();
         };
 
-        let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+        let metadata_dir = self.metadata_dir_for(source.acceleration());
 
         AccelerationLayout::cayenne(PathBuf::from(metadata_dir), PathBuf::from(data_dir))
     }
@@ -3874,7 +3979,7 @@ impl DataAccelerator for CayenneAccelerator {
         // (the bucket/prefix is assumed to exist or will be created by the object store)
         if s3::is_s3_express_data_path(source) {
             // For S3 Express, we need to check if the metadata database exists locally
-            return Self::metadata_db_exists(source);
+            return self.metadata_db_exists(source);
         }
 
         // For local storage, check if both the data directory and metadata database exist
@@ -3888,7 +3993,7 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         // Also check if the metadata database exists (indicates proper initialization)
-        Self::metadata_db_exists(source)
+        self.metadata_db_exists(source)
     }
 
     /// Initializes a `Cayenne` database for the dataset
@@ -3911,7 +4016,7 @@ impl DataAccelerator for CayenneAccelerator {
         // First, and in every mode: `init` follows this with a snapshot bootstrap and,
         // for `mode: file_create`, a delete of the data directory, neither of which may
         // run over a Turso metastore.
-        Self::ensure_supported_metastore(source).await?;
+        self.ensure_supported_metastore(source).await?;
 
         if !source.is_file_accelerated() {
             return Ok(());
@@ -4089,7 +4194,7 @@ impl DataAccelerator for CayenneAccelerator {
             let path_buf = PathBuf::from(&dir_path);
             if path_exists(&path_buf).await {
                 let metadata_dir_for_snapshot =
-                    PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
+                    PathBuf::from(self.metadata_dir_for(Some(acceleration)));
                 let snapshot_layout = runtime_acceleration::snapshot::AccelerationLayout::cayenne(
                     metadata_dir_for_snapshot,
                     path_buf.clone(),
@@ -4209,7 +4314,7 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         if let Some(acceleration) = source.acceleration() {
-            let metadata_dir = PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
+            let metadata_dir = PathBuf::from(self.metadata_dir_for(Some(acceleration)));
             let snapshot_adapter = runtime_acceleration::snapshot::AccelerationLayout::cayenne(
                 metadata_dir.clone(),
                 path_buf.clone(),
@@ -4433,11 +4538,11 @@ impl DataAccelerator for CayenneAccelerator {
             ))
         } else {
             // Get metadata catalog for partition tracking
-            let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+            let metadata_dir = self.metadata_dir_for(source.acceleration());
 
             // Refuse a Turso metastore before the directory is created, so a dataset
             // that fails here leaves nothing behind.
-            Self::ensure_supported_metastore(source).await?;
+            self.ensure_supported_metastore(source).await?;
             tokio::fs::create_dir_all(&metadata_dir)
                 .await
                 .boxed()
@@ -4470,11 +4575,8 @@ impl DataAccelerator for CayenneAccelerator {
             let partition_on_conflict = table_metadata.on_conflict.clone();
 
             // Build S3 object store if using S3 Express One Zone storage
-            let object_store_config = s3::build_s3_object_store(
-                source,
-                CayenneAccelerator::new().cayenne_data_dir(source)?,
-            )
-            .await?;
+            let object_store_config =
+                s3::build_s3_object_store(source, self.cayenne_data_dir(source)?).await?;
 
             // Create partition creator
             let unsupported_type_action = Self::get_unsupported_type_action(source);
@@ -4988,19 +5090,26 @@ impl DataAccelerator for CayenneAccelerator {
     async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::debug!("Cayenne accelerator shutdown: starting catalog shutdown");
 
-        // Get the catalog if it was initialized
-        let catalog = self.catalog.get().map(Arc::clone);
+        let catalogs: Vec<Arc<dyn cayenne::MetadataCatalog>> = self
+            .catalogs
+            .lock()
+            .values()
+            .filter_map(|cell| cell.get().map(Arc::clone))
+            .collect();
+        let memory_catalog = self.memory_catalog.get().map(Arc::clone);
 
-        if let Some(catalog) = catalog {
-            // Run shutdown on the catalog to flush WAL and optimize
+        if catalogs.is_empty() && memory_catalog.is_none() {
+            tracing::debug!("Cayenne catalog was never initialized, skipping shutdown");
+            return Ok(());
+        }
+
+        for catalog in catalogs.into_iter().chain(memory_catalog) {
             catalog.shutdown().await.map_err(|e| {
                 tracing::warn!("Failed to shutdown Cayenne catalog: {e}");
                 Box::new(e) as Box<dyn std::error::Error + Send + Sync>
             })?;
-            tracing::debug!("Cayenne accelerator shutdown: complete");
-        } else {
-            tracing::debug!("Cayenne catalog was never initialized, skipping shutdown");
         }
+        tracing::debug!("Cayenne accelerator shutdown: complete");
 
         Ok(())
     }

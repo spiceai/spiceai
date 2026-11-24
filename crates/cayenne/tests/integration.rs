@@ -83,6 +83,7 @@ mod incremental_stats_test;
 mod ingest_fsync_regression_test;
 mod inline_tombstone_reclaim_test;
 mod inline_with_pending_deletions_test;
+mod instance_isolation_test;
 mod int64_pk_deletion_test;
 mod integration_test;
 mod keybased_deletion_test;
