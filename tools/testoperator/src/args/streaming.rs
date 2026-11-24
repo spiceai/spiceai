@@ -37,10 +37,12 @@ use crate::commands::streaming::querysets::QuerySetType;
 /// - `DYNAMODB_AWS_REGION`: AWS region (required)
 /// - `DYNAMODB_AWS_ACCESS_KEY_ID`: AWS access key ID (required)
 /// - `DYNAMODB_AWS_SECRET_ACCESS_KEY`: AWS secret access key (required)
+/// - `DYNAMODB_AWS_SESSION_TOKEN`: AWS session token (optional, for temporary credentials)
 /// - `DYNAMODB_AWS_ENDPOINT_URL`: Custom endpoint URL (optional, for `LocalStack`)
 ///
 /// ### Snapshot Storage (required)
 /// - `SNAPSHOT_S3_LOCATION`: S3 location for snapshots (e.g., `s3://bucket/snapshots/`)
+/// - `SNAPSHOT_S3_SESSION_TOKEN`: S3 session token (optional, for temporary credentials)
 /// - `SNAPSHOT_S3_REGION`: S3 region (optional)
 #[derive(Parser, Debug, Clone)]
 pub struct StreamingDynamodbArgs {
@@ -95,6 +97,7 @@ pub struct StreamingDynamodbArgs {
 /// - `DYNAMODB_AWS_REGION`: AWS region (required)
 /// - `DYNAMODB_AWS_ACCESS_KEY_ID`: AWS access key ID (required)
 /// - `DYNAMODB_AWS_SECRET_ACCESS_KEY`: AWS secret access key (required)
+/// - `DYNAMODB_AWS_SESSION_TOKEN`: AWS session token (optional, for temporary credentials)
 /// - `DYNAMODB_AWS_ENDPOINT_URL`: Custom endpoint URL (optional, for `LocalStack`)
 #[derive(Parser, Debug, Clone)]
 pub struct StreamingDynamodbCorrectnessArgs {

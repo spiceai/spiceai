@@ -227,7 +227,7 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
                     "DELETE FROM nation WHERE n_nationkey >= 5 OR n_name NOT LIKE '%A'",
                 ))
                 .with_dataset(make_s3_dataset(
-                    "spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet",
+                    "spice-datasets-gjezag77s0hu/taxi_small_samples/taxi_sample.parquet",
                     "taxi_trips",
                     "duckdb",
                     "DELETE FROM taxi_trips WHERE VendorID != 2 OR Airport_fee != 1.75",

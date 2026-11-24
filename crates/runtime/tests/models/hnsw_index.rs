@@ -61,7 +61,7 @@ fn model2vec_embedding() -> Embeddings {
 /// Helper: creates a source dataset for the mega-science S3 data (no acceleration).
 fn mega_science_source_dataset(name: &str) -> Dataset {
     let mut dataset = Dataset::new(
-        "s3://spiceai-public-datasets/MegaScience/mega-science-small.jsonl",
+        "s3://spice-datasets-gjezag77s0hu/MegaScience/mega-science-small.jsonl",
         name,
     );
     dataset.params = Some(Params::from_string_map(
