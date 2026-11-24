@@ -17,7 +17,6 @@ rewrites it). A script moves up to this directory once its bug is fixed.
 
 | Scenario | Bug |
 | --- | --- |
-| `cayenne-snapshot-position-deletes-moved-dir` | A Cayenne snapshot of a table with no primary key, restored with a different `cayenne_file_path`, serves the rows a `DELETE` removed before the snapshot: the deletion vectors still name the writer's data files (#16735). |
 | `cayenne-snapshot-reader-path-change` | A reader whose `cayenne_file_path` changes while the snapshot store is down stops answering until the store is back. |
 | `snapshot-source-moved-location` | A `file_format: snapshot` dataset moved to a location whose snapshot it cannot restore serves the previous location's rows (#16098). |
 | `snapshot-source-projected-publisher` | Snapshots of a publisher whose `refresh_sql` drops columns are served instead of refused, and newer snapshots are then rejected (#16099). |
@@ -41,6 +40,7 @@ invocation restores the original metadata bytes.
 | `snapshots-writer-lease` | A single publisher, standby behavior, graceful handoff (#15256), expiry after SIGKILL, and restore of the new publisher's data. The graceful holder has a two-hour lease; publication within 20 seconds of shutdown must therefore use release rather than expiry. |
 | `snapshots-kill-during-upload` | SIGKILL at different delays after refresh completion, then cold restore without the source. Requires a whole generation, the original key count and sum, a generation that could have been published, and each row's deterministic payload. |
 | `snapshots-object-store` | S3-compatible runtime state and per-dataset snapshot locations, cold restore, and source recovery. |
+| `cayenne-snapshot-position-deletes-moved-dir` | A `DELETE` on a Cayenne table with no primary key writes position deletion vectors; a snapshot taken after it restores on empty local storage with exactly the kept rows, into the writer's directory and into a different `cayenne_file_path` and `cayenne_metadata_dir` (#16735). |
 | `snapshots-policies` | Creation triggers, `always` versus `on_change`, and create-only versus bootstrap-only behavior. |
 | `snapshots-reader` | Explicit `refresh_mode: snapshot` replication and cache behavior while polls find no new snapshot. |
 | `snapshots` | File-store restore and source recovery. |

@@ -1,22 +1,4 @@
 {
-  "cayenne-snapshot-position-deletes-moved-dir": [
-    {
-      "run": "cayenne-snapshot-position-deletes-moved-dir",
-      "who": "moved",
-      "key": "query: SELECT id, v FROM t #3",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 17143, actual: 20000 }",
-      "group": "snapshot-readers"
-    },
-    {
-      "run": "cayenne-snapshot-position-deletes-moved-dir",
-      "who": "moved",
-      "key": "query: SELECT count(*) AS n FROM t WHERE id % 7 = 0",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"0\\\"\", actual: \"\\\"2857\\\"\" }",
-      "group": "snapshot-readers"
-    }
-  ],
   "cayenne-snapshot-reader-path-change": [
     {
       "run": "cayenne-snapshot-reader-path-change",
