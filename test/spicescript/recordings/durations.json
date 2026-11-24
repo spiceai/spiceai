@@ -53,7 +53,7 @@
   "duplicate-keys": 12,
   "dynamodb": 90,
   "dynamodb-iterator-expiry": 461,
-  "dynamodb-snapshot-crash": 16,
+  "dynamodb-snapshot-crash": 33,
   "dynamodb-stream-faults": 173,
   "dynamodb-types": 16,
   "dynamodb-writes": 25,

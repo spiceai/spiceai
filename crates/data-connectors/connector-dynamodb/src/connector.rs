@@ -925,19 +925,32 @@ async fn emit_overwrite_then_live(
 
     // Last, once nothing else can fail: a failed setup keeps the checkpoint, and
     // the accelerated table, as they were.
-    if let Some(store) = checkpoint_store
-        && let Err(source) = store.upsert(RELOAD_IN_PROGRESS).await
-    {
-        return Err(stream::once(async move {
-            Err(DynamoDBStreamError::FailedToMarkReload { table_name, source }.into())
-        })
-        .boxed());
+    if let Err(error) = mark_reload_in_progress(checkpoint_store.as_ref(), &table_name).await {
+        return Err(stream::once(async move { Err(error.into()) }).boxed());
     }
 
     Ok(snapshot
         .chain(stream::once(async move { Ok(checkpoint_envelope) }))
         .chain(live)
         .boxed())
+}
+
+/// Stores [`RELOAD_IN_PROGRESS`] in place of the checkpoint, before a reload hands
+/// out its truncate (see [`emit_overwrite_then_live`]). Without a store there is
+/// no checkpoint to replace.
+async fn mark_reload_in_progress(
+    store: Option<&Arc<dyn BlobCheckpointStore>>,
+    table_name: &str,
+) -> Result<(), DynamoDBStreamError> {
+    let Some(store) = store else {
+        return Ok(());
+    };
+    store.upsert(RELOAD_IN_PROGRESS).await.map_err(|source| {
+        DynamoDBStreamError::FailedToMarkReload {
+            table_name: table_name.to_string(),
+            source,
+        }
+    })
 }
 
 /// Resumes streaming from an existing checkpoint, handling shard expiration scenarios.
@@ -1420,6 +1433,72 @@ impl CommitChange for DynamoDBStreamCommitter {
                     source: Box::new(e),
                 })
         }))
+    }
+}
+
+#[cfg(test)]
+mod reload_marker_tests {
+    use super::*;
+    use runtime_checkpoint_api::{BlobCheckpoint, CheckpointError};
+    use std::sync::Mutex;
+
+    const SAVED: &str = r#"{"shards":{}}"#;
+
+    /// A checkpoint store holding `SAVED`, whose writes fail.
+    struct ReadOnlyStore(Mutex<Option<String>>);
+
+    #[async_trait]
+    impl BlobCheckpointStore for ReadOnlyStore {
+        async fn get(&self) -> Result<Option<BlobCheckpoint>, CheckpointError> {
+            let data = self.0.lock().expect("store lock").clone();
+            Ok(data.map(|data| BlobCheckpoint {
+                data,
+                updated_at: None,
+            }))
+        }
+
+        async fn upsert(&self, _data: &str) -> Result<(), CheckpointError> {
+            Err(CheckpointError::Store {
+                source: "attempt to write a readonly database".into(),
+            })
+        }
+
+        async fn delete(&self) -> Result<(), CheckpointError> {
+            Err(CheckpointError::Store {
+                source: "attempt to write a readonly database".into(),
+            })
+        }
+    }
+
+    /// When the marker cannot be stored, the reload must not start: the earlier
+    /// checkpoint is left as it was, and the error names the table, what the user
+    /// loses, and what to check.
+    #[tokio::test]
+    async fn a_failed_marker_write_stops_the_reload() {
+        let store = Arc::new(ReadOnlyStore(Mutex::new(Some(SAVED.to_string()))));
+        let as_store: Arc<dyn BlobCheckpointStore> = Arc::<ReadOnlyStore>::clone(&store);
+
+        let error = mark_reload_in_progress(Some(&as_store), "orders")
+            .await
+            .expect_err("the marker write fails");
+
+        assert_eq!(
+            error.to_string(),
+            "Failed to record that DynamoDB table 'orders' is being reloaded, so the dataset is not reloaded and receives no changes until Spice restarts. Check that the acceleration's files are writable; see https://spiceai.org/docs/components/data-connectors/dynamodb. Cause: Checkpoint store operation failed: attempt to write a readonly database"
+        );
+        assert_eq!(store.0.lock().expect("store lock").as_deref(), Some(SAVED));
+    }
+
+    /// The marker is not a checkpoint, so a build that predates it reads it as
+    /// unreadable and reloads instead of resuming over a partial table.
+    #[test]
+    fn the_marker_is_not_a_checkpoint() {
+        let error = serde_json::from_str::<Checkpoint>(RELOAD_IN_PROGRESS)
+            .expect_err("the marker does not parse as a checkpoint");
+        assert_eq!(
+            error.to_string(),
+            "missing field `shards` at line 1 column 27"
+        );
     }
 }
 

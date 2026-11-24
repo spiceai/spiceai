@@ -21,6 +21,12 @@ sources:
     env: { SERVICES: dynamodb, AWS_DEFAULT_REGION: us-east-1 }
     ready: awslocal dynamodb list-tables
 
+# Every persistent acceleration keeps a stream position, so each must recover.
+variants:
+  cayenne: {}
+  cayenne-object-native: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
+  sqlite: { datasets: { stall: { acceleration: { engine: sqlite } } } }
+
 spicepod:
   version: v1
   kind: Spicepod
