@@ -56,6 +56,7 @@ pub(crate) mod dictionary_id_fixture;
 pub mod federation;
 pub mod stream;
 mod substrait;
+pub mod substrait_parameters;
 
 pub use delegated_search::{
     SEARCH_CALL_TYPE_URL, SEARCH_SCORE_COLUMN, delegated_search, delegated_search_schema,
