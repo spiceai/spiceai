@@ -18,7 +18,7 @@ limitations under the License.
 //! accelerated HTTP connector dataset.
 //!
 //! The scenario being tested:
-//! 1. An HTTP dataset is accelerated (`Cayenne` or Arrow).
+//! 1. An HTTP dataset is accelerated (`Cayenne`).
 //! 2. A view is created using `json_get` to extract columns from the JSON content.
 //! 3. While the runtime is running, the spicepod is updated with a new view SQL
 //!    that adds an extra column.
@@ -192,9 +192,9 @@ async fn query_batches(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, Stri
 
 /// Core logic for the hot-reload regression test, parameterized by acceleration engine.
 ///
-/// `engine` should be `"cayenne"`, `"arrow"`, `""` (the default engine), etc.
+/// `engine` selects the acceleration engine.
 async fn run_view_hot_reload_test(engine: &str) -> Result<(), String> {
-    let test_dir = get_test_dir(if engine.is_empty() { "arrow" } else { engine });
+    let test_dir = get_test_dir(if engine.is_empty() { "default" } else { engine });
     // Clean up any leftovers from a previous run.
     if test_dir.exists() {
         std::fs::remove_dir_all(&test_dir).ok();
@@ -344,20 +344,5 @@ async fn test_http_json_view_hot_reload_cayenne() -> Result<(), String> {
 
     test_request_context()
         .scope(async { run_view_hot_reload_test("cayenne").await })
-        .await
-}
-
-/// Same regression test with the Arrow accelerator to determine
-/// whether the bug is Cayenne-specific or affects all acceleration engines.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_http_json_view_hot_reload_arrow() -> Result<(), String> {
-    let _ = rustls::crypto::CryptoProvider::install_default(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    );
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
-
-    test_request_context()
-        .scope(async { run_view_hot_reload_test("arrow").await })
         .await
 }

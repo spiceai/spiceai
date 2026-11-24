@@ -105,7 +105,7 @@ fn rows(a: &[i32], b: &[&str]) -> Result<RecordBatch, anyhow::Error> {
     )?)
 }
 
-/// Registers [`TABLE`] on `executor` as a writable, empty Arrow table.
+/// Registers [`TABLE`] on `executor` as a writable, empty Cayenne memory table.
 async fn register_writable_table(executor: &Arc<Runtime>) -> Result<(), anyhow::Error> {
     let datafusion = executor.datafusion();
     let table = create_internal_accelerated_table(
@@ -114,7 +114,8 @@ async fn register_writable_table(executor: &Arc<Runtime>) -> Result<(), anyhow::
         table_schema(),
         None,
         Acceleration {
-            engine: Engine::Arrow,
+            engine: Engine::Cayenne,
+            mode: runtime_acceleration::acceleration::Mode::Memory,
             ..Acceleration::default()
         },
         None,
