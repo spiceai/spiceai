@@ -2635,6 +2635,66 @@ async fn a_scan_during_a_held_change_stream_commit_answers_the_prior_rows() {
     assert_eq!(sorted_rows(&ctx, name).await, prefix_rows(100));
 }
 
+/// A scan during an append whose dataset head write is held answers exactly
+/// the rows of the appends that returned: the append's files are named only in
+/// its buffered record until that head write lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scan_during_a_held_append_commit_answers_the_prior_rows() {
+    let name = "held_append_commit";
+    let (faults, fixture) = fault_fixture().await;
+    create_append_table(&fixture, name, std::slice::from_ref(&(1..51))).await;
+    let ctx = SessionContext::new();
+    // Every scan captures its view anew, so every scan reads the catalog.
+    let table = Arc::new(
+        crate::common::table_builder_on_store(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+            fixture
+                .data_store
+                .config
+                .clone()
+                .expect("an object-native data store"),
+        )
+        .with_scan_view_reuse(cayenne::ScanViewReuse::WithinLag(Duration::ZERO))
+        .open(name)
+        .await
+        .expect("open the table"),
+    );
+    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register");
+    assert_eq!(sorted_rows(&ctx, name).await, prefix_rows(50));
+
+    faults.arm(Op::Cas, is_head, Fault::Hold);
+    let append = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { run(&ctx, &append_sql(name, &(51..101))).await }
+    });
+    let held = tokio::time::timeout(Duration::from_secs(30), faults.wait_held(None))
+        .await
+        .expect("the append reaches its head write");
+    for _ in 0..3 {
+        let during = tokio::time::timeout(Duration::from_secs(10), sorted_rows(&ctx, name))
+            .await
+            .expect("a scan does not wait for the held head write");
+        assert_eq!(
+            during,
+            prefix_rows(50),
+            "a scan answers only the rows of the appends that returned"
+        );
+    }
+    assert!(!append.is_finished(), "the append waits for its head write");
+
+    faults.clear_rules();
+    faults.deliver(held).await.expect("deliver the head write");
+    faults.respond(held).expect("return its response");
+    tokio::time::timeout(Duration::from_secs(30), append)
+        .await
+        .expect("the append returns")
+        .expect("the append task");
+    table.drain_in_flight_maintenance().await.expect("drain");
+    assert_eq!(sorted_rows(&ctx, name).await, prefix_rows(100));
+}
+
 /// Creates the key-less table `name` in `fixture` and appends `ids` to it, one
 /// data file per range.
 async fn create_append_table(fixture: &crate::common::TestFixture, name: &str, ids: &[Range<i64>]) {
