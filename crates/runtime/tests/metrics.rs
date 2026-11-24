@@ -336,7 +336,7 @@ fn csv_backed_dataset(dir: &std::path::Path, name: &str) -> Dataset {
     dataset.time_format = Some(TimeFormat::UnixSeconds);
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("arrow".to_string()),
+        engine: Some("cayenne".to_string()),
         mode: Mode::Memory,
         refresh_mode: Some(RefreshMode::Full),
         ..Acceleration::default()
