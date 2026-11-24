@@ -5,7 +5,10 @@ description: >
   location with no space: in an S3-compatible store and in a local directory,
   the dataset loads, takes an append and serves it after a restart, and its
   objects are under the location's path as written (`state dir/`), never under
-  a percent-encoded copy of it (`state%20dir/`, `state%2520dir/`).
+  a percent-encoded copy of it (`state%20dir/`, `state%2520dir/`). A path
+  written with escapes is decoded once: `state%2Ddir/` keeps the objects under
+  `state-dir/`. A path with a literal `%` is in
+  `known-failing/cayenne/location-literal-percent.yaml`.
 
 sources:
   src: { kind: postgres }
@@ -20,6 +23,19 @@ variants:
         params: { cayenne_vnext: enabled }
         state:
           location: s3://${sources.lake.bucket}/state dir/
+          params:
+            s3_endpoint: ${sources.lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.lake.key}
+            s3_secret: ${sources.lake.secret}
+            allow_http: 'true'
+  s3-escaped:
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state:
+          location: s3://${sources.lake.bucket}/state%2Ddir/
           params:
             s3_endpoint: ${sources.lake.endpoint}
             s3_region: us-east-1
@@ -66,6 +82,10 @@ steps:
     only: s3-space
   - assert-objects: { source: lake, prefix: state%, contains: /cayenne/, max: 0 }
     only: s3-space
+  - assert-objects: { source: lake, prefix: state-dir/cayenne/v1/datasets/facts-, contains: .vortex, min: 1 }
+    only: s3-escaped
+  - assert-objects: { source: lake, prefix: state%, contains: /cayenne/, max: 0 }
+    only: s3-escaped
   - assert-files: { contains: ['^state/cayenne/v1/datasets/facts-[^/]+/data/.+\.vortex$'] }
     only: local-plain
   - assert-files: { contains: ['^state dir/cayenne/v1/datasets/facts-[^/]+/data/.+\.vortex$'], lacks: ['^state%[^/]*/cayenne/'] }

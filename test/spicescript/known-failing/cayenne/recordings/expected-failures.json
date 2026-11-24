@@ -582,6 +582,25 @@
       "group": "cayenne"
     }
   ],
+  "location-literal-percent": [
+    {
+      "run": "location-literal-percent",
+      "who": "s3-percent",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.connection\",\"type\":\"connection\"},\"error_message\":\"Failed to refresh dataset from the data connector: Execution error: Failed to create ObjectStoreWrite for 'state%2520dir/cayenne/v1/d",
+      "group": "cayenne"
+    },
+    {
+      "run": "location-literal-percent",
+      "who": "local-percent",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "Failed to create ObjectStoreWrite for '",
+      "pattern": "Failed to create ObjectStoreWrite for '",
+      "group": "cayenne"
+    }
+  ],
   "maintained-aggregates-served": [
     {
       "run": "maintained-aggregates-served",
