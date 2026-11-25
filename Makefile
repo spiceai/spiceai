@@ -242,10 +242,12 @@ print-rust-gate-features:
 # `runtime-datafusion`'s `is_distinct_from_precedence` binary is self-contained
 # (in-memory SessionContext, no credentials) and gates the vendored sqlparser
 # fix that binds `IS [NOT] DISTINCT FROM` tighter than `AND` / `OR`.
+# `data_components`' `avro_decode_allocation` binary measures, with a counting
+# allocator, the heap a CDC Avro body with oversized array and map counts claims.
 # `accelerator-cayenne`'s `integration` binary opens Cayenne accelerations through
 # the accelerator registry on temp dirs: stored data files, partitioning, lookup
 # indexes, snapshot restore and source acknowledgement. It needs no service.
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(bedrock_nova_reasoning|anthropic_stream_errors|list_models_errors|model2vec_hf_cache|safetensors_hf_cache|gguf_hf_cache)::/)) + (binary_id(=llms-llamacpp::integration) & test(/^load_errors::/)) + binary_id(=llama-cpp::integration) + binary_id(=duckdb-oracle::integration) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use)) + (package(=runtime-datafusion) & binary(=is_distinct_from_precedence)) + binary_id(=accelerator-cayenne::integration)
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(bedrock_nova_reasoning|anthropic_stream_errors|list_models_errors|model2vec_hf_cache|safetensors_hf_cache|gguf_hf_cache)::/)) + (binary_id(=llms-llamacpp::integration) & test(/^load_errors::/)) + binary_id(=llama-cpp::integration) + binary_id(=duckdb-oracle::integration) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use)) + (package(=runtime-datafusion) & binary(=is_distinct_from_precedence)) + binary_id(=accelerator-cayenne::integration) + (package(=data_components) & binary(=avro_decode_allocation))
 # Tests that run after merge, in `trunk_tests.yml` (`make nextest-post-merge`),
 # and not in the gate that sign-off and the merge queue run. Each is slow, and
 # none has caught a defect in the gate:
@@ -312,13 +314,16 @@ nextest:
 # alone, with the gate's DuckDB result-correctness feature. It lists the
 # selection first and fails unless every test the filter names is in it, so a
 # renamed test cannot quietly drop out of both runs.
+# The listing is JSON because CI's cargo-nextest (.github/actions/setup-nextest)
+# predates `--message-format oneline`; this counts the tests the filter matched.
+_COUNT_LISTED_MATCHES = import json, sys; d = json.load(sys.stdin); print(sum(t['filter-match']['status'] == 'matches' for s in d['rust-suites'].values() for t in s['testcases'].values()))
 _POST_MERGE_SELECTION = -p cayenne --features cayenne/result-correctness-duckdb --lib --test integration $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 .PHONY: nextest-post-merge
 nextest-post-merge:
 	@$(_WITH_LIBDUCKDB) \
 	named=$$(printf '%s' '$(NEXTEST_POST_MERGE_FILTER)' | grep -o 'test(=' | wc -l | tr -d ' '); \
-	listed=$$(cargo nextest list $(_POST_MERGE_SELECTION) --message-format oneline -E '$(NEXTEST_POST_MERGE_FILTER)') || exit $$?; \
-	count=$$(printf '%s\n' "$$listed" | grep -c .); \
+	listed=$$(cargo nextest list $(_POST_MERGE_SELECTION) --message-format json -E '$(NEXTEST_POST_MERGE_FILTER)') || exit $$?; \
+	count=$$(printf '%s' "$$listed" | $(PYTHON) -c "$(_COUNT_LISTED_MATCHES)") || exit $$?; \
 	if [ "$$count" != "$$named" ]; then \
 	  echo "nextest-post-merge: NEXTEST_POST_MERGE_FILTER names $$named tests but selects $$count, so a named test was renamed or removed. Update the filter in the Makefile." >&2; \
 	  exit 1; \
