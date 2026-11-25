@@ -1050,6 +1050,39 @@
   ],
   "object-native-replicas-takeover": [
     {
+      "run": "object-native-replicas-takeover[src=debezium]",
+      "who": "b",
+      "key": "query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total, sum(id * v) AS weighted FROM events",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"17796\\\"\", actual: \"\\\"18255\\\"\" }",
+      "group": "cayenne",
+      "may-pass": true,
+      "varies": true,
+      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\", row_number: 1, expected: \"\\\\\"[0-9]+\\\\\"\", actual: \"\\\\\"[0-9]+\\\\\"\" \\}"
+    },
+    {
+      "run": "object-native-replicas-takeover[src=debezium]",
+      "who": "b",
+      "key": "query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total, sum(id * v) AS weighted FROM events #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"17023\\\"\", actual: \"\\\"17449\\\"\" }",
+      "group": "cayenne",
+      "may-pass": true,
+      "varies": true,
+      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\", row_number: 1, expected: \"\\\\\"[0-9]+\\\\\"\", actual: \"\\\\\"[0-9]+\\\\\"\" \\}"
+    },
+    {
+      "run": "object-native-replicas-takeover[src=debezium]",
+      "who": "a",
+      "key": "query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total, sum(id * v) AS weighted FROM events #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"17023\\\"\", actual: \"\\\"17449\\\"\" }",
+      "group": "cayenne",
+      "may-pass": true,
+      "varies": true,
+      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\", row_number: 1, expected: \"\\\\\"[0-9]+\\\\\"\", actual: \"\\\\\"[0-9]+\\\\\"\" \\}"
+    },
+    {
       "run": "object-native-replicas-takeover[src=postgres]",
       "who": "b",
       "key": "query: SELECT count(*) AS n, sum(e.v) AS total FROM events e JOIN marks m ON e.batch = m.batch JOIN acked k ON m.lsn <= k.lsn WHERE k.at = 'cut'",
@@ -1072,7 +1105,9 @@
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"n\", row_number: 5, expected: \"\\\"1000\\\"\", actual: \"\\\"2000\\\"\" }",
       "group": "cayenne",
-      "may-pass": true
+      "may-pass": true,
+      "varies": true,
+      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\", row_number: [0-9]+, expected: \"\\\\\"[0-9]+\\\\\"\", actual: \"\\\\\"[0-9]+\\\\\"\" \\}"
     }
   ],
   "postgres-cdc-atomicity": [

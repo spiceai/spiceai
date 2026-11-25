@@ -524,6 +524,9 @@ steps:
 
   # A dies mid-stream, in the middle of a run of updates and deletes, each
   # its own transaction; B takes over from the offsets in the location.
+  # Expected to fail at times (recordings/expected-failures.json, may-pass): in
+  # 1 of 7 runs B, writing within seconds of taking over, kept two rows for
+  # some keys of this primary-keyed dataset.
   - source-exec:
       src: |
         DO $$ BEGIN FOR i IN 1..300 LOOP
