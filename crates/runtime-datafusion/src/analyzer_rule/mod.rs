@@ -19,6 +19,9 @@ pub use duplicate_plan_node::*;
 pub mod exact_float_decimal_cast;
 pub use exact_float_decimal_cast::ExactFloatLiteralDecimalCast;
 
+pub mod round_decimal_places_literal;
+pub use round_decimal_places_literal::RoundDecimalPlacesLiteral;
+
 pub mod partitioned_table_scan_rewrite;
 pub use partitioned_table_scan_rewrite::*;
 
@@ -72,6 +75,13 @@ impl AnalyzerRulesBuilder {
         // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
         rules.extend([
             Arc::new(ResolveGroupingFunction::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
+            // Before type coercion: `round`'s decimal return type is only
+            // `Decimal(p, decimal_places)` when `decimal_places` is a literal.
+            // SQL integers are `Int64`, so coercion would wrap them as
+            // `CAST(Int64(n) AS Int32)` and analysis would report
+            // `Decimal(p+1, s)` while execution produces `Decimal(p, n)`
+            // (#15652, #15708; spiceai/datafusion#273).
+            Arc::new(RoundDecimalPlacesLiteral::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
             Arc::new(TypeCoercion::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
             // After coercion has placed the float-literal-to-decimal casts, and
             // before the optimizer folds them inexactly (#14970).

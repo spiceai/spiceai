@@ -3995,6 +3995,118 @@ mod tests {
         assert_eq!(field.data_type(), &DataType::Decimal128(22, 2));
     }
 
+    /// #15652 / #15708: `COALESCE(ROUND(decimal), 0)` must advertise the same
+    /// decimal type Flight streams, and return `0.00` for a NULL / empty input.
+    #[tokio::test]
+    async fn get_schema_matches_streamed_schema_for_coalesce_round_decimal() {
+        const CASES: [(&str, &str); 3] = [
+            (
+                "SELECT coalesce(round(x,2),0) AS v FROM (VALUES (CAST(NULL AS DECIMAL(25,2)))) t(x)",
+                "0.00",
+            ),
+            (
+                "SELECT coalesce(round(sum(x),2),0) FROM (VALUES (CAST(1.5 AS DECIMAL(15,2)))) t(x) WHERE x < 0",
+                "0.00",
+            ),
+            (
+                "SELECT coalesce(round(CAST(NULL AS DECIMAL(25,2)),2),0)",
+                "0.00",
+            ),
+        ];
+
+        for (sql, expected) in CASES {
+            let (advertised, streamed, pretty) = advertised_and_streamed(sql).await;
+            let advertised_types: Vec<_> = advertised
+                .fields()
+                .iter()
+                .map(|field| field.data_type().clone())
+                .collect();
+            let streamed_types: Vec<_> = streamed
+                .fields()
+                .iter()
+                .map(|field| field.data_type().clone())
+                .collect();
+            assert_eq!(
+                advertised_types, streamed_types,
+                "GetFlightInfo schema must match the streamed schema for `{sql}`:\nadvertised={advertised:?}\nstreamed={streamed:?}"
+            );
+            assert!(
+                matches!(advertised.field(0).data_type(), DataType::Decimal128(_, 2)),
+                "`{sql}` should be Decimal128(_, 2), got {:?}",
+                advertised.field(0).data_type()
+            );
+            assert!(
+                pretty.contains(expected),
+                "`{sql}` should contain {expected}, got:\n{pretty}"
+            );
+        }
+    }
+
+    /// #15652: `round(decimal, 2)` must advertise `Decimal(p, 2)`, not
+    /// `Decimal(p+1, s)`, matching the batches Flight streams.
+    #[tokio::test]
+    async fn get_schema_matches_streamed_schema_for_decimal_round() {
+        for sql in [
+            "SELECT round(CAST(2.345 AS DECIMAL(10,3)), 2) AS x",
+            "SELECT round(x, 2) AS x FROM (VALUES (CAST(1.255 AS DECIMAL(10,3)))) t(x)",
+            "SELECT round(avg(x), 2) AS x FROM (VALUES (CAST(1.25 AS DECIMAL(10,2))), (2.50)) t(x)",
+        ] {
+            let (advertised, streamed, _pretty) = advertised_and_streamed(sql).await;
+            let advertised_types: Vec<_> = advertised
+                .fields()
+                .iter()
+                .map(|field| field.data_type().clone())
+                .collect();
+            let streamed_types: Vec<_> = streamed
+                .fields()
+                .iter()
+                .map(|field| field.data_type().clone())
+                .collect();
+            assert_eq!(
+                advertised_types, streamed_types,
+                "GetFlightInfo schema must match the streamed schema for `{sql}`:\nadvertised={advertised:?}\nstreamed={streamed:?}"
+            );
+        }
+    }
+
+    async fn advertised_and_streamed(sql: &str) -> (Schema, Schema, String) {
+        use futures::StreamExt as _;
+
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+
+        let (advertised, _) = QueryBuilder::new(sql, Arc::clone(&df))
+            .build()
+            .get_schema()
+            .await
+            .unwrap_or_else(|error| panic!("schema for `{sql}`: {error}"));
+
+        let mut query = QueryBuilder::new(sql, df)
+            .build()
+            .run()
+            .await
+            .unwrap_or_else(|error| panic!("run `{sql}`: {error}"));
+        let streamed = query.data.schema().as_ref().clone();
+        let mut batches = Vec::new();
+        while let Some(batch) = query.data.next().await {
+            batches.push(batch.unwrap_or_else(|error| panic!("batch for `{sql}`: {error}")));
+        }
+        assert!(
+            !batches.is_empty(),
+            "expected a result batch for `{sql}` so the schema check is not vacuous"
+        );
+        let pretty = arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("pretty format")
+            .to_string();
+        (advertised, streamed, pretty)
+    }
+
     /// A leaked `x-session-id` must not let `GetFlightInfo` resolve
     /// against another principal's session (and then cache that plan
     /// under the caller's namespace).
