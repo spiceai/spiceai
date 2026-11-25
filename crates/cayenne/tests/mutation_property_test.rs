@@ -51,7 +51,7 @@ limitations under the License.
 
 use crate::common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -63,13 +63,14 @@ use common::{BackendType, TestFixture};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::execution::context::SessionContext;
+use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::{Expr, col, lit};
 use datafusion_expr::dml::InsertOp;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
+use futures::StreamExt;
 
 /// Slot advancer that arms `cdc_durability: memory` deferral in tests (the
 /// runtime installs the real one on the first replayable committer). Without it
@@ -567,11 +568,9 @@ async fn settle_protected_maintenance_only(
     Ok(())
 }
 
-/// Prepare enough warm-tier files for a cold-promotion.
-async fn materialize_warm_files_for_cold_promotion(
-    table: &Arc<CayenneTableProvider>,
-    durability: Durability,
-) -> TestResult<()> {
+/// Makes every write so far durable in files: a memory-tier checkpoint, or the
+/// post-write maintenance of a durable write. A cold promotion needs these files.
+async fn checkpoint(table: &Arc<CayenneTableProvider>, durability: Durability) -> TestResult<()> {
     table.flush_pending_maintenance().await?;
     if durability == Durability::Memory {
         table.checkpoint_mem_tier().await?;
@@ -584,21 +583,9 @@ async fn read_rows(ctx: &SessionContext, name: &str) -> TestResult<Model> {
         .sql(&format!("SELECT id, value FROM {name} ORDER BY id"))
         .await?;
     let mut model = Model::new();
-    for b in &df.collect().await? {
-        let ids = b
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("id");
-        let vals = b
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("value");
-        for i in 0..b.num_rows() {
-            if model.insert(ids.value(i), vals.value(i)).is_some() {
-                model.insert(ids.value(i), i64::MIN); // duplicate sentinel
-            }
+    for (id, value) in df.collect().await?.iter().flat_map(batch_rows) {
+        if model.insert(id, value).is_some() {
+            model.insert(id, i64::MIN); // duplicate sentinel
         }
     }
     Ok(model)
@@ -965,7 +952,7 @@ async fn run_sequential(
             }
             Op::MoveToColdTier => {
                 // Durable warm files must exist for the trigger to fire.
-                materialize_warm_files_for_cold_promotion(&table, w.durability).await?;
+                checkpoint(&table, w.durability).await?;
                 // `Ok(false)` (warm tier below threshold) is fine.
                 let _ = table.promote_warm_to_cold().await?;
                 // Then the datalake merge and GC, serialized in the same task —
@@ -1154,7 +1141,7 @@ async fn run_concurrent(
                 // serialized after promote (production order); see the
                 // sequential arm.
                 let t = handle.read().await;
-                materialize_warm_files_for_cold_promotion(&t, w.durability).await?;
+                checkpoint(&t, w.durability).await?;
                 let _ = t.promote_warm_to_cold().await?;
                 let _ = t.compact_cold_tier().await?;
                 t.run_cold_tier_gc_tick().await;
@@ -2041,6 +2028,269 @@ async fn delete_after_max_cutoff_prune_and_merge_applies_impl(f: TestFixture) ->
     Ok(())
 }
 test_on_data_store!(delete_after_max_cutoff_prune_and_merge_applies_impl);
+
+// --- Older readers across delete and reinsert of the same keys ---
+//
+// A scan reads the table as it was when it was planned. Readers are held while
+// a history deletes keys, checkpoints, reinserts the same keys with new values,
+// checkpoints again, runs the compaction passes and a full rewrite, and sweeps
+// retired files within the retention. Each reader must then return exactly the
+// rows of its snapshot, while a new query, and a reopened table, return the rows
+// after the history.
+
+/// The rows of a batch of `SELECT id, value`.
+fn batch_rows(batch: &RecordBatch) -> Vec<(i64, i64)> {
+    let column = |index: usize| {
+        batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("an Int64 column")
+    };
+    let (ids, values) = (column(0), column(1));
+    (0..batch.num_rows())
+        .map(|row| (ids.value(row), values.value(row)))
+        .collect()
+}
+
+/// Two readers of one snapshot: a planned query that has not started, and a
+/// started one that has returned its first batch.
+struct HeldReaders {
+    /// The rows of the snapshot.
+    expected: Vec<(i64, i64)>,
+    ctx: SessionContext,
+    plan: Arc<dyn datafusion_physical_plan::ExecutionPlan>,
+    stream: SendableRecordBatchStream,
+    first_batch: Vec<(i64, i64)>,
+}
+
+impl HeldReaders {
+    async fn start(
+        table: &Arc<CayenneTableProvider>,
+        name: &str,
+        model: &Model,
+    ) -> TestResult<Self> {
+        // One partition and small batches, so the started query still has
+        // batches to read after its first one.
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_target_partitions(1)
+                .with_batch_size(64),
+        );
+        ctx.register_table(name, Arc::clone(table) as Arc<dyn TableProvider>)?;
+        let query = ctx.sql(&format!("SELECT id, value FROM {name}")).await?;
+        let plan = query.clone().create_physical_plan().await?;
+        let mut stream = query.execute_stream().await?;
+        let first = stream
+            .next()
+            .await
+            .ok_or("the started query returned no batch")??;
+        Ok(Self {
+            expected: model.iter().map(|(&k, &v)| (k, v)).collect(),
+            ctx,
+            plan,
+            stream,
+            first_batch: batch_rows(&first),
+        })
+    }
+
+    /// Runs both readers to the end and checks each returned exactly the rows
+    /// of its snapshot.
+    async fn finish(mut self, label: &str) -> TestResult<()> {
+        let expected = self.expected;
+        assert!(
+            !self.first_batch.is_empty() && self.first_batch.len() < expected.len(),
+            "{label}: the started query must have rows left to read after its first batch \
+             ({} of {})",
+            self.first_batch.len(),
+            expected.len()
+        );
+        let mut planned: Vec<(i64, i64)> =
+            datafusion_physical_plan::collect(self.plan, self.ctx.task_ctx())
+                .await?
+                .iter()
+                .flat_map(batch_rows)
+                .collect();
+        planned.sort_unstable();
+        assert_eq!(planned, expected, "{label}: the planned query's rows");
+        let mut started = self.first_batch;
+        while let Some(batch) = self.stream.next().await {
+            started.extend(batch_rows(&batch?));
+        }
+        started.sort_unstable();
+        assert_eq!(started, expected, "{label}: the started query's rows");
+        Ok(())
+    }
+}
+
+/// `count` distinct keys of `model`, including every key of `always`.
+fn pick_keys(rng: &mut Rng, model: &Model, count: usize, always: &[i64]) -> BTreeSet<i64> {
+    let keys: Vec<i64> = model.keys().copied().collect();
+    let mut picked: BTreeSet<i64> = always.iter().copied().collect();
+    while picked.len() < count {
+        let index = rng.below(u64::try_from(keys.len()).expect("key count fits u64"));
+        picked.insert(keys[usize::try_from(index).expect("index fits usize")]);
+    }
+    picked
+}
+
+async fn delete_keys(
+    table: &Arc<CayenneTableProvider>,
+    keys: &BTreeSet<i64>,
+    durability: Durability,
+) -> TestResult<()> {
+    match durability {
+        Durability::File => {
+            let deleted = delete_filter(
+                table,
+                col("id").in_list(keys.iter().map(|&k| lit(k)).collect(), false),
+            )
+            .await?;
+            assert_eq!(
+                deleted,
+                u64::try_from(keys.len()).expect("key count fits u64"),
+                "rows deleted"
+            );
+        }
+        Durability::Memory => {
+            let keys: Vec<i64> = keys.iter().copied().collect();
+            table
+                .write_cdc_delete_keys_in_memory(&id_batch(&keys))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// The passes a compaction trigger can run, then a retired-file sweep that keeps
+/// each retired file for the retention. Each pass applies its own trigger, so
+/// on files this small only the seq-prefix bake of a key-delete table commits.
+async fn maintain(table: &Arc<CayenneTableProvider>) -> TestResult<()> {
+    table.bake_seq_prefix_protected_snapshots().await?;
+    table.maybe_compact_small_files().await?;
+    table.compact_protected_snapshots_subset(usize::MAX).await?;
+    table.sweep_retired_files_now().await;
+    Ok(())
+}
+
+async fn older_readers_across_delete_and_reinsert(
+    f: &TestFixture,
+    mode: Mode,
+    durability: Durability,
+    seed: u64,
+) -> TestResult<()> {
+    const KEYS: i64 = 1_200;
+    const LOADS: i64 = 3;
+    let name = format!("older_readers_{mode:?}_{durability:?}_{seed}").to_lowercase();
+    let label = format!("mode={mode:?} durability={durability:?} seed={seed}");
+    let (table, ctx) = create_table(f, &name, mode, durability, None, false).await?;
+    let mut rng = Rng::new(seed);
+    let mut model = Model::new();
+
+    // Three loads; on the memory tier the last stays in memory, so the first
+    // readers hold rows from files and from the memory tier.
+    for load in 0..LOADS {
+        let rows: Vec<(i64, i64)> = (load * KEYS / LOADS..(load + 1) * KEYS / LOADS)
+            .map(|id| (id, rng.below_i64(VALUE_SPACE)))
+            .collect();
+        upsert(&table, &rows, durability).await?;
+        model.extend(rows);
+        if load + 1 < LOADS {
+            checkpoint(&table, durability).await?;
+        }
+    }
+    let first_readers = HeldReaders::start(&table, &name, &model).await?;
+
+    // Delete keys from a file and from the last load, checkpoint, reinsert them
+    // with new values, checkpoint and maintain.
+    let deleted = pick_keys(&mut rng, &model, 40, &[7, KEYS - 7]);
+    delete_keys(&table, &deleted, durability).await?;
+    for key in &deleted {
+        model.remove(key);
+    }
+    checkpoint(&table, durability).await?;
+    let reinserted: Vec<(i64, i64)> = deleted
+        .iter()
+        .map(|&k| (k, VALUE_SPACE + rng.below_i64(VALUE_SPACE)))
+        .collect();
+    upsert(&table, &reinserted, durability).await?;
+    model.extend(reinserted.iter().copied());
+    checkpoint(&table, durability).await?;
+    maintain(&table).await?;
+    assert_converged_no_duplicates(&ctx, &name, &model, &format!("{label}: after round 1")).await?;
+
+    let second_readers = HeldReaders::start(&table, &name, &model).await?;
+
+    // Delete reinserted keys and others again, checkpoint, reinsert some of them
+    // and new keys, checkpoint and maintain.
+    let mut deleted: BTreeSet<i64> = deleted.into_iter().step_by(2).collect();
+    deleted.extend(pick_keys(&mut rng, &model, 20, &[7, KEYS - 7]));
+    delete_keys(&table, &deleted, durability).await?;
+    for key in &deleted {
+        model.remove(key);
+    }
+    checkpoint(&table, durability).await?;
+    let mut keys: BTreeSet<i64> = deleted
+        .iter()
+        .copied()
+        .filter(|&k| k != KEYS - 7)
+        .step_by(2)
+        .collect();
+    keys.extend([7, KEYS + 1, KEYS + 2]);
+    let reinserted: Vec<(i64, i64)> = keys
+        .into_iter()
+        .map(|k| (k, 2 * VALUE_SPACE + rng.below_i64(VALUE_SPACE)))
+        .collect();
+    upsert(&table, &reinserted, durability).await?;
+    model.extend(reinserted.iter().copied());
+    checkpoint(&table, durability).await?;
+    maintain(&table).await?;
+    // The table's files are too small for the triggered passes to rewrite them,
+    // so a full rewrite replaces every file both sets of readers hold.
+    assert!(
+        table.force_full_compaction().await?,
+        "{label}: the full rewrite must commit while the readers are held"
+    );
+    table.sweep_retired_files_now().await;
+
+    first_readers
+        .finish(&format!("{label}: readers before round 1"))
+        .await?;
+    second_readers
+        .finish(&format!("{label}: readers before round 2"))
+        .await?;
+    assert_converged_no_duplicates(&ctx, &name, &model, &format!("{label}: after round 2")).await?;
+
+    table.elapse_data_file_retention();
+    table.sweep_retired_files_now().await;
+    assert_converged_no_duplicates(&ctx, &name, &model, &format!("{label}: after the sweep"))
+        .await?;
+
+    table.quiesce().await;
+    let (_reopened, reopened_ctx) = reopen_table(f, &name).await?;
+    assert_converged_no_duplicates(&reopened_ctx, &name, &model, &format!("{label}: reopened"))
+        .await?;
+    Ok(())
+}
+
+async fn older_readers(f: &TestFixture, mode: Mode, durability: Durability) -> TestResult<()> {
+    for seed in [16_139, 2] {
+        older_readers_across_delete_and_reinsert(f, mode, durability, seed).await?;
+    }
+    Ok(())
+}
+async fn older_readers_key_file_impl(f: TestFixture) -> TestResult<()> {
+    older_readers(&f, Mode::Key, Durability::File).await
+}
+async fn older_readers_key_memory_impl(f: TestFixture) -> TestResult<()> {
+    older_readers(&f, Mode::Key, Durability::Memory).await
+}
+async fn older_readers_auto_file_impl(f: TestFixture) -> TestResult<()> {
+    older_readers(&f, Mode::Auto, Durability::File).await
+}
+test_on_data_store!(older_readers_key_file_impl);
+test_on_data_store!(older_readers_key_memory_impl);
+test_on_data_store!(older_readers_auto_file_impl);
 
 // --- Concurrent pure-upsert convergence (GREEN control: loss needs deletes) ---
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
