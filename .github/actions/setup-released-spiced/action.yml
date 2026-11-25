@@ -1,9 +1,11 @@
 name: Setup released spiced
-description: 'Installs the spiced a release published, verified against its SHA-256 digest'
+description: 'Installs the spiced a release published, once its archive is verified'
 
-# GitHub publishes asset digests only from v1.3.2 on; an earlier release has none to verify
-# against and is refused. Release binaries are built without ODBC and without the PostgreSQL
-# accelerator, so a spicepod that needs either is refused rather than run without it.
+# The archive must match the digest .github/release-digests.json records for a release published
+# before SHA256SUMS, or else the release's SHA256SUMS, with SHA256SUMS and the archive each
+# carrying a build attestation from build_release.yml on a release branch, for the commit the tag
+# names. Any other release is refused. Release binaries are built without ODBC and without the
+# PostgreSQL accelerator, so a spicepod that needs either is refused rather than run without it.
 inputs:
   release:
     description: 'Release tag, e.g. v2.1.0'
@@ -16,25 +18,30 @@ inputs:
     required: false
     default: 'false'
   github_token:
-    description: 'Token that can read the release'
+    description: 'Token that can read the release and its attestations'
     required: true
 outputs:
   SPICED_COMMIT:
     description: 'Commit the release tag points to'
-    value: ${{ steps.install.outputs.SPICED_COMMIT }}
+    value: ${{ steps.find.outputs.SPICED_COMMIT }}
 runs:
   using: 'composite'
   steps:
-    - name: Install the released spiced
-      id: install
+    - name: Download the released spiced
+      id: find
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github_token }}
         RELEASE: ${{ inputs.release }}
         SPICEPOD_FILE: ${{ inputs.spicepod_file }}
         WITH_ODBC: ${{ inputs.with_odbc }}
+        DIGESTS: ${{ github.action_path }}/../../release-digests.json
       run: |
         set -euo pipefail
+        if ! [[ "${RELEASE}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.?[0-9]+)?$ ]]; then
+          echo "::error::'${RELEASE}' is not a release tag such as v2.1.0"
+          exit 1
+        fi
         if [ "${WITH_ODBC}" = "true" ]; then
           echo "::error::Release binaries are built without ODBC; benchmark ${RELEASE} with ODBC from a commit or branch build instead"
           exit 1
@@ -46,23 +53,82 @@ runs:
         api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
         auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json")
         asset="spiced_linux_x86_64.tar.gz"
-        release_asset="$(curl -fsSL "${auth[@]}" "${api}/releases/tags/${RELEASE}" \
-          | python3 -c 'import json,sys; a = next((a for a in json.load(sys.stdin)["assets"] if a["name"] == sys.argv[1]), {}); print(a.get("id") or "-", a.get("digest") or "-")' "${asset}")"
-        read -r asset_id digest <<< "${release_asset}"
+        dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/released-spiced.XXXXXX")"
+        curl -fsSL "${auth[@]}" "${api}/releases/tags/${RELEASE}" > "${dir}/release.json"
+        ids="$(python3 -c 'import json,sys; a = {x["name"]: x["id"] for x in json.load(open(sys.argv[1]))["assets"]}; print(a.get(sys.argv[2], "-"), a.get("SHA256SUMS", "-"))' "${dir}/release.json" "${asset}")"
+        read -r asset_id sums_id <<< "${ids}"
         if [ "${asset_id}" = "-" ]; then
           echo "::error::${RELEASE} has no ${asset}"
           exit 1
         fi
-        case "${digest}" in
-          sha256:*) ;;
-          *) echo "::error::${RELEASE} has no published SHA-256 digest for ${asset}, so its binary cannot be verified; benchmark it from a commit or branch build instead"; exit 1 ;;
-        esac
-        curl -fsSL --retry 3 -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" \
-          -o "${asset}" "${api}/releases/assets/${asset_id}"
-        echo "${digest#sha256:}  ${asset}" | sha256sum --check
-        tar -xzf "${asset}" spiced
-        sudo cp ./spiced /usr/local/bin/spiced
-        spiced --version
+        get() {
+          curl -fsSL --retry 3 -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" \
+            -o "$2" "${api}/releases/assets/$1"
+        }
+        get "${asset_id}" "${dir}/${asset}"
+        if [ "${sums_id}" != "-" ]; then
+          get "${sums_id}" "${dir}/SHA256SUMS"
+          expected="$(awk -v f="${asset}" '$2 == f || $2 == "*" f { print $1 }' "${dir}/SHA256SUMS")"
+          attested=true
+          source="the SHA256SUMS of ${RELEASE}"
+        else
+          expected="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["releases"].get(sys.argv[2], {}).get(sys.argv[3], ""))' "${DIGESTS}" "${RELEASE}" "${asset}")"
+          attested=false
+          source=".github/release-digests.json"
+        fi
+        if ! [[ "${expected}" =~ ^[0-9a-f]{64}$ ]]; then
+          echo "::error::${RELEASE} has no SHA256SUMS listing ${asset} and no digest for it in .github/release-digests.json, so its spiced cannot be verified; not running it"
+          exit 1
+        fi
+        actual="$(sha256sum "${dir}/${asset}" | cut -d ' ' -f 1)"
+        if [ "${actual}" != "${expected}" ]; then
+          echo "::error::${asset} of ${RELEASE} has SHA-256 ${actual}, not ${expected} from ${source}; not running it"
+          exit 1
+        fi
+        echo "${asset} of ${RELEASE} matches ${source}."
         commit="$(curl -fsSL "${auth[@]}" "${api}/commits/${RELEASE}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')"
-        echo "SPICED_COMMIT=${commit}"
-        echo "SPICED_COMMIT=${commit}" >> "${GITHUB_OUTPUT}"
+        if ! [[ "${commit}" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::error::Could not read the commit ${RELEASE} names"
+          exit 1
+        fi
+        {
+          echo "archive=${dir}/${asset}"
+          echo "sums=${dir}/SHA256SUMS"
+          echo "attested=${attested}"
+          echo "SPICED_COMMIT=${commit}"
+        } >> "${GITHUB_OUTPUT}"
+
+    - name: Verify SHA256SUMS's build attestation
+      if: steps.find.outputs.attested == 'true'
+      uses: $/.github/actions/verify-attestation
+      with:
+        file: ${{ steps.find.outputs.sums }}
+        release: 'true'
+        source-commit: ${{ steps.find.outputs.SPICED_COMMIT }}
+        token: ${{ inputs.github_token }}
+
+    - name: Verify the archive's build attestation
+      if: steps.find.outputs.attested == 'true'
+      uses: $/.github/actions/verify-attestation
+      with:
+        file: ${{ steps.find.outputs.archive }}
+        release: 'true'
+        source-commit: ${{ steps.find.outputs.SPICED_COMMIT }}
+        token: ${{ inputs.github_token }}
+
+    - name: Install the released spiced
+      shell: bash
+      env:
+        ARCHIVE: ${{ steps.find.outputs.archive }}
+        SPICED_COMMIT: ${{ steps.find.outputs.SPICED_COMMIT }}
+      run: |
+        set -euo pipefail
+        dir="$(dirname "${ARCHIVE}")"
+        tar -xzf "${ARCHIVE}" -C "${dir}" spiced
+        if [ ! -f "${dir}/spiced" ] || [ -L "${dir}/spiced" ]; then
+          echo "::error::${ARCHIVE} holds no spiced"
+          exit 1
+        fi
+        sudo cp "${dir}/spiced" /usr/local/bin/spiced
+        spiced --version
+        echo "SPICED_COMMIT=${SPICED_COMMIT}"

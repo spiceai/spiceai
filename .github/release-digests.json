@@ -1,0 +1,25 @@
+{
+  "description": "SHA-256 digests of the spiced archives of releases published before SHA256SUMS. A CI job runs such a release's spiced (spicescript's `from:` base releases, a release tag as a benchmark's spiced_ref) only when its archive matches the digest here. A release with a SHA256SUMS asset is checked against that file and its build attestation instead. Each digest is the one GitHub recorded when the release workflow (github-actions[bot]) uploaded the asset, which was never replaced.",
+  "releases": {
+    "v2.3.4": {
+      "spiced_darwin_aarch64.tar.gz": "ea6e3ec4525f12da859e77a09a11cb98542b2b7a0b4ad74e1ebf55674883be54",
+      "spiced_linux_aarch64.tar.gz": "803bc9e2b03b2aa72351bac38ddc061ccbdf88880a1c4b509e1c8fb83eda62eb",
+      "spiced_linux_x86_64.tar.gz": "8514120733a1fcdf9aad9c7a8ee306f71aa7ab727d34aab0b24acea1a7a1a8a4"
+    },
+    "v2.4.1": {
+      "spiced_darwin_aarch64.tar.gz": "97286123bc63d858ea0eb2dfe6d423f376d774cf8aae7a777ced268ebd0cf80b",
+      "spiced_linux_aarch64.tar.gz": "d9864abfe967ff1288bb19e5bc5275d22668cbf331a499e36fbd4ffcee962e7c",
+      "spiced_linux_x86_64.tar.gz": "1701c81dee93632e8e57f27ffd597a1c2a24c25c83b376e15cafac973fffc5b3"
+    },
+    "v2.4.2": {
+      "spiced_darwin_aarch64.tar.gz": "7a6e7451412c1c9e013a20f196a2b5867d3e265427c04bd87515063ee323e879",
+      "spiced_linux_aarch64.tar.gz": "97c8e06ede4e1c3267e0b2501d881065a624674deb339a6391ca27921c99709b",
+      "spiced_linux_x86_64.tar.gz": "0da1ab975d3f103c876d94c4a32918ff64f4fef3edf5b2207a65191ab47a06c4"
+    },
+    "v2.4.3": {
+      "spiced_darwin_aarch64.tar.gz": "cd04f1900d5a0c7a6c9946ab55ffbbb65f33e5564100286bece6b13a13d3d8e2",
+      "spiced_linux_aarch64.tar.gz": "a31af19780d9c05a03eb97e0dd647f723750b9473edec6d8226f6a40713b3185",
+      "spiced_linux_x86_64.tar.gz": "8b394694b1f91a90a6f933600bf52832ae793118328df5b5faa2b519ba8d091f"
+    }
+  }
+}

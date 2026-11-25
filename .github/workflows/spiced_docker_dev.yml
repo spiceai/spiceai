@@ -135,6 +135,13 @@ jobs:
           echo "revision=${revision}" >> "$GITHUB_OUTPUT"
           echo "on_trunk=${on_trunk}" >> "$GITHUB_OUTPUT"
           echo "Provenance: revision=${revision} on_trunk=${on_trunk} ref_type=${GITHUB_REF_TYPE} ref_name=${GITHUB_REF_NAME}"
+          # The build jobs hold this run's OIDC token, which on trunk is trunk's store and
+          # registry identity, so a trunk run builds only trunk's code. Build another ref's
+          # commit from a run on that ref.
+          if [ "$GITHUB_REF" = refs/heads/trunk ] && [ "$on_trunk" != true ]; then
+            echo "::error::This run is on trunk, so it builds only a commit on trunk, and ${revision} is not one (within trunk's last 100 commits). Dispatch spiced_docker_dev on the branch that has it."
+            exit 1
+          fi
 
       - name: Set target architectures
         id: set_targets
@@ -208,6 +215,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
 
       - name: Add dev postfix to version in Cargo.toml
         env:
@@ -303,6 +311,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
 
       - name: Add dev postfix to version in Cargo.toml
         env:

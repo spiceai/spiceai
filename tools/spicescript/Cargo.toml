@@ -33,6 +33,7 @@ parquet = { workspace = true, features = ["arrow"] }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 regex.workspace = true
 secrecy.workspace = true
+sha2.workspace = true
 reqwest.workspace = true
 result-compare = { path = "../../crates/result-compare" }
 serde.workspace = true

@@ -3198,8 +3198,10 @@ jobs:
 
       # Upgrade scripts start on the release their `from:` names and upgrade
       # to this build: spicescript resolves `X.Y.x` against the GitHub releases
-      # and downloads each release it needs into ~/.cache/spicescript, so no
-      # `--from` is passed here. The token is for the releases API's rate limit.
+      # and downloads each release it needs into ~/.cache/spicescript, running it
+      # only once it is verified (tools/spicescript/README.md), so no `--from` is
+      # passed here. The token is for the releases API's rate limit and the
+      # attestation check.
       - name: Run scenario scripts
         if: ${{ !matrix.changed }}
         env:

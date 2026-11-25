@@ -76,7 +76,12 @@ jobs:
           spiced_ref="${INPUT_SPICED_REF}"
           spiced_sha="$(git rev-parse HEAD)"
           spiced_sha_short="$(git rev-parse --short=12 HEAD)"
-          image_tag="trunk-${spiced_sha_short}"
+          # Only a trunk run builds and names a `trunk-` image (spiced_docker_dev builds only a
+          # trunk commit there); another ref's run names its image `dev-`.
+          case "$GITHUB_REF" in
+            refs/heads/trunk) image_tag="trunk-${spiced_sha_short}" ;;
+            *) image_tag="dev-${spiced_sha_short}" ;;
+          esac
           need_build="true"
 
           if [ -n "${CUSTOM_IMAGE_TAG}" ]; then

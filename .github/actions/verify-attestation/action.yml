@@ -4,15 +4,23 @@ description: >-
   `signer-workflow` made on trunk (`gh attestation verify --repo <this repository>
   --signer-workflow <it> --source-ref refs/heads/trunk`). A job with the full CI roles runs it on
   every binary or archive it downloads from the CI object store, before running it: anything
-  built off trunk, or not attested at all, fails here.
+  built off trunk, or not attested at all, fails here. Given `release: true` instead, the file
+  must carry the attestation a published release's files carry: `build_release.yml` on a release
+  branch, on a GitHub-hosted runner (`--cert-identity-regex ... --deny-self-hosted-runners`, as
+  the install scripts check it).
 
 inputs:
   file:
     description: The downloaded file.
     required: true
   signer-workflow:
-    description: The workflow that builds and attests it on trunk, e.g. `.github/workflows/build_release.yml`.
-    required: true
+    description: The workflow that builds and attests it on trunk, e.g. `.github/workflows/build_release.yml`. Not used with `release`.
+    required: false
+    default: ''
+  release:
+    description: '`true` for a file of a published release, attested by build_release.yml on a release branch.'
+    required: false
+    default: 'false'
   source-commit:
     description: The commit the file must have been built from (`--source-digest`), so an older trunk build cannot stand in for it.
     required: false
@@ -30,6 +38,7 @@ runs:
       env:
         FILE: ${{ inputs.file }}
         SIGNER_WORKFLOW: ${{ inputs.signer-workflow }}
+        RELEASE: ${{ inputs.release }}
         SOURCE_COMMIT: ${{ inputs.source-commit }}
         GH_TOKEN: ${{ inputs.token }}
       run: |
@@ -40,6 +49,27 @@ runs:
         fi
         if ! command -v gh >/dev/null 2>&1; then
           echo "::error::The GitHub CLI (gh) is not installed on this runner, so $FILE's attestation cannot be verified; not running it."
+          exit 1
+        fi
+        if [ "$RELEASE" = true ]; then
+          if [ -n "$SIGNER_WORKFLOW" ]; then
+            echo "::error::verify-attestation: give signer-workflow or release, not both."
+            exit 1
+          fi
+          # Every published release file is attested by build_release.yml on a release branch.
+          repository_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY}"
+          identity="^${repository_url//./\\.}/\\.github/workflows/build_release\\.yml@refs/heads/release/"
+          if ! out="$(gh attestation verify "$FILE" --repo "$GITHUB_REPOSITORY" \
+            --cert-identity-regex "$identity" --deny-self-hosted-runners ${SOURCE_COMMIT:+--source-digest "$SOURCE_COMMIT"} 2>&1)"; then
+            printf '%s\n' "$out"
+            echo "::error::$FILE has no build attestation from build_release.yml on a release branch; not running it."
+            exit 1
+          fi
+          echo "$FILE: attested by build_release.yml on a release branch."
+          exit 0
+        fi
+        if [ -z "$SIGNER_WORKFLOW" ]; then
+          echo "::error::verify-attestation: signer-workflow is required."
           exit 1
         fi
         signer="${GITHUB_REPOSITORY}/${SIGNER_WORKFLOW#./}"

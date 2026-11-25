@@ -47,11 +47,12 @@ class VerifyAttestationTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertTrue(self.calls.read_text().rstrip("\n").endswith("--source-ref refs/heads/trunk --source-digest 0123abc"))
 
-    def verify(self, file=None, gh_exit=0, source_commit=""):
+    def verify(self, file=None, gh_exit=0, source_commit="", signer=".github/workflows/build_release.yml", release="false"):
         env = {
             "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
             "FILE": str(file or self.file),
-            "SIGNER_WORKFLOW": ".github/workflows/build_release.yml",
+            "SIGNER_WORKFLOW": signer,
+            "RELEASE": release,
             "GITHUB_REPOSITORY": "spiceai/spiceai",
             "GH_TOKEN": "a-token",
             "FAKE_GH_EXIT": str(gh_exit),
@@ -68,6 +69,27 @@ class VerifyAttestationTest(unittest.TestCase):
             "spiceai/spiceai/.github/workflows/build_release.yml --source-ref refs/heads/trunk\n",
         )
         self.assertIn("attested by spiceai/spiceai/.github/workflows/build_release.yml on trunk", proc.stdout)
+
+    def test_a_release_file_must_be_attested_on_a_release_branch_on_a_hosted_runner(self):
+        proc = self.verify(signer="", release="true", source_commit="0123abc")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(
+            self.calls.read_text(),
+            f"attestation verify {self.file} --repo spiceai/spiceai --cert-identity-regex "
+            "^https://github\\.com/spiceai/spiceai/\\.github/workflows/build_release\\.yml@refs/heads/release/ "
+            "--deny-self-hosted-runners --source-digest 0123abc\n",
+        )
+        proc = self.verify(signer="", release="true", gh_exit=1)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("has no build attestation from build_release.yml on a release branch", proc.stdout)
+
+    def test_one_signer_rule_is_required(self):
+        for signer, release, message in (("", "false", "signer-workflow is required"),
+                                         (".github/workflows/build_release.yml", "true", "not both")):
+            with self.subTest(signer=signer, release=release):
+                proc = self.verify(signer=signer, release=release)
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn(message, proc.stdout)
 
     def test_no_matching_attestation_fails_closed(self):
         # An unattested file, another signer and a branch other than trunk all fail the same way.
