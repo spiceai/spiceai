@@ -73,6 +73,17 @@ pub trait KafkaCheckpointStore: Send + Sync {
     /// Persist the whole checkpoint — metadata row and offset rows together.
     async fn upsert(&self, checkpoint: &KafkaCheckpoint) -> Result<(), CheckpointError>;
 
+    /// The stored checkpoint, recording `checkpoint` first when none is stored
+    /// and this instance may write it, so that instances starting together on
+    /// one shared state location all use the one consumer group recorded
+    /// first. `Ok(None)` when none is stored and this instance cannot record
+    /// one: it does not write the dataset (a replica), and the instance that
+    /// does records it.
+    async fn get_or_record(
+        &self,
+        checkpoint: &KafkaCheckpoint,
+    ) -> Result<Option<KafkaCheckpoint>, CheckpointError>;
+
     /// Advance only the offset rows, leaving the metadata row untouched.
     ///
     /// Each row resolves to the **greater** of the stored and the incoming offset, so

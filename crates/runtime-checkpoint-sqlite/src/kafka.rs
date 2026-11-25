@@ -74,6 +74,19 @@ impl SqliteKafkaCheckpointStore {
 
 #[async_trait]
 impl KafkaCheckpointStore for SqliteKafkaCheckpointStore {
+    /// A `SQLite` file is written by one instance only, so the first caller
+    /// always records.
+    async fn get_or_record(
+        &self,
+        checkpoint: &KafkaCheckpoint,
+    ) -> Result<Option<KafkaCheckpoint>, CheckpointError> {
+        if let Some(stored) = self.get().await? {
+            return Ok(Some(stored));
+        }
+        self.upsert(checkpoint).await?;
+        Ok(Some(checkpoint.clone()))
+    }
+
     async fn upsert(&self, checkpoint: &KafkaCheckpoint) -> Result<(), CheckpointError> {
         let pool = &self.pool;
         let metadata = checkpoint;

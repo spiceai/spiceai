@@ -477,12 +477,8 @@ impl DataConnector for Debezium {
                     connector_component: ConnectorComponent::from(dataset),
                 })?;
 
-                kafka_consumer.subscribe(topic).boxed().context(
-                    super::UnableToGetReadProviderSnafu {
-                        dataconnector: "debezium",
-                        connector_component: ConnectorComponent::from(dataset),
-                    },
-                )?;
+                // Only the instance that reads the change stream joins the group.
+                kafka_consumer.subscribe_on_read(topic);
 
                 (kafka_consumer, metadata, schema)
             }
@@ -673,13 +669,8 @@ async fn get_metadata_from_kafka(
         connector_component: ConnectorComponent::from(dataset),
     })?;
 
-    kafka_consumer
-        .subscribe(topic)
-        .boxed()
-        .context(super::UnableToGetReadProviderSnafu {
-            dataconnector: "debezium",
-            connector_component: ConnectorComponent::from(dataset),
-        })?;
+    // Only the instance that reads the change stream joins the group.
+    kafka_consumer.subscribe_on_read(topic);
 
     // Sample the schema with a temporary consumer. The real consumer is not polled
     // here: it starts each partition at the beginning when it is assigned.
@@ -717,9 +708,15 @@ async fn get_metadata_from_kafka(
                         schema_fields: vec![],
                         offsets: Vec::new(),
                     };
-                    if let Some(sys) = debezium_kafka_sys {
-                        let _ = set_metadata_to_accelerator(sys, &metadata).await;
-                    }
+                    let (kafka_consumer, metadata) = record_metadata(
+                        dataset,
+                        topic,
+                        kafka_config,
+                        debezium_kafka_sys,
+                        kafka_consumer,
+                        metadata,
+                    )
+                    .await?;
                     return Ok((kafka_consumer, metadata, Arc::clone(declared)));
                 }
                 return Err(super::DataConnectorError::UnableToGetReadProvider {
@@ -741,9 +738,15 @@ async fn get_metadata_from_kafka(
                         schema_fields: vec![],
                         offsets: Vec::new(),
                     };
-                    if let Some(sys) = debezium_kafka_sys {
-                        let _ = set_metadata_to_accelerator(sys, &metadata).await;
-                    }
+                    let (kafka_consumer, metadata) = record_metadata(
+                        dataset,
+                        topic,
+                        kafka_config,
+                        debezium_kafka_sys,
+                        kafka_consumer,
+                        metadata,
+                    )
+                    .await?;
                     return Ok((kafka_consumer, metadata, Arc::clone(declared)));
                 }
                 return Err(e).boxed().context(super::UnableToGetReadProviderSnafu {
@@ -783,17 +786,128 @@ async fn get_metadata_from_kafka(
         offsets: Vec::new(),
     };
 
-    if let Some(debezium_kafka_sys) = debezium_kafka_sys {
-        set_metadata_to_accelerator(debezium_kafka_sys, &metadata)
-            .await
-            .boxed()
-            .context(super::UnableToGetReadProviderSnafu {
-                dataconnector: "debezium",
-                connector_component: ConnectorComponent::from(dataset),
-            })?;
-    }
+    let proposed_fields = metadata.schema_fields.clone();
+    let (kafka_consumer, metadata) = record_metadata(
+        dataset,
+        topic,
+        kafka_config,
+        debezium_kafka_sys,
+        kafka_consumer,
+        metadata,
+    )
+    .await?;
+    // Another instance recorded the dataset's checkpoint first: read with the
+    // schema it recorded.
+    let schema = if metadata.schema_fields == proposed_fields {
+        schema
+    } else {
+        let inferred = debezium::arrow::convert_fields_to_arrow_schema(
+            metadata.schema_fields.iter().collect(),
+        )
+        .boxed()
+        .context(super::UnableToGetReadProviderSnafu {
+            dataconnector: "debezium",
+            connector_component: ConnectorComponent::from(dataset),
+        })?;
+        merge_inferred_and_declared_schemas(Arc::new(inferred), declared_schema)
+    };
 
     Ok((kafka_consumer, metadata, schema))
+}
+
+/// Record `proposed` as the dataset's checkpoint unless one is recorded
+/// already, and return the consumer and checkpoint to read with.
+///
+/// Instances that start together on one shared state location each propose a
+/// new consumer group; the location keeps the first one recorded, and an
+/// instance whose proposal lost reads with that group from its recorded
+/// offsets instead. A replica records nothing and keeps its proposal: it never
+/// reads the change stream, so it never joins the group, and it reloads the
+/// recorded checkpoint when it takes over writing.
+async fn record_metadata(
+    dataset: &DatasetSpec,
+    topic: &str,
+    kafka_config: &KafkaConfig,
+    debezium_kafka_sys: Option<&dyn DebeziumCheckpointStore>,
+    kafka_consumer: KafkaConsumer,
+    proposed: DebeziumKafkaMetadata,
+) -> super::DataConnectorResult<(KafkaConsumer, DebeziumKafkaMetadata)> {
+    let Some(sys) = debezium_kafka_sys else {
+        return Ok((kafka_consumer, proposed));
+    };
+    let recorded = record_metadata_to_accelerator(sys, &proposed)
+        .await
+        .boxed()
+        .context(super::UnableToGetReadProviderSnafu {
+            dataconnector: "debezium",
+            connector_component: ConnectorComponent::from(dataset),
+        })?;
+    let Some(recorded) = recorded else {
+        return Ok((kafka_consumer, proposed));
+    };
+    if recorded.consumer_group_id == proposed.consumer_group_id && recorded.offsets.is_empty() {
+        return Ok((kafka_consumer, proposed));
+    }
+    ensure!(
+        recorded.topic == topic,
+        super::InvalidConfigurationNoSourceSnafu {
+            dataconnector: "debezium",
+            message: format!(
+                "The topic has changed from {} to {topic}. The existing accelerator data may be out of date.",
+                recorded.topic
+            ),
+            connector_component: ConnectorComponent::from(dataset),
+        }
+    );
+    let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
+        &dataset.name.to_string(),
+        &recorded.consumer_group_id,
+        kafka_config,
+        &recorded.offsets,
+    )
+    .boxed()
+    .context(super::UnableToGetReadProviderSnafu {
+        dataconnector: "debezium",
+        connector_component: ConnectorComponent::from(dataset),
+    })?;
+    kafka_consumer.subscribe_on_read(topic);
+    Ok((kafka_consumer, recorded))
+}
+
+/// [`DebeziumCheckpointStore::get_or_record`], as the connector speaks it.
+async fn record_metadata_to_accelerator(
+    debezium_kafka_sys: &dyn DebeziumCheckpointStore,
+    metadata: &DebeziumKafkaMetadata,
+) -> Result<Option<DebeziumKafkaMetadata>, CheckpointError> {
+    let schema_fields_json = serde_json::to_string(&metadata.schema_fields).map_err(|source| {
+        CheckpointError::Store {
+            source: Box::new(source),
+        }
+    })?;
+    let Some(checkpoint) = debezium_kafka_sys
+        .get_or_record(&DebeziumCheckpoint {
+            consumer_group_id: metadata.consumer_group_id.clone(),
+            topic: metadata.topic.clone(),
+            primary_keys: metadata.primary_keys.clone(),
+            schema_fields_json,
+            offsets: metadata.offsets.clone(),
+        })
+        .await?
+    else {
+        return Ok(None);
+    };
+    let schema_fields = serde_json::from_str(&checkpoint.schema_fields_json).map_err(|source| {
+        CheckpointError::Store {
+            source: Box::new(source),
+        }
+    })?;
+    Ok(Some(DebeziumKafkaMetadata {
+        consumer_group_id: checkpoint.consumer_group_id,
+        topic: checkpoint.topic,
+        primary_keys: checkpoint.primary_keys,
+        schema_fields,
+        offsets: checkpoint.offsets,
+    }))
 }
 
 /// Peek at the most recent message on `topic` using a temporary consumer.

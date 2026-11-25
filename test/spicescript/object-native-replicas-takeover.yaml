@@ -1,0 +1,737 @@
+name: object-native-replicas-takeover
+tags: [long]
+description: >
+  The setup of object-native-replicas.yaml, over each change source a writer
+  consumes: PostgreSQL replication, a Kafka topic in append mode, Debezium
+  through Kafka, and S3 event notifications through SQS. Two instances share
+  one state location; the first to start writes, and the other takes over when
+  the writer dies at the boundary between committing to the location and
+  acknowledging the source. Every change is applied exactly once across the
+  takeover: each answer is checked against PostgreSQL, which holds the same
+  rows, and a count of distinct keys beside the row count catches a record
+  applied twice in append mode.
+
+sources:
+  # The oracle for every source, and the source itself for `postgres` and
+  # `debezium`. One database for both instances: they share its slot.
+  src: { kind: postgres, shared: true }
+  # Its shared bucket holds the state location both instances use.
+  lake: { kind: rustfs }
+  # A forwarder that instance A alone reaches the state location through, so
+  # pausing it cuts A off from the location while B and the sources stay
+  # reachable. Started by the first step.
+  cut:
+    kind: docker
+    image: docker.io/library/python:3.12-alpine
+    ports: [9000]
+    command: [sleep, infinity]
+    ready: 'true'
+  # One topic per run, which both instances read. Three listeners: Debezium,
+  # in a container, reaches the broker as host.docker.internal; spiced, on the
+  # host, as 127.0.0.1; rpk, in the broker's container, as 127.0.0.1:9093.
+  kafka:
+    kind: docker
+    shared: true
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.6
+    ports: [9092, 19092]
+    command: [redpanda, start, --smp, '1', --overprovisioned, --node-id, '0', --mode, dev-container,
+      --kafka-addr, 'internal://0.0.0.0:9092,external://0.0.0.0:19092,local://127.0.0.1:9093',
+      --advertise-kafka-addr, 'internal://host.docker.internal:${port.9092},external://127.0.0.1:${port.19092},local://127.0.0.1:9093']
+    ready: rpk cluster health | grep -E 'Healthy:.+true'
+  # Debezium Server publishing PostgreSQL's changes to Kafka.
+  dbz:
+    kind: docker
+    image: quay.io/debezium/server:3.1
+    host-network: true
+    command: [sleep, infinity]
+    ready: 'true'
+  # S3 and SQS. Port 4567 is a proxy in front of SQS that holds every
+  # DeleteMessage while /tmp/hold-deletes exists, so the writer can be killed
+  # after it applied a notification and before the queue forgets it.
+  sqs:
+    kind: docker
+    image: docker.io/localstack/localstack:4.9
+    ports: [4566, 4567]
+    env: { SERVICES: 's3,sqs', AWS_DEFAULT_REGION: us-east-1 }
+    ready: awslocal sqs list-queues && awslocal s3 ls
+
+matrix:
+  src: [postgres, kafka, debezium, s3]
+
+variants:
+  a:
+    spicepod: { runtime: { state: { params: { s3_endpoint: 'http://127.0.0.1:${sources.cut.port.9000}' } } } }
+    env: { AWS_ENDPOINT_URL_SQS: 'http://127.0.0.1:${sources.sqs.port.4567}' }
+  b:
+    env: { AWS_ENDPOINT_URL_SQS: 'http://127.0.0.1:${sources.sqs.port.4567}' }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: object-native-replicas-takeover
+  runtime:
+    params: { cayenne_vnext: enabled }
+    state:
+      location: s3://${sources.lake.shared_bucket}/state/
+      params:
+        s3_endpoint: ${sources.lake.endpoint}
+        s3_region: us-east-1
+        s3_auth: key
+        s3_key: ${sources.lake.key}
+        s3_secret: ${sources.lake.secret}
+        allow_http: 'true'
+
+defaults:
+  # The instances work together, so they run side by side; each answers from
+  # the one shared source.
+  run-variants: side-by-side
+  compare-variants: false
+  expect: { oracle: src }
+
+steps:
+  # A's route to the state location.
+  - source-exec:
+      cut: >-
+        printf '%s\n'
+        'import asyncio, sys'
+        'async def pipe(r, w):'
+        '    try:'
+        '        while d := await r.read(65536):'
+        '            w.write(d)'
+        '            await w.drain()'
+        '    finally:'
+        '        w.close()'
+        'async def handle(r, w):'
+        '    ur, uw = await asyncio.open_connection(sys.argv[1], int(sys.argv[2]))'
+        '    await asyncio.gather(pipe(r, uw), pipe(ur, w), return_exceptions=True)'
+        'async def main():'
+        '    server = await asyncio.start_server(handle, "0.0.0.0", 9000)'
+        '    await server.serve_forever()'
+        'asyncio.run(main())' > /tmp/forward.py &&
+        nohup python3 /tmp/forward.py host.docker.internal $(echo '${sources.lake.endpoint}' | sed 's#.*:##; s#/.*##') > /tmp/forward.log 2>&1 < /dev/null &
+    only: a
+
+  # ---------------------------------------------------------------- postgres
+  # An insert-only table whose rows carry the batch (transaction) they were
+  # written in; `marks` records the WAL position after each batch commits.
+  - source-exec:
+      src:
+        - 'CREATE TABLE events (id bigint PRIMARY KEY, batch int NOT NULL, v bigint NOT NULL)'
+        - 'CREATE TABLE marks (batch int PRIMARY KEY, lsn bigint NOT NULL)'
+        - 'CREATE TABLE acked (at text PRIMARY KEY, lsn bigint NOT NULL)'
+        - 'INSERT INTO events SELECT i, 0, i FROM generate_series(1, 1000) AS i'
+        - 'INSERT INTO marks VALUES (0, pg_current_wal_lsn() - ''0/0'')'
+    only: a
+    when: { src: postgres }
+  - start:
+      patch:
+        spicepod:
+          datasets: &postgres
+          - from: postgres:public.events
+            name: events
+            params: { $merge: '${sources.src.params}', pg_replication_status_interval: 200ms }
+            acceleration:
+              enabled: true
+              engine: cayenne
+              mode: file
+              refresh_mode: changes
+              primary_key: id
+              params: { cayenne_cdc_mem_tier_min_flush_bytes: '0' }
+          # Read straight from the source, so a query can name the batches whose
+          # commit the slot has acknowledged.
+          - from: postgres:public.marks
+            name: marks
+            params: ${sources.src.params}
+          - from: postgres:public.acked
+            name: acked
+            params: ${sources.src.params}
+    only: a
+    when: { src: postgres }
+  - query: SELECT count(*) AS n, sum(v) AS total FROM events
+    eventually: 60s
+    only: a
+    when: { src: postgres }
+  - start: { patch: { spicepod: { datasets: *postgres } } }
+    only: b
+    when: { src: postgres }
+  - query: SELECT count(*) AS n, sum(v) AS total FROM events
+    eventually: 60s
+    only: b
+    when: { src: postgres }
+  - source-query: { src: "SELECT count(*) AS slots FROM pg_replication_slots WHERE database = current_database()" }
+    expect: { rows: [['1']] }
+    only: a
+    when: { src: postgres }
+
+  # A large transaction, and A killed while it applies it. The slot must not
+  # be acknowledged past what A committed to the location.
+  - source-exec:
+      src:
+        - 'INSERT INTO events SELECT i, 1, i FROM generate_series(1001, 2000) AS i'
+        - 'INSERT INTO marks VALUES (1, pg_current_wal_lsn() - ''0/0'')'
+        - 'INSERT INTO events SELECT i, 2, i FROM generate_series(2001, 1002000) AS i'
+        - 'INSERT INTO marks VALUES (2, pg_current_wal_lsn() - ''0/0'')'
+    only: a
+    when: { src: postgres }
+  - wait-metric:
+      name: dataset_acceleration_cdc_apply_burst_rows_total
+      labels: { dataset: events }
+      above: 100000
+      timeout: 120s
+    only: a
+    when: { src: postgres }
+  - kill-spiced: {}
+    only: a
+    when: { src: postgres }
+  - source-exec:
+      src: >-
+        INSERT INTO acked SELECT 'kill', confirmed_flush_lsn - '0/0' FROM pg_replication_slots
+        WHERE database = current_database()
+    only: b
+    when: { src: postgres }
+  # The kill landed before the large transaction was acknowledged; otherwise
+  # this run did not exercise the boundary.
+  - source-query: { src: "SELECT count(*) AS unacked FROM marks WHERE batch = 2 AND lsn > (SELECT lsn FROM acked WHERE at = 'kill')" }
+    expect: { rows: [['1']] }
+    only: b
+    when: { src: postgres }
+  - assert-log: { contains: "Dataset 'events' \\(cayenne\\) is now written by this instance" }
+    eventually: 120s
+    only: b
+    when: { src: postgres }
+  # Every batch the slot acknowledged by the time A died is in the location:
+  # B resumed after it, so a batch acknowledged but not committed would be
+  # missing for good.
+  - query: >-
+      SELECT count(*) AS n, sum(e.v) AS total FROM events e
+      JOIN marks m ON e.batch = m.batch JOIN acked k ON m.lsn <= k.lsn
+      WHERE k.at = 'kill'
+    eventually: 120s
+    only: b
+    when: { src: postgres }
+  # Every row once.
+  - query: SELECT batch, count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events GROUP BY batch ORDER BY batch
+    eventually: 120s
+    only: b
+    when: { src: postgres }
+  - source-query: { src: "SELECT count(*) AS slots FROM pg_replication_slots WHERE database = current_database()" }
+    expect: { rows: [['1']] }
+    only: b
+    when: { src: postgres }
+
+  # A follows B, then takes over again when B dies, writing through its own
+  # route to the location.
+  - start: {}
+    only: a
+    when: { src: postgres }
+  - kill-spiced: {}
+    only: b
+    when: { src: postgres }
+  - assert-log: { contains: "Dataset 'events' \\(cayenne\\) is now written by this instance" }
+    eventually: 120s
+    only: a
+    when: { src: postgres }
+  - source-exec:
+      src:
+        - 'INSERT INTO events SELECT i, 3, i FROM generate_series(1002001, 1003000) AS i'
+        - 'INSERT INTO marks VALUES (3, pg_current_wal_lsn() - ''0/0'')'
+    only: a
+    when: { src: postgres }
+  - query: SELECT batch, count(*) AS n, sum(v) AS total FROM events GROUP BY batch ORDER BY batch
+    eventually: 120s
+    only: a
+    when: { src: postgres }
+  - start: {}
+    only: b
+    when: { src: postgres }
+
+  # A, still writing, is cut off from the location but not from the source.
+  # It can no longer commit, so it must acknowledge nothing more; B takes over
+  # once A's lease lapses and resumes the slot from the last commit.
+  - pause-source: cut
+    when: { src: postgres }
+  - source-exec:
+      src:
+        - 'INSERT INTO events SELECT i, 4, i FROM generate_series(1003001, 1004000) AS i'
+        - 'INSERT INTO marks VALUES (4, pg_current_wal_lsn() - ''0/0'')'
+    only: b
+    when: { src: postgres }
+  - sleep: 5s
+    when: { src: postgres }
+  - source-exec:
+      src: >-
+        INSERT INTO acked SELECT 'cut', confirmed_flush_lsn - '0/0' FROM pg_replication_slots
+        WHERE database = current_database()
+    only: b
+    when: { src: postgres }
+  - assert-log: { count: { "Dataset 'events' \\(cayenne\\) is now written by this instance": 2 } }
+    eventually: 180s
+    only: b
+    when: { src: postgres }
+  - query: >-
+      SELECT count(*) AS n, sum(e.v) AS total FROM events e
+      JOIN marks m ON e.batch = m.batch JOIN acked k ON m.lsn <= k.lsn
+      WHERE k.at = 'cut'
+    eventually: 180s
+    only: b
+    when: { src: postgres }
+  - query: SELECT batch, count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events GROUP BY batch ORDER BY batch
+    eventually: 180s
+    only: b
+    when: { src: postgres }
+  # Reconnected, A follows B.
+  - unpause-source: cut
+    when: { src: postgres }
+  - source-exec:
+      src:
+        - 'INSERT INTO events SELECT i, 5, i FROM generate_series(1004001, 1004500) AS i'
+        - 'INSERT INTO marks VALUES (5, pg_current_wal_lsn() - ''0/0'')'
+    only: b
+    when: { src: postgres }
+  - query: SELECT batch, count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events GROUP BY batch ORDER BY batch
+    eventually: 120s
+    only: b
+    when: { src: postgres }
+  - query: SELECT batch, count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events GROUP BY batch ORDER BY batch
+    eventually: 180s
+    only: a
+    when: { src: postgres }
+  - source-query: { src: "SELECT count(*) AS slots FROM pg_replication_slots WHERE database = current_database()" }
+    expect: { rows: [['1']] }
+    only: a
+    when: { src: postgres }
+
+  # No takeover found the slot acknowledged past the position the location
+  # records as applied: the slot's `confirmed_flush_lsn` never ran ahead of
+  # the committed position, so each new writer resumed the slot instead of
+  # rebuilding the acceleration from the source.
+  - assert-log: { lacks: 'rebuild_cause="acknowledged_past"' }
+    when: { src: postgres }
+
+  # ------------------------------------------------------------------- kafka
+  # Both instances start together on the empty location, before the topic
+  # has a message: neither has found a consumer group in the location.
+  - source-exec:
+      kafka: rpk topic create -X brokers=127.0.0.1:9093 ${sources.kafka.namespace}_events -p 3
+    only: a
+    when: { src: kafka }
+  - source-exec:
+      src: CREATE TABLE events (id bigint PRIMARY KEY, v bigint NOT NULL)
+    only: a
+    when: { src: kafka }
+  - start:
+      ready: false
+      patch:
+        spicepod:
+          datasets: &kafka
+          - from: kafka:${sources.kafka.namespace}_events
+            name: events
+            params:
+              kafka_bootstrap_servers: 127.0.0.1:${sources.kafka.port.19092}
+              kafka_security_protocol: PLAINTEXT
+              batch_max_size: '200'
+            acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: append }
+    only: a
+    when: { src: kafka }
+  - start: { ready: false, patch: { spicepod: { datasets: *kafka } } }
+    only: b
+    when: { src: kafka }
+  - sleep: 5s
+    when: { src: kafka }
+  - source-exec:
+      kafka: >-
+        for i in $(seq 1 300); do echo "{\"id\": $i, \"v\": $((i * 3))}"; done
+        | rpk topic produce -X brokers=127.0.0.1:9093 ${sources.kafka.namespace}_events
+    only: a
+    when: { src: kafka }
+  - source-exec:
+      src: INSERT INTO events SELECT i, i * 3 FROM generate_series(1, 300) AS i
+    only: a
+    when: { src: kafka }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events
+    eventually: 120s
+    only: a
+    when: { src: kafka }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events
+    eventually: 120s
+    only: b
+    when: { src: kafka }
+  # The two instances agreed on one consumer group.
+  - source-query: { kafka: "rpk group list -X brokers=127.0.0.1:9093 | awk '{ print $2 }' | grep -c '^spice[.]ai-events-' || true" }
+    expect: { rows: [['1']] }
+    only: a
+    when: { src: kafka }
+
+  # Messages keep arriving while both run: the writer reads every partition.
+  - source-exec:
+      kafka: >-
+        for i in $(seq 301 2300); do echo "{\"id\": $i, \"v\": $((i * 3))}"; done
+        | rpk topic produce -X brokers=127.0.0.1:9093 ${sources.kafka.namespace}_events
+    only: a
+    when: { src: kafka }
+  - source-exec:
+      src: INSERT INTO events SELECT i, i * 3 FROM generate_series(301, 2300) AS i
+    only: a
+    when: { src: kafka }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events
+    eventually: 90s
+    only: a
+    when: { src: kafka }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events
+    eventually: 90s
+    only: b
+    when: { src: kafka }
+
+  # A dies mid-stream; B takes over from the offsets in the location.
+  - source-exec:
+      kafka: >-
+        for i in $(seq 2301 62300); do echo "{\"id\": $i, \"v\": $((i * 3))}"; done
+        | rpk topic produce -X brokers=127.0.0.1:9093 ${sources.kafka.namespace}_events
+    only: a
+    when: { src: kafka }
+  - source-exec:
+      src: INSERT INTO events SELECT i, i * 3 FROM generate_series(2301, 62300) AS i
+    only: a
+    when: { src: kafka }
+  - kill-spiced: {}
+    only: a
+    when: { src: kafka }
+  - assert-log: { contains: "Dataset 'events' \\(cayenne\\) is now written by this instance" }
+    eventually: 120s
+    only: b
+    when: { src: kafka }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events
+    eventually: 180s
+    only: b
+    when: { src: kafka }
+
+  # A, started again, follows B; B keeps reading every partition.
+  - start: {}
+    only: a
+    when: { src: kafka }
+  - source-exec:
+      kafka: >-
+        for i in $(seq 62301 63300); do echo "{\"id\": $i, \"v\": $((i * 3))}"; done
+        | rpk topic produce -X brokers=127.0.0.1:9093 ${sources.kafka.namespace}_events
+    only: a
+    when: { src: kafka }
+  - source-exec:
+      src: INSERT INTO events SELECT i, i * 3 FROM generate_series(62301, 63300) AS i
+    only: a
+    when: { src: kafka }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events
+    eventually: 120s
+    only: b
+    when: { src: kafka }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events
+    eventually: 120s
+    only: a
+    when: { src: kafka }
+
+  # ---------------------------------------------------------------- debezium
+  - source-exec:
+      src: |
+        CREATE TABLE events (id bigint PRIMARY KEY, v bigint NOT NULL);
+        ALTER TABLE events REPLICA IDENTITY FULL;
+        INSERT INTO events SELECT i, i FROM generate_series(1, 20000) AS i;
+    only: a
+    when: { src: debezium }
+  - source-exec:
+      dbz: >-
+        mkdir -p /tmp/${sources.src.namespace};
+        cd /debezium;
+        DEBEZIUM_SINK_TYPE=kafka
+        DEBEZIUM_SINK_KAFKA_PRODUCER_BOOTSTRAP_SERVERS=${sources.dbz.host_from_container}:${sources.kafka.port.9092}
+        DEBEZIUM_SINK_KAFKA_PRODUCER_KEY_SERIALIZER=org.apache.kafka.common.serialization.StringSerializer
+        DEBEZIUM_SINK_KAFKA_PRODUCER_VALUE_SERIALIZER=org.apache.kafka.common.serialization.StringSerializer
+        DEBEZIUM_SOURCE_CONNECTOR_CLASS=io.debezium.connector.postgresql.PostgresConnector
+        DEBEZIUM_SOURCE_OFFSET_STORAGE_FILE_FILENAME=/tmp/${sources.src.namespace}/offsets.dat
+        DEBEZIUM_SOURCE_OFFSET_FLUSH_INTERVAL_MS=0
+        DEBEZIUM_SOURCE_DATABASE_HOSTNAME=${sources.dbz.host_from_container}
+        DEBEZIUM_SOURCE_DATABASE_PORT=${sources.src.params.pg_port}
+        DEBEZIUM_SOURCE_DATABASE_USER=${sources.src.params.pg_user}
+        DEBEZIUM_SOURCE_DATABASE_PASSWORD=${sources.src.params.pg_pass}
+        DEBEZIUM_SOURCE_DATABASE_DBNAME=${sources.src.params.pg_db}
+        DEBEZIUM_SOURCE_TOPIC_PREFIX=${sources.src.namespace}
+        DEBEZIUM_SOURCE_TABLE_INCLUDE_LIST=public.events
+        DEBEZIUM_SOURCE_PLUGIN_NAME=pgoutput
+        DEBEZIUM_SOURCE_SLOT_NAME=dbz_${sources.src.namespace}
+        DEBEZIUM_SOURCE_PUBLICATION_NAME=dbz_${sources.src.namespace}
+        DEBEZIUM_FORMAT_VALUE=json
+        DEBEZIUM_FORMAT_KEY=json
+        QUARKUS_HTTP_PORT=${instance.port}
+        QUARKUS_LOG_FILE_ENABLE=false
+        nohup /debezium/run.sh > /proc/1/fd/1 2>&1 < /dev/null &
+    only: a
+    when: { src: debezium }
+  - source-query: { kafka: "rpk topic list -X brokers=127.0.0.1:9093 | awk '{ print $1 }' | grep -cxE '${sources.src.namespace}[.]public[.]events' || true" }
+    expect: { rows: [['1']] }
+    eventually: 90s
+    only: a
+    when: { src: debezium }
+  - start:
+      patch:
+        spicepod:
+          datasets: &debezium
+          - from: debezium:${sources.src.namespace}.public.events
+            name: events
+            params:
+              kafka_bootstrap_servers: 127.0.0.1:${sources.kafka.port.19092}
+              kafka_security_protocol: plaintext
+              batch_max_size: '200'
+            acceleration:
+              enabled: true
+              engine: cayenne
+              mode: file
+              refresh_mode: changes
+              primary_key: id
+              params: { cayenne_cdc_mem_tier_min_flush_bytes: '0' }
+    only: a
+    when: { src: debezium }
+  - query: SELECT count(*) AS n, sum(v) AS total FROM events
+    eventually: 120s
+    only: a
+    when: { src: debezium }
+  - start: { patch: { spicepod: { datasets: *debezium } } }
+    only: b
+    when: { src: debezium }
+  - query: SELECT count(*) AS n, sum(v) AS total FROM events
+    eventually: 120s
+    only: b
+    when: { src: debezium }
+
+  # Updates and deletes while both run.
+  - source-exec:
+      src: |
+        UPDATE events SET v = v + 1 WHERE id % 7 = 0;
+        DELETE FROM events WHERE id % 11 = 0;
+        INSERT INTO events SELECT i, i FROM generate_series(20001, 21000) AS i;
+    only: a
+    when: { src: debezium }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events
+    eventually: 90s
+    only: a
+    when: { src: debezium }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events
+    eventually: 90s
+    only: b
+    when: { src: debezium }
+
+  # A dies mid-stream, in the middle of a run of updates and deletes, each
+  # its own transaction; B takes over from the offsets in the location.
+  - source-exec:
+      src: |
+        DO $$ BEGIN FOR i IN 1..300 LOOP
+          UPDATE events SET v = v * 2 WHERE id % 300 = i - 1;
+          DELETE FROM events WHERE id = i * 13;
+          COMMIT;
+        END LOOP; END $$;
+    only: a
+    when: { src: debezium }
+  - kill-spiced: {}
+    only: a
+    when: { src: debezium }
+  - source-exec:
+      src: |
+        UPDATE events SET v = -v WHERE id % 5 = 0;
+        DELETE FROM events WHERE id % 17 = 0;
+    only: b
+    when: { src: debezium }
+  - assert-log: { contains: "Dataset 'events' \\(cayenne\\) is now written by this instance" }
+    eventually: 120s
+    only: b
+    when: { src: debezium }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total, sum(id * v) AS weighted FROM events
+    eventually: 180s
+    only: b
+    when: { src: debezium }
+
+  # A, started again, follows B.
+  - start: {}
+    only: a
+    when: { src: debezium }
+  - source-exec:
+      src: |
+        UPDATE events SET v = 0 WHERE id % 19 = 0;
+        DELETE FROM events WHERE id % 23 = 0;
+    only: b
+    when: { src: debezium }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total, sum(id * v) AS weighted FROM events
+    eventually: 120s
+    only: b
+    when: { src: debezium }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total, sum(id * v) AS weighted FROM events
+    eventually: 120s
+    only: a
+    when: { src: debezium }
+
+  # ---------------------------------------------------------------------- s3
+  # A bucket whose object creations under `data/` notify a queue, behind the
+  # proxy that can hold deletes. A message stays invisible for 10 s after it
+  # is received.
+  - source-exec:
+      sqs: >-
+        awslocal s3 mb s3://events &&
+        awslocal sqs create-queue --queue-name events --attributes VisibilityTimeout=10 &&
+        awslocal s3api put-bucket-notification-configuration --bucket events --notification-configuration
+        '{"QueueConfigurations":[{"QueueArn":"arn:aws:sqs:us-east-1:000000000000:events","Events":["s3:ObjectCreated:*","s3:ObjectRemoved:*"],"Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"data/"}]}}}]}' &&
+        printf '%s\n'
+        'import http.server, os, time, urllib.error, urllib.request'
+        'class Proxy(http.server.BaseHTTPRequestHandler):'
+        '    protocol_version = "HTTP/1.1"'
+        '    def log_message(self, *args): pass'
+        '    def do_GET(self): self.forward()'
+        '    def do_POST(self): self.forward()'
+        '    def forward(self):'
+        '        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))'
+        '        target = self.headers.get("X-Amz-Target", "")'
+        '        if ("DeleteMessage" in target or b"Action=DeleteMessage" in body) and os.path.exists("/tmp/hold-deletes"):'
+        '            with open("/tmp/held-deletes", "a") as held: held.write(target + "\n")'
+        '            while os.path.exists("/tmp/hold-deletes"): time.sleep(0.1)'
+        '            self.send_response(503); self.send_header("Content-Length", "0"); self.end_headers(); return'
+        '        request = urllib.request.Request("http://127.0.0.1:4566" + self.path, data=body if self.command == "POST" else None, method=self.command)'
+        '        for key, value in self.headers.items():'
+        '            if key.lower() not in ("host", "content-length", "connection", "transfer-encoding"): request.add_header(key, value)'
+        '        try:'
+        '            response = urllib.request.urlopen(request, timeout=60)'
+        '            status, headers, data = response.status, response.headers, response.read()'
+        '        except urllib.error.HTTPError as error:'
+        '            status, headers, data = error.code, error.headers, error.read()'
+        '        self.send_response(status)'
+        '        for key, value in headers.items():'
+        '            if key.lower() not in ("content-length", "connection", "transfer-encoding", "date", "server"): self.send_header(key, value)'
+        '        self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)'
+        'http.server.ThreadingHTTPServer(("0.0.0.0", 4567), Proxy).serve_forever()' > /tmp/proxy.py &&
+        (nohup python3 /tmp/proxy.py > /tmp/proxy.log 2>&1 < /dev/null &) &&
+        for o in 1 2 3; do
+          printf 'id,v\n' > /tmp/o$o.csv;
+          for i in $(seq $((o * 10 - 9)) $((o * 10))); do echo "$i,$((i * 7))" >> /tmp/o$o.csv; done;
+          awslocal s3 cp /tmp/o$o.csv s3://events/data/o$o.csv;
+        done
+    only: a
+    when: { src: s3 }
+  - source-exec:
+      src: |
+        CREATE TABLE events (id bigint NOT NULL, v bigint NOT NULL);
+        INSERT INTO events SELECT i, i * 7 FROM generate_series(1, 30) AS i;
+    only: a
+    when: { src: s3 }
+  - start:
+      patch:
+        spicepod:
+          datasets: &s3
+          - from: s3://events/data/
+            name: events
+            params:
+              s3_endpoint: http://127.0.0.1:${sources.sqs.port.4566}
+              s3_region: us-east-1
+              s3_url_style: path
+              s3_auth: key
+              s3_key: test
+              s3_secret: test
+              allow_http: 'true'
+              file_format: csv
+              s3_changes_queue_url: https://sqs.us-east-1.amazonaws.com/000000000000/events
+            # No primary key: an object applied twice appends its rows twice.
+            acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes }
+    only: a
+    when: { src: s3 }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events
+    eventually: 60s
+    only: a
+    when: { src: s3 }
+  - start: { patch: { spicepod: { datasets: *s3 } } }
+    only: b
+    when: { src: s3 }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events
+    eventually: 60s
+    only: b
+    when: { src: s3 }
+
+  # A notification A applies while both run.
+  - source-exec:
+      sqs: >-
+        printf 'id,v\n31,217\n32,224\n' > /tmp/o4.csv && awslocal s3 cp /tmp/o4.csv s3://events/data/o4.csv
+    only: a
+    when: { src: s3 }
+  - source-exec:
+      src: INSERT INTO events VALUES (31, 217), (32, 224)
+    only: a
+    when: { src: s3 }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events
+    eventually: 60s
+    only: b
+    when: { src: s3 }
+
+  # A applies the next notification, commits it to the location (B serves
+  # it), and is killed while its delete of the message is held. The message
+  # comes back to the queue, and B, once it writes, receives it again.
+  - source-exec:
+      sqs: >-
+        touch /tmp/hold-deletes &&
+        printf 'id,v\n33,231\n34,238\n35,245\n' > /tmp/o5.csv && awslocal s3 cp /tmp/o5.csv s3://events/data/o5.csv
+    only: a
+    when: { src: s3 }
+  - source-exec:
+      src: INSERT INTO events VALUES (33, 231), (34, 238), (35, 245)
+    only: a
+    when: { src: s3 }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events
+    eventually: 60s
+    only: b
+    when: { src: s3 }
+  - source-query: { sqs: "grep -c DeleteMessage /tmp/held-deletes" }
+    expect: { rows: [['1']] }
+    eventually: 30s
+    only: a
+    when: { src: s3 }
+  - kill-spiced: {}
+    only: a
+    when: { src: s3 }
+  - source-exec: { sqs: rm -f /tmp/hold-deletes }
+    only: a
+    when: { src: s3 }
+  - assert-log: { contains: "Dataset 'events' \\(cayenne\\) is now written by this instance" }
+    eventually: 120s
+    only: b
+    when: { src: s3 }
+  # B has received the message again and deleted it: the queue is empty.
+  - source-query:
+      sqs: >-
+        awslocal sqs get-queue-attributes --queue-url http://localhost:4566/000000000000/events
+        --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible
+        --query 'join(`,`, [Attributes.ApproximateNumberOfMessages, Attributes.ApproximateNumberOfMessagesNotVisible])' --output text
+    expect: { rows: [['0,0']] }
+    eventually: 120s
+    only: b
+    when: { src: s3 }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events
+    eventually: 60s
+    only: b
+    when: { src: s3 }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events
+    consistently: 15s
+    only: b
+    when: { src: s3 }
+
+  # A, started again, follows B.
+  - start: {}
+    only: a
+    when: { src: s3 }
+  - source-exec:
+      sqs: >-
+        printf 'id,v\n36,252\n' > /tmp/o6.csv && awslocal s3 cp /tmp/o6.csv s3://events/data/o6.csv
+    only: a
+    when: { src: s3 }
+  - source-exec:
+      src: INSERT INTO events VALUES (36, 252)
+    only: a
+    when: { src: s3 }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events
+    eventually: 60s
+    only: b
+    when: { src: s3 }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events
+    eventually: 60s
+    only: a
+    when: { src: s3 }

@@ -627,6 +627,25 @@ impl AckSlot {
         self.committed.load(Ordering::Acquire)
     }
 
+    /// How far the slot may be acknowledged on this member's behalf: its committed
+    /// floor, but never past the position durably recorded for it once it has one.
+    ///
+    /// The recorded position is where the next writer resumes, on this process's
+    /// restart or on another instance taking the acceleration over. A slot
+    /// acknowledged past it holds no record of the changes in between, so the
+    /// next writer cannot tell an interval with nothing to apply from changes
+    /// acknowledged but never applied, and rebuilds the acceleration from the
+    /// source. A member with no recorded position yet (still loading its initial
+    /// snapshot, or never recorded) has no resume point to protect, and holds the
+    /// slot at its committed floor.
+    fn acknowledgeable(&self) -> u64 {
+        let committed = self.committed();
+        match self.recorded() {
+            0 => committed,
+            recorded => committed.min(recorded),
+        }
+    }
+
     fn delivered(&self) -> u64 {
         self.delivered.load(Ordering::Acquire)
     }
@@ -723,6 +742,8 @@ impl AckSlot {
 struct AckTable {
     members: RwLock<HashMap<MemberKey, Arc<AckSlot>>>,
     shared_flush: AtomicU64,
+    /// The position the slot is acknowledged at; see [`Self::acknowledged_lsn`].
+    acknowledged: AtomicU64,
 }
 
 impl AckTable {
@@ -908,6 +929,31 @@ impl AckTable {
     /// Seed the shared flush with the slot's consistent LSN so we never ack 0.
     fn seed(&self, lsn: u64) {
         advance_monotonic(&self.shared_flush, lsn);
+        advance_monotonic(&self.acknowledged, lsn);
+    }
+
+    /// The position to acknowledge to the server as the slot's
+    /// `confirmed_flush_lsn`: the minimum over all members of
+    /// [`AckSlot::acknowledgeable`], advanced monotonically and never past
+    /// [`Self::flush_lsn`].
+    ///
+    /// Separate from [`Self::flush_lsn`], which is how far every member has
+    /// applied: the slot waits until that is also recorded, so whoever resumes it
+    /// next — this process after a crash, or another instance taking over a
+    /// shared acceleration — resumes from the recorded position instead of
+    /// rebuilding the acceleration. An idle member's position is recorded by the
+    /// next pass of the applied-position writer, so the slot trails the applied
+    /// floor by at most one such pass.
+    fn acknowledged_lsn(&self) -> u64 {
+        let applied = self.flush_lsn();
+        let floor = read_lock(&self.members)
+            .values()
+            .map(|slot| slot.acknowledgeable())
+            .min();
+        if let Some(floor) = floor {
+            advance_monotonic(&self.acknowledged, floor.min(applied));
+        }
+        self.acknowledged.load(Ordering::Acquire)
     }
 
     /// Read-time slot-level floor: the minimum `committed` over all members
@@ -3922,7 +3968,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                     // member by the single consolidated boundary flush below, not
                     // a separate per-member pass.
                     commit_watermark = Some(client::pg_epoch_to_system_time(commit_time_micros));
-                    client.update_applied_lsn(Lsn(source.ack.flush_lsn()));
+                    client.update_applied_lsn(Lsn(source.ack.acknowledged_lsn()));
                     should_flush = true;
                 }
                 ReplicationEvent::KeepAlive {
@@ -4063,7 +4109,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                             }
                         }
                     }
-                    client.update_applied_lsn(Lsn(source.ack.flush_lsn()));
+                    client.update_applied_lsn(Lsn(source.ack.acknowledged_lsn()));
                 }
                 ReplicationEvent::Message { .. } => {}
                 ReplicationEvent::StoppedAt { reached } => {
@@ -4103,7 +4149,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                     input_wait_us: input_us_acc,
                     processing_us: proc_us_acc,
                     server_wal_end: max_wal_end,
-                    confirmed_flush_lsn: source.ack.flush_lsn(),
+                    confirmed_flush_lsn: source.ack.acknowledged_lsn(),
                     commit_watermark,
                 });
                 input_us_acc = 0;

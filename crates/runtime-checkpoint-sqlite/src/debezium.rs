@@ -59,6 +59,19 @@ impl SqliteDebeziumCheckpointStore {
 
 #[async_trait]
 impl DebeziumCheckpointStore for SqliteDebeziumCheckpointStore {
+    /// A `SQLite` file is written by one instance only, so the first caller
+    /// always records.
+    async fn get_or_record(
+        &self,
+        checkpoint: &DebeziumCheckpoint,
+    ) -> Result<Option<DebeziumCheckpoint>, CheckpointError> {
+        if let Some(stored) = self.get().await? {
+            return Ok(Some(stored));
+        }
+        self.upsert(checkpoint).await?;
+        Ok(Some(checkpoint.clone()))
+    }
+
     async fn upsert(&self, checkpoint: &DebeziumCheckpoint) -> Result<(), CheckpointError> {
         let pool = &self.pool;
         let metadata = checkpoint;

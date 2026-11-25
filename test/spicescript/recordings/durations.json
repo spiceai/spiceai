@@ -127,6 +127,7 @@
   "newest-by-time": 39,
   "object-native-data": 49,
   "object-native-replicas": 83,
+  "object-native-replicas-takeover": 422,
   "object-native-same-bucket": 47,
   "on-zero-results": 43,
   "ordering-window-join-semantics": 5,

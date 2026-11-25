@@ -87,6 +87,18 @@ impl Values {
             .map_err(store_error)
     }
 
+    /// The value, recording `value` first when there is none and this instance
+    /// writes the dataset's log; `None` on a replica when there is none yet.
+    async fn get_or_record(&self, value: &Value) -> Result<Option<Value>, CheckpointError> {
+        let bytes = serde_json::to_vec(value).map_err(store_error)?;
+        self.catalog
+            .sidecar_value_or_record(&self.key, || bytes)
+            .await
+            .map_err(store_error)?
+            .map(|bytes| serde_json::from_slice(&bytes).map_err(store_error))
+            .transpose()
+    }
+
     async fn advance_offsets(&self, offsets: &[KafkaOffset]) -> Result<(), CheckpointError> {
         self.catalog
             .advance_sidecar_counters(&self.key, &offset_counters(offsets))
@@ -262,30 +274,52 @@ impl KafkaCheckpointStore for NativeKafkaStore {
         let Some(value) = self.0.get().await? else {
             return Ok(None);
         };
-        Ok(Some(KafkaCheckpoint {
-            consumer_group_id: text(&value, "consumer_group_id")?,
-            topic: text(&value, "topic")?,
-            schema_json: text(&value, "schema_json")?,
-            offsets: self.0.offsets().await?,
-        }))
+        self.checkpoint(&value).await.map(Some)
     }
 
     async fn upsert(&self, checkpoint: &KafkaCheckpoint) -> Result<(), CheckpointError> {
         self.0
-            .set_with_offsets(
-                &json!({
-                    "consumer_group_id": checkpoint.consumer_group_id,
-                    "topic": checkpoint.topic,
-                    "schema_json": checkpoint.schema_json,
-                }),
-                &checkpoint.offsets,
-            )
+            .set_with_offsets(&kafka_value(checkpoint), &checkpoint.offsets)
             .await
+    }
+
+    async fn get_or_record(
+        &self,
+        checkpoint: &KafkaCheckpoint,
+    ) -> Result<Option<KafkaCheckpoint>, CheckpointError> {
+        if !checkpoint.offsets.is_empty() {
+            return Err(store_error(
+                "a recorded Kafka checkpoint starts with no offsets",
+            ));
+        }
+        match self.0.get_or_record(&kafka_value(checkpoint)).await? {
+            Some(value) => self.checkpoint(&value).await.map(Some),
+            None => Ok(None),
+        }
     }
 
     async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> Result<(), CheckpointError> {
         self.0.advance_offsets(offsets).await
     }
+}
+
+impl NativeKafkaStore {
+    async fn checkpoint(&self, value: &Value) -> Result<KafkaCheckpoint, CheckpointError> {
+        Ok(KafkaCheckpoint {
+            consumer_group_id: text(value, "consumer_group_id")?,
+            topic: text(value, "topic")?,
+            schema_json: text(value, "schema_json")?,
+            offsets: self.0.offsets().await?,
+        })
+    }
+}
+
+fn kafka_value(checkpoint: &KafkaCheckpoint) -> Value {
+    json!({
+        "consumer_group_id": checkpoint.consumer_group_id,
+        "topic": checkpoint.topic,
+        "schema_json": checkpoint.schema_json,
+    })
 }
 
 /// `{ "consumer_group_id", "topic", "primary_keys", "schema_fields_json" }`, plus
@@ -298,6 +332,37 @@ impl DebeziumCheckpointStore for NativeDebeziumStore {
         let Some(value) = self.0.get().await? else {
             return Ok(None);
         };
+        self.checkpoint(&value).await.map(Some)
+    }
+
+    async fn upsert(&self, checkpoint: &DebeziumCheckpoint) -> Result<(), CheckpointError> {
+        self.0
+            .set_with_offsets(&debezium_value(checkpoint), &checkpoint.offsets)
+            .await
+    }
+
+    async fn get_or_record(
+        &self,
+        checkpoint: &DebeziumCheckpoint,
+    ) -> Result<Option<DebeziumCheckpoint>, CheckpointError> {
+        if !checkpoint.offsets.is_empty() {
+            return Err(store_error(
+                "a recorded Debezium checkpoint starts with no offsets",
+            ));
+        }
+        match self.0.get_or_record(&debezium_value(checkpoint)).await? {
+            Some(value) => self.checkpoint(&value).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> Result<(), CheckpointError> {
+        self.0.advance_offsets(offsets).await
+    }
+}
+
+impl NativeDebeziumStore {
+    async fn checkpoint(&self, value: &Value) -> Result<DebeziumCheckpoint, CheckpointError> {
         let primary_keys = value
             .get("primary_keys")
             .cloned()
@@ -305,32 +370,23 @@ impl DebeziumCheckpointStore for NativeDebeziumStore {
             .transpose()
             .map_err(store_error)?
             .ok_or_else(|| store_error("checkpoint has no 'primary_keys'"))?;
-        Ok(Some(DebeziumCheckpoint {
-            consumer_group_id: text(&value, "consumer_group_id")?,
-            topic: text(&value, "topic")?,
+        Ok(DebeziumCheckpoint {
+            consumer_group_id: text(value, "consumer_group_id")?,
+            topic: text(value, "topic")?,
             primary_keys,
-            schema_fields_json: text(&value, "schema_fields_json")?,
+            schema_fields_json: text(value, "schema_fields_json")?,
             offsets: self.0.offsets().await?,
-        }))
+        })
     }
+}
 
-    async fn upsert(&self, checkpoint: &DebeziumCheckpoint) -> Result<(), CheckpointError> {
-        self.0
-            .set_with_offsets(
-                &json!({
-                    "consumer_group_id": checkpoint.consumer_group_id,
-                    "topic": checkpoint.topic,
-                    "primary_keys": checkpoint.primary_keys,
-                    "schema_fields_json": checkpoint.schema_fields_json,
-                }),
-                &checkpoint.offsets,
-            )
-            .await
-    }
-
-    async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> Result<(), CheckpointError> {
-        self.0.advance_offsets(offsets).await
-    }
+fn debezium_value(checkpoint: &DebeziumCheckpoint) -> Value {
+    json!({
+        "consumer_group_id": checkpoint.consumer_group_id,
+        "topic": checkpoint.topic,
+        "primary_keys": checkpoint.primary_keys,
+        "schema_fields_json": checkpoint.schema_fields_json,
+    })
 }
 
 /// [`MongoCheckpointMetadata`] as JSON, with the store's write time.
