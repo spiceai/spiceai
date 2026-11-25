@@ -487,12 +487,12 @@ mod delta {
 
         let store = vended_object_store(&table_url, credentials, aws_region).await?;
 
-        DeltaTable::from_object_store(delta_path.to_string(), store).map_err(|e| {
-            Error::CreateDeltaTable {
+        DeltaTable::from_object_store(delta_path.to_string(), store)
+            .await
+            .map_err(|e| Error::CreateDeltaTable {
                 url: delta_path.to_string(),
                 source: Box::new(e),
-            }
-        })
+            })
     }
 
     #[async_trait::async_trait]
@@ -524,6 +524,7 @@ mod delta {
                         "Unable to use Unity Catalog credential vending for table; falling back to configured storage credentials: {err}"
                     );
                     let delta = DeltaTable::from(delta_path, self.params.clone(), &self.io_runtime)
+                        .await
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
                         .with_table_parquet_options(self.table_parquet_options.clone());
                     Ok(Arc::new(delta))

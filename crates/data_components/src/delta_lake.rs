@@ -125,6 +125,14 @@ pub enum Error {
         table_url: String,
         source: object_store::Error,
     },
+
+    #[snafu(display(
+        "Failed to load Delta Lake table '{table_location}': the load task did not complete: {source}"
+    ))]
+    LoadTaskFailed {
+        table_location: String,
+        source: tokio::task::JoinError,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -168,6 +176,7 @@ impl Read for DeltaTableFactory {
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let delta_path = table_reference.table().to_string();
         let delta: DeltaTable = DeltaTable::from(delta_path, self.params.clone(), &self.io_runtime)
+            .await
             .boxed()?
             .with_table_parquet_options(self.table_parquet_options.clone());
         Ok(Arc::new(delta))
@@ -192,10 +201,50 @@ pub struct DeltaTable {
 }
 
 impl DeltaTable {
-    pub fn from(
+    /// Loads the table at `table_location`, resolving storage credentials from `options`.
+    pub async fn from(
         table_location: String,
         options: HashMap<String, SecretString>,
         io_runtime: &Handle,
+    ) -> Result<Self> {
+        let io_runtime = io_runtime.clone();
+        Self::load_blocking(table_location.clone(), move || {
+            Self::open(table_location, options, io_runtime)
+        })
+        .await
+    }
+
+    /// Loads a table backed by a pre-built object store, bypassing the credential
+    /// resolution in [`DeltaTable::from`].
+    ///
+    /// Used by Unity Catalog credential vending, where the store
+    /// authenticates with vended, refresh-aware credentials.
+    pub async fn from_object_store(
+        table_location: String,
+        object_store: Arc<dyn object_store::ObjectStore>,
+    ) -> Result<Self> {
+        Self::load_blocking(table_location.clone(), move || {
+            Self::open_with_object_store(table_location, object_store)
+        })
+        .await
+    }
+
+    /// delta-kernel reads the Delta log synchronously and parks the calling thread until the
+    /// object-store reads finish, which can take minutes when storage is slow or unreachable.
+    /// Loading on the blocking pool keeps that wait off the Tokio workers.
+    async fn load_blocking(
+        table_location: String,
+        load: impl FnOnce() -> Result<Self> + Send + 'static,
+    ) -> Result<Self> {
+        tokio::task::spawn_blocking(load)
+            .await
+            .context(LoadTaskFailedSnafu { table_location })?
+    }
+
+    fn open(
+        table_location: String,
+        options: HashMap<String, SecretString>,
+        io_runtime: Handle,
     ) -> Result<Self> {
         let table_url = delta_kernel::try_parse_uri(ensure_folder_location(table_location))
             .map_err(handle_delta_error)?;
@@ -233,7 +282,7 @@ impl DeltaTable {
                     &table_url,
                     region,
                     sdk_config.as_ref(),
-                    io_runtime.clone(),
+                    io_runtime,
                 ) {
                     Ok(sdk_store) => {
                         tracing::trace!(
@@ -292,12 +341,7 @@ impl DeltaTable {
         Ok((parquet_store, engine))
     }
 
-    /// Creates a `DeltaTable` backed by a pre-built object store, bypassing
-    /// the credential resolution in [`DeltaTable::from`].
-    ///
-    /// Used by Unity Catalog credential vending, where the store
-    /// authenticates with vended, refresh-aware credentials.
-    pub fn from_object_store(
+    fn open_with_object_store(
         table_location: String,
         object_store: Arc<dyn object_store::ObjectStore>,
     ) -> Result<Self> {
@@ -3842,12 +3886,13 @@ mod table_read_tests {
     }
 
     /// Registers the table once, the way a dataset keeps its provider while the table changes.
-    fn registered(table: &Path) -> SessionContext {
+    async fn registered(table: &Path) -> SessionContext {
         let provider = DeltaTable::from(
             table.to_str().expect("utf-8 path").to_string(),
             HashMap::new(),
             &Handle::current(),
         )
+        .await
         .expect("open Delta table");
         let ctx = SessionContext::new();
         ctx.register_table("t", Arc::new(provider))
@@ -3880,6 +3925,7 @@ mod table_read_tests {
             HashMap::new(),
             &Handle::current(),
         )
+        .await
         .expect("open Delta table");
         let ctx = SessionContext::new();
         ctx.register_table("t", Arc::new(provider))
@@ -4006,7 +4052,7 @@ mod table_read_tests {
                 add_file("part-0.parquet", size),
             ],
         );
-        let ctx = registered(table);
+        let ctx = registered(table).await;
         assert_batches_eq!(
             [
                 "+----+--------+---+",
@@ -4111,7 +4157,7 @@ mod table_read_tests {
                 add_file("part-0.parquet", size),
             ],
         );
-        let ctx = registered(table);
+        let ctx = registered(table).await;
 
         // The upgrade keeps each name as its physical name, so the old files still read.
         let size = write_i32_file(

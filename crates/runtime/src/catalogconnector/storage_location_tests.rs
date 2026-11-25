@@ -412,7 +412,9 @@ async fn start_mock(fixture: &Fixture) -> MockCatalog {
     .await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+// One worker: the mock storage server runs on the test runtime, so a table load that
+// blocks a worker on storage reads leaves nothing to serve them and the load times out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn unity_catalog_refuses_a_local_storage_location() {
     let fixture = Fixture::new();
     let mock = start_mock(&fixture).await;
@@ -430,7 +432,8 @@ async fn unity_catalog_refuses_a_local_storage_location() {
     assert!(error.contains(NOT_FOUND), "unexpected error: {error}");
 }
 
-#[tokio::test(flavor = "multi_thread")]
+// One worker, as in `unity_catalog_refuses_a_local_storage_location`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn unity_catalog_with_credential_vending_refuses_a_local_storage_location() {
     let fixture = Fixture::new();
     let mock = start_mock(&fixture).await;
