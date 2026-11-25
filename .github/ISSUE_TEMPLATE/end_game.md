@@ -120,7 +120,6 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
    - **Data Accelerators**
      - [ ] [DuckDB Accelerator](https://github.com/spiceai/cookbook/blob/trunk/duckdb/accelerator/README.md)
      - [ ] [PostgreSQL Accelerator](https://github.com/spiceai/cookbook/blob/trunk/postgres/accelerator/README.md)
-     - [ ] [SQLite Accelerator](https://github.com/spiceai/cookbook/blob/trunk/sqlite/accelerator/README.md)
      - [ ] [Arrow Accelerator](https://github.com/spiceai/cookbook/blob/trunk/arrow/README.md)
      - [ ] [Caching Accelerator](https://github.com/spiceai/cookbook/blob/trunk/caching/accelerator/README.md)
      - [ ] Update accelerator status per [Accelerator RC Criteria](https://github.com/spiceai/spiceai/blob/trunk/docs/criteria/accelerators/rc.md)
