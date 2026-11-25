@@ -363,11 +363,10 @@ async fn an_upgrade_loads_from_the_source_and_leaves_the_sqlite_copy_untouched()
     );
 }
 
-/// A recreate stopped after it dropped the object-native table and before it forgot
-/// what that table left: the object-native metastore keeps a dropped dataset's source
-/// positions and moves them into the next dataset created under its name. The next
-/// start creates the table anew and empty, so its Kafka source must start the topic
-/// from the beginning, not resume past messages the empty table never received.
+/// A dropped object-native table's source positions do not outlive it: the drop
+/// forgets them in the commit that ends the dataset's log, so the next start, which
+/// creates the table anew and empty, has no Kafka offsets to resume from and starts the
+/// topic from the beginning rather than past messages the empty table never received.
 #[tokio::test]
 async fn a_new_object_native_table_does_not_resume_from_a_dropped_tables_offsets() {
     use runtime_checkpoint_api::kafka::{KafkaCheckpoint, KafkaOffset};

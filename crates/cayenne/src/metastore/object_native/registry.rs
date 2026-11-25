@@ -446,8 +446,11 @@ impl ObjectNativeCatalog {
     }
 
     /// Dropping a dataset removes its name from the registry, which ends its
-    /// log; its bookkeeping values move to the registry, where they were kept
-    /// before datasets had logs, so they outlive the table as they did then.
+    /// log, and forgets its bookkeeping (load record, append cursor and every
+    /// source position) in the same commit: the next dataset created under the
+    /// name starts empty, so its source must not resume from where this one
+    /// stopped. Values the registry holds for the name while no log has it are
+    /// forgotten with them.
     pub(super) async fn drop_dataset(&self, name: &str) -> CatalogResult<bool> {
         let (domain, own) = {
             let routes = self.routes.read();
@@ -482,11 +485,11 @@ impl ObjectNativeCatalog {
                 .map_err(invalid)?;
             let mut unregister = vec![position(REGISTRY, name, None)];
             unregister.extend(
-                domain
+                self.registry
                     .positions_of(name)
                     .await
                     .into_iter()
-                    .map(|((source, partition), value)| position(&source, &partition, Some(value))),
+                    .map(|((source, partition), _)| position(&source, &partition, None)),
             );
             self.registry.commit_actions(unregister).await?;
             {
@@ -508,32 +511,6 @@ impl ObjectNativeCatalog {
         let tables = domain.tables().await;
         self.routes.write().refresh(&domain, tables);
         Ok(dropped)
-    }
-
-    /// Forgets the runtime's bookkeeping for `name` that the registry keeps while no
-    /// dataset of that name has a log: what a dropped dataset of that name left (its
-    /// load record, append cursor, and every source position, such as Kafka offsets),
-    /// which [`Self::create_dataset`] would otherwise move into a new, empty dataset's
-    /// log for its source to resume from. Returns how many values it forgot; a dataset
-    /// that has a log keeps its own.
-    /// # Errors
-    /// Returns an error when the registry cannot be written.
-    pub async fn forget_bookkeeping_without_log(&self, name: &str) -> CatalogResult<usize> {
-        if self.routes.read().by_name.contains_key(name) {
-            return Ok(0);
-        }
-        let held = self.registry.positions_of(name).await;
-        if held.is_empty() {
-            return Ok(0);
-        }
-        self.registry
-            .commit_actions(
-                held.iter()
-                    .map(|((source, partition), _)| position(source, partition, None))
-                    .collect(),
-            )
-            .await?;
-        Ok(held.len())
     }
 
     /// The runtime's bookkeeping value under `key` (a CDC position, a dataset

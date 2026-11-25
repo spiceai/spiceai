@@ -739,13 +739,6 @@ impl CayenneAccelerator {
         metastore_type: Metastore,
     ) -> Result<()> {
         let table_name = source.name().to_string();
-        // The object-native metastore moves every source position a dropped table of
-        // this name left (Kafka offsets, a CDC token) into the new table's log, and the
-        // drop that left them may have stopped before forgetting them. The new table
-        // is empty, so its source must not resume from them.
-        if metastore_type == Metastore::ObjectNative {
-            self.forget_dropped_bookkeeping(&table_name).await?;
-        }
         // The SQLite sidecar is the dataset's own `cayenne.db` under its metadata
         // directory, which is not the shared catalog's when datasets set different
         // `cayenne_metadata_dir`s. With no such file there is no load record to clear.
@@ -801,23 +794,6 @@ impl CayenneAccelerator {
         }
         Ok(())
     }
-    /// Forgets what `table_name`'s dropped object-native table left: the object-native
-    /// metastore keeps a dropped dataset's bookkeeping (its load record and every
-    /// source position, such as Kafka offsets) and moves it into the log of the next
-    /// dataset created under its name, whose source would then resume an empty table
-    /// past rows it still has. Called right after a drop for a recreate, before this
-    /// start's source writes any bookkeeping of its own.
-    pub(super) async fn forget_dropped_bookkeeping(&self, table_name: &str) -> Result<()> {
-        if let Some(native) = self.native_catalog.get() {
-            native
-                .forget_bookkeeping_without_log(table_name)
-                .await
-                .boxed()
-                .context(AccelerationInitializationFailedSnafu)?;
-        }
-        Ok(())
-    }
-
     /// Drops `table_name`'s copy in the object-native metastore, when one exists, for
     /// a `mode: file_create` start on `SQLite`, so the table it creates is new and the
     /// next start does not find the dataset in both metastores. A copy whose data is
@@ -856,7 +832,6 @@ impl CayenneAccelerator {
                 "Dropped the older object-native Cayenne table metadata for '{table_name}' (file_create mode)"
             );
         }
-        self.forget_dropped_bookkeeping(table_name).await?;
         if let Some(data_path) = placed.as_deref() {
             tracing::info!(
                 target: "spiced::acceleration::cayenne",

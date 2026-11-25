@@ -1605,6 +1605,28 @@ async fn catalog_directly_inside(
     Ok(None)
 }
 
+/// Removes everything under `dir` but `kept`, a path inside it, and the
+/// directories on the way to it.
+async fn remove_all_but(dir: &Path, kept: &Path) -> std::io::Result<()> {
+    let dir = tokio::fs::canonicalize(dir).await?;
+    let mut entries = tokio::fs::read_dir(&dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path == kept {
+            continue;
+        }
+        let file_type = entry.file_type().await?;
+        if file_type.is_dir() && kept.starts_with(&path) {
+            Box::pin(remove_all_but(&path, kept)).await?;
+        } else if file_type.is_dir() {
+            tokio::fs::remove_dir_all(&path).await?;
+        } else {
+            tokio::fs::remove_file(&path).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn path_exists(path: impl AsRef<Path>) -> bool {
     matches!(tokio::fs::try_exists(path).await, Ok(true))
 }
@@ -1837,29 +1859,40 @@ impl CayenneAccelerator {
             data_dir: data_dir.to_string(),
             source: source_error,
         };
-        // A dataset named `cayenne` keeps its data in `.spice/data/cayenne/` by default,
-        // which is also where the object-native metastore of the default state location
-        // keeps everything, under `v1/`. Its own tables are directories named by table
-        // id, never `v1`, so it removes those and leaves the object-native store, which
-        // holds every other dataset that metastore accelerates.
-        let data_path = Path::new(data_dir);
-        if path_exists(data_path.join(OBJECT_NATIVE_STORE_DIR).join("catalog")).await {
-            let mut entries = tokio::fs::read_dir(data_path).await.map_err(failed)?;
-            while let Some(entry) = entries.next_entry().await.map_err(failed)? {
-                if entry.file_name() == OBJECT_NATIVE_STORE_DIR {
-                    continue;
-                }
-                let path = entry.path();
-                if entry.file_type().await.map_err(failed)?.is_dir() {
-                    tokio::fs::remove_dir_all(&path).await.map_err(failed)?;
-                } else {
-                    tokio::fs::remove_file(&path).await.map_err(failed)?;
-                }
-            }
+        // The state location, or the object-native metastore in it, can be inside
+        // this directory: a dataset named `cayenne` keeps its data in
+        // `.spice/data/cayenne/` by default, which is also where the default
+        // location's object-native metastore keeps everything (`v1/`), and a location
+        // can be configured inside any dataset's directory. Whichever of them is inside
+        // is kept, with the path to it, and the rest is removed: the dataset's own
+        // tables are directories named by table id, never `v1`.
+        if let Some(kept) = Self::state_kept_under(source, Path::new(data_dir)).await {
+            remove_all_but(Path::new(data_dir), &kept)
+                .await
+                .map_err(failed)?;
             return Ok(());
         }
         tokio::fs::remove_dir_all(data_dir).await.map_err(failed)?;
         Ok(())
+    }
+
+    /// The local state location, or the object-native metastore in it
+    /// (`<location>/cayenne/v1`), when it is inside `data_dir`: the location when it
+    /// is, else the metastore when that is. `None` for a location in an object store,
+    /// or one that `data_dir` does not contain.
+    async fn state_kept_under(source: &dyn AccelerationSource, data_dir: &Path) -> Option<PathBuf> {
+        let location = effective_state_location(&source.app()).ok()?;
+        let location = url::Url::parse(&location.location)
+            .ok()?
+            .to_file_path()
+            .ok()?;
+        let data_dir = tokio::fs::canonicalize(data_dir).await.ok()?;
+        let location = tokio::fs::canonicalize(&location).await.unwrap_or(location);
+        if location != data_dir && location.starts_with(&data_dir) {
+            return Some(location);
+        }
+        let store = location.join("cayenne").join(OBJECT_NATIVE_STORE_DIR);
+        (store.starts_with(&data_dir) && path_exists(&store).await).then_some(store)
     }
 
     /// Removes each local directory among `dirs` that exists, through
@@ -4189,13 +4222,7 @@ impl DataAccelerator for CayenneAccelerator {
                     "Dropped existing Cayenne table metadata for '{table_name}' (file_create mode)"
                 );
             }
-            if catalog
-                .as_any()
-                .downcast_ref::<cayenne::metastore::object_native::ObjectNativeCatalog>()
-                .is_some()
-            {
-                self.forget_dropped_bookkeeping(&table_name).await?;
-            }
+
             // Recreated on SQLite (the flag off, or a cluster): the object-native
             // metastore may hold a copy from a start with the flag on, which missed
             // every change since. It is dropped too, so the table this start creates
