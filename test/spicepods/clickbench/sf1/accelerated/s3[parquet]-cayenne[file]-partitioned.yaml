@@ -1,0 +1,21 @@
+version: v1
+kind: Spicepod
+name: s3[parquet]-cayenne[file]-partitioned
+datasets:
+  - from: s3://benchmarks/clickbench/hits.parquet
+    name: hits
+    params:
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+      s3_session_token: ${secrets:S3_SESSION_TOKEN}
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_sql: "SELECT * FROM hits LIMIT 50000000" # Match the 50-million-row subset in the memory-mode benchmark
+      partition_by:
+        - bucket(5, "EventDate")

@@ -1,14 +1,13 @@
 import os
+import sys
 import argparse
 import requests
 
 apiHost = "https://api.github.com"
 token = os.getenv("GITHUB_TOKEN")
 
-if token == None:
-    print("ERROR: Specify GITHUB_TOKEN environment variable")
-    exit(1)
-
+# main() refuses to run without GITHUB_TOKEN, so no request is sent with this
+# header unset. The check is not done at import so the tests can load the module.
 authHeader = { "Authorization": f"token {token}"}
 
 # GitHub rejects a release body longer than this with a 422. Release notes are
@@ -84,17 +83,18 @@ def createRelease(owner, repo, tag, release_name, body, prerelease):
     }
 
     resp = requests.post(url, headers=authHeader, json=data)
-    if not resp.ok:
-        # In our matrix publish example, it is possible for a race condition in happen when creating the release - so handle it by retrying to get the release
-        releaseInfo = getReleaseByTag(owner, repo, tag)
-        if releaseInfo is not None:
-            return releaseInfo
-        
-        # If we still aren't able to get the release, then print the creation error
-        print(resp.status_code)
-        print(resp.json())
-    else:
+    if resp.ok:
         return resp.json()
+
+    # In our matrix publish example, it is possible for a race condition in happen when creating the release - so handle it by retrying to get the release
+    releaseInfo = getReleaseByTag(owner, repo, tag)
+    if releaseInfo is not None:
+        return releaseInfo
+
+    # If we still aren't able to get the release, then print the creation error
+    print(resp.status_code)
+    print(resp.json())
+    return None
 
 def updateRelease(id, owner, repo, release_name, body, prerelease):
     url = f"{apiHost}/repos/{owner}/{repo}/releases/{id}"
@@ -166,9 +166,11 @@ def actionUpload(args):
     release_name, body = extract_title_from_body(body, args.release_name)
 
     # Step 2: Create the release if it doesn't exist
-    if releaseInfo == None:
+    if releaseInfo is None:
         print("Creating release")
         releaseInfo = createRelease(args.owner, args.repo, args.tag, release_name, body, is_prerelease)
+        if releaseInfo is None:
+            sys.exit(f"ERROR: Unable to create or find a release with tag: {args.tag}")
         print("Release created!")
     else:
         # Step 2.5: Update the release with the latest info
@@ -195,7 +197,7 @@ def actionDelete(args):
     # Step 1: Get the release
     releaseInfo = getReleaseByTag(args.owner, args.repo, args.tag)
 
-    if releaseInfo == None:
+    if releaseInfo is None:
         print(f"Unable to find a release with tag: {args.tag}")
         return
 
@@ -210,6 +212,9 @@ def actionDelete(args):
                 deleteAsset(args.owner, args.repo, asset["id"])
 
 def main():
+    if token is None:
+        sys.exit("ERROR: Specify GITHUB_TOKEN environment variable")
+
     args = parser.parse_args()
     print(args)
 
@@ -222,7 +227,7 @@ def main():
         return
 
     print(f"Unknown action {args.action}!")
-    exit(1)
+    sys.exit(1)
 
 if __name__ == "__main__":
     main()

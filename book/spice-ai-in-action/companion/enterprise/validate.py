@@ -8,8 +8,8 @@ resources=[d for d in yaml.safe_load_all(Path(a.rendered_chart).read_text()) if 
 crds={d['spec']['names']['kind']:d for d in resources if d['kind']=='CustomResourceDefinition'}
 results=[]
 for path in sorted(root.glob('*.template.json')):
- manifest=json.loads(path.read_text());kind=manifest['kind'];version_name=manifest['apiVersion'].split('/')[1]
- version=next(v for v in crds[kind]['spec']['versions'] if v['name']==version_name)
+ manifest=json.loads(path.read_text());kind=manifest['kind']
+ version=next(v for v in crds[kind]['spec']['versions'] if v['name']==manifest['apiVersion'].split('/')[1])
  errors=list(jsonschema.Draft7Validator(version['schema']['openAPIV3Schema']).iter_errors(manifest))
  results.append({'file':path.name,'valid':not errors,'errors':[e.message for e in errors]})
 record={'scope':'Offline outer-CRD structural validation; no runtime, admission, image, identity, or cluster execution. Nested Spicepod needs separate validation.','results':results}

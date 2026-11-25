@@ -303,13 +303,16 @@ nextest:
 # alone, with the gate's DuckDB result-correctness feature. It lists the
 # selection first and fails unless every test the filter names is in it, so a
 # renamed test cannot quietly drop out of both runs.
+# The listing is JSON because CI's cargo-nextest (.github/actions/setup-nextest)
+# predates `--message-format oneline`; this counts the tests the filter matched.
+_COUNT_LISTED_MATCHES = import json, sys; d = json.load(sys.stdin); print(sum(t['filter-match']['status'] == 'matches' for s in d['rust-suites'].values() for t in s['testcases'].values()))
 _POST_MERGE_SELECTION = -p cayenne --features cayenne/result-correctness-duckdb --lib --test integration $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 .PHONY: nextest-post-merge
 nextest-post-merge:
 	@$(_WITH_LIBDUCKDB) \
 	named=$$(printf '%s' '$(NEXTEST_POST_MERGE_FILTER)' | grep -o 'test(=' | wc -l | tr -d ' '); \
-	listed=$$(cargo nextest list $(_POST_MERGE_SELECTION) --message-format oneline -E '$(NEXTEST_POST_MERGE_FILTER)') || exit $$?; \
-	count=$$(printf '%s\n' "$$listed" | grep -c .); \
+	listed=$$(cargo nextest list $(_POST_MERGE_SELECTION) --message-format json -E '$(NEXTEST_POST_MERGE_FILTER)') || exit $$?; \
+	count=$$(printf '%s' "$$listed" | $(PYTHON) -c "$(_COUNT_LISTED_MATCHES)") || exit $$?; \
 	if [ "$$count" != "$$named" ]; then \
 	  echo "nextest-post-merge: NEXTEST_POST_MERGE_FILTER names $$named tests but selects $$count, so a named test was renamed or removed. Update the filter in the Makefile." >&2; \
 	  exit 1; \
