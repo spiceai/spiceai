@@ -1770,6 +1770,10 @@ pub(crate) async fn create_table_provider(
         agg_pushdown_optimization,
     );
 
+    // DuckDB evaluates the `UPDATE` and `DELETE` the writer renders.
+    let write_provider =
+        runtime_datafusion::checked_arithmetic::with_plain_arithmetic_writes(write_provider);
+
     let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
         write_provider,
         read_provider,
@@ -2424,15 +2428,14 @@ mod tests {
         let provider = accelerator
             .create_external_table(cmd, None, vec![], None)
             .await?;
-        let poly = spice_table::find_layer::<data_components::poly::PolyTableProvider>(
-            provider.as_ref(),
-            spice_table::LayerWalk::Write,
-        )
-        .expect("the poly read/write layer");
-        let writer = poly.writer();
-        let writer = writer
-            .downcast_ref::<datafusion_table_providers::duckdb::write::DuckDBTableWriter>()
-            .expect("DuckDBTableWriter");
+        // Write settings live on `DuckDBTableWriter`. The write stack also
+        // carries `PlainArithmeticWrites` (so DuckDB sees `+` / `-` / `*` in
+        // UPDATE/DELETE SQL, not `__spice_checked_*`) and the poly read/write
+        // split; `find_concrete` walks those layers.
+        let writer = spice_table::find_concrete::<
+            datafusion_table_providers::duckdb::write::DuckDBTableWriter,
+        >(provider.as_ref(), spice_table::LayerWalk::Write)
+        .expect("DuckDBTableWriter under the write walk");
         Ok(writer.write_settings().clone())
     }
 
