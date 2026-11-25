@@ -120,6 +120,29 @@ class InstallCacheTest(unittest.TestCase):
         self.assertEqual(len(self.downloads), 2)
         self.assert_genuine(target)
 
+    def test_an_install_holding_another_file_is_replaced(self):
+        target = self.install()
+        (target / "sqlite.toml").write_text('[Driver]\nshared = "/tmp/planted.so"\n')
+        self.install()
+        self.assertEqual(len(self.downloads), 2)
+        self.assertEqual(sorted(os.listdir(target)), sorted([libduckdb.ARCHIVE, LIBRARY, libduckdb.MANIFEST]))
+        self.assert_genuine(target)
+
+    def test_a_cache_path_with_a_line_break_is_refused(self):
+        self.cache = Path(self.tmp.name).resolve() / "cache\nBASH_ENV=/tmp/evil.sh\nX="
+        with self.assertRaises(libduckdb.Error):
+            self.install()
+        self.assertEqual(self.downloads, [])
+
+    def test_a_lock_that_is_a_link_is_not_followed(self):
+        outside = Path(self.tmp.name) / "outside"
+        outside.write_text("keep me")
+        self.cache.mkdir(parents=True)
+        (self.cache / f".{VERSION}.lock").symlink_to(outside)
+        with self.assertRaises(libduckdb.Error):
+            self.install()
+        self.assertEqual(outside.read_text(), "keep me")
+
     def test_a_download_that_does_not_match_fails_and_installs_nothing(self):
         self.served = release_archive(b"planted library")
         with self.assertRaises(libduckdb.Error):

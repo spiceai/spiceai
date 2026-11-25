@@ -136,6 +136,10 @@ def extract(archive: bytes, url: str, library: str) -> bytes:
 
 def install(version: str | None, cache_dir: Path) -> Path:
     cache_dir = cache_dir.expanduser().resolve()
+    # The directory printed goes into ADBC_DRIVER_PATH, which CI writes as one line of
+    # GITHUB_ENV, so a path that could break a line, or end a value, is refused.
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in str(cache_dir)):
+        raise Error(f"the cache directory {str(cache_dir)!r} has a control character in its path")
     entry = listed_release(version)
     version = entry["version"]
     release, library = release_platform()
@@ -155,7 +159,12 @@ def install(version: str | None, cache_dir: Path) -> Path:
     # no install could publish over one another run had just returned, and the
     # caller of that run would find its manifest gone.
     cache_dir.mkdir(parents=True, exist_ok=True)
-    with open(cache_dir / f".{version}.lock", "w") as lock:
+    try:
+        # Never through a symbolic link, which would truncate whatever it points at.
+        fd = os.open(cache_dir / f".{version}.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    except OSError as e:
+        raise Error(f"cannot open the lock {cache_dir / f'.{version}.lock'}: {e}") from e
+    with os.fdopen(fd, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if installed(target, library, expected):
             return target
@@ -215,9 +224,13 @@ def installed(target: Path, library: str, expected: str) -> bool:
     SHA-256 `expected`. Nothing there is taken on trust: the kept archive is
     hashed against `expected`, the library must be the one that archive holds,
     byte for byte, and the manifest the one `publish` writes. A symbolic link,
-    a missing file or any difference means the install is replaced."""
+    a missing or extra file, or any difference means the install is replaced."""
     files = [target / ARCHIVE, target / library, target / MANIFEST]
     if target.is_symlink() or not target.is_dir():
+        return False
+    # Nothing else either: the directory goes first on ADBC_DRIVER_PATH, where another
+    # driver manifest would be found.
+    if sorted(os.listdir(target)) != sorted(path.name for path in files):
         return False
     if any(path.is_symlink() or not path.is_file() for path in files):
         return False

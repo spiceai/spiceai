@@ -71,7 +71,7 @@ runs:
         # into it, as regular files with the bytes they had: anything else there would
         # run ahead of the system's own commands.
         if [ "$INPUT_INSTALL_SCOPE" = job ]; then
-          entries="$(cd "$install_dir" && ls -A | LC_ALL=C sort | tr '\n' ' ')"
+          entries="$(find "$install_dir" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort | tr '\n' ' ')"
           if [ "$entries" != "spice spiced " ] ||
             [ -L "$install_dir/spice" ] || [ ! -f "$install_dir/spice" ] ||
             [ -L "$install_dir/spiced" ] || [ ! -f "$install_dir/spiced" ] ||

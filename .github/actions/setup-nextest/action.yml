@@ -65,6 +65,7 @@ runs:
 
         # Only the verified archive's cargo-nextest is installed, into CARGO_HOME's bin,
         # which setup-rust makes the job's own on a self-hosted Mac.
+        echo "Installing cargo-nextest $version for $target from its pinned release."
         dir="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/cargo-nextest.XXXXXX")"
         bash "$github_dir/scripts/cached_fetch.sh" "$sha256" "$dir/cargo-nextest.tar.gz" "$url"
         tar -xzf "$dir/cargo-nextest.tar.gz" -C "$dir" cargo-nextest

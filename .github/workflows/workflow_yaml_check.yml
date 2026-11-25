@@ -41,6 +41,7 @@ on:
       - '.github/scripts/test_extract_snapshot_archives.py'
       - '.github/scripts/test_install_spice.py'
       - '.github/scripts/test_setup_nextest.py'
+      - '.github/scripts/test_setup_libduckdb.py'
       - 'scripts/libduckdb.py'
       - 'scripts/test_libduckdb.py'
       - 'test/duckdb_versions.json'
@@ -79,6 +80,7 @@ on:
       - '.github/scripts/test_extract_snapshot_archives.py'
       - '.github/scripts/test_install_spice.py'
       - '.github/scripts/test_setup_nextest.py'
+      - '.github/scripts/test_setup_libduckdb.py'
       - 'scripts/libduckdb.py'
       - 'scripts/test_libduckdb.py'
       - 'test/duckdb_versions.json'
@@ -138,6 +140,7 @@ jobs:
           python .github/scripts/test_extract_snapshot_archives.py -v
           python .github/scripts/test_install_spice.py -v
           python .github/scripts/test_setup_nextest.py -v
+          python .github/scripts/test_setup_libduckdb.py -v
           python scripts/test_libduckdb.py -v
 
       - name: Validate GitHub Actions definitions
