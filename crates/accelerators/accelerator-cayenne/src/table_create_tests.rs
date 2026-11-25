@@ -363,6 +363,73 @@ async fn an_upgrade_loads_from_the_source_and_leaves_the_sqlite_copy_untouched()
     );
 }
 
+/// A recreate stopped after it dropped the object-native table and before it forgot
+/// what that table left: the object-native metastore keeps a dropped dataset's source
+/// positions and moves them into the next dataset created under its name. The next
+/// start creates the table anew and empty, so its Kafka source must start the topic
+/// from the beginning, not resume past messages the empty table never received.
+#[tokio::test]
+async fn a_new_object_native_table_does_not_resume_from_a_dropped_tables_offsets() {
+    use runtime_checkpoint_api::kafka::{KafkaCheckpoint, KafkaOffset};
+
+    let base = tempfile::tempdir().expect("temp dir");
+    let name = "orders";
+    let flag_on = dataset(base.path(), name, "enabled", Mode::File);
+
+    let (accelerator, table) = start(&flag_on).await;
+    load(&accelerator, &flag_on, &table, 0..300).await;
+    accelerator
+        .sidecar(&flag_on, OpenOption::OpenExisting)
+        .await
+        .expect("sidecar")
+        .kafka_checkpoint_store()
+        .expect("kafka store")
+        .upsert(&KafkaCheckpoint {
+            consumer_group_id: "group".to_string(),
+            topic: "orders".to_string(),
+            schema_json: "{}".to_string(),
+            offsets: vec![KafkaOffset {
+                topic: "orders".to_string(),
+                partition: 0,
+                offset: 299,
+            }],
+        })
+        .await
+        .expect("record the offsets");
+    let native = Arc::clone(accelerator.native_catalog.get().expect("native catalog"));
+    assert!(
+        cayenne::MetadataCatalog::drop_table(native.as_ref(), name)
+            .await
+            .expect("drop the table"),
+        "the table existed"
+    );
+    accelerator.shutdown().await.expect("shut down");
+    drop((accelerator, table, native));
+
+    let (accelerator, table) = start(&flag_on).await;
+    let resumed = accelerator
+        .sidecar(&flag_on, OpenOption::OpenExisting)
+        .await
+        .expect("sidecar")
+        .kafka_checkpoint_store()
+        .expect("kafka store")
+        .get()
+        .await
+        .expect("read the offsets")
+        .map(|checkpoint| {
+            checkpoint
+                .offsets
+                .into_iter()
+                .map(|o| (o.topic, o.partition, o.offset))
+                .collect::<Vec<_>>()
+        });
+    assert_eq!(
+        (row_count(&table).await, resumed),
+        (0, None),
+        "the new table is empty, so its source has no offsets to resume from"
+    );
+}
+
 /// `name` under `runtime.params.cayenne_vnext: enabled` and an `s3://` state location,
 /// with no `cayenne_file_path`, so a new table keeps its data files in the location.
 fn placed_dataset(base: &Path, name: &str, mode: Mode) -> TestAccelerationSource {
