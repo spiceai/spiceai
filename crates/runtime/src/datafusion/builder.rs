@@ -4360,6 +4360,7 @@ mod tests {
                 "spice_ddl_rewrite",
                 "federation_optimizer_rule",
                 "resolve_grouping_function",
+                "round_decimal_places_literal",
                 "type_coercion",
                 "exact_float_literal_decimal_cast",
                 "spice_ddl_rewrite",
