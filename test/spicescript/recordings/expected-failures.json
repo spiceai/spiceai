@@ -743,22 +743,6 @@
     {
       "run": "mysql-cdc-parity",
       "who": "object-native",
-      "key": "query: SELECT * FROM orders #8",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "mysql-cdc-parity",
-      "who": "object-native",
-      "key": "query: SELECT * FROM customers #8",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "mysql-cdc-parity",
-      "who": "object-native",
       "key": "query: SELECT * FROM customers #9",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for customers: Acceleration not ready; loading initial data for customers",
@@ -1258,22 +1242,6 @@
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 18449, actual: 18818 }",
       "group": "cayenne",
       "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native",
-      "key": "query: SELECT * FROM orders #9",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native",
-      "key": "query: SELECT * FROM customers #7",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
-      "group": "cayenne"
     },
     {
       "run": "postgres-cdc-parity",
