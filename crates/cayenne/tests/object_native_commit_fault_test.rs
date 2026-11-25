@@ -1386,13 +1386,27 @@ mod data_path {
         }
         drop(held);
         let armed = arm(&faults, &dataset_head(&native, "facts"));
+        // A small-file pass declines while the appends' maintenance is still in
+        // flight, so it is retried until it rewrites or the fault fires.
         let rewrite = {
             let table = Arc::clone(&placed.table);
+            let fired = Arc::clone(&armed);
             tokio::spawn(async move {
-                if whole {
-                    table.force_full_compaction().await
-                } else {
-                    table.compact_current_snapshot_small_files().await
+                let mut attempts = 0;
+                loop {
+                    let rewritten = if whole {
+                        table.force_full_compaction().await
+                    } else {
+                        table.compact_current_snapshot_small_files().await
+                    };
+                    attempts += 1;
+                    if !matches!(rewritten, Ok(false))
+                        || fired.load(std::sync::atomic::Ordering::SeqCst)
+                        || attempts == 50
+                    {
+                        return rewritten;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             })
         };
