@@ -1,4 +1,5 @@
 name: layout-coverage
+tags: [long]
 description: >
   How an acceleration lays data out never changes an answer: Cayenne
   (default, sorted, clustered, partitioned, indexed, zstd) answers the extended corpus and ternary logic partitioning as

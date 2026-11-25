@@ -1,6 +1,12 @@
 ---
 name: integration tests (llms)
 
+# The model integration tests: local models (llama.cpp, mistral.rs) and the
+# hosted providers. They run after merge, not in the merge queue: on a trunk or
+# release push that touches the model crates (below), and on every
+# trunk_tests.yml run, which calls this workflow so a failure counts toward
+# Trunk Health.
+
 on:
   push:
     branches:
@@ -19,12 +25,24 @@ on:
       - 'crates/evaluate-chat/**'
       - 'crates/llms-llamacpp/**'
       - 'crates/llama-cpp/**'
-  merge_group:
-    branches:
-      - trunk
-      - release-*
-      - release/*
-      - feature-*
+  # trunk_tests.yml calls this with the commit it tests.
+  workflow_call:
+    inputs:
+      ref:
+        description: 'The commit to test (default: the calling run''s commit)'
+        required: false
+        type: string
+        default: ''
+      run:
+        description: 'Which groups of models to run: all, hosted or self-hosted'
+        required: false
+        type: string
+        default: all
+      models:
+        description: 'Comma-separated models to run instead of each group''s whole set'
+        required: false
+        type: string
+        default: ''
   workflow_dispatch:
     inputs:
       run:
@@ -73,13 +91,12 @@ jobs:
       - name: Set up matrix
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         id: setup-matrix
+        env:
+          RUN: ${{ inputs.run }}
+          MODELS: ${{ inputs.models }}
         with:
           script: |
-            // `spiceai-macos-large` in the merge queue, like `build`: on the
-            // `spiceai-macos` minis these legs queued 52.5 min at p90 for a
-            // runner and then ran for about a minute (merge_group,
-            // 2026-09-29..10-13). The standard pool on every other event.
-            const runner = context.eventName === 'merge_group' ? 'spiceai-macos-large' : 'spiceai-macos';
+            const runner = 'spiceai-macos';
             const matrix = [
               {
                 name: 'self-hosted',
@@ -97,9 +114,12 @@ jobs:
               }
             ];
 
-            if (context.eventName === 'workflow_dispatch') {
-              const name = context.payload.inputs.run;
-              const requested = (context.payload.inputs.models || '')
+            // A dispatch or a call names its groups and models through the
+            // workflow's inputs; a call runs under its caller's event, so the
+            // event name cannot tell these apart.
+            const name = process.env.RUN;
+            if (name) {
+              const requested = (process.env.MODELS || '')
                 .split(',')
                 .map(model => model.trim())
                 .filter(Boolean);
@@ -132,11 +152,7 @@ jobs:
 
   build:
     name: Build Test Binary
-    # `spiceai-macos-large` in the merge queue: on the `spiceai-macos` minis
-    # this build queued 68 min at p90 for a runner (merge_group,
-    # 2026-09-29..10-13). The `test` legs follow it there through
-    # `setup-matrix`. The standard pool on every other event.
-    runs-on: ${{ github.event_name == 'merge_group' && 'spiceai-macos-large' || 'spiceai-macos' }}
+    runs-on: spiceai-macos
     environment: ci
     # Slowest observed success in the 2026-07-25..08-08 window: 17 min, but
     # every sample had a warm sccache. Sized against the other macOS workspace
@@ -149,6 +165,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
           fetch-depth: 1 # Shallow clone for faster checkout
 
@@ -224,7 +241,7 @@ jobs:
       AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
       AZURE_OPENAI_TENANT_ID: ${{ secrets.AZURE_OPENAI_TENANT_ID }}
       AZURE_OPENAI_CLIENT_ID: ${{ secrets.AZURE_OPENAI_CLIENT_ID }}
-      HAS_BEDROCK_ROLE: ${{ secrets.AWS_BEDROCK_ROLE_ARN != '' }}
+      HAS_BEDROCK_ROLE: ${{ secrets.CI_AWS_BEDROCK_ROLE_ARN != '' }}
     strategy:
       # The two arms cover disjoint model sets — self-hosted local models and the hosted
       # providers — so one arm's result says nothing about the other's, and cancelling the
@@ -245,6 +262,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
 
       # Bedrock: an IAM role that trusts this job's GitHub OIDC token (subject
@@ -256,7 +274,7 @@ jobs:
         id: bedrock-role
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_BEDROCK_ROLE_ARN }}
           role-session-name: gha-llms-bedrock-${{ github.run_id }}
           aws-region: us-east-1
           output-env-credentials: false
@@ -313,13 +331,13 @@ jobs:
           # honours it for every service, so leaving it set sends this suite's Bedrock
           # calls to the local build cache instead of AWS.
           unset AWS_ENDPOINT_URL
-          # Bedrock runs as the CI role (`AWS_BEDROCK_ROLE_ARN`): until the `ci` environment has
+          # Bedrock runs as the CI role (`CI_AWS_BEDROCK_ROLE_ARN`): until the `ci` environment has
           # one, the other providers still run, and the run says Bedrock did not.
           if [[ ",${MODEL_ALLOWLIST}," == *",bedrock,"* && "${HAS_BEDROCK_ROLE}" != "true" ]]; then
-            echo "::warning::AWS_BEDROCK_ROLE_ARN is not set in the ci environment, so this run does not test Bedrock. Create the Bedrock CI role and set the secret."
+            echo "::warning::CI_AWS_BEDROCK_ROLE_ARN is not set in the ci environment, so this run does not test Bedrock. Create the Bedrock CI role and set the secret."
             MODEL_ALLOWLIST=$(printf '%s' "$MODEL_ALLOWLIST" | tr ',' '\n' | grep -vx bedrock | paste -sd, - || true)
             if [ -z "$MODEL_ALLOWLIST" ]; then
-              echo "::error::This run tests only Bedrock, which needs AWS_BEDROCK_ROLE_ARN."
+              echo "::error::This run tests only Bedrock, which needs CI_AWS_BEDROCK_ROLE_ARN."
               exit 1
             fi
             export MODEL_ALLOWLIST
@@ -378,14 +396,18 @@ jobs:
     # The engine's model, differential and greedy-pick tests download Qwen3-0.6B (639 MB), its
     # MTP tests Qwen3.5-0.8B (550 MB), and its content-part tests both, from Hugging Face and run
     # them; its no-network tests run in `make nextest`.
-    if: github.event_name != 'workflow_dispatch' || inputs.run != 'hosted'
-    runs-on: ${{ github.event_name == 'merge_group' && 'spiceai-macos-large' || 'spiceai-macos' }}
+    if: inputs.run != 'hosted'
+    runs-on: spiceai-macos
     # Sized like the build job above: a cold cache rebuilds llama.cpp and mistral.rs.
     timeout-minutes: 180
-    permissions: read-all
+    # Only the checkout reads anything; a caller cannot grant `read-all`
+    # alongside the `id-token: write` the test job needs.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
           fetch-depth: 1
 
@@ -395,10 +417,14 @@ jobs:
       - name: Set up the C and C++ toolchain
         uses: $/.github/actions/setup-cc
 
-      - name: Run the llama.cpp engine's model, content-part, differential, greedy-pick, Harmony, MTP, prefix-reuse, Hugging Face resolution and unsupported-architecture tests
+      - name: Run the llama.cpp engine's model, content-part, differential, greedy-pick, Harmony, Inkling, MTP, prefix-reuse, Hugging Face resolution and unsupported-architecture tests
         env:
           # Metal runners do not have `xcrun metal`
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
+        # One test at a time. Each test loads a model of its own, and several models computing
+        # on one Apple GPU at once can hang it ("Caused GPU Hang Error"): the GPU's recovery then
+        # discards every model's queued work, failing tests that did nothing wrong. Four at a
+        # time still hangs the M3 Pro runners' GPU.
         run: |
-          cargo test -p llms-llamacpp --features metal --test integration -- model:: batching:: content_parts:: differential:: distributed:: greedy:: harmony:: mtp:: prefix_reuse:: sequences:: hf_resolution:: unsupported::
+          cargo test -p llms-llamacpp --features metal --test integration -- --test-threads=1 model:: batching:: content_parts:: differential:: distributed:: greedy:: harmony:: inkling:: mtp:: prefix_reuse:: sequences:: system_messages:: hf_resolution:: unsupported::

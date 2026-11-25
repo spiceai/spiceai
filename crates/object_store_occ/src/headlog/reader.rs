@@ -50,7 +50,8 @@ pub struct Reader {
 
 impl Reader {
     /// GET head, then fetch the checkpoint and the listed batches, at most
-    /// [`DEFAULT_READ_CONCURRENCY`] GETs at a time.
+    /// [`DEFAULT_READ_CONCURRENCY`] GETs at a time. When a listed object was
+    /// collected under a newer floor meanwhile, opens from the newer head.
     /// # Errors
     /// Missing referenced objects, malformed history, and transport failures are errors.
     pub async fn open(store: Arc<dyn ObjectStore>, prefix: Path) -> Result<(Self, Opened)> {
@@ -68,37 +69,37 @@ impl Reader {
         if concurrency == 0 {
             return invalid("read concurrency must be at least 1");
         }
-        let state = read_head(store.as_ref(), &prefix).await?;
-        let head = &state.head;
-        let checkpoint = async {
-            if head.floor == 0 {
-                Ok(None)
-            } else {
-                load_checkpoint(store.as_ref(), &prefix, head)
-                    .await
-                    .map(|c| Some(c.root))
+        let mut state = read_head(store.as_ref(), &prefix).await?;
+        let mut retries = 0;
+        loop {
+            match load(store.as_ref(), &prefix, &state, concurrency).await {
+                Ok(opened) => {
+                    return Ok((
+                        Self {
+                            store,
+                            prefix,
+                            state,
+                            concurrency,
+                        },
+                        opened,
+                    ));
+                }
+                // An object the head lists is gone. If the floor has moved
+                // since, a collector deleted it below the newer floor: open
+                // from the newer head. Otherwise it is missing, an error.
+                Err(error) if retries < OPEN_RETRIES && is_not_found(&error) => {
+                    let latest = read_head(store.as_ref(), &prefix).await?;
+                    if latest.head.incarnation != state.head.incarnation
+                        || latest.head.floor <= state.head.floor
+                    {
+                        return Err(error);
+                    }
+                    state = latest;
+                    retries += 1;
+                }
+                Err(error) => return Err(error),
             }
-        };
-        let records = async {
-            let records =
-                records_since(store.as_ref(), &prefix, head, head.floor, concurrency).await?;
-            resolve_spilled(store.as_ref(), &prefix, records, concurrency).await
-        };
-        let (checkpoint_root, records) = futures::try_join!(checkpoint, records)?;
-        let opened = Opened {
-            checkpoint_root,
-            floor: head.floor,
-            records,
-        };
-        Ok((
-            Self {
-                store,
-                prefix,
-                state,
-                concurrency,
-            },
-            opened,
-        ))
+        }
     }
 
     #[must_use]
@@ -148,6 +149,48 @@ impl Reader {
     }
 }
 
+/// How many times a cold open starts over from a newer head after a listed
+/// object was collected under it.
+const OPEN_RETRIES: usize = 3;
+
+fn is_not_found(error: &super::Error) -> bool {
+    matches!(
+        error,
+        super::Error::Storage {
+            source: object_store::Error::NotFound { .. }
+        }
+    )
+}
+
+/// Fetch what `state` lists: its checkpoint and the records after its floor.
+async fn load(
+    store: &dyn ObjectStore,
+    prefix: &Path,
+    state: &HeadState,
+    concurrency: usize,
+) -> Result<Opened> {
+    let head = &state.head;
+    let checkpoint = async {
+        if head.floor == 0 {
+            Ok(None)
+        } else {
+            load_checkpoint(store, prefix, head)
+                .await
+                .map(|c| Some(c.root))
+        }
+    };
+    let records = async {
+        let records = records_since(store, prefix, head, head.floor, concurrency).await?;
+        resolve_spilled(store, prefix, records, concurrency).await
+    };
+    let (checkpoint_root, records) = futures::try_join!(checkpoint, records)?;
+    Ok(Opened {
+        checkpoint_root,
+        floor: head.floor,
+        records,
+    })
+}
+
 pub(super) async fn records_since(
     store: &dyn ObjectStore,
     prefix: &Path,
@@ -165,7 +208,7 @@ pub(super) async fn records_since(
         }
         reads.push(async move {
             let bytes = store
-                .get(&numbered(prefix, "wal", start))
+                .get(&numbered(prefix, super::BATCHES, start))
                 .await?
                 .bytes()
                 .await?;
@@ -223,7 +266,7 @@ async fn resolve_spilled(
 ) -> Result<Vec<RecordWithCommit>> {
     futures::stream::iter(records.into_iter().map(|mut entry| async move {
         if let Some(spilled) = entry.record.spilled.take() {
-            let path = spilled_path(prefix, entry.record.generation, &spilled.digest)?;
+            let path = spilled_path(prefix, entry.commit, &entry.record.attempt_id);
             let bytes = store.get(&path).await?.bytes().await?;
             if bytes.len() as u64 != spilled.len
                 || blake3::hash(&bytes).as_bytes()[..] != spilled.digest[..]

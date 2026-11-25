@@ -596,6 +596,9 @@ pub struct Builder {
     append_cursor_store: Option<refresh_task::append_cursor::AppendCursorStore>,
     node_local: bool,
     append_grouping: Option<Arc<AppendGrouping>>,
+    /// Forwards committed append refreshes to the dataset's `DoExchange`
+    /// subscribers.
+    data_update_publisher: Option<runtime_acceleration::dataupdate::DataUpdatePublisher>,
 }
 
 impl Builder {
@@ -656,6 +659,7 @@ impl Builder {
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
             user_facing_schema: None,
             cdc_param_overrides: None,
+            data_update_publisher: None,
             fallback_retention_keep: None,
             append_cursor_store: None,
             node_local: false,
@@ -1029,6 +1033,17 @@ impl Builder {
         self
     }
 
+    /// Forward each committed append refresh to the dataset's `DoExchange`
+    /// subscribers, so an append stream from this dataset delivers the rows
+    /// its refreshes append.
+    pub fn data_update_publisher(
+        &mut self,
+        publisher: Option<runtime_acceleration::dataupdate::DataUpdatePublisher>,
+    ) -> &mut Self {
+        self.data_update_publisher = publisher;
+        self
+    }
+
     /// Provide per-dataset `cdc_*` parameter overrides drawn from
     /// `dataset.acceleration.params`. These layer on top of the runtime-global
     /// CDC config only for this dataset's changes stream;
@@ -1306,6 +1321,7 @@ impl Builder {
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
         refresher.with_engine_type_rewrites(self.engine_type_rewrites);
         refresher.with_cdc_param_overrides(self.cdc_param_overrides);
+        refresher.with_data_update_publisher(self.data_update_publisher);
 
         // Durable federated write-back (#11838): a WriteBack Cayenne table whose
         // commit path marks dirty keys gets a per-table delivery worker that
@@ -1830,6 +1846,12 @@ impl AcceleratedTable {
     /// Returns [`Error::InvalidRefreshOverrides`] describing the first problem found.
     pub async fn validate_refresh_overrides(&self, overrides: &RefreshOverrides) -> Result<()> {
         let refresh = self.refresh_params.read().await.clone();
+        let has_primary_key = self.accelerator.constraints().is_some_and(|constraints| {
+            !get_primary_keys_from_constraints(constraints, &self.accelerator.schema()).is_empty()
+        });
+        overrides
+            .validate_append_keys(&refresh, has_primary_key)
+            .context(InvalidRefreshOverridesSnafu)?;
         overrides
             .validate_for(&self.dataset_name, &refresh, self.federated.schema())
             .context(InvalidRefreshOverridesSnafu)

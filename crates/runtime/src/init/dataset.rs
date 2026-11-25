@@ -787,8 +787,8 @@ impl Runtime {
             let ds_for_lazy = Arc::clone(&ds);
             let connector_builder: crate::init::dataset_initialization::LazyConnectorBuilder =
                 Box::new(move || {
-                    let runtime = runtime_for_lazy;
-                    let ds = ds_for_lazy;
+                    let runtime = Arc::clone(&runtime_for_lazy);
+                    let ds = Arc::clone(&ds_for_lazy);
                     Box::pin(async move {
                         runtime
                             .get_dataconnector_from_dataset(ds)
@@ -4915,7 +4915,7 @@ mod tests {
         }
 
         let not_cayenne = Acceleration {
-            engine: Engine::Sqlite,
+            engine: Engine::Arrow,
             ..acceleration_with_params(WriteMode::WriteThrough, &none)
         };
         assert_eq!(
@@ -7097,7 +7097,10 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         assert_eq!(names(&reloading), ["child", "grandchild"]);
 
         // Nothing changed, nothing reloads.
-        assert!(with_localpod_dependents(vec![], &all).is_empty());
+        assert_eq!(
+            with_localpod_dependents(vec![], &all),
+            [] as [Arc<Dataset>; 0]
+        );
     }
 
     /// Two `localpod` datasets reading through each other can never load; the ordering walk
@@ -7271,7 +7274,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         let unchanged = Arc::clone(&runtime)
             .apply_dataset_diff(&app("http://a"), &app("http://a"))
             .await;
-        assert!(reloaded(unchanged).is_empty());
+        assert_eq!(reloaded(unchanged), [] as [String; 0]);
 
         let changed = Arc::clone(&runtime)
             .apply_dataset_diff(&app("http://a"), &app("http://b"))

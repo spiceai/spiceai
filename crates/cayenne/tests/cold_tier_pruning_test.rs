@@ -315,7 +315,10 @@ async fn test_warm_tier_normalized_clustering_prunes_both_dimensions_impl(
         table.effective_sort_columns_for_rewrite().is_empty(),
         "automatic/inferred sort columns must be disabled by explicit cluster_by"
     );
-    table.sort_and_rewrite_data(1024 * 1024).await?;
+    assert!(
+        table.force_full_compaction().await?,
+        "the full compaction must commit"
+    );
 
     let all_files = planned_files_for(&ctx, "SELECT id FROM warm_cluster_prune_t").await?;
     assert!(
@@ -835,7 +838,7 @@ async fn test_cold_tier_pk_bloom_composite_key_impl(
         "SELECT id FROM bloom_comp_t WHERE id = {id} AND region = {}",
         (region + 1) % 3
     );
-    assert!(collect_ids(&ctx, &wrong).await?.is_empty());
+    assert_eq!(collect_ids(&ctx, &wrong).await?, [] as [i64; 0]);
     assert!(
         planned_distinct_files_for(&ctx, &wrong).await? <= 2,
         "a pair no file holds is rejected by the blooms"

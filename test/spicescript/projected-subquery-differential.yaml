@@ -1,4 +1,5 @@
 name: projected-subquery-differential
+tags: [long]
 description: >
   Projected subquery predicates preserve expression names, correlations and
   three-valued logic over seeded nullable data with duplicates. PostgreSQL is

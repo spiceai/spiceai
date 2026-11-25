@@ -248,7 +248,7 @@ pub fn create_otel_periodic_reader(
     let protocol = if config.is_http() { "http" } else { "grpc" };
     let temporality = map_temporality(config.temporality);
     tracing::info!(
-        endpoint = %config.endpoint,
+        endpoint = %redact::redact_url_credentials(&config.endpoint),
         protocol = protocol,
         push_interval_secs = push_interval.as_secs(),
         metrics_filter = ?config.metrics,
@@ -534,7 +534,8 @@ impl<E: SdkLogExporter> SdkLogExporter for ReportingLogExporter<E> {
 /// What an operator reads when log export to `endpoint` starts failing.
 #[must_use]
 pub fn log_export_failed_message(endpoint: &str, cause: &OTelSdkError) -> String {
-    let cause = util::single_line(&cause.to_string()).into_owned();
+    let endpoint = redact::redact_url_credentials(endpoint);
+    let cause = redact::redact_message_credentials(&util::single_line(&cause.to_string()));
     format!(
         "Failed to export logs to the OpenTelemetry endpoint '{endpoint}', so log records are dropped until it recovers. Check that the endpoint is reachable and accepts OTLP logs. Cause: {cause}. See: {OTEL_EXPORTER_DOCS_URL}"
     )
@@ -544,6 +545,7 @@ pub fn log_export_failed_message(endpoint: &str, cause: &OTelSdkError) -> String
 /// `undelivered` records were not delivered.
 #[must_use]
 pub fn log_export_recovered_message(endpoint: &str, undelivered: u64) -> String {
+    let endpoint = redact::redact_url_credentials(endpoint);
     let records = if undelivered == 1 {
         "1 log record was".to_string()
     } else {
@@ -1168,6 +1170,24 @@ mod tests {
                 &OTelSdkError::InternalFailure("HTTP export failed.\nStatus Code: 404".to_string()),
             ),
             "Failed to export logs to the OpenTelemetry endpoint 'http://otel-collector:4318', so log records are dropped until it recovers. Check that the endpoint is reachable and accepts OTLP logs. Cause: Operation failed: HTTP export failed. Status Code: 404. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetryotel_exporter"
+        );
+    }
+
+    /// An endpoint can carry a credential in its userinfo or query string; the messages name
+    /// the endpoint without it.
+    #[test]
+    fn test_log_export_messages_leave_out_endpoint_credentials() {
+        let endpoint = "http://alice:hunter2@otel-collector:4318/v1/logs?api_key=abc123";
+        assert_eq!(
+            log_export_failed_message(
+                endpoint,
+                &OTelSdkError::InternalFailure("HTTP export failed: network error".to_string()),
+            ),
+            "Failed to export logs to the OpenTelemetry endpoint 'http://otel-collector:4318/v1/logs?api_key=***', so log records are dropped until it recovers. Check that the endpoint is reachable and accepts OTLP logs. Cause: Operation failed: HTTP export failed: network error. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetryotel_exporter"
+        );
+        assert_eq!(
+            log_export_recovered_message(endpoint, 3),
+            "Log export to the OpenTelemetry endpoint 'http://otel-collector:4318/v1/logs?api_key=***' recovered; 3 log records were not delivered while it was failing."
         );
     }
 

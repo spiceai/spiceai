@@ -341,6 +341,7 @@ impl Runtime {
             // Most of `runtime.*` sizes or builds something that is already
             // running. Say so rather than silently ignoring the edit.
             warn_on_start_time_only_changes(&current_app.runtime, &new_app.runtime);
+            crate::log_refused_components(&new_app, Some(current_app));
 
             // Startup warned about the components already loaded, so name only the ones
             // this reload adds or changes. An executor runs the scheduler's spicepod,
@@ -708,7 +709,7 @@ mod tests {
 
     #[test]
     fn an_unchanged_runtime_reports_nothing() {
-        assert!(changed_sections(|_| {}).is_empty());
+        assert_eq!(changed_sections(|_| {}), [] as [&str; 0]);
     }
 
     /// Settings that apply on a reload: reporting them would tell the operator

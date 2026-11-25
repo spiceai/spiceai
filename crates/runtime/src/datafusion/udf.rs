@@ -251,7 +251,7 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
                 upsert_user_function_info(info_from_decl(&decl));
                 tracing::info!(
                     name = %decl.name,
-                    from = %decl.from,
+                    from = %user_function_display_from(&decl),
                     "Registered user function"
                 );
                 functions_to_expose_as_tools.push(decl);
@@ -273,7 +273,7 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
                 upsert_user_function_info(info_from_decl(&decl));
                 tracing::info!(
                     name = %decl.name,
-                    from = %decl.from,
+                    from = %user_function_display_from(&decl),
                     "Registered user table function"
                 );
                 if decl.as_tool {
@@ -456,12 +456,27 @@ pub(crate) fn effective_user_function_volatility(decl: &Function) -> &'static st
     }
 }
 
+/// A function's `from` as the runtime reports it: in its registration log line,
+/// `list_udfs()`, `/v1/functions` and the schema context NSQL sends a model.
+///
+/// An HTTP function's endpoint URL can carry a credential — `user:password@` or a
+/// signed or keyed query parameter (`?token=`, `?sig=`) — and every one of those
+/// readers is wider than the operator who wrote the Spicepod: a read-only API key, a
+/// log pipeline, a model provider. So the URL is reported the way `/v1/datasets`
+/// reports a dataset's `from`, through
+/// [`redact_source_credentials`](crate::http::v1::redact_source_credentials): the
+/// userinfo removed and secret query values replaced, everything else as written. The
+/// request still goes to the URL as written.
+pub(crate) fn user_function_display_from(decl: &Function) -> String {
+    crate::http::v1::redact_source_credentials(&decl.from)
+}
+
 fn info_from_decl(decl: &Function) -> UserFunctionInfo {
     UserFunctionInfo {
         name: decl.name.clone(),
         kind: decl.kind.as_str().to_string(),
         volatility: effective_user_function_volatility(decl).to_string(),
-        from: decl.from.clone(),
+        from: user_function_display_from(decl),
         description: decl.description.clone(),
     }
 }
@@ -599,7 +614,7 @@ async fn apply_function_diff_inner(
                     add_code_executing_function(&next.name);
                 }
                 upsert_user_function_info(info_from_decl(&next));
-                tracing::info!(name = %next.name, from = %next.from, "Registered user function");
+                tracing::info!(name = %next.name, from = %user_function_display_from(&next), "Registered user function");
                 functions_to_expose_as_tools.push(next);
             }
             runtime_datafusion_udfs::user_functions::BuiltFunction::Table(udtf) => {
@@ -618,7 +633,7 @@ async fn apply_function_diff_inner(
                     add_code_executing_function(&next.name);
                 }
                 upsert_user_function_info(info_from_decl(&next));
-                tracing::info!(name = %next.name, from = %next.from, "Registered user table function");
+                tracing::info!(name = %next.name, from = %user_function_display_from(&next), "Registered user table function");
                 if next.as_tool {
                     tracing::warn!(name = %next.name, "User table functions cannot be exposed as tools; skipping tool exposure");
                 }
@@ -647,6 +662,7 @@ pub struct UserFunctionInfo {
     pub name: String,
     pub kind: String,
     pub volatility: String,
+    /// The declaration's `from` without credentials; see [`user_function_display_from`].
     pub from: String,
     pub description: Option<String>,
 }
@@ -925,6 +941,7 @@ mod tests {
             depends_on: vec![],
             metrics: None,
             as_tool: true,
+            build: None,
         }
     }
 

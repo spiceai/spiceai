@@ -349,7 +349,7 @@ mod tests {
         );
         assert_eq!(search_words("StoreSales2024"), ["store", "sales2024"]);
         assert_eq!(search_words("  Net-Paid  "), ["net", "paid"]);
-        assert!(search_words(" .,_ ").is_empty());
+        assert_eq!(search_words(" .,_ "), [] as [String; 0]);
     }
 
     #[test]

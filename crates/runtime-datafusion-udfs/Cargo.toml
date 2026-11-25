@@ -23,7 +23,8 @@ datafusion.workspace = true
 datafusion-datasource.workspace = true
 futures.workspace = true
 half = "2"
-blake3 = { workspace = true, optional = true }
+# Checks a WASM module against its `params.sha256` pin.
+sha2 = { workspace = true, optional = true }
 llms = { path = "../llms", default-features = false, optional = true }
 model-capabilities = { path = "../model-capabilities", optional = true }
 reqwest = { workspace = true, optional = true }
@@ -67,8 +68,7 @@ harness = false
 default = []
 http-functions = ["dep:reqwest", "dep:runtime-auth", "dep:url"]
 models = ["dep:llms", "dep:model-capabilities", "dep:runtime-status"]
-wasm-functions = ["dep:arrow-ipc", "dep:arrow_tools", "dep:wasmtime"]
-wasm-functions-compile = ["wasm-functions", "dep:blake3"]
+wasm-functions = ["dep:arrow-ipc", "dep:arrow_tools", "dep:sha2", "dep:wasmtime"]
 
 [lints]
 workspace = true

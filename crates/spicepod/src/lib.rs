@@ -39,9 +39,12 @@ use spec::{SpicepodDefinition, SpicepodVersion};
 
 pub mod acceleration;
 pub mod component;
+pub mod dependency;
 pub mod drasi;
 pub mod extension;
+mod field_path;
 pub mod fts;
+pub mod host_program;
 mod keywords;
 mod metadata;
 pub mod metric;
@@ -138,6 +141,18 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Parses a Spicepod definition from an in-memory YAML value. A type error names
+/// the failing field path, e.g. `datasets[0].acceleration.enabled: Invalid type ...`.
+///
+/// # Errors
+///
+/// Returns the deserialization error when `value` does not match the Spicepod schema.
+pub fn parse_definition_value(
+    value: yaml::Value,
+) -> std::result::Result<SpicepodDefinition, yaml::Error> {
+    field_path::from_value(value)
+}
+
 impl Error {
     /// Whether the Spicepod file is absent, as opposed to present but
     /// unloadable.
@@ -174,7 +189,7 @@ pub struct Spicepod {
 
     pub models: Vec<Model>,
 
-    pub dependencies: Vec<String>,
+    pub dependencies: Vec<dependency::Dependency>,
 
     pub embeddings: Vec<Embeddings>,
 
@@ -319,7 +334,7 @@ impl Spicepod {
         validate_spicepod_header(&raw, &path)?;
 
         let spicepod_definition: SpicepodDefinition =
-            yaml::from_value(raw).context(UnableToParseSpicepodSnafu)?;
+            field_path::from_value(raw).context(UnableToParseSpicepodSnafu)?;
 
         let resolved_datasets = component::resolve_component_references(
             fs,
@@ -433,6 +448,24 @@ impl Spicepod {
         Self::load_from_rdr(&fs, spicepod_rdr, path).await
     }
 
+    /// Parse a manifest that has already been read into memory, resolving
+    /// component references relative to `base_path`.
+    ///
+    /// For a caller that has verified the bytes it read: parsing them, rather
+    /// than reopening the file by name, means the manifest that is built is the
+    /// one that was checked, whatever happens to the name afterwards.
+    pub async fn load_from_bytes(
+        bytes: Vec<u8>,
+        base_path: impl Into<PathBuf>,
+    ) -> Result<Spicepod> {
+        Self::load_from_rdr(
+            &reader::StdFileSystem,
+            Box::new(std::io::Cursor::new(bytes)),
+            base_path,
+        )
+        .await
+    }
+
     pub async fn load_from(
         fs: &(impl reader::ReadableYaml + Send + Sync),
         path: impl Into<PathBuf>,
@@ -478,8 +511,10 @@ impl Spicepod {
             .context(UnableToOpenSpicepodSnafu { path: path.clone() })?
             .context(SpicepodNotFoundSnafu { path: path.clone() })?;
 
-        let spicepod_definition: SpicepodDefinition =
+        let raw: yaml::Value =
             yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
+        let spicepod_definition: SpicepodDefinition =
+            field_path::from_value(raw).context(UnableToParseSpicepodSnafu)?;
 
         Ok(spicepod_definition)
     }

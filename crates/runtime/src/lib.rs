@@ -815,6 +815,9 @@ pub struct Runtime {
     embedding_loads: Arc<init::model::LoadTasks>,
     /// The reranker loads in progress.
     reranker_loads: Arc<init::model::LoadTasks>,
+    /// The catalog loads in progress, so a Spicepod change can stop the load of a
+    /// configuration it replaces or removes.
+    catalog_loads: Arc<init::model::LoadTasks>,
     /// Names of the SQL functions registered for `as_sql` tools.
     tool_udfs: Arc<parking_lot::Mutex<HashSet<String>>>,
     /// The installed app's `row_id` keys, read by `/v1/search` and `vector_search`.
@@ -1749,6 +1752,16 @@ impl Runtime {
         tls_config: Option<Arc<TlsConfig>>,
         endpoint_auth: EndpointAuth,
     ) -> Result<()> {
+        // A request with no principal may call read-write tools only when the runtime
+        // authenticates no caller, as it may then write through `/v1/sql`.
+        ::tools::set_runtime_authenticates_callers(
+            endpoint_auth.http_auth.is_some()
+                || !matches!(
+                    endpoint_auth.identity_source,
+                    runtime_auth::IdentitySource::Anonymous
+                ),
+        );
+
         // Executors: mark cluster status Initializing before any await so a
         // concurrent `load_components` cannot report ready from dataset-only
         // status while task slots are still closed (Fix B for #11758).
@@ -2223,6 +2236,10 @@ impl Runtime {
     pub async fn load_components(self: Arc<Self>) {
         self.secrets_preflight().await;
 
+        if let Some(app) = self.read_app().await {
+            log_refused_components(&app, None);
+        }
+
         let hold_ready_for_warmup = self.df.results_cache_warmup_holds_ready();
         if hold_ready_for_warmup {
             tracing::info!(
@@ -2585,7 +2602,12 @@ impl Runtime {
             && let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(&catalog_name)
             && let Some(tool) = catalog.get(&name).await
         {
-            return Some(tool);
+            // Under the name it is listed as, as `list_all_tools` returns it, so the tool is
+            // named the same in its errors and `task_history` whichever path called it.
+            return Some(with_name(
+                &tool,
+                encode_tool_name(&catalog_name, &name).as_str(),
+            ));
         }
         // Fall back to a direct (non-catalog) lookup — covers top-level tools
         // whose names legitimately contain the `__` catalog separator.
@@ -2618,5 +2640,18 @@ impl From<runtime_acceleration::AccelerationParseError> for Error {
         Error::InvalidAccelerationConfiguration {
             source: Box::new(err),
         }
+    }
+}
+
+/// Log each component a Spicepod dependency declared but may not load because
+/// `spicepod.yaml` does not trust it to run programs on the host. Each is
+/// logged once: `previous` is the app already loaded, whose refusals were
+/// logged when it loaded.
+pub(crate) fn log_refused_components(app: &App, previous: Option<&App>) {
+    for refused in &app.refused_components {
+        if previous.is_some_and(|previous| previous.refused_components.contains(refused)) {
+            continue;
+        }
+        tracing::error!("{}", refused.message());
     }
 }

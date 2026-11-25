@@ -855,15 +855,18 @@ mod tests {
 
     #[test]
     fn bridge_preserves_filtering_and_unrecognized_records() {
-        assert!(output("error", OPENDAL_RETRY_TARGET, Level::Warn, &diagnostic(URL)).is_empty());
-        assert!(
+        assert_eq!(
+            output("error", OPENDAL_RETRY_TARGET, Level::Warn, &diagnostic(URL)),
+            ""
+        );
+        assert_eq!(
             output(
                 "warn,opendal::layers::retry=off",
                 OPENDAL_RETRY_TARGET,
                 Level::Warn,
                 &diagnostic(URL)
-            )
-            .is_empty()
+            ),
+            ""
         );
         for (target, level, message) in [
             (

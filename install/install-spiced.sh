@@ -147,7 +147,9 @@ SPICE_ATTESTATION_SIGNER='^https://github\.com/spiceai/spiceai/\.github/workflow
 
 # Saves a URL to a file, sending GITHUB_TOKEN when it is set. Fails on an HTTP error. A request
 # that times out or gets a 408, 429 or 5xx is tried up to 3 more times, a second apart, so a
-# brief GitHub error doesn't stop the install. A 404, such as the SHA256SUMS of a release
+# brief GitHub error doesn't stop the install. curl stops retrying when the next try would start
+# more than 10 seconds after the first, so a rate limit whose Retry-After asks for a longer wait
+# fails at once instead of stalling the install. A 404, such as the SHA256SUMS of a release
 # without one, is not retried.
 verifyFetch() {
     local url="$1"
@@ -159,7 +161,7 @@ verifyFetch() {
         if [ -n "${GITHUB_TOKEN:-}" ]; then
             auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
         fi
-        curl --fail -sSL --retry 3 --retry-delay 1 "${auth[@]}" "$url" -o "$out"
+        curl --fail -sSL --retry 3 --retry-delay 1 --retry-max-time 10 "${auth[@]}" "$url" -o "$out"
     else
         if [ -n "${GITHUB_TOKEN:-}" ]; then
             auth=(--header="Authorization: Bearer $GITHUB_TOKEN")
@@ -305,28 +307,29 @@ getLatestRelease() {
         if [ -n "${GITHUB_TOKEN:-}" ]; then
             headers=(-H "Authorization: Bearer $GITHUB_TOKEN")
         fi
-        response=$(curl -fsS "${headers[@]}" "$spiceReleaseUrl") || {
-            echo "Failed to get latest release information"
-            exit 1
-        }
+        response=$(curl -fsS "${headers[@]}" "$spiceReleaseUrl") || latestReleaseFailed
     else
         if [ -n "${GITHUB_TOKEN:-}" ]; then
             headers=(--header="Authorization: Bearer $GITHUB_TOKEN")
         fi
-        response=$(wget -nv "${headers[@]}" --header="Accept: application/json" -O - "$spiceReleaseUrl") || {
-            echo "Failed to get latest release information"
-            exit 1
-        }
+        response=$(wget -nv "${headers[@]}" --header="Accept: application/json" -O - "$spiceReleaseUrl") || latestReleaseFailed
     fi
 
     latest_release=$(printf '%s\n' "$response" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 
     if [ -z "$latest_release" ]; then
-        echo "Failed to get latest release information"
-        exit 1
+        latestReleaseFailed
     fi
 
     ret_val=$latest_release
+}
+
+# Exits because the latest release could not be looked up, saying how to get past a GitHub API
+# rate limit, the usual cause.
+latestReleaseFailed() {
+    echo "Failed to get latest release information"
+    echo "If the GitHub API rate limit was exceeded, set GITHUB_TOKEN or pass a version to install, e.g. 'curl -fsSL $SPICE_INSTALLER_URL | bash -s 1.0.0'."
+    exit 1
 }
 
 validateRuntimeArchive() {

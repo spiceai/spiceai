@@ -117,7 +117,6 @@ impl DebeziumKafka {
         &self.primary_keys
     }
 
-    #[must_use]
     pub fn stream_changes(&self) -> ChangesStream {
         let schema = Arc::clone(&self.schema);
         let primary_keys = self.primary_keys.clone();
@@ -154,7 +153,10 @@ impl DebeziumKafka {
                         &changes,
                         projection.as_ref(),
                     )
-                    .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?
+                    .map_err(|e| cdc::StreamError::Connector {
+                        connector: "Debezium",
+                        source: Box::new(e),
+                    })?
                     .with_source_commit_ts_ms(source_commit_ts_ms);
 
                     let committer = MessageBatchCommitter::from_messages(consumer, messages)

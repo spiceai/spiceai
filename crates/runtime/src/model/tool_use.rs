@@ -182,51 +182,52 @@ impl ToolUsingChat {
     /// Call a spiced runtime tool.
     ///
     /// Return the result as a JSON value.
+    #[expect(
+        clippy::manual_assert,
+        reason = "if cfg!(...) is intentionally conditional on feature flag"
+    )]
     async fn call_tool(&self, tool_call: &ChatCompletionMessageToolCall) -> Value {
-        match self.as_spiced_tool(tool_call) {
-            Some(t) => match with_budget(
-                self.result_budget().await,
-                t.call(&tool_call.function.arguments),
-            )
-            .await
-            {
-                Ok(v) => {
-                    tracing::info!(
-                        target: "task_history",
-                        progress = Progress::log()
-                            .id(Some(tool_call.id.clone()))
-                            .title(format!("'{}' tool completed successfully", tool_call.function.name))
-                            .json_content(v.clone())
-                            .to_jsonl(),
-                    );
-                    v
-                }
-                Err(e) => {
-                    tracing::info!(
-                        target: "task_history",
-                        progress = Progress::error()
-                            .id(Some(tool_call.id.clone()))
-                            .title(format!("'{}' tool completed unsuccessfully", tool_call.function.name))
-                            .content(e.to_string())
-                            .to_jsonl(),
-                    );
-                    tool_call_error_response(t.name().as_ref(), e)
-                }
-            },
-            None => {
-                // All calls to `call_tool` should have previously checked that `tool_call` has an associated tool.
-                if cfg!(feature = "dev") {
-                    panic!(
-                        "Tool '{}' was provided to LLM, but now no longer exists. This should not be possible.",
-                        tool_call.function.name
-                    );
-                } else {
-                    tracing::warn!(
-                        "Tool '{}' was provided to LLM, but now no longer exists. This should not be possible.",
-                        tool_call.function.name
-                    );
-                    Value::Null
-                }
+        let Some(t) = self.as_spiced_tool(tool_call) else {
+            // All calls to `call_tool` should have previously checked that `tool_call` has an associated tool.
+            if cfg!(feature = "dev") {
+                panic!(
+                    "Tool '{}' was provided to LLM, but now no longer exists. This should not be possible.",
+                    tool_call.function.name
+                );
+            }
+            tracing::warn!(
+                "Tool '{}' was provided to LLM, but now no longer exists. This should not be possible.",
+                tool_call.function.name
+            );
+            return Value::Null;
+        };
+        match with_budget(
+            self.result_budget().await,
+            t.call(&tool_call.function.arguments),
+        )
+        .await
+        {
+            Ok(v) => {
+                tracing::info!(
+                    target: "task_history",
+                    progress = Progress::log()
+                        .id(Some(tool_call.id.clone()))
+                        .title(format!("'{}' tool completed successfully", tool_call.function.name))
+                        .json_content(v.clone())
+                        .to_jsonl(),
+                );
+                v
+            }
+            Err(e) => {
+                tracing::info!(
+                    target: "task_history",
+                    progress = Progress::error()
+                        .id(Some(tool_call.id.clone()))
+                        .title(format!("'{}' tool completed unsuccessfully", tool_call.function.name))
+                        .content(e.to_string())
+                        .to_jsonl(),
+                );
+                tool_call_error_response(t.name().as_ref(), e)
             }
         }
     }
@@ -1454,10 +1455,11 @@ mod tests {
             None
         }
 
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(json!([{ "rows": 3 }]))
         }
@@ -1939,10 +1941,11 @@ mod tests {
             None
         }
 
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(json!([{ "answer": 42 }]))
         }
     }
@@ -1964,10 +1967,11 @@ mod tests {
             None
         }
 
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             let call = self.0.fetch_add(1, Ordering::SeqCst) + 1;
             Ok(
                 json!({"datasets": [{"table": format!("dataset_{call}")}], "total": 1, "has_more": false}),

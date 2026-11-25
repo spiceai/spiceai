@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q1"
+---
++------------------+
+| c_customer_id    |
++------------------+
+| AAAAAAAAAAABBAAA |
+| AAAAAAAAAAADAAAA |
+| AAAAAAAAAAADBAAA |
+| AAAAAAAAAAAHBAAA |
+| AAAAAAAAAAAIAAAA |
+| AAAAAAAAAABEBAAA |
+| AAAAAAAAAABEBAAA |
+| AAAAAAAAAABNAAAA |
+| AAAAAAAAAACIAAAA |
+| AAAAAAAAAACIAAAA |
++------------------+

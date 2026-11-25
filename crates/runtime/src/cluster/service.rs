@@ -73,6 +73,7 @@ use tonic::{
     transport::{ClientTlsConfig, Endpoint},
 };
 
+use crate::cluster::peer::{Advertised, authorize_executor_claim, registered_elsewhere_message};
 use crate::cluster::{
     ExecutorRegistry, TablePartitions,
     {SchedulerPeers, partition::partition_value_to_bytes},
@@ -81,6 +82,7 @@ use crate::datafusion::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_RUNTIME_SCHEMA,
 };
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
+use runtime_cluster::peer::PeerCertificate;
 use runtime_cluster::{ExecutorRegistration, Registered};
 use telemetry::metrics_reader::MetricsReader;
 
@@ -88,6 +90,9 @@ use telemetry::metrics_reader::MetricsReader;
 /// before it treats the executor as gone. Executors send a heartbeat every 10
 /// seconds.
 const CONTROL_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What a refused control stream is described as, in the refusal.
+const OPEN_CONTROL_STREAM: &str = "open the control stream";
 
 /// Handle for sending messages to a connected executor.
 struct ExecutorStreamHandle {
@@ -308,7 +313,8 @@ struct ControlStreamOutbound {
     /// The task that reads the executor's messages. The response ends when it ends, so an
     /// executor the scheduler no longer reads (it sent nothing for
     /// `CONTROL_STREAM_IDLE_TIMEOUT` and was unregistered) sees its stream end and reconnects.
-    reader: Option<tokio::task::JoinHandle<()>>,
+    /// It ends with the status the stream was refused with, if it was.
+    reader: Option<tokio::task::JoinHandle<Option<Status>>>,
     _outbound_tx: mpsc::Sender<SchedulerControlMessage>,
 }
 
@@ -324,6 +330,10 @@ impl Stream for ControlStreamOutbound {
         }
         match this.reader.as_mut().map(|reader| Pin::new(reader).poll(cx)) {
             Some(Poll::Pending) => Poll::Pending,
+            Some(Poll::Ready(Ok(Some(refusal)))) => {
+                this.reader = None;
+                Poll::Ready(Some(Err(refusal)))
+            }
             Some(Poll::Ready(_)) | None => {
                 this.reader = None;
                 Poll::Ready(None)
@@ -586,6 +596,7 @@ impl ClusterService for ClusterServiceImpl {
         &self,
         request: Request<Streaming<ExecutorControlMessage>>,
     ) -> Result<Response<Self::ControlStreamStream>, Status> {
+        let certificate = PeerCertificate::from_request(&request);
         let mut inbound = request.into_inner();
         let cancel = CancellationToken::new();
         let inbound_cancel = cancel.clone();
@@ -607,36 +618,38 @@ impl ClusterService for ClusterServiceImpl {
         let metrics_node_id = self.advertise_address.clone();
         let state_location = self.state_location().await;
         let reader = tokio::spawn(async move {
-            let (executor_id, process_id) = match inbound.next().await {
+            let (executor_id, process_id, first_message) = match inbound.next().await {
                 Some(Ok(msg)) => {
-                    let executor_id = msg.executor_id.clone();
+                    let executor_id = msg.executor_id;
                     if executor_id.is_empty() {
                         tracing::warn!("Executor connected with empty executor_id, closing stream");
-                        return;
+                        return None;
                     }
                     tracing::debug!("Executor control stream connected: {executor_id}");
-
-                    // Handle the first message if it contains data.
-                    if let Some(message) = msg.message {
-                        handle_executor_message(
-                            &executor_id,
-                            &msg.process_id,
-                            &message,
-                            &datafusion,
-                        )
-                        .await;
-                    }
-                    (executor_id, msg.process_id)
+                    (executor_id, msg.process_id, msg.message)
                 }
                 Some(Err(e)) => {
                     tracing::warn!("Error receiving first executor control message: {e}");
-                    return;
+                    return None;
                 }
                 None => {
                     tracing::debug!("Executor control stream closed before sending any messages");
-                    return;
+                    return None;
                 }
             };
+
+            // Nothing the stream carries is acted on before it is known to come
+            // from the node that registered the executor.
+            if let Err(refusal) = authorize_executor_claim(
+                &executor_registry,
+                certificate.as_ref(),
+                &executor_id,
+                None,
+                OPEN_CONTROL_STREAM,
+            ) {
+                return Some(refusal);
+            }
+            let identity = certificate.as_ref().map(|c| c.identity().clone());
 
             // Register the executor with the registry.
             let Registered {
@@ -644,9 +657,27 @@ impl ClusterService for ClusterServiceImpl {
                 registration,
                 connection,
             } = executor_registry
-                .register(executor_id.clone(), &process_id, outbound_tx_for_registry)
+                .register(
+                    executor_id.clone(),
+                    &process_id,
+                    identity.clone(),
+                    outbound_tx_for_registry,
+                )
                 .await;
             match registration {
+                ExecutorRegistration::IdentityMismatch => {
+                    let registered = executor_registry
+                        .registered_identity_conflict(&executor_id, identity.as_ref())
+                        .flatten();
+                    let message = registered_elsewhere_message(
+                        OPEN_CONTROL_STREAM,
+                        &executor_id,
+                        identity.as_ref(),
+                        registered.as_ref(),
+                    );
+                    tracing::warn!("{message}");
+                    return Some(Status::permission_denied(message));
+                }
                 ExecutorRegistration::Duplicate => {
                     tracing::error!(
                         "{}",
@@ -658,7 +689,7 @@ impl ClusterService for ClusterServiceImpl {
                     // Keep the stream open and ignore it, so the duplicate does not
                     // reconnect and register again.
                     while let Some(Ok(_)) = inbound.next().await {}
-                    return;
+                    return None;
                 }
                 ExecutorRegistration::Restarted => {
                     tracing::info!(
@@ -680,6 +711,10 @@ impl ClusterService for ClusterServiceImpl {
                     }
                 }
                 ExecutorRegistration::New | ExecutorRegistration::Reconnected => {}
+            }
+
+            if let Some(message) = first_message.as_ref() {
+                handle_executor_message(&executor_id, &process_id, message, &datafusion).await;
             }
 
             // Update active executor count metric.
@@ -746,14 +781,24 @@ impl ClusterService for ClusterServiceImpl {
                                             }
                                         }
                                         ExecutorMessage::FlightEndpoint(endpoint) => {
-                                            register_executor_flight_endpoint(
+                                            if authorize_executor_claim(
                                                 &executor_registry,
-                                                &datafusion,
+                                                certificate.as_ref(),
                                                 &executor_id,
-                                                &endpoint.executor_url,
-                                                &process_id,
+                                                Some(Advertised::Address(&endpoint.executor_url)),
+                                                "register the Flight endpoint",
                                             )
-                                            .await;
+                                            .is_ok()
+                                            {
+                                                register_executor_flight_endpoint(
+                                                    &executor_registry,
+                                                    &datafusion,
+                                                    &executor_id,
+                                                    &endpoint.executor_url,
+                                                    &process_id,
+                                                )
+                                                .await;
+                                            }
                                         }
                                         ExecutorMessage::Shutdown(_) => {
                                             handle_executor_message(
@@ -797,7 +842,7 @@ impl ClusterService for ClusterServiceImpl {
             // connection under its id replaced this one.
             if !executor_registry.unregister(&executor_id, connection).await {
                 tracing::debug!("Replaced executor control stream ended: {executor_id}");
-                return;
+                return None;
             }
 
             // Update active executor count metric.
@@ -815,6 +860,7 @@ impl ClusterService for ClusterServiceImpl {
             }
 
             tracing::debug!("Executor control stream ended: {executor_id}");
+            None
         });
 
         let stream = ControlStreamOutbound {
@@ -831,6 +877,7 @@ impl ClusterService for ClusterServiceImpl {
         &self,
         request: Request<AllocateInitialPartitionsRequest>,
     ) -> Result<Response<AllocateInitialPartitionsResponse>, Status> {
+        let certificate = PeerCertificate::from_request(&request);
         let AllocateInitialPartitionsRequest {
             executor_url,
             executor_id,
@@ -847,6 +894,14 @@ impl ClusterService for ClusterServiceImpl {
         } else {
             executor_id.as_str()
         };
+
+        authorize_executor_claim(
+            &self.executor_registry,
+            certificate.as_ref(),
+            executor_id,
+            Some(Advertised::Address(&executor_url)),
+            "allocate partitions",
+        )?;
 
         // Gate on dataset readiness. Partition-expression serialization needs
         // every accelerated table's schema to be in the SessionContext; if a
@@ -1139,10 +1194,18 @@ async fn handle_executor_message(
             } else {
                 shutdown.reason.clone()
             };
-            let ballista_executor_id = if shutdown.ballista_executor_id.is_empty() {
+            // An executor reports its own shutdown; its Ballista registration uses
+            // the same id.
+            let ballista_executor_id = if shutdown.ballista_executor_id.is_empty()
+                || shutdown.ballista_executor_id == executor_id
+            {
                 executor_id
             } else {
-                shutdown.ballista_executor_id.as_str()
+                tracing::warn!(
+                    "Executor '{executor_id}' reported the shutdown of executor '{}' on its control stream; only its own shutdown is applied",
+                    shutdown.ballista_executor_id
+                );
+                executor_id
             };
             tracing::info!(
                 executor_id = %executor_id,
@@ -2904,7 +2967,7 @@ mod tests {
     #[test]
     fn test_encode_batches_to_ipc_empty_is_empty() {
         let encoded = encode_batches_to_ipc(&[]).expect("encoding empty slice should succeed");
-        assert!(encoded.is_empty());
+        assert_eq!(encoded, [] as [u8; 0]);
     }
 
     /// Round-trips multiple batches through a single IPC stream. This both

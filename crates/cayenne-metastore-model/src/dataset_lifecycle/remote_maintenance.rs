@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Independent maintenance snapshots and exact-base publication beside one ingest buffer.
-use super::{Data, File, Keys, Op, Protocol as Local, Record, Rows};
+use super::{Data, File, Keys, Op, Protocol as Local, Record, Rows, record_lines, rows_text};
 use stateright::{Model, Property};
 
 #[derive(Clone, Debug)]
@@ -499,6 +499,139 @@ impl Model for Protocol {
             }
         }
         (next != *state).then_some(next)
+    }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Buffer(t, k, true) => format!("ingest buffers an upsert of t{t}.k{k}"),
+            Action::Buffer(t, k, false) => format!("ingest buffers a delete of t{t}.k{k}"),
+            Action::Acknowledge => "ingest plans a commit of its buffer".into(),
+            Action::PublishWriter => "ingest publishes its commit (CAS)".into(),
+            Action::RetryWriter => "ingest retries its commit on the new head".into(),
+            Action::Prepare => "ingest prepares its buffer (two-phase)".into(),
+            Action::Resolve(true) => "resolve the prepared operations: commit".into(),
+            Action::Resolve(false) => "resolve the prepared operations: abort".into(),
+            Action::Plan(n, mask, false) => {
+                format!("node {n} plans a warm rewrite (selection {mask:b})")
+            }
+            Action::Plan(n, mask, true) => {
+                format!("node {n} plans a cold rewrite (selection {mask:b})")
+            }
+            Action::Promote(n, mask) => {
+                format!("node {n} plans a promotion to cold (selection {mask:b})")
+            }
+            Action::PlanClear(n) => format!("node {n} plans clearing applied delete vectors"),
+            Action::PlanCheckpoint(n) => format!("node {n} plans a checkpoint"),
+            Action::PublishMaintenance(n) => format!("node {n} publishes its plan (CAS)"),
+            Action::RetryMaintenance(n) => {
+                format!("node {n} revalidates and retries its plan, or drops it")
+            }
+            Action::ExpireLease(n) => {
+                format!("node {n}'s lease expires; a new generation takes it")
+            }
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let state = self.next_state(last_state, action)?;
+        let expected = state
+            .expected
+            .last()
+            .copied()
+            .unwrap_or(state.initial.rows());
+        Some(crate::explorer::summary(&[
+            format!("reader sees:  {}", rows_text(&state.data.rows())),
+            format!("source says:  {}", rows_text(&expected)),
+            format!(
+                "plans per node: {:?}, completed: {:?}",
+                state.plans, state.completed
+            ),
+            crate::explorer::flags(&[
+                ("prepared", state.prepared),
+                ("writer refused", state.refused),
+                ("writer retried", state.original_retry),
+                ("maintenance retried", state.maintenance_retry),
+                ("clear retried", state.clear_retry),
+                ("stale-generation publication", state.stale_publication),
+                ("plan dropped and replanned", state.replanned),
+                ("plan fenced", state.fenced),
+            ]),
+        ]))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{Svg, Tone, row};
+        let state = path.last_state();
+        let mut svg = Svg::new();
+        let generations: Vec<String> = state
+            .generation
+            .iter()
+            .enumerate()
+            .map(|(n, g)| format!("node {n} gen {g}"))
+            .collect();
+        let head = vec![
+            format!("commit {}", state.log.len()),
+            format!("maintenance leases: {}", generations.join(", ")),
+        ];
+        let bottom = state.data.draw(
+            &mut svg,
+            0,
+            0,
+            "DATASET HEAD AND FILES",
+            &head,
+            Some(&state.objects),
+        );
+        let mut boxes = vec![];
+        if let Some((base, ops)) = &state.writer {
+            let ops: Vec<String> = ops
+                .iter()
+                .map(|o| {
+                    format!(
+                        "t{}.k{}={}",
+                        o.table,
+                        o.key,
+                        o.value.map_or("delete".into(), |v| format!("v{v}"))
+                    )
+                })
+                .collect();
+            boxes.push((
+                format!("INGEST COMMIT (planned on commit {base})"),
+                vec![ops.join(", ")],
+                Tone::Staged,
+            ));
+        }
+        for (node, pending) in state.pending.iter().enumerate() {
+            if let Some(p) = pending {
+                let mut lines = record_lines(&p.record);
+                if let Some((c, _, _)) = &p.checkpoint {
+                    lines.push(format!("checkpoint at commit {c}"));
+                }
+                let superseded = p.generation != state.generation[node];
+                boxes.push((
+                    format!(
+                        "NODE {node} PLAN (gen {}, on commit {}){}",
+                        p.generation,
+                        p.base,
+                        if superseded {
+                            " - superseded lease"
+                        } else {
+                            ""
+                        }
+                    ),
+                    lines,
+                    if superseded { Tone::Gone } else { Tone::Staged },
+                ));
+            }
+        }
+        for (c, data, _) in &state.checkpoints {
+            boxes.push((
+                format!("CHECKPOINT at commit {c}"),
+                vec![rows_text(&data.rows())],
+                Tone::Live,
+            ));
+        }
+        if !boxes.is_empty() {
+            svg.heading(0, bottom + 16, "IN FLIGHT AND PUBLISHED CHECKPOINTS");
+            row(&mut svg, bottom + 40, &boxes);
+        }
+        Some(svg.finish())
     }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![

@@ -202,7 +202,7 @@ mod tests {
             ",
         );
         assert_eq!(catalog.acceleration, None);
-        assert!(catalog.exclude.is_empty());
+        assert_eq!(catalog.exclude, [] as [String; 0]);
     }
 
     #[test]

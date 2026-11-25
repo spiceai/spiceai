@@ -731,7 +731,7 @@ mod tests {
     /// `SparkConnectTableProvider`'s `SQLExecutor` overrode no
     /// `can_execute_plan`, so the default `true` federated every plan and
     /// Spark answered
-    /// `[UNRESOLVED_ROUTINE] Cannot resolve routine \`spice_only_udf\``. The
+    /// `` [UNRESOLVED_ROUTINE] Cannot resolve routine `spice_only_udf` ``. The
     /// same executor is what the Databricks `spark_connect` mode federates
     /// through, on both the dataset and the `catalogs:` path. Regression test
     /// for #13664.

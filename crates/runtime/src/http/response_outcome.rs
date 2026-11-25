@@ -317,7 +317,7 @@ mod tests {
                 Poll::Ready(Some(Ok(_)))
             ));
         }
-        assert!(recorder.recorded().is_empty());
+        assert_eq!(recorder.recorded(), [] as [ResponseOutcome; 0]);
 
         assert!(matches!(
             tracked.as_mut().poll_frame(&mut cx),
@@ -339,7 +339,7 @@ mod tests {
             tracked.as_mut().poll_frame(&mut cx),
             Poll::Ready(Some(Ok(_)))
         ));
-        assert!(recorder.recorded().is_empty());
+        assert_eq!(recorder.recorded(), [] as [ResponseOutcome; 0]);
 
         drop(tracked);
 

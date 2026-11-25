@@ -86,7 +86,7 @@ async fn glue_federation() -> Result<(), anyhow::Error> {
                 batches.push(batch?);
             }
 
-            assert!(!batches.is_empty());
+            assert_ne!(batches, [] as [arrow::array::RecordBatch; 0]);
 
             let schema = batches[0].schema();
             let record = concat_batches(&schema, &batches).expect("concat batches");

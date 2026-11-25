@@ -1638,7 +1638,16 @@ impl CayenneCatalog {
         memory_mode: bool,
         settings_change: SettingsChangeAction,
     ) -> CatalogResult<()> {
-        verify_stored_data_files_in(self, table, memory_mode, settings_change).await
+        verify_stored_data_files_in(
+            table,
+            memory_mode,
+            settings_change,
+            self.get_all_snapshot_sequences(&table.table_id),
+            |snapshot_id| async move {
+                self.get_snapshot_files(&table.table_id, &snapshot_id).await
+            },
+        )
+        .await
     }
 
     async fn validate_existing_table_configuration(
@@ -2602,6 +2611,16 @@ impl MetadataCatalog for CayenneCatalog {
         crate::provider::append_commit::commit_transaction(txn, publications[0].table_id).await
     }
 
+    fn data_write_gate(&self, _table_id: &str) -> crate::catalog::DataWriteGate {
+        // One process writes a SQLite metastore's tables.
+        crate::catalog::DataWriteGate::open()
+    }
+
+    async fn follow_commits(&self, _table_id: &str) -> CatalogResult<u64> {
+        // One process writes a SQLite metastore; its state is always current.
+        Ok(0)
+    }
+
     async fn init(&self) -> CatalogResult<()> {
         // Create database directory if it doesn't exist.
         //
@@ -3285,6 +3304,10 @@ impl MetadataCatalog for CayenneCatalog {
                 .inline_data
                 .iter()
                 .any(|data| data.table_id != *table_id)
+            || commit
+                .table_statistics
+                .as_ref()
+                .is_some_and(|stats| stats.table_id != *table_id)
         {
             return Err(CatalogError::InvalidOperationNoSource {
                 message: format!("Mem-tier commit rows must belong to table '{table_id}'"),
@@ -3330,6 +3353,49 @@ impl MetadataCatalog for CayenneCatalog {
                             })
                             .await?;
                         }
+                    }
+                    // Three parameters per row, below SQLite's 32 766 limit.
+                    for chunk in commit.insert_records.chunks(32_000 / 3) {
+                        let (sql, params) = Self::build_insert_records_chunk_sql(
+                            table_id,
+                            chunk,
+                            commit.sequence_number,
+                        );
+                        tx.execute(ExecuteParams { sql: &sql, params }).await?;
+                    }
+                    if let Some(stats) = &commit.table_statistics {
+                        tx.execute(ExecuteParams {
+                            sql: TABLE_STATISTICS_UPSERT_SQL,
+                            params: vec![
+                                MetastoreValue::Text(stats.table_id.clone()),
+                                MetastoreValue::Blob(stats.statistics_blob.clone()),
+                                MetastoreValue::Integer(stats.num_rows),
+                                stats
+                                    .ndv_sketches
+                                    .clone()
+                                    .map_or(MetastoreValue::Null, MetastoreValue::Blob),
+                                MetastoreValue::Integer(i64::from(stats.num_rows_exact)),
+                            ],
+                        })
+                        .await?;
+                    }
+                    for file in &commit.manifest_files {
+                        tx.execute(ExecuteParams {
+                            sql: SNAPSHOT_FILE_UPSERT_SQL,
+                            params: snapshot_file_params(file),
+                        })
+                        .await?;
+                    }
+                    if let Some(snapshot_id) = &commit.keep_file_statistics_of {
+                        tx.execute(ExecuteParams {
+                            sql: "DELETE FROM cayenne_snapshot_file_statistics \
+                                  WHERE table_id = ?1 AND snapshot_id != ?2",
+                            params: vec![
+                                MetastoreValue::Text(table_id.clone()),
+                                MetastoreValue::Text(snapshot_id.clone()),
+                            ],
+                        })
+                        .await?;
                     }
                     CatalogResult::Ok(())
                 }
@@ -4092,6 +4158,7 @@ impl MetadataCatalog for CayenneCatalog {
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
         delete_files: &[crate::metadata::DeleteFile],
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()> {
         // Same retry-on-conflict shape as commit_compaction; the only
         // additional work happens inside the transaction via
@@ -4113,10 +4180,22 @@ impl MetadataCatalog for CayenneCatalog {
                 }
             })?;
 
-            match self
-                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id, inlined, delete_files)
+            let applied = async {
+                if let Some(files) = files {
+                    self.replace_snapshot_files_in_txn(&mut *tx, table_id, new_snapshot_id, files)
+                        .await?;
+                }
+                self.commit_overwrite_in_txn(
+                    &mut *tx,
+                    table_id,
+                    new_snapshot_id,
+                    inlined,
+                    delete_files,
+                )
                 .await
-            {
+            }
+            .await;
+            match applied {
                 Ok(()) => match tx.commit().await {
                     Ok(()) => return Ok(()),
                     Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
@@ -6563,12 +6642,17 @@ fn stored_snapshot_dir(table_path: &str, table_id: &str, snapshot_id: &str) -> s
 /// catalog's reads, and decide by `settings_change` whether a mismatch rebuilds
 /// the table, holds it, refuses it, or is served with a warning. See
 /// [`CayenneCatalog::verify_stored_data_files`] for the rules.
-pub(crate) async fn verify_stored_data_files_in<C: MetadataCatalog + ?Sized>(
-    catalog: &C,
+pub(crate) async fn verify_stored_data_files_in<F, Fut>(
     table: &TableMetadata,
     memory_mode: bool,
     settings_change: SettingsChangeAction,
-) -> CatalogResult<()> {
+    snapshot_sequences: impl std::future::Future<Output = CatalogResult<HashMap<String, i64>>> + Send,
+    snapshot_files: F,
+) -> CatalogResult<()>
+where
+    F: Fn(String) -> Fut + Send,
+    Fut: std::future::Future<Output = CatalogResult<Vec<SnapshotFile>>> + Send,
+{
     // A table whose data is in the object-native location has no folder per
     // snapshot to compare, and its committed state is its only file record.
     if table.path.starts_with("s3://")
@@ -6581,8 +6665,7 @@ pub(crate) async fn verify_stored_data_files_in<C: MetadataCatalog + ?Sized>(
     // by CDC upserts and checkpoints live in their own snapshots), so every
     // live snapshot is checked before deciding: a tolerated mismatch in one
     // must not hide unreadable rows in another.
-    let mut protected: Vec<String> = catalog
-        .get_all_snapshot_sequences(&table.table_id)
+    let mut protected: Vec<String> = snapshot_sequences
         .await?
         .into_keys()
         .filter(|snapshot_id| *snapshot_id != table.current_snapshot_id)
@@ -6590,9 +6673,7 @@ pub(crate) async fn verify_stored_data_files_in<C: MetadataCatalog + ?Sized>(
     protected.sort();
     let mut damages = Vec::new();
     for snapshot_id in std::iter::once(table.current_snapshot_id.clone()).chain(protected) {
-        let manifest = catalog
-            .get_snapshot_files(&table.table_id, &snapshot_id)
-            .await?;
+        let manifest = snapshot_files(snapshot_id.clone()).await?;
         if let Some(damage) = inspect_stored_data_files(table, &snapshot_id, manifest).await? {
             damages.push(damage);
         }
@@ -10191,7 +10272,7 @@ mod tests {
             .get_table("test_table")
             .await
             .expect("Failed to get table");
-        assert!(metadata.primary_key.is_empty());
+        assert_eq!(metadata.primary_key, [] as [String; 0]);
         assert_eq!(metadata.table_id, table_id_1);
 
         // Now try to create with a primary key change — should fall back to stored config
@@ -10219,7 +10300,7 @@ mod tests {
             .get_table("test_table")
             .await
             .expect("Failed to get table");
-        assert!(metadata.primary_key.is_empty());
+        assert_eq!(metadata.primary_key, [] as [String; 0]);
         assert_eq!(metadata.table_id, table_id_1);
 
         // Recreate with the SAME config — should return the same table_id
@@ -12175,8 +12256,14 @@ mod tests {
             id_schema(),
         );
         let requested = requested_like(&stored, |_| {});
-        assert!(identity_setting_changes(&stored, &requested).is_empty());
-        assert!(layout_setting_changes(&stored.vortex_config, &requested.vortex_config).is_empty());
+        assert_eq!(
+            identity_setting_changes(&stored, &requested),
+            [] as [SettingChange; 0]
+        );
+        assert_eq!(
+            layout_setting_changes(&stored.vortex_config, &requested.vortex_config),
+            [] as [SettingChange; 0]
+        );
     }
 
     #[test]
@@ -12220,7 +12307,10 @@ mod tests {
         let requested = requested_like(&stored, |options| {
             options.on_conflict = Some(upsert_on(&["id"]));
         });
-        assert!(identity_setting_changes(&stored, &requested).is_empty());
+        assert_eq!(
+            identity_setting_changes(&stored, &requested),
+            [] as [SettingChange; 0]
+        );
     }
 
     fn with_detection(pk_conflict_detection: PkConflictDetection) -> crate::metadata::VortexConfig {
@@ -12382,7 +12472,10 @@ mod tests {
             options.vortex_config = with_detection(PkConflictDetection::None);
         });
         assert!(disables_pk_conflict_detection(&stored, &requested));
-        assert!(identity_setting_changes(&stored, &requested).is_empty());
+        assert_eq!(
+            identity_setting_changes(&stored, &requested),
+            [] as [SettingChange; 0]
+        );
     }
 
     /// A table without conflict detection resolves no conflicts whatever its row records,
@@ -12405,7 +12498,10 @@ mod tests {
         let requested = requested_like(&stored, |options| {
             options.on_conflict = None;
         });
-        assert!(identity_setting_changes(&stored, &requested).is_empty());
+        assert_eq!(
+            identity_setting_changes(&stored, &requested),
+            [] as [SettingChange; 0]
+        );
     }
 
     #[test]
@@ -12446,7 +12542,10 @@ mod tests {
         let requested = requested_like(&stored, |options| {
             options.base_path = "/data/trips".to_string();
         });
-        assert!(identity_setting_changes(&stored, &requested).is_empty());
+        assert_eq!(
+            identity_setting_changes(&stored, &requested),
+            [] as [SettingChange; 0]
+        );
     }
 
     /// Layout settings change how rows are written, never what a stored row means, so
@@ -12471,7 +12570,10 @@ mod tests {
                 ..crate::metadata::VortexConfig::default()
             };
         });
-        assert!(identity_setting_changes(&stored, &requested).is_empty());
+        assert_eq!(
+            identity_setting_changes(&stored, &requested),
+            [] as [SettingChange; 0]
+        );
         assert_eq!(
             described(&layout_setting_changes(
                 &stored.vortex_config,
@@ -12763,13 +12865,13 @@ mod tests {
             refused.to_string(),
             "the existing acceleration of dataset 'trips' was built with settings it cannot adopt in place (`primary_key`: none -> ['id'])"
         );
-        assert!(
+        assert_eq!(
             catalog
                 .get_table("trips")
                 .await
                 .expect("read the table")
-                .primary_key
-                .is_empty()
+                .primary_key,
+            [] as [String; 0]
         );
 
         // The same change while the source cannot be read on the table's schema: kept,
@@ -12785,13 +12887,13 @@ mod tests {
                 .expect("reopen while the source cannot be read"),
             table_id
         );
-        assert!(
+        assert_eq!(
             catalog
                 .get_table("trips")
                 .await
                 .expect("read the table")
-                .primary_key
-                .is_empty()
+                .primary_key,
+            [] as [String; 0]
         );
 
         // The same change when the caller keeps stored tables: the stored settings win
@@ -12808,7 +12910,7 @@ mod tests {
             table_id
         );
         let stored = catalog.get_table("trips").await.expect("read the table");
-        assert!(stored.primary_key.is_empty());
+        assert_eq!(stored.primary_key, [] as [String; 0]);
         assert_eq!(stored.vortex_config.sort_columns, vec!["id".to_string()]);
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);

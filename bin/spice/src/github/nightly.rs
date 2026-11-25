@@ -676,7 +676,7 @@ mod tests {
         let NightlyError::NoBuildOn { available, .. } = error else {
             panic!("expected NoBuildOn, got {error}");
         };
-        assert!(!available.is_empty());
+        assert_ne!(available, [] as [NaiveDate; 0]);
         for day in available {
             let build = find(&source, Some(day), "linux_x86_64", at(21))
                 .await

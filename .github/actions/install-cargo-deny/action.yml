@@ -1,0 +1,52 @@
+name: Install cargo-deny
+description: >-
+  Installs the cargo-deny release pinned in .github/ci-cache/pins.json into the job's own
+  directory and puts it on PATH. The release archive comes through
+  .github/scripts/cached_fetch.sh, from the CI cache when the job has one and from GitHub
+  otherwise, and is checked against its pinned SHA-256 either way.
+
+runs:
+  using: composite
+  steps:
+    - name: Install cargo-deny
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        RUNNER_ENV: ${{ runner.environment }}
+      run: |
+        set -euo pipefail
+        github_dir="$ACTION_PATH/../.."
+        case "$(uname -s)-$(uname -m)" in
+          Linux-x86_64) target=x86_64-unknown-linux-musl ;;
+          Linux-aarch64) target=aarch64-unknown-linux-musl ;;
+          Darwin-arm64) target=aarch64-apple-darwin ;;
+          Darwin-x86_64) target=x86_64-apple-darwin ;;
+          *)
+            echo "::error::.github/ci-cache/pins.json pins no cargo-deny release for $(uname -s) $(uname -m)."
+            exit 1
+            ;;
+        esac
+        read -r version sha256 url < <(python3 - "$github_dir/ci-cache/pins.json" "$target" <<'PY'
+        import json, sys
+        pin = json.load(open(sys.argv[1]))["cargo-deny"]
+        target = sys.argv[2]
+        if target not in pin["sha256"]:
+            sys.exit(f"pins.json pins no cargo-deny {pin['version']} for {target}")
+        print(pin["version"], pin["sha256"][target], pin["url"].format(version=pin["version"], target=target))
+        PY
+        )
+
+        # A self-hosted Mac outlives the job, so the archive can be kept on the host for
+        # the next job there. Several runner instances share each host; cached_fetch.sh
+        # writes the copy under a temporary name and renames it.
+        if [ -z "${CI_CACHE_DIR:-}" ] && [ "$RUNNER_ENV" = self-hosted ] && [ "$(uname -s)" = Darwin ]; then
+          export CI_CACHE_DIR="$HOME/Library/Caches/spice-ci/downloads"
+        fi
+
+        # The job's own directory, not ~/.cargo/bin: jobs that share a host would
+        # otherwise replace each other's binary.
+        dir="$RUNNER_TEMP/cargo-deny-$version"
+        bash "$github_dir/scripts/cached_fetch.sh" "$sha256" "$dir/cargo-deny.tar.gz" "$url"
+        tar -xzf "$dir/cargo-deny.tar.gz" -C "$dir" --strip-components=1 "cargo-deny-$version-$target/cargo-deny"
+        echo "$dir" >> "$GITHUB_PATH"
+        "$dir/cargo-deny" --version

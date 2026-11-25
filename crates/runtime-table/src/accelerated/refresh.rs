@@ -93,6 +93,14 @@ pub enum InvalidRefreshOverrides {
     /// type its `time_format` cannot read.
     #[snafu(display("Invalid refresh_sql: {source}"))]
     TimeColumnInvalid { source: Error },
+
+    /// An append override on a dataset that is not itself refreshed in append mode and
+    /// has neither a `time_column` nor a primary key: the append would read the whole
+    /// source again and insert every row a second time.
+    #[snafu(display(
+        "Append mode requires either `time_column` or `primary_key` to be specified in the dataset configuration. For details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#append"
+    ))]
+    AppendRequiresTimeColumnOrPrimaryKey,
 }
 
 /// The name a refresh mode is written with in a spicepod or a refresh request.
@@ -229,6 +237,30 @@ impl RefreshOverrides {
             }
             .fail(),
         }
+    }
+
+    /// Checks that an `append` override can run on a dataset that is not configured with
+    /// `refresh_mode: append`, which the dataset's startup check has not seen. The spicepod
+    /// rule applies: an append needs a `time_column` or a primary key, since otherwise it
+    /// has no watermark and no key, and re-inserts the whole source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidRefreshOverrides::AppendRequiresTimeColumnOrPrimaryKey`] when it
+    /// has neither.
+    pub fn validate_append_keys(
+        &self,
+        refresh: &Refresh,
+        has_primary_key: bool,
+    ) -> Result<(), InvalidRefreshOverrides> {
+        if self.mode == Some(RefreshMode::Append)
+            && refresh.mode != RefreshMode::Append
+            && refresh.time_column.is_none()
+            && !has_primary_key
+        {
+            return AppendRequiresTimeColumnOrPrimaryKeySnafu.fail();
+        }
+        Ok(())
     }
 
     /// Checks the overrides against the dataset they refresh, before the refresh is
@@ -936,6 +968,9 @@ pub struct Refresher {
     initial_status: Option<status::ComponentStatus>,
     /// Where an append refresh keeps the source snapshot it last loaded.
     append_cursor_store: Option<AppendCursorStore>,
+    /// Forwards committed append refreshes to the dataset's `DoExchange`
+    /// subscribers.
+    data_update_publisher: Option<runtime_acceleration::dataupdate::DataUpdatePublisher>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -999,6 +1034,7 @@ impl Refresher {
             is_s3_express_acceleration: false,
             engine_type_rewrites: &[],
             cdc_param_overrides: None,
+            data_update_publisher: None,
             initial_status: None,
             append_cursor_store: None,
         }
@@ -1178,6 +1214,16 @@ impl Refresher {
         rules: arrow_tools::type_rewrite::TypeRewriteRules,
     ) -> &mut Self {
         self.engine_type_rewrites = rules;
+        self
+    }
+
+    /// Forward each committed append refresh to the dataset's `DoExchange`
+    /// subscribers.
+    pub fn with_data_update_publisher(
+        &mut self,
+        publisher: Option<runtime_acceleration::dataupdate::DataUpdatePublisher>,
+    ) -> &mut Self {
+        self.data_update_publisher = publisher;
         self
     }
 
@@ -1463,7 +1509,9 @@ impl Refresher {
             .with_change_sink(self.change_sink.clone())
             .with_cache_write_sender(self.cache_write_sender.clone());
 
-        refresh_task_runner = refresh_task_runner.with_cpu_runtime(self.cpu_runtime.clone());
+        refresh_task_runner = refresh_task_runner
+            .with_cpu_runtime(self.cpu_runtime.clone())
+            .with_data_update_publisher(self.data_update_publisher.clone());
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresh_task_runner =
@@ -2106,6 +2154,47 @@ mod tests {
                     && message.contains("Valid modes are 'full' or 'append'"),
                 "{message}"
             );
+        }
+    }
+
+    #[test]
+    fn an_append_override_needs_a_time_column_or_primary_key() {
+        let append = RefreshOverrides {
+            sql: None,
+            mode: Some(RefreshMode::Append),
+            max_jitter: None,
+        };
+        let full = Refresh::new(RefreshMode::Full);
+        let err = append
+            .validate_append_keys(&full, false)
+            .expect_err("an append with no watermark and no key is rejected");
+        assert!(
+            matches!(
+                err,
+                InvalidRefreshOverrides::AppendRequiresTimeColumnOrPrimaryKey
+            ) && err
+                .to_string()
+                .contains("Append mode requires either `time_column` or `primary_key`"),
+            "{err}"
+        );
+        append
+            .validate_append_keys(&full, true)
+            .expect("a primary key is enough");
+        append
+            .validate_append_keys(&full.clone().time_column("ts".to_string()), false)
+            .expect("a time column is enough");
+        // A dataset refreshed in append mode passed the startup check, as did its
+        // changes stream.
+        append
+            .validate_append_keys(&Refresh::new(RefreshMode::Append), false)
+            .expect("checked at startup");
+        for mode in [None, Some(RefreshMode::Full)] {
+            RefreshOverrides {
+                mode,
+                ..append.clone()
+            }
+            .validate_append_keys(&full, false)
+            .expect("only an append override is checked");
         }
     }
 

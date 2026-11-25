@@ -1,11 +1,13 @@
 name: object-native-data
+tags: [long]
 description: >
   A dataset whose data files are in `runtime.state.location` (#16131), appended
   from PostgreSQL without a primary key: every acknowledged append is counted
-  exactly right after it; scans send no LIST; a kill during an append leaves no
-  partial write; an instance that loses its directory serves every row with the
-  source down, three times; a copy of the location at another prefix serves the
-  same rows; a data file that is truncated, then deleted, fails the query with
+  exactly right after it; from its start through three appends it sends one
+  data-file LIST, and its scans none; a kill during an append leaves no partial
+  write; an instance that loses its directory serves every row with the source
+  down, three times; a copy of the location at another prefix serves the same
+  rows; a data file that is truncated, then deleted, fails the query with
   its error each time, and `mode: file_create` reloads the dataset. The
   `today` variant (no flag, local data) gives the same answers where it takes
   part; the steps that need the location are for object-native-s3 only.
@@ -72,6 +74,23 @@ steps:
   - source-exec: { src: "INSERT INTO facts SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i * 10 FROM generate_series(3001, 3500) i" }
   - refresh: facts
   - query: SELECT count(*) AS n, sum(v) AS s FROM facts
+
+  # Exactly one data-file LIST since `spiced` started (the two steps below):
+  # the open's of the lookup index directory, which it clears for a dataset
+  # without an index. The dataset writes every file at its final key, so
+  # neither its open nor its appends list `_staging/`.
+  - wait-metric:
+      name: state_store_request_duration_ms_count
+      labels: { feature: cayenne_data, operation: list }
+      above: 0
+      timeout: 2s
+    only: *in-location
+  - wait-metric:
+      name: state_store_request_duration_ms_count
+      labels: { feature: cayenne_data, operation: list }
+      below: 2
+      timeout: 2s
+    only: *in-location
 
   # No LIST on the scan path: the location's data-file requests counted as
   # `operation="list"` do not move while only scans run.

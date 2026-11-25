@@ -333,9 +333,11 @@ fn schedule(script: &Script, steps: &[Step]) -> Schedule {
 
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_mins(3);
 
-/// `--max-wait`: the longest any wait for a condition may take, whatever the
-/// script asks for. Scripts that are expected to fail pay every wait in full,
-/// so a run of them is bounded by this instead.
+/// `--max-wait`: the longest a check's wait for a condition (`eventually`, a
+/// refresh) may take, whatever the script asks for. Scripts that are expected
+/// to fail pay every such wait in full, so a run of them is bounded by this
+/// instead. Readiness waits after `start`, `restart` and `upgrade` keep their
+/// own limits: they are setup, not checks.
 static MAX_WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
 
 /// Sets `--max-wait` for this run.
@@ -369,7 +371,9 @@ pub struct Target {
     pub binary: PathBuf,
 }
 
+#[derive(Clone)]
 pub struct Options {
+    pub repetition: Option<u32>,
     pub targets: Vec<Target>,
     /// `--from`: the binary every instance starts on, in place of any
     /// script's `from:`; an `upgrade` step moves it to its target's.
@@ -658,8 +662,12 @@ pub async fn run_script(script: &Script, options: &Options, slots: &Slots) -> Re
             let script_busy = Arc::clone(&script_busy);
             async move {
                 let run_label = script.run_label(&combo);
+                let repetition = options
+                    .repetition
+                    .map(|index| format!("-repetition-{index}"))
+                    .unwrap_or_default();
                 let run_id = format!(
-                    "{}-{combo_index}-{}",
+                    "{}-{combo_index}{repetition}-{}",
                     sanitize(&script.name),
                     std::process::id()
                 );
@@ -811,25 +819,44 @@ async fn run_combination(
                     .map(|(name, _, kind, _)| (name.as_str(), kind.as_str())),
             )?;
         }
-        for (name, spec, kind, version) in resolved {
-            let src = crate::docker::publishing_also_on(
-                bridge.filter(|_| published_to_bridge(&kind)),
-                source::start(
-                    name,
-                    run_id,
-                    &kind,
-                    version.as_deref(),
-                    &options.work_dir.join(run_id).join("sources"),
-                    spec,
-                ),
-            )
-            .await
-            .with_context(|| format!("Failed to start source '{name}' ({kind})"))?;
+        // Every source at once: none depends on another. At the first that
+        // fails, the starts still running are dropped, which removes what
+        // they had started (a container removes itself when dropped, and one
+        // still being created is removed by the task creating it). Those
+        // that had started are registered first, so the removal below stops
+        // them.
+        let work = options.work_dir.join(run_id).join("sources");
+        let mut starting: futures::stream::FuturesUnordered<_> = resolved
+            .into_iter()
+            .map(|(name, spec, kind, version)| {
+                let work = &work;
+                async move {
+                    let began = Instant::now();
+                    let src = crate::docker::publishing_also_on(
+                        bridge.filter(|_| published_to_bridge(&kind)),
+                        source::start(name, run_id, &kind, version.as_deref(), work, spec),
+                    )
+                    .await
+                    .with_context(|| format!("Failed to start source '{name}' ({kind})"));
+                    (name, kind, src, began.elapsed())
+                }
+            })
+            .collect();
+        while let Some((name, kind, src, took)) = futures::StreamExt::next(&mut starting).await {
+            let src = src?;
+            // Starting a source (pulling, creating and waiting for its
+            // containers) is part of the time a combination runs, and is not
+            // a step, so it is reported on its own.
+            say!(
+                "   source {name} ({kind}) started ({:.1}s)",
+                took.as_secs_f64()
+            );
             sources.by_name.insert(name.clone(), Arc::from(src));
             sources.state.insert(name.clone(), SourceState::Running);
             key_room.release(source::containers(&kind));
             sources.kinds.insert(name.clone(), kind);
         }
+        drop(starting);
         let mut instances = create_instances(script, options, combo, run_id, &sources).await?;
         // Instances that were skipped start no executors: give their share
         // back, and let each remaining executor give back its own as it starts.
@@ -911,6 +938,7 @@ async fn run_combination(
             }
         }
         // Every process of every instance at once.
+        let stopping_started = Instant::now();
         let mut stopping = Vec::new();
         for instance in &mut instances {
             stopping.push(instance.spiced.stop(TEARDOWN_TIMEOUT));
@@ -922,6 +950,10 @@ async fn run_combination(
             }
         }
         let _ = futures::future::join_all(stopping).await;
+        say!(
+            "   instances stopped ({:.1}s)",
+            stopping_started.elapsed().as_secs_f64()
+        );
         for instance in &mut instances {
             if !instance.answers.is_empty() || instance.broken.is_some() {
                 say!(
@@ -948,12 +980,17 @@ async fn run_combination(
         let dir = combination_capture_dir(&capture_dir(root, script), script, run_label);
         capture_combination(&sources, run_id, &options.work_dir.join(run_id), &dir).await;
     }
-    if !options.keep {
+    if !options.keep && !sources.by_name.is_empty() {
+        let removing = Instant::now();
         for src in sources.by_name.values() {
             if let Err(e) = src.remove().await {
                 say!("warning: {e:#}");
             }
         }
+        say!(
+            "   sources removed ({:.1}s)",
+            removing.elapsed().as_secs_f64()
+        );
     }
     result
 }

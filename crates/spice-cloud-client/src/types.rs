@@ -516,21 +516,6 @@ pub struct MetricsResponse {
 // Auth
 // ============================================================================
 
-// Debug is intentionally not derived: access_token must not appear in logs or error output.
-#[derive(Deserialize)]
-pub struct AuthExchangeResponse {
-    pub access_token: Option<String>,
-    #[serde(default)]
-    pub access_denied: bool,
-}
-
-// Debug is intentionally not derived: the device auth `code` is short-lived but
-// exchangeable for an access token, so treat it like a secret.
-#[derive(Serialize)]
-pub struct AuthExchangeRequest<'a> {
-    pub code: &'a str,
-}
-
 // Debug is intentionally not derived: client_secret must not appear in logs or error output.
 #[derive(Serialize)]
 pub struct OAuthTokenRequest<'a> {
