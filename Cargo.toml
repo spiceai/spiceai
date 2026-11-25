@@ -662,6 +662,13 @@ tantivy-query-grammar = { path = "vendor/tantivy-query-grammar" }
 # dropping it.
 sqlparser = { path = "vendor/sqlparser" }
 
+# Local vendored fork of `apache-avro` 0.21.0 (path: vendor/apache-avro) that
+# bounds the memory an Avro array or map may claim from its declared item count:
+# upstream reserves the count a block header declares before decoding any item,
+# so a few bytes of input allocated gigabytes. Used by CDC Avro ingest and by
+# Iceberg manifest reads. See vendor/apache-avro/README.md before dropping it.
+apache-avro = { path = "vendor/apache-avro" }
+
 # Dependencies on crates.io `backoff` 0.4 resolve to the workspace crate.
 backoff = { path = "crates/backoff" }
 

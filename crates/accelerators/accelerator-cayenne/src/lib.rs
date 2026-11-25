@@ -3174,7 +3174,8 @@ impl CayenneAccelerator {
             .with_maintained_aggregates(maintained_aggregate_specs)
             .with_durable_write_back(durable_write_back)
             .with_scan_view_reuse(scan_view_reuse)
-            .with_secondary_indexes(secondary_index_columns(source));
+            .with_secondary_indexes(secondary_index_columns(source))
+            .with_schema_indexes(&schema);
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
         }

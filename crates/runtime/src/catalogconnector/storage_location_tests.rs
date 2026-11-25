@@ -21,6 +21,12 @@ limitations under the License.
 //! Each test loads a real runtime with a catalog served by [`MockCatalog`], which
 //! answers the Unity Catalog API and also serves a directory as the S3 bucket
 //! `bucket`, so a table stored in object storage can still be loaded end to end.
+//!
+//! The mock runs on the test's own runtime, which has a single worker. Loading a
+//! catalog that blocks that worker while it waits on the mock therefore hangs
+//! every time instead of only when no other worker happens to be polling for
+//! I/O, so these tests also guard that opening a Delta table never blocks a
+//! Tokio worker.
 
 use std::{
     collections::HashMap,
@@ -441,7 +447,7 @@ fn start_mock(fixture: &Fixture) -> MockCatalog {
     )
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn unity_catalog_refuses_a_local_storage_location() {
     let fixture = Fixture::new();
     let mock = start_mock(&fixture);
@@ -459,7 +465,7 @@ async fn unity_catalog_refuses_a_local_storage_location() {
     assert!(error.contains(NOT_FOUND), "unexpected error: {error}");
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn unity_catalog_with_credential_vending_refuses_a_local_storage_location() {
     let fixture = Fixture::new();
     let mock = start_mock(&fixture);
@@ -487,7 +493,7 @@ async fn unity_catalog_with_credential_vending_refuses_a_local_storage_location(
 }
 
 #[cfg(feature = "databricks")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn databricks_delta_lake_mode_refuses_a_local_storage_location() {
     let fixture = Fixture::new();
     let mock = MockCatalog::start(

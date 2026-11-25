@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 mod completeness;
-pub use completeness::HttpFetchCompletion;
+pub use completeness::{HttpFetchCompletion, RequestPages};
 
 use super::json_nest::{HttpJsonNesting, decompose_json_row};
 use crate::rate_limit::RateLimiter;
@@ -2649,6 +2649,11 @@ impl HttpExec {
     #[must_use]
     pub fn for_cache_fetch(&self) -> (Self, HttpFetchCompletion) {
         let completion = HttpFetchCompletion::new(self.partitions.len());
+        let completion = if self.provider.is_paginated() {
+            completion.for_paginated_source()
+        } else {
+            completion
+        };
         let mut plan = self.clone();
         plan.completion = Some(completion.clone());
         plan.metrics = ExecutionPlanMetricsSet::new();
