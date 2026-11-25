@@ -81,6 +81,17 @@ pub(crate) fn seal(out: &mut Vec<u8>) {
     out.extend_from_slice(&checksum.to_le_bytes());
 }
 
+/// The body of the first bytes of a file of `kind`, after checking the frame's
+/// magic, version and kind but not its checksum, which covers the whole file.
+pub(crate) fn open_prefix(prefix: &[u8], kind: u32) -> Result<Reader<'_>> {
+    let mut reader = Reader(prefix);
+    ensure!(
+        reader.u32()? == MAGIC && reader.u32()? == VERSION && reader.u32()? == kind,
+        FormatSnafu { kind }
+    );
+    Ok(reader)
+}
+
 /// The body of `bytes`, after checking the frame and checksum.
 pub(crate) fn open(bytes: &[u8], kind: u32) -> Result<Reader<'_>> {
     ensure!(bytes.len() >= 20, TruncatedSnafu);

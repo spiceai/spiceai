@@ -359,7 +359,78 @@ impl IndexRun {
     }
 }
 
+/// What a persisted run's file says about the run, read from its first bytes:
+/// the files it covers and its row count, which its file name is derived from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunDescriptor {
+    /// The names of the data files the run covers.
+    pub files: Vec<String>,
+    /// The rows the run indexes.
+    pub rows: u64,
+}
+
+impl RunDescriptor {
+    /// The file name of the run this describes ([`IndexRun::file_name`]).
+    #[must_use]
+    pub fn file_name(&self) -> String {
+        run_file_name(self.files.iter().map(String::as_str), self.rows)
+    }
+}
+
+/// A persisted run's file name: a digest of the names of the files it covers
+/// and its row count, so the same run always has the same name.
+fn run_file_name<'a>(files: impl Iterator<Item = &'a str>, rows: u64) -> String {
+    let mut descriptor = Vec::new();
+    for file in files {
+        descriptor.extend_from_slice(&(file.len() as u64).to_le_bytes());
+        descriptor.extend_from_slice(file.as_bytes());
+    }
+    descriptor.extend_from_slice(&rows.to_le_bytes());
+    format!("{:016x}.run", hash_index::hash_key_bytes(&[&descriptor]))
+}
+
 impl IndexRun {
+    /// The name this run persists under: a digest of the files it covers and
+    /// its row count. A run built again over the same files has the same name.
+    #[must_use]
+    pub fn file_name(&self) -> String {
+        run_file_name(self.files.iter().map(|file| &**file), self.rows as u64)
+    }
+
+    /// The files and row count a persisted run's file holds, read from the
+    /// file's first bytes (`prefix`), or `Ok(None)` when `prefix` ends before
+    /// them. The checksum covers the whole file and is not checked: compare
+    /// [`RunDescriptor::file_name`] with the file's name to trust the result.
+    ///
+    /// # Errors
+    ///
+    /// When `prefix` is not the start of a run file of this format version, or
+    /// names more files than a run can cover.
+    pub fn describe(prefix: &[u8]) -> crate::persist::Result<Option<RunDescriptor>> {
+        use crate::persist::Error;
+        let parse = || -> crate::persist::Result<RunDescriptor> {
+            let mut reader = crate::persist::open_prefix(prefix, crate::persist::KIND_RUN)?;
+            reader.u64()?;
+            let count = reader.u32()? as usize;
+            if count > MAX_RUN_FILES {
+                return Err(Error::Corrupt);
+            }
+            let mut files = Vec::with_capacity(count.min(1 << 16));
+            for _ in 0..count {
+                let len = reader.u32()? as usize;
+                let name = std::str::from_utf8(reader.bytes(len)?).map_err(|_| Error::Corrupt)?;
+                files.push(name.to_string());
+            }
+            let rows = reader.u64()?;
+            Ok(RunDescriptor { files, rows })
+        };
+        match parse() {
+            Ok(descriptor) => Ok(Some(descriptor)),
+            Err(Error::Truncated) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Persist as a standalone file (see [`crate::persist`]).
     #[must_use]
     #[expect(

@@ -843,16 +843,45 @@ impl ObjectNativeCatalog {
             .iter()
             .any(|(_, footprint)| footprint.iter().any(|table| table == table_id))
     }
-    /// The keys of `table_id` retired and not yet forgotten, including those a
-    /// buffered change retires: the retirement sweep may delete each once its
-    /// retention passes, so nothing may name one again meanwhile.
+    /// Register a lookup-index run over the data files `files`, persisted at
+    /// `run_key` (relative to the table's directory), unless one of them is
+    /// gone or the file is retired. `in_flight` names the files this
+    /// process's writes hold uncommitted, which are not gone. Returns whether
+    /// it registered the run.
     /// # Errors
-    /// Returns an error when the table is unknown.
-    pub async fn retiring(
+    /// Returns an error when the commit is not accepted, as when another
+    /// instance has taken writing the table over.
+    pub async fn register_index_run_covering(
+        &self,
+        run: &crate::metadata::IndexRunRecord,
+        files: &[String],
+        run_key: &str,
+        in_flight: &std::collections::HashSet<String>,
+    ) -> CatalogResult<bool> {
+        self.for_table(&run.table_id)
+            .register_index_run_covering(run, files, run_key, in_flight)
+            .await
+    }
+
+    /// Unregister lookup-index run `run_name` of `index_key` and retire its
+    /// file `run_key`, in one commit, once one of the data files `files` it
+    /// covers is gone (`in_flight`, the files this process's writes hold
+    /// uncommitted, are not). Returns whether the file is retired.
+    /// # Errors
+    /// Returns an error when the commit is not accepted, as when another
+    /// instance has taken writing the table over.
+    pub async fn retire_index_run(
         &self,
         table_id: &str,
-    ) -> CatalogResult<std::collections::BTreeSet<String>> {
-        self.for_table(table_id).retiring(table_id).await
+        index_key: &str,
+        run_name: &str,
+        files: &[String],
+        run_key: &str,
+        in_flight: &std::collections::HashSet<String>,
+    ) -> CatalogResult<bool> {
+        self.for_table(table_id)
+            .retire_index_run(table_id, index_key, run_name, files, run_key, in_flight)
+            .await
     }
 
     /// Retire `keys` of `table_id`, objects the orphan sweep found that no

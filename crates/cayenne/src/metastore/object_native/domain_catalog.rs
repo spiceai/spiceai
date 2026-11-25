@@ -1498,15 +1498,101 @@ impl MetadataCatalog for Domain {
 }
 
 impl Domain {
-    /// The keys of `table_id` retired and not yet forgotten, buffered
-    /// retirements included: a key that may be deleted once its retention
-    /// passes, so a write must not name it again meanwhile.
-    pub(super) async fn retiring(
+    /// The names of the data files `table` names, live or retired, and of the
+    /// files this process's writes hold in flight (`in_flight`, read before
+    /// the state, since a write records its files in the state before it
+    /// stops holding them): the files a scan can read, or may once their
+    /// commit lands. A file not among them is gone (deleted, or never to be
+    /// committed: another instance's writes are fenced), and no run over it
+    /// is built again.
+    fn readable_file_names(
+        table: &cayenne_metastore_actions::TableState,
+        in_flight: &std::collections::HashSet<String>,
+    ) -> std::collections::HashSet<String> {
+        table
+            .live_keys()
+            .iter()
+            .chain(&table.retired)
+            .map(|key| key.rsplit('/').next().unwrap_or(key).to_string())
+            .chain(in_flight.iter().cloned())
+            .collect()
+    }
+
+    /// Register lookup-index run `run`, which covers the data files `files`,
+    /// unless one of them is gone or its file is retired: such a run's name is
+    /// one whose file may be deleted, so registering it could name a file a
+    /// delete in flight removes. Returns whether it registered the run.
+    pub(super) async fn register_index_run_covering(
+        &self,
+        run: &crate::metadata::IndexRunRecord,
+        files: &[String],
+        run_key: &str,
+        in_flight: &std::collections::HashSet<String>,
+    ) -> CatalogResult<bool> {
+        let mut inner = self.inner.take().await;
+        let table = inner.table(&run.table_id)?;
+        let readable = Self::readable_file_names(table, in_flight);
+        if table.retired.contains(run_key) || !files.iter().all(|file| readable.contains(file)) {
+            return Ok(false);
+        }
+        inner
+            .commit(vec![Action::new(Kind::AddIndexRun(proto::IndexRun {
+                table_id: run.table_id.clone(),
+                index_key: run.index_key.clone(),
+                run_name: run.run_name.clone(),
+                rows: run.row_count,
+                size: run.size_bytes,
+            }))])
+            .await?;
+        Ok(true)
+    }
+
+    /// Retire lookup-index run file `run_key` (run `run_name` of `index_key`,
+    /// over the data files `files`) in one commit that also unregisters the
+    /// run, once one of those data files is gone: no run over them can be
+    /// built again, so its name is never registered again and deleting its
+    /// file cannot remove a file a later registration names. Returns whether
+    /// the run file is retired; `false`, committing nothing, while all its
+    /// files can still be read, the log is stopped, or a transaction reserves
+    /// the table.
+    pub(super) async fn retire_index_run(
         &self,
         table_id: &str,
-    ) -> CatalogResult<std::collections::BTreeSet<String>> {
-        let inner = self.inner.take().await;
-        Ok(inner.table(table_id)?.retired.iter().cloned().collect())
+        index_key: &str,
+        run_name: &str,
+        files: &[String],
+        run_key: &str,
+        in_flight: &std::collections::HashSet<String>,
+    ) -> CatalogResult<bool> {
+        let mut inner = self.inner.take().await;
+        if inner.stop.is_some() || inner.reserved(table_id) {
+            return Ok(false);
+        }
+        let table = inner.table(table_id)?;
+        let readable = Self::readable_file_names(table, in_flight);
+        if files.iter().all(|file| readable.contains(file)) {
+            return Ok(false);
+        }
+        let mut actions = Vec::new();
+        if table
+            .index_runs
+            .contains_key(&(index_key.to_string(), run_name.to_string()))
+        {
+            actions.push(Action::new(Kind::RemoveIndexRun(proto::IndexRun {
+                table_id: table_id.to_string(),
+                index_key: index_key.to_string(),
+                run_name: run_name.to_string(),
+                rows: 0,
+                size: 0,
+            })));
+        }
+        if !table.retired.contains(run_key) {
+            actions.push(actions::retire_files(table_id, &[run_key.to_string()]));
+        }
+        if !actions.is_empty() {
+            inner.commit(actions).await?;
+        }
+        Ok(true)
     }
 
     /// Retire `keys` of `table_id` in one commit: objects the orphan sweep

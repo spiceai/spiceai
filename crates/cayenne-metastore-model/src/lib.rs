@@ -12,6 +12,7 @@ mod data_files;
 mod dataset_lifecycle;
 mod explorer;
 mod floors;
+mod index_runs;
 mod intent_partitioned;
 mod intent_roll_forward;
 mod mem_tier;
@@ -111,7 +112,7 @@ const CURRENT_DEFECTS: [&str; 1] = ["mem-tier-current-3-exhaust"];
 /// (including the data-file replay),
 /// and the runs `crates/cayenne`'s mem-tier replay names directly. A test keeps
 /// this list equal to the runs those files name.
-const REPLAYED_AGAINST_CODE: [&str; 35] = [
+const REPLAYED_AGAINST_CODE: [&str; 37] = [
     "commits-restart-no-persist-before-send",
     "commits-restart-turnover",
     "data-files",
@@ -120,7 +121,9 @@ const REPLAYED_AGAINST_CODE: [&str; 35] = [
     "data-files-retire-3-retires-carried",
     "data-files-retire-forget-early",
     "data-files-retire-ignores-restore-hold",
+    "data-files-retire-lean-orphan-commits",
     "data-files-retire-local-ignores-retention",
+    "data-files-retire-orphan-deletes-directly",
     "data-files-retire-prepared",
     "data-files-retire-prepared-orphan-ignores-reservation",
     "data-files-retire-remote",
@@ -2693,6 +2696,28 @@ fn additional_runs() -> Vec<Run> {
             failure,
         });
     }
+    // Persisted lookup-index runs, named for the data files they cover.
+    for (name, failure) in [
+        ("index-runs", ""),
+        (
+            "index-runs-delete-while-live",
+            "registered run's file exists",
+        ),
+        ("index-runs-skip-retired", "registered run's file exists"),
+        (
+            "index-runs-persist-forgotten",
+            "registered run's file exists",
+        ),
+    ] {
+        runs.push(Run {
+            name,
+            family: "index-runs",
+            mode: name,
+            bound: 0,
+            seed: None,
+            failure,
+        });
+    }
     runs
 }
 
@@ -3452,6 +3477,7 @@ fn dispatch(r: Run, v: &mut impl Visitor) -> Option<bool> {
         "object-names" => v.visit(object_names::Protocol::new(r.mode, r.bound), r, None),
         "reads" => v.visit(reads::Protocol::new(r.mode, r.bound), r, None),
         "data-files" => v.visit(data_files::Protocol::new(r.mode, r.bound), r, None),
+        "index-runs" => v.visit(index_runs::Protocol::new(r.mode), r, None),
         "action-compatibility" => v.visit(action_compatibility::Protocol::new(r.mode), r, None),
         "retention" => v.visit(retention::Protocol::new(r.mode), r, None),
         "replicas" => v.visit(replicas::Protocol::new(r.mode), r, None),
@@ -3772,8 +3798,9 @@ mod explorer_tests {
     use std::collections::BTreeSet;
 
     /// Families that show text only; every other family draws its state.
-    const TEXT_ONLY: [&str; 5] = [
+    const TEXT_ONLY: [&str; 6] = [
         "action-compatibility",
+        "index-runs",
         "position-deletes",
         "predicate-progress",
         "read-delivery",
@@ -3876,7 +3903,7 @@ mod explorer_tests {
             .filter(|f| !TEXT_ONLY.contains(f))
             .collect();
         assert_eq!(render.drawn, expected);
-        assert_eq!(render.families.len(), 25, "{:?}", render.families);
+        assert_eq!(render.families.len(), 26, "{:?}", render.families);
         assert!(
             render.steps > 10_000,
             "only {} steps rendered",

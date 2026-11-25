@@ -12875,6 +12875,7 @@ impl CayenneTableProvider {
                 self.table_metadata.table_id.clone(),
                 url.prefix().clone(),
                 url.to_string(),
+                Arc::clone(&self.uncommitted_files),
             )
             .await;
             return;
@@ -12913,6 +12914,7 @@ impl CayenneTableProvider {
                 self.table_metadata.table_id.clone(),
                 &url,
                 live,
+                Arc::clone(&self.uncommitted_files),
             )
             .await;
     }
