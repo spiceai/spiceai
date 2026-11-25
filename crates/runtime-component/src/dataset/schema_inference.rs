@@ -461,7 +461,7 @@ mod tests {
     fn applies_primary_key_and_seeds_upsert_for_changes() {
         // CDC (`refresh_mode: changes`) needs the upsert on_conflict to route WAL
         // UPDATE events, so it is seeded alongside the inferred primary key.
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Cayenne);
         let inferred = InferredSchema {
             primary_key: vec!["id".to_string()],
             ..InferredSchema::default()
@@ -486,7 +486,7 @@ mod tests {
         // Outside CDC the on_conflict must NOT be seeded: a configured on_conflict
         // forces accelerator-only writes, which would silently reroute
         // `write_mode: write_through` DML away from the federated source.
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Cayenne);
         let inferred = InferredSchema {
             primary_key: vec!["id".to_string()],
             ..InferredSchema::default()
@@ -507,7 +507,7 @@ mod tests {
     fn seeds_primary_key_upsert_alongside_other_on_conflict() {
         // A user-configured on_conflict for a non-PK column must not prevent the
         // inferred primary key from getting its own upsert (CDC requires it).
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Cayenne);
         acc.on_conflict.insert(
             col_ref(&["name"]),
             OnConflictBehavior::Upsert(UpsertOptions::default()),
@@ -535,7 +535,7 @@ mod tests {
 
     #[test]
     fn respects_user_primary_key() {
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Cayenne);
         acc.primary_key = Some(col_ref(&["user_id"]));
         let inferred = InferredSchema {
             primary_key: vec!["id".to_string()],
@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn skips_primary_key_with_missing_column() {
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Cayenne);
         let inferred = InferredSchema {
             primary_key: vec!["absent".to_string()],
             ..InferredSchema::default()
@@ -577,7 +577,7 @@ mod tests {
         // constraint onto rows already appended, and an overlapping re-read window
         // would violate a just-added key — so append never gets inferred
         // constraints, on any engine.
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Cayenne);
         let inferred = InferredSchema {
             primary_key: vec!["id".to_string()],
             indexes: vec![InferredIndex {
@@ -601,7 +601,7 @@ mod tests {
 
     #[test]
     fn applies_unique_and_non_unique_indexes() {
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Cayenne);
         let inferred = InferredSchema {
             indexes: vec![
                 InferredIndex {
@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn skips_index_equal_to_primary_key() {
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Cayenne);
         let inferred = InferredSchema {
             primary_key: vec!["id".to_string()],
             indexes: vec![InferredIndex {
@@ -659,7 +659,7 @@ mod tests {
 
     #[test]
     fn skips_inferred_indexes_when_user_configured_any() {
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Cayenne);
         acc.indexes
             .insert(col_ref(&["existing"]), IndexType::Enabled);
         let inferred = InferredSchema {

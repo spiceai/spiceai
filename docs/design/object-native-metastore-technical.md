@@ -6,7 +6,9 @@ milestones, decisions 1.1–1.14, 2.1–2.2 and 3.1–3.5, and every rejected
 alternative. This document says what to build: the components, the rules each
 follows, and the order of work, with the code each step changes. It is not a
 full specification. Exact rules and their proofs live in the protocol model,
-[`crates/cayenne-metastore-model`](../../crates/cayenne-metastore-model/README.md).
+[`crates/cayenne-metastore-model`](../../crates/cayenne-metastore-model/README.md);
+`cayenne-metastore-model serve <run>` opens any cited run's counterexample or
+witness in the [Stateright Explorer](../../crates/cayenne-metastore-model/README.md#exploring-runs-in-the-stateright-explorer).
 The user-facing surface is Enhancement [#16245](https://github.com/spiceai/spiceai/issues/16245); nothing here adds a user decision
 beyond `runtime.state.location`.
 
@@ -517,7 +519,18 @@ Per dataset, a **dataset entry** (name, partitions), and per table:
   `AddDeleteFiles`, `RemoveDeleteFiles{ids}` (the deletion-vector sweep) and
   `ClearDeleteFiles{seq_le: d}`, which is guarded by **coverage**: every live
   file, cold files included, whose `min_seq` is at most d has `applied_through`
-  of at least d, so no file can still hold a row those deletes hide.
+  of at least d, and no inline record, a seal's shadow included, holds a row
+  with `seq` at most d, so no file or record can still hold a row those deletes
+  hide.
+  - *Coverage includes inline rows.* A seal's shadow is an inline record, not a
+    file, and a later seal's delete is what hides a superseded shadow row. If a
+    clear dropped that delete while the shadow still held the row, recovery would
+    read the key twice. The clear waits for the checkpoint that moves the shadow
+    into a file. The mem-tier model met the same case in memory: after two
+    seals, its bake dropped the in-memory delete at the delete fence and served
+    the shadow row beside its replacement. The engine's bake prunes at the lowest
+    of that fence, the highest `seq` it folds and its cold-tier cap, which keeps
+    the delete.
   - *Clearing follows coverage, not one compaction.* A compaction that rewrites
     every file a delete could hide rows in clears it in its own record; otherwise
     a later record, such as a cold promotion, clears it once the rest are
@@ -627,7 +640,20 @@ deletion-vector metadata. This design changes neither allocation nor stamping.
 **What the rule guarantees.** Per-key visibility is unchanged: it compares one
 key's `seq`s in one table, so a row with data `seq` s is hidden by a delete with
 `seq ≥ s`, and a re-inserted row is visible iff its insert `seq` exceeds the
-delete's. Cross-key cutoffs within a table equal commit order: the seq-prefix
+delete's. Only the files in no file group read a reinsert `seq`, and only while
+the table has no file group, as today only the current snapshot does, and only
+while no protected snapshot exists. A re-inserted row is read from the newer
+file that holds it, so honoring the re-insert over an older file's version of
+the key would serve both. The shared key-delete pushdown also reads reinsert
+`seq`s, for every file, but only to decide which keys it may skip before the
+per-file filter; a key it keeps is still hidden or shown by that filter. That
+rule is also why a checkpoint's insert records need not be stamped at the
+checkpoint's own `seq`: no per-file filter honors a stamp while the snapshot it
+describes is live, and `mem-tier-late-stamp`, which stamps late, holds within
+its bounds.
+Leaving the insert records out altogether does fail (`mem-tier-no-insert-records`).
+A design that let group files honor a reinsert `seq` would make that stamp's
+order load-bearing. Cross-key cutoffs within a table equal commit order: the seq-prefix
 bake's cutoff, compaction's "clear deletes at or below the cutoff", the orphan
 deletion-vector sweep's floor, file-group fences, and the transaction begin
 token `sequence_high_water()`.
@@ -820,8 +846,8 @@ front of the destination is out of scope.
   more durability than the commit that names it, so both use one tier. A local
   data file is written through a store that syncs the file and every directory
   the write created, with `sync_all` (`F_FULLFSYNC` on macOS), before the call
-  returns (`object_store_occ/src/durable_local.rs`, `DurableLocalFileSystem`):
-  the same tier as the metastore's [durable local writes](#the-write-path).
+  returns (`LocalConditionalPut::new_durable_keyed_by_absolute_path`,
+  `object_store_occ/src/local_conditional_put.rs`): the same tier as the metastore's [durable local writes](#the-write-path).
   `object_store` 0.14 adds the same syncs as an option (`with_fsync`). One
   local store for data and metastore, and whether its flushes survive a power
   loss, are an [open decision](#open-decisions).
@@ -887,7 +913,7 @@ it matters only for a production local mode, which is not planned.
   deletion vectors under `<table_id>/deletions/`, not in a folder per snapshot.
   A manifest row stores the path relative to the table; a row written by an
   earlier build as `<snapshot_id>/<name>` keeps resolving. The retirement
-  record, reader pins and the writer's record work by file, commit or snapshot
+  record and the writer's record work by file, commit or snapshot
   id, none of which needs a folder, and the orphan sweep lists the data path
   once either way. A partitioned dataset's child tables are proposed under
   `data/<parent_table_id>/<child_table_id>/`, so the dataset is one prefix to
@@ -1113,7 +1139,14 @@ every request:
 - **Seal.** A seal writes the mem-tier's rows as an unpublished inline record,
   the *shadow*, which only recovery reads, and its tombstones as key deletion
   vectors. With the object-native metastore, its changes and the source
-  position it acknowledges commit as one record.
+  position it acknowledges commit as one record. The shadow's rows carry one
+  `seq`, reserved while the capture still holds the mem-tier, so every apply
+  after the capture deletes at a higher `seq`. A later seal acknowledges such
+  an apply, and the source does not re-deliver it, so its delete must hide the
+  shadow row after a restart. Reserving after the capture lets the shadow row
+  outrank that delete and leaves the key twice (`mem-tier-no-capture-reservation`,
+  replayed against the engine by
+  `mem_tier_model_replay_control_capture_reservation`).
 - **Checkpoint.** A checkpoint writes the same rows into a new protected
   snapshot (keyed tables) or into the current snapshot (position-based tables)
   and records the files in the manifest from the writer's record
@@ -1201,6 +1234,42 @@ two halves. The table at the end gives the reason for each rule.
   checkpoint root. A new GC after a takeover learns them there and restarts each
   timer. The orphan sweep skips them.
 - Attempt evidence is kept for the evidence horizon, T_O.
+
+**Log objects below the floor: implemented in the prototype.** When a
+checkpoint's floor is published, the batches it covers, the payloads their
+records spilled and the previous checkpoint leave the head. The head log's
+`Collector` (`crates/object_store_occ/src/headlog/collect.rs`) deletes them
+once no log reader can still need them, by a rule that needs no durable
+removal list:
+
+- It notes each floor it has not seen with the head's commit, and stamps it
+  with the `LastModified` of a later head with a higher commit: that head was
+  written on a base holding the floor, so after the floor was published. (The
+  head that first shows the floor can carry an earlier time: a store may set
+  `LastModified` when an upload starts, and the local store stamps the staged
+  file before its rename.) It deletes below the floor once a later head's
+  `LastModified` is a retention past the stamp.
+  A reader that read an older head read it before the floor was published, so
+  it has had at least the retention to fetch what that head lists.
+- A restarted collector knows no stamps; it stamps the current floor afresh.
+  That stamp is later than the lost ones, so a restart delays deletion by at
+  most a retention and never hastens it.
+- It deletes by name: batches starting at or below the floor (a floor is a
+  batch end), spilled payloads at or below it (named `records/<commit>-<attempt>`),
+  and checkpoints below it. The current checkpoint carries the attempt evidence,
+  so resolving an uncertain commit never needs a deleted object.
+- Only cold opens and polls read these objects, so the retention is shorter
+  than T (`DEFAULT_RETENTION`, ten minutes). A cold open that finds a listed
+  object gone while the floor has moved starts over from the newer head; it
+  returns that head's state, never a mix. The catalog runs one collection per
+  log at a time beside its commits, after each checkpoint.
+- Model: `window-storage-7-exhaust` (deletion, a reader of an older head, a
+  collector restart) and the `window-storage-gc-early-5-exhaust` control, which
+  deletes without waiting and fails I7. Their traces replay against the
+  collector.
+
+Objects a record's actions reference (data files, `objects/blobs/…`) are not
+log objects: they follow the rules above and [#15818](https://github.com/spiceai/spiceai/issues/15818).
 
 **What a query is guaranteed.** **Readers never write.** A query starts from a
 state confirmed current within S, **counted from when the confirming GET was
@@ -1304,27 +1373,27 @@ the writer's process.
 - A retired file keeps its entry until it is forgotten, so a scan that captured
   it just before the commit still reads it.
 
-**The retention, and local pins.**
+**The retention.**
 
 - The sweep deletes a retired file no earlier than T after it first observes
   the removal, timed on the sweeping process's clock and kept in memory. A restart or takeover reads the retired set from the state and
-  restarts every timer, which only delays a delete.
+  restarts every timer, which only delays a delete. In the first version a
+  writer that restarts more often than T never reaches T, so its retired files
+  are not deleted until it stays up for T; a durable removal time is deferred.
 - Every instance confirms its heads about every 10 s, and a query
   starts from a head confirmed within S. So a query on any instance reads its
   files for at least T − S. One that runs longer may fail with the
   [data-file error](#readers), saying to rerun it, never with other rows.
-- A scan on the sweeping instance also pins the commit it captured, taken
-  under the table's listing fence and released when the plan and its streams
-  drop. The sweep keeps every file removed after the oldest pinned commit, so a
-  local query may run past T. Pins are in memory: readers write nothing. A
-  restore point or a snapshot export holds the table's file deletions.
+- Scans hold nothing back: T alone protects a query, on the sweeping instance
+  as on any other, so readers write nothing. A restore point or a snapshot
+  export holds the table's file deletions.
 - **Snapshots share files.** A compaction keeps a file it carries in place, so
   several snapshots can name one file. Per-file retirement needs nothing more:
   a carried file is never removed, so it is never retired. At three uploads the
   model found that a snapshot-level rule keeping only the files live snapshots
   reference is not enough once files are shared: a later sweep could delete a
-  file a pinned scan still reads ([Data-files model](#data-files-model)). The
-  model is to be rewritten for per-file retirement, keeping that control.
+  file a running scan still reads ([Data-files model](#data-files-model)), so
+  the model checks per-file retirement with that control.
 
 **The retirement sweep.**
 
@@ -1350,7 +1419,7 @@ the writer's process.
   snapshot's files are not under one prefix anyway.
 - Every data-file and deletion-vector delete goes through one check: no live
   entry and no unresolved `Prepare` names the key. The file's own retired
-  entry does not block it; the retention, pins and holds above do. Only dropping a dataset and
+  entry does not block it; the retention and the holds above do. Only dropping a dataset and
   `mode: file_create` delete a folder, the dataset's own, after T.
 - A compaction's carried files never enter the writer's record of uncommitted
   files. They are committed already, and the record protects only uploads not
@@ -1398,11 +1467,10 @@ the writer's process.
   lease fences every other writer's commit, so no commit can name a file the
   sweep deletes. The model checks this with the record and the lease alone
   (`data-files-intent`), and the floor is a backstop.
-- **Unfinished multipart uploads** under the table's prefix are aborted after
-  the same floor, counted from the time the store says each was initiated
-  (`ListMultipartUploads`, `AbortMultipartUpload`). A listing does not show
+- **Unfinished multipart uploads are not aborted.** A listing does not show
   them, they cost storage, and S3 Express directory buckets have no lifecycle
-  rule that would remove them.
+  rule that would remove them; aborting them is tracked in
+  [#16688](https://github.com/spiceai/spiceai/issues/16688).
 - **When it runs.** Once when the table opens, then at most once every 15
   minutes per table, started by the cleanup that follows a commit or by the
   maintenance tick. It does not run while the
@@ -1995,13 +2063,13 @@ committed file sets, CDC, and the data-file lifecycle.
   `full`, `append` and `changes` datasets under `datasets/<folder>/data`, with
   the path recorded relative to the destination; the live set from committed
   state; appends at their final keys; merged deletion vectors read
-  concurrently; and reclamation by a retirement record with the retention T, local reader pins and an
+  concurrently; and reclamation by a retirement record with the retention T and an
   orphan sweep.
 - **Code:** `crates/cayenne` (`dataset_storage.rs`, `provider/table.rs`,
   `provider/uncommitted_files.rs`, `provider/orphan_sweep.rs`,
   `provider/delete/vector_io.rs`, `metastore/object_native/`);
-  `object_store_occ` (`durable_local.rs`); `accelerators/accelerator-cayenne`
-  (placement, the multipart-upload abort); `runtime-state-location` (the
+  `object_store_occ` (`local_conditional_put.rs`); `accelerators/accelerator-cayenne`
+  (placement); `runtime-state-location` (the
   `cayenne_data` meter).
 - **Exit:** the spicescript scenario `object-native-data.yaml`, against the
   source and a variant with the flag off: every acknowledged append is counted
@@ -2222,7 +2290,7 @@ the model README maps each to its runs.
 | I12 | The state at every commit equals running the accepted writes one at a time in commit order, read-dependent writes included, and each key has at most one live row. |
 | I13 | Every data file the committed state names exists in the store; a commit names only files whose upload has returned. |
 | I14 | A reader sees only data files committed at its head version, and an upload whose commit was aborted or abandoned never becomes visible. An unknown outcome resolves all-or-nothing: either every file of the attempt is committed or none is. |
-| I15 | A data file or deletion vector is deleted only after the record that removed it from the live set, and no earlier than T after the sweep observed that removal; never while a scan pins a commit that includes it or a restore point copies it; and a forgotten file leaves nothing behind. |
+| I15 | A data file or deletion vector is deleted only after the record that removed it from the live set, and no earlier than T after the sweep observed that removal; never while a restore point or snapshot export holds the table's deletions; and a forgotten file leaves nothing behind. |
 | I16 | A row the mem-tier's seal made durable is in exactly one durable place at every commit: the commit that registers a checkpoint's snapshot also clears the seal's shadow of the same rows, so no crash leaves a row both in the shadow and in the snapshot ([The in-memory tier's seal and checkpoint](#the-in-memory-tiers-seal-and-checkpoint)). |
 
 ### Data-files model
@@ -2246,7 +2314,12 @@ one safeguard removed, which the checker must reject.
   statistics that exist only for live or retired files; and dataset drop and
   the deletion-vector sweep.
 - **I16** is checked by engine tests and a spicescript scenario, not by the
-  model ([The in-memory tier's seal and checkpoint](#the-in-memory-tiers-seal-and-checkpoint)).
+  model. The mem-tier model's "recovered reads match the source" catches a row
+  in both the shadow and a snapshot only while that row is visible: once a later
+  delete hides both copies, the reads still match. The model always commits the
+  shadow clear with the snapshot, and checking I16 itself needs a property over
+  the durable copies, with a control that separates the two
+  ([The in-memory tier's seal and checkpoint](#the-in-memory-tiers-seal-and-checkpoint)).
 
 ## Appendix: the store contract
 

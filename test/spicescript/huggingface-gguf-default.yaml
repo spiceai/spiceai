@@ -1,0 +1,31 @@
+name: huggingface-gguf-default
+description: >
+  A Hugging Face GGUF repository named with no `files` loads the quantization
+  llama.cpp's `-hf` loads, `Q4_K_M`, and not the largest the machine holds:
+  unsloth's Qwen3-0.6B repository, at a pinned revision, offers 26
+  quantizations from the 0.2 GB `UD-IQ1_S` to the 1.2 GB `BF16`. The log
+  names the quantization it loads, with its size, and how to load another,
+  and the model answers from it.
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: huggingface-gguf-default
+  models:
+    - from: huggingface:huggingface.co/unsloth/Qwen3-0.6B-GGUF:50968a4468ef4233ed78cd7c3de230dd1d61a56b
+      name: qwen3
+
+steps:
+  - start: { ready-timeout: 600s }
+  - assert-log:
+      count:
+        "INFO .*Model 'qwen3' loads quantization Q4_K_M \\(1 file, 0\\.4 GB\\) from Hugging Face repo 'unsloth/Qwen3-0\\.6B-GGUF', the quantization a model with no `files` loads: its Q4_K_M, as llama\\.cpp loads it\\. To load another of its 26 complete GGUF quantizations, name it in the model's `files`: BF16 \\(1\\.2 GB\\), ": 1
+  - http:
+      method: POST
+      path: /v1/chat/completions
+      headers: { content-type: application/json }
+      body: '{"model": "qwen3", "messages": [{"role": "user", "content": "What is 12 times 12? Reply with only the number."}], "temperature": 0, "reasoning_effort": "none", "max_tokens": 16}'
+    expect:
+      status: 200
+      json:
+        - { pointer: /choices/0/message/content, equals: '144' }

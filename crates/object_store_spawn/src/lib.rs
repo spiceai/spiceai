@@ -38,7 +38,10 @@ limitations under the License.
 
 mod guard;
 
-pub use guard::{DestinationGuard, DestinationRefused};
+pub use guard::{
+    DestinationGuard, DestinationRefused, OFF_ORIGIN_REDIRECT_REFUSED, REDIRECT_CHAIN_REFUSED,
+    redirect_continues_off_origin, redirect_leaves_origin,
+};
 
 use std::{
     future::poll_fn,

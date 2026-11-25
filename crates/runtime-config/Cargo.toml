@@ -1,0 +1,16 @@
+[package]
+description = "The runtime's startup configuration set from spiced's command line: bind addresses, cluster options, and role"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "runtime-config"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+clap.workspace = true
+spicepod = { path = "../spicepod", default-features = false }
+
+[lints]
+workspace = true
