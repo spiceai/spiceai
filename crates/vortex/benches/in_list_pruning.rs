@@ -29,6 +29,7 @@ use datafusion_physical_expr::expressions::{InListExpr, Literal, col};
 use vortex::VortexSessionDefault;
 use vortex::dtype::{DType, Nullability, PType, StructFields};
 use vortex::expr::not;
+use vortex::expr::stats::rewrite::BoundExpressionPruneExt;
 use vortex::session::VortexSession;
 use vortex_datafusion::{DefaultExpressionConvertor, ExpressionConvertor};
 

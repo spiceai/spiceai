@@ -5,12 +5,32 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 
 use arrow_schema::DataType;
+use arrow_schema::Field;
 use arrow_schema::Schema;
 use datafusion_common::Result as DFResult;
 use datafusion_common::ScalarValue;
+use datafusion_common::arrow::array::ArrayRef as ArrowArrayRef;
+use datafusion_common::arrow::array::BooleanArray;
+use datafusion_common::arrow::array::Decimal32Array;
+use datafusion_common::arrow::array::Decimal64Array;
+use datafusion_common::arrow::array::Decimal128Array;
+use datafusion_common::arrow::array::Decimal256Array;
+use datafusion_common::arrow::array::Float16Array;
+use datafusion_common::arrow::array::Float32Array;
+use datafusion_common::arrow::array::Float64Array;
+use datafusion_common::arrow::array::Int8Array;
+use datafusion_common::arrow::array::Int16Array;
+use datafusion_common::arrow::array::Int32Array;
+use datafusion_common::arrow::array::Int64Array;
+use datafusion_common::arrow::array::UInt8Array;
+use datafusion_common::arrow::array::UInt16Array;
+use datafusion_common::arrow::array::UInt32Array;
+use datafusion_common::arrow::array::UInt64Array;
+use datafusion_common::arrow::compute::CastOptions;
+use datafusion_common::arrow::compute::cast_with_options;
+use datafusion_common::arrow::datatypes::i256;
 use datafusion_common::exec_datafusion_err;
 use datafusion_common::tree_node::TreeNode;
-use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_expr::Operator as DFOperator;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_functions_nested::length::ArrayLength;
@@ -18,7 +38,6 @@ use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr::projection::ProjectionExpr;
 use datafusion_physical_expr::projection::ProjectionExprs;
-use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_plan::expressions as df_expr;
 use itertools::Itertools;
 use vortex::VortexSessionDefault;
@@ -28,9 +47,11 @@ use vortex::array::VortexSessionExecute;
 use vortex::array::arrays::ConstantArray;
 use vortex::array::builtins::ArrayBuiltins;
 use vortex::arrow::ArrowSession;
+use vortex::arrow::ArrowSessionExt;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
 use vortex::dtype::half::f16;
+use vortex::error::VortexResult;
 use vortex::expr::Expression;
 use vortex::expr::and_collect;
 use vortex::expr::cast;
@@ -61,6 +82,9 @@ pub struct ProcessedProjection {
     pub scan_projection: Expression,
     /// Projection expressions evaluated by `DataFusion` after the scan.
     pub leftover_projection: ProjectionExprs,
+    /// Whether the scan evaluates the projection's expressions, rather than reading the raw
+    /// columns they reference for `DataFusion` to evaluate.
+    pub pushed_down: bool,
 }
 
 /// Tries to convert the expressions into a vortex conjunction. Will return `None` iff the input conjunction is empty.
@@ -102,8 +126,13 @@ pub trait ExpressionConvertor: Send + Sync {
         self.convert(expr)
     }
 
-    /// Split a projection into Vortex expressions that can be pushed down and leftover
-    /// `DataFusion` projections that need to be evaluated after the scan.
+    /// Push a projection into the Vortex scan, whole or not at all.
+    ///
+    /// When every expression converts, the scan evaluates them and `DataFusion` only renames its
+    /// output. Otherwise the scan reads the raw columns they reference, as
+    /// [`Self::no_pushdown_projection`] does. Pushing part of a projection would put the pushed
+    /// expressions, named by their aliases, beside the raw columns the rest read, and an alias
+    /// can share a column's name: `SELECT b AS a, abs(a)` read `abs(b)`.
     ///
     /// # Errors
     ///
@@ -142,6 +171,7 @@ pub trait ExpressionConvertor: Send + Sync {
         Ok(ProcessedProjection {
             scan_projection: pack(scan_columns, Nullability::NonNullable),
             leftover_projection: source_projection,
+            pushed_down: false,
         })
     }
 }
@@ -574,83 +604,56 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
         input_schema: &Schema,
         output_schema: &Schema,
     ) -> DFResult<ProcessedProjection> {
+        let pushable = source_projection.iter().all(|projection_expr| {
+            self.can_be_pushed_down(&projection_expr.expr, input_schema)
+                && !contains_decimal_arithmetic(&projection_expr.expr, input_schema)
+        });
+        if !pushable {
+            return self.no_pushdown_projection(source_projection, input_schema);
+        }
+
         let mut scan_projection = vec![];
         let mut leftover_projection: Vec<ProjectionExpr> = vec![];
 
         for projection_expr in source_projection.iter() {
-            let r = projection_expr.expr.apply(|node| {
-                // Vortex evaluates decimal-to-floating casts with different
-                // precision/null semantics than DataFusion for some inputs, and
-                // has no kernel for some other casts. Keep those expressions above
-                // the scan.
-                if contains_decimal_to_floating_cast(node, input_schema)
-                    || contains_cast_vortex_cannot_evaluate(node, input_schema)
-                {
-                    scan_projection.extend(
-                        collect_columns(node)
-                            .into_iter()
-                            .map(|c| (c.name().to_string(), get_item(c.name(), root()))),
-                    );
-
-                    leftover_projection.push(projection_expr.clone());
-                    return Ok(TreeNodeRecursion::Stop);
-                }
-
-                // We only pull column children of scalar functions that we can't push into the scan.
-                if let Some(scalar_fn_expr) = node.downcast_ref::<ScalarFunctionExpr>()
-                    && !can_scalar_fn_be_pushed_down(scalar_fn_expr, input_schema)
-                {
-                    scan_projection.extend(
-                        collect_columns(node)
-                            .into_iter()
-                            .map(|c| (c.name().to_string(), get_item(c.name(), root()))),
-                    );
-
-                    leftover_projection.push(projection_expr.clone());
-                    return Ok(TreeNodeRecursion::Stop);
-                }
-
-                // DataFusion assumes different decimal types can be coerced.
-                // Vortex expects a perfect match so we don't push it down.
-                if let Some(binary_expr) = node.downcast_ref::<df_expr::BinaryExpr>()
-                    && binary_expr.op().is_numerical_operators()
-                    && (is_decimal(&binary_expr.left().data_type(input_schema)?)
-                        && is_decimal(&binary_expr.right().data_type(input_schema)?))
-                {
-                    scan_projection.extend(
-                        collect_columns(node)
-                            .into_iter()
-                            .map(|c| (c.name().to_string(), get_item(c.name(), root()))),
-                    );
-
-                    leftover_projection.push(projection_expr.clone());
-                    return Ok(TreeNodeRecursion::Stop);
-                }
-
-                Ok(TreeNodeRecursion::Continue)
-            })?;
-
-            // if we didn't stop early
-            if matches!(r, TreeNodeRecursion::Continue) {
-                scan_projection.push((
-                    projection_expr.alias.clone(),
-                    self.convert(projection_expr.expr.as_ref())?,
-                ));
-                leftover_projection.push(ProjectionExpr {
-                    expr: Arc::new(df_expr::Column::new_with_schema(
-                        projection_expr.alias.as_str(),
-                        output_schema,
-                    )?),
-                    alias: projection_expr.alias.clone(),
-                });
-            }
+            scan_projection.push((
+                projection_expr.alias.clone(),
+                self.convert(projection_expr.expr.as_ref())?,
+            ));
+            leftover_projection.push(ProjectionExpr {
+                expr: Arc::new(df_expr::Column::new_with_schema(
+                    projection_expr.alias.as_str(),
+                    output_schema,
+                )?),
+                alias: projection_expr.alias.clone(),
+            });
         }
 
         Ok(ProcessedProjection {
             scan_projection: pack(scan_projection, Nullability::NonNullable),
             leftover_projection: leftover_projection.into(),
+            pushed_down: true,
         })
     }
+}
+
+/// Whether `expr` does arithmetic over two decimal operands anywhere. `DataFusion` gives the
+/// result a precision and scale of its own, and Vortex's need not match it, so a projected
+/// value would change type.
+fn contains_decimal_arithmetic(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    expr.exists(|node| {
+        Ok(node
+            .downcast_ref::<df_expr::BinaryExpr>()
+            .is_some_and(|binary| {
+                binary.op().is_numerical_operators()
+                    && [binary.left(), binary.right()].iter().all(|operand| {
+                        operand
+                            .data_type(schema)
+                            .is_ok_and(|data_type| is_decimal(&data_type))
+                    })
+            }))
+    })
+    .unwrap_or(true)
 }
 
 fn try_operator_from_df(value: DFOperator) -> DFResult<Operator> {
@@ -717,6 +720,11 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
         return false;
     }
 
+    if contains_an_expression_the_scan_evaluates_differently(df_expr, schema) {
+        tracing::debug!(%df_expr, "DataFusion expression contains an expression the scan evaluates differently and can't be pushed down");
+        return false;
+    }
+
     let expr = df_expr;
     if let Some(binary) = expr.downcast_ref::<df_expr::BinaryExpr>() {
         can_binary_be_pushed_down(binary, schema)
@@ -739,11 +747,13 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
     } else if let Some(not_expr) = expr.downcast_ref::<df_expr::NotExpr>() {
         can_be_pushed_down_impl(not_expr.arg(), schema)
     } else if let Some(in_list) = expr.downcast_ref::<df_expr::InListExpr>() {
+        // `convert` builds a constant list, so every element has to be a literal: an
+        // element that reads a column (`a IN (b, 4, 5)`) passes the element checks below
+        // and then fails the scan.
         can_be_pushed_down_impl(in_list.expr(), schema)
-            && in_list
-                .list()
-                .iter()
-                .all(|e| can_be_pushed_down_impl(e, schema))
+            && in_list.list().iter().all(|e| {
+                e.downcast_ref::<df_expr::Literal>().is_some() && can_be_pushed_down_impl(e, schema)
+            })
     } else if let Some(scalar_fn) = expr.downcast_ref::<ScalarFunctionExpr>() {
         can_scalar_fn_be_pushed_down(scalar_fn, schema)
     } else if let Some(case_expr) = expr.downcast_ref::<df_expr::CaseExpr>() {
@@ -881,8 +891,26 @@ fn can_binary_be_pushed_down(binary: &df_expr::BinaryExpr, schema: &Schema) -> b
     let is_op_supported = try_operator_from_df(*binary.op()).is_ok();
     is_op_supported
         && !compares_two_float_expressions(*binary.op(), binary.left(), binary.right(), schema)
+        && arithmetic_operands_share_a_type(binary, schema)
         && can_be_pushed_down_impl(binary.left(), schema)
         && can_be_pushed_down_impl(binary.right(), schema)
+}
+
+/// Whether an arithmetic expression's operands have one type, which Vortex arithmetic
+/// requires. `DataFusion` multiplies a `DECIMAL(15, 2)` by a `DECIMAL(10, 0)` (or by the
+/// literal `2`, typed `DECIMAL(20, 0)`) without casting either, and Vortex refuses to bind
+/// that, which fails the scan rather than the predicate.
+fn arithmetic_operands_share_a_type(binary: &df_expr::BinaryExpr, schema: &Schema) -> bool {
+    if !binary.op().is_numerical_operators() {
+        return true;
+    }
+    match (
+        binary.left().data_type(schema),
+        binary.right().data_type(schema),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// Whether `left op right` compares two floating-point operands neither of
@@ -997,6 +1025,45 @@ fn contains_decimal_to_floating_cast(df_expr: &Arc<dyn PhysicalExpr>, schema: &S
         .any(|child| contains_decimal_to_floating_cast(child, schema))
 }
 
+/// Whether `df_expr` holds, anywhere, an expression the scan evaluates differently from
+/// `DataFusion`: arithmetic over operands of different types, a comparison of two float
+/// expressions, or a `CASE` with a branch `DataFusion` runs on some rows only and that can
+/// fail. The arms of [`can_be_pushed_down_impl`] check these on the expressions they recurse
+/// into, but the expression under a cast, and the argument of `array_length`, are checked only
+/// for being convertible, so the whole tree is searched here. Without it
+/// `CAST(CASE WHEN b <> 0 THEN 12 / b ELSE 0 END AS DOUBLE) = 6` reached the scan, which
+/// evaluates every branch and divides by zero, and `CAST(f = g AS INT) = 1` dropped the rows
+/// where `f` and `g` hold `-0.0` and `0.0`.
+fn contains_an_expression_the_scan_evaluates_differently(
+    df_expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> bool {
+    if let Some(binary) = df_expr.downcast_ref::<df_expr::BinaryExpr>()
+        && (!arithmetic_operands_share_a_type(binary, schema)
+            || compares_two_float_expressions(*binary.op(), binary.left(), binary.right(), schema))
+    {
+        return true;
+    }
+
+    if let Some(case_expr) = df_expr.downcast_ref::<df_expr::CaseExpr>()
+        && case_has_a_conditional_branch_that_can_fail(case_expr, schema)
+    {
+        return true;
+    }
+
+    if let Some(dynamic_filter) = df_expr.downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+        && let Ok(current) = dynamic_filter.current()
+        && contains_an_expression_the_scan_evaluates_differently(&current, schema)
+    {
+        return true;
+    }
+
+    df_expr
+        .children()
+        .into_iter()
+        .any(|child| contains_an_expression_the_scan_evaluates_differently(child, schema))
+}
+
 /// Whether `df_expr` holds a cast Vortex can't evaluate.
 ///
 /// A static filter rarely carries a cast, because `DataFusion` unwraps it into the
@@ -1036,17 +1103,38 @@ fn vortex_evaluates_cast(source: &DataType, target: &DataType) -> bool {
     static EVALUATES: LazyLock<DashMap<(DataType, DataType), bool>> =
         LazyLock::new(DashMap::default);
 
+    match (source, target) {
+        // A list cast casts each element, so it is evaluated as its element cast is, with the
+        // same exclusion of decimal-to-floating casts as a column's. Casting nullable elements
+        // to non-nullable ones fails on a null element.
+        (
+            DataType::List(from) | DataType::LargeList(from),
+            DataType::List(to) | DataType::LargeList(to),
+        ) => {
+            return (to.is_nullable() || !from.is_nullable())
+                && !(is_decimal(from.data_type()) && to.data_type().is_floating())
+                && vortex_evaluates_cast(from.data_type(), to.data_type());
+        }
+        // Vortex has no cast from a fixed-size list to a list.
+        (DataType::FixedSizeList(..), DataType::List(_) | DataType::LargeList(_)) => {
+            return false;
+        }
+        _ => {}
+    }
+
     if let Some(evaluates) = EVALUATES.get(&(source.clone(), target.clone())) {
         return *evaluates;
     }
-    let evaluates = probe_vortex_cast(source, target);
+    let evaluates =
+        probe_vortex_cast(source, target) && vortex_casts_extremes_like_arrow(source, target);
     EVALUATES.insert((source.clone(), target.clone()), evaluates);
     evaluates
 }
 
-fn probe_vortex_cast(source: &DataType, target: &DataType) -> bool {
-    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::default);
+/// The session the cast probes evaluate Vortex casts with.
+static PROBE_SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::default);
 
+fn probe_vortex_cast(source: &DataType, target: &DataType) -> bool {
     let arrow = ArrowSession::default();
     let (Ok(source), Ok(target)) = (
         arrow.from_arrow_datatype(source, Nullability::Nullable),
@@ -1074,7 +1162,7 @@ fn probe_vortex_cast(source: &DataType, target: &DataType) -> bool {
         return false;
     }
 
-    let mut ctx = SESSION.create_execution_ctx();
+    let mut ctx = PROBE_SESSION.create_execution_ctx();
     ConstantArray::new(value, 1)
         .into_array()
         .execute::<Canonical>(&mut ctx)
@@ -1083,10 +1171,160 @@ fn probe_vortex_cast(source: &DataType, target: &DataType) -> bool {
         .is_ok()
 }
 
+/// Whether a `CASE` has a branch that `DataFusion` evaluates on some rows only and that can
+/// fail.
+///
+/// `DataFusion` evaluates the first `WHEN` on every row, each `THEN` only on the rows its
+/// `WHEN` selected, and each later `WHEN` and the `ELSE` only on the rows no earlier `WHEN`
+/// did, so `CASE WHEN b <> 0 THEN 12 / b ELSE 0 END` never divides by zero. Vortex evaluates
+/// every branch on every row, and fails the scan on the row the guard was written for. Such
+/// a `CASE` stays above the scan.
+fn case_has_a_conditional_branch_that_can_fail(
+    case_expr: &df_expr::CaseExpr,
+    schema: &Schema,
+) -> bool {
+    let when_then = case_expr.when_then_expr();
+    let later_whens = when_then.iter().skip(1).map(|(when_expr, _)| when_expr);
+    let thens = when_then.iter().map(|(_, then_expr)| then_expr);
+    later_whens
+        .chain(thens)
+        .chain(case_expr.else_expr())
+        .any(|branch| can_fail(branch, schema))
+}
+
+/// Whether evaluating `expr` can fail on some row: integer or decimal arithmetic, which
+/// fails on division by zero and on overflow, anywhere in the expression. Casts that can fail
+/// never reach the scan (see [`vortex_casts_extremes_like_arrow`]).
+fn can_fail(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    expr.exists(|node| {
+        Ok(node
+            .downcast_ref::<df_expr::BinaryExpr>()
+            .is_some_and(|binary| {
+                binary.op().is_numerical_operators()
+                    && binary
+                        .data_type(schema)
+                        .is_ok_and(|data_type| data_type.is_integer() || is_decimal(&data_type))
+            }))
+    })
+    .unwrap_or(true)
+}
+
+/// Whether Vortex casts the extreme values of `source` to `target` the way Arrow does.
+///
+/// Arrow's cast is the one `DataFusion` runs when a filter stays above the scan, so a
+/// pushed-down cast has to give the same value for every value of the source type. A cast
+/// Arrow refuses for some value, such as one out of the target's range, stays above the scan
+/// even when Vortex refuses it too: Vortex may answer a comparison through the cast without
+/// casting the value (`CAST(d AS BIGINT) > 0` over a `DECIMAL(19, 0)` of `10^19 - 1`
+/// returned the row where `DataFusion` fails the query), so only a cast that cannot fail is
+/// safe to push. Each extreme, and zero, is cast on its own, so one value's failure does not
+/// hide another's answer. A non-numeric source type has no extremes to try and keeps the
+/// answer [`probe_vortex_cast`] gives; a numeric one without them stays above the scan.
+fn vortex_casts_extremes_like_arrow(source: &DataType, target: &DataType) -> bool {
+    let Some(values) = extreme_values(source) else {
+        return !source.is_numeric();
+    };
+    let options = CastOptions {
+        safe: false,
+        ..CastOptions::default()
+    };
+    let field = Field::new("value", target.clone(), true);
+    (0..values.len()).all(|index| {
+        let value = values.slice(index, 1);
+        let arrow = cast_with_options(&value, target, &options);
+        let vortex = vortex_cast(&value, target, &field);
+        match (arrow, vortex) {
+            (Ok(arrow), Ok(vortex)) => arrow.as_ref() == vortex.as_ref(),
+            _ => false,
+        }
+    })
+}
+
+/// Cast `value` to `target` in Vortex and export the result to Arrow as `field`.
+fn vortex_cast(
+    value: &ArrowArrayRef,
+    target: &DataType,
+    field: &Field,
+) -> VortexResult<ArrowArrayRef> {
+    let array = PROBE_SESSION
+        .arrow()
+        .from_arrow_array(Arc::clone(value), true)?;
+    let target_dtype = PROBE_SESSION
+        .arrow()
+        .from_arrow_datatype(target, Nullability::Nullable)?;
+    let mut ctx = PROBE_SESSION.create_execution_ctx();
+    let cast = array
+        .cast(target_dtype)?
+        .execute::<Canonical>(&mut ctx)?
+        .into_array();
+    PROBE_SESSION
+        .arrow()
+        .execute_arrow(cast, Some(field), &mut ctx)
+}
+
+/// The smallest and largest values of `source`, and zero, for the types whose casts can
+/// overflow or lose a value.
+fn extreme_values(source: &DataType) -> Option<ArrowArrayRef> {
+    Some(match source {
+        DataType::Boolean => Arc::new(BooleanArray::from(vec![false, true])),
+        DataType::Int8 => Arc::new(Int8Array::from(vec![i8::MIN, 0, i8::MAX])),
+        DataType::Int16 => Arc::new(Int16Array::from(vec![i16::MIN, 0, i16::MAX])),
+        DataType::Int32 => Arc::new(Int32Array::from(vec![i32::MIN, 0, i32::MAX])),
+        DataType::Int64 => Arc::new(Int64Array::from(vec![i64::MIN, 0, i64::MAX])),
+        DataType::UInt8 => Arc::new(UInt8Array::from(vec![0, u8::MAX])),
+        DataType::UInt16 => Arc::new(UInt16Array::from(vec![0, u16::MAX])),
+        DataType::UInt32 => Arc::new(UInt32Array::from(vec![0, u32::MAX])),
+        DataType::UInt64 => Arc::new(UInt64Array::from(vec![0, u64::MAX])),
+        DataType::Float16 => Arc::new(Float16Array::from(vec![
+            f16::MIN,
+            f16::from_f32(0.0),
+            f16::MAX,
+        ])),
+        DataType::Float32 => Arc::new(Float32Array::from(vec![f32::MIN, 0.0, f32::MAX])),
+        DataType::Float64 => Arc::new(Float64Array::from(vec![f64::MIN, 0.0, f64::MAX])),
+        DataType::Decimal32(precision, scale) => {
+            let largest = 10_i32.checked_pow(u32::from(*precision))?.checked_sub(1)?;
+            Arc::new(
+                Decimal32Array::from(vec![-largest, 0, largest])
+                    .with_precision_and_scale(*precision, *scale)
+                    .ok()?,
+            )
+        }
+        DataType::Decimal64(precision, scale) => {
+            let largest = 10_i64.checked_pow(u32::from(*precision))?.checked_sub(1)?;
+            Arc::new(
+                Decimal64Array::from(vec![-largest, 0, largest])
+                    .with_precision_and_scale(*precision, *scale)
+                    .ok()?,
+            )
+        }
+        DataType::Decimal128(precision, scale) => {
+            let largest = 10_i128.checked_pow(u32::from(*precision))?.checked_sub(1)?;
+            Arc::new(
+                Decimal128Array::from(vec![-largest, 0, largest])
+                    .with_precision_and_scale(*precision, *scale)
+                    .ok()?,
+            )
+        }
+        DataType::Decimal256(precision, scale) => {
+            let largest = i256::from_i128(10)
+                .checked_pow(u32::from(*precision))?
+                .checked_sub(i256::ONE)?;
+            Arc::new(
+                Decimal256Array::from(vec![largest.wrapping_neg(), i256::ZERO, largest])
+                    .with_precision_and_scale(*precision, *scale)
+                    .ok()?,
+            )
+        }
+        _ => return None,
+    })
+}
+
 fn can_case_be_pushed_down(case_expr: &df_expr::CaseExpr, schema: &Schema) -> bool {
-    case_expr
-        .expr()
-        .is_none_or(|base_expr| can_be_pushed_down_impl(base_expr, schema))
+    !case_has_a_conditional_branch_that_can_fail(case_expr, schema)
+        && case_expr
+            .expr()
+            .is_none_or(|base_expr| can_be_pushed_down_impl(base_expr, schema))
         && case_expr
             .when_then_expr()
             .iter()
@@ -1425,6 +1663,8 @@ mod tests {
 
     #[test]
     fn test_in_list_conversion_produces_pruning_expression() {
+        use vortex::expr::stats::rewrite::BoundExpressionPruneExt;
+
         let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
         let column = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
         let values = vec![
@@ -1817,11 +2057,62 @@ mod tests {
     #[case::string_to_decimal(DataType::Utf8, DataType::Decimal128(19, 0), false)]
     #[case::string_to_string_view(DataType::Utf8, DataType::Utf8View, true)]
     #[case::binary_to_string(DataType::Binary, DataType::Utf8, false)]
-    #[case::bool_to_int(DataType::Boolean, DataType::Int32, false)]
+    // Vortex casts a boolean to an integer as Arrow does, for every value.
+    #[case::bool_to_int(DataType::Boolean, DataType::Int32, true)]
     #[case::dictionary_to_string(
         DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
         DataType::Utf8,
         true
+    )]
+    // Narrow, wide and half-precision sources are probed at their extremes too.
+    #[case::decimal32_to_int16(DataType::Decimal32(9, 0), DataType::Int16, false)]
+    #[case::decimal64_to_int32(DataType::Decimal64(18, 0), DataType::Int32, false)]
+    #[case::decimal256_to_int64(DataType::Decimal256(40, 0), DataType::Int64, false)]
+    #[case::decimal256_widening(DataType::Decimal256(40, 0), DataType::Decimal256(41, 0), true)]
+    #[case::float16_to_int8(DataType::Float16, DataType::Int8, false)]
+    #[case::float16_to_float64(DataType::Float16, DataType::Float64, true)]
+    // A list cast casts each element, so it is pushed exactly when its element cast is.
+    #[case::list_int_to_float(
+        list_of(DataType::Int32, true),
+        list_of(DataType::Float64, true),
+        true
+    )]
+    #[case::large_list_int_to_list_float(
+        DataType::LargeList(Arc::new(Field::new_list_field(DataType::Int64, true))),
+        list_of(DataType::Float64, true),
+        true
+    )]
+    #[case::list_bool_to_float(
+        list_of(DataType::Boolean, true),
+        list_of(DataType::Float64, true),
+        true
+    )]
+    #[case::list_decimal_to_float(
+        list_of(DataType::Decimal128(15, 2), true),
+        list_of(DataType::Float64, true),
+        false
+    )]
+    #[case::list_decimal_scale_down(
+        list_of(DataType::Decimal128(10, 2), true),
+        list_of(DataType::Decimal128(10, 0), true),
+        false
+    )]
+    #[case::list_string_to_float(
+        list_of(DataType::Utf8, true),
+        list_of(DataType::Float64, true),
+        false
+    )]
+    // Casting to non-null elements fails on a null element.
+    #[case::list_to_non_null_elements(
+        list_of(DataType::Int32, true),
+        list_of(DataType::Int32, false),
+        false
+    )]
+    // Vortex has no cast from a fixed-size list to a list.
+    #[case::fixed_size_list_to_list(
+        DataType::FixedSizeList(Arc::new(Field::new_list_field(DataType::Int32, true)), 2),
+        list_of(DataType::Float64, true),
+        false
     )]
     fn test_cast_pushdown(
         #[case] source: DataType,
@@ -1954,6 +2245,11 @@ mod tests {
             as Arc<dyn PhysicalExpr>;
 
         assert!(can_be_pushed_down_impl(&binary_expr, &test_schema));
+    }
+
+    /// A `List` of `element`, with the element field `DataFusion` names `item`.
+    fn list_of(element: DataType, nullable: bool) -> DataType {
+        DataType::List(Arc::new(Field::new_list_field(element, nullable)))
     }
 
     #[test]
