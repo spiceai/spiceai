@@ -3612,11 +3612,16 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
         // from it: a replacement installed after this point is one this connection
         // never saw, and a refusal it reports must not be attributed to it.
         let connection_generation = source.slot_generation.load(Ordering::Acquire);
+        // Start at the acknowledged position, not the applied floor: the client
+        // seeds the slot's acknowledgement from its start position and never
+        // lowers it, so starting at the applied floor would acknowledge the slot
+        // past positions not yet recorded. The commits in between are replayed
+        // and skipped by every member that already applied them.
         let config = client::build_replication_config(
             &params,
             &slot_name,
             &publication_name,
-            source.ack.flush_lsn(),
+            source.ack.acknowledged_lsn(),
         );
         let mut client = match ReplicationClient::connect(config).await {
             Ok(c) => {

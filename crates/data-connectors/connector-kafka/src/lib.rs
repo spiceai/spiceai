@@ -725,8 +725,6 @@ async fn bootstrap_new_kafka_consumer(
                 dataconnector: "kafka",
                 connector_component: ConnectorComponent::from(dataset),
             })?
-        && !(recorded.consumer_group_id == metadata.consumer_group_id
-            && recorded.offsets.is_empty())
     {
         ensure!(
             topic == recorded.topic,
@@ -739,7 +737,16 @@ async fn bootstrap_new_kafka_consumer(
                 connector_component: ConnectorComponent::from(dataset),
             }
         );
-        return consumer_for_metadata(dataset, topic, kafka_config, recorded);
+        // A checkpoint with no offsets holds nothing read yet: this consumer, in
+        // the recorded group, starts each partition at the beginning. Otherwise
+        // read as the checkpoint says. Either way, with the recorded schema.
+        if recorded.consumer_group_id != metadata.consumer_group_id
+            || !recorded.offsets.is_empty()
+        {
+            return consumer_for_metadata(dataset, topic, kafka_config, recorded);
+        }
+        kafka_consumer.subscribe_on_read(topic);
+        return Ok((kafka_consumer, recorded.schema));
     }
 
     // Only the instance that reads the change stream joins the group; it starts

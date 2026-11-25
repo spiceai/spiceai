@@ -717,7 +717,8 @@ async fn get_metadata_from_kafka(
                         metadata,
                     )
                     .await?;
-                    return Ok((kafka_consumer, metadata, Arc::clone(declared)));
+                    let schema = recorded_schema(dataset, &metadata, Some(declared))?;
+                    return Ok((kafka_consumer, metadata, schema));
                 }
                 return Err(super::DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "debezium".to_string(),
@@ -747,7 +748,8 @@ async fn get_metadata_from_kafka(
                         metadata,
                     )
                     .await?;
-                    return Ok((kafka_consumer, metadata, Arc::clone(declared)));
+                    let schema = recorded_schema(dataset, &metadata, Some(declared))?;
+                    return Ok((kafka_consumer, metadata, schema));
                 }
                 return Err(e).boxed().context(super::UnableToGetReadProviderSnafu {
                     dataconnector: "debezium",
@@ -770,14 +772,6 @@ async fn get_metadata_from_kafka(
         });
     };
 
-    let inferred = debezium::arrow::convert_fields_to_arrow_schema(schema_fields.clone())
-        .boxed()
-        .context(super::UnableToGetReadProviderSnafu {
-            dataconnector: "debezium",
-            connector_component: ConnectorComponent::from(dataset),
-        })?;
-    let schema = merge_inferred_and_declared_schemas(Arc::new(inferred), declared_schema);
-
     let metadata = DebeziumKafkaMetadata {
         consumer_group_id: kafka_consumer.group_id().to_string(),
         topic: topic.to_string(),
@@ -786,7 +780,6 @@ async fn get_metadata_from_kafka(
         offsets: Vec::new(),
     };
 
-    let proposed_fields = metadata.schema_fields.clone();
     let (kafka_consumer, metadata) = record_metadata(
         dataset,
         topic,
@@ -796,21 +789,9 @@ async fn get_metadata_from_kafka(
         metadata,
     )
     .await?;
-    // Another instance recorded the dataset's checkpoint first: read with the
-    // schema it recorded.
-    let schema = if metadata.schema_fields == proposed_fields {
-        schema
-    } else {
-        let inferred = debezium::arrow::convert_fields_to_arrow_schema(
-            metadata.schema_fields.iter().collect(),
-        )
-        .boxed()
-        .context(super::UnableToGetReadProviderSnafu {
-            dataconnector: "debezium",
-            connector_component: ConnectorComponent::from(dataset),
-        })?;
-        merge_inferred_and_declared_schemas(Arc::new(inferred), declared_schema)
-    };
+    // Another instance may have recorded the dataset's checkpoint first: read
+    // with the fields it recorded.
+    let schema = recorded_schema(dataset, &metadata, declared_schema)?;
 
     Ok((kafka_consumer, metadata, schema))
 }
@@ -845,9 +826,6 @@ async fn record_metadata(
     let Some(recorded) = recorded else {
         return Ok((kafka_consumer, proposed));
     };
-    if recorded.consumer_group_id == proposed.consumer_group_id && recorded.offsets.is_empty() {
-        return Ok((kafka_consumer, proposed));
-    }
     ensure!(
         recorded.topic == topic,
         super::InvalidConfigurationNoSourceSnafu {
@@ -859,6 +837,12 @@ async fn record_metadata(
             connector_component: ConnectorComponent::from(dataset),
         }
     );
+    // A checkpoint with no offsets holds nothing read yet: this consumer, in the
+    // recorded group, starts each partition at the beginning. Either way the
+    // caller reads with the recorded keys and schema.
+    if recorded.consumer_group_id == proposed.consumer_group_id && recorded.offsets.is_empty() {
+        return Ok((kafka_consumer, recorded));
+    }
     let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
         &dataset.name.to_string(),
         &recorded.consumer_group_id,
@@ -872,6 +856,32 @@ async fn record_metadata(
     })?;
     kafka_consumer.subscribe_on_read(topic);
     Ok((kafka_consumer, recorded))
+}
+
+/// The schema to read the dataset with: the change-event fields `metadata`
+/// records, merged with the declared columns, or the declared columns alone when
+/// it records none.
+fn recorded_schema(
+    dataset: &DatasetSpec,
+    metadata: &DebeziumKafkaMetadata,
+    declared_schema: Option<&SchemaRef>,
+) -> super::DataConnectorResult<SchemaRef> {
+    if metadata.schema_fields.is_empty()
+        && let Some(declared) = declared_schema
+    {
+        return Ok(Arc::clone(declared));
+    }
+    let inferred =
+        debezium::arrow::convert_fields_to_arrow_schema(metadata.schema_fields.iter().collect())
+            .boxed()
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "debezium",
+                connector_component: ConnectorComponent::from(dataset),
+            })?;
+    Ok(merge_inferred_and_declared_schemas(
+        Arc::new(inferred),
+        declared_schema,
+    ))
 }
 
 /// [`DebeziumCheckpointStore::get_or_record`], as the connector speaks it.

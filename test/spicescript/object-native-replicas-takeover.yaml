@@ -224,6 +224,32 @@ steps:
   - start: {}
     only: a
     when: { src: postgres }
+  # WAL the dataset does not publish moves on, so B applies nothing and
+  # records its idle position only on its next pass. The source drops B's
+  # replication connection, and B reconnects: it must still acknowledge no
+  # further than it has recorded, since A takes over right after, before
+  # that pass.
+  - source-exec:
+      src:
+        - 'CREATE TABLE noise (i int)'
+        - 'INSERT INTO noise SELECT generate_series(1, 200000)'
+    only: b
+    when: { src: postgres }
+  - sleep: 2s
+    when: { src: postgres }
+  - source-exec:
+      src: >-
+        SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots
+        WHERE database = current_database() AND active_pid IS NOT NULL
+    only: b
+    when: { src: postgres }
+  - source-query: { src: "SELECT count(*) AS active FROM pg_replication_slots WHERE database = current_database() AND active" }
+    expect: { rows: [['1']] }
+    eventually: 30s
+    only: b
+    when: { src: postgres }
+  - sleep: 1s
+    when: { src: postgres }
   - kill-spiced: {}
     only: b
     when: { src: postgres }
@@ -296,6 +322,10 @@ steps:
   - query: SELECT batch, count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events GROUP BY batch ORDER BY batch
     eventually: 120s
     only: b
+    when: { src: postgres }
+  - query: SELECT batch, count(DISTINCT id) AS ids, sum(DISTINCT id) AS id_total FROM events GROUP BY batch ORDER BY batch
+    eventually: 180s
+    only: a
     when: { src: postgres }
   - query: SELECT batch, count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events GROUP BY batch ORDER BY batch
     eventually: 180s
@@ -526,7 +556,9 @@ steps:
   # its own transaction; B takes over from the offsets in the location.
   # Expected to fail at times (recordings/expected-failures.json, may-pass): in
   # 1 of 7 runs B, writing within seconds of taking over, kept two rows for
-  # some keys of this primary-keyed dataset.
+  # some keys of this primary-keyed dataset. Only that shape is waived: the key
+  # set is checked first and never waived, so a waived row-count mismatch can
+  # only be extra copies of keys the source has.
   - source-exec:
       src: |
         DO $$ BEGIN FOR i IN 1..300 LOOP
@@ -549,6 +581,10 @@ steps:
     eventually: 120s
     only: b
     when: { src: debezium }
+  - query: SELECT count(DISTINCT id) AS ids, sum(DISTINCT id) AS id_total FROM events
+    eventually: 180s
+    only: b
+    when: { src: debezium }
   - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total, sum(id * v) AS weighted FROM events
     eventually: 180s
     only: b
@@ -564,9 +600,17 @@ steps:
         DELETE FROM events WHERE id % 23 = 0;
     only: b
     when: { src: debezium }
+  - query: SELECT count(DISTINCT id) AS ids, sum(DISTINCT id) AS id_total FROM events
+    eventually: 120s
+    only: b
+    when: { src: debezium }
   - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total, sum(id * v) AS weighted FROM events
     eventually: 120s
     only: b
+    when: { src: debezium }
+  - query: SELECT count(DISTINCT id) AS ids, sum(DISTINCT id) AS id_total FROM events
+    eventually: 120s
+    only: a
     when: { src: debezium }
   - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total, sum(id * v) AS weighted FROM events
     eventually: 120s

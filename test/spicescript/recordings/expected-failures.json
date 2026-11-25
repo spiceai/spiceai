@@ -1058,7 +1058,7 @@
       "group": "cayenne",
       "may-pass": true,
       "varies": true,
-      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\", row_number: 1, expected: \"\\\\\"[0-9]+\\\\\"\", actual: \"\\\\\"[0-9]+\\\\\"\" \\}"
+      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\", row_number: [0-9]+,"
     },
     {
       "run": "object-native-replicas-takeover[src=debezium]",
@@ -1069,7 +1069,7 @@
       "group": "cayenne",
       "may-pass": true,
       "varies": true,
-      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\", row_number: 1, expected: \"\\\\\"[0-9]+\\\\\"\", actual: \"\\\\\"[0-9]+\\\\\"\" \\}"
+      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\", row_number: [0-9]+,"
     },
     {
       "run": "object-native-replicas-takeover[src=debezium]",
@@ -1080,7 +1080,7 @@
       "group": "cayenne",
       "may-pass": true,
       "varies": true,
-      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\", row_number: 1, expected: \"\\\\\"[0-9]+\\\\\"\", actual: \"\\\\\"[0-9]+\\\\\"\" \\}"
+      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\", row_number: [0-9]+,"
     },
     {
       "run": "object-native-replicas-takeover[src=postgres]",
@@ -1107,7 +1107,7 @@
       "group": "cayenne",
       "may-pass": true,
       "varies": true,
-      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\", row_number: [0-9]+, expected: \"\\\\\"[0-9]+\\\\\"\", actual: \"\\\\\"[0-9]+\\\\\"\" \\}"
+      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\", row_number: [0-9]+,"
     }
   ],
   "postgres-cdc-atomicity": [
