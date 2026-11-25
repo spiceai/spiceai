@@ -9918,8 +9918,11 @@ impl CayenneTableProvider {
             });
         }
 
-        let path = url.path().trim_start_matches('/');
-        Ok(ObjectStorePath::from(path))
+        crate::dataset_storage::object_key_of_url(&url).map_err(|source| Error::ObjectStore {
+            operation: "resolve the object path of a data URL",
+            table: self.table_metadata.table_name.clone(),
+            source: source.into(),
+        })
     }
 
     /// Releases everything the Vortex caches still hold for files this table has
@@ -10157,13 +10160,13 @@ impl CayenneTableProvider {
                 source,
             })?;
 
-        let mut base_prefix = base_url.path().trim_start_matches('/').to_string();
-        if !base_prefix.ends_with('/') {
-            base_prefix.push('/');
-        }
-
-        let prefix =
-            ObjectStorePath::from(format!("{base_prefix}{}/", self.table_metadata.table_id));
+        let prefix = crate::dataset_storage::object_key_of_url(&base_url)
+            .map_err(|source| Error::ObjectStore {
+                operation: "resolve the object path of a data URL",
+                table: self.table_metadata.table_name.clone(),
+                source: source.into(),
+            })?
+            .join(self.table_metadata.table_id.as_str());
 
         let list_result = config
             .store
