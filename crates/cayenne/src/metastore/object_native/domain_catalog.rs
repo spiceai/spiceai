@@ -1476,3 +1476,44 @@ impl MetadataCatalog for Domain {
             .await
     }
 }
+
+impl Domain {
+    /// Retire `keys` of `table_id` in one commit: objects the orphan sweep
+    /// found that no committed state names. Returns the keys it retired,
+    /// leaving out any that are live or retired already, or `None`, committing
+    /// nothing, while the log is stopped or a transaction reserves the table.
+    ///
+    /// The record goes through this log's fenced publication, so an instance
+    /// another has taken writing over from is refused, retires nothing, and
+    /// the retirement sweep never deletes on its behalf: an object judged
+    /// unnamed from a view that predates the takeover is never deleted on
+    /// that judgment alone.
+    pub(super) async fn retire_orphans(
+        &self,
+        table_id: &str,
+        keys: &[String],
+    ) -> CatalogResult<Option<Vec<String>>> {
+        let mut inner = self.inner.take().await;
+        if inner.stop.is_some() || inner.reserved(table_id) {
+            return Ok(None);
+        }
+        let table = inner.table(table_id)?;
+        // A key a change since the sweep's read makes live is kept: the
+        // `RetireFiles` guard would refuse it, and a refused record stops the log.
+        let live = table.live_keys();
+        let mut keys: Vec<String> = keys
+            .iter()
+            .filter(|key| !live.contains(*key) && !table.retired.contains(*key))
+            .cloned()
+            .collect();
+        keys.sort();
+        keys.dedup();
+        if keys.is_empty() {
+            return Ok(Some(keys));
+        }
+        inner
+            .commit(vec![actions::retire_files(table_id, &keys)])
+            .await?;
+        Ok(Some(keys))
+    }
+}

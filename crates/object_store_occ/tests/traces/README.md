@@ -226,10 +226,11 @@ whose PUT has not returned, and a reader that lists the prefix.
 ## Data-file retirement traces
 
 `data-files-retire.jsonl` holds the witnesses of `data-files-retire` (17),
-`data-files-retire-3` (17), `data-files-retire-remote` (14) and
-`data-files-retire-prepared` (18), `data-files-retire-walk.jsonl` 20 walks of
-each (seed 42, 40 steps), and `data-files-retire-controls.jsonl` the
-counterexample of each of eight controls for the property it must fail. They
+`data-files-retire-3` (17), `data-files-retire-remote` (14),
+`data-files-retire-prepared` (18) and `data-files-retire-lean-orphan-commits`
+(14), `data-files-retire-walk.jsonl` 20 walks of each (seed 42, 40 steps), and
+`data-files-retire-controls.jsonl` the counterexample of each of nine controls
+for the property it must fail. They
 exist only here. Generated serially from the repository root (`TRACE_JSON`
 appends, so delete the files first; the controls file is then filtered to the
 `FAIL` line of each run's expected property, as `lib.rs` lists it):
@@ -237,7 +238,7 @@ appends, so delete the files first; the controls file is then filtered to the
     cargo build --release -p cayenne-metastore-model
     B=target/release/cayenne-metastore-model; T=crates/object_store_occ/tests/traces
     for r in data-files-retire data-files-retire-3 data-files-retire-remote \
-      data-files-retire-prepared; do
+      data-files-retire-prepared data-files-retire-lean-orphan-commits; do
       TRACE_JSON=$T/data-files-retire.jsonl $B run $r
       WALK=42:20:40 TRACE_JSON=$T/data-files-retire-walk.jsonl $B run $r
     done
@@ -245,7 +246,8 @@ appends, so delete the files first; the controls file is then filtered to the
       data-files-retire-local-ignores-retention data-files-retire-remote-ignores-retention \
       data-files-retire-forget-early data-files-retire-ignores-restore-hold \
       data-files-retire-sweep-uncommitted \
-      data-files-retire-prepared-orphan-ignores-reservation; do
+      data-files-retire-prepared-orphan-ignores-reservation \
+      data-files-retire-orphan-deletes-directly; do
       EXHAUST=1 TRACE_JSON=$T/data-files-retire-controls.jsonl $B run $r
     done
 
@@ -255,7 +257,7 @@ place (`CompactCarry` needs two live files and an upload).
 `../data_file_replay.rs` replays them through the real head log, whose records
 here are this test's own per-file encoding (`AddFiles`, `RemoveFiles`,
 `ReplaceFiles` with carried files, a prepared `ReplaceFiles`, its resolve,
-`ForgetRetired{files}`), folded after every action into the live set and the
+`RetireFiles{files}` for the orphan sweep, `ForgetRetired{files}`), folded after every action into the live set and the
 retired set (each file with the model version of the record that removed it),
 and through data PUTs, GETs and `delete_stream` deletes on the fault store (a
 failed delete is a `Fail` fault on its path). The sweep's rules are checked

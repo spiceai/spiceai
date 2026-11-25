@@ -13,7 +13,7 @@
 //! | `Create`/`Cas`/`Put` | error, not applied | applied, error | captured until `deliver`/`respond` |
 //! | `MultipartComplete` | error, object absent, upload still open | applied (object present), error | captured until `deliver`/`respond` |
 //! | `MultipartBegin`/`Part`/`Abort` | error, not applied | applied, error | as `Fail` |
-//! | `Delete` (per path) | error for that path, object kept | deleted, error for that path | as `Fail` |
+//! | `Delete` (per path) | error for that path, object kept | deleted, error for that path | captured until `deliver`/`respond`; later paths of the stream wait behind it |
 //! | `Copy`/`Rename` | error, not applied | applied, error | as `Fail` |
 //! | `Get`/`GetConditional`/`Head`/`List` | error, not sent | as `Fail` | as `Fail` |
 //!
@@ -70,6 +70,8 @@ enum Request {
         options: PutOptions,
     },
     Complete(SharedUpload),
+    /// One path of a delete stream.
+    Delete,
 }
 
 struct Held {
@@ -222,6 +224,22 @@ fn refused(op: Op) -> object_store::Error {
 
 fn lost() -> object_store::Error {
     injected("response lost after I/O")
+}
+
+/// Delete `path` from `inner` and log it.
+async fn delete_one(
+    inner: &Arc<dyn ObjectStore>,
+    shared: &Shared,
+    path: &Path,
+) -> object_store::Result<Path> {
+    let _guard = shared.applied.lock().await;
+    let answer = inner
+        .delete_stream(futures::stream::iter([Ok(path.clone())]).boxed())
+        .next()
+        .await
+        .unwrap_or_else(|| Err(injected("delete returned no result")));
+    shared.record(path, Op::Delete, "delete", None, &answer);
+    answer
 }
 
 /// Whether `fault` stops a request that cannot be held before it reaches storage.
@@ -402,7 +420,8 @@ impl FaultStore {
 
     /// Apply the exact original request, even if already delivered: the same
     /// bytes and condition for a put, another `complete` for a multipart
-    /// completion (the inner store decides what a repeated completion does).
+    /// completion (the inner store decides what a repeated completion does),
+    /// the delete of its path for a delete.
     /// # Errors
     /// Unknown id or underlying storage failure.
     pub async fn deliver(&self, id: u64) -> object_store::Result<PutResult> {
@@ -420,6 +439,14 @@ impl FaultStore {
         let result = match request {
             Request::Put { payload, options } => self.put_inner(&path, payload, options).await,
             Request::Complete(upload) => self.shared.complete(&path, &upload).await,
+            Request::Delete => {
+                delete_one(&self.inner, &self.shared, &path)
+                    .await
+                    .map(|_| PutResult {
+                        e_tag: None,
+                        version: None,
+                    })
+            }
         };
         if let Some(held) = self.shared.state.lock().held.get_mut(&id)
             && held.first.is_none()
@@ -621,16 +648,15 @@ impl ObjectStore for FaultStore {
                 async move {
                     let path = path?;
                     let fault = shared.fault(Op::Delete, &path);
+                    if fault == Some(Fault::Hold) {
+                        // In flight until delivered, and answered only when
+                        // its response is released.
+                        return shared.hold(&path, Request::Delete).await.map(|_| path);
+                    }
                     if stops(fault) {
                         return Err(refused(Op::Delete));
                     }
-                    let _guard = shared.applied.lock().await;
-                    let answer = inner
-                        .delete_stream(futures::stream::iter([Ok(path.clone())]).boxed())
-                        .next()
-                        .await
-                        .unwrap_or_else(|| Err(injected("delete returned no result")));
-                    shared.record(&path, Op::Delete, "delete", None, &answer);
+                    let answer = delete_one(&inner, &shared, &path).await;
                     if answer.is_ok() && fault == Some(Fault::DropResponse) {
                         return Err(lost());
                     }

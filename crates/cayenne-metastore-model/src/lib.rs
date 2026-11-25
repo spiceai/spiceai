@@ -2502,6 +2502,23 @@ fn additional_runs() -> Vec<Run> {
             2,
             "committed files exist",
         ),
+        // The lease holder's orphan sweep modelled in full: a `RetireFiles`
+        // commit, then the retirement sweep's timer, delete and forget.
+        (
+            "data-files-retire-lean-orphan-commits",
+            "data-files-intent-retire-lean-orphan-commits",
+            2,
+            "",
+        ),
+        // A writer another instance's takeover fenced, unaware of it, deletes
+        // what its own stale view does not name instead of retiring it by a
+        // commit the lease generation would refuse.
+        (
+            "data-files-retire-orphan-deletes-directly",
+            "data-files-intent-retire-orphan-deletes-directly",
+            2,
+            "committed files exist",
+        ),
         (
             "data-files-retire-prepared",
             "data-files-intent-retire-prepared",

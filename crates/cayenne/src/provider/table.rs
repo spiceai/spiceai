@@ -3696,6 +3696,11 @@ pub struct CayenneTableProvider {
     /// In memory: a restart or a takeover observes every file again, which only
     /// delays its deletion.
     retired_file_timers: Arc<ParkingMutex<HashMap<String, Instant>>>,
+    /// Retired file key → size, for the objects this process's orphan sweep
+    /// retired, so the retirement sweep counts their deletion under the orphan
+    /// sweep's operation. In memory: after a restart they count under the
+    /// retirement sweep's.
+    retired_orphan_sizes: Arc<ParkingMutex<HashMap<String, u64>>>,
     /// Bumped by every retirement into `retired_snapshot_dirs`, so the follow-up
     /// sweep knows to keep going for directories retired while it runs.
     retired_snapshot_generation: Arc<AtomicU64>,
@@ -4151,6 +4156,7 @@ pub struct SnapshotDirPins {
     last_listed: Arc<ParkingMutex<HashMap<String, Instant>>>,
     retired: Arc<ParkingMutex<HashMap<String, Instant>>>,
     retired_files: Arc<ParkingMutex<HashMap<String, Instant>>>,
+    retired_orphans: Arc<ParkingMutex<HashMap<String, u64>>>,
 }
 
 impl SnapshotDirPins {
@@ -4161,6 +4167,7 @@ impl SnapshotDirPins {
             && Arc::ptr_eq(&self.last_listed, &other.last_listed)
             && Arc::ptr_eq(&self.retired, &other.retired)
             && Arc::ptr_eq(&self.retired_files, &other.retired_files)
+            && Arc::ptr_eq(&self.retired_orphans, &other.retired_orphans)
     }
 }
 
@@ -8735,6 +8742,7 @@ impl CayenneTableProvider {
             last_listed: Arc::clone(&self.snapshot_last_listed),
             retired: Arc::clone(&self.retired_snapshot_dirs),
             retired_files: Arc::clone(&self.retired_file_timers),
+            retired_orphans: Arc::clone(&self.retired_orphan_sizes),
         }
     }
 
@@ -10447,22 +10455,39 @@ impl CayenneTableProvider {
             })
             .collect();
         let mut reclaimed = RetiredDirReclaim::default();
+        // Objects the orphan sweep retired count under its own operation.
+        let mut orphans_reclaimed = RetiredDirReclaim::default();
         let mut failed = 0_u64;
         for batch in due.chunks(crate::dataset_storage::DELETE_BATCH) {
-            let objects: Vec<(ObjectStorePath, u64)> = batch
-                .iter()
-                .map(|key| {
-                    (
-                        Self::retired_file_location(&table_root, key),
-                        sizes.get(key).copied().unwrap_or(0),
-                    )
-                })
-                .collect();
-            let (deleted, outcome) = self
-                .delete_sized_counted(&store, objects, "delete a retired file")
-                .await;
-            reclaimed.files = reclaimed.files.saturating_add(deleted.files);
-            reclaimed.bytes = reclaimed.bytes.saturating_add(deleted.bytes);
+            let mut orphans: Vec<(ObjectStorePath, u64)> = Vec::new();
+            let mut retired: Vec<(ObjectStorePath, u64)> = Vec::new();
+            {
+                let orphan_sizes = self.retired_orphan_sizes.lock();
+                for key in batch {
+                    let location = Self::retired_file_location(&table_root, key);
+                    match orphan_sizes.get(key.as_str()) {
+                        Some(size) => orphans.push((location, *size)),
+                        None => retired.push((location, sizes.get(key).copied().unwrap_or(0))),
+                    }
+                }
+            }
+            let mut outcome = Ok(());
+            if !orphans.is_empty() {
+                let (deleted, result) = self
+                    .delete_sized_counted(&store, orphans, "delete a retired file")
+                    .await;
+                orphans_reclaimed.files = orphans_reclaimed.files.saturating_add(deleted.files);
+                orphans_reclaimed.bytes = orphans_reclaimed.bytes.saturating_add(deleted.bytes);
+                outcome = result;
+            }
+            if !retired.is_empty() {
+                let (deleted, result) = self
+                    .delete_sized_counted(&store, retired, "delete a retired file")
+                    .await;
+                reclaimed.files = reclaimed.files.saturating_add(deleted.files);
+                reclaimed.bytes = reclaimed.bytes.saturating_add(deleted.bytes);
+                outcome = outcome.and(result);
+            }
             if let Err(error) = outcome {
                 failed = failed.saturating_add(1);
                 tracing::warn!(
@@ -10478,6 +10503,11 @@ impl CayenneTableProvider {
                     let mut timers = self.retired_file_timers.lock();
                     for key in batch {
                         timers.remove(key);
+                    }
+                    drop(timers);
+                    let mut orphans = self.retired_orphan_sizes.lock();
+                    for key in batch {
+                        orphans.remove(key);
                     }
                 }
                 // A transaction reserves the table: the files are gone, and a
@@ -10497,7 +10527,11 @@ impl CayenneTableProvider {
         maintenance_metrics::track_maintenance(
             table_name,
             MaintenanceOp::RetiredDirSweep,
-            retired_dir_sweep_outcome(reclaimed.files, 0, failed),
+            retired_dir_sweep_outcome(
+                reclaimed.files.saturating_add(orphans_reclaimed.files),
+                0,
+                failed,
+            ),
         );
         if reclaimed.files > 0 {
             maintenance_metrics::track_reclaimed(
@@ -10505,6 +10539,15 @@ impl CayenneTableProvider {
                 MaintenanceOp::RetiredDirSweep,
                 reclaimed.files,
                 reclaimed.bytes,
+                0,
+            );
+        }
+        if orphans_reclaimed.files > 0 {
+            maintenance_metrics::track_reclaimed(
+                table_name,
+                MaintenanceOp::OrphanFileSweep,
+                orphans_reclaimed.files,
+                orphans_reclaimed.bytes,
                 0,
             );
         }
@@ -12598,6 +12641,7 @@ impl CayenneTableProvider {
             append_admission: Arc::new(tokio::sync::RwLock::new(())),
             retired_snapshot_dirs: snapshot_dir_pins.retired,
             retired_file_timers: snapshot_dir_pins.retired_files,
+            retired_orphan_sizes: snapshot_dir_pins.retired_orphans,
             snapshot_last_listed: snapshot_dir_pins.last_listed,
             snapshot_scan_refs: snapshot_dir_pins.scan_refs,
             position_compaction_skip_streak: Arc::new(ParkingMutex::new(
@@ -15101,6 +15145,7 @@ impl CayenneTableProvider {
             append_admission: Arc::clone(&self.append_admission),
             retired_snapshot_dirs: Arc::clone(&self.retired_snapshot_dirs),
             retired_file_timers: Arc::clone(&self.retired_file_timers),
+            retired_orphan_sizes: Arc::clone(&self.retired_orphan_sizes),
             snapshot_last_listed: Arc::clone(&self.snapshot_last_listed),
             snapshot_scan_refs: Arc::clone(&self.snapshot_scan_refs),
             position_compaction_skip_streak: Arc::clone(&self.position_compaction_skip_streak),
@@ -25174,8 +25219,9 @@ impl CayenneTableProvider {
         let result = self.sweep_orphan_files(floor).await;
         let outcome = match &result {
             Ok(report) if report.skipped.is_some() => None,
-            Ok(report) if report.failed > 0 => Some(MaintenanceOutcome::Failed),
-            Ok(report) if !report.deleted.is_empty() => Some(MaintenanceOutcome::Reclaimed),
+            // Retiring returns no space itself: the retirement sweep deletes the
+            // objects later and counts them under this operation.
+            Ok(report) if !report.retired.is_empty() => Some(MaintenanceOutcome::Applied),
             Ok(_) => Some(MaintenanceOutcome::NoOp),
             Err(_) => Some(MaintenanceOutcome::Failed),
         };
@@ -25190,9 +25236,9 @@ impl CayenneTableProvider {
     }
 
     /// Run the orphan sweep ([`super::orphan_sweep`]) with the age floor
-    /// `floor`: delete what a listing of the table finds that no snapshot names,
-    /// no write of this process holds, and the store dates older than the floor,
-    /// in batched requests.
+    /// `floor`: retire, in one commit, what a listing of the table finds that no
+    /// snapshot names, no write of this process holds, and the store dates older
+    /// than the floor; the retirement sweep deletes it after the retention.
     /// Nothing listed is ever adopted. The caller holds `orphan_sweep_running`.
     ///
     /// # Errors
@@ -25353,59 +25399,62 @@ impl CayenneTableProvider {
                     report.kept_young += 1;
                     continue;
                 }
-                doomed.push((meta.location.clone(), meta.size));
+                // The key the retirement record names it by: a deletion
+                // vector's is relative to the data path, beside the table's
+                // directory; every other object's is relative to the table's.
+                let retired_key = if matches!(placement(key), Placement::Deletion { .. }) {
+                    format!("{table_id}/{key}")
+                } else {
+                    key.to_string()
+                };
+                doomed.push((retired_key, meta.size));
             }
             doomed
         };
-        let sizes: HashMap<ObjectStorePath, u64> = doomed.iter().cloned().collect();
-        let outcome = crate::dataset_storage::delete_in_batches(
-            &store,
-            doomed.into_iter().map(|(location, _)| location).collect(),
-        )
-        .await;
-        report.failed = outcome.failed;
-        if outcome.failed > 0 {
+        if doomed.is_empty() {
+            return Ok(report);
+        }
+        // Retire them in one commit instead of deleting them: the retirement
+        // sweep deletes them after the retention, as it does every retired
+        // file. The commit goes through the table's fenced log, so an instance
+        // that another has taken writing over from, and whose view of the
+        // table is therefore stale, retires nothing and deletes nothing.
+        let keys: Vec<String> = doomed.iter().map(|(key, _)| key.clone()).collect();
+        let Some(retired) = native
+            .retire_orphans(&table_id, &keys)
+            .await
+            .map_err(|source| Error::Catalog { source })?
+        else {
+            report.skipped = Some("the table's retired snapshots are not settled");
+            return Ok(report);
+        };
+        if !retired.is_empty() {
+            let sizes: HashMap<&str, u64> = doomed
+                .iter()
+                .map(|(key, size)| (key.as_str(), *size))
+                .collect();
+            let mut orphans = self.retired_orphan_sizes.lock();
+            for key in &retired {
+                orphans.insert(key.clone(), sizes.get(key.as_str()).copied().unwrap_or(0));
+            }
+            drop(orphans);
+            // Their retention starts with the commit that retired them, and the
+            // retirement sweep runs once it has passed, even if the table is
+            // never written again.
+            let now = Instant::now();
+            let mut timers = self.retired_file_timers.lock();
+            for key in &retired {
+                timers.entry(key.clone()).or_insert(now);
+            }
+            drop(timers);
+            self.follow_up_retired_snapshot_dirs(crate::metastore_layout::DATA_FILE_RETENTION);
             tracing::debug!(
                 table = self.table_name(),
-                failed = outcome.failed,
-                error = ?outcome.first_error,
-                "The orphan sweep could not delete some unreferenced objects; the next sweep retries them"
+                retired = retired.len(),
+                "The orphan sweep retired objects no snapshot of the table names; the retirement sweep deletes them after the retention"
             );
         }
-        let reclaimed_bytes = outcome
-            .deleted
-            .iter()
-            .map(|location| sizes.get(location).copied().unwrap_or(0))
-            .fold(0_u64, u64::saturating_add);
-        if !outcome.deleted.is_empty() {
-            maintenance_metrics::track_reclaimed(
-                self.table_name(),
-                MaintenanceOp::OrphanFileSweep,
-                u64::try_from(outcome.deleted.len()).unwrap_or(u64::MAX),
-                reclaimed_bytes,
-                0,
-            );
-        }
-        // An object already gone is reported deleted, and reclaims nothing.
-        report.deleted = outcome
-            .deleted
-            .iter()
-            .chain(&outcome.missing)
-            .map(|location| {
-                crate::object_relative(&table_prefix, location)
-                    .unwrap_or(location.as_ref())
-                    .to_string()
-            })
-            .collect();
-        report.deleted.sort();
-
-        if !report.deleted.is_empty() {
-            tracing::debug!(
-                table = self.table_name(),
-                deleted = report.deleted.len(),
-                "The orphan sweep reclaimed objects no snapshot of the table names"
-            );
-        }
+        report.retired = retired;
         Ok(report)
     }
 

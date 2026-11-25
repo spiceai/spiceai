@@ -826,6 +826,22 @@ impl ObjectNativeCatalog {
             .iter()
             .any(|(_, footprint)| footprint.iter().any(|table| table == table_id))
     }
+    /// Retire `keys` of `table_id`, objects the orphan sweep found that no
+    /// committed state names, in one commit; the retirement sweep deletes them
+    /// after the retention. Returns the keys retired, or `None` while the log
+    /// is stopped or a transaction reserves the table.
+    /// # Errors
+    /// Returns an error when the commit is not accepted, as when another
+    /// instance has taken writing the table over.
+    pub async fn retire_orphans(
+        &self,
+        table_id: &str,
+        keys: &[String],
+    ) -> CatalogResult<Option<Vec<String>>> {
+        self.for_table(table_id)
+            .retire_orphans(table_id, keys)
+            .await
+    }
     /// The time the store stamped on the head of the log that holds `table_id`
     /// when it was last written: the store's clock as of the table's latest
     /// commit or takeover, which the orphan sweep measures object ages against.

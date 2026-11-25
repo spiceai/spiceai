@@ -31,7 +31,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use object_store_sim::Op;
 use object_store_sim::fault::FaultStore;
 
@@ -556,4 +556,307 @@ async fn a_writer_whose_lease_requests_recover_writes_again() {
         }
     }
     assert_eq!(a.count_and_sum().await, expected(1..=200));
+}
+
+/// The same takeover, but A's own clock stood still while B wrote for two
+/// hours of store time, as a suspended VM's or a sleeping laptop's monotonic
+/// clock does: on A's clock its lease has not lapsed, so its write gate is
+/// still open. A's orphan sweep, which judges unnamed from A's view of the
+/// table, predates every commit of B; that judgment alone must delete nothing.
+/// The sweep retires through A's fenced log, which refuses it, and A's
+/// retirement sweep deletes only what a commit retired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_whose_clock_stood_still_deletes_nothing_its_successor_commits() {
+    let clock = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let objects: Arc<dyn ObjectStore> = Arc::clone(&clock) as Arc<dyn ObjectStore>;
+    let a = Instance::start(&objects, "a", LEASE).await;
+    let a_table = Arc::new(
+        a.builder(&a.data_url)
+            .create(CreateTableOptions {
+                table_name: TABLE.to_string(),
+                schema: schema(),
+                primary_key: Vec::new(),
+                on_conflict: None,
+                base_path: a.data_url.clone(),
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    inline_max_rows: 0,
+                    inline_max_bytes: 0,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("create the table"),
+    );
+    a.ctx
+        .register_table(
+            TABLE,
+            Arc::clone(&a_table) as Arc<dyn datafusion::datasource::TableProvider>,
+        )
+        .expect("register");
+    let data_url = a.data_url.clone();
+    a.insert(1, 100).await.expect("A writes");
+    let table_id = a.catalog.get_table(TABLE).await.expect("table").table_id;
+
+    let b = Instance::start(&objects, "b", LEASE).await;
+    b.open_table(&data_url).await;
+    let is_lease = |path: &Path| path.as_ref().contains("/leases/");
+    for op in [Op::Get, Op::GetConditional, Op::Head, Op::Put] {
+        a.requests.fail_while(op, is_lease);
+    }
+    b.insert_once_writer(&data_url, 101, 200).await;
+    clock.advance_clock(Duration::from_hours(2));
+    b.insert(201, 300).await.expect("B writes again");
+    assert_eq!(b.count_and_sum().await, expected(1..=300), "B took over");
+
+    // A resumes: on its own clock its lease's deadline is still ahead.
+    let gate = a.catalog.data_write_gate(&table_id);
+    gate.hold_until(Instant::now() + Duration::from_hours(3));
+    assert!(gate.allows(), "A's write gate is open, as its clock says");
+
+    let swept = a_table
+        .sweep_orphan_files_now()
+        .await
+        .expect_err("A's orphan sweep is refused after the takeover");
+    assert!(
+        swept
+            .to_string()
+            .contains("is now written by another instance"),
+        "{swept}"
+    );
+    a_table.reclaim_retired_snapshots_now().await;
+
+    let mut missing = Vec::new();
+    for request in b.requests.log() {
+        if request.op == Op::MultipartComplete
+            && request.path.as_ref().ends_with(".vortex")
+            && objects.head(&request.path).await.is_err()
+        {
+            missing.push(request.path.to_string());
+        }
+    }
+    assert_eq!(
+        missing,
+        Vec::<String>::new(),
+        "B's committed data files are all still stored"
+    );
+    // A third instance, with nothing cached, reads every row B committed.
+    let c = Instance::start(&objects, "c", LEASE).await;
+    c.open_table(&data_url).await;
+    let rows = c
+        .ctx
+        .sql(&format!(
+            "SELECT count(*), coalesce(sum(v), 0) FROM (SELECT id, v FROM {TABLE} WHERE v >= 0)"
+        ))
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("a fresh instance reads every committed file");
+    let value = |column: usize| {
+        rows[0]
+            .column(column)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64")
+            .value(0)
+    };
+    assert_eq!((value(0), value(1)), expected(1..=300));
+}
+
+/// A writer is taken over in the middle of a sweep, with its deletes still in
+/// flight: A retired orphans while it held the lease, and its retirement sweep
+/// has sent their deletes, which the network holds. A's lease requests then
+/// fail, B takes over and commits for two hours of store time, and only then
+/// do A's held deletes land. They remove only what A's committed record
+/// retired; A's forget record is refused, so A learns it was fenced and a
+/// later orphan sweep of A's retires nothing; and every file A or B committed
+/// is still stored, so a fresh instance reads every row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_taken_over_mid_sweep_with_deletes_in_flight_deletes_nothing_its_successor_commits()
+ {
+    let clock = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let objects: Arc<dyn ObjectStore> = Arc::clone(&clock) as Arc<dyn ObjectStore>;
+    let a = Instance::start(&objects, "a", LEASE).await;
+    let a_table = Arc::new(
+        a.builder(&a.data_url)
+            .create(CreateTableOptions {
+                table_name: TABLE.to_string(),
+                schema: schema(),
+                primary_key: Vec::new(),
+                on_conflict: None,
+                base_path: a.data_url.clone(),
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    inline_max_rows: 0,
+                    inline_max_bytes: 0,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("create the table"),
+    );
+    a.ctx
+        .register_table(
+            TABLE,
+            Arc::clone(&a_table) as Arc<dyn datafusion::datasource::TableProvider>,
+        )
+        .expect("register");
+    let data_url = a.data_url.clone();
+    a.insert(1, 100).await.expect("A writes");
+    let table_id = a.catalog.get_table(TABLE).await.expect("table").table_id;
+
+    // Objects no commit names beside A's data file, as a crashed write leaves
+    // them, then two hours of store time and a commit that dates the head.
+    let table_dir = a
+        .requests
+        .log()
+        .into_iter()
+        .find(|request| {
+            request.op == Op::MultipartComplete && request.path.as_ref().ends_with(".vortex")
+        })
+        .and_then(|request| {
+            request
+                .path
+                .as_ref()
+                .rsplit_once('/')
+                .map(|(dir, _)| dir.to_string())
+        })
+        .expect("A's data file");
+    let orphans: Vec<Path> = (0..3)
+        .map(|i| {
+            Path::from(format!(
+                "{table_dir}/{}_{i:05}.vortex",
+                uuid::Uuid::now_v7().simple()
+            ))
+        })
+        .collect();
+    for orphan in &orphans {
+        objects
+            .put(orphan, PutPayload::from_static(b"orphan"))
+            .await
+            .expect("plant an orphan");
+    }
+    clock.advance_clock(Duration::from_hours(2));
+    a.insert(101, 200).await.expect("A writes again");
+    let retired = a_table
+        .sweep_orphan_files_now()
+        .await
+        .expect("A's orphan sweep");
+    assert_eq!(
+        retired.retired.len(),
+        orphans.len(),
+        "A retired the orphans: {retired:?}"
+    );
+
+    // A's retirement sweep sends their deletes; the first is held in flight,
+    // and the rest of its batch waits behind it.
+    let is_orphan = {
+        let orphans = orphans.clone();
+        move |path: &Path| orphans.contains(path)
+    };
+    a.requests
+        .arm(Op::Delete, is_orphan, object_store_sim::fault::Fault::Hold);
+    let sweeping = {
+        let a_table = Arc::clone(&a_table);
+        tokio::spawn(async move { a_table.reclaim_retired_snapshots_now().await })
+    };
+    let held = tokio::time::timeout(Duration::from_secs(15), a.requests.wait_held(None))
+        .await
+        .expect("A's delete is held in flight");
+    assert!(
+        orphans.iter().all(|orphan| clock
+            .log()
+            .iter()
+            .all(|r| r.path != *orphan || r.op != Op::Delete)),
+        "no delete has landed yet"
+    );
+
+    // B takes over and writes for two hours of store time.
+    let b = Instance::start(&objects, "b", LEASE).await;
+    b.open_table(&data_url).await;
+    let is_lease = |path: &Path| path.as_ref().contains("/leases/");
+    for op in [Op::Get, Op::GetConditional, Op::Head, Op::Put] {
+        a.requests.fail_while(op, is_lease);
+    }
+    b.insert_once_writer(&data_url, 201, 300).await;
+    clock.advance_clock(Duration::from_hours(2));
+    b.insert(301, 400).await.expect("B writes again");
+    assert_eq!(b.count_and_sum().await, expected(1..=400), "B took over");
+
+    // A's deletes in flight land now.
+    a.requests
+        .deliver(held)
+        .await
+        .expect("the held delete lands");
+    a.requests.respond(held).expect("A hears it");
+    tokio::time::timeout(Duration::from_secs(15), sweeping)
+        .await
+        .expect("A's retirement sweep finishes")
+        .expect("join");
+
+    // The sweep's `ForgetRetired` record, sent once its deletes returned, is
+    // refused: A learns it was fenced, even with its lease's deadline ahead on
+    // its own clock, and a later orphan sweep of A's retires nothing.
+    let gate = a.catalog.data_write_gate(&table_id);
+    gate.hold_until(Instant::now() + Duration::from_hours(3));
+    assert!(!gate.allows(), "A learned it no longer writes the dataset");
+    let late = a_table.sweep_orphan_files_now().await;
+    assert!(
+        late.as_ref().map_or(true, |sweep| sweep.retired.is_empty()),
+        "A's late orphan sweep retires nothing: {late:?}"
+    );
+    let landed: Vec<String> = clock
+        .log()
+        .into_iter()
+        .filter(|request| request.op == Op::Delete && request.result.is_ok())
+        .map(|request| request.path.to_string())
+        .collect();
+    let mut deleted_orphans: Vec<&Path> = orphans
+        .iter()
+        .filter(|orphan| landed.iter().any(|path| path == orphan.as_ref()))
+        .collect();
+    deleted_orphans.sort();
+    let mut expected_orphans: Vec<&Path> = orphans.iter().collect();
+    expected_orphans.sort();
+    assert_eq!(
+        deleted_orphans, expected_orphans,
+        "A's in-flight deletes landed after the takeover, on the orphans A retired"
+    );
+
+    let mut missing = Vec::new();
+    for request in a.requests.log().into_iter().chain(b.requests.log()) {
+        if request.op == Op::MultipartComplete
+            && request.path.as_ref().ends_with(".vortex")
+            && objects.head(&request.path).await.is_err()
+        {
+            missing.push(request.path.to_string());
+        }
+    }
+    assert_eq!(
+        missing,
+        Vec::<String>::new(),
+        "every data file A and B committed is still stored"
+    );
+    let c = Instance::start(&objects, "c", LEASE).await;
+    c.open_table(&data_url).await;
+    let rows = c
+        .ctx
+        .sql(&format!(
+            "SELECT count(*), coalesce(sum(v), 0) FROM (SELECT id, v FROM {TABLE} WHERE v >= 0)"
+        ))
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("a fresh instance reads every committed file");
+    let value = |column: usize| {
+        rows[0]
+            .column(column)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64")
+            .value(0)
+    };
+    assert_eq!((value(0), value(1)), expected(1..=400));
 }
