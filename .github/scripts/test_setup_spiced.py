@@ -329,11 +329,14 @@ class SetupSpicedTest(StoreTest):
                 self.assertIn("is not a plain ref", proc.stdout)
                 self.assertEqual(located, {})
 
-    def test_a_spiced_commit_with_a_newline_is_refused(self):
-        proc, located = self.locate(RELEASE, spiced_commit=f"{self.release}\nprefix=")
-        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        self.assertIn("must not contain a newline", proc.stdout)
-        self.assertEqual(located, {})
+    def test_a_spiced_commit_that_is_not_a_full_hash_is_refused(self):
+        for commit in (f"{self.release}\nprefix=", self.release[:12], f"{self.release[:39]}$(id)",
+                       "../../../../trunk", self.release.upper()):
+            with self.subTest(commit=commit):
+                proc, located = self.locate(RELEASE, spiced_commit=commit)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("must be a full 40-character commit hash", proc.stdout)
+                self.assertEqual(located, {})
 
     def test_every_read_uses_the_located_prefix(self):
         for step in (FIND, "Find the latest built spiced commit (Windows)", DOWNLOAD,

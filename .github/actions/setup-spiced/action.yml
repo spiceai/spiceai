@@ -96,8 +96,10 @@ runs:
           # GIT_NO_LAZY_FETCH keeps a commit trunk lacks missing, so: not on trunk.
           GIT_NO_LAZY_FETCH=1 git --git-dir "$git_dir" merge-base --is-ancestor "$1" refs/remotes/origin/trunk 2>/dev/null
         }
-        if [[ "$INPUT_SPICED_COMMIT" == *$'\n'* || "$INPUT_SPICED_COMMIT" == *$'\r'* ]]; then
-          echo "::error::setup-spiced: spiced_commit must not contain a newline"
+        # Builds are stored under the full commit hash that built them. The commit is also part of
+        # a store key and of a later step's script, so anything else is refused before either.
+        if [ -n "$INPUT_SPICED_COMMIT" ] && ! [[ "$INPUT_SPICED_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::error::setup-spiced: spiced_commit must be a full 40-character commit hash."
           exit 1
         fi
         # A bare branch name is that branch (`trunk`, `release/2.4`). A ref becomes part of a store
@@ -115,7 +117,7 @@ runs:
         fi
         if [ -z "$INPUT_SPICED_COMMIT" ]; then
           source_ref="$REF"
-        elif [[ "$INPUT_SPICED_COMMIT" =~ ^[0-9a-f]{40}$ ]] && on_trunk "$INPUT_SPICED_COMMIT"; then
+        elif on_trunk "$INPUT_SPICED_COMMIT"; then
           source_ref=refs/heads/trunk
         elif [ "$REF" != refs/heads/trunk ]; then
           source_ref="$REF"
