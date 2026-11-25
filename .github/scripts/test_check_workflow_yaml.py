@@ -1457,10 +1457,25 @@ runs:
             (root / "tools" / "x" / "Dockerfile").write_text("FROM ubuntu\nRUN curl -fsSLo /tmp/x https://x\n")
             (root / "target" / "debug").mkdir(parents=True)
             (root / "target" / "debug" / "Dockerfile").write_text("RUN curl https://x | sh\n")
+            (root / ".git" / "x").mkdir(parents=True)
+            (root / ".git" / "x" / "Dockerfile").write_text("RUN curl https://x | sh\n")
+            # Hidden directories and Containerfiles are checked too.
+            (root / ".devcontainer").mkdir()
+            (root / ".devcontainer" / "Dockerfile").write_text("FROM ubuntu\nRUN curl -fsSL https://x | bash\n")
+            (root / "Containerfile").write_text("FROM ubuntu\nRUN curl -fsSL https://x | sh\n")
+            (root / "tools" / "x" / "build.containerfile").write_text("FROM ubuntu\nRUN wget -qO- https://x | sh\n")
+            (root / "Dockerfile.dev").write_text("FROM ubuntu\nRUN curl -fsSL https://x | sh -s -- -y\n")
             failures = check_workflow_yaml.check_definitions(github_dir)
             self.assertEqual(
-                [f.split(": runs a download as code")[0] for f in failures],
-                [f"{root / 'Dockerfile-cuda'}:3", f"{root / 'tools' / 'x' / 'release.Dockerfile'}:2"],
+                sorted(f.split(": runs a download as code")[0] for f in failures),
+                sorted([
+                    f"{root / 'Dockerfile-cuda'}:3",
+                    f"{root / 'tools' / 'x' / 'release.Dockerfile'}:2",
+                    f"{root / '.devcontainer' / 'Dockerfile'}:2",
+                    f"{root / 'Containerfile'}:2",
+                    f"{root / 'tools' / 'x' / 'build.containerfile'}:2",
+                    f"{root / 'Dockerfile.dev'}:2",
+                ]),
             )
 
     def test_the_repository_runs_no_download_as_code(self):

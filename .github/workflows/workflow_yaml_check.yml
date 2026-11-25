@@ -47,6 +47,9 @@ on:
       - 'test/duckdb_versions.json'
       - '**/Dockerfile*'
       - '**/*.Dockerfile'
+      - '**/*.dockerfile'
+      - '**/Containerfile*'
+      - '**/*.containerfile'
   push:
     branches:
       - trunk
@@ -86,6 +89,9 @@ on:
       - 'test/duckdb_versions.json'
       - '**/Dockerfile*'
       - '**/*.Dockerfile'
+      - '**/*.dockerfile'
+      - '**/Containerfile*'
+      - '**/*.containerfile'
   workflow_dispatch:
 
 concurrency:

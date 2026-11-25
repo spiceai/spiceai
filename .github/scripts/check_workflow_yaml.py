@@ -48,7 +48,8 @@
 # would grant.
 #
 # And no script under `.github/` (a workflow or composite action `run:`, or a shell or
-# PowerShell file), and no Dockerfile in the repository, runs a download as code: piped into a shell, read through `<(curl …)`, passed to
+# PowerShell file), and no Dockerfile or Containerfile in the repository, runs a download
+# as code: piped into a shell, read through `<(curl …)`, passed to
 # `sh -c "$(curl …)"`, or given to PowerShell's `iex`, nor names the unpinned rustup
 # installers (sh.rustup.rs, win.rustup.rs). A download is kept as a file, checked against
 # a pinned SHA-256, and then run.
@@ -993,31 +994,31 @@ def check_download_execution(jobs: dict) -> list[str]:
 
 
 SCRIPT_SUFFIXES = (".sh", ".bash", ".zsh", ".ksh", ".ps1")
-# Directories a Dockerfile search skips: build output and other tools' trees.
+# Directories a container file search skips: git's own, and build output. Hidden
+# directories such as .devcontainer are searched.
 NOT_SOURCE = frozenset({".git", "target", "node_modules"})
 
 
-def is_dockerfile(name: str) -> bool:
-    return name.startswith("Dockerfile") or name.lower().endswith(".dockerfile")
+def is_container_file(name: str) -> bool:
+    """Dockerfile, Dockerfile.<x>, Dockerfile-<x>, Containerfile[.<x>], <x>.dockerfile or <x>.containerfile."""
+    return name.startswith(("Dockerfile", "Containerfile")) or name.lower().endswith((".dockerfile", ".containerfile"))
 
 
-def repository_dockerfiles(root: Path) -> list[Path]:
-    """Every Dockerfile under `root`, outside build output and hidden directories."""
+def repository_container_files(root: Path) -> list[Path]:
+    """Every Dockerfile and Containerfile under `root`, outside git's directory and build output."""
     found = []
     for directory, subdirectories, files in os.walk(root):
-        subdirectories[:] = [
-            d for d in subdirectories if d not in NOT_SOURCE and (not d.startswith(".") or d == ".github")
-        ]
-        found.extend(Path(directory, name) for name in files if is_dockerfile(name))
+        subdirectories[:] = [d for d in subdirectories if d not in NOT_SOURCE]
+        found.extend(Path(directory, name) for name in files if is_container_file(name))
     return sorted(found)
 
 
 def check_script_downloads(github_dir: Path) -> list[str]:
-    """Report a shell or PowerShell script under the .github directory, or a Dockerfile in the
-    repository, that runs a download as code."""
+    """Report a shell or PowerShell script under the .github directory, or a Dockerfile or
+    Containerfile in the repository, that runs a download as code."""
     problems = []
     scripts = [p for p in github_dir.rglob("*") if p.suffix in SCRIPT_SUFFIXES]
-    for path in sorted(scripts) + repository_dockerfiles(github_dir.resolve().parent):
+    for path in sorted(scripts) + repository_container_files(github_dir.resolve().parent):
         if path.is_file():
             problems.extend(
                 f"{path}:{number}: runs a download as code (`{line}`): {DOWNLOAD_EXECUTION_REMEDY}"

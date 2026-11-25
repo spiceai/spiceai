@@ -11,6 +11,7 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -134,14 +135,75 @@ class InstallCacheTest(unittest.TestCase):
             self.install()
         self.assertEqual(self.downloads, [])
 
-    def test_a_lock_that_is_a_link_is_replaced_not_followed(self):
+    def test_a_lock_file_left_as_a_link_is_never_used(self):
+        # The cache directory itself is the lock, so a link where a lock file once was is
+        # neither followed nor removed, and no run races another to remove it.
         outside = Path(self.tmp.name) / "outside"
         outside.write_text("keep me")
         self.cache.mkdir(parents=True)
         (self.cache / f".{VERSION}.lock").symlink_to(outside)
         self.assert_genuine(self.install())
         self.assertEqual(outside.read_text(), "keep me")
-        self.assertFalse((self.cache / f".{VERSION}.lock").is_symlink())
+        self.assertTrue((self.cache / f".{VERSION}.lock").is_symlink())
+
+    def run_main(self, cache, extra_env=None):
+        """libduckdb.main() in its own process, with the fabricated release and a download
+        that counts itself and takes a moment, as concurrent runs would see it."""
+        archive = Path(self.tmp.name) / "release.tar.gz"
+        archive.write_bytes(ARCHIVE)
+        helper = Path(self.tmp.name) / "run_main.py"
+        helper.write_text(
+            "import os, sys, time\n"
+            "from pathlib import Path\n"
+            "sys.path.insert(0, os.environ['SCRIPTS'])\n"
+            "import libduckdb\n"
+            "libduckdb.VERSIONS_FILE = Path(os.environ['VERSIONS'])\n"
+            "def download(url, version):\n"
+            "    with open(os.environ['COUNTER'], 'a') as f:\n"
+            "        f.write('download\\n')\n"
+            "    time.sleep(0.3)\n"
+            "    return Path(os.environ['ARCHIVE']).read_bytes()\n"
+            "libduckdb.download = download\n"
+            "sys.argv = ['libduckdb.py', '--version', os.environ['VERSION'], '--cache-dir', os.environ['CACHE']]\n"
+            "sys.exit(libduckdb.main())\n"
+        )
+        env = dict(os.environ, SCRIPTS=os.path.dirname(os.path.abspath(libduckdb.__file__)),
+                   VERSIONS=str(libduckdb.VERSIONS_FILE), COUNTER=str(Path(self.tmp.name) / "downloads"),
+                   ARCHIVE=str(archive), VERSION=VERSION, CACHE=str(cache), PYTHONDONTWRITEBYTECODE="1")
+        return subprocess.Popen([sys.executable, "-I", str(helper)], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+
+    def test_concurrent_runs_install_once_and_all_succeed(self):
+        self.cache.mkdir(parents=True)
+        (self.cache / f".{VERSION}.lock").symlink_to(Path(self.tmp.name) / "nowhere")
+        runs = [self.run_main(self.cache) for _ in range(4)]
+        results = [run.communicate(timeout=60) + (run.returncode,) for run in runs]
+        self.assertEqual([code for _, _, code in results], [0, 0, 0, 0], results)
+        self.assertEqual({out.strip() for out, _, _ in results}, {str(self.cache / VERSION)})
+        self.assertEqual((Path(self.tmp.name) / "downloads").read_text().count("download"), 1)
+        self.assert_genuine(self.cache / VERSION)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can read anything")
+    def test_an_unreadable_file_inside_an_install_is_replaced(self):
+        target = self.install()
+        (target / LIBRARY).chmod(0)
+        self.assert_genuine(self.install())
+        self.assertEqual(len(self.downloads), 2)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can write anything")
+    def test_a_file_system_error_while_installing_is_one_error(self):
+        self.cache.mkdir(parents=True)
+        self.cache.chmod(0o500)
+        self.addCleanup(self.cache.chmod, 0o755)
+        with self.assertRaises(libduckdb.Error) as raised:
+            self.install()
+        self.assertIn(f"could not install DuckDB {VERSION}", str(raised.exception))
+        run = self.run_main(self.cache)
+        out, err, code = run.communicate(timeout=60) + (run.wait(),)
+        self.assertEqual(code, 1, err)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(len(err.strip().splitlines()), 1, err)
+        self.assertTrue(err.startswith("error: could not install DuckDB"), err)
 
     def test_a_cache_path_with_a_path_separator_is_refused(self):
         self.cache = Path(self.tmp.name).resolve() / f"evil{os.pathsep}cache"

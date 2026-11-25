@@ -158,29 +158,37 @@ def install(version: str | None, cache_dir: Path) -> Path:
     if installed(target, library, expected):
         return target
 
-    # One run installs a release at a time. Without the lock, a run that found
-    # no install could publish over one another run had just returned, and the
-    # caller of that run would find its manifest gone.
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = cache_dir / f".{version}.lock"
+    # One run installs at a time. Without the lock, a run that found no install
+    # could publish over one another run had just returned, and the caller of that
+    # run would find its manifest gone. The cache directory itself is the lock, so
+    # no file in it is opened for locking: nothing left there, a symbolic link
+    # included, can redirect the lock, and concurrent runs never remove one.
     try:
-        # Never through a symbolic link, which could point anywhere: one left there is removed.
-        if lock_path.is_symlink():
-            lock_path.unlink()
-        fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(cache_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW)
     except OSError as e:
-        raise Error(f"cannot open the lock {lock_path}: {e}") from e
-    with os.fdopen(fd, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        raise Error(f"cannot open the cache directory {cache_dir} to lock it: {e}") from e
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
         if installed(target, library, expected):
             return target
         publish(target, library, expected, version, release)
+    finally:
+        os.close(fd)
     return target
 
 
 def publish(target: Path, library: str, expected: str, version: str, release: str) -> None:
     """Download, check and install the release at `target`. The caller holds
-    the release's lock and found no complete install there."""
+    the cache's lock and found no complete install there. A file system error is
+    reported as an Error, in one line."""
+    try:
+        _publish(target, library, expected, version, release)
+    except OSError as e:
+        raise Error(f"could not install DuckDB {version} into {target}: {e}") from e
+
+
+def _publish(target: Path, library: str, expected: str, version: str, release: str) -> None:
     url = archive_url(version, release)
     archive = download(url, version)
     actual = sha256(archive)
@@ -239,25 +247,23 @@ def installed(target: Path, library: str, expected: str) -> bool:
     if target.is_symlink() or not target.is_dir():
         return False
     # Nothing else either: the directory goes first on ADBC_DRIVER_PATH, where another
-    # driver manifest would be found.
+    # driver manifest would be found. Anything that cannot be read is not a usable
+    # install either, so it is replaced.
     try:
         if sorted(os.listdir(target)) != sorted(path.name for path in files):
             return False
-    except OSError:
-        return False
-    if any(path.is_symlink() or not path.is_file() for path in files):
-        return False
-    archive = (target / ARCHIVE).read_bytes()
-    if sha256(archive) != expected:
-        return False
-    try:
+        if any(path.is_symlink() or not path.is_file() for path in files):
+            return False
+        archive = (target / ARCHIVE).read_bytes()
+        if sha256(archive) != expected:
+            return False
         held = extract(archive, archive_url(target.name, release_platform()[0]), library)
-    except (Error, OSError, ValueError, EOFError, zipfile.BadZipFile, tarfile.TarError):
+        return (
+            sha256((target / library).read_bytes()) == sha256(held)
+            and (target / MANIFEST).read_text() == manifest(target, library)
+        )
+    except (Error, OSError, ValueError, EOFError, UnicodeDecodeError, zipfile.BadZipFile, tarfile.TarError):
         return False
-    return (
-        sha256((target / library).read_bytes()) == sha256(held)
-        and (target / MANIFEST).read_text() == manifest(target, library)
-    )
 
 
 def main() -> int:
@@ -274,8 +280,8 @@ def main() -> int:
     args = parser.parse_args()
     try:
         print(install(args.version, args.cache_dir))
-    except Error as e:
-        print(f"error: {e}", file=sys.stderr)
+    except (Error, OSError) as e:
+        print(f"error: {e}".replace("\n", " "), file=sys.stderr)
         return 1
     return 0
 
