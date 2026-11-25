@@ -241,9 +241,9 @@ class BuildStoresUnderItsPrefixTest(StoreTest):
                 self.assertLess(names.index(attest["name"]), names.index(upload["name"]))
 
     def test_the_key_a_release_build_writes_is_the_key_its_readers_read(self):
-        # The release branch builds commit C and stores it. The daily dispatch, on trunk, finds C
-        # as the branch's latest build by the same rule as this action's, and the bench run it
-        # dispatches on the branch downloads C with this action.
+        # The release branch builds commit C and stores it. Its leg of the daily dispatch, a run
+        # on the branch that trunk's dispatch starts, finds C as the branch's latest build, and
+        # the bench run that leg dispatches on the branch downloads C.
         proc, values = self.store_prefix(RELEASE)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         written = []
@@ -257,8 +257,8 @@ class BuildStoresUnderItsPrefixTest(StoreTest):
         self.assertEqual(written, [self.key(prefix, self.release), self.key(prefix, self.release, odbc=True)])
         self.stored.write_text(written[0] + "\n")
 
-        # The dispatch's read: no commit, the branch as `ref`.
-        proc, located = self.locate("refs/heads/trunk", ref="release/2.4")
+        # The leg's read: no commit, its own branch as `ref`.
+        proc, located = self.locate(RELEASE, ref=RELEASE)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(located, {"ref": RELEASE, "prefix": prefix})
         proc, found = self.run_step(FIND, {"REF": located["ref"], "SOURCE_PREFIX": located["prefix"]})
@@ -274,6 +274,21 @@ class BuildStoresUnderItsPrefixTest(StoreTest):
         log = self.mc_log.read_text()
         self.assertIn(f"mc cp {written[0]} ", log)
         self.assertIn("sudo cp ./spiced /usr/local/bin/spiced", log)
+
+
+class ToolBuildsStoreUnderThePrefixTest(unittest.TestCase):
+    """The testoperator and spicepod-validator binaries the release leg's jobs build and reuse."""
+
+    def test_each_tool_build_reads_and_writes_under_the_runs_prefix(self):
+        for name in ("build-testoperator", "build-spicepod-validator"):
+            with self.subTest(action=name):
+                steps = yaml.safe_load((GITHUB_DIR / "actions" / name / "action.yml").read_text())["runs"]["steps"]
+                self.assertEqual(steps[0].get("uses"), "./.github/actions/ci-store-prefix")
+                keys = [line for step in steps for line in str(step.get("run", "")).splitlines()
+                        if "spice-minio/artifacts/" in line]
+                self.assertEqual(len(keys), 3, keys)
+                for line in keys:
+                    self.assertIn("spice-minio/artifacts/${CI_STORE_PREFIX}", line)
 
 
 class SetupSpicedTest(StoreTest):
@@ -298,11 +313,29 @@ class SetupSpicedTest(StoreTest):
 
     def test_a_release_commit_is_read_under_the_release_branchs_prefix(self):
         prefix = f"untrusted/{REPOSITORY_ID}/{RELEASE}/"
-        for github_ref, ref in ((RELEASE, "refs/heads/trunk"), (PULL_REQUEST, RELEASE), ("refs/heads/trunk", RELEASE)):
-            with self.subTest(github_ref=github_ref, ref=ref):
-                proc, located = self.locate(github_ref, ref=ref, spiced_commit=self.release)
+        for ref in ("refs/heads/trunk", RELEASE):
+            with self.subTest(ref=ref):
+                proc, located = self.locate(RELEASE, ref=ref, spiced_commit=self.release)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(located["prefix"], prefix)
+
+    def test_a_run_never_takes_another_refs_build(self):
+        # A build of a ref other than trunk runs only in a run of that ref, with that ref's
+        # credentials: a trunk run's store credentials write trunk's keys.
+        for github_ref, ref, commit in (
+            ("refs/heads/trunk", RELEASE, ""),
+            ("refs/heads/trunk", "release/2.4", ""),
+            ("refs/heads/trunk", RELEASE, "release"),
+            ("refs/heads/trunk", "refs/heads/trunk", "release"),
+            (PULL_REQUEST, RELEASE, ""),
+            (PULL_REQUEST, RELEASE, "release"),
+            ("refs/heads/feature", RELEASE, ""),
+        ):
+            with self.subTest(github_ref=github_ref, ref=ref, commit=commit):
+                proc, located = self.locate(github_ref, ref=ref, spiced_commit=self.release if commit else "")
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("runs only a spiced that trunk or this run's own ref built", proc.stdout)
+                self.assertEqual(located, {})
 
     def test_the_latest_build_is_the_newest_stored_commit_under_the_prefix(self):
         prefix = f"untrusted/{REPOSITORY_ID}/{RELEASE}/"
@@ -317,7 +350,8 @@ class SetupSpicedTest(StoreTest):
         proc, located = self.locate(PULL_REQUEST, ref="trunk")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(located, {"ref": "refs/heads/trunk", "prefix": ""})
-        proc, located = self.locate(PULL_REQUEST, ref="release/2.4")
+        proc, located = self.locate(RELEASE, ref="release/2.4")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(located, {"ref": RELEASE, "prefix": f"untrusted/{REPOSITORY_ID}/{RELEASE}/"})
 
     def test_a_ref_that_is_not_a_plain_ref_is_refused(self):

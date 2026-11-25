@@ -5,8 +5,9 @@ description: >-
   run, this release branch's included, uses `untrusted/<repository id>/<github.ref>/`, the only
   keys the store lets it write; the repository id keeps two repositories' refs apart. Sets
   CI_STORE_PREFIX for the rest of the job and outputs it. build_and_release.yml takes the segment
-  from here for every spiced and spice upload, and setup-spiced reads a build where the ref that
-  built it stored it.
+  from here for every spiced and spice upload, and build-testoperator and build-spicepod-validator
+  for the binaries they store and reuse. setup-spiced reads a build where the ref that built it
+  stored it.
 
 outputs:
   prefix:

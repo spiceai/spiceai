@@ -21,6 +21,7 @@ on:
       - '.github/scripts/docker_pull.sh'
       - '.github/scripts/test_docker_pull.py'
       - '.github/scripts/test_setup_spiced.py'
+      - '.github/scripts/test_testoperator_dispatch.py'
   push:
     branches:
       - trunk
@@ -34,6 +35,7 @@ on:
       - '.github/scripts/docker_pull.sh'
       - '.github/scripts/test_docker_pull.py'
       - '.github/scripts/test_setup_spiced.py'
+      - '.github/scripts/test_testoperator_dispatch.py'
   workflow_dispatch:
 
 concurrency:
@@ -74,6 +76,7 @@ jobs:
           python .github/scripts/test_codeql_workflow.py -v
           python .github/scripts/test_docker_pull.py -v
           python .github/scripts/test_setup_spiced.py -v
+          python .github/scripts/test_testoperator_dispatch.py -v
 
       - name: Validate GitHub Actions definitions
         run: python .github/scripts/check_workflow_yaml.py
