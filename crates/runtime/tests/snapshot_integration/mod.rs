@@ -69,7 +69,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-const SNAPSHOT_BUCKET: &str = "spiceai-snapshot-integration-tests";
+const SNAPSHOT_BUCKET: &str = "spiceai-ci-snapshot-integration-tests";
 const SNAPSHOT_REGION: &str = "us-west-2";
 const TAXI_TRIPS_DATASET_NAME: &str = "taxi_trips";
 

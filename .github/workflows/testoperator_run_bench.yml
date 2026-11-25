@@ -586,9 +586,9 @@ jobs:
       - name: Start the Databricks cluster
         if: ${{ contains(github.event.inputs.spicepod_path, 'spark') }}
         env:
-          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
+          DATABRICKS_HOST: ${{ vars.CI_DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.CI_DATABRICKS_TOKEN }}
+          DATABRICKS_CLUSTER_ID: ${{ vars.CI_DATABRICKS_CLUSTER_ID }}
         run: |
           # The Clusters API takes cluster_id as a query/body parameter; a path segment such as
           # /clusters/<id>/start returns ENDPOINT_NOT_FOUND.
@@ -623,7 +623,7 @@ jobs:
         id: aws-databricks-delta
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_DATABRICKS_DELTA_ROLE_ARN }}
           role-session-name: gha-databricks-delta-${{ github.run_id }}
           role-duration-seconds: 36000
           aws-region: us-east-1
@@ -634,7 +634,7 @@ jobs:
         id: aws-s3-athena
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_S3_ATHENA_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_S3_ATHENA_ROLE_ARN }}
           role-session-name: gha-s3-athena-${{ github.run_id }}
           role-duration-seconds: 36000
           aws-region: us-east-1
@@ -645,7 +645,7 @@ jobs:
         id: aws-dynamodb
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_DYNAMODB_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_DYNAMODB_ROLE_ARN }}
           role-session-name: gha-dynamodb-${{ github.run_id }}
           role-duration-seconds: 36000
           aws-region: us-east-1
@@ -684,12 +684,12 @@ jobs:
           S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
           S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
           S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
-          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
-          DATABRICKS_ODBC_PATH: ${{ vars.DATABRICKS_ODBC_PATH }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          DATABRICKS_ENDPOINT: ${{ vars.DATABRICKS_ENDPOINT }}
-          DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
-          DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.DATABRICKS_SQL_WAREHOUSE_ID }}
+          DATABRICKS_HOST: ${{ vars.CI_DATABRICKS_HOST }}
+          DATABRICKS_ODBC_PATH: ${{ vars.CI_DATABRICKS_ODBC_PATH }}
+          DATABRICKS_TOKEN: ${{ secrets.CI_DATABRICKS_TOKEN }}
+          DATABRICKS_ENDPOINT: ${{ vars.CI_DATABRICKS_HOST }}
+          DATABRICKS_CLUSTER_ID: ${{ vars.CI_DATABRICKS_CLUSTER_ID }}
+          DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.CI_DATABRICKS_SQL_WAREHOUSE_ID }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta.outputs.aws-access-key-id }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta.outputs.aws-secret-access-key }}
           AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta.outputs.aws-session-token }}
@@ -723,9 +723,9 @@ jobs:
           SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
           SPICEAI_CLICKBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
           SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
-          SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
-          SQL_WAREHOUSE_DATABRICKS_HOST: ${{ vars.SQL_WAREHOUSE_DATABRICKS_HOST }}
-          SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
+          SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.CI_DATABRICKS_TOKEN }}
+          SQL_WAREHOUSE_DATABRICKS_HOST: ${{ vars.CI_DATABRICKS_HOST }}
+          SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.CI_DATABRICKS_SQL_WAREHOUSE_ID }}
           INSTA_UPDATE: ${{ steps.determine_update_snapshots.outputs.update_snapshots}}
           MSSQL_HOST: localhost
           MSSQL_USER: sa

@@ -50,6 +50,35 @@ pub enum DeliveryError {
 
 pub type DeliveryResult<T = ()> = std::result::Result<T, DeliveryError>;
 
+/// What a delivery's read of the accelerator was taken against, from
+/// [`WriteBackDeliverer::begin_read`], handed back to
+/// [`WriteBackDeliverer::deliver_upserts`] with the rows that read returned.
+/// Opaque to the worker: only the deliverer that issued it knows what it holds.
+/// The default holds nothing.
+#[derive(Default)]
+pub struct ReadFence(Option<Box<dyn std::any::Any + Send + Sync>>);
+
+impl ReadFence {
+    #[must_use]
+    pub fn new<T: std::any::Any + Send + Sync>(fence: T) -> Self {
+        Self(Some(Box::new(fence)))
+    }
+
+    /// The fence, when this one holds a `T`.
+    #[must_use]
+    pub fn downcast_ref<T: std::any::Any>(&self) -> Option<&T> {
+        self.0.as_ref().and_then(|fence| fence.downcast_ref::<T>())
+    }
+}
+
+impl std::fmt::Debug for ReadFence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ReadFence")
+            .field(&self.0.as_ref().map(|_| ".."))
+            .finish()
+    }
+}
+
 /// A connector that owns the transaction each durable write-back delivery runs
 /// in, so it can observe or stamp that transaction (see the module docs).
 ///
@@ -68,15 +97,28 @@ pub type DeliveryResult<T = ()> = std::result::Result<T, DeliveryError>;
 /// (#13398), so the seam that made it expressible is gone.
 #[async_trait]
 pub trait WriteBackDeliverer: Send + Sync {
+    /// Called by the worker immediately **before** it reads the rows it is about
+    /// to deliver from the accelerator. The returned fence is passed back to
+    /// [`deliver_upserts`](Self::deliver_upserts) with those rows.
+    ///
+    /// `PostgreSQL` uses it to learn which changes the read already observed, so
+    /// the echo of the delivery is applied for a key that changed through the
+    /// change stream after the read (#16505). The default holds nothing.
+    fn begin_read(&self) -> ReadFence {
+        ReadFence::default()
+    }
+
     /// Upsert every batch of `rows` into the source in **one** transaction. `rows`
     /// are in the accelerator's schema; casting them to the source table's schema
-    /// (if needed) is the deliverer's own concern, not the worker's.
+    /// (if needed) is the deliverer's own concern, not the worker's. `read` is the
+    /// fence [`begin_read`](Self::begin_read) returned before the read that
+    /// produced `rows`.
     ///
     /// # Errors
     ///
     /// Returns an error if the transaction cannot be prepared, executed, or
     /// committed; the worker retries the whole pass.
-    async fn deliver_upserts(&self, rows: Vec<RecordBatch>) -> DeliveryResult;
+    async fn deliver_upserts(&self, rows: Vec<RecordBatch>, read: ReadFence) -> DeliveryResult;
 
     /// The primary-key column this deliverer upserts on — its `ON CONFLICT` target.
     ///

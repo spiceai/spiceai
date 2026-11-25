@@ -747,6 +747,69 @@ async fn aggregates_after_an_overwrite_repeating_keys_ignore_superseded_copies()
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+/// `MIN` and `MAX` of strings longer than the footer's 64-byte bound return the whole value,
+/// right after the write and after a restart. The footer records a string column's bounds
+/// cut to 64 bytes and inexact. The per-file statistics a scan persists from the footer must
+/// keep them inexact: read back as exact, they answered both from the cut bounds after the
+/// table was reopened.
+#[tokio::test(flavor = "multi_thread")]
+async fn string_min_max_past_the_footer_bound_return_the_whole_value() {
+    let lowest = format!("a{}", "b".repeat(120));
+    let highest = format!("z{}", "y".repeat(120));
+    let mut failures = Vec::new();
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, catalog, runtime_env, _dir) = table(mode).await;
+        write(
+            &provider,
+            InsertOp::Overwrite,
+            vec![batch(&[
+                (1, lowest.as_str()),
+                (2, "m"),
+                (3, highest.as_str()),
+            ])],
+        )
+        .await
+        .expect("overwrite");
+        // The first query after the write persists the files' statistics; the reopen reads
+        // them back.
+        for stage in ["after the write", "after reopen"] {
+            let provider = if stage == "after the write" {
+                provider.clone_for_write()
+            } else {
+                provider
+                    .flush_pending_maintenance()
+                    .await
+                    .expect("flush the write's maintenance");
+                reopen(&catalog, &runtime_env).await
+            };
+            let ctx = SessionContext::new();
+            ctx.register_table("t", Arc::new(provider))
+                .expect("register");
+            let batches = ctx
+                .sql("SELECT MIN(value), MAX(value) FROM t")
+                .await
+                .expect("query")
+                .collect()
+                .await
+                .expect("collect");
+            let observed = (
+                batches[0].column(0).as_string::<i32>().value(0).to_string(),
+                batches[0].column(1).as_string::<i32>().value(0).to_string(),
+            );
+            if observed != (lowest.clone(), highest.clone()) {
+                failures.push(format!(
+                    "{mode:?} {stage}: MIN has {} bytes and MAX {}, expected {} and {}",
+                    observed.0.len(),
+                    observed.1.len(),
+                    lowest.len(),
+                    highest.len()
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 /// Arrival ordering applies to both an INSERT and a transaction's write.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_arrival_statement_resolves_repeated_keys_across_batches() {

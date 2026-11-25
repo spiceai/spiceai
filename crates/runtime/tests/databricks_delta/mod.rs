@@ -79,7 +79,7 @@ async fn databricks_delta_lake_integration_test() -> Result<(), anyhow::Error> {
         .scope(async {
             let app = AppBuilder::new("databricks_delta_lake_connector")
                 .with_dataset(make_dataset(
-                    "spiceai_sandbox.integration.delta_all_types_table",
+                    "spiceai_ci.integration.delta_all_types_table",
                     "datatypes",
                 ))
                 .build();
@@ -145,7 +145,7 @@ async fn databricks_delta_lake_schema_inference_test() -> Result<(), anyhow::Err
         .scope(async {
             let app = AppBuilder::new("databricks_delta_lake_schema_test")
                 .with_dataset(make_dataset(
-                    "spiceai_sandbox.integration.delta_all_types_table",
+                    "spiceai_ci.integration.delta_all_types_table",
                     "datatypes",
                 ))
                 .build();
@@ -202,7 +202,7 @@ async fn databricks_delta_lake_dataset_registration_test() -> Result<(), anyhow:
         .scope(async {
             let app = AppBuilder::new("databricks_delta_lake_registration_test")
                 .with_dataset(make_dataset(
-                    "spiceai_sandbox.integration.delta_all_types_table",
+                    "spiceai_ci.integration.delta_all_types_table",
                     "datatypes",
                 ))
                 .build();
