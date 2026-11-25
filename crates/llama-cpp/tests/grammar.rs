@@ -74,7 +74,12 @@ fn valid_repetitions_parse() {
 
 #[test]
 fn malformed_grammars_fail() {
-    for grammar in ["", "root ::= missing\n", "root ::= \"x\"{,}\n", "root ::= <think>\n"] {
+    for grammar in [
+        "",
+        "root ::= missing\n",
+        "root ::= \"x\"{,}\n",
+        "root ::= <think>\n",
+    ] {
         check_grammar(grammar).expect_err(grammar);
     }
 }
@@ -82,11 +87,26 @@ fn malformed_grammars_fail() {
 #[test]
 fn schema_with_inverted_bounds_is_refused() {
     for (schema, keyword) in [
-        (r#"{"type":"array","items":{"type":"integer"},"minItems":3,"maxItems":1}"#, "minItems 3 above maxItems 1"),
-        (r#"{"type":"string","minLength":5,"maxLength":2}"#, "minLength 5 above maxLength 2"),
-        (r#"{"type":"object","minProperties":4,"maxProperties":1}"#, "minProperties 4 above maxProperties 1"),
-        (r#"{"type":"array","contains":{"type":"integer"},"minContains":3,"maxContains":2}"#, "minContains 3 above maxContains 2"),
-        (r#"{"type":"integer","minimum":10,"maximum":1}"#, "minimum 10 above maximum 1"),
+        (
+            r#"{"type":"array","items":{"type":"integer"},"minItems":3,"maxItems":1}"#,
+            "minItems 3 above maxItems 1",
+        ),
+        (
+            r#"{"type":"string","minLength":5,"maxLength":2}"#,
+            "minLength 5 above maxLength 2",
+        ),
+        (
+            r#"{"type":"object","minProperties":4,"maxProperties":1}"#,
+            "minProperties 4 above maxProperties 1",
+        ),
+        (
+            r#"{"type":"array","contains":{"type":"integer"},"minContains":3,"maxContains":2}"#,
+            "minContains 3 above maxContains 2",
+        ),
+        (
+            r#"{"type":"integer","minimum":10,"maximum":1}"#,
+            "minimum 10 above maximum 1",
+        ),
         (
             r#"{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string"},"minItems":2,"maxItems":0}}}"#,
             "'/properties/tags' has minItems 2 above maxItems 0",
@@ -99,7 +119,10 @@ fn schema_with_inverted_bounds_is_refused() {
         let err = schema_grammar(schema).expect_err(schema);
         let message = err.to_string();
         assert!(message.contains(keyword), "{schema}: {message}");
-        assert!(message.contains("which no value satisfies"), "{schema}: {message}");
+        assert!(
+            message.contains("which no value satisfies"),
+            "{schema}: {message}"
+        );
     }
 }
 
