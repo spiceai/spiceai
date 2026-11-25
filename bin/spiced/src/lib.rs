@@ -349,8 +349,8 @@ fn spawn_cpu_share_drift_task() {
 /// same way a local spicepod's does.
 pub struct AppBundle {
     pub app: Option<Arc<App>>,
-    /// Why the local `spicepod.yaml` did not load, in pods-watcher mode where
-    /// that is not fatal.
+    /// Why the local `spicepod.yaml` did not load, in pods-watcher mode on an
+    /// instance with a Cloud Connect identity, where that is not fatal.
     spicepod_load_error: Option<app::Error>,
     /// The spicepod the app was loaded from, when it came from the cloud-managed
     /// file. `None` means the runtime is serving something a deployment did not
@@ -1204,6 +1204,68 @@ fn awaiting_deployed_spicepod(cloud_connect_configured: bool, error: &app::Error
     cloud_connect_configured && error.is_spicepod_missing()
 }
 
+/// Waits until the spicepod in `spicepod_path` loads, for a pods-watcher start
+/// whose spicepod did not, and returns it.
+///
+/// The runtime decides its endpoint authentication once, from the spicepod it
+/// starts with, and so does everything that depends on it: which routes need
+/// credentials and how a client certificate is used. A runtime that started
+/// without a spicepod would serve every endpoint without authentication until a
+/// restart, whatever `runtime.auth` the spicepod set once it loaded. So nothing
+/// is bound until the spicepod loads, and the runtime then starts as it does
+/// from a valid one.
+///
+/// The spicepod is loaded again on every change the pods watcher reports, and
+/// once more after the watch begins, so an edit made before then is not missed.
+async fn wait_for_valid_spicepod(spicepod_path: &Path, error: &app::Error) -> Result<App> {
+    tracing::warn!("{}", waiting_for_spicepod_warning(spicepod_path, error));
+    let mut watcher = PodsWatcher::new(spicepod_path);
+    let mut changes = watcher
+        .watch()
+        .await
+        .context(UnableToInitializePodsWatcherSnafu)?;
+    let mut last_error = error.to_string();
+    loop {
+        match AppBuilder::build_from_path(spicepod_path.to_path_buf()).await {
+            Ok(app) => {
+                tracing::info!("{}", spicepod_loaded_message(spicepod_path));
+                return Ok(app);
+            }
+            Err(e) => {
+                let message = e.to_string();
+                if message != last_error {
+                    tracing::warn!("{}", waiting_for_spicepod_warning(spicepod_path, &e));
+                    last_error = message;
+                }
+            }
+        }
+        if changes.recv().await.is_none() {
+            return Err(Error::GenericError {
+                reason: format!(
+                    "Stopped watching '{}' for spicepod changes before a valid spicepod.yaml loaded. Report this bug on GitHub: https://github.com/spiceai/spiceai/issues",
+                    spicepod_path.display()
+                ),
+            });
+        }
+    }
+}
+
+/// The warning a pods-watcher start logs while its spicepod does not load.
+fn waiting_for_spicepod_warning(spicepod_path: &Path, error: &app::Error) -> String {
+    format!(
+        "Failed to load the spicepod in '{}', so the runtime does not start serving until it loads. Fix spicepod.yaml and the runtime starts. Cause: {error}",
+        spicepod_path.display()
+    )
+}
+
+/// The message a pods-watcher start logs when the spicepod it waited for loads.
+fn spicepod_loaded_message(spicepod_path: &Path) -> String {
+    format!(
+        "Loaded the spicepod in '{}'; starting the runtime.",
+        spicepod_path.display()
+    )
+}
+
 /// What `build_app` decided about which spicepod this start serves, logged once
 /// tracing exists.
 enum DeploymentNote {
@@ -1432,11 +1494,18 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
             Some(Arc::new(app))
         }
         Err(e) => {
-            // In pods watcher mode, allow runtime to start without a valid spicepod
-            // It will load the spicepod when it becomes available
             if args.pods_watcher_enabled && args.spicepod.is_none() && !cloud_managed_state {
-                spicepod_load_error = Some(e);
-                None
+                if cloud_connect_identity.is_some() {
+                    // Cloud Connect declines the pods watcher, so nothing would
+                    // load this file: the instance starts and waits for a
+                    // deployment instead.
+                    spicepod_load_error = Some(e);
+                    None
+                } else {
+                    let mut app = wait_for_valid_spicepod(&spicepod_path, &e).await?;
+                    app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
+                    Some(Arc::new(app))
+                }
             // `take()` cannot lose a note here: the `Loaded` case returned
             // above, so what is left is either nothing or the rejection this
             // arm folds the local failure into.
@@ -2252,5 +2321,77 @@ mod tests {
 
         // A manifest file path resolves to itself when it exists.
         assert_eq!(local_spicepod_manifest(&manifest), Some(manifest));
+    }
+
+    const SPICEPOD_WITH_API_KEY: &str = "version: v1
+kind: Spicepod
+name: waits-for-spicepod
+runtime:
+  auth:
+    api-key:
+      enabled: true
+      keys: [k1:rw]
+";
+
+    /// A pods-watcher start whose spicepod does not load waits for it, and
+    /// returns it, `runtime.auth` included, once an edit makes it load.
+    #[tokio::test]
+    async fn a_pods_watcher_start_waits_until_its_spicepod_loads() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // Canonical, as the working directory `spiced` watches is: the platform
+        // watcher reports canonical paths, and macOS temp directories are
+        // reached through a symlink.
+        let root = dir.path().canonicalize().expect("canonical temp dir");
+        let manifest = root.join("spicepod.yaml");
+        std::fs::write(&manifest, SPICEPOD_WITH_API_KEY.replace("keys:", "keyz:"))
+            .expect("write a spicepod.yaml with an unknown field");
+        let error = AppBuilder::build_from_path(&root)
+            .await
+            .expect_err("a spicepod with an unknown field does not load");
+
+        let wait = wait_for_valid_spicepod(&root, &error);
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut wait)
+                .await
+                .is_err(),
+            "the wait ended while the spicepod still did not load"
+        );
+
+        std::fs::write(&manifest, SPICEPOD_WITH_API_KEY).expect("write a valid spicepod.yaml");
+        let app = tokio::time::timeout(Duration::from_secs(30), wait)
+            .await
+            .expect("the wait ends once the spicepod loads")
+            .expect("the spicepod loads");
+        assert_eq!(app.name, "waits-for-spicepod");
+        let api_key = app
+            .runtime
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.api_key.as_ref())
+            .expect("the loaded spicepod keeps its `runtime.auth`");
+        assert!(api_key.enabled);
+        assert_eq!(api_key.keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_waiting_messages_name_the_directory_and_what_happens_next() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let error = missing_spicepod_error(dir.path()).await;
+
+        assert_eq!(
+            waiting_for_spicepod_warning(dir.path(), &error),
+            format!(
+                "Failed to load the spicepod in '{}', so the runtime does not start serving until it loads. Fix spicepod.yaml and the runtime starts. Cause: {error}",
+                dir.path().display()
+            )
+        );
+        assert_eq!(
+            spicepod_loaded_message(dir.path()),
+            format!(
+                "Loaded the spicepod in '{}'; starting the runtime.",
+                dir.path().display()
+            )
+        );
     }
 }

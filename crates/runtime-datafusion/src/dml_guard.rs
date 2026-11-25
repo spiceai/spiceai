@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Refuses a `DELETE`/`UPDATE` whose row condition cannot reach the table.
+//! Rewrites a `DELETE`/`UPDATE` so that its row condition and new values reach
+//! the table, and refuses one whose row condition cannot.
 //!
 //! A table provider receives the rows to affect as a list of filter
 //! expressions, and an **empty list means every row** — that is the documented
@@ -24,7 +25,10 @@ limitations under the License.
 //! moved anywhere else is not seen, and the statement silently widens:
 //!
 //! - `WHERE FALSE` collapses the input to an `EmptyRelation`. No filter is left
-//!   to find, so a statement that matches no rows affects all of them.
+//!   to find, so a statement that matches no rows would affect all of them.
+//!   [`rewrite_dml_for_the_table`] plans it as a statement that affects none.
+//!   Such a statement never reaches the table, so a dataset that refuses every
+//!   write of its kind (a snapshot acceleration, for one) returns 0 for it.
 //! - `WHERE id IN (SELECT ...)`, `EXISTS`, and `NOT EXISTS` are decorrelated
 //!   into a join, which carries the restriction the filter list then lacks.
 //! - `WHERE id = 1 AND EXISTS (...)` is worse: `id = 1` survives on its own, so
@@ -40,10 +44,26 @@ limitations under the License.
 //! still intact, and it is a *positive* recognizer: a plan is planned only when
 //! every node in it is one whose restriction the filter list provably carries.
 //! Anything else is refused rather than approximated.
+//!
+//! The filter list and the assigned values also have to name only the table's
+//! own columns. When a condition or a new value repeats an expression, the
+//! optimizer computes it once in a projection under it and reads the computed
+//! column (`__common_expr_1`), which the table does not have.
+//! [`rewrite_dml_for_the_table`] puts a non-volatile expression back in its
+//! place. A column computed by a volatile expression, such as a model call
+//! placed to run once per row, keeps its name, and the table refuses it.
 
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use datafusion::common::ScalarValue;
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::logical_expr::{DmlStatement, LogicalPlan, WriteOp};
+use datafusion::logical_expr::{
+    DmlStatement, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Projection, WriteOp, lit,
+};
+use datafusion::optimizer::push_down_filter::replace_cols_by_name;
 
 /// How a statement restricts its rows in a way the extracted filters cannot
 /// express, and what the user can do instead.
@@ -74,12 +94,6 @@ fn unrepresentable_node(node: &LogicalPlan) -> Option<Unrepresentable> {
         | LogicalPlan::Projection(_)
         | LogicalPlan::SubqueryAlias(_)
         | LogicalPlan::Filter(_) => None,
-
-        // `WHERE FALSE`, and anything the optimizer proves selects nothing.
-        LogicalPlan::EmptyRelation(_) => Some(Unrepresentable {
-            cause: "a condition that no row can satisfy",
-            remedy: "Correct the condition, or remove the statement if it was meant to affect nothing",
-        }),
 
         // What `IN (SELECT ...)`, `EXISTS`, and `NOT EXISTS` decorrelate into.
         LogicalPlan::Join(_) | LogicalPlan::Subquery(_) => Some(Unrepresentable {
@@ -142,6 +156,176 @@ pub fn ensure_dml_restriction_reaches_the_table(plan: &LogicalPlan) -> Result<()
     .map(|_| ())
 }
 
+/// Rewrite each `DELETE`/`UPDATE` so that the filter list and the assigned
+/// values the planner extracts from it name only the table's own columns:
+///
+/// - A statement whose condition selects no row is planned as one that affects
+///   no row, since its filter list would otherwise be empty, which means every
+///   row.
+/// - A column that a projection computes from a non-volatile expression,
+///   directly under the filter or projection that reads it, is replaced by
+///   that expression.
+///
+/// Returns the plan unchanged, without copying it, when it holds no such
+/// statement.
+///
+/// # Errors
+///
+/// When a rewritten node cannot be rebuilt.
+pub fn rewrite_dml_for_the_table(plan: &LogicalPlan) -> Result<Cow<'_, LogicalPlan>> {
+    let has_row_condition = plan.exists(|node| {
+        Ok(matches!(
+            node,
+            LogicalPlan::Dml(DmlStatement {
+                op: WriteOp::Delete | WriteOp::Update,
+                ..
+            })
+        ))
+    })?;
+    if !has_row_condition {
+        return Ok(Cow::Borrowed(plan));
+    }
+
+    let rewritten = plan.clone().transform_up(|node| match node {
+        LogicalPlan::Dml(dml) if matches!(dml.op, WriteOp::Delete | WriteOp::Update) => {
+            if selects_no_row(&dml.input) {
+                return Ok(Transformed::yes(affects_no_row(&dml)?));
+            }
+            let input = Arc::unwrap_or_clone(Arc::clone(&dml.input))
+                .transform_up(inline_computed_columns)?;
+            if !input.transformed {
+                return Ok(Transformed::no(LogicalPlan::Dml(dml)));
+            }
+            Ok(Transformed::yes(LogicalPlan::Dml(DmlStatement {
+                input: Arc::new(input.data),
+                ..dml
+            })))
+        }
+        other => Ok(Transformed::no(other)),
+    })?;
+    Ok(Cow::Owned(rewritten.data))
+}
+
+/// Whether the statement's input provably yields no row: an empty relation
+/// under nodes that never add one.
+fn selects_no_row(input: &LogicalPlan) -> bool {
+    match input {
+        LogicalPlan::EmptyRelation(empty) => !empty.produce_one_row,
+        LogicalPlan::Projection(Projection { input, .. })
+        | LogicalPlan::Filter(Filter { input, .. })
+        | LogicalPlan::SubqueryAlias(datafusion::logical_expr::SubqueryAlias { input, .. }) => {
+            selects_no_row(input)
+        }
+        _ => false,
+    }
+}
+
+/// The result of a statement that affects no row, in the statement's own
+/// output schema: a count of 0.
+fn affects_no_row(dml: &DmlStatement) -> Result<LogicalPlan> {
+    let count = dml.output_schema.field(0).name();
+    LogicalPlanBuilder::empty(true)
+        .project(vec![lit(ScalarValue::UInt64(Some(0))).alias(count)])?
+        .build()
+}
+
+/// In a filter or projection, replace each column that the projection directly
+/// below it computes from a non-volatile expression by that expression. That
+/// projection then also passes on every column of its input, since the
+/// expression reads columns the projection may have left out.
+fn inline_computed_columns(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+    match node {
+        LogicalPlan::Filter(filter) => {
+            let Some(computed) = computed_columns_below(&filter.input) else {
+                return Ok(Transformed::no(LogicalPlan::Filter(filter)));
+            };
+            let predicate = replace_cols_by_name(filter.predicate.clone(), &computed)?;
+            if predicate == filter.predicate {
+                return Ok(Transformed::no(LogicalPlan::Filter(filter)));
+            }
+            Ok(Transformed::yes(LogicalPlan::Filter(Filter::try_new(
+                predicate,
+                pass_on_input_columns_below(&filter.input)?,
+            )?)))
+        }
+        LogicalPlan::Projection(projection) => {
+            let Some(computed) = computed_columns_below(&projection.input) else {
+                return Ok(Transformed::no(LogicalPlan::Projection(projection)));
+            };
+            let mut changed = false;
+            let exprs = projection
+                .expr
+                .iter()
+                .map(|expr| {
+                    let inlined = replace_cols_by_name(expr.clone(), &computed)?;
+                    if inlined == *expr {
+                        return Ok(inlined);
+                    }
+                    changed = true;
+                    // Keep the output name the projection had.
+                    inlined.alias_if_changed(expr.schema_name().to_string())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if !changed {
+                return Ok(Transformed::no(LogicalPlan::Projection(projection)));
+            }
+            Ok(Transformed::yes(LogicalPlan::Projection(
+                Projection::try_new(exprs, pass_on_input_columns_below(&projection.input)?)?,
+            )))
+        }
+        other => Ok(Transformed::no(other)),
+    }
+}
+
+/// When `plan` is a projection, the columns it computes from a non-volatile
+/// expression, by name. `None` when `plan` is not a projection or computes no
+/// such column.
+fn computed_columns_below(plan: &LogicalPlan) -> Option<HashMap<String, Expr>> {
+    match plan {
+        LogicalPlan::Projection(projection) => {
+            let computed: HashMap<String, Expr> = projection
+                .schema
+                .columns()
+                .into_iter()
+                .zip(&projection.expr)
+                // A volatile expression, such as a model call placed to run
+                // once per row, keeps its column.
+                .filter(|(_, expr)| !matches!(expr, Expr::Column(_)) && !expr.is_volatile())
+                .map(|(column, expr)| (column.flat_name(), expr.clone().unalias()))
+                .collect();
+            (!computed.is_empty()).then_some(computed)
+        }
+        _ => None,
+    }
+}
+
+/// When `plan` is a projection, rebuild it so that it also passes on each
+/// column of its input that it leaves out.
+fn pass_on_input_columns_below(plan: &Arc<LogicalPlan>) -> Result<Arc<LogicalPlan>> {
+    match plan.as_ref() {
+        LogicalPlan::Projection(projection) => {
+            let left_out: Vec<Expr> = projection
+                .input
+                .schema()
+                .columns()
+                .into_iter()
+                .filter(|column| !projection.schema.has_column(column))
+                .map(Expr::Column)
+                .collect();
+            if left_out.is_empty() {
+                return Ok(Arc::clone(plan));
+            }
+            let mut exprs = projection.expr.clone();
+            exprs.extend(left_out);
+            Ok(Arc::new(LogicalPlan::Projection(Projection::try_new(
+                exprs,
+                Arc::clone(&projection.input),
+            )?)))
+        }
+        _ => Ok(Arc::clone(plan)),
+    }
+}
+
 fn ensure_statement_restriction_reaches_the_table(dml: &DmlStatement) -> Result<()> {
     let verb = match dml.op {
         WriteOp::Delete => Verb {
@@ -199,11 +383,13 @@ mod tests {
     use std::sync::{Arc, Mutex, Weak};
 
     /// Records the filter list each DML call receives, so a test can assert not
-    /// only that a statement was refused but that nothing reached the table.
+    /// only that a statement was refused but that nothing reached the table,
+    /// and the values each UPDATE assigns.
     #[derive(Debug)]
     struct Recorder {
         schema: SchemaRef,
         seen: Arc<Mutex<Vec<Vec<Expr>>>>,
+        assigned: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
     #[async_trait]
@@ -219,11 +405,15 @@ mod tests {
         async fn scan(
             &self,
             _state: &dyn Session,
-            _projection: Option<&Vec<usize>>,
+            projection: Option<&Vec<usize>>,
             _filters: &[Expr],
             _limit: Option<usize>,
         ) -> Result<Arc<dyn ExecutionPlan>> {
-            Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))))
+            let schema = match projection {
+                Some(columns) => Arc::new(self.schema.project(columns)?),
+                None => Arc::clone(&self.schema),
+            };
+            Ok(Arc::new(EmptyExec::new(schema)))
         }
 
         async fn delete_from(
@@ -238,10 +428,16 @@ mod tests {
         async fn update(
             &self,
             _state: &dyn Session,
-            _assignments: Vec<(String, Expr)>,
+            assignments: Vec<(String, Expr)>,
             filters: Vec<Expr>,
         ) -> Result<Arc<dyn ExecutionPlan>> {
             self.seen.lock().expect("record update").push(filters);
+            self.assigned.lock().expect("record assignments").push(
+                assignments
+                    .iter()
+                    .map(|(column, value)| format!("{column} = {value}"))
+                    .collect(),
+            );
             Ok(dml_result())
         }
     }
@@ -259,6 +455,10 @@ mod tests {
     struct Outcome {
         error: Option<String>,
         calls: Vec<Vec<String>>,
+        /// The values each UPDATE call assigned.
+        assignments: Vec<Vec<String>>,
+        /// The `count` the statement returned, when it ran.
+        count: Option<u64>,
     }
 
     impl Outcome {
@@ -270,6 +470,23 @@ mod tests {
                 self.error
             );
             self.calls
+        }
+
+        /// Proof that a statement affected no row: it ran, returned a count of
+        /// 0, and never reached the table, whose empty filter list would mean
+        /// every row.
+        fn affected_nothing(self) {
+            assert!(
+                self.error.is_none(),
+                "expected the statement to run: {:?}",
+                self.error
+            );
+            assert!(
+                self.calls.is_empty(),
+                "a statement that selects no row reached the table: {:?}",
+                self.calls
+            );
+            assert_eq!(self.count, Some(0));
         }
 
         /// The refusal — and, in the same breath, proof that nothing reached
@@ -292,6 +509,7 @@ mod tests {
             Field::new("label", DataType::Utf8, true),
         ]));
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let assigned = Arc::new(Mutex::new(Vec::new()));
 
         // The planner under test, wired as the runtime wires it, including the
         // cache invalidation rule that wraps every write.
@@ -310,6 +528,7 @@ mod tests {
             Arc::new(Recorder {
                 schema: Arc::clone(&schema),
                 seen: Arc::clone(&seen),
+                assigned: Arc::clone(&assigned),
             }),
         )
         .expect("register t");
@@ -318,13 +537,17 @@ mod tests {
             Arc::new(Recorder {
                 schema,
                 seen: Arc::new(Mutex::new(Vec::new())),
+                assigned: Arc::new(Mutex::new(Vec::new())),
             }),
         )
         .expect("register s");
 
-        let error = match ctx.sql(sql).await {
-            Err(e) => Some(e.to_string()),
-            Ok(plan) => plan.collect().await.err().map(|e| e.to_string()),
+        let (error, count) = match ctx.sql(sql).await {
+            Err(e) => (Some(e.to_string()), None),
+            Ok(plan) => match plan.collect().await {
+                Err(e) => (Some(e.to_string()), None),
+                Ok(batches) => (None, returned_count(&batches)),
+            },
         };
 
         let calls = seen
@@ -339,7 +562,24 @@ mod tests {
             })
             .collect();
 
-        Outcome { error, calls }
+        let assignments = assigned.lock().expect("read assignments").clone();
+
+        Outcome {
+            error,
+            calls,
+            assignments,
+            count,
+        }
+    }
+
+    /// The single `count` value a DML statement returns.
+    fn returned_count(batches: &[arrow::record_batch::RecordBatch]) -> Option<u64> {
+        let batch = batches.iter().find(|batch| batch.num_rows() > 0)?;
+        batch
+            .column_by_name("count")?
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .map(|counts| counts.value(0))
     }
 
     /// A statement the table can carry reaches it, with its condition intact.
@@ -366,23 +606,92 @@ mod tests {
 
     /// A condition that selects nothing must not be read as "no condition".
     ///
-    /// Regression: `WHERE FALSE` collapses the input to an `EmptyRelation`,
-    /// leaving no filter to extract, and an empty filter list means every row —
-    /// so a statement matching zero rows deleted the whole table.
+    /// `WHERE FALSE` collapses the input to an `EmptyRelation`, leaving no
+    /// filter to extract, and an empty filter list means every row. The
+    /// statement affects no row and never reaches the table.
     #[tokio::test]
-    async fn a_condition_that_matches_no_rows_is_refused() {
+    async fn a_condition_that_matches_no_rows_affects_none() {
         for sql in [
             "DELETE FROM t WHERE FALSE",
             "DELETE FROM t WHERE 1 = 0",
+            "DELETE FROM t WHERE NULL",
             "DELETE FROM t WHERE id > 0 AND FALSE",
             "UPDATE t SET label = 'x' WHERE FALSE",
+            "EXPLAIN ANALYZE DELETE FROM t WHERE FALSE",
         ] {
-            let err = run(sql).await.refused();
-            assert!(
-                err.contains("no row can satisfy"),
-                "{sql} was not refused for the right reason: {err}"
-            );
+            let outcome = run(sql).await;
+            if sql.starts_with("EXPLAIN") {
+                assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+                assert!(outcome.calls.is_empty(), "{sql}: {:?}", outcome.calls);
+            } else {
+                outcome.affected_nothing();
+            }
         }
+    }
+
+    /// An UPDATE that repeats an expression reaches the table with conditions
+    /// and values on its own columns, also when it assigns a column that only
+    /// the repeated expression reads.
+    #[tokio::test]
+    async fn a_repeated_expression_in_an_update_reaches_the_table_as_written() {
+        let outcome = run("UPDATE t SET price = 9 WHERE price * 2 > 3 AND price * 2 < 10").await;
+        assert_eq!(
+            (outcome.calls.clone(), outcome.error.clone()),
+            (
+                vec![vec![
+                    "price * Float64(2) > Float64(3)".to_string(),
+                    "price * Float64(2) < Float64(10)".to_string(),
+                ]],
+                None
+            )
+        );
+        assert_eq!(
+            outcome.assignments,
+            vec![vec!["price = Float64(9)".to_string()]]
+        );
+
+        let outcome = run("UPDATE t SET price = price * 2 + price * 2 WHERE id = 1").await;
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.calls, vec![vec!["id = Int32(1)".to_string()]]);
+        assert_eq!(
+            outcome.assignments,
+            vec![vec![
+                "price = price * Float64(2) + price * Float64(2)".to_string()
+            ]]
+        );
+    }
+
+    /// A condition that repeats an expression reaches the table as conditions
+    /// on its own columns, not on the column the optimizer computes the
+    /// expression into.
+    #[tokio::test]
+    async fn a_repeated_expression_reaches_the_table_as_written() {
+        assert_eq!(
+            run("DELETE FROM t WHERE id * 2 > 1 AND id * 2 < 10")
+                .await
+                .planned(),
+            vec![vec![
+                "CAST(id AS Int64) * Int64(2) > Int64(1)".to_string(),
+                "CAST(id AS Int64) * Int64(2) < Int64(10)".to_string(),
+            ]]
+        );
+        assert_eq!(
+            run("DELETE FROM t WHERE id * 2 = 4 OR id * 2 = 8")
+                .await
+                .planned(),
+            vec![vec![
+                "CAST(id AS Int64) * Int64(2) = Int64(4) OR CAST(id AS Int64) * Int64(2) = Int64(8)".to_string()
+            ]]
+        );
+        assert_eq!(
+            run("UPDATE t SET price = id * 2 WHERE id * 2 > 3 AND id * 2 < 7")
+                .await
+                .planned(),
+            vec![vec![
+                "CAST(id AS Int64) * Int64(2) > Int64(3)".to_string(),
+                "CAST(id AS Int64) * Int64(2) < Int64(7)".to_string(),
+            ]]
+        );
     }
 
     /// A subquery condition is decorrelated into a join, which the filter list
@@ -435,6 +744,38 @@ mod tests {
             .await
             .refused();
         assert!(err.contains("Failed to delete from table 't'"), "{err}");
+    }
+
+    /// A column computed by a volatile expression, such as a model call placed
+    /// to run once per row, is not put back into the condition.
+    #[test]
+    fn a_volatile_computed_column_stays_a_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table = datafusion::datasource::provider_as_source(Arc::new(Recorder {
+            schema,
+            seen: Arc::new(Mutex::new(Vec::new())),
+            assigned: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let input = LogicalPlanBuilder::scan("t", Arc::clone(&table), None)
+            .and_then(|plan| {
+                plan.project(vec![
+                    datafusion::functions::math::expr_fn::random().alias("r"),
+                    datafusion::prelude::col("id"),
+                ])
+            })
+            .and_then(|plan| plan.filter(datafusion::prelude::col("r").gt(lit(0.5))))
+            .and_then(|plan| plan.project(vec![datafusion::prelude::col("id")]))
+            .and_then(LogicalPlanBuilder::build)
+            .expect("build the statement's input");
+        let delete = LogicalPlan::Dml(DmlStatement::new(
+            "t".into(),
+            table,
+            WriteOp::Delete,
+            Arc::new(input),
+        ));
+
+        let rewritten = rewrite_dml_for_the_table(&delete).expect("rewrite");
+        assert_eq!(rewritten.as_ref(), &delete);
     }
 
     /// A plan that is not DML has no row condition to lose, and is never
