@@ -136,6 +136,11 @@ struct Inner {
     /// what it caches from the catalog when the revision differs from the one
     /// it last loaded at (see [`crate::catalog::MetadataCatalog::follow_commits`]).
     revision: u64,
+    /// For the latest revisions a replica reached by following the writer,
+    /// oldest first: the revision, and when the writer prepared the oldest
+    /// commit that revision added (Unix milliseconds on its clock). Bounded by
+    /// [`FOLLOWED_REVISIONS_KEPT`].
+    followed_revisions: std::collections::VecDeque<(u64, u64)>,
     /// A batch of followed records failed to apply after part of it changed
     /// the state, and the reader's cursor already covers it: the next follow
     /// reads the log again rather than resume from there.
@@ -257,6 +262,11 @@ fn position(source: &str, partition: &str, value: Option<Vec<u8>>) -> Action {
         position: value.unwrap_or_default(),
     }))
 }
+/// How many followed revisions a log remembers the commit times of (see
+/// `Inner::followed_revisions`). A table more revisions behind than this reports
+/// the oldest one remembered.
+const FOLLOWED_REVISIONS_KEPT: usize = 256;
+
 fn invalid(error: impl std::fmt::Display) -> CatalogError {
     CatalogError::InvalidOperationNoSource {
         message: error.to_string(),

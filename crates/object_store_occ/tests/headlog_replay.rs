@@ -806,6 +806,7 @@ impl Replay {
                     generation: 1,
                     payload: Bytes::copy_from_slice(&payload),
                     spilled: None,
+                    prepared_unix_ms: 0,
                 })
                 .encoded_len()
                     < size
@@ -842,6 +843,7 @@ impl Replay {
                             generation: lease,
                             payload: payload.clone(),
                             spilled: None,
+                            prepared_unix_ms: 0,
                         };
                         head.window.push(object_store_occ::headlog::WindowRecord {
                             encoded: record.encode_to_vec(),

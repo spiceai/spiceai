@@ -788,7 +788,7 @@ impl ObjectNativeCatalog {
             if self.registry.data_writes.allows() {
                 return Ok(());
             }
-            self.registry.follow_commits("").await?;
+            self.registry.follow_commits("", 0).await?;
             self.open_new_dataset_logs().await?;
             if self.routes.read().by_name.contains_key(name) {
                 return Ok(());

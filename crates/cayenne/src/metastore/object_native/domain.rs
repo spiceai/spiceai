@@ -1343,6 +1343,7 @@ impl Inner {
                 reader: DatasetStateReader::from_state(state, store, prefix).with_anchor(anchor),
                 head,
                 revision: 0,
+                followed_revisions: std::collections::VecDeque::new(),
                 reread: false,
                 data_writes: crate::catalog::DataWriteGate::closed(),
                 stop,
@@ -1384,13 +1385,17 @@ impl Inner {
 
     /// On a replica, apply the commits the writer made since this log last
     /// read its head: one conditional GET when nothing changed. Returns the
-    /// log's revision afterwards, and when the newest commit read was
-    /// published. The writer's own state is always current.
-    pub(super) async fn follow(&mut self) -> CatalogResult<crate::catalog::FollowedCommits> {
+    /// log's revision afterwards, and when the writer prepared the oldest
+    /// commit after revision `served`. The writer's own state is always
+    /// current.
+    pub(super) async fn follow(
+        &mut self,
+        served: u64,
+    ) -> CatalogResult<crate::catalog::FollowedCommits> {
         let Head::Replica(reader) = &mut self.head else {
             return Ok(crate::catalog::FollowedCommits {
                 revision: self.revision,
-                head_published_ms: None,
+                oldest_unserved_ms: None,
             });
         };
         let poll = if self.reread {
@@ -1402,9 +1407,12 @@ impl Inner {
             Poll::Unchanged => {}
             Poll::Records(entries) => {
                 if entries.is_empty() {
-                    return Ok(self.followed());
+                    return Ok(self.followed(served));
                 }
+                let oldest = Self::oldest_prepared(&entries)
+                    .unwrap_or_else(|| reader.published_ms());
                 self.revision += 1;
+                self.note_followed_revision(oldest);
                 if let Err(error) = Self::apply_followed(&mut self.reader.state, entries) {
                     self.reread = true;
                     return Err(error);
@@ -1418,17 +1426,43 @@ impl Inner {
                 self.reread = false;
             }
         }
-        Ok(self.followed())
+        Ok(self.followed(served))
     }
 
-    /// The revision, and when the head a replica last read was published.
-    fn followed(&self) -> crate::catalog::FollowedCommits {
+    /// When the writer prepared the oldest of `entries` that records it.
+    fn oldest_prepared(entries: &[object_store_occ::headlog::RecordWithCommit]) -> Option<u64> {
+        entries
+            .iter()
+            .map(|entry| entry.record.prepared_unix_ms)
+            .filter(|ms| *ms > 0)
+            .min()
+    }
+
+    /// Remember that the current revision's oldest commit was prepared at
+    /// `oldest_ms`.
+    fn note_followed_revision(&mut self, oldest_ms: u64) {
+        if self.followed_revisions.len() >= super::FOLLOWED_REVISIONS_KEPT {
+            self.followed_revisions.pop_front();
+        }
+        self.followed_revisions
+            .push_back((self.revision, oldest_ms));
+    }
+
+    /// The revision, and when the writer prepared the oldest commit a table
+    /// that serves revision `served` does not serve yet.
+    fn followed(&self, served: u64) -> crate::catalog::FollowedCommits {
+        let oldest_unserved_ms = if served == self.revision {
+            None
+        } else {
+            self.followed_revisions
+                .iter()
+                .find(|(revision, _)| *revision > served)
+                .or_else(|| self.followed_revisions.back())
+                .map(|(_, ms)| *ms)
+        };
         crate::catalog::FollowedCommits {
             revision: self.revision,
-            head_published_ms: match &self.head {
-                Head::Replica(reader) => Some(reader.published_ms()),
-                Head::Writer(_) => None,
-            },
+            oldest_unserved_ms,
         }
     }
 
@@ -1439,9 +1473,14 @@ impl Inner {
             Reader::open(Arc::clone(&self.reader.store), self.reader.prefix.clone())
                 .await
                 .map_err(super::read_failure)?;
+        // The records after the floor carry their commit times. Commits folded
+        // into the checkpoint are older, so a lag measured from these is a
+        // lower bound.
+        let oldest = Self::oldest_prepared(&opened.records).unwrap_or_else(|| reader.published_ms());
         let replayed = replay_state(opened)?;
         self.reader.state = replayed.state;
         self.revision += 1;
+        self.note_followed_revision(oldest);
         self.floor_state = replayed.floor_state;
         self.since_floor = replayed.since_floor;
         self.head = Head::Replica(Box::new(reader));

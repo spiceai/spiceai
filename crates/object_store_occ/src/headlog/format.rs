@@ -134,6 +134,11 @@ pub struct Record {
     /// Set when the payload is stored as its own object; `payload` is then empty.
     #[prost(message, optional, tag = "4")]
     pub spilled: Option<Spilled>,
+    /// When the writer prepared this record for publication, as Unix
+    /// milliseconds on its clock; 0 for a record from a writer that did not
+    /// record it. A retry of the attempt keeps the time of its first try.
+    #[prost(uint64, tag = "5")]
+    pub prepared_unix_ms: u64,
 }
 
 /// A payload stored at `records/<commit>-<attempt id hex>`, verified by its

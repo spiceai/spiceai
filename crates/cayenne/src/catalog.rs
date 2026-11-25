@@ -790,11 +790,11 @@ pub async fn commit_at_acknowledgement_for(
 pub struct FollowedCommits {
     /// The revision of the committed state, which changes whenever it does.
     pub revision: u64,
-    /// When the newest commit this instance has read was published, as Unix
-    /// milliseconds on the location's clock; `None` when it is not known
-    /// (a metastore this instance alone writes, or a log not read since it
-    /// opened).
-    pub head_published_ms: Option<u64>,
+    /// When the writer prepared the oldest commit after the caller's
+    /// `served_revision`, as Unix milliseconds on the writer's clock; `None`
+    /// when the caller serves every commit read (or this instance alone
+    /// writes the metastore).
+    pub oldest_unserved_ms: Option<u64>,
 }
 
 /// Trait for metadata catalog operations.
@@ -873,7 +873,11 @@ pub trait MetadataCatalog: Send + Sync {
     ///
     /// [`CatalogError::LocationUnreachable`] when the location did not answer
     /// the read; any other error when what it answered cannot be applied.
-    async fn follow_commits(&self, table_id: &str) -> CatalogResult<FollowedCommits>;
+    async fn follow_commits(
+        &self,
+        table_id: &str,
+        served_revision: u64,
+    ) -> CatalogResult<FollowedCommits>;
 
     /// Whether this instance may write `table_id`'s data to its location: open
     /// while it writes the table, closed while another instance does. Every

@@ -610,7 +610,7 @@ pub fn register_cayenne_telemetry() {
     let _ = meter
         .u64_observable_gauge("dataset_acceleration_replica_lag_ms")
         .with_description(
-            "On an instance that serves a dataset another instance writes: how long ago that instance published the newest commit this one does not serve yet, or 0 when it serves every commit it has read. Absent on the writer.",
+            "On an instance that serves a dataset another instance writes: how long ago that instance published the oldest commit this one does not serve yet, or 0 when it serves every commit it has read. Absent on the writer.",
         )
         .with_unit("ms")
         .with_callback(|obs| {

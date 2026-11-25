@@ -2926,11 +2926,11 @@ pub struct CayenneTableProvider {
     /// (strict) unless set ([`Self::set_replica_view_lag`]). Shared across all
     /// clones for the same table.
     replica_view_lag_ns: Arc<AtomicU64>,
-    /// When the newest commit this table has read but does not serve yet was
-    /// published, as Unix milliseconds on the location's clock; `u64::MAX`
+    /// When the writer prepared the oldest commit this table has read but does
+    /// not serve yet, as Unix milliseconds on the writer's clock; `u64::MAX`
     /// while it serves every commit it has read (see [`Self::replica_lag`]).
     /// Shared across all clones for the same table.
-    unserved_head_published_ms: Arc<AtomicU64>,
+    oldest_unserved_commit_ms: Arc<AtomicU64>,
     /// The dataset's store, for a table whose data path is an object-store URL:
     /// `url` is `cayenne://<table id>/` and `store` is [`Self::dataset_storage`]'s
     /// store, registered under that URL in each `RuntimeEnv` the table uses.
@@ -12555,7 +12555,7 @@ impl CayenneTableProvider {
             last_query_ns: Arc::new(AtomicU64::new(u64::MAX)),
             loaded_revision: Arc::new(AtomicU64::new(u64::MAX)),
             replica_view_lag_ns: Arc::new(AtomicU64::new(0)),
-            unserved_head_published_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            oldest_unserved_commit_ms: Arc::new(AtomicU64::new(u64::MAX)),
             object_store_config,
             dataset_storage,
             data_root,
@@ -15013,7 +15013,7 @@ impl CayenneTableProvider {
             last_query_ns: Arc::clone(&self.last_query_ns),
             loaded_revision: Arc::clone(&self.loaded_revision),
             replica_view_lag_ns: Arc::clone(&self.replica_view_lag_ns),
-            unserved_head_published_ms: Arc::clone(&self.unserved_head_published_ms),
+            oldest_unserved_commit_ms: Arc::clone(&self.oldest_unserved_commit_ms),
             object_store_config: self.object_store_config.clone(),
             dataset_storage: self.dataset_storage.clone(),
             data_root: Arc::clone(&self.data_root),
@@ -35397,22 +35397,24 @@ impl CayenneTableProvider {
     /// The caller holds `write_lock`, taken before the scan view's build
     /// admission: a rewrite takes them in that order too.
     async fn confirm_head(&self) -> Result<()> {
-        let followed = self.follow_head_within_deadline().await?;
+        let loaded = self.loaded_revision.load(Ordering::Acquire);
+        let followed = self.follow_head_within_deadline(loaded).await?;
         let revision = followed.revision;
-        if self.loaded_revision.load(Ordering::Acquire) != revision {
+        if loaded != revision {
             // Not served until the reload below completes; a reload that
-            // fails leaves it unserved, and the replica's lag grows.
-            let published_ms = followed
-                .head_published_ms
+            // fails leaves it unserved, and the replica's lag grows from the
+            // oldest commit it has not served.
+            let prepared_ms = followed
+                .oldest_unserved_ms
                 .unwrap_or_else(unix_time_ms_now)
                 .min(u64::MAX - 1);
-            self.unserved_head_published_ms
-                .store(published_ms, Ordering::Release);
+            self.oldest_unserved_commit_ms
+                .fetch_min(prepared_ms, Ordering::AcqRel);
             self.reload_from_catalog().await?;
             self.reload_cached_statistics_and_inline_state().await?;
             self.loaded_revision.store(revision, Ordering::Release);
         }
-        self.unserved_head_published_ms
+        self.oldest_unserved_commit_ms
             .store(u64::MAX, Ordering::Release);
         Ok(())
     }
@@ -35423,7 +35425,10 @@ impl CayenneTableProvider {
     /// transport failure, is *Location unreachable*. The read runs as a task of
     /// its own, so abandoning it never cuts a follow short: the next one waits
     /// for it, and is bounded the same way.
-    async fn follow_head_within_deadline(&self) -> Result<crate::catalog::FollowedCommits> {
+    async fn follow_head_within_deadline(
+        &self,
+        served_revision: u64,
+    ) -> Result<crate::catalog::FollowedCommits> {
         let unreachable = |cause: String| Error::QueryRead {
             source: crate::dataset_storage::QueryReadError::LocationUnreachable {
                 dataset: self.table_metadata.table_name.clone(),
@@ -35436,7 +35441,8 @@ impl CayenneTableProvider {
         };
         let catalog = Arc::clone(&self.catalog);
         let table_id = self.table_metadata.table_id.clone();
-        let follow = task::spawn(async move { catalog.follow_commits(&table_id).await });
+        let follow =
+            task::spawn(async move { catalog.follow_commits(&table_id, served_revision).await });
         let deadline = crate::metastore_layout::HEAD_CONFIRM_DEADLINE;
         match tokio::time::timeout(deadline, follow).await {
             Err(_) => Err(unreachable(format!(
@@ -35452,7 +35458,7 @@ impl CayenneTableProvider {
         }
     }
 
-    /// How long ago the writer published the newest commit this table does
+    /// How long ago the writer published the oldest commit this table does
     /// not serve yet, or zero when it serves every commit it has read; `None`
     /// for a table that writes its dataset, or whose data is not in the
     /// object-native location. Reported as `dataset_acceleration_replica_lag_ms`.
@@ -35461,12 +35467,12 @@ impl CayenneTableProvider {
         if !self.serves_from_writer() {
             return None;
         }
-        let published_ms = self.unserved_head_published_ms.load(Ordering::Acquire);
-        if published_ms == u64::MAX {
+        let prepared_ms = self.oldest_unserved_commit_ms.load(Ordering::Acquire);
+        if prepared_ms == u64::MAX {
             return Some(Duration::ZERO);
         }
         Some(Duration::from_millis(
-            unix_time_ms_now().saturating_sub(published_ms),
+            unix_time_ms_now().saturating_sub(prepared_ms),
         ))
     }
 

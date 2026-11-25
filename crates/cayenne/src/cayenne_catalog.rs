@@ -2619,11 +2619,12 @@ impl MetadataCatalog for CayenneCatalog {
     async fn follow_commits(
         &self,
         _table_id: &str,
+        _served_revision: u64,
     ) -> CatalogResult<crate::catalog::FollowedCommits> {
         // One process writes a SQLite metastore; its state is always current.
         Ok(crate::catalog::FollowedCommits {
             revision: 0,
-            head_published_ms: None,
+            oldest_unserved_ms: None,
         })
     }
 

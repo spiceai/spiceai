@@ -95,7 +95,7 @@ steps:
 
   # A starts first and writes the dataset.
   - start:
-      patch: { spicepod: { runtime: { state: { location: '${sources.state.path}' } } } }
+      patch: { spicepod: { runtime: { state: { location: 'file://${sources.state.path}/' } } } }
     only: a
     when: { location: local }
   - start:
@@ -120,7 +120,7 @@ steps:
   # B serves A's rows from the location, consuming nothing: the source still
   # has exactly one slot.
   - start:
-      patch: { spicepod: { runtime: { state: { location: '${sources.state.path}' } } } }
+      patch: { spicepod: { runtime: { state: { location: 'file://${sources.state.path}/' } } } }
     only: b
     when: { location: local }
   - start:

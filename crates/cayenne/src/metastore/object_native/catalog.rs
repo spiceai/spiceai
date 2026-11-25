@@ -75,8 +75,11 @@ impl MetadataCatalog for ObjectNativeCatalog {
     async fn follow_commits(
         &self,
         table_id: &str,
+        served_revision: u64,
     ) -> CatalogResult<crate::catalog::FollowedCommits> {
-        self.for_table(table_id).follow_commits(table_id).await
+        self.for_table(table_id)
+            .follow_commits(table_id, served_revision)
+            .await
     }
     async fn init(&self) -> CatalogResult<()> {
         self.on_every_log(|domain| async move { domain.init().await })

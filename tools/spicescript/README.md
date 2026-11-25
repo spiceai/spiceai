@@ -267,7 +267,7 @@ mapping's own keys winning: `params: { $merge: '${sources.lake.params}',
 file_format: parquet }`.
 
 **Placeholders**: `${sources.<name>.<field>}`, `${matrix.<key>}`,
-`${variant.name}`, `${instance.name}`, `${instance.dir}`, `${instance.port}`
+`${variant.name}`, `${instance.name}`, `${instance.id}` (its `SPICE_INSTANCE_ID`; `${instances.<name>.id}` names another instance's), `${instance.dir}`, `${instance.port}`
 (a free port for the script's own use), `${instance.http_port}` (the port
 `spiced` serves HTTP on, for a container that posts to it),
 `${instance.flight_port}` (the port it serves Flight on, for a
@@ -302,14 +302,14 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `spice: [args…]` | Run the `spice` CLI against the instance; `output-contains`, `expect-error`. |
 | `refresh: <dataset>` | Trigger a refresh and wait for it to finish; `expect-error`; `wait: false` only triggers it. |
 | `explain: <sql>` | `EXPLAIN` (`analyze: true`), requiring `contains:` fragments or the absence of `omits:` ones. |
-| `assert-status: { dataset, status, message-contains, ready, has, lacks }` | Check a dataset's status from `/v1/datasets`. |
+| `assert-status: { dataset, status, message-contains, ready, has, lacks, fields }` | Check a dataset's status from `/v1/datasets`; `fields: { writer: '${instances.a.id}' }` requires fields to equal these strings. |
 | `assert-log: { contains, lacks, count, clean, allow }` | Check the instance's `spiced.log` with regular expressions; `count: { <pattern>: N \| '>=N' }`. |
 | `assert-files: { contains, lacks, lacks-dirs }` | Check files under the instance's directory, by path relative to it (files only, not empty directories); `lacks-dirs` checks directories, empty ones included, as `<path>/`. |
 | `wipe-instance-dir: { keep }` | Delete everything `spiced` wrote in the instance's directory (`.spice/`, data and metastore files), as if the instance had lost its disk, keeping the spicepod, `spiced.log` and the `keep` paths (relative to the directory, such as a local state location). Refused while `spiced` or an executor runs; put `stop` or `kill-spiced` before it. |
 | `assert-objects: { source, prefix, contains, min, max }` | Require objects under a prefix of an object store or files source; `contains` counts only keys containing that text. `min` defaults to 1, or to 0 when `max` is given (`max: 0` requires none). |
 | `sample-objects: { source, prefix, contains, every, for, max-objects, max-bytes }` | Sample the count and total bytes of the objects under a prefix every `every` for `for` (at least six samples), as a series printed with the step. Fails when a sample is over `max-objects` or `max-bytes`, or when the series trends upward: the peak of its last third is more than a quarter (and at least one) above the peak of its middle third. Pair it with a `background` writer for a fixed-rate run. |
 | `mark-metrics: <id>` | Keep a `/metrics` scrape for a later `wait-metric … since:`. |
-| `wait-metric: { name, labels, above \| below \| increases \| increased-by, since, timeout, drive }` | Wait for a series to meet a condition. `drive` writes new data each round while waiting, for conditions (such as a compaction) that need new data rather than time. |
+| `wait-metric: { name, labels, above \| below \| increases \| increased-by \| absent, since, timeout, drive }` | Wait for a series to meet a condition; `absent: true` waits until no series with that name and labels is published. `drive` writes new data each round while waiting, for conditions (such as a compaction) that need new data rather than time. |
 | `background: { id, query \| source-exec, concurrency, every, expect }` | Loop a query or a source write until `stop-background: <id>`. `expect: { column: value }` is an invariant every answer must keep. `${round}` counts iterations. |
 | `stop-background: { id, allow }` | Stop it; fails on any error not matching `allow`. Prints the iteration count, the P99 latency and the commonest allowed errors. |
 | `load: { queries \| corpus, clients, duration \| count, expect, faults, recover-within, … }` | Queries from many clients at once, every answer checked, with faults applied while they run (see [Load](#load)). |
