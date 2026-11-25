@@ -47,7 +47,7 @@ const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 pub fn get_s3_dictionary_dataset(name: &str) -> Dataset {
     Dataset::new(
-        "s3://spiceai-public-datasets/dictionary_example/dictionary_example.parquet",
+        "s3://spice-datasets-gjezag77s0hu/dictionary_example/dictionary_example.parquet",
         name,
     )
 }

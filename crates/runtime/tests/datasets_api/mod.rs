@@ -56,7 +56,7 @@ const PERMISSION_STATUS_CONNECTOR: &str = "permissionstatus";
 
 fn get_s3_parquet_dataset(name: &str) -> SpicepodDataset {
     SpicepodDataset::new(
-        "s3://spiceai-public-datasets/dictionary_example/dictionary_example.parquet",
+        "s3://spice-datasets-gjezag77s0hu/dictionary_example/dictionary_example.parquet",
         name,
     )
 }

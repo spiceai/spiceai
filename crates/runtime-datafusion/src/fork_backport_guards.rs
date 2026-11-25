@@ -554,6 +554,88 @@ async fn several_count_distinct_over_nested_values_charge_each_value_once() {
     }
 }
 
+/// spiceai/datafusion#279 and #280. A join with a high fan-out yields many output
+/// batches per input batch without polling an input, so unless each output batch
+/// spends the cooperative budget, the task running it never yields: a cancelled
+/// or timed-out query cannot stop it, and on a single-threaded runtime nothing
+/// else runs. Each query here runs on a single-threaded runtime and must give its
+/// 100 ms read timeout a chance to fire. A sort-merge join sorts its inputs
+/// first, and that read yields, so its inputs are finite and share one key.
+#[test]
+fn every_join_yields_to_the_scheduler() {
+    let mut never_yielded = Vec::new();
+    for (operator, prefer_hash_join, sql) in [
+        (
+            "HashJoinExec",
+            true,
+            "SELECT max(a.value + b.value) FROM range(1, 10000) b JOIN range(1, 1000000000000) a ON a.value % 2 = b.value % 2",
+        ),
+        (
+            "SortMergeJoinExec",
+            false,
+            "SELECT max(a.value + b.value) FROM range(1, 20000) b JOIN range(1, 20000) a ON a.value / 1000000 = b.value / 1000000",
+        ),
+        (
+            "NestedLoopJoinExec",
+            true,
+            "SELECT max(a.value + b.value) FROM range(1, 10000) b JOIN range(1, 1000000000000) a ON a.value + b.value > 1",
+        ),
+        (
+            "CrossJoinExec",
+            true,
+            "SELECT max(a.value + b.value) FROM range(1, 10000) b CROSS JOIN range(1, 1000000000000) a",
+        ),
+    ] {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("runtime builds");
+            let result = runtime.block_on(async {
+                let ctx = spice_session(|config| {
+                    config.options_mut().optimizer.prefer_hash_join = prefer_hash_join;
+                    // One partition keeps repartition exchanges, which yield on their own, out
+                    // of the plan. A sort-merge join is planned only over several partitions.
+                    if prefer_hash_join {
+                        config.options_mut().execution.target_partitions = 1;
+                    }
+                });
+                let plan = ctx
+                    .sql(sql)
+                    .await
+                    .expect("query plans")
+                    .create_physical_plan()
+                    .await
+                    .expect("physical plan");
+                let shown = datafusion::physical_plan::displayable(plan.as_ref())
+                    .indent(false)
+                    .to_string();
+                assert!(
+                    shown.contains(operator),
+                    "{sql} is not planned with {operator}:\n{shown}"
+                );
+                let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())
+                    .expect("query executes");
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    futures::StreamExt::next(&mut stream),
+                )
+                .await
+                .is_err()
+            });
+            let _ = done.send(result);
+        });
+        if finished.recv_timeout(std::time::Duration::from_secs(30)) != Ok(true) {
+            never_yielded.push(operator);
+        }
+    }
+    assert!(
+        never_yielded.is_empty(),
+        "{never_yielded:?} never yielded, so their queries' read timeouts could not fire"
+    );
+}
+
 /// The SQL planner refuses a data type nested more than 64 array or struct
 /// levels deep, and still plans one at the limit.
 #[tokio::test(flavor = "multi_thread")]
@@ -612,6 +694,79 @@ async fn a_cast_to_a_mixed_array_and_struct_type_past_the_limit_is_refused() {
     .expect_err("65 levels exceed the limit");
     assert!(
         error.contains("SQL data type nesting depth exceeds the maximum of 64"),
+        "{error}"
+    );
+}
+
+/// apache/datafusion#23188, carried by spiceai/datafusion#306. `SIMILAR TO` was
+/// planned as an unanchored POSIX regex match, so `%` and `_` were literal and a
+/// pattern matched anywhere in the string: `'abc' SIMILAR TO 'a%'` was false and
+/// `'abc' SIMILAR TO 'b'` was true. It is a SQL pattern again: `%` is any string,
+/// `_` is one character, `.` is a literal, and the whole string must match. The
+/// answer is the same from a literal, an in-memory table and a Parquet table.
+#[tokio::test(flavor = "multi_thread")]
+async fn similar_to_matches_the_whole_string_with_sql_wildcards() {
+    let ctx = spice_session(|_| {});
+    assert_eq!(
+        answer(
+            &ctx,
+            "SELECT 'abc' SIMILAR TO 'a%', 'x' SIMILAR TO '_', 'abc' SIMILAR TO 'b', \
+             'abc' NOT SIMILAR TO 'b', 'a.' SIMILAR TO 'a.', 'ab' SIMILAR TO 'a.'"
+        )
+        .await,
+        Ok(owned(&["true,true,false,true,true,false"])),
+        "SIMILAR TO is anchored, with `%` and `_` as wildcards and `.` as a literal"
+    );
+
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let path = dir.path().join("similar_to_segments.parquet");
+    write_parquet(
+        &ctx,
+        "SELECT * FROM (VALUES ('AUTOMOBILE'), ('BUILDING'), ('FURNITURE'), ('MACHINERY'), \
+         ('HOUSEHOLD'), (NULL)) AS t(s)",
+        &path,
+    )
+    .await;
+    run_statements(
+        &ctx,
+        &[
+            "CREATE TABLE similar_to_memory(s VARCHAR) AS VALUES ('AUTOMOBILE'), ('BUILDING'), \
+             ('FURNITURE'), ('MACHINERY'), ('HOUSEHOLD'), (NULL)",
+            &format!(
+                "CREATE EXTERNAL TABLE similar_to_parquet STORED AS PARQUET LOCATION '{}'",
+                path.display()
+            ),
+        ],
+    )
+    .await;
+    for table in ["similar_to_memory", "similar_to_parquet"] {
+        for (predicate, expected) in [
+            (
+                "s SIMILAR TO '(AUTO|BUILD)%'",
+                &["AUTOMOBILE", "BUILDING"][..],
+            ),
+            (
+                "s NOT SIMILAR TO '(AUTO|BUILD)%'",
+                &["FURNITURE", "HOUSEHOLD", "MACHINERY"][..],
+            ),
+            ("s SIMILAR TO 'MACHIN'", &[][..]),
+            ("s SIMILAR TO '%URE'", &["FURNITURE"][..]),
+            ("s SIMILAR TO 'HOUSEHOL_'", &["HOUSEHOLD"][..]),
+        ] {
+            assert_eq!(
+                sorted_answer(&ctx, &format!("SELECT s FROM {table} WHERE {predicate}")).await,
+                Ok(sorted(expected)),
+                "{table} WHERE {predicate}"
+            );
+        }
+    }
+
+    // `ESCAPE` is refused rather than answered as if it were not there.
+    let error = answer(&ctx, "SELECT 'a%b' SIMILAR TO 'a!%b' ESCAPE '!'")
+        .await
+        .expect_err("SIMILAR TO ... ESCAPE must fail, not return a wrong answer");
+    assert!(
+        error.contains("SIMILAR TO does not support escape_char"),
         "{error}"
     );
 }

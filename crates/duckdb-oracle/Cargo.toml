@@ -1,0 +1,16 @@
+[package]
+name = "duckdb-oracle"
+edition.workspace = true
+version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adbc_core.workspace = true
+adbc_driver_manager.workspace = true
+arrow.workspace = true
+snafu.workspace = true
+
+[lints]
+workspace = true

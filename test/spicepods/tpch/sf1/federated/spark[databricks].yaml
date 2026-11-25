@@ -2,28 +2,28 @@ version: v1
 kind: Spicepod
 name: spark[databricks]-federated
 datasets:
-  - from: spark:spiceai_sandbox.tpch.customer
+  - from: spark:spiceai_ci.tpch.customer
     name: customer
     params: &spark_params
       spark_remote: sc://${ env:DATABRICKS_HOST }:443/;use_ssl=true;user_id=spice.ai;token=${ env:DATABRICKS_TOKEN };x-databricks-cluster-id=${ env:DATABRICKS_CLUSTER_ID };
-  - from: spark:spiceai_sandbox.tpch.lineitem
+  - from: spark:spiceai_ci.tpch.lineitem
     name: lineitem
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpch.nation
+  - from: spark:spiceai_ci.tpch.nation
     name: nation
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpch.orders
+  - from: spark:spiceai_ci.tpch.orders
     name: orders
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpch.part
+  - from: spark:spiceai_ci.tpch.part
     name: part
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpch.partsupp
+  - from: spark:spiceai_ci.tpch.partsupp
     name: partsupp
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpch.region
+  - from: spark:spiceai_ci.tpch.region
     name: region
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpch.supplier
+  - from: spark:spiceai_ci.tpch.supplier
     name: supplier
     params: *spark_params

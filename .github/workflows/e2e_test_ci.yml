@@ -927,7 +927,7 @@ jobs:
         run: |
           echo "datasets:" >> spicepod.yaml
           echo "  - name: test_parquet_table" >> spicepod.yaml
-          echo "    from: s3://spiceai-public-datasets/test_parquet_table/" >> spicepod.yaml
+          echo "    from: s3://spice-datasets-gjezag77s0hu/test_parquet_table/" >> spicepod.yaml
           echo "    params:" >> spicepod.yaml
           echo "      file_format: parquet" >> spicepod.yaml
 
@@ -2504,7 +2504,7 @@ jobs:
         run: |
 
           echo "catalogs:" >> spicepod.yaml
-          echo "  - from: databricks:spiceai_sandbox" >> spicepod.yaml
+          echo "  - from: databricks:spiceai_ci" >> spicepod.yaml
           echo "    name: db_uc" >> spicepod.yaml
           echo "    include:" >> spicepod.yaml
           echo "      - 'tpcds.*'" >> spicepod.yaml
@@ -2524,7 +2524,7 @@ jobs:
         id: databricks-token
         uses: ./.github/actions/databricks-oidc-token
         with:
-          host: ${{ vars.NEW_DATABRICKS_HOST }}
+          host: ${{ vars.CI_DATABRICKS_HOST }}
           client-id: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
           audience: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
 
@@ -2532,7 +2532,7 @@ jobs:
         id: aws-databricks-delta-new
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
           role-session-name: gha-databricks-delta-${{ github.run_id }}
           aws-region: us-east-1
           output-env-credentials: false
@@ -2545,7 +2545,7 @@ jobs:
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta-new.outputs.aws-access-key-id }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta-new.outputs.aws-secret-access-key }}
           AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta-new.outputs.aws-session-token }}
-          DATABRICKS_ENDPOINT: ${{ vars.NEW_DATABRICKS_HOST }}
+          DATABRICKS_ENDPOINT: ${{ vars.CI_DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ steps.databricks-token.outputs.token }}
         run: |
           spice run &> spice.log &
