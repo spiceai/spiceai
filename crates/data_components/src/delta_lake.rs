@@ -125,6 +125,14 @@ pub enum Error {
         table_url: String,
         source: object_store::Error,
     },
+
+    #[snafu(display(
+        "Failed to load Delta Lake table '{table_url}' because loading it stopped unexpectedly. This is a bug in Spice; report it at https://github.com/spiceai/spiceai/issues"
+    ))]
+    LoadTaskFailed {
+        table_url: String,
+        source: tokio::task::JoinError,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -167,7 +175,8 @@ impl Read for DeltaTableFactory {
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let delta_path = table_reference.table().to_string();
-        let delta: DeltaTable = DeltaTable::from(delta_path, self.params.clone(), &self.io_runtime)
+        let delta: DeltaTable = DeltaTable::open(delta_path, self.params.clone(), &self.io_runtime)
+            .await
             .boxed()?
             .with_table_parquet_options(self.table_parquet_options.clone());
         Ok(Arc::new(delta))
@@ -192,7 +201,48 @@ pub struct DeltaTable {
 }
 
 impl DeltaTable {
-    pub fn from(
+    /// Opens the Delta table at `table_location`.
+    ///
+    /// Reading the Delta log blocks the calling thread until the reads finish
+    /// (delta-kernel waits on its own background runtime), so the load runs on
+    /// the blocking pool. On a Tokio worker it would stall every task queued
+    /// behind it, including the tasks that drive the worker's I/O.
+    pub async fn open(
+        table_location: String,
+        options: HashMap<String, SecretString>,
+        io_runtime: &Handle,
+    ) -> Result<Self> {
+        let table_url = table_location.clone();
+        let io_runtime = io_runtime.clone();
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || {
+            span.in_scope(|| Self::from(table_location, options, &io_runtime))
+        })
+        .await
+        .context(LoadTaskFailedSnafu { table_url })?
+    }
+
+    /// Opens the Delta table at `table_location` through a pre-built object
+    /// store, bypassing the credential resolution in [`DeltaTable::open`].
+    ///
+    /// Used by Unity Catalog credential vending, where the store
+    /// authenticates with vended, refresh-aware credentials. Like
+    /// [`DeltaTable::open`], the blocking Delta log read runs on the blocking pool.
+    pub async fn open_with_object_store(
+        table_location: String,
+        object_store: Arc<dyn object_store::ObjectStore>,
+    ) -> Result<Self> {
+        let table_url = table_location.clone();
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || {
+            span.in_scope(|| Self::from_object_store(table_location, object_store))
+        })
+        .await
+        .context(LoadTaskFailedSnafu { table_url })?
+    }
+
+    /// Blocks until the Delta log is read; async callers use [`DeltaTable::open`].
+    fn from(
         table_location: String,
         options: HashMap<String, SecretString>,
         io_runtime: &Handle,
@@ -292,12 +342,9 @@ impl DeltaTable {
         Ok((parquet_store, engine))
     }
 
-    /// Creates a `DeltaTable` backed by a pre-built object store, bypassing
-    /// the credential resolution in [`DeltaTable::from`].
-    ///
-    /// Used by Unity Catalog credential vending, where the store
-    /// authenticates with vended, refresh-aware credentials.
-    pub fn from_object_store(
+    /// Blocks until the Delta log is read; async callers use
+    /// [`DeltaTable::open_with_object_store`].
+    fn from_object_store(
         table_location: String,
         object_store: Arc<dyn object_store::ObjectStore>,
     ) -> Result<Self> {
@@ -3760,6 +3807,135 @@ mod table_read_tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(log.join("00000000000000000000.json"), commit).expect("write commit");
+    }
+
+    /// An object store whose reads run on the runtime that opened the table, the way a
+    /// store served from inside the same process does.
+    #[derive(Debug)]
+    struct CallerRuntimeStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+        caller: Handle,
+    }
+
+    impl std::fmt::Display for CallerRuntimeStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CallerRuntimeStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl object_store::ObjectStore for CallerRuntimeStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            let inner = Arc::clone(&self.inner);
+            let location = location.clone();
+            self.caller
+                .spawn(async move { inner.get_opts(&location, options).await })
+                .await
+                .map_err(|e| object_store::Error::Generic {
+                    store: "CallerRuntimeStore",
+                    source: Box::new(e),
+                })?
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Opening a table through a pre-built object store must not read the Delta log on the
+    /// calling Tokio worker. With a single worker, a worker blocked on the log read leaves the
+    /// store's reads, which run on that same runtime, unable to make progress.
+    #[test]
+    fn open_with_object_store_does_not_block_the_calling_worker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_delta_log(dir.path(), ID_TS_SCHEMA, &[]);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(CallerRuntimeStore {
+            inner: Arc::new(
+                object_store::local::LocalFileSystem::new_with_prefix(dir.path())
+                    .expect("local store"),
+            ),
+            caller: runtime.handle().clone(),
+        });
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        runtime.spawn(async move {
+            let opened =
+                DeltaTable::open_with_object_store("s3://bucket/".to_string(), store).await;
+            sender
+                .send(opened.map(|table| {
+                    table
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|field| field.name().clone())
+                        .collect::<Vec<_>>()
+                }))
+                .expect("the test is waiting for the result");
+        });
+        let opened = receiver.recv_timeout(std::time::Duration::from_secs(30));
+        // A worker blocked on the log read never finishes, so don't wait for it on drop.
+        runtime.shutdown_background();
+
+        let columns = opened
+            .expect("the table must open without blocking the only Tokio worker")
+            .expect("the table opens");
+        assert_eq!(columns, vec!["id".to_string(), "ts".to_string()]);
     }
 
     /// Writes an `INT32` Parquet file whose columns carry the given (physical) names.
