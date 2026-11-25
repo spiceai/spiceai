@@ -73,6 +73,14 @@ pub struct DatasetInfo {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub next_refresh: Option<String>,
 
+    /// The instance that writes the dataset's acceleration, by its instance ID
+    /// (`SPICE_INSTANCE_ID`, which defaults to the host name). With several
+    /// instances on one state location this is the one instance writing the
+    /// dataset; otherwise it is this instance. Only included when
+    /// `status=true`, for an accelerated dataset whose writer is known.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub writer: Option<String>,
+
     /// Custom properties for the dataset
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
     pub properties: HashMap<String, serde_json::Value>,

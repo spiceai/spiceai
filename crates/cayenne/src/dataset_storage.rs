@@ -194,6 +194,67 @@ impl Display for DataFileError {
 
 impl std::error::Error for DataFileError {}
 
+/// *Location unreachable* (#16245): a query that serves another instance's
+/// writes could not confirm the dataset head at `location`, the shared state
+/// location, because of `cause`.
+#[must_use]
+pub fn location_unreachable_message(dataset: &str, location: &str, cause: &str) -> String {
+    format!(
+        "Failed to query dataset '{dataset}' (cayenne): the shared state location '{location}' did not respond, so the query fails rather than return results that may miss acknowledged writes. Retry once the location responds. Cause: {cause}"
+    )
+}
+
+/// *Query outlived its files* (#16245): a scan read past `retention` after the
+/// state it reads was confirmed, when the files it names may be reclaimed.
+#[must_use]
+pub fn query_outlived_files_message(dataset: &str, retention: std::time::Duration) -> String {
+    format!(
+        "Failed to query dataset '{dataset}' (cayenne): the query ran longer than {}, the time files are kept after compaction, so it stopped rather than return partial results. Rerun the query.",
+        crate::metastore_layout::describe_duration(retention)
+    )
+}
+
+/// Why a query of a dataset in the object-native location stopped before it
+/// read the dataset's state or files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryReadError {
+    /// The dataset head could not be confirmed (see
+    /// [`location_unreachable_message`]).
+    LocationUnreachable {
+        /// The dataset queried.
+        dataset: String,
+        /// The shared state location, without credentials.
+        location: String,
+        /// What the location answered, or that it did not answer in time.
+        cause: String,
+    },
+    /// The scan ran past the data-file retention (see
+    /// [`query_outlived_files_message`]).
+    OutlivedFiles {
+        /// The dataset queried.
+        dataset: String,
+        /// How long files stay in storage after a commit removes them.
+        retention: std::time::Duration,
+    },
+}
+
+impl Display for QueryReadError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LocationUnreachable {
+                dataset,
+                location,
+                cause,
+            } => f.write_str(&location_unreachable_message(dataset, location, cause)),
+            Self::OutlivedFiles { dataset, retention } => {
+                f.write_str(&query_outlived_files_message(dataset, *retention))
+            }
+        }
+    }
+}
+
+impl std::error::Error for QueryReadError {}
+
 /// A store for a dataset whose data is in a local directory addressed as
 /// `file:///…`: object paths are absolute paths without the leading `/`. A
 /// write survives a process crash (written to a temporary file, then renamed)
@@ -889,6 +950,27 @@ mod tests {
                 location
             ),
             "Failed to query dataset 'orders' (cayenne): deletion file 't/s/deletions/delete_1.arrow' is missing from 's3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000/data', so the query fails rather than return rows the dataset deleted. To reload the dataset from its source, start it once with `acceleration.mode: file_create`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        );
+    }
+
+    #[test]
+    fn the_replica_read_texts_name_the_dataset_the_location_and_what_to_do() {
+        assert_eq!(
+            QueryReadError::LocationUnreachable {
+                dataset: "orders".to_string(),
+                location: "s3://bucket/state".to_string(),
+                cause: "no answer within 10 seconds".to_string(),
+            }
+            .to_string(),
+            "Failed to query dataset 'orders' (cayenne): the shared state location 's3://bucket/state' did not respond, so the query fails rather than return results that may miss acknowledged writes. Retry once the location responds. Cause: no answer within 10 seconds"
+        );
+        assert_eq!(
+            QueryReadError::OutlivedFiles {
+                dataset: "orders".to_string(),
+                retention: std::time::Duration::from_hours(1),
+            }
+            .to_string(),
+            "Failed to query dataset 'orders' (cayenne): the query ran longer than 1 hour, the time files are kept after compaction, so it stopped rather than return partial results. Rerun the query."
         );
     }
 

@@ -75,6 +75,95 @@ use vortex_datafusion::VortexSource;
 pub(crate) struct SnapshotScanRef {
     refs: Arc<Mutex<SnapshotScanRefs>>,
     snapshot_ids: Vec<String>,
+    /// For a table that serves another instance's writes, the time after
+    /// which a scan of the captured files stops (see [`ReadDeadline`]). Set
+    /// once, when the scan view holding this guard is first planned.
+    read_deadline: OnceLock<ReadDeadline>,
+}
+
+/// When a scan of a table that serves another instance's writes must stop
+/// reading: the files the scan view names stay in storage for the data-file
+/// retention after a commit of that instance removes them (see
+/// [`crate::metastore_layout::data_file_retention`]), and that commit came
+/// after the view's state was confirmed current. A scan still reading past
+/// `confirmed_at + retention` stops with
+/// [`crate::dataset_storage::QueryReadError::OutlivedFiles`] rather than read
+/// a file that may be reclaimed.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadDeadline {
+    deadline: std::time::Instant,
+    retention: std::time::Duration,
+    dataset: Arc<str>,
+}
+
+impl ReadDeadline {
+    /// The deadline of a scan view whose state was confirmed current at
+    /// `confirmed_at`: for a view that serves another instance's writes, when
+    /// the read of the head was sent.
+    pub(crate) fn new(
+        confirmed_at: std::time::Instant,
+        retention: std::time::Duration,
+        dataset: Arc<str>,
+    ) -> Self {
+        Self {
+            deadline: confirmed_at + retention,
+            retention,
+            dataset,
+        }
+    }
+
+    fn passed(&self) -> bool {
+        std::time::Instant::now() >= self.deadline
+    }
+
+    fn error(&self) -> DataFusionError {
+        DataFusionError::External(Box::new(
+            crate::dataset_storage::QueryReadError::OutlivedFiles {
+                dataset: self.dataset.to_string(),
+                retention: self.retention,
+            },
+        ))
+    }
+}
+
+/// A scan's output, stopped with [`ReadDeadline::error`] once its deadline
+/// passes: checked before each read of the input, so no read starts after
+/// it, and applied to an input error that arrives after it, which may be a
+/// file reclaimed under a read that started just before.
+struct ReadDeadlineStream {
+    input: SendableRecordBatchStream,
+    deadline: ReadDeadline,
+    stopped: bool,
+}
+
+impl futures::Stream for ReadDeadlineStream {
+    type Item = Result<arrow::record_batch::RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.stopped {
+            return std::task::Poll::Ready(None);
+        }
+        if self.deadline.passed() {
+            self.stopped = true;
+            return std::task::Poll::Ready(Some(Err(self.deadline.error())));
+        }
+        match self.input.poll_next_unpin(cx) {
+            std::task::Poll::Ready(Some(Err(_))) if self.deadline.passed() => {
+                self.stopped = true;
+                std::task::Poll::Ready(Some(Err(self.deadline.error())))
+            }
+            other => other,
+        }
+    }
+}
+
+impl datafusion_execution::RecordBatchStream for ReadDeadlineStream {
+    fn schema(&self) -> SchemaRef {
+        self.input.schema()
+    }
 }
 
 /// Per-snapshot scan refcounts for snapshot-folder cleanup.
@@ -93,7 +182,22 @@ impl SnapshotScanRef {
                 *map.snapshots.entry(id.clone()).or_insert(0) += 1;
             }
         }
-        Arc::new(Self { refs, snapshot_ids })
+        Arc::new(Self {
+            refs,
+            snapshot_ids,
+            read_deadline: OnceLock::new(),
+        })
+    }
+
+    /// Stop every scan holding this guard at `deadline`. The first call wins:
+    /// a scan view's guard is shared by every scan planned from the view, and
+    /// the view's confirmation time does not change.
+    pub(crate) fn limit_reads(&self, deadline: ReadDeadline) {
+        let _ = self.read_deadline.set(deadline);
+    }
+
+    fn read_deadline(&self) -> Option<&ReadDeadline> {
+        self.read_deadline.get()
     }
 }
 
@@ -1301,10 +1405,27 @@ impl ExecutionPlan for CayenneAccelerationExec {
         // per batch; it drops (releasing the ref-count) when the stream is fully
         // consumed or dropped. `None` on the inner per-snapshot wrappers.
         let scan_guard = self.scan_guard.clone();
+        let read_deadline = scan_guard
+            .as_ref()
+            .and_then(|guard| guard.read_deadline().cloned());
         let mapped = mapped.map(move |item| {
             let _hold = &scan_guard;
             item
         });
+        // A scan of a dataset in the object-native location stops once the
+        // files it reads may be reclaimed (see `ReadDeadline`).
+        let mapped: futures::stream::BoxStream<'static, Result<arrow::record_batch::RecordBatch>> =
+            match read_deadline {
+                Some(deadline) => Box::pin(ReadDeadlineStream {
+                    input: Box::pin(RecordBatchStreamAdapter::new(
+                        Arc::clone(&schema),
+                        mapped,
+                    )),
+                    deadline,
+                    stopped: false,
+                }),
+                None => mapped.boxed(),
+            };
         // Charge this scan's canonicalized batches against the query pool. Two
         // conditions gate it:
         //

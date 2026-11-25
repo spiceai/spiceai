@@ -1228,11 +1228,14 @@ async fn create_instances(
             } else {
                 loopback_ip
             };
+            // Spice derives replication slot names from this, so instances
+            // sharing a source do not take each other's slots.
+            let instance_id = format!("{run_id}-{index}");
             let context = json!({
                 "sources": source_ctx,
                 "matrix": combo,
                 "variant": { "name": variant_name },
-                "instance": { "name": label, "dir": dir.display().to_string(), "port": crate::docker::free_port_on(node_ip)?,
+                "instance": { "name": label, "id": instance_id, "dir": dir.display().to_string(), "port": crate::docker::free_port_on(node_ip)?,
                     "executor_port": crate::docker::free_port_on(node_ip)?, "http_port": http_port,
                     "flight_port": crate::docker::free_port_on(node_ip)?,
                     "host_from_container": host_from_container },
@@ -1320,9 +1323,7 @@ async fn create_instances(
                     );
                 }
             }
-            // Spice derives replication slot names from this, so instances
-            // sharing a source do not take each other's slots.
-            env.insert("SPICE_INSTANCE_ID".into(), format!("{run_id}-{index}"));
+            env.insert("SPICE_INSTANCE_ID".into(), instance_id.clone());
             let first_binary = options
                 .from_override
                 .as_ref()
@@ -1447,6 +1448,20 @@ async fn create_instances(
                 key_room: None,
             });
         }
+    }
+    // Every instance's steps can name every instance's `SPICE_INSTANCE_ID`,
+    // as `${instances.<name>.id}`.
+    let ids: Map<String, Value> = instances
+        .iter()
+        .map(|instance| {
+            (
+                instance.label.clone(),
+                json!({ "id": instance.context["instance"]["id"] }),
+            )
+        })
+        .collect();
+    for instance in &mut instances {
+        instance.context["instances"] = Value::Object(ids.clone());
     }
     Ok(instances)
 }

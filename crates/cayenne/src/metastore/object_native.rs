@@ -46,6 +46,10 @@ struct Domain {
     /// The writer lease that decides whether this instance writes the log,
     /// under [`Access::Leased`].
     lease: Option<WriterLease>,
+    /// The instance that writes the log, by the identity its lease names, as
+    /// this instance last read the lease; `None` until it has, or while the
+    /// lease names no holder. Only for a log with a lease.
+    writer: tokio::sync::watch::Sender<Option<Arc<str>>>,
 }
 
 /// A log's writer lease, as this instance holds or watches it.
@@ -256,6 +260,19 @@ fn position(source: &str, partition: &str, value: Option<Vec<u8>>) -> Action {
 fn invalid(error: impl std::fmt::Display) -> CatalogError {
     CatalogError::InvalidOperationNoSource {
         message: error.to_string(),
+    }
+}
+/// A failed read of a log: [`CatalogError::LocationUnreachable`] when the
+/// store did not answer (a transport failure or a server error, after the
+/// store's own retries), any other error when its answer cannot be used.
+fn read_failure(error: object_store_occ::headlog::Error) -> CatalogError {
+    match &error {
+        object_store_occ::headlog::Error::Storage {
+            source: object_store::Error::Generic { .. } | object_store::Error::JoinError { .. },
+        } => CatalogError::LocationUnreachable {
+            message: error.to_string(),
+        },
+        _ => invalid(error),
     }
 }
 fn validate_uuid(name: &str, value: &str) -> CatalogResult<()> {

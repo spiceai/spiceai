@@ -177,7 +177,7 @@ pub use staging_wal::{CayenneStagedAppend, PartitionedWalObjectStore, PreparedSt
 pub use table::{
     CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder, FileDeletionHold,
     IndexPersistence, LastSmallFileCompactPath, LookupIndexSnapshotHold,
-    PreparedAppendSnapshotPublish, ScanViewReuse, SnapshotDirPins,
+    PreparedAppendSnapshotPublish, ScanViewReuse, SnapshotDirPins, replica_lags,
 };
 pub use transaction::{CayenneTransaction, TransactionCommit, TxnTable};
 pub use tuning::{
@@ -205,6 +205,13 @@ pub enum Error {
     /// Catalog operation failed (DB commit, sequence increment, partition ops).
     #[snafu(display("{source}"))]
     Catalog { source: CatalogError },
+
+    /// A query of a dataset in the object-native location could not read its
+    /// state or files (see [`crate::dataset_storage::QueryReadError`]).
+    #[snafu(display("{source}"))]
+    QueryRead {
+        source: crate::dataset_storage::QueryReadError,
+    },
 
     /// `DataFusion` plan/execution error (scan, sort, insert, listing table ops).
     #[snafu(transparent)]

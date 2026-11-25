@@ -4923,8 +4923,10 @@ impl DataFusion {
             Some(engine) => engine.writer_role(dataset).await,
             None => None,
         };
-        let replica = writer_role.as_ref().is_some_and(|role| !*role.borrow());
-        if writer_role.is_some() {
+        let replica = writer_role.as_ref().is_some_and(|role| !*role.writes.borrow());
+        if let Some(role) = &writer_role {
+            self.runtime_status()
+                .set_dataset_writer(&dataset.name, role.writer.clone());
             // The writer records its completed initial load in the location;
             // a replica is ready from then on.
             let initial_load = shared_initial_load_record(dataset).await?;
@@ -7896,11 +7898,12 @@ const WRITER_ROLE_RELOAD_RETRY: Duration = Duration::from_secs(15);
 /// be reached, say), it asks again, and a reload that replaces the table ends
 /// it.
 async fn watch_writer_role(
-    mut role: data_accelerator_api::WriterRole,
+    role: data_accelerator_api::WriterRole,
     built_as_writer: bool,
     dataset: TableReference,
     reloads: tokio::sync::mpsc::UnboundedSender<TableReference>,
 ) {
+    let mut role = role.writes;
     loop {
         if *role.borrow_and_update() == built_as_writer {
             if role.changed().await.is_err() {

@@ -738,6 +738,8 @@ pub enum MetricCondition {
         amount: f64,
         since: Option<String>,
     },
+    /// No series with this name and labels is published.
+    Absent,
 }
 
 #[derive(Debug, Clone)]
@@ -763,6 +765,9 @@ pub struct StatusStep {
     /// Fields of the dataset's status that must be set, or must be absent.
     pub has: Vec<String>,
     pub lacks: Vec<String>,
+    /// Fields of the dataset's status that must equal these strings, which
+    /// take placeholders (`${instances.<variant>.id}`).
+    pub fields: BTreeMap<String, String>,
     pub timing: Timing,
 }
 
@@ -1986,6 +1991,9 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
             let lacks = inner
                 .parse("lacks", "`lacks` must be a list of field names")?
                 .unwrap_or_default();
+            let fields = inner
+                .parse("fields", "`fields` must map field names to string values")?
+                .unwrap_or_default();
             inner.finish()?;
             let timing = opts.timing("a check")?;
             Action::AssertStatus(StatusStep {
@@ -1995,6 +2003,7 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
                 ready,
                 has,
                 lacks,
+                fields,
                 timing,
             })
         }
@@ -2509,6 +2518,9 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
             }
             if inner.bool("increases")? {
                 conditions.push(MetricCondition::Increases);
+            }
+            if inner.bool("absent")? {
+                conditions.push(MetricCondition::Absent);
             }
             if let Some(v) = inner.take("increased-by") {
                 conditions.push(MetricCondition::IncreasedBy {

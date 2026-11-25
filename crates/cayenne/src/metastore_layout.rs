@@ -57,6 +57,96 @@ pub use util::spice_paths::fs_probe_path;
 /// folder, and the folder `file_create` replaces, stay as long.
 pub const DATA_FILE_RETENTION: std::time::Duration = std::time::Duration::from_hours(1);
 
+/// Replaces [`DATA_FILE_RETENTION`], in seconds, for end-to-end tests that must
+/// see a scan outlive it within a test's run time. Every instance on one
+/// location must use the same value. Not a setting: the retention is fixed.
+const TEST_DATA_FILE_RETENTION_ENV: &str = "SPICE_TEST_CAYENNE_DATA_FILE_RETENTION_SECS";
+
+/// How long a query may read a dataset's data files after the state it reads
+/// was confirmed current, and how long a removed file stays in storage after
+/// the sweep first observes the removal: [`DATA_FILE_RETENTION`], unless an
+/// end-to-end test shortens it.
+#[must_use]
+pub fn data_file_retention() -> std::time::Duration {
+    static RETENTION: std::sync::LazyLock<std::time::Duration> = std::sync::LazyLock::new(|| {
+        std::env::var(TEST_DATA_FILE_RETENTION_ENV)
+            .ok()
+            .and_then(|secs| secs.parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .map_or(DATA_FILE_RETENTION, std::time::Duration::from_secs)
+    });
+    *RETENTION
+}
+
+/// How long the writer waits, after it first observes that a commit removed a
+/// file, before it deletes the file: the retention plus a twelfth of it. A
+/// query stops reading at the retention itself (see
+/// [`data_file_retention`]), so a read already in flight then, and a
+/// difference in clock rate between instances, never meet a deleted file.
+#[must_use]
+pub fn data_file_reclaim_after() -> std::time::Duration {
+    let retention = data_file_retention();
+    retention + retention / 12
+}
+
+/// How long a query that serves another instance's writes waits for its read
+/// of the dataset head, counted from when the read was sent. A query that does
+/// not have the head confirmed by then fails rather than answer from a state it
+/// could not confirm (S in `docs/design/object-native-metastore.md`, 1.10).
+pub const HEAD_CONFIRM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A duration for a user-facing message: whole hours, minutes or seconds, such
+/// as "1 hour", "90 minutes" or "15 seconds".
+#[must_use]
+pub fn describe_duration(duration: std::time::Duration) -> String {
+    let secs = duration.as_secs();
+    let (amount, unit) = if secs >= 3600 && secs.is_multiple_of(3600) {
+        (secs / 3600, "hour")
+    } else if secs >= 60 && secs.is_multiple_of(60) {
+        (secs / 60, "minute")
+    } else {
+        (secs, "second")
+    };
+    if amount == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{amount} {unit}s")
+    }
+}
+
+/// The state location (`runtime.state.location`) a dataset's data path in the
+/// object-native location is under, for messages: `s3://bucket/state` for
+/// `s3://bucket/state/cayenne/v1/datasets/<folder>/data`. Credentials and query
+/// parameters are removed. `None` for any other path.
+#[must_use]
+pub fn state_location_of(data_path: &str) -> Option<String> {
+    if !is_object_native_data_path(data_path) {
+        return None;
+    }
+    let mut url = url::Url::parse(data_path).ok()?;
+    let segments: Vec<String> = url
+        .path()
+        .trim_matches('/')
+        .split('/')
+        .map(str::to_string)
+        .collect();
+    // `<location>/cayenne/v1/datasets/<folder>/data`.
+    let keep = segments
+        .len()
+        .checked_sub(if segments.len() >= 5 && segments[segments.len() - 5] == "cayenne" {
+            5
+        } else {
+            4
+        })?;
+    url.set_path(&format!("/{}", segments[..keep].join("/")));
+    url.set_query(None);
+    url.set_fragment(None);
+    // Fails only for a URL that cannot carry credentials, which then has none.
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    Some(url.as_str().trim_end_matches('/').to_string())
+}
+
 /// Configuration error for data outside the object-native state location.
 #[must_use]
 pub fn object_native_data_path_refusal(dataset: &str) -> String {
@@ -450,6 +540,44 @@ pub fn is_object_native_data_path(path: &str) -> bool {
         segments.as_slice(),
         [.., "v1", "datasets", folder, "data"] if !folder.is_empty()
     )
+}
+
+#[cfg(test)]
+mod replica_read_message_tests {
+    use super::{describe_duration, state_location_of};
+    use std::time::Duration;
+
+    #[test]
+    fn the_state_location_is_the_data_path_without_the_dataset_folder() {
+        assert_eq!(
+            state_location_of(
+                "s3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000/data"
+            )
+            .as_deref(),
+            Some("s3://bucket/state")
+        );
+        assert_eq!(
+            state_location_of(
+                "s3://key:secret@bucket/state/cayenne/v1/datasets/orders-0190c2c4/data?sig=abc"
+            )
+            .as_deref(),
+            Some("s3://bucket/state")
+        );
+        assert_eq!(
+            state_location_of("file:///var/spice/cayenne/v1/datasets/orders-0190c2c4/data")
+                .as_deref(),
+            Some("file:///var/spice")
+        );
+        assert_eq!(state_location_of("s3://bucket/orders/data"), None);
+    }
+
+    #[test]
+    fn durations_read_in_whole_units() {
+        assert_eq!(describe_duration(Duration::from_hours(1)), "1 hour");
+        assert_eq!(describe_duration(Duration::from_secs(90 * 60)), "90 minutes");
+        assert_eq!(describe_duration(Duration::from_secs(15)), "15 seconds");
+        assert_eq!(describe_duration(Duration::from_secs(1)), "1 second");
+    }
 }
 
 #[cfg(test)]

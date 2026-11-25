@@ -132,6 +132,11 @@ impl WriterLease {
     fn renew_every(&self) -> std::time::Duration {
         self.lease.duration() / 3
     }
+
+    /// The identity this instance's lease names when it holds it.
+    fn identity(&self) -> Arc<str> {
+        Arc::from(self.lease.holder().identity())
+    }
 }
 
 impl Domain {
@@ -155,6 +160,15 @@ impl Domain {
             }
         };
         let dataset = &lease.dataset;
+        let writer = match &role {
+            LeaseRole::Holder { .. } => Some(lease.identity()),
+            LeaseRole::Standby { holder } => holder.as_deref().map(Arc::from),
+        };
+        self.writer.send_if_modified(|current| {
+            let changed = *current != writer;
+            *current = writer;
+            changed
+        });
         match role {
             LeaseRole::Holder {
                 valid_until,
@@ -397,15 +411,20 @@ impl Domain {
         };
         let mut config = config;
         let mut valid_until = None;
+        let writer = tokio::sync::watch::Sender::new(None);
         if let Some(lease) = &lease {
             config.access = match lease.acquire().await? {
                 LeaseRole::Holder {
                     valid_until: until, ..
                 } => {
                     valid_until = Some(until);
+                    writer.send_replace(Some(lease.identity()));
                     Access::Writer
                 }
-                LeaseRole::Standby { .. } => Access::Replica,
+                LeaseRole::Standby { holder } => {
+                    writer.send_replace(holder.map(Arc::from));
+                    Access::Replica
+                }
             };
         }
         let data_writes = match config.access {
@@ -432,6 +451,7 @@ impl Domain {
             folder: String::new(),
             data_writes,
             lease,
+            writer,
             inner: Arc::new(StateSlot {
                 available: Notify::new(),
                 reserved: std::sync::atomic::AtomicBool::new(false),
@@ -1364,21 +1384,25 @@ impl Inner {
 
     /// On a replica, apply the commits the writer made since this log last
     /// read its head: one conditional GET when nothing changed. Returns the
-    /// log's revision afterwards. The writer's own state is always current.
-    pub(super) async fn follow(&mut self) -> CatalogResult<u64> {
+    /// log's revision afterwards, and when the newest commit read was
+    /// published. The writer's own state is always current.
+    pub(super) async fn follow(&mut self) -> CatalogResult<crate::catalog::FollowedCommits> {
         let Head::Replica(reader) = &mut self.head else {
-            return Ok(self.revision);
+            return Ok(crate::catalog::FollowedCommits {
+                revision: self.revision,
+                head_published_ms: None,
+            });
         };
         let poll = if self.reread {
             Poll::Reopen
         } else {
-            reader.poll().await.map_err(invalid)?
+            reader.poll().await.map_err(super::read_failure)?
         };
         match poll {
             Poll::Unchanged => {}
             Poll::Records(entries) => {
                 if entries.is_empty() {
-                    return Ok(self.revision);
+                    return Ok(self.followed());
                 }
                 self.revision += 1;
                 if let Err(error) = Self::apply_followed(&mut self.reader.state, entries) {
@@ -1394,7 +1418,18 @@ impl Inner {
                 self.reread = false;
             }
         }
-        Ok(self.revision)
+        Ok(self.followed())
+    }
+
+    /// The revision, and when the head a replica last read was published.
+    fn followed(&self) -> crate::catalog::FollowedCommits {
+        crate::catalog::FollowedCommits {
+            revision: self.revision,
+            head_published_ms: match &self.head {
+                Head::Replica(reader) => Some(reader.published_ms()),
+                Head::Writer(_) => None,
+            },
+        }
     }
 
     /// Read the committed log again from its head and follow it from there as
@@ -1403,7 +1438,7 @@ impl Inner {
         let (reader, opened) =
             Reader::open(Arc::clone(&self.reader.store), self.reader.prefix.clone())
                 .await
-                .map_err(invalid)?;
+                .map_err(super::read_failure)?;
         let replayed = replay_state(opened)?;
         self.reader.state = replayed.state;
         self.revision += 1;

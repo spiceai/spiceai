@@ -35,6 +35,14 @@ use std::sync::Arc;
 #[expect(missing_docs)]
 #[derive(Debug, Snafu)]
 pub enum CatalogError {
+    /// The state location did not answer a read: a transport failure or a
+    /// server error, as opposed to an answer that cannot be applied.
+    #[snafu(display("{message}"))]
+    LocationUnreachable {
+        /// What the store reported.
+        message: String,
+    },
+
     /// Database error
     #[snafu(display("Database error: {message}"))]
     Database {
@@ -777,6 +785,18 @@ pub async fn commit_at_acknowledgement_for(
     catalog.commit_pending_for(table_id).await
 }
 
+/// What [`MetadataCatalog::follow_commits`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FollowedCommits {
+    /// The revision of the committed state, which changes whenever it does.
+    pub revision: u64,
+    /// When the newest commit this instance has read was published, as Unix
+    /// milliseconds on the location's clock; `None` when it is not known
+    /// (a metastore this instance alone writes, or a log not read since it
+    /// opened).
+    pub head_published_ms: Option<u64>,
+}
+
 /// Trait for metadata catalog operations.
 ///
 /// This trait provides the core operations needed to manage a Cayenne catalog,
@@ -848,7 +868,12 @@ pub trait MetadataCatalog: Send + Sync {
     ///
     /// No default: a wrapper must forward it, or its replica never sees new
     /// commits.
-    async fn follow_commits(&self, table_id: &str) -> CatalogResult<u64>;
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::LocationUnreachable`] when the location did not answer
+    /// the read; any other error when what it answered cannot be applied.
+    async fn follow_commits(&self, table_id: &str) -> CatalogResult<FollowedCommits>;
 
     /// Whether this instance may write `table_id`'s data to its location: open
     /// while it writes the table, closed while another instance does. Every

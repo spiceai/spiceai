@@ -280,6 +280,7 @@ pub(super) async fn wait_metric(
         let text = instance.spiced.metrics().await?;
         let value = read(&text, &w.name);
         let met = match (&w.condition, value) {
+            (MetricCondition::Absent, value) => value.is_none(),
             (_, None) => false,
             (MetricCondition::Above(x), Some(v)) => v > *x,
             (MetricCondition::Below(x), Some(v)) => v < *x,
@@ -355,6 +356,14 @@ pub(super) async fn assert_status(instance: &mut Instance, step: &StatusStep) ->
             }
             for field in &step.lacks {
                 ensure!(!set(field), "expected no `{field}`, saw {info}");
+            }
+            for (field, want) in &step.fields {
+                let want = instance.sql(want)?;
+                let seen = info.get(field).and_then(Value::as_str);
+                ensure!(
+                    seen == Some(want.as_str()),
+                    "expected `{field}` to be '{want}', saw {info}"
+                );
             }
             Ok::<_, anyhow::Error>(seen)
         }
