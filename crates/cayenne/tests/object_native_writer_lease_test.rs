@@ -33,7 +33,7 @@ use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 use object_store_sim::Op;
-use object_store_sim::fault::FaultStore;
+use object_store_sim::fault::{Fault, FaultStore};
 
 const LOCATION: &str = "s3://bucket/state/cayenne/v1";
 const TABLE: &str = "orders";
@@ -170,6 +170,45 @@ impl Instance {
             }
             Err(error) => Err(format!("get_table: {error}")),
         }
+    }
+
+    /// Load the dataset as the accelerator does, defined as `definition`.
+    async fn load_defined(
+        &self,
+        definition: Option<cayenne::DatasetDefinition>,
+    ) -> Result<(), String> {
+        let table = self
+            .builder(&self.data_url)
+            .create(CreateTableOptions {
+                table_name: TABLE.to_string(),
+                schema: schema(),
+                primary_key: Vec::new(),
+                on_conflict: None,
+                base_path: self.data_url.clone(),
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    inline_max_rows: 0,
+                    inline_max_bytes: 0,
+                    definition: definition.map(Arc::new),
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let _ = self.ctx.deregister_table(TABLE);
+        self.ctx
+            .register_table(TABLE, Arc::new(table))
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Whether this instance writes the dataset now.
+    fn writes_dataset(&self) -> bool {
+        self.catalog
+            .as_any()
+            .downcast_ref::<ObjectNativeCatalog>()
+            .and_then(|catalog| catalog.writer_watch(TABLE))
+            .is_some_and(|watch| *watch.borrow())
     }
 
     /// Open (or open again) the table, as the runtime does when it loads a
@@ -556,4 +595,93 @@ async fn a_writer_whose_lease_requests_recover_writes_again() {
         }
     }
     assert_eq!(a.count_and_sum().await, expected(1..=200));
+}
+
+/// `orders` from one `from`, at the server `host` names.
+fn defined_at(app: &str, host: &str) -> cayenne::DatasetDefinition {
+    cayenne::DatasetDefinition::new(app)
+        .with_setting("from", "postgres:public.orders")
+        .with_connection([("pg_connection_string", host, true)])
+}
+
+/// The dataset's own writer lease object, not the registry's.
+fn dataset_lease(path: &Path) -> bool {
+    path.as_ref().contains("/datasets/") && path.as_ref().ends_with("leases/writer.json")
+}
+
+/// An instance whose Spicepod defines the dataset differently is refused its
+/// copy, and never becomes its writer: not even when the lease request that
+/// takes the copy over, once its writer stopped, was in flight while it was
+/// refused. It hands that lease back, so the next instance that matches the
+/// copy writes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_instance_refused_its_copy_hands_back_a_lease_it_won_meanwhile() {
+    let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let a = Instance::start(&objects, "a", LEASE).await;
+    a.load_defined(Some(defined_at("shop", "db-a")))
+        .await
+        .expect("A creates the copy");
+    let b = Instance::start(&objects, "b", LEASE).await;
+    assert!(!b.writes_dataset(), "B opens the copy as a replica");
+
+    // A stops without handing its lease back. Once it lapses, B's request to
+    // take the dataset over is held before it reaches the store.
+    b.requests.arm(Op::Cas, dataset_lease, Fault::Hold);
+    drop(a);
+    let held = b.requests.wait_held(None).await;
+
+    let error = b
+        .load_defined(Some(defined_at("store", "db-b")))
+        .await
+        .expect_err("another definition is refused");
+    assert!(
+        error.contains(
+            "was built from a different definition (one of the secret settings `pg_connection_string` changed)"
+        ),
+        "{error}"
+    );
+    assert!(!error.contains("db-a") && !error.contains("db-b"), "{error}");
+
+    // The takeover lands, and B learns it holds the lease.
+    b.requests.deliver(held).await.expect("the takeover lands");
+    b.requests.respond(held).expect("B reads its answer");
+    let deadline = Instant::now() + LEASE * 2;
+    while Instant::now() < deadline {
+        assert!(!b.writes_dataset(), "B became the writer of a copy it does not serve");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // An instance with the copy's definition writes it.
+    let c = Instance::start(&objects, "c", LEASE).await;
+    c.load_defined(Some(defined_at("shop", "db-a")))
+        .await
+        .expect("C serves the copy");
+    c.insert_once_writer(&c.data_url.clone(), 1, 10).await;
+    assert_eq!(c.count_and_sum().await, expected(1..=10));
+}
+
+/// A copy created before copies recorded their definitions has none until its
+/// writer records one. A replica waits for that record instead of serving a
+/// copy it cannot compare with, then is refused when it differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replica_waits_for_the_writer_to_record_a_definition() {
+    let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let a = Instance::start(&objects, "a", LEASE).await;
+    a.load_defined(None).await.expect("A creates a copy with no definition");
+    let b = Arc::new(Instance::start(&objects, "b", LEASE).await);
+    let waiting = {
+        let b = Arc::clone(&b);
+        tokio::spawn(async move { b.load_defined(Some(defined_at("store", "db-b"))).await })
+    };
+    tokio::time::sleep(LEASE / 2).await;
+    assert!(!waiting.is_finished(), "B served a copy with no recorded definition");
+
+    a.load_defined(Some(defined_at("shop", "db-a")))
+        .await
+        .expect("A records its definition");
+    let error = waiting
+        .await
+        .expect("join")
+        .expect_err("B is refused once the definition is recorded");
+    assert!(error.contains("was built from a different definition"), "{error}");
 }

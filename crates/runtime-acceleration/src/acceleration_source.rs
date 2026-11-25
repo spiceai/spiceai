@@ -27,18 +27,38 @@ pub type InitializedSourcesFuture<'a> =
 /// The settings in a Spicepod that define the rows an acceleration of a source
 /// stores. An engine that keeps the acceleration as a copy in a shared state
 /// location records them with the copy, and never serves a copy built from others.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct SourceDefinition {
     /// Where the rows come from: a dataset's `from`, or a view's SQL.
     pub from: String,
-    /// The source's connection settings (a dataset's `params`), as written: a
-    /// `${ secrets:… }` reference is resolved by the engine that records them.
-    pub params: std::collections::HashMap<String, String>,
+    /// The source's connection settings, as its connector reads them: each one
+    /// the Spicepod sets and each secret the connector loads from a secret store
+    /// itself, with `${ … }` references resolved. A connector's defaults are not
+    /// part of it, so a release that changes one changes no definition.
+    pub connection: Vec<ConnectionSetting>,
     /// `acceleration.refresh_sql`.
     pub refresh_sql: Option<String>,
     /// The columns the Spicepod declares, each with its declared type and
     /// nullability, in declaration order. A description is not part of it.
     pub columns: Vec<String>,
+    /// The other settings that decide which rows the acceleration keeps (refresh
+    /// mode, data window, retention, time column, conflict handling), by the name
+    /// the Spicepod gives them.
+    pub row_settings: Vec<(&'static str, Option<String>)>,
+    /// For a view, the definition of each dataset or view its SQL reads, by name:
+    /// two views with one SQL over different sources hold different rows.
+    pub reads: Vec<(String, SourceDefinition)>,
+}
+
+/// One connection setting of a source, as its connector reads it.
+#[derive(Clone, Debug)]
+pub struct ConnectionSetting {
+    /// The name the Spicepod gives the setting (`pg_host`).
+    pub name: String,
+    pub value: secrecy::SecretString,
+    /// Whether the connector declares the setting secret. A secret is recorded
+    /// only together with the other settings, never on its own.
+    pub secret: bool,
 }
 
 impl SourceDefinition {
@@ -52,16 +72,24 @@ impl SourceDefinition {
                     "{}\u{0}{}\u{0}{}",
                     column.name,
                     column.r#type.as_deref().unwrap_or_default(),
-                    column.nullable.map_or("", |nullable| if nullable {
-                        "null"
-                    } else {
-                        "not null"
-                    })
+                    column
+                        .nullable
+                        .map_or("", |nullable| if nullable { "null" } else { "not null" })
                 )
             })
             .collect()
     }
 }
+
+/// What [`AccelerationSource::definition`] returns.
+pub type DefinitionFuture<'a> = Pin<
+    Box<
+        dyn Future<
+                Output = Result<Option<SourceDefinition>, Box<dyn std::error::Error + Send + Sync>>,
+            > + Send
+            + 'a,
+    >,
+>;
 
 /// Represents an acceleration source component, such as a dataset or a view.
 /// Provides additional information about the source, such as its name and associated metadata.
@@ -124,7 +152,7 @@ pub trait AccelerationSource: Send + Sync {
     ///
     /// Deliberately has NO default implementation: a source that silently answered
     /// `None` would let an engine serve it another definition's copy.
-    fn definition(&self) -> Option<SourceDefinition>;
+    fn definition(&self) -> DefinitionFuture<'_>;
 
     /// Whether rows can reach this source through anything other than its refresh path
     /// — `access: read_write` on a dataset, or DML against a DDL-created table.

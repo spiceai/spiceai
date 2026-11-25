@@ -1,17 +1,20 @@
 name: object-native-definitions
 description: >
   Two Spicepods, apps 'shop' and 'store', run on one state location. Both
-  declare a dataset 'orders' with the same `from`, each read from its own
-  Postgres server, and both declare 'common' from the same server. The copy of
-  'orders' records the definition it was built from, connection settings
-  included, so the second app's 'orders' fails with an error naming the setting
-  that differs, never its value, and neither app's rows ever appear in the
-  other's results. 'common' has one definition, so the second app serves the
-  first app's copy. The app that cannot serve 'orders' never takes over writing
-  it: with the first app stopped and started again, its 'orders' follows its
-  source. Renaming the first app keeps its copies, and changing only
-  `refresh_sql` is a different definition. Every answer is checked against its
-  own source.
+  declare a dataset 'orders' with the same `from` and no connection settings:
+  each reads its own Postgres server through a connection string the connector
+  loads from the environment. The copy of 'orders' records the definition it
+  was built from, connection settings included, so the second app's 'orders'
+  fails with an error naming the secret setting that differs, never its value,
+  and neither app's rows ever appear in the other's results. Each app also
+  declares 'by_owner', a view with one SQL over an unaccelerated dataset on its
+  own server: the view's definition includes what it reads, so the second app's
+  view fails too. Both declare 'common' from the same server, so the second app
+  serves the first app's copy. The app that cannot serve 'orders' never takes
+  over writing it: with the first app stopped and started again, its 'orders'
+  follows its source. Renaming the first app keeps its copies, and changing
+  only `refresh_sql`, or only the refresh data window, is a different
+  definition. Every answer is checked against its own source.
 
 sources:
   # Two Postgres servers with the same table name and schema, different rows.
@@ -20,12 +23,16 @@ sources:
   # Its shared bucket holds the state location both apps use.
   lake: { kind: rustfs }
 
+# Each app's `pg_connection_string`, which the connector loads from the
+# environment because no dataset sets it, names its own server.
 variants:
   shop:
-    datasets: { orders: { params: '${sources.shop_db.params}' } }
+    env: { PG_CONNECTION_STRING: 'host=127.0.0.1 port=${sources.shop_db.params.pg_port} user=postgres password=${sources.shop_db.params.pg_pass} dbname=${sources.shop_db.params.pg_db} sslmode=disable' }
+    datasets: { raw: { params: '${sources.shop_db.params}' } }
   store:
+    env: { PG_CONNECTION_STRING: 'host=127.0.0.1 port=${sources.store_db.params.pg_port} user=postgres password=${sources.store_db.params.pg_pass} dbname=${sources.store_db.params.pg_db} sslmode=disable' }
     spicepod: { name: store }
-    datasets: { orders: { params: '${sources.store_db.params}' } }
+    datasets: { raw: { params: '${sources.store_db.params}' } }
 
 spicepod:
   version: v1
@@ -51,14 +58,26 @@ spicepod:
         mode: file
         refresh_mode: full
         refresh_check_interval: 2s
+    # Unaccelerated: the view below reads it.
+    - from: postgres:public.orders
+      name: raw
     - from: postgres:public.common
       name: common
-      params: ${sources.shop_db.params}
+      params:
+        pg_connection_string: 'host=127.0.0.1 port=${sources.shop_db.params.pg_port} user=postgres password=${sources.shop_db.params.pg_pass} dbname=${sources.shop_db.params.pg_db} sslmode=disable'
       acceleration:
         enabled: true
         engine: cayenne
         mode: file
         refresh_mode: full
+        refresh_check_interval: 2s
+  views:
+    - name: by_owner
+      sql: SELECT o_owner, count(*) AS n, sum(o_total) AS total FROM raw GROUP BY o_owner
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
         refresh_check_interval: 2s
 
 defaults:
@@ -69,14 +88,14 @@ defaults:
 steps:
   - source-exec:
       shop_db: |
-        CREATE TABLE orders (o_id bigint PRIMARY KEY, o_owner text, o_total numeric(15, 2));
+        CREATE TABLE orders (o_id bigint PRIMARY KEY, o_owner text, o_total numeric(15, 2), o_at timestamptz NOT NULL DEFAULT TIMESTAMPTZ '2026-01-01 00:00:00+00');
         INSERT INTO orders SELECT i, 'shop', i * 1.25 FROM generate_series(1, 300) AS i;
         CREATE TABLE common (c_id bigint PRIMARY KEY, c_v bigint);
         INSERT INTO common SELECT i, i * 10 FROM generate_series(1, 50) AS i;
     only: shop
   - source-exec:
       store_db: |
-        CREATE TABLE orders (o_id bigint PRIMARY KEY, o_owner text, o_total numeric(15, 2));
+        CREATE TABLE orders (o_id bigint PRIMARY KEY, o_owner text, o_total numeric(15, 2), o_at timestamptz NOT NULL DEFAULT TIMESTAMPTZ '2026-01-01 00:00:00+00');
         INSERT INTO orders SELECT i, 'store', i * 2.5 FROM generate_series(1, 200) AS i;
     only: shop
 
@@ -102,7 +121,16 @@ steps:
   - assert-status:
       dataset: orders
       status: Error
-      message-contains: "was built from a different definition (`pg_port` changed), so this instance neither serves nor writes it"
+      message-contains: "was built from a different definition (one of the secret settings `pg_connection_string` changed), so this instance neither serves nor writes it"
+    only: store
+  - query: SELECT * FROM by_owner
+    expect: { oracle: shop_db }
+    oracle-sql: SELECT o_owner, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_owner
+    eventually: 60s
+    only: shop
+  - assert-log:
+      contains: ["Failed to load .*'by_owner' \\(cayenne\\): its copy in the state location '[^']+' was built from a different definition \\(the definition of 'raw', which it reads, changed\\)"]
+    eventually: 60s
     only: store
   - query: SELECT count(*) AS n, sum(c_v) AS total FROM common
     expect: { oracle: shop_db }
@@ -176,5 +204,17 @@ steps:
       dataset: orders
       status: Error
       message-contains: "was built from a different definition (`refresh_sql` changed)"
+    eventually: 60s
+    only: shop
+
+  # So is a different refresh data window: it changes which rows are kept.
+  - restart:
+      ready: false
+      patch: { datasets: { orders: { time_column: o_at, acceleration: { refresh_data_window: 7d } } } }
+    only: shop
+  - assert-status:
+      dataset: orders
+      status: Error
+      message-contains: "`refresh_data_window` changed"
     eventually: 60s
     only: shop

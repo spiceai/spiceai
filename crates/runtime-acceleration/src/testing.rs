@@ -193,8 +193,8 @@ impl AccelerationSource for TestAccelerationSource {
         self.on_schema_change
     }
 
-    fn definition(&self) -> Option<crate::SourceDefinition> {
-        None
+    fn definition(&self) -> crate::DefinitionFuture<'_> {
+        Box::pin(std::future::ready(Ok(None)))
     }
 
     fn allows_write(&self) -> bool {

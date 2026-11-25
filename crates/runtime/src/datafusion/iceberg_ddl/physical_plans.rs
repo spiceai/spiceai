@@ -162,9 +162,9 @@ impl AccelerationSource for IcebergDdlAccelerationSource {
         None
     }
 
-    fn definition(&self) -> Option<runtime_acceleration::SourceDefinition> {
+    fn definition(&self) -> runtime_acceleration::DefinitionFuture<'_> {
         // A table created by DDL has no Spicepod definition.
-        None
+        Box::pin(std::future::ready(Ok(None)))
     }
 
     fn allows_write(&self) -> bool {

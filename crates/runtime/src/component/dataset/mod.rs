@@ -172,6 +172,51 @@ impl Dataset {
     }
 }
 
+impl Dataset {
+    /// The settings besides its source that decide which rows this dataset's
+    /// acceleration keeps, for its definition (see
+    /// [`runtime_acceleration::SourceDefinition::row_settings`]).
+    fn row_settings(&self) -> Vec<(&'static str, Option<String>)> {
+        // A setting's serialized name, as the Spicepod writes it. Serializing these
+        // enums cannot fail.
+        fn json(value: &impl serde::Serialize) -> String {
+            serde_json::to_string(value).unwrap_or_default()
+        }
+        let acceleration = self.acceleration.as_ref();
+        vec![
+            (
+                "refresh_mode",
+                acceleration.map(|acceleration| {
+                    json(&runtime_acceleration::acceleration_source::resolved_refresh_mode(
+                        self,
+                        acceleration,
+                    ))
+                }),
+            ),
+            (
+                "refresh_data_window",
+                acceleration.and_then(|a| a.refresh_data_window.clone()),
+            ),
+            (
+                "retention_period",
+                acceleration.and_then(|a| a.retention_period.clone()),
+            ),
+            ("retention_sql", acceleration.and_then(|a| a.retention_sql.clone())),
+            (
+                "retention_check_enabled",
+                acceleration.map(|a| a.retention_check_enabled.to_string()),
+            ),
+            ("time_column", self.time_column.clone()),
+            ("time_format", self.time_format.map(|format| format.to_string())),
+            ("time_partition_column", self.time_partition_column.clone()),
+            (
+                "time_partition_format",
+                self.time_partition_format.map(|format| format.to_string()),
+            ),
+        ]
+    }
+}
+
 impl AccelerationSource for Dataset {
     fn clone_arc(&self) -> Arc<dyn AccelerationSource> {
         Arc::new(self.clone())
@@ -214,12 +259,17 @@ impl AccelerationSource for Dataset {
         Some(self.on_schema_change)
     }
 
-    fn definition(&self) -> Option<runtime_acceleration::SourceDefinition> {
-        Some(runtime_acceleration::SourceDefinition {
-            from: self.from.clone(),
-            params: self.params.clone(),
-            refresh_sql: self.refresh_sql(),
-            columns: runtime_acceleration::SourceDefinition::declared_columns(&self.columns),
+    fn definition(&self) -> runtime_acceleration::DefinitionFuture<'_> {
+        Box::pin(async move {
+            let connection = crate::dataconnector::parameters::connection_settings(self).await?;
+            Ok(Some(runtime_acceleration::SourceDefinition {
+                from: self.from.clone(),
+                connection,
+                refresh_sql: self.refresh_sql(),
+                columns: runtime_acceleration::SourceDefinition::declared_columns(&self.columns),
+                row_settings: self.row_settings(),
+                reads: Vec::new(),
+            }))
         })
     }
 

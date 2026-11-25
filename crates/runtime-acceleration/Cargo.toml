@@ -35,6 +35,7 @@ runtime-datafusion = { path = "../runtime-datafusion" }
 runtime-query-engine = { path = "../runtime-query-engine" }
 telemetry = { path = "../telemetry" }
 runtime-parameters = { path = "../runtime-parameters" }
+secrecy.workspace = true
 runtime-object-store = { path = "../runtime-object-store" }
 runtime-secrets = { path = "../runtime-secrets" }
 runtime-state-location = { path = "../runtime-state-location" }

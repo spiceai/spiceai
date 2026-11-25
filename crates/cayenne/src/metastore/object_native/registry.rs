@@ -597,9 +597,9 @@ impl ObjectNativeCatalog {
         let Some(requested) = requested else {
             return Ok(());
         };
-        let Some(stored) = domain.sidecar_value(DEFINITION_KEY).await? else {
-            // A copy built before copies recorded their definitions: it takes this
-            // one, recorded by the instance that writes it.
+        let Some(stored) = self.recorded_definition(name, domain, requested).await? else {
+            // A copy built before copies recorded their definitions, which this
+            // instance writes: it takes this instance's definition.
             domain.accept_lease();
             self.record_definition(name, domain, requested).await;
             return Ok(());
@@ -629,6 +629,42 @@ impl ObjectNativeCatalog {
             self.record_definition(name, domain, requested).await;
         }
         Ok(())
+    }
+
+    /// The definition record of `name`'s copy, following its log. A copy built
+    /// before copies recorded their definitions has none until the instance that
+    /// writes it records its own: a replica waits for that record (up to four
+    /// lease durations) rather than serve a copy it cannot compare with. `None`
+    /// when this instance writes the copy and none is recorded.
+    async fn recorded_definition(
+        &self,
+        name: &str,
+        domain: &Domain,
+        requested: &DatasetDefinition,
+    ) -> CatalogResult<Option<Vec<u8>>> {
+        let lease = match self.config.access {
+            super::Access::Leased(settings) => settings.duration,
+            super::Access::Writer | super::Access::Replica => {
+                super::LeaseSettings::default().duration
+            }
+        };
+        let deadline = tokio::time::Instant::now() + lease * 4;
+        loop {
+            if let Some(stored) = domain.sidecar_value(DEFINITION_KEY).await? {
+                return Ok(Some(stored));
+            }
+            if domain.data_writes.allows() {
+                return Ok(None);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(invalid(format!(
+                    "{} has no recorded definition in the shared state location yet, and another Spice instance writes it, so this instance (app '{}') waits for that instance to record one rather than serve a copy it cannot compare with. Retry once the instance that writes the dataset has loaded it.",
+                    subject(name),
+                    requested.app()
+                )));
+            }
+            tokio::time::sleep((lease / 6).max(std::time::Duration::from_millis(50))).await;
+        }
     }
 
     /// Record `definition`, with its app, as the one `name`'s copy was built from,

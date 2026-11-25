@@ -169,6 +169,59 @@ impl ConnectorContext for RuntimeConnectorContext {
     }
 }
 
+/// `dataset`'s connection settings as its connector reads them, for the definition
+/// an accelerator records with a copy in a shared state location: each setting the
+/// Spicepod sets and each secret the connector loads from a secret store itself,
+/// with `${ … }` references resolved, named as the Spicepod names them. A
+/// connector's defaults are left out, so a release that changes a default changes
+/// no definition. A source with no connector has none.
+///
+/// # Errors
+///
+/// A connector that is not in this build, or a setting that does not resolve, as
+/// loading the dataset's connector reports it.
+pub async fn connection_settings(
+    dataset: &Dataset,
+) -> Result<Vec<runtime_acceleration::ConnectionSetting>, Box<dyn std::error::Error + Send + Sync>>
+{
+    let connector = DatasetSpec::source(dataset);
+    let (prefix, specs) = {
+        let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+        let Some(factory) = guard.get(connector) else {
+            return Ok(Vec::new());
+        };
+        (factory.prefix(), factory.parameters())
+    };
+    let secrets = dataset.runtime.secrets();
+    let params = try_get_params_with_secrets(Arc::clone(&secrets), &dataset.params).await?;
+    // The connector's own load reports anything wrong with these settings.
+    let parameters = Parameters::try_new_with_secret_sources(
+        &format!("connector {connector}"),
+        params.into_iter().collect(),
+        prefix,
+        secrets,
+        specs,
+        Diagnostics::Suppress,
+        Some(secret_sources_from_templates(&dataset.params)),
+    )
+    .await?;
+    Ok(parameters
+        .iter()
+        .filter_map(|(name, value)| {
+            let spec = parameters.describe(name);
+            let written = spec.display_name(prefix);
+            let set = dataset.params.contains_key(name.as_str())
+                || dataset.params.contains_key(&written)
+                || parameters.is_autoloaded(name);
+            set.then(|| runtime_acceleration::ConnectionSetting {
+                name: written,
+                value: value.clone(),
+                secret: spec.secret,
+            })
+        })
+        .collect())
+}
+
 pub struct ConnectorParamsBuilder {
     connector: Arc<str>,
     component: ConnectorComponent,

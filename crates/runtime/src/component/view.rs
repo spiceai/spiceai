@@ -152,6 +152,84 @@ impl View {
     }
 }
 
+/// How deep a view's definition follows views it reads. Views cannot read each
+/// other in a cycle, so this only bounds a misconfiguration.
+const MAX_VIEW_DEPTH: usize = 16;
+
+/// `view`'s definition: its SQL, and the definition of each dataset and view
+/// that SQL reads, so two views with one SQL over different sources differ.
+fn view_definition(
+    view: &View,
+    depth: usize,
+) -> futures::future::BoxFuture<
+    '_,
+    Result<runtime_acceleration::SourceDefinition, Box<dyn std::error::Error + Send + Sync>>,
+> {
+    Box::pin(async move {
+        let mut reads = Vec::new();
+        let names = read_table_names(&view.sql);
+        let datasets = if names.is_empty() {
+            Vec::new()
+        } else {
+            Arc::clone(&view.runtime).get_valid_datasets(&view.app, crate::LogErrors(false))
+        };
+        for name in names {
+            let read = if let Some(dataset) = datasets.iter().find(|ds| ds.name == name) {
+                dataset.definition().await?
+            } else if let Some(spec) = view
+                .app
+                .views
+                .iter()
+                .find(|spec| TableReference::from(spec.name.as_str()) == name)
+                && depth < MAX_VIEW_DEPTH
+            {
+                let builder = super::view::ViewBuilder::try_from(spec.clone())
+                    .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+                let read =
+                    View::new(builder.build(), Arc::clone(&view.runtime), Arc::clone(&view.app));
+                Some(view_definition(&read, depth + 1).await?)
+            } else {
+                // A table the Spicepod does not define (a catalog's): its name.
+                None
+            };
+            reads.push((
+                name.to_string(),
+                read.unwrap_or_else(|| runtime_acceleration::SourceDefinition {
+                    from: name.to_string(),
+                    ..Default::default()
+                }),
+            ));
+        }
+        reads.sort_by(|a, b| a.0.cmp(&b.0));
+        reads.dedup_by(|a, b| a.0 == b.0);
+        Ok(runtime_acceleration::SourceDefinition {
+            from: view.sql.to_string(),
+            connection: Vec::new(),
+            refresh_sql: view
+                .acceleration
+                .as_ref()
+                .and_then(|acceleration| acceleration.refresh_sql.clone()),
+            columns: runtime_acceleration::SourceDefinition::declared_columns(&view.columns),
+            row_settings: Vec::new(),
+            reads,
+        })
+    })
+}
+
+/// The tables `sql` reads, or none when it does not parse (the view then fails
+/// to register on its own).
+fn read_table_names(sql: &str) -> Vec<TableReference> {
+    use datafusion::sql::{parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
+    match DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}) {
+        Ok(statements) if statements.len() == 1 => {
+            statements.front().map_or_else(Vec::new, |statement| {
+                runtime_datafusion::dependent_tables::get_dependent_table_names(statement)
+            })
+        }
+        _ => Vec::new(),
+    }
+}
+
 impl AccelerationSource for View {
     fn clone_arc(&self) -> Arc<dyn AccelerationSource> {
         Arc::new(self.clone()) as Arc<dyn AccelerationSource>
@@ -198,17 +276,8 @@ impl AccelerationSource for View {
         None
     }
 
-    fn definition(&self) -> Option<runtime_acceleration::SourceDefinition> {
-        // A view's rows come from its SQL, so the SQL is where they come from.
-        Some(runtime_acceleration::SourceDefinition {
-            from: self.sql.to_string(),
-            params: self.params.clone(),
-            refresh_sql: self
-                .acceleration
-                .as_ref()
-                .and_then(|acceleration| acceleration.refresh_sql.clone()),
-            columns: runtime_acceleration::SourceDefinition::declared_columns(&self.columns),
-        })
+    fn definition(&self) -> runtime_acceleration::DefinitionFuture<'_> {
+        Box::pin(async move { view_definition(self, 0).await.map(Some) })
     }
 
     fn on_schema_change(&self) -> Option<runtime_acceleration::OnSchemaChange> {

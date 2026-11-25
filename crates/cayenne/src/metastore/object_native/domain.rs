@@ -159,6 +159,15 @@ impl Domain {
             }
         };
         let dataset = &lease.dataset;
+        // Declined while the request was in flight: hand back what it acquired
+        // rather than become the writer of a copy this instance does not serve.
+        if lease.declined.load(std::sync::atomic::Ordering::Acquire) {
+            if matches!(role, LeaseRole::Holder { .. }) {
+                self.data_writes.set(false);
+                lease.release().await;
+            }
+            return true;
+        }
         match role {
             LeaseRole::Holder {
                 valid_until,

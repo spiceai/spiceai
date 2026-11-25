@@ -203,9 +203,9 @@ impl AccelerationSource for InternalAccelerationSource {
         None
     }
 
-    fn definition(&self) -> Option<runtime_acceleration::SourceDefinition> {
+    fn definition(&self) -> runtime_acceleration::DefinitionFuture<'_> {
         // No Spicepod defines an internal table: the runtime does.
-        None
+        Box::pin(std::future::ready(Ok(None)))
     }
 
     fn allows_write(&self) -> bool {

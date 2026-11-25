@@ -21,13 +21,15 @@ limitations under the License.
 //! serves or writes that copy, even when the two definitions share a name and a
 //! `from`. The record holds digests only, never a value, so it stores no secret.
 //!
-//! - Each dataset setting (`from`, `refresh_sql`, ...) has a digest of its own.
-//! - The source's connection settings (`params`), as the source reads them with
-//!   every `${ … }` reference resolved, have one digest together: two hosts behind
-//!   one `from` differ, and so does a rotated secret.
-//! - Each connection setting also has a digest of its value as the Spicepod writes
-//!   it, which names the setting that changed. A value read from a secret store is
-//!   written as its reference, so no secret's digest is kept on its own.
+//! - Each dataset setting (`from`, `refresh_sql`, the settings that decide which
+//!   rows are kept, ...) has a digest of its own, and so does the definition of
+//!   each dataset or view a view reads.
+//! - The source's connection settings, as its connector reads them (with every
+//!   `${ … }` reference resolved and each secret it loads itself), have one digest
+//!   together: two hosts behind one `from` differ, and so does a rotated secret.
+//! - Each connection setting the connector does not declare secret also has a
+//!   digest of its own, which names the setting that changed. A secret setting is
+//!   recorded by name only: a digest of it alone could be tested against guesses.
 //! - The definition's id is a digest of the dataset settings and the connection
 //!   digest. A copy per definition is keyed by it, in the registry entry beside the
 //!   copy's folder.
@@ -40,7 +42,11 @@ use prost::Message;
 const SETTING_CONTEXT: &str = "spice.ai cayenne 2026-11 dataset definition setting";
 const CONNECTION_CONTEXT: &str = "spice.ai cayenne 2026-11 dataset definition connection";
 const CONNECTION_SETTING_CONTEXT: &str =
-    "spice.ai cayenne 2026-11 dataset definition connection setting as written";
+    "spice.ai cayenne 2026-11 dataset definition connection setting";
+const READ_CONTEXT: &str = "spice.ai cayenne 2026-11 dataset definition read";
+
+/// The prefix of a setting that holds the definition of a table a view reads.
+const READ_PREFIX: &str = "reads:";
 const ID_CONTEXT: &str = "spice.ai cayenne 2026-11 dataset definition id";
 
 /// The format of [`DefinitionRecord`] this build writes and reads.
@@ -54,8 +60,9 @@ pub struct DatasetDefinition {
     settings: BTreeMap<String, [u8; 32]>,
     /// Every connection setting of the source as it reads them, together.
     connection: [u8; 32],
-    /// Each connection setting's name and a digest of its value as written.
-    connection_settings: BTreeMap<String, [u8; 32]>,
+    /// Each connection setting's name, with a digest of its value unless the
+    /// connector declares it secret.
+    connection_settings: BTreeMap<String, Option<[u8; 32]>>,
     /// The Spicepod's name. Recorded and reported, never compared.
     app: String,
 }
@@ -103,21 +110,42 @@ impl DatasetDefinition {
         self
     }
 
-    /// Set the source's connection settings: `written`, by name, as the Spicepod
-    /// writes them (a secret as its `${ secrets:… }` reference), and `resolved`, as
-    /// the source reads them. The resolved values decide the definition: two
-    /// sources at different hosts differ, as do two values of one reference.
+    /// Set the source's connection settings as its connector reads them: each
+    /// setting's name, value, and whether the connector declares it secret. Their
+    /// values together decide the definition, so two sources at different hosts
+    /// differ, as do two values of one secret.
     #[must_use]
     pub fn with_connection<'a>(
         mut self,
-        written: impl IntoIterator<Item = (&'a str, &'a str)>,
-        resolved: impl IntoIterator<Item = (&'a str, &'a str)>,
+        settings: impl IntoIterator<Item = (&'a str, &'a str, bool)>,
     ) -> Self {
-        self.connection = connection_digest(&resolved.into_iter().collect());
-        self.connection_settings = written
-            .into_iter()
-            .map(|(name, value)| (name.to_string(), connection_setting_digest(name, value)))
+        let settings: Vec<(&str, &str, bool)> = settings.into_iter().collect();
+        self.connection = connection_digest(
+            &settings
+                .iter()
+                .map(|(name, value, _)| (*name, *value))
+                .collect(),
+        );
+        self.connection_settings = settings
+            .iter()
+            .map(|(name, value, secret)| {
+                (
+                    (*name).to_string(),
+                    (!secret).then(|| connection_setting_digest(name, value)),
+                )
+            })
             .collect();
+        self
+    }
+
+    /// Add the definition of `table`, which this one (a view's) reads.
+    #[must_use]
+    pub fn with_read(mut self, table: &str, definition: &DatasetDefinition) -> Self {
+        let mut hasher = blake3::Hasher::new_derive_key(READ_CONTEXT);
+        update_framed(&mut hasher, table.as_bytes());
+        hasher.update(&definition.id());
+        self.settings
+            .insert(format!("{READ_PREFIX}{table}"), *hasher.finalize().as_bytes());
         self
     }
 
@@ -160,7 +188,7 @@ impl DatasetDefinition {
                 .iter()
                 .map(|(name, digest)| SettingDigest {
                     name: name.clone(),
-                    digest: digest.to_vec(),
+                    digest: digest.map(|digest| digest.to_vec()).unwrap_or_default(),
                 })
                 .collect(),
             app: self.app.clone(),
@@ -214,7 +242,8 @@ pub(crate) struct DefinitionRecord {
     pub settings: Vec<SettingDigest>,
     #[prost(bytes = "vec", tag = "4")]
     pub connection: Vec<u8>,
-    /// Each connection setting's name, with a digest of its value as written.
+    /// Each connection setting's name, with a digest of its value, or none for a
+    /// setting the connector declares secret.
     #[prost(message, repeated, tag = "5")]
     pub connection_settings: Vec<SettingDigest>,
     /// The app that last served the copy as its writer.
@@ -266,7 +295,10 @@ impl DefinitionRecord {
         for name in setting_names {
             match (stored.get(name), requested.settings.get(name)) {
                 (Some(stored), Some(requested)) if *stored == requested.as_slice() => {}
-                _ => changes.push(format!("`{name}` changed")),
+                _ => changes.push(match name.strip_prefix(READ_PREFIX) {
+                    Some(table) => format!("the definition of '{table}', which it reads, changed"),
+                    None => format!("`{name}` changed"),
+                }),
             }
         }
         if self.connection != requested.connection {
@@ -277,12 +309,12 @@ impl DefinitionRecord {
                 .collect();
             let mut named = Vec::new();
             for (name, digest) in &requested.connection_settings {
-                match stored.get(name.as_str()) {
-                    None => named.push(format!("`{name}` added")),
-                    Some(stored) if *stored != digest.as_slice() => {
+                match (stored.get(name.as_str()), digest) {
+                    (None, _) => named.push(format!("`{name}` added")),
+                    (Some(stored), Some(digest)) if *stored != digest.as_slice() => {
                         named.push(format!("`{name}` changed"));
                     }
-                    Some(_) => {}
+                    _ => {}
                 }
             }
             for name in stored.keys() {
@@ -290,12 +322,20 @@ impl DefinitionRecord {
                     named.push(format!("`{name}` removed"));
                 }
             }
-            // Every setting is written as before, so a value one of them reads
-            // from a secret store or the environment changed.
+            // Every setting with a digest of its own matches, so a secret one
+            // changed.
             if named.is_empty() {
-                named.push(
-                    "a secret or environment value a setting in `params` reads changed".to_string(),
-                );
+                let secrets: Vec<String> = requested
+                    .connection_settings
+                    .iter()
+                    .filter(|(_, digest)| digest.is_none())
+                    .map(|(name, _)| format!("`{name}`"))
+                    .collect();
+                named.push(if secrets.is_empty() {
+                    "a connection setting changed".to_string()
+                } else {
+                    format!("one of the secret settings {} changed", secrets.join(", "))
+                });
             }
             changes.extend(named);
         }
@@ -317,16 +357,13 @@ mod tests {
         orders_with(host, "hunter2")
     }
 
-    /// `pg_pass` is read from a secret store, as `${ secrets:pg_pass }`.
+    /// `pg_pass` is a setting the connector declares secret.
     fn orders_with(host: &str, pass: &str) -> DatasetDefinition {
         DatasetDefinition::new("shop")
             .with_setting("from", "postgres:public.orders")
             .with_optional_setting("refresh_sql", None)
             .with_list_setting::<&str>("primary_key", &["id"])
-            .with_connection(
-                [("pg_host", host), ("pg_pass", "${ secrets:pg_pass }")],
-                [("pg_host", host), ("pg_pass", pass)],
-            )
+            .with_connection([("pg_host", host, false), ("pg_pass", pass, true)])
     }
 
     fn changes(stored: &DatasetDefinition, requested: &DatasetDefinition) -> Vec<String> {
@@ -345,12 +382,44 @@ mod tests {
         assert_ne!(a.id(), b.id());
         assert_eq!(changes(&a, &b), vec!["`pg_host` changed".to_string()]);
         let record = a.record().encode_to_vec();
-        for secret in [&b"db-a.internal"[..], b"hunter2"] {
+        for value in [&b"db-a.internal"[..], b"hunter2"] {
             assert!(
-                !record.windows(secret.len()).any(|window| window == secret),
+                !record.windows(value.len()).any(|window| window == value),
                 "the record holds a setting's value"
             );
         }
+    }
+
+    /// A secret setting is recorded by name only: no digest of it alone, which
+    /// could be tested against guesses, only the digest of every setting together.
+    #[test]
+    fn a_secret_setting_has_no_digest_of_its_own() {
+        let record = orders("db").record();
+        let pass = record
+            .connection_settings
+            .iter()
+            .find(|setting| setting.name == "pg_pass")
+            .expect("named");
+        assert!(pass.digest.is_empty());
+        let host = record
+            .connection_settings
+            .iter()
+            .find(|setting| setting.name == "pg_host")
+            .expect("named");
+        assert_eq!(host.digest.len(), 32);
+    }
+
+    /// A rotated secret is a different definition, though every other setting
+    /// matches: the change names the secret settings, not their values.
+    #[test]
+    fn a_rotated_secret_is_a_different_definition() {
+        let a = orders_with("db", "hunter2");
+        let rotated = orders_with("db", "correct horse");
+        assert_ne!(a.id(), rotated.id());
+        assert_eq!(
+            changes(&a, &rotated),
+            vec!["one of the secret settings `pg_pass` changed".to_string()]
+        );
     }
 
     /// The app is recorded but is not part of the definition, so a renamed app
@@ -363,7 +432,7 @@ mod tests {
             ..a.clone()
         };
         assert_eq!(a.id(), renamed.id());
-        assert_eq!(changes(&a, &renamed), [] as [std::string::String; 0]);
+        assert_eq!(changes(&a, &renamed), Vec::<String>::new());
     }
 
     #[test]
@@ -372,61 +441,46 @@ mod tests {
         let refresh = a
             .clone()
             .with_optional_setting("refresh_sql", Some("SELECT * FROM orders WHERE id < 10"));
-        assert_eq!(
-            changes(&a, &refresh),
-            vec!["`refresh_sql` changed".to_string()]
-        );
+        assert_eq!(changes(&a, &refresh), vec!["`refresh_sql` changed".to_string()]);
         // Unset and empty are different values.
         let empty = a.clone().with_optional_setting("refresh_sql", Some(""));
+        assert_eq!(changes(&a, &empty), vec!["`refresh_sql` changed".to_string()]);
+        let window = a
+            .clone()
+            .with_optional_setting("refresh_data_window", Some("7d"));
         assert_eq!(
-            changes(&a, &empty),
-            vec!["`refresh_sql` changed".to_string()]
+            changes(&a, &window),
+            vec!["`refresh_data_window` changed".to_string()]
         );
-        let key = a
-            .clone()
-            .with_list_setting("primary_key", &["id", "region"]);
+        let key = a.clone().with_list_setting("primary_key", &["id", "region"]);
         assert_eq!(changes(&a, &key), vec!["`primary_key` changed".to_string()]);
-        let added = a.clone().with_connection(
-            [
-                ("pg_host", "db"),
-                ("pg_pass", "${ secrets:pg_pass }"),
-                ("pg_sslmode", "require"),
-            ],
-            [
-                ("pg_host", "db"),
-                ("pg_pass", "hunter2"),
-                ("pg_sslmode", "require"),
-            ],
-        );
+        let added = a.clone().with_connection([
+            ("pg_host", "db", false),
+            ("pg_pass", "hunter2", true),
+            ("pg_sslmode", "require", false),
+        ]);
         assert_eq!(changes(&a, &added), vec!["`pg_sslmode` added".to_string()]);
-        let removed = a
-            .clone()
-            .with_connection([("pg_host", "db")], [("pg_host", "db")]);
+        let removed = a.clone().with_connection([("pg_host", "db", false)]);
         assert_eq!(changes(&a, &removed), vec!["`pg_pass` removed".to_string()]);
     }
 
-    /// A rotated secret is a different definition, though the Spicepod reads the
-    /// same: the change names what reads from a secret store, not the secret.
+    /// A view's definition holds those of the tables it reads: one SQL over two
+    /// sources is two definitions, naming the table whose definition differs.
     #[test]
-    fn a_rotated_secret_is_a_different_definition() {
-        let a = orders_with("db", "hunter2");
-        let rotated = orders_with("db", "correct horse");
-        assert_ne!(a.id(), rotated.id());
+    fn a_view_over_a_different_source_is_a_different_definition() {
+        let view = |source: &DatasetDefinition| {
+            DatasetDefinition::new("shop")
+                .with_setting("from", "SELECT * FROM orders")
+                .with_read("orders", source)
+        };
+        let a = view(&orders("db-a"));
+        let b = view(&orders("db-b"));
+        assert_ne!(a.id(), b.id());
         assert_eq!(
-            changes(&a, &rotated),
-            vec!["a secret or environment value a setting in `params` reads changed".to_string()]
+            changes(&a, &b),
+            vec!["the definition of 'orders', which it reads, changed".to_string()]
         );
-    }
-
-    /// The same values written another way read the same source: one definition.
-    #[test]
-    fn the_resolved_values_decide_the_definition() {
-        let inline = DatasetDefinition::new("shop")
-            .with_connection([("pg_host", "db")], [("pg_host", "db")]);
-        let from_env = DatasetDefinition::new("shop")
-            .with_connection([("pg_host", "${ env:PG_HOST }")], [("pg_host", "db")]);
-        assert_eq!(inline.id(), from_env.id());
-        assert_eq!(changes(&inline, &from_env), [] as [std::string::String; 0]);
+        assert_eq!(view(&orders("db-a")).id(), a.id());
     }
 
     /// The digests are framed, so moving a boundary between two parts of a value
@@ -436,8 +490,8 @@ mod tests {
         let ab = DatasetDefinition::new("app").with_list_setting("primary_key", &["a", "b"]);
         let a_b = DatasetDefinition::new("app").with_list_setting::<&str>("primary_key", &["ab"]);
         assert_ne!(ab.id(), a_b.id());
-        let host = DatasetDefinition::new("app").with_connection([], [("pg_host", "ab")]);
-        let renamed = DatasetDefinition::new("app").with_connection([], [("pg_hosta", "b")]);
+        let host = DatasetDefinition::new("app").with_connection([("pg_host", "ab", false)]);
+        let renamed = DatasetDefinition::new("app").with_connection([("pg_hosta", "b", false)]);
         assert_ne!(host.id(), renamed.id());
     }
 
