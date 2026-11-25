@@ -29,7 +29,9 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     },
+    thread,
     time::Duration,
 };
 
@@ -120,27 +122,55 @@ struct MockState {
 /// It denies every credential-vending request, because a vended S3 store always
 /// connects to AWS. A vended catalog therefore reads its tables with the static
 /// storage credentials it falls back to.
+///
+/// The HTTP server runs on its own OS thread and Tokio runtime. Catalog load
+/// opens the remote Delta table with `DeltaTable::from`, which blocks the
+/// calling Tokio worker on `TokioBackgroundExecutor` (`std::sync::mpsc::recv`
+/// without `block_in_place`). Sharing this mock with that runtime lets the
+/// worker that owns `axum::serve` stall: the S3 client retries until
+/// `retry_timeout` (180s), and the 60s `load_components` wait panics with
+/// [`Elapsed`](tokio::time::error::Elapsed).
 struct MockCatalog {
     endpoint: String,
     state: Arc<MockState>,
+    /// Dropping the handle detaches the server until the test process exits.
+    _server: thread::JoinHandle<()>,
 }
 
 impl MockCatalog {
-    async fn start(tables: Vec<serde_json::Value>, bucket: PathBuf) -> Self {
+    fn start(tables: Vec<serde_json::Value>, bucket: PathBuf) -> Self {
         let state = Arc::new(MockState {
             tables,
             bucket,
             credential_requests: AtomicUsize::new(0),
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener binds");
-        let endpoint = format!("http://{}", listener.local_addr().expect("local address"));
-        let router = Router::new()
-            .fallback(handle)
-            .with_state(Arc::clone(&state));
-        tokio::spawn(axum::serve(listener, router).into_future());
-        Self { endpoint, state }
+        let serve_state = Arc::clone(&state);
+        let (ready, started) = mpsc::channel();
+        let server = thread::Builder::new()
+            .name("storage-location-mock".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("mock runtime");
+                runtime.block_on(async move {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                        .await
+                        .expect("listener binds");
+                    let endpoint =
+                        format!("http://{}", listener.local_addr().expect("local address"));
+                    ready.send(endpoint).expect("send mock endpoint");
+                    let router = Router::new().fallback(handle).with_state(serve_state);
+                    axum::serve(listener, router).await.expect("mock server");
+                });
+            })
+            .expect("spawn mock thread");
+        let endpoint = started.recv().expect("mock server starts");
+        Self {
+            endpoint,
+            state,
+            _server: server,
+        }
     }
 
     fn credential_requests(&self) -> usize {
@@ -401,7 +431,7 @@ fn unity_catalog(mock: &MockCatalog, extra: &[(&str, &str)]) -> Catalog {
     )
 }
 
-async fn start_mock(fixture: &Fixture) -> MockCatalog {
+fn start_mock(fixture: &Fixture) -> MockCatalog {
     MockCatalog::start(
         vec![
             uc_table("local_table", &fixture.local_location),
@@ -409,13 +439,12 @@ async fn start_mock(fixture: &Fixture) -> MockCatalog {
         ],
         fixture.bucket.clone(),
     )
-    .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unity_catalog_refuses_a_local_storage_location() {
     let fixture = Fixture::new();
-    let mock = start_mock(&fixture).await;
+    let mock = start_mock(&fixture);
     let runtime = load_catalog(unity_catalog(&mock, &[])).await;
 
     assert_eq!(registered_tables(&runtime, "uc"), vec!["remote_table"]);
@@ -433,7 +462,7 @@ async fn unity_catalog_refuses_a_local_storage_location() {
 #[tokio::test(flavor = "multi_thread")]
 async fn unity_catalog_with_credential_vending_refuses_a_local_storage_location() {
     let fixture = Fixture::new();
-    let mock = start_mock(&fixture).await;
+    let mock = start_mock(&fixture);
     let runtime = load_catalog(unity_catalog(
         &mock,
         &[("unity_catalog_credential_vending", "enabled")],
@@ -464,8 +493,7 @@ async fn databricks_delta_lake_mode_refuses_a_local_storage_location() {
     let mock = MockCatalog::start(
         vec![uc_table("local_table", &fixture.local_location)],
         fixture.bucket.clone(),
-    )
-    .await;
+    );
     let runtime = load_catalog(catalog(
         "databricks:cat".to_string(),
         &[
