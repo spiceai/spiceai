@@ -294,6 +294,27 @@ async fn create_table(
     pk_keyset_cache_mb: Option<usize>,
     cold: bool,
 ) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
+    create_table_with_retention(
+        fixture,
+        name,
+        mode,
+        durability,
+        pk_keyset_cache_mb,
+        cold,
+        Vec::new(),
+    )
+    .await
+}
+
+async fn create_table_with_retention(
+    fixture: &TestFixture,
+    name: &str,
+    mode: Mode,
+    durability: Durability,
+    pk_keyset_cache_mb: Option<usize>,
+    cold: bool,
+    retention: Vec<Expr>,
+) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
     // Local `file://` cold store per table (no object-store config needed —
     // the default local store resolves it).
     let cold_url = if cold {
@@ -324,7 +345,7 @@ async fn create_table(
     let table = Arc::new(
         fixture
             .data_store
-            .create(catalog, ctx.runtime_env(), opts)
+            .create_with_retention(catalog, ctx.runtime_env(), opts, retention)
             .await?,
     );
     if durability == Durability::Memory {
@@ -2026,6 +2047,224 @@ fn overwrite_lets_a_waiting_batch_finish_its_groups() -> Result<(), String> {
         overwrite_lets_a_waiting_batch_finish_its_groups_impl,
     )
 }
+
+// --- Focused regression: a re-upsert survives a bake, a merge and a reload ---
+//
+// A key is deleted and upserted again, so two key deletion vectors name it: the
+// delete, and the upsert's supersede carrying the re-insert sequence. The
+// seq-prefix bake folds both into its output and prunes them from the in-memory
+// index, but they stay durable until the orphaned-vector sweep reclaims them. The
+// protected-snapshot merge that follows runs with an empty index, and must still
+// tag its output at or above those vectors: a protected snapshot applies every
+// deletion above its tag to its rows, ignoring re-inserts, and both a reopen and
+// a retention pass reload the vectors from the catalog. The concurrent walks
+// reach this only by timing; here each maintenance pass runs at a fixed point.
+#[derive(Clone, Copy, Debug)]
+enum DeletionReload {
+    /// Open the table again from the catalog.
+    Reopen,
+    /// A retention pass that deletes a row reloads the index in place.
+    RetentionPass,
+}
+
+/// The retention filter of the [`DeletionReload::RetentionPass`] table: no row
+/// the test writes matches it except [`RETENTION_ROW`].
+fn negative_values() -> Expr {
+    col("value").lt(lit(0_i64))
+}
+const RETENTION_ROW: (i64, i64) = (1_000, -1);
+
+/// Upsert `row` and run the maintenance it triggers to completion. Not
+/// `settle`: that also runs the test-only full current-snapshot rewrite, which
+/// would fold the protected snapshots the merge-fence tests depend on.
+async fn upsert_and_drain(table: &Arc<CayenneTableProvider>, row: (i64, i64)) -> TestResult<()> {
+    upsert(table, &[row], Durability::File).await?;
+    table.flush_pending_maintenance().await?;
+    table.drain_in_flight_maintenance().await?;
+    Ok(())
+}
+
+async fn reupsert_survives_bake_merge_and_reload(
+    f: TestFixture,
+    reload: DeletionReload,
+) -> TestResult<()> {
+    let name = format!("reupsert_bake_merge_{reload:?}");
+    let retention = match reload {
+        DeletionReload::Reopen => Vec::new(),
+        DeletionReload::RetentionPass => vec![negative_values()],
+    };
+    let (table, ctx) = create_table_with_retention(
+        &f,
+        &name,
+        Mode::Key,
+        Durability::File,
+        None,
+        false,
+        retention,
+    )
+    .await?;
+    let table_id = table.metadata().table_id.clone();
+
+    upsert_and_drain(&table, (1, 100)).await?;
+    delete_key(&table, 1, Durability::File).await?;
+    upsert_and_drain(&table, (1, 200)).await?;
+    for key in 2..6 {
+        upsert_and_drain(&table, (key, key * 10)).await?;
+    }
+    assert!(
+        table.bake_seq_prefix_protected_snapshots().await?,
+        "the seq-prefix bake must commit"
+    );
+    assert_eq!(
+        table.deletion_index_len(),
+        0,
+        "the bake must prune both deletion vectors naming key 1 from the in-memory index"
+    );
+    let key_1_vectors: Vec<i64> = f
+        .catalog
+        .get_table_delete_files(&table_id)
+        .await?
+        .iter()
+        .map(|file| file.sequence_number)
+        .collect();
+    assert_eq!(
+        key_1_vectors.len(),
+        2,
+        "both deletion vectors naming key 1 stay durable after the bake"
+    );
+
+    // Write until the size-tier merge folds every protected snapshot into one.
+    let merge_trigger = VortexConfig::default().compaction_trigger_protected_snapshots;
+    let protected = f.catalog.get_all_snapshot_sequences(&table_id).await?.len();
+    let mut model: Model = std::iter::once((1, 200))
+        .chain((2..6).map(|key| (key, key * 10)))
+        .collect();
+    for key in 6..6 + i64::try_from(merge_trigger - protected)? {
+        upsert_and_drain(&table, (key, key * 10)).await?;
+        model.insert(key, key * 10);
+    }
+    let thresholds = f.catalog.get_all_snapshot_sequences(&table_id).await?;
+    assert_eq!(
+        thresholds.len(),
+        1,
+        "the size-tier merge must fold every protected snapshot into one"
+    );
+    assert_eq!(
+        table.deletion_index_len(),
+        0,
+        "the merge must run on an index the bake emptied"
+    );
+    let merged_threshold = *thresholds.values().next().expect("one protected snapshot");
+    let newest_vector = *key_1_vectors.iter().max().expect("two vectors");
+    assert!(
+        merged_threshold >= newest_vector,
+        "the merged snapshot is tagged {merged_threshold}, below the deletion vector at \
+         {newest_vector} its rows already reflect"
+    );
+    assert_converged(&read_rows(&ctx, &name).await?, &model, "before the reload");
+
+    match reload {
+        DeletionReload::Reopen => {
+            let (reopened, reopened_ctx) = reopen_table(&f, &name).await?;
+            assert_converged(
+                &read_rows(&reopened_ctx, &name).await?,
+                &model,
+                "after reopen",
+            );
+            reopened.drain_in_flight_maintenance().await?;
+        }
+        DeletionReload::RetentionPass => {
+            upsert_and_drain(&table, RETENTION_ROW).await?;
+            assert_eq!(
+                f.catalog.get_table_delete_files(&table_id).await?.len(),
+                3,
+                "the retention pass must delete its row, which reloads the deletion index"
+            );
+            assert_converged(
+                &read_rows(&ctx, &name).await?,
+                &model,
+                "after a retention pass",
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn reupsert_survives_bake_merge_and_reopen_impl(f: TestFixture) -> TestResult<()> {
+    reupsert_survives_bake_merge_and_reload(f, DeletionReload::Reopen).await
+}
+test_on_data_store!(reupsert_survives_bake_merge_and_reopen_impl);
+
+async fn reupsert_survives_bake_merge_and_retention_pass_impl(f: TestFixture) -> TestResult<()> {
+    reupsert_survives_bake_merge_and_reload(f, DeletionReload::RetentionPass).await
+}
+test_on_data_store!(reupsert_survives_bake_merge_and_retention_pass_impl);
+
+// A prune at a cutoff above every recorded deletion (`i64::MAX`) must not lift
+// the merge tag above deletions written after it: a protected snapshot applies
+// only the deletions above its tag, so a delete of a merged row would never
+// apply. The delete runs after the merge; one before it would drop the row from
+// the merged output and pass either way.
+async fn delete_after_max_cutoff_prune_and_merge_applies_impl(f: TestFixture) -> TestResult<()> {
+    let name = "delete_after_max_cutoff_prune_and_merge";
+    let (table, ctx) = create_table(&f, name, Mode::Key, Durability::File, None, false).await?;
+    let table_id = table.metadata().table_id.clone();
+
+    let mut model = Model::new();
+    for key in 1..4 {
+        upsert_and_drain(&table, (key, key * 10)).await?;
+        model.insert(key, key * 10);
+    }
+    // A key no row holds: its tombstone hides nothing, so pruning it leaves
+    // every row as the model has it.
+    let absent_key = col("id").in_list(vec![lit(99_i64)], false);
+    assert!(
+        table.delete_from_cdc_fast(&[absent_key]).await?.is_some(),
+        "the key-delete path must record the tombstone"
+    );
+    assert_eq!(
+        table.deletion_index_len(),
+        1,
+        "premise: the prune must run on a nonempty deletion index"
+    );
+    table.prune_deletion_index_at_or_below(i64::MAX);
+    assert_eq!(
+        table.deletion_index_len(),
+        0,
+        "the prune must empty the index"
+    );
+
+    let merge_trigger = VortexConfig::default().compaction_trigger_protected_snapshots;
+    let protected = f.catalog.get_all_snapshot_sequences(&table_id).await?.len();
+    for key in 4..4 + i64::try_from(merge_trigger - protected)? {
+        upsert_and_drain(&table, (key, key * 10)).await?;
+        model.insert(key, key * 10);
+    }
+    let thresholds = f.catalog.get_all_snapshot_sequences(&table_id).await?;
+    assert_eq!(
+        thresholds.len(),
+        1,
+        "the size-tier merge must fold every protected snapshot into one"
+    );
+
+    delete_key(&table, 2, Durability::File).await?;
+    model.remove(&2);
+    assert_converged(
+        &read_rows(&ctx, name).await?,
+        &model,
+        "after deleting a merged row",
+    );
+
+    let (reopened, reopened_ctx) = reopen_table(&f, name).await?;
+    assert_converged(
+        &read_rows(&reopened_ctx, name).await?,
+        &model,
+        "after reopen",
+    );
+    reopened.drain_in_flight_maintenance().await?;
+    Ok(())
+}
+test_on_data_store!(delete_after_max_cutoff_prune_and_merge_applies_impl);
 
 // --- Concurrent pure-upsert convergence (GREEN control: loss needs deletes) ---
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
