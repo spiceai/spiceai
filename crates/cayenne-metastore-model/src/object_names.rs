@@ -100,6 +100,8 @@ pub(crate) struct State {
     replacement_created: bool,
     /// An upload whose response was lost was sent again.
     retried: bool,
+    /// A holder referenced an upload it made under an earlier holding.
+    foreign_ref: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
@@ -170,6 +172,7 @@ impl Model for Protocol {
             replacement: None,
             replacement_created: false,
             retried: false,
+            foreign_ref: false,
         }]
     }
     fn actions(&self, s: &State, a: &mut Vec<Action>) {
@@ -195,6 +198,9 @@ impl Model for Protocol {
                 }
                 next.takes += 1;
                 next.units[u].generation += 1;
+                // Uploads belong to the holding that made them, so a new holding
+                // starts with none, as a fenced commit and a reused unit id leave.
+                next.nodes[i].uploads.clear();
                 next.nodes[i].hold = Some(Hold {
                     slot: u,
                     generation: next.units[u].generation,
@@ -247,6 +253,7 @@ impl Model for Protocol {
                     next.nodes[i].uploads.clear();
                 } else if s.store.iter().any(|(n, b, _)| *n == name && *b == bytes) {
                     // The holder reads its upload back by digest before referencing it.
+                    next.foreign_ref |= bytes.0 != h.token;
                     next.refs.push((name, bytes));
                     next.refs.sort_unstable();
                 }
@@ -317,6 +324,10 @@ impl Model for Protocol {
             ),
             crate::explorer::flags(&[
                 ("BAD name collision (different bytes)", s.collision),
+                (
+                    "BAD reference to an earlier holding's upload",
+                    s.foreign_ref,
+                ),
                 ("holder fenced", s.fenced),
                 ("replacement unit created an object", s.replacement_created),
                 ("upload retried", s.retried),
@@ -442,6 +453,10 @@ impl Model for Protocol {
             Property::always("no name created with different bytes", |_, s: &State| {
                 !s.collision
             }),
+            Property::always(
+                "a holder references only its own holding's uploads",
+                |_, s: &State| !s.foreign_ref,
+            ),
             Property::always(
                 "referenced objects read back with their digest",
                 |_, s: &State| {
