@@ -1438,33 +1438,39 @@ mod data_path {
             expected,
             "{what}: after the resume"
         );
-        if compacts {
+        if let Some(held) = held {
+            // Closed to maintenance before the hold is released, so nothing
+            // rewrites the appends before the restart.
+            let mut quiesce = std::pin::pin!(placed.table.quiesce());
+            let _ = futures::poll!(quiesce.as_mut());
+            drop(held);
+            quiesce.await;
+        } else {
             placed
                 .table
                 .drain_in_flight_maintenance()
                 .await
                 .expect("drain");
-            assert_eq!(
-                keyed_totals(&placed.ctx, "facts").await,
-                expected,
-                "{what}: after the appends' compaction"
-            );
+            placed.table.quiesce().await;
         }
         assert_eq!(
-            current().await != before_appends,
-            compacts,
-            "{what}: a compaction rewrote the appends"
+            keyed_totals(&placed.ctx, "facts").await,
+            expected,
+            "{what}: after maintenance"
         );
+        let compacted = current().await != before_appends;
         let data_url = placed.data_url.clone();
-        // Released only once the table is gone, so no compaction runs before
-        // the restart when `!compacts`.
-        drop((placed, shared, native, held));
+        drop((placed, shared, native));
         let reopened: Arc<dyn MetadataCatalog> = Arc::new(catalog(&store).await);
         let placed = place(&store, &reopened, "facts", false, Some(data_url)).await;
         assert_eq!(
             keyed_totals(&placed.ctx, "facts").await,
             expected,
             "{what}: after a restart"
+        );
+        assert_eq!(
+            compacted, compacts,
+            "{what}: a compaction rewrote the appends"
         );
         armed.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -1501,9 +1507,12 @@ mod data_path {
         let head = object_store_occ::headlog::Head::decode(payload.as_ref().concat().as_slice())
             .expect("a head");
         head.window.last().is_some_and(|newest| {
-            record_actions(&newest.encoded)
-                .iter()
-                .any(|action| action.name() == "SetCurrentSnapshot")
+            record_actions(&newest.encoded).iter().any(|action| {
+                matches!(
+                    action.kind,
+                    Some(cayenne_metastore_actions::Kind::SetCurrentSnapshot(_))
+                )
+            })
         })
     }
 
@@ -1511,43 +1520,35 @@ mod data_path {
     /// the one that makes its output current, has an unknown outcome (landed or
     /// not) keeps every row, with and without a compaction of the appends that
     /// follow it, in memory and in a local directory.
+    #[rstest::rstest]
     #[tokio::test]
-    async fn appends_after_a_rewrite_whose_own_commit_has_an_unknown_outcome_keep_every_row() {
-        for local in [false, true] {
-            for whole in [true, false] {
-                for landed in [true, false] {
-                    for compacts in [true, false] {
-                        let directory = tempfile::tempdir().expect("a directory");
-                        let inner: Arc<dyn ObjectStore> = if local {
-                            Arc::new(
-                                object_store_occ::LocalConditionalPut::new_durable(
-                                    directory.path(),
-                                )
-                                .expect("a local store"),
-                            )
-                        } else {
-                            Arc::new(InMemory::new())
-                        };
-                        let what = format!(
-                            "local={local} whole={whole} landed={landed} compacts={compacts}"
-                        );
-                        assert!(
-                            appends_after_a_rewrite_with_an_unknown_outcome(
-                                inner,
-                                whole,
-                                |faults, head| {
-                                    lose_a_commit(faults, head, landed, sets_the_current_snapshot)
-                                },
-                                compacts,
-                                &what,
-                            )
-                            .await,
-                            "{what}: the rewrite's commit lost its outcome"
-                        );
-                    }
-                }
-            }
-        }
+    async fn appends_after_a_rewrite_whose_own_commit_has_an_unknown_outcome_keep_every_row(
+        #[values(false, true)] local: bool,
+        #[values(true, false)] whole: bool,
+        #[values(true, false)] landed: bool,
+        #[values(true, false)] compacts: bool,
+    ) {
+        let directory = tempfile::tempdir().expect("a directory");
+        let inner: Arc<dyn ObjectStore> = if local {
+            Arc::new(
+                object_store_occ::LocalConditionalPut::new_durable(directory.path())
+                    .expect("a local store"),
+            )
+        } else {
+            Arc::new(InMemory::new())
+        };
+        let what = format!("local={local} whole={whole} landed={landed} compacts={compacts}");
+        assert!(
+            appends_after_a_rewrite_with_an_unknown_outcome(
+                inner,
+                whole,
+                |faults, head| lose_a_commit(faults, head, landed, sets_the_current_snapshot),
+                compacts,
+                &what,
+            )
+            .await,
+            "{what}: the rewrite's commit lost its outcome"
+        );
     }
 
     /// A transaction across datasets whose `Resolve` on one dataset fails with

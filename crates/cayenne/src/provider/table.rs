@@ -4488,6 +4488,25 @@ pub(crate) fn refused_until_reload(refuses_queries: bool) -> &'static str {
     }
 }
 
+/// The error of a commit by `writer` (such as "a write") to `table` that failed
+/// with `error`, and whose outcome could not be read back (`read_error`): its
+/// files are kept, and the table refuses what [`refused_until_reload`] names.
+pub(crate) fn unresolved_commit_error(
+    table: String,
+    writer: &str,
+    error: &dyn std::fmt::Display,
+    read_error: &dyn std::fmt::Display,
+    refuses_queries: bool,
+) -> Error {
+    Error::IncompleteWrite {
+        table,
+        message: format!(
+            "{writer}'s commit failed ({error}), and reading back whether it committed failed too ({read_error}). Its files are kept, and {} until the table is reloaded from its catalog. Restart Spice to reload it",
+            refused_until_reload(refuses_queries)
+        ),
+    }
+}
+
 /// The message for a write or query of a table refused because an earlier write
 /// could not confirm whether it committed (see [`refused_until_reload`]).
 pub(crate) fn outcome_unknown_message(refuses_queries: bool) -> String {
@@ -32977,13 +32996,13 @@ impl CayenneTableProvider {
                 self.uncommitted_files.forget(new_snapshot_id);
                 self.publication_outcome_unknown
                     .store(true, Ordering::Release);
-                Err(Error::IncompleteWrite {
-                    table: table.to_string(),
-                    message: format!(
-                        "a compaction's commit failed ({error}), and reading back whether it committed failed too ({read_error}). Its files are kept, and {} until the table is reloaded from its catalog. Restart Spice to reload it",
-                        refused_until_reload(true)
-                    ),
-                })
+                Err(unresolved_commit_error(
+                    table.to_string(),
+                    "a compaction",
+                    error,
+                    &read_error,
+                    true,
+                ))
             }
         }
     }

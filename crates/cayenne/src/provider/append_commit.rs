@@ -268,15 +268,13 @@ pub(super) async fn resolve_failed_commit(
                 .publication_outcome_unknown()
                 .store(true, Ordering::Release);
             Err(Failure {
-                error: Error::IncompleteWrite {
+                error: super::table::unresolved_commit_error(
                     table,
-                    message: format!(
-                        "a write's commit failed ({error}), and reading back whether it committed failed too ({read_error}). Its files are kept, and {} until the table is reloaded from its catalog. Restart Spice to reload it",
-                        super::table::refused_until_reload(
-                            prepared.table.data_in_object_native_location()
-                        )
-                    ),
-                },
+                    "a write",
+                    &error,
+                    &read_error,
+                    prepared.table.data_in_object_native_location(),
+                ),
                 keep_files: true,
             })
         }
@@ -316,7 +314,8 @@ pub(super) async fn snapshot_sequence_once_readable(
 
 /// `read`, retried with a doubling wait while the dataset's state cannot be
 /// read (it is reading its state back after a commit whose outcome is unknown),
-/// for up to [`UNKNOWN_OUTCOME_READ_BACK_WAIT`].
+/// for up to [`UNKNOWN_OUTCOME_READ_BACK_WAIT`]. The deadline bounds each read
+/// too, since a read can wait for the read-back itself.
 pub(super) async fn once_readable<T, F, Fut>(mut read: F) -> CatalogResult<T>
 where
     F: FnMut() -> Fut,
@@ -325,14 +324,23 @@ where
     let deadline = tokio::time::Instant::now() + UNKNOWN_OUTCOME_READ_BACK_WAIT;
     let mut wait = std::time::Duration::from_millis(20);
     loop {
-        match read().await {
-            Ok(value) => return Ok(value),
-            Err(error) if tokio::time::Instant::now() + wait >= deadline => return Err(error),
+        let error = match tokio::time::timeout_at(deadline, read()).await {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error)) => error,
             Err(_) => {
-                tokio::time::sleep(wait).await;
-                wait = (wait * 2).min(std::time::Duration::from_secs(2));
+                return Err(crate::catalog::CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "the dataset did not finish reading its state back within {} s",
+                        UNKNOWN_OUTCOME_READ_BACK_WAIT.as_secs()
+                    ),
+                });
             }
+        };
+        if tokio::time::Instant::now() + wait >= deadline {
+            return Err(error);
         }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(std::time::Duration::from_secs(2));
     }
 }
 
