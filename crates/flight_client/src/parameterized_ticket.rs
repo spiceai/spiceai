@@ -35,6 +35,22 @@ use arrow_flight::{Ticket, sql::Any};
 use bytes::Bytes;
 use prost::Message;
 
+/// The `GetSqlInfo` code under which a Spice runtime reports the version of
+/// the parameterized Substrait ticket it accepts: [`PARAMETERIZED_SUBSTRAIT_VERSION`]
+/// when it accepts this one. Flight SQL reserves codes 0 to 9,999; custom
+/// codes start at 10,000. A server that does not report the code, version 0,
+/// does not accept the ticket. Another server's custom codes mean what that
+/// server says, so the code is read only from a server whose
+/// `FlightSqlServerName` is [`SPICE_SERVER_NAME`].
+pub const SQL_INFO_PARAMETERIZED_SUBSTRAIT: u32 = 10_000;
+
+/// The version of the parameterized Substrait ticket ([`wrap`]) this build
+/// sends and accepts.
+pub const PARAMETERIZED_SUBSTRAIT_VERSION: i32 = 1;
+
+/// The `FlightSqlServerName` a Spice runtime reports in `GetSqlInfo`.
+pub const SPICE_SERVER_NAME: &str = "Spice.ai";
+
 /// Identifies a ticket made by [`wrap`].
 ///
 /// Not a Flight SQL command: `DoGet` matches on it before command dispatch, so
