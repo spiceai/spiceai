@@ -11,10 +11,13 @@
 # The `rustfs-credentials` action and cached_fetch.sh both get their credentials here, so
 # the audience and the request bounds are set in one place.
 #
-# Usage: bash .github/scripts/rustfs_credentials.sh ENDPOINT [DURATION_SECONDS [AUDIENCE]]
+# Usage: bash .github/scripts/rustfs_credentials.sh ENDPOINT [DURATION_SECONDS [AUDIENCE [POLICY_FILE]]]
 #   ENDPOINT          the store's S3 endpoint, which answers STS as well
 #   DURATION_SECONDS  the credentials' lifetime, 900 to 43200 seconds (default 3600)
-#   AUDIENCE          the OIDC token audience the store trusts (default below)
+#   AUDIENCE          the OIDC token audience the store trusts (default below; empty for it)
+#   POLICY_FILE       a session policy (JSON) sent as `Policy`: the credentials may then do
+#                     only what both it and the store's own policy allow, as for credentials
+#                     handed to code outside this job
 # On failure it prints nothing on stdout, one line saying why on stderr, and exits 1.
 set -euo pipefail
 
@@ -25,12 +28,13 @@ fail() {
   exit 1
 }
 
-if [ "$#" -lt 1 ] || [ "$#" -gt 3 ]; then
-  fail "rustfs_credentials.sh needs ENDPOINT, and optionally DURATION_SECONDS and AUDIENCE; got $# arguments."
+if [ "$#" -lt 1 ] || [ "$#" -gt 4 ]; then
+  fail "rustfs_credentials.sh needs ENDPOINT, and optionally DURATION_SECONDS, AUDIENCE and POLICY_FILE; got $# arguments."
 fi
 endpoint="${1%/}"
 duration="${2:-3600}"
 audience="${3:-$default_audience}"
+policy_file="${4:-}"
 if [ -z "$endpoint" ]; then
   fail "rustfs_credentials.sh needs the store's endpoint; it was empty."
 fi
@@ -42,6 +46,17 @@ if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUES
 fi
 if ! command -v jq >/dev/null 2>&1; then
   fail "jq is not installed, so GitHub's OIDC token response cannot be read."
+fi
+policy=()
+if [ -n "$policy_file" ]; then
+  # Sent compact; STS takes a session policy of at most 2048 characters.
+  if ! compact="$(jq -ce 'select(type == "object")' "$policy_file" 2>/dev/null)"; then
+    fail "The session policy $policy_file is not a JSON object."
+  fi
+  if [ "${#compact}" -gt 2048 ]; then
+    fail "The session policy $policy_file is ${#compact} characters compact, over STS's 2048."
+  fi
+  policy=(--data-urlencode "Policy=$compact")
 fi
 
 # Bearer tokens go to curl on stdin, so neither is ever on a command line.
@@ -78,6 +93,7 @@ response="$(printf '%s' "$oidc_token" |
     --data-urlencode 'Version=2011-06-15' \
     --data-urlencode "DurationSeconds=$duration" \
     --data-urlencode 'WebIdentityToken@-' \
+    ${policy[@]+"${policy[@]}"} \
     --write-out '\n%{http_code}')" || status=$?
 code="${response##*$'\n'}"
 body="${response%$'\n'*}"

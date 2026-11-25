@@ -343,14 +343,28 @@ jobs:
           output-env-credentials: false
           output-credentials: true
 
+      # spidapter hands the spicepod's store credentials to a Spice Cloud app that runs whatever
+      # image the run names, so the app gets only credentials that read the benchmark data: a
+      # second exchange whose session policy (.github/store-policies/benchmark-data-read-only.json)
+      # allows nothing else. The job's own credentials, which write this run's store keys, stay in
+      # the job. A refused exchange fails the job; there is no fallback.
+      - name: Get read-only RustFS credentials for the cluster app
+        id: rustfs-app
+        uses: $/.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '36000'
+          session-policy: benchmark-data-read-only
+          export-env: 'false'
+
       - name: Run the cluster benchmark - ${{ env.CB_SPICEPOD_PATH }}
         env:
           SPICEAI_API_KEY: ${{ env.SPICEAI_API_KEY }}
           SPICE_CLOUD_API_URL: https://api.spice.ai
           S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
-          S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
-          S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
-          S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
+          S3_KEY: ${{ steps.rustfs-app.outputs.access-key-id }}
+          S3_SECRET: ${{ steps.rustfs-app.outputs.secret-access-key }}
+          S3_SESSION_TOKEN: ${{ steps.rustfs-app.outputs.session-token }}
           AWS_ACCESS_KEY_ID: ${{ env.CB_COMPUTE == 'ec2' && env.AWS_ACCESS_KEY_ID || steps.aws-iceberg.outputs.aws-access-key-id }}
           AWS_SECRET_ACCESS_KEY: ${{ env.CB_COMPUTE == 'ec2' && env.AWS_SECRET_ACCESS_KEY || steps.aws-iceberg.outputs.aws-secret-access-key }}
           AWS_SESSION_TOKEN: ${{ env.CB_COMPUTE == 'ec2' && env.AWS_SESSION_TOKEN || steps.aws-iceberg.outputs.aws-session-token }}

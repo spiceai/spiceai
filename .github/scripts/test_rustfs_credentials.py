@@ -70,6 +70,7 @@ class RustfsCredentialsActionTest(unittest.TestCase):
             "ENDPOINT": values["endpoint"],
             "AUDIENCE": values["audience"],
             "DURATION_SECONDS": values["duration-seconds"],
+            "SESSION_POLICY": values["session-policy"],
             "EXPORT_ENV": values["export-env"],
         }
         proc = subprocess.run(
@@ -116,6 +117,39 @@ class RustfsCredentialsActionTest(unittest.TestCase):
         self.assertEqual(request["Version"], "2011-06-15")
         self.assertEqual(request["DurationSeconds"], "12000")
         self.assertEqual(request["WebIdentityToken"], OIDC_TOKEN)
+
+    def test_no_session_policy_is_sent_unless_one_is_named(self):
+        proc, _, _ = self.run_action()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        (request,) = self.store.sts_requests
+        self.assertNotIn("Policy", request)
+
+    def test_a_named_session_policy_is_sent_compact_from_the_actions_own_copy(self):
+        policy = (ACTION_DIR.parent.parent / "store-policies" / "benchmark-data-read-only.json").read_text()
+        proc, outputs, exports = self.run_action(**{"session-policy": "benchmark-data-read-only", "export-env": "false"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        (request,) = self.store.sts_requests
+        self.assertEqual(request["Policy"], policy.rstrip("\n"))
+        self.assertEqual(len(request["Policy"]), 486)
+        self.assertEqual(len(outputs.splitlines()), 3)
+        self.assertEqual(exports, "")
+
+    def test_a_session_policy_that_is_not_a_named_policy_is_refused(self):
+        for name in ("../../../etc/passwd", "Benchmark", "missing-policy"):
+            with self.subTest(name=name):
+                proc, outputs, _ = self.run_action(**{"session-policy": name})
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn(".github/store-policies/", proc.stdout)
+                self.assertEqual(outputs, "")
+        self.assertEqual(self.store.sts_requests, [])
+
+    def test_a_refused_read_only_exchange_fails_without_falling_back(self):
+        self.store.sts_status = 403
+        proc, outputs, _ = self.run_action(**{"session-policy": "benchmark-data-read-only"})
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(outputs, "")
+        (request,) = self.store.sts_requests
+        self.assertIn("Policy", request)
 
     def test_an_audience_input_is_used(self):
         proc, _, _ = self.run_action(audience="another-audience")

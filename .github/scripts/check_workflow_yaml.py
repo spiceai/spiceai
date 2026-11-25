@@ -432,6 +432,74 @@ def check_attested_builds(jobs: dict) -> list[str]:
     return problems
 
 
+# spidapter hands the spicepod's store credentials to a Spice Cloud app, which runs whatever image
+# the run names. So a step that runs it takes them only from an exchange whose session policy
+# reads the benchmark data and allows nothing else; the job's own credentials write its store keys.
+RUSTFS_ACTION = "$/.github/actions/rustfs-credentials"
+READ_ONLY_POLICY = "benchmark-data-read-only"
+READ_ONLY_POLICY_JSON = (
+    '{"Version":"2012-10-17","Statement":[{"Sid":"BenchmarkDataBuckets","Effect":"Allow",'
+    '"Action":["s3:GetBucketLocation","s3:ListBucket"],"Resource":["arn:aws:s3:::benchmarks",'
+    '"arn:aws:s3:::iceberg"]},{"Sid":"BenchmarkDataRead","Effect":"Allow","Action":["s3:GetObject"],'
+    '"Resource":["arn:aws:s3:::benchmarks/tpch_sf*","arn:aws:s3:::benchmarks/tpcds_sf*",'
+    '"arn:aws:s3:::benchmarks/clickbench/*","arn:aws:s3:::benchmarks/delta/*",'
+    '"arn:aws:s3:::benchmarks/hadoop/*","arn:aws:s3:::iceberg/*"]}]}'
+)
+APP_STORE_CREDENTIALS = {"S3_KEY": "access-key-id", "S3_SECRET": "secret-access-key", "S3_SESSION_TOKEN": "session-token"}
+STEP_OUTPUT = re.compile(r"\$\{\{\s*steps\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)\s*\}\}")
+# spidapter as the system adapter testoperator deploys the app through, or run as one directly.
+RUNS_SPIDAPTER = re.compile(r"--system-adapter-stdio-cmd\s+['\"]?spidapter\b|(?:^|[\s;&|(])spidapter\s+(?:stdio|deploy)\b")
+
+
+def check_app_store_credentials(jobs: dict) -> list[str]:
+    """Report a step that runs spidapter with store credentials from anything but the read-only exchange."""
+    problems = []
+    for name, job in jobs.items():
+        steps = _steps(job)
+        for position, step in enumerate(steps, start=1):
+            if not RUNS_SPIDAPTER.search(str(step.get("run", ""))):
+                continue
+            label = step.get("name") or f"step {position}"
+            earlier = {s.get("id"): s for s in steps[: position - 1] if s.get("id")}
+            env = step.get("env") if isinstance(step.get("env"), dict) else {}
+            for variable, output in APP_STORE_CREDENTIALS.items():
+                value = str(env.get(variable, ""))
+                match = STEP_OUTPUT.fullmatch(value.strip())
+                source = earlier.get(match.group(1)) if match else None
+                if (
+                    match
+                    and match.group(2) == output
+                    and source is not None
+                    and source.get("uses") == RUSTFS_ACTION
+                    and (source.get("with") or {}).get("session-policy") == READ_ONLY_POLICY
+                ):
+                    continue
+                problems.append(
+                    f"job `{name}` step `{label}` runs spidapter, which hands {variable} to a Spice Cloud "
+                    f"app, but takes it from `{value or '(unset)'}`; take it from `steps.<id>.outputs.{output}` "
+                    f"of an earlier `{RUSTFS_ACTION}` step with `session-policy: {READ_ONLY_POLICY}`"
+                )
+    return problems
+
+
+def check_store_policies(github_dir: Path) -> list[str]:
+    """Report a read-only session policy file whose content is not the one the store side expects,
+    or that is missing while a workflow names it."""
+    path = github_dir / "store-policies" / f"{READ_ONLY_POLICY}.json"
+    if not path.is_file():
+        named = any(
+            re.search(rf"session-policy:\s*['\"]?{READ_ONLY_POLICY}\b", workflow.read_text(encoding="utf-8"))
+            for workflow in workflow_files(github_dir)
+        )
+        return [f"{path}: missing, and a workflow names it as a session policy"] if named else []
+    if path.read_bytes() != READ_ONLY_POLICY_JSON.encode() + b"\n":
+        return [
+            f"{path}: is not the benchmark data read-only session policy, compact on one line; the "
+            "store side keeps the same policy, so change both together"
+        ]
+    return []
+
+
 def check_ci_role_calls(workflows: dict[str, dict]) -> list[str]:
     """Report a call to a CI role workflow that is not at trunk, or one that names it wrongly.
 
@@ -621,6 +689,7 @@ def check_workflow(text: str) -> list[str]:
         problems.extend(check_untrusted_expansions(document, jobs))
         problems.extend(check_ci_role_jobs(document))
         problems.extend(check_attested_builds(jobs))
+        problems.extend(check_app_store_credentials(jobs))
         problems.extend(check_download_execution(jobs))
 
     return problems
@@ -1284,6 +1353,7 @@ def check_definitions(github_dir: Path) -> list[str]:
     failures.extend(f"{github_dir / 'workflows'}/{problem}" for problem in check_ci_role_calls(workflows))
     failures.extend(f"{github_dir / 'workflows'}/{problem}" for problem in check_reusable_secrets(workflows))
     failures.extend(check_script_downloads(github_dir))
+    failures.extend(check_store_policies(github_dir))
     return failures
 
 

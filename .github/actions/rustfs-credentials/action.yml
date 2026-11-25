@@ -19,6 +19,15 @@ inputs:
     description: Credential lifetime in seconds, from 900 to 43200. It must cover the job's last RustFS request.
     required: false
     default: '3600'
+  session-policy:
+    description: >-
+      The name of a session policy in .github/store-policies/ (`benchmark-data-read-only` for
+      `benchmark-data-read-only.json`), for credentials handed to code this job does not
+      control: they may do only what both it and the store's policy allow. It is read from this
+      action's own copy of the repository, never the job's checkout. Empty for the store's policy
+      alone.
+    required: false
+    default: ''
   export-env:
     description: >-
       'true' exports AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN to the steps
@@ -48,14 +57,27 @@ runs:
         ENDPOINT: ${{ inputs.endpoint }}
         AUDIENCE: ${{ inputs.audience }}
         DURATION_SECONDS: ${{ inputs.duration-seconds }}
+        SESSION_POLICY: ${{ inputs.session-policy }}
         EXPORT_ENV: ${{ inputs.export-env }}
       run: |
         set -euo pipefail
+        policy_file=''
+        if [[ -n "$SESSION_POLICY" ]]; then
+          if ! [[ "$SESSION_POLICY" =~ ^[a-z0-9-]+$ ]]; then
+            echo "::error::session-policy '$SESSION_POLICY' is not the name of a policy in .github/store-policies/."
+            exit 1
+          fi
+          policy_file="$GITHUB_ACTION_PATH/../../store-policies/$SESSION_POLICY.json"
+          if [[ ! -f "$policy_file" ]]; then
+            echo "::error::.github/store-policies/$SESSION_POLICY.json does not exist."
+            exit 1
+          fi
+        fi
         err="$(mktemp)"
         trap 'rm -f "$err"' EXIT
         status=0
         credentials="$(bash "$GITHUB_ACTION_PATH/../../scripts/rustfs_credentials.sh" \
-          "$ENDPOINT" "$DURATION_SECONDS" "$AUDIENCE" 2>"$err")" || status=$?
+          "$ENDPOINT" "$DURATION_SECONDS" "$AUDIENCE" ${policy_file:+"$policy_file"} 2>"$err")" || status=$?
         if [[ "$status" -ne 0 ]]; then
           reason="$(head -n 1 "$err")"
           echo "::error::${reason:-rustfs_credentials.sh failed with exit ${status}.}"

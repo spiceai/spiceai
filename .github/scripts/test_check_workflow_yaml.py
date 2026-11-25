@@ -713,6 +713,66 @@ class CheckAttestedBuildsTest(unittest.TestCase):
                     self.assertNotIn("id-token", job.get("permissions") or {})
 
 
+class CheckAppStoreCredentialsTest(unittest.TestCase):
+    DOC = (
+        "on: workflow_dispatch\njobs:\n  bench:\n    runs-on: ubuntu-24.04\n    steps:\n"
+        "      - id: rustfs\n        uses: $/.github/actions/rustfs-credentials\n"
+        "        with:\n          endpoint: e\n"
+        "      - id: rustfs-app\n        uses: $/.github/actions/rustfs-credentials\n"
+        "        with:\n          endpoint: e\n{policy}"
+        "      - name: Run\n        env:\n"
+        "          S3_KEY: ${{{{ steps.{key}.outputs.access-key-id }}}}\n"
+        "          S3_SECRET: ${{{{ steps.rustfs-app.outputs.secret-access-key }}}}\n"
+        "          S3_SESSION_TOKEN: ${{{{ steps.rustfs-app.outputs.session-token }}}}\n"
+        "        run: testoperator run bench --system-adapter-stdio-cmd spidapter\n"
+    )
+    POLICY = "          session-policy: benchmark-data-read-only\n"
+
+    def problems(self, policy="", key="rustfs-app"):
+        text = self.DOC.format(policy=policy, key=key)
+        return [p for p in check_workflow_yaml.check_workflow(text) if "runs spidapter" in p]
+
+    def test_only_credentials_from_the_read_only_exchange_reach_the_app(self):
+        self.assertEqual(self.problems(policy=self.POLICY), [])
+        self.assertEqual(len(self.problems()), 3)
+        (problem,) = self.problems(policy=self.POLICY, key="rustfs")
+        self.assertIn("hands S3_KEY to a Spice Cloud app, but takes it from `${{ steps.rustfs.outputs.access-key-id }}`", problem)
+
+    def test_credentials_from_anywhere_else_are_reported(self):
+        text = self.DOC.format(policy=self.POLICY, key="rustfs-app").replace(
+            "${{ steps.rustfs-app.outputs.secret-access-key }}", "${{ secrets.S3_SECRET }}")
+        found = [p for p in check_workflow_yaml.check_workflow(text) if "runs spidapter" in p]
+        self.assertEqual(len(found), 1)
+        self.assertIn("S3_SECRET", found[0])
+
+    def test_a_step_that_only_builds_spidapter_is_not_checked(self):
+        text = ("on: push\njobs:\n  b:\n    runs-on: ubuntu-24.04\n    steps:\n"
+                "      - run: cargo build -p spidapter && ./target/release/spidapter --version\n")
+        self.assertEqual([p for p in check_workflow_yaml.check_workflow(text) if "runs spidapter" in p], [])
+
+    def test_the_policy_file_must_be_the_read_only_policy(self):
+        self.assertEqual(check_workflow_yaml.check_store_policies(Path(__file__).resolve().parents[1]), [])
+        with tempfile.TemporaryDirectory() as tmp:
+            github_dir = Path(tmp)
+            self.assertEqual(check_workflow_yaml.check_store_policies(github_dir), [])
+            (github_dir / "workflows").mkdir()
+            (github_dir / "workflows" / "bench.yml").write_text(self.DOC.format(policy=self.POLICY, key="rustfs-app"))
+            self.assertIn("missing, and a workflow names it", check_workflow_yaml.check_store_policies(github_dir)[0])
+            (github_dir / "store-policies").mkdir()
+            policy = github_dir / "store-policies" / "benchmark-data-read-only.json"
+            policy.write_text(check_workflow_yaml.READ_ONLY_POLICY_JSON + "\n")
+            self.assertEqual(check_workflow_yaml.check_store_policies(github_dir), [])
+            policy.write_text(check_workflow_yaml.READ_ONLY_POLICY_JSON.replace('"s3:GetObject"', '"s3:*"') + "\n")
+            self.assertIn("is not the benchmark data read-only session policy",
+                          check_workflow_yaml.check_store_policies(github_dir)[0])
+
+    def test_the_cluster_bench_passes(self):
+        workflow = Path(__file__).resolve().parents[1] / "workflows" / "testoperator_run_cluster_bench_aws.yml"
+        found = [p for p in check_workflow_yaml.check_workflow(workflow.read_text()) if "runs spidapter" in p]
+        self.assertEqual(found, [])
+        self.assertEqual(len(check_workflow_yaml.READ_ONLY_POLICY_JSON), 486)
+
+
 class CheckCiRoleCallsTest(unittest.TestCase):
     REUSABLE = yaml.safe_load(REUSABLE_CI_ROLE.replace("{steps}", CHOOSE + ASSUME.format(role=CHOSEN)))
 
