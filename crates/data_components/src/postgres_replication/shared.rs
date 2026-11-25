@@ -6352,6 +6352,47 @@ mod tests {
         assert_eq!(ack.flush_lsn(), 400);
     }
 
+    /// The slot is acknowledged only as far as every member's position is
+    /// recorded: an idle member credited to the WAL head holds the slot at its
+    /// recorded position until the applied-position writer records the credit,
+    /// so whoever resumes the slot next resumes it from the recorded position
+    /// rather than finding the slot acknowledged past it and rebuilding.
+    #[test]
+    fn acknowledgement_waits_for_the_recorded_position() {
+        let ack = AckTable::default();
+        ack.seed(100);
+        ack.register(&key("a"), false);
+        ack.register(&key("b"), false);
+        ack.promote_ready_members();
+        let a = ack.slot(&key("a")).expect("a registered");
+        let b = ack.slot(&key("b")).expect("b registered");
+        a.seat_recorded(100);
+        b.seat_recorded(100);
+
+        // a applies and records 300; b has nothing to apply and is credited to
+        // the WAL head. Both have applied to 300, but b has recorded only 100.
+        ack.deliver(&key("a"), 300);
+        a.note_recorded(300);
+        ack.commit(&key("a"), 300);
+        ack.credit_idle(300);
+        assert_eq!(ack.flush_lsn(), 300);
+        assert_eq!(ack.acknowledged_lsn(), 100);
+
+        // The writer records b's credit: now the slot may be acknowledged there.
+        b.note_recorded(300);
+        assert_eq!(ack.acknowledged_lsn(), 300);
+
+        // A recorded position ahead of the applied one does not lead the slot.
+        a.note_recorded(500);
+        b.note_recorded(500);
+        assert_eq!(ack.acknowledged_lsn(), 300);
+
+        // A member with no recorded position yet holds the slot at its applied
+        // floor, and the acknowledgement never moves back.
+        ack.register(&key("c"), false);
+        assert_eq!(ack.acknowledged_lsn(), 300);
+    }
+
     #[test]
     fn detach_reports_snapshotting_state() {
         let ack = AckTable::default();
