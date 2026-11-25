@@ -69,6 +69,20 @@ jobs:
       contents: read
       id-token: write  # RustFS credentials and Databricks access tokens
     uses: spiceai/spiceai/.github/workflows/testoperator_run_data_consistency_aws.yml@trunk
+    # By name, exactly what the called workflow declares in on.workflow_call.secrets.
+    secrets:
+      CI_AWS_PULL_REQUEST_ROLE_ARN: ${{ secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}
+      CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN: ${{ secrets.CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+      SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+      SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
+      SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
+      SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
+      TEST_MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
+      TEST_MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
+      TEST_MYSQL_USERNAME: ${{ secrets.TEST_MYSQL_USERNAME }}
+      TEST_POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
     with:
       compare_spicepod_path: ${{ github.event.inputs.compare_spicepod_path }}
       query_overrides: ${{ github.event.inputs.query_overrides }}

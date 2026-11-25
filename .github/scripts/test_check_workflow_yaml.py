@@ -723,6 +723,95 @@ class CheckCiRoleCallsTest(unittest.TestCase):
         self.assertIn("there is no .github/workflows/gone.yml", problems[0])
 
 
+class CheckReusableSecretsTest(unittest.TestCase):
+    """A call to a reusable workflow passes every secret it reads (by name for a CI role one)."""
+
+    NEEDED = ("CI_AWS_DYNAMODB_ROLE_ARN", "CI_AWS_PULL_REQUEST_ROLE_ARN")
+
+    def role_workflow(self, declared=NEEDED, required=True):
+        document = yaml.safe_load(REUSABLE_CI_ROLE.replace("{steps}", CHOOSE + ASSUME.format(role=CHOSEN)))
+        call = document[True]["workflow_call"]
+        if declared:
+            call["secrets"] = {name: {"required": required} for name in declared}
+        return document
+
+    def caller(self, target="x_aws.yml", secrets=None):
+        job = {"uses": f"spiceai/spiceai/.github/workflows/{target}@trunk", "with": {"runner_type": "x"}}
+        if secrets is not None:
+            job["secrets"] = secrets
+        return {True: {"workflow_dispatch": None}, "jobs": {"call": job}}
+
+    def by_name(self, names=NEEDED):
+        return {name: f"${{{{ secrets.{name} }}}}" for name in names}
+
+    def problems(self, workflows):
+        return check_workflow_yaml.check_reusable_secrets(workflows)
+
+    def test_a_call_that_passes_every_secret_by_name_is_accepted(self):
+        workflows = {"x_aws.yml": self.role_workflow(), "x.yml": self.caller(secrets=self.by_name())}
+        self.assertEqual(self.problems(workflows), [])
+
+    def test_a_call_that_passes_no_secrets_is_reported_for_each(self):
+        problems = self.problems({"x_aws.yml": self.role_workflow(), "x.yml": self.caller()})
+        self.assertEqual(len(problems), 2, problems)
+        self.assertIn("does not pass secret `CI_AWS_DYNAMODB_ROLE_ARN`, which x_aws.yml reads", problems[0])
+        self.assertIn("would read as empty with no error", problems[0])
+
+    def test_a_secret_read_but_not_declared_is_reported(self):
+        workflows = {
+            "x_aws.yml": self.role_workflow(declared=("CI_AWS_PULL_REQUEST_ROLE_ARN",)),
+            "x.yml": self.caller(secrets=self.by_name()),
+        }
+        problems = self.problems(workflows)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("passes secret `CI_AWS_DYNAMODB_ROLE_ARN`, which x_aws.yml does not declare", problems[0])
+
+    def test_a_ci_role_workflow_declares_each_secret_required(self):
+        workflows = {"x_aws.yml": self.role_workflow(required=False), "x.yml": self.caller(secrets=self.by_name())}
+        problems = self.problems(workflows)
+        self.assertEqual(len(problems), 2, problems)
+        self.assertIn("is not declared `required: true`", problems[0])
+
+    def test_a_ci_role_workflow_never_inherits_every_secret(self):
+        problems = self.problems({"x_aws.yml": self.role_workflow(), "x.yml": self.caller(secrets="inherit")})
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("passes `secrets: inherit` to the CI AWS role workflow x_aws.yml", problems[0])
+
+    def test_another_reusable_workflow_may_inherit_but_not_go_without(self):
+        other = yaml.safe_load(
+            "on:\n  workflow_call:\njobs:\n  test:\n    runs-on: x\n    environment: ci\n"
+            "    steps:\n      - run: echo \"$K\"\n        env:\n          K: ${{ secrets.SMB_PASSWORD }}\n"
+        )
+        inherit = self.caller("llms.yml", "inherit")
+        self.assertEqual(self.problems({"llms.yml": other, "t.yml": inherit}), [])
+        problems = self.problems({"llms.yml": other, "t.yml": self.caller("llms.yml")})
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("does not pass secret `SMB_PASSWORD`", problems[0])
+
+    def test_the_repository_passes_every_secret(self):
+        github_dir = Path(__file__).resolve().parents[1]
+        self.assertEqual([f for f in check_workflow_yaml.check_definitions(github_dir) if "secret" in f], [])
+
+
+class IntegrationAwsCallsTest(unittest.TestCase):
+    """integration.yml calls integration_aws.yml once per job; each call must run only its own,
+    or every call would run all three jobs side by side against the same AWS resources."""
+
+    def test_each_call_runs_exactly_one_job(self):
+        workflows = Path(__file__).resolve().parents[1] / "workflows"
+        caller = yaml.safe_load((workflows / "integration.yml").read_text())
+        called = yaml.safe_load((workflows / "integration_aws.yml").read_text())
+        calls = {
+            name: (job.get("with") or {}).get("job")
+            for name, job in caller["jobs"].items()
+            if str(job.get("uses", "")).endswith("integration_aws.yml")
+        }
+        self.assertEqual(calls, {name: name for name in calls})
+        self.assertEqual(sorted(calls), sorted(called["jobs"]))
+        for name, job in called["jobs"].items():
+            self.assertEqual(job.get("if"), f"inputs.job == '{name}'", name)
+
+
 class CheckActionExpansionsTest(unittest.TestCase):
     ACTION = """\
 name: Setup

@@ -45,7 +45,8 @@
 # read-only pull request role off trunk, gives that step every other build it runs, and
 # writes to the repository only with the full roles. The roles' AWS trust policies make the
 # same split by `job_workflow_ref` and `ref`; this keeps the workflows asking for what AWS
-# would grant.
+# would grant. Every call to a reusable workflow passes each secret that workflow reads, by
+# name for a CI AWS role workflow: one it is not passed reads as empty, with no error.
 #
 # And no script under `.github/` (a workflow or composite action `run:`, or a shell or
 # PowerShell file), and no Dockerfile or Containerfile in the repository, runs a download
@@ -469,6 +470,81 @@ def check_ci_role_calls(workflows: dict[str, dict]) -> list[str]:
             for key, value in sorted(declared.items()):
                 if isinstance(value, dict) and value.get("required") and key not in given:
                     problems.append(f"{where} does not pass `{key}`, which {target} requires")
+    return problems
+
+
+# A secret a workflow reads, in dot or bracket form. GITHUB_TOKEN reaches every called
+# workflow without being passed.
+SECRET_READ = re.compile(r"\bsecrets\.([A-Za-z_][A-Za-z0-9_]*)|\bsecrets\[\s*'([A-Za-z_][A-Za-z0-9_]*)'\s*\]")
+ALWAYS_PASSED = frozenset({"GITHUB_TOKEN"})
+
+
+def _secrets_read(document: dict) -> set[str]:
+    """The secrets a workflow's jobs read, from the parsed document (comments do not count)."""
+    text = yaml.safe_dump(document.get("jobs") or {})
+    return {a or b for a, b in SECRET_READ.findall(text)} - ALWAYS_PASSED
+
+
+def check_reusable_secrets(workflows: dict[str, dict]) -> list[str]:
+    """Report a call to a reusable workflow that does not pass a secret the workflow reads.
+
+    A reusable workflow gets only the secrets its caller passes, environment secrets
+    included, and one it is not passed reads as an empty string with no error: the queue's
+    CI AWS role jobs once assumed no role at all that way. So every call passes by name each
+    secret the called workflow reads, which that workflow declares under
+    `on.workflow_call.secrets`; a CI AWS role workflow declares each as required, so GitHub
+    refuses a call that drops one, and never gets `secrets: inherit`, which would hand it
+    every secret. Another reusable workflow may take `inherit`.
+    """
+    role_workflows = {name for name, document in workflows.items() if ci_role_jobs(document)}
+    problems = []
+    for name in sorted(role_workflows):
+        spec = _triggers(workflows[name])
+        call = (spec.get("workflow_call") or {}) if isinstance(spec, dict) else {}
+        declared = (call.get("secrets") or {}) if isinstance(call, dict) else {}
+        for secret, value in sorted(declared.items()):
+            if not (isinstance(value, dict) and value.get("required") is True):
+                problems.append(
+                    f"{name}: secret `{secret}` is not declared `required: true`, so a caller that "
+                    "drops it would run with it empty"
+                )
+    for caller, document in sorted(workflows.items()):
+        jobs = document.get("jobs")
+        if not isinstance(jobs, dict):
+            continue
+        for job_name, job in jobs.items():
+            uses = job.get("uses") if isinstance(job, dict) else None
+            if not isinstance(uses, str):
+                continue
+            match = TRUNK_CALL.fullmatch(uses) or LOCAL_CALL.fullmatch(uses)
+            if not match or match.group(1) not in workflows:
+                continue
+            target = match.group(1)
+            where = f"{caller}: job `{job_name}`"
+            passed = job.get("secrets")
+            if passed == "inherit":
+                if target in role_workflows:
+                    problems.append(
+                        f"{where} passes `secrets: inherit` to the CI AWS role workflow {target}, which "
+                        "would hand it every secret; pass each secret it declares by name"
+                    )
+                continue
+            spec = _triggers(workflows[target])
+            call = (spec.get("workflow_call") or {}) if isinstance(spec, dict) else {}
+            declared = set((call.get("secrets") or {}) if isinstance(call, dict) else {})
+            given = set(passed) if isinstance(passed, dict) else set()
+            for secret in sorted((_secrets_read(workflows[target]) | declared) - given):
+                problems.append(
+                    f"{where} does not pass secret `{secret}`, which {target} reads: a reusable workflow "
+                    f"gets only the secrets its caller passes, so it would read as empty with no error. "
+                    f"Pass `{secret}: ${{{{ secrets.{secret} }}}}`, and declare it in {target}'s "
+                    "on.workflow_call.secrets"
+                )
+            for secret in sorted(given - declared):
+                problems.append(
+                    f"{where} passes secret `{secret}`, which {target} does not declare in "
+                    "on.workflow_call.secrets"
+                )
     return problems
 
 
@@ -1154,6 +1230,7 @@ def check_definitions(github_dir: Path) -> list[str]:
         if document is not None:
             workflows[path.name] = document
     failures.extend(f"{github_dir / 'workflows'}/{problem}" for problem in check_ci_role_calls(workflows))
+    failures.extend(f"{github_dir / 'workflows'}/{problem}" for problem in check_reusable_secrets(workflows))
     failures.extend(check_script_downloads(github_dir))
     return failures
 

@@ -200,6 +200,14 @@ jobs:
       # `compute: ec2` assumes the sandbox benchmark role over OIDC.
       id-token: write
     uses: spiceai/spiceai/.github/workflows/testoperator_run_cluster_bench_aws.yml@trunk
+    # By name, exactly what the called workflow declares in on.workflow_call.secrets.
+    secrets:
+      CI_AWS_EC2_BENCH_ROLE_ARN: ${{ secrets.CI_AWS_EC2_BENCH_ROLE_ARN }}
+      CI_AWS_ICEBERG_ROLE_ARN: ${{ secrets.CI_AWS_ICEBERG_ROLE_ARN }}
+      CI_AWS_PULL_REQUEST_ROLE_ARN: ${{ secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}
+      SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+      SPICE_MANAGEMENT_CLIENT_ID_PROD: ${{ secrets.SPICE_MANAGEMENT_CLIENT_ID_PROD }}
+      SPICE_MANAGEMENT_CLIENT_SECRET_PROD: ${{ secrets.SPICE_MANAGEMENT_CLIENT_SECRET_PROD }}
     with:
       app_storage_size_gb: ${{ github.event.inputs.app_storage_size_gb }}
       cayenne_file_path: ${{ github.event.inputs.cayenne_file_path }}

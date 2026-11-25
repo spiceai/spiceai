@@ -624,6 +624,12 @@ jobs:
       # Exchanged for the Bedrock role's AWS credentials: workload identity federation.
       id-token: write
     uses: spiceai/spiceai/.github/workflows/integration_models_aws.yml@trunk
+    # By name, exactly what the called workflow declares in on.workflow_call.secrets.
+    secrets:
+      CI_AWS_BEDROCK_ROLE_ARN: ${{ secrets.CI_AWS_BEDROCK_ROLE_ARN }}
+      CI_AWS_PULL_REQUEST_ROLE_ARN: ${{ secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}
+      SCP_SPICEHQ_SPICEIO_API_KEY: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+      SMB_PASSWORD: ${{ secrets.SMB_PASSWORD }}
     with:
       update_snapshots: ${{ github.event.inputs.update_snapshots }}
 

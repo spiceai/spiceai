@@ -244,6 +244,18 @@ jobs:
       contents: read
       id-token: write  # RustFS and Docker Hub credentials, and the tokens of the live scripts
     uses: spiceai/spiceai/.github/workflows/trunk_tests_aws.yml@trunk
+    # By name, exactly what the called workflow declares in on.workflow_call.secrets.
+    secrets:
+      ANTHROPIC_FEDERATION_RULE_ID: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
+      ANTHROPIC_ORGANIZATION_ID: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
+      ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+      ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+      CI_AWS_PULL_REQUEST_ROLE_ARN: ${{ secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}
+      CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN: ${{ secrets.CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+      OPENAI_WIF_AUDIENCE: ${{ secrets.OPENAI_WIF_AUDIENCE }}
+      SPICE_SECRET_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
     with:
       needs_resolve_build_run: ${{ needs.resolve.outputs.build_run }}
       needs_resolve_sha: ${{ needs.resolve.outputs.sha }}

@@ -63,6 +63,11 @@ jobs:
       id-token: write
       contents: read
     uses: spiceai/spiceai/.github/workflows/testoperator_run_streaming_correctness_aws.yml@trunk
+    # By name, exactly what the called workflow declares in on.workflow_call.secrets.
+    secrets:
+      CI_AWS_PULL_REQUEST_ROLE_ARN: ${{ secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}
+      CI_AWS_STREAMING_BENCH_ROLE_ARN: ${{ secrets.CI_AWS_STREAMING_BENCH_ROLE_ARN }}
+      SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
     with:
       mutation_ratio: ${{ github.event.inputs.mutation_ratio }}
       mutation_seed: ${{ github.event.inputs.mutation_seed }}

@@ -8,7 +8,41 @@ name: integration tests (CI AWS role jobs)
 
 on:
   workflow_call:
+    # The secrets the jobs below read. A reusable workflow gets only the secrets its
+    # caller passes, environment secrets included, and one it is not passed reads as
+    # empty with no error, so each is required and every caller passes it by name.
+    # check_workflow_yaml.py keeps this list and the callers' `secrets:` complete.
+    secrets:
+      CI_AWS_DATABRICKS_DELTA_ROLE_ARN:
+        required: true
+      CI_AWS_DYNAMODB_ROLE_ARN:
+        required: true
+      CI_AWS_ICEBERG_ROLE_ARN:
+        required: true
+      CI_AWS_PULL_REQUEST_ROLE_ARN:
+        required: true
+      CI_AWS_S3_VECTORS_ROLE_ARN:
+        required: true
+      CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN:
+        required: true
+      ORACLE_CLOUD_CONNECTION_STRING:
+        required: true
+      ORACLE_CLOUD_PASSWORD:
+        required: true
+      ORACLE_CLOUD_USERNAME:
+        required: true
+      ORACLE_CLOUD_WALLET_SSO_CERT:
+        required: true
+      SPICE_SECRET_SPICEAI_KEY:
+        required: true
+      SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY:
+        required: true
     inputs:
+      # integration.yml calls this file once per job, so each call runs only the job it names.
+      job:
+        description: 'The job to run: test-partitions, test-aws-sdk or test-snapshot-refresh.'
+        type: string
+        required: true
       needs_check_changes_relevant_changes:
         type: string
         required: false
@@ -43,6 +77,7 @@ env:
 
 jobs:
   test-partitions:
+    if: inputs.job == 'test-partitions'
     name: Run Integration Tests (part ${{ matrix.label }})
     permissions:
       id-token: write  # RustFS, AWS, Docker Hub and Databricks credentials over OIDC
@@ -369,6 +404,7 @@ jobs:
           retention-days: 1
 
   test-aws-sdk:
+    if: inputs.job == 'test-aws-sdk'
     name: AWS SDK Integration Tests
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 12.4 min (run 34213792762).
     # 60 is kept deliberately as a stuck-runner backstop, 4.8x that.
@@ -466,6 +502,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration_aws_sdk)'
 
   test-snapshot-refresh:
+    if: inputs.job == 'test-snapshot-refresh'
     environment: ci
     name: Snapshot Refresh Mode Integration Tests
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 10.9 min (run 34213792762).

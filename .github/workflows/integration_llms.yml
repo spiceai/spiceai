@@ -248,6 +248,23 @@ jobs:
       # federation.
       id-token: write
     uses: spiceai/spiceai/.github/workflows/integration_llms_aws.yml@trunk
+    # By name, exactly what the called workflow declares in on.workflow_call.secrets.
+    secrets:
+      ANTHROPIC_FEDERATION_RULE_ID: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
+      ANTHROPIC_ORGANIZATION_ID: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
+      ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+      ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+      AZURE_OPENAI_CLIENT_ID: ${{ secrets.AZURE_OPENAI_CLIENT_ID }}
+      AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+      AZURE_OPENAI_TENANT_ID: ${{ secrets.AZURE_OPENAI_TENANT_ID }}
+      CI_AWS_BEDROCK_ROLE_ARN: ${{ secrets.CI_AWS_BEDROCK_ROLE_ARN }}
+      CI_AWS_PULL_REQUEST_ROLE_ARN: ${{ secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}
+      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+      SCP_SPICEHQ_SPICEIO_API_KEY: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+      SMB_PASSWORD: ${{ secrets.SMB_PASSWORD }}
+      SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+      TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
     with:
       needs_setup_matrix_matrix: ${{ needs.setup-matrix.outputs.matrix }}
       ref: ${{ inputs.ref }}

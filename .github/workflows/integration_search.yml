@@ -35,5 +35,11 @@ jobs:
       # Exchanged for OpenAI access tokens: workload identity federation.
       id-token: write
     uses: spiceai/spiceai/.github/workflows/integration_search_aws.yml@trunk
+    # By name, exactly what the called workflow declares in on.workflow_call.secrets.
+    secrets:
+      CI_AWS_PULL_REQUEST_ROLE_ARN: ${{ secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}
+      CI_AWS_S3_VECTORS_ROLE_ARN: ${{ secrets.CI_AWS_S3_VECTORS_ROLE_ARN }}
+      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
     with:
       update_snapshots: ${{ github.event.inputs.update_snapshots }}

@@ -391,7 +391,22 @@ jobs:
       id-token: write  # RustFS, AWS, Docker Hub and Databricks credentials over OIDC
       contents: read
     uses: ./.github/workflows/integration_aws.yml
+    # By name, exactly what the called workflow declares in on.workflow_call.secrets.
+    secrets:
+      CI_AWS_DATABRICKS_DELTA_ROLE_ARN: ${{ secrets.CI_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+      CI_AWS_DYNAMODB_ROLE_ARN: ${{ secrets.CI_AWS_DYNAMODB_ROLE_ARN }}
+      CI_AWS_ICEBERG_ROLE_ARN: ${{ secrets.CI_AWS_ICEBERG_ROLE_ARN }}
+      CI_AWS_PULL_REQUEST_ROLE_ARN: ${{ secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}
+      CI_AWS_S3_VECTORS_ROLE_ARN: ${{ secrets.CI_AWS_S3_VECTORS_ROLE_ARN }}
+      CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN: ${{ secrets.CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+      ORACLE_CLOUD_CONNECTION_STRING: ${{ secrets.ORACLE_CLOUD_CONNECTION_STRING }}
+      ORACLE_CLOUD_PASSWORD: ${{ secrets.ORACLE_CLOUD_PASSWORD }}
+      ORACLE_CLOUD_USERNAME: ${{ secrets.ORACLE_CLOUD_USERNAME }}
+      ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
+      SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
+      SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
     with:
+      job: test-partitions
       needs_check_changes_relevant_changes: ${{ needs.check_changes.outputs.relevant_changes }}
       run_all_tests: ${{ github.event.inputs.run_all_tests }}
       update_snapshots: ${{ github.event.inputs.update_snapshots }}
@@ -916,6 +931,22 @@ jobs:
       contents: read
       id-token: write  # RustFS credentials
     uses: ./.github/workflows/integration_aws.yml
+    with:
+      job: test-aws-sdk
+    # By name, exactly what the called workflow declares in on.workflow_call.secrets.
+    secrets:
+      CI_AWS_DATABRICKS_DELTA_ROLE_ARN: ${{ secrets.CI_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+      CI_AWS_DYNAMODB_ROLE_ARN: ${{ secrets.CI_AWS_DYNAMODB_ROLE_ARN }}
+      CI_AWS_ICEBERG_ROLE_ARN: ${{ secrets.CI_AWS_ICEBERG_ROLE_ARN }}
+      CI_AWS_PULL_REQUEST_ROLE_ARN: ${{ secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}
+      CI_AWS_S3_VECTORS_ROLE_ARN: ${{ secrets.CI_AWS_S3_VECTORS_ROLE_ARN }}
+      CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN: ${{ secrets.CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+      ORACLE_CLOUD_CONNECTION_STRING: ${{ secrets.ORACLE_CLOUD_CONNECTION_STRING }}
+      ORACLE_CLOUD_PASSWORD: ${{ secrets.ORACLE_CLOUD_PASSWORD }}
+      ORACLE_CLOUD_USERNAME: ${{ secrets.ORACLE_CLOUD_USERNAME }}
+      ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
+      SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
+      SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
 
   test-aws-sdk-credential-bridge:
     name: AWS SDK Credential Bridge Integration Tests
@@ -1006,6 +1037,22 @@ jobs:
       contents: read
       id-token: write  # RustFS credentials
     uses: ./.github/workflows/integration_aws.yml
+    with:
+      job: test-snapshot-refresh
+    # By name, exactly what the called workflow declares in on.workflow_call.secrets.
+    secrets:
+      CI_AWS_DATABRICKS_DELTA_ROLE_ARN: ${{ secrets.CI_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+      CI_AWS_DYNAMODB_ROLE_ARN: ${{ secrets.CI_AWS_DYNAMODB_ROLE_ARN }}
+      CI_AWS_ICEBERG_ROLE_ARN: ${{ secrets.CI_AWS_ICEBERG_ROLE_ARN }}
+      CI_AWS_PULL_REQUEST_ROLE_ARN: ${{ secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}
+      CI_AWS_S3_VECTORS_ROLE_ARN: ${{ secrets.CI_AWS_S3_VECTORS_ROLE_ARN }}
+      CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN: ${{ secrets.CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+      ORACLE_CLOUD_CONNECTION_STRING: ${{ secrets.ORACLE_CLOUD_CONNECTION_STRING }}
+      ORACLE_CLOUD_PASSWORD: ${{ secrets.ORACLE_CLOUD_PASSWORD }}
+      ORACLE_CLOUD_USERNAME: ${{ secrets.ORACLE_CLOUD_USERNAME }}
+      ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
+      SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
+      SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
 
   test-data-components:
     environment: ci

@@ -9,6 +9,19 @@ name: integration tests (models) (CI AWS role jobs)
 
 on:
   workflow_call:
+    # The secrets the jobs below read. A reusable workflow gets only the secrets its
+    # caller passes, environment secrets included, and one it is not passed reads as
+    # empty with no error, so each is required and every caller passes it by name.
+    # check_workflow_yaml.py keeps this list and the callers' `secrets:` complete.
+    secrets:
+      CI_AWS_BEDROCK_ROLE_ARN:
+        required: true
+      CI_AWS_PULL_REQUEST_ROLE_ARN:
+        required: true
+      SCP_SPICEHQ_SPICEIO_API_KEY:
+        required: true
+      SMB_PASSWORD:
+        required: true
     inputs:
       update_snapshots:
         type: string

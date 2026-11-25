@@ -43,6 +43,14 @@ jobs:
       # Exchanged for OpenAI access tokens: workload identity federation.
       id-token: write
     uses: spiceai/spiceai/.github/workflows/testoperator_run_search_aws.yml@trunk
+    # By name, exactly what the called workflow declares in on.workflow_call.secrets.
+    secrets:
+      CI_AWS_PULL_REQUEST_ROLE_ARN: ${{ secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}
+      CI_AWS_S3_VECTORS_ROLE_ARN: ${{ secrets.CI_AWS_S3_VECTORS_ROLE_ARN }}
+      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+      SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+      SPICE_SECRET_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
     with:
       ready_wait: ${{ github.event.inputs.ready_wait }}
       runner_type: ${{ github.event.inputs.runner_type }}

@@ -9,6 +9,23 @@ name: cluster benchmark e2e tests (CI AWS role jobs)
 
 on:
   workflow_call:
+    # The secrets the jobs below read. A reusable workflow gets only the secrets its
+    # caller passes, environment secrets included, and one it is not passed reads as
+    # empty with no error, so each is required and every caller passes it by name.
+    # check_workflow_yaml.py keeps this list and the callers' `secrets:` complete.
+    secrets:
+      CI_AWS_EC2_BENCH_ROLE_ARN:
+        required: true
+      CI_AWS_ICEBERG_ROLE_ARN:
+        required: true
+      CI_AWS_PULL_REQUEST_ROLE_ARN:
+        required: true
+      SPICEAI_BENCHMARK_METRICS_KEY:
+        required: true
+      SPICE_MANAGEMENT_CLIENT_ID_PROD:
+        required: true
+      SPICE_MANAGEMENT_CLIENT_SECRET_PROD:
+        required: true
     inputs:
       app_storage_size_gb:
         type: string

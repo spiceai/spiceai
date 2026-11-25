@@ -9,6 +9,35 @@ name: data consistency tests (CI AWS role jobs)
 
 on:
   workflow_call:
+    # The secrets the jobs below read. A reusable workflow gets only the secrets its
+    # caller passes, environment secrets included, and one it is not passed reads as
+    # empty with no error, so each is required and every caller passes it by name.
+    # check_workflow_yaml.py keeps this list and the callers' `secrets:` complete.
+    secrets:
+      CI_AWS_PULL_REQUEST_ROLE_ARN:
+        required: true
+      CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN:
+        required: true
+      SNOWFLAKE_ACCOUNT:
+        required: true
+      SNOWFLAKE_PASSWORD:
+        required: true
+      SNOWFLAKE_USERNAME:
+        required: true
+      SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY:
+        required: true
+      SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY:
+        required: true
+      SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY:
+        required: true
+      TEST_MONGODB_PASSWORD:
+        required: true
+      TEST_MYSQL_PASSWORD:
+        required: true
+      TEST_MYSQL_USERNAME:
+        required: true
+      TEST_POSTGRES_PASSWORD:
+        required: true
     inputs:
       compare_spicepod_path:
         type: string
