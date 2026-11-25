@@ -547,7 +547,10 @@ async fn cayenne_memory_mode_retention_sql_matching_every_row_empties_the_tier()
 ///
 /// Cayenne refuses `partition_by` in memory mode, so partitioned retention is only
 /// reachable in file mode. Retention runs from post-write maintenance after each
-/// partition's write commits, so the poll is what waits for it.
+/// partition's write commits, so the poll is what waits for it. As in the file-mode
+/// test above, the refresh adds a surviving row the initial load cannot produce, so
+/// the assertions pass only once the refresh has reloaded every partition and
+/// retention has run over it again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cayenne_partitioned_file_mode_applies_retention_sql_in_every_partition()
 -> Result<(), anyhow::Error> {
@@ -613,9 +616,11 @@ async fn cayenne_partitioned_file_mode_applies_retention_sql_in_every_partition(
                 "{PART_TABLE} sets `partition_by` but its scan reads no partitions:\n{plan}"
             );
 
-            trigger_refresh(&rt, PART_TABLE).await?;
+            let mut rows = INITIAL_ROWS.to_vec();
+            rows.push(ADDED_ROW);
+            write_source(&source, &rows)?;
 
-            let expected: Vec<(i64, i64)> = INITIAL_ROWS
+            let expected: Vec<(i64, i64)> = rows
                 .iter()
                 .copied()
                 .filter(|(_, score)| *score >= SCORE_FLOOR)
@@ -637,14 +642,14 @@ async fn cayenne_partitioned_file_mode_applies_retention_sql_in_every_partition(
                 row_count(&rt, PART_TABLE).await?
             );
 
-            let rows = run_query(
+            let served = run_query(
                 &rt,
                 &format!("SELECT id, score FROM {PART_TABLE} ORDER BY id"),
             )
             .await?;
             let lines = expected_table(&expected);
             let rendered: Vec<&str> = lines.iter().map(String::as_str).collect();
-            assert_batches_eq!(&rendered, &rows);
+            assert_batches_eq!(&rendered, &served);
 
             Ok(())
         })
