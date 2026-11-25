@@ -591,6 +591,29 @@ async fn read_rows(ctx: &SessionContext, name: &str) -> TestResult<Model> {
     Ok(model)
 }
 
+/// Every `(id, value)` row, sorted, duplicates kept: the whole content of a
+/// table without a key, which [`read_rows`] would fold by key.
+async fn read_row_multiset(ctx: &SessionContext, name: &str) -> TestResult<Vec<(i64, i64)>> {
+    let df = ctx
+        .sql(&format!("SELECT id, value FROM {name} ORDER BY id, value"))
+        .await?;
+    let mut rows = Vec::new();
+    for b in &df.collect().await? {
+        let ids = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id");
+        let vals = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value");
+        rows.extend((0..b.num_rows()).map(|i| (ids.value(i), vals.value(i))));
+    }
+    Ok(rows)
+}
+
 fn assert_converged(live: &Model, model: &Model, ctx_msg: &str) {
     let missing: Vec<(i64, i64)> = model
         .iter()
@@ -1810,6 +1833,209 @@ async fn reupsert_after_overwrite_delete_is_visible_impl(f: TestFixture) -> Test
     Ok(())
 }
 test_on_data_store!(reupsert_after_overwrite_delete_is_visible_impl);
+
+// --- Focused regression: a change-stream write staged before an overwrite ---
+//
+// A change-stream append stages, then publishes later; a keyed one publishes
+// without the write lock. An overwrite that starts in between is ordered after
+// the staged write: it waits for the publish, then replaces it. Published after
+// the overwrite instead, the keyed write's deletes would still target the
+// replaced snapshot, so a key both writes hold (50) would be served twice.
+// Covers both deletion modes and a table without a key.
+async fn staged_cdc_write_is_ordered_before_overwrite_impl(f: TestFixture) -> TestResult<()> {
+    for (label, keyed, mode) in [
+        ("key", true, Mode::Key),
+        ("position", true, Mode::Position),
+        ("unkeyed", false, Mode::Key),
+    ] {
+        let name = format!("staged_before_overwrite_{label}");
+        let opts = CreateTableOptions {
+            table_name: name.clone(),
+            schema: schema(),
+            primary_key: if keyed {
+                vec!["id".to_string()]
+            } else {
+                vec![]
+            },
+            on_conflict: keyed
+                .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+            base_path: f.data_store.base_path(&name),
+            partition_column: None,
+            vortex_config: config(mode, Durability::File, None, None),
+        };
+        let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&f.catalog) as Arc<dyn MetadataCatalog>;
+        let ctx = SessionContext::new();
+        let table = Arc::new(
+            f.data_store
+                .create(catalog, ctx.runtime_env(), opts)
+                .await?,
+        );
+        ctx.register_table(name.as_str(), Arc::clone(&table) as Arc<dyn TableProvider>)?;
+
+        upsert(&table, &[(1, 10), (2, 20)], Durability::File).await?;
+        let staged = table
+            .write_cdc_append_stream(
+                batch_to_stream(rows_to_batch(&[(1, 11), (50, 500), (51, 510)])),
+                &ctx.task_ctx(),
+            )
+            .await?;
+        assert!(
+            staged.has_pending_finalize(),
+            "{label}: the change-stream write must stage before it publishes"
+        );
+
+        let replacement = [(50, 5000), (100, 1000), (101, 1010)];
+        let mut overwrite_task = tokio::spawn({
+            let table = Arc::clone(&table);
+            async move {
+                overwrite(&table, &replacement)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        });
+        // Time is what is under test: the overwrite must still be waiting for
+        // the staged write after a window far longer than it takes to run.
+        let early =
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut overwrite_task).await;
+        let overwrite_waited = early.is_err();
+        let published = staged.finish().await?;
+        match early {
+            Ok(overwritten) => overwritten??,
+            Err(_) => overwrite_task.await??,
+        }
+
+        let model: Model = replacement.into_iter().collect();
+        let message = format!(
+            "{label}: the overwrite replaces the staged write (published {published} rows, \
+             overwrite waited for it: {overwrite_waited})"
+        );
+        assert_converged_no_duplicates(&ctx, &name, &model, &message).await?;
+        assert_eq!(published, 3, "{message}");
+        assert!(overwrite_waited, "{message}");
+
+        let (table, ctx) = reopen_table(&f, &name).await?;
+        assert_converged_no_duplicates(&ctx, &name, &model, &format!("{message}, reopened"))
+            .await?;
+
+        // The next change-stream write resolves its keys against the replacement.
+        let next = [(50, 5001), (102, 1020)];
+        upsert(&table, &next, Durability::Memory).await?;
+        let mut model = model;
+        if keyed {
+            model.extend(next);
+            assert_converged_no_duplicates(&ctx, &name, &model, &format!("{message}, next write"))
+                .await?;
+        } else {
+            // A table without a key keeps both rows of key 50.
+            let mut expected: Vec<(i64, i64)> = replacement.into_iter().chain(next).collect();
+            expected.sort_unstable();
+            assert_eq!(
+                read_row_multiset(&ctx, &name).await?,
+                expected,
+                "{message}, next write appends"
+            );
+        }
+    }
+    Ok(())
+}
+test_on_data_store!(staged_cdc_write_is_ordered_before_overwrite_impl);
+
+// A change-stream batch applied as one metastore record publishes each group
+// only when the record commits, after its last group. An overwrite that starts
+// between two groups waits for that record, so the later groups must still be
+// able to stage and delete: otherwise the batch and the overwrite each wait for
+// the other until the overwrite times out. Only the object-native metastore
+// commits a batch as one record, so this runs on it on every lane.
+async fn overwrite_lets_a_waiting_batch_finish_its_groups_impl(f: TestFixture) -> TestResult<()> {
+    let name = "overwrite_waits_for_batch_record".to_string();
+    let opts = CreateTableOptions {
+        table_name: name.clone(),
+        schema: schema(),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+        base_path: f.data_store.base_path(&name),
+        partition_column: None,
+        vortex_config: config(Mode::Key, Durability::File, None, None),
+    };
+    let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&f.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        f.data_store
+            .create(catalog, ctx.runtime_env(), opts)
+            .await?,
+    );
+    ctx.register_table(name.as_str(), Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    upsert(&table, &[(1, 10), (2, 20)], Durability::File).await?;
+
+    let replacement = [(100, 1000), (101, 1010)];
+    let started = std::time::Instant::now();
+    let (overwritten, after_commit) = cayenne::catalog::with_same_record_commits(async {
+        let first = table
+            .write_cdc_append_stream(batch_to_stream(rows_to_batch(&[(3, 30)])), &ctx.task_ctx())
+            .await?;
+        first.finish().await?;
+        let overwrite_task = tokio::spawn({
+            let table = Arc::clone(&table);
+            async move {
+                overwrite(&table, &replacement)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        });
+        // The later groups must start only once the overwrite holds admission
+        // while it waits for this batch's record.
+        let waiting = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !table.append_admission_held_exclusively() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            waiting.is_ok(),
+            "the overwrite starts waiting for the batch's record"
+        );
+        let second = table
+            .write_cdc_append_stream(batch_to_stream(rows_to_batch(&[(4, 40)])), &ctx.task_ctx())
+            .await?;
+        second.finish().await?;
+        let deleted = table.delete_from_cdc_fast(&[col("id").eq(lit(1))]).await?;
+        assert_eq!(
+            deleted,
+            Some(1),
+            "the batch's delete group runs as a key delete"
+        );
+        TestResult::Ok((overwrite_task, started.elapsed()))
+    })
+    .await;
+    let (overwrite_task, second_group_after) = overwritten?;
+    assert!(
+        !overwrite_task.is_finished(),
+        "the overwrite waits for the batch's record"
+    );
+    table.catalog().commit_pending_for(table.table_id()).await?;
+    after_commit.run().await;
+    let overwrite_result = overwrite_task.await?;
+    let message = format!(
+        "later groups ran after {second_group_after:?}, overwrite result {overwrite_result:?}"
+    );
+    assert!(
+        second_group_after < std::time::Duration::from_secs(10),
+        "{message}"
+    );
+    overwrite_result?;
+    let model: Model = replacement.into_iter().collect();
+    assert_converged_no_duplicates(&ctx, &name, &model, &message).await?;
+    Ok(())
+}
+#[test]
+fn overwrite_lets_a_waiting_batch_finish_its_groups() -> Result<(), String> {
+    common::run_with_backend_blocking(
+        BackendType::ObjectNative,
+        overwrite_lets_a_waiting_batch_finish_its_groups_impl,
+    )
+}
 
 // --- Focused regression: a re-upsert survives a bake, a merge and a reload ---
 //
