@@ -425,7 +425,25 @@ impl FixtureDataStore {
         runtime_env: Arc<RuntimeEnv>,
         options: CreateTableOptions,
     ) -> Result<CayenneTableProvider, Box<dyn std::error::Error>> {
-        let table = self.builder(catalog, runtime_env).create(options).await?;
+        self.create_with_retention(catalog, runtime_env, options, Vec::new())
+            .await
+    }
+
+    /// [`Self::create`] with `retention` as the table's retention filters.
+    /// # Errors
+    /// As [`Self::create`].
+    pub async fn create_with_retention(
+        &self,
+        catalog: Arc<dyn MetadataCatalog>,
+        runtime_env: Arc<RuntimeEnv>,
+        options: CreateTableOptions,
+        retention: Vec<datafusion::logical_expr::Expr>,
+    ) -> Result<CayenneTableProvider, Box<dyn std::error::Error>> {
+        let table = self
+            .builder(catalog, runtime_env)
+            .with_retention_filters(retention)
+            .create(options)
+            .await?;
         self.check_placement(&table)?;
         Ok(table)
     }

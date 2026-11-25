@@ -7,7 +7,9 @@ description: >
   reused across queries; retries of a 503 that clears; a 4xx surfaced as an
   error, a row or a warning per on_error_response; Link-header and cursor
   pagination; a dataset with declared columns that does not call the server
-  until it is first queried (and fails then if they do not match); a
+  until it is first queried (and fails then if they do not match), and one
+  whose server is unavailable at that first query and that loads once the
+  server answers, without a restart, federated and accelerated; a
   json_object catch-all column; JSON nulls, missing keys, nested documents
   and arrays, federated and accelerated into Cayenne; the runtime's own
   Server-Timing and trace-id headers; its streamed vnd JSON and CSV SQL
@@ -28,6 +30,14 @@ description: >
 sources:
   api: { kind: mock-http }
   elsewhere: { kind: mock-http }
+
+# The spicepod as written, and the same with the deferred dataset `late_items`
+# accelerated, whose first query hands off to the accelerated load.
+variants:
+  federated: federated
+  late-items-accelerated:
+    datasets:
+      late_items: { acceleration: { enabled: true, engine: cayenne } }
 
 spicepod:
   version: v1
@@ -153,6 +163,13 @@ spicepod:
         graphql_auth_token: k3y
     - from: ${sources.api.url}/files/items.csv
       name: items_deferred
+      params: { file_format: csv }
+      ready_state: on_registration
+      columns:
+        - { name: id, type: bigint }
+        - { name: name, type: text }
+    - from: ${sources.api.url}/files/late.csv
+      name: late_items
       params: { file_format: csv }
       ready_state: on_registration
       columns:
@@ -311,6 +328,10 @@ steps:
           headers: { content-type: text/csv }
           body: "id,name\n1,one\n2,two\n"
         - |
+          path: /files/late.csv
+          status: 503
+          body: busy
+        - |
           path: /moved/old
           status: 302
           headers: { location: '${sources.api.url}/moved/new' }
@@ -407,6 +428,24 @@ steps:
     expect: { rows: [['0']] }
   - query: SELECT id, name FROM items_deferred
     expect: { rows: [['1', one], ['2', two]] }
+    eventually: 30s
+
+  # A deferred dataset whose server is unavailable at its first query fails
+  # that query, then loads once the server answers, without a restart.
+  - query: SELECT id, name FROM late_items
+    expect-error: true
+  - assert-status: { dataset: late_items, status: Error }
+    eventually: 30s
+  - source-exec:
+      api:
+        - |
+          path: /files/late.csv
+          headers: { content-type: text/csv }
+          body: "id,name\n1,one\n2,two\n"
+  - query: SELECT id, name FROM late_items
+    expect: { rows: [['1', one], ['2', two]] }
+    eventually: 60s
+  - assert-status: { dataset: late_items, status: Ready }
     eventually: 30s
 
   # Static files.

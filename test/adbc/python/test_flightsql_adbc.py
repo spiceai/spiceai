@@ -16,16 +16,21 @@ Usage:
 """
 
 import argparse
+import importlib.util
 import sys
 from typing import Optional
 
 try:
     import adbc_driver_flightsql.dbapi as flight_sql
-    # pyarrow is imported to verify availability; bind to _ to indicate intentional non-use
-    import pyarrow as _pyarrow  # noqa: F401
-    del _pyarrow
 except ImportError as e:
     print(f"Error: Missing required package: {e}")
+    print("Install with: pip install adbc-driver-flightsql pyarrow")
+    sys.exit(1)
+
+# The driver imports without pyarrow and only needs it once a query returns rows,
+# so check for it here rather than fail partway through the tests.
+if importlib.util.find_spec("pyarrow") is None:
+    print("Error: Missing required package: No module named 'pyarrow'")
     print("Install with: pip install adbc-driver-flightsql pyarrow")
     sys.exit(1)
 
