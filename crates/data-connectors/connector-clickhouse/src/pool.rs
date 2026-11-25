@@ -55,8 +55,9 @@ impl ClickhouseConnectionPool {
     // Creates a new instance of `ClickhouseConnectionPool`.
     #[must_use]
     pub fn new(options: Options, db: Arc<str>, compute_context: String) -> Self {
-        // Match SQL null extension and empty-set aggregate semantics on every
-        // connection, including handles acquired directly for streaming queries.
+        // Match SQL null extension, `UNION` and empty-set aggregate semantics on
+        // every connection, including handles acquired directly for streaming
+        // queries.
         // Two analyzer rewrites change aggregate results: `optimize_uniq_to_count`
         // makes `count(DISTINCT x)` over a subquery grouped by `x` count a NULL
         // group, and `optimize_rewrite_aggregate_function_with_if` makes
@@ -65,6 +66,7 @@ impl ClickhouseConnectionPool {
         // them ignores them.
         let options = options
             .with_setting("join_use_nulls", 1_u64, true)
+            .with_setting("union_default_mode", "DISTINCT", true)
             .with_setting("aggregate_functions_null_for_empty", 1_u64, true)
             .with_setting("optimize_uniq_to_count", 0_u64, false)
             .with_setting("optimize_rewrite_aggregate_function_with_if", 0_u64, false);

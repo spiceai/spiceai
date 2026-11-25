@@ -20,17 +20,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use clickhouse_rs::ClientHandle;
-use data_components::function_support::{FunctionSupport, contains_unsupported_functions};
+use data_components::{
+    SOURCE_TYPE_METADATA_KEY,
+    function_support::{FunctionSupport, contains_unsupported_functions},
+};
 use datafusion::{
-    arrow::datatypes::{DataType, SchemaRef},
+    arrow::datatypes::{DataType, Field, SchemaRef},
     common::{
         DFSchema, NullEquality, Result, ScalarValue, Statistics, TableReference,
         tree_node::TreeNodeRecursion,
     },
     datasource::TableProvider,
     logical_expr::{
-        Expr, ExprSchemable, JoinType, LogicalPlan, Operator, WindowFrameBound, WindowFrameUnits,
-        WindowFunctionDefinition,
+        Distinct, Expr, ExprSchemable, JoinType, LogicalPlan, Operator, WindowFrameBound,
+        WindowFrameUnits, WindowFunctionDefinition,
         expr::{AggregateFunction, ScalarFunction, WindowFunction},
     },
     optimizer::OptimizerRule,
@@ -55,11 +58,7 @@ pub(super) fn create_federated_provider(
     table: ClickhouseSqlTable,
     table_reference: TableReference,
 ) -> FederatedTableProviderAdaptor {
-    let table = Arc::new(
-        table
-            .with_function_support(Some(function_support()))
-            .with_dialect(Arc::new(ClickHouseDialect::new())),
-    );
+    let table = Arc::new(with_clickhouse_policy(table));
     let executor = Arc::new(ClickhouseExecutor {
         table: Arc::clone(&table),
     });
@@ -70,6 +69,105 @@ pub(super) fn create_federated_provider(
         table.schema(),
     ));
     FederatedTableProviderAdaptor::new_with_provider(source, table)
+}
+
+/// `table` with the expressions, dialect and sort pushdown that `ClickHouse`
+/// evaluates as Spice does. Its own scan, used without federation, cannot check
+/// the keys of a sort pushed into it, so a table with a column
+/// [`orders_by_stored_value`] sorts in Spice there.
+fn with_clickhouse_policy(table: ClickhouseSqlTable) -> ClickhouseSqlTable {
+    let sorts_as_spice = !table
+        .schema()
+        .fields()
+        .iter()
+        .any(|field| orders_by_stored_value(field));
+    table
+        .with_function_support(Some(function_support()))
+        .with_dialect(Arc::new(ClickHouseDialect::new()))
+        .with_allow_physical_sort_pushdown(sorts_as_spice)
+}
+
+/// Whether `ClickHouse` orders this column, or a value inside it, by a stored
+/// value that its text, as Spice reads it, does not sort by: an `Enum` by its
+/// number, a `UUID` by its two halves, and an IP address by its bytes.
+pub(crate) fn orders_by_stored_value(field: &Field) -> bool {
+    field
+        .metadata()
+        .get(SOURCE_TYPE_METADATA_KEY)
+        .is_some_and(|source_type| {
+            ["Enum8(", "Enum16(", "UUID", "IPv4", "IPv6"]
+                .iter()
+                .any(|name| source_type.contains(name))
+        })
+}
+
+/// Whether `expr` reads a column [`orders_by_stored_value`], or a column that is
+/// not in `scope` at all. A filter checked for the scan's own SQL names its
+/// columns with the table, which `scope` may not, so a column is also found by
+/// its name; the filters `SqlExec` checks come with no scope.
+fn reads_a_stored_value(expr: &Expr, scope: &DFSchema) -> bool {
+    expr.column_refs().into_iter().any(|column| {
+        let field = scope
+            .qualified_field_from_column(column)
+            .map(|(_, field)| field)
+            .or_else(|_| scope.field_with_unqualified_name(&column.name));
+        match field {
+            Ok(field) => orders_by_stored_value(field),
+            Err(_) => true,
+        }
+    })
+}
+
+/// Whether `expr` compares, sorts or converts a column [`orders_by_stored_value`]
+/// rather than only selecting it or testing it for equality. `ClickHouse` would
+/// order its stored values, and its functions reject or convert them. A `CASE`
+/// that returns such a column stays local too: its result in Spice carries no
+/// source type, so a later sort or `min`/`max` on it would not be recognized.
+fn uses_a_stored_value(expr: &Expr, scope: &DFSchema) -> bool {
+    let reads = |expr: &Expr| reads_a_stored_value(expr, scope);
+    let is_min_or_max = |name: &str| matches!(name, "min" | "max");
+    let orders = |op: &Operator| {
+        matches!(
+            op,
+            Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+        )
+    };
+    match expr {
+        Expr::BinaryExpr(binary) => {
+            (orders(&binary.op) || binary.op == Operator::StringConcat)
+                && (reads(&binary.left) || reads(&binary.right))
+        }
+        Expr::SetComparison(set_comparison) => {
+            orders(&set_comparison.op)
+                && (reads(&set_comparison.expr)
+                    || set_comparison
+                        .subquery
+                        .subquery
+                        .schema()
+                        .fields()
+                        .iter()
+                        .any(|field| orders_by_stored_value(field)))
+        }
+        Expr::Case(case) => {
+            case.when_then_expr.iter().any(|(_, then)| reads(then))
+                || case.else_expr.as_deref().is_some_and(reads)
+        }
+        Expr::Between(between) => {
+            reads(&between.expr) || reads(&between.low) || reads(&between.high)
+        }
+        Expr::Like(like) => reads(&like.expr) || reads(&like.pattern),
+        Expr::ScalarFunction(call) => call.args.iter().any(reads),
+        Expr::AggregateFunction(aggregate) => {
+            is_min_or_max(aggregate.func.name()) && aggregate.params.args.iter().any(reads)
+        }
+        Expr::WindowFunction(window) => {
+            window.params.order_by.iter().any(|key| reads(&key.expr))
+                || matches!(&window.fun, WindowFunctionDefinition::AggregateUDF(aggregate)
+                    if is_min_or_max(aggregate.name()))
+                    && window.params.args.iter().any(reads)
+        }
+        _ => false,
+    }
 }
 
 /// How an expression check treats the subquery of an `= ANY`/`ALL`.
@@ -88,8 +186,9 @@ enum SetComparisonSubquery {
 /// NULL for a NULL argument (`concat_ws`, and `greatest`/`least` before
 /// `ClickHouse` 24.12), and some names do not exist there. Some of these are
 /// refused for some arguments: `concat`, `coalesce` and `get_field` by
-/// [`scalar_call_reads_the_same`], and `like`/`ilike` and `ltrim`/`rtrim` by
-/// [`supports_expression_for`].
+/// [`scalar_call_reads_the_same`], `like`/`ilike` and `ltrim`/`rtrim` by
+/// [`supports_expression_for`], and every call that reads a column
+/// [`orders_by_stored_value`] by [`uses_a_stored_value`].
 const CLICKHOUSE_SCALAR_FUNCTIONS: &[&str] = &[
     "abs",
     "acos",
@@ -272,6 +371,9 @@ fn supports_expression_for(
     subquery: SetComparisonSubquery,
 ) -> bool {
     let scope = schema.unwrap_or_else(|| DFSchema::empty_ref());
+    if uses_a_stored_value(expr, scope) {
+        return false;
+    }
     // A local parent can still federate its input projection. Check every
     // computed output, including folded literals and CASE expressions, against
     // the native driver's decimal decoding limit.
@@ -516,8 +618,17 @@ fn plan_names_a_backslash(plan: &LogicalPlan) -> bool {
     walked.is_err() || found
 }
 
-/// Whether this plan or a subquery in it has a join `ClickHouse` evaluates
-/// differently, or an `UNNEST`, which `ClickHouse` does not have.
+/// Whether this plan or a subquery in it has a node `ClickHouse` evaluates
+/// differently or does not have:
+/// - a join of another kind than inner and outer, with a filter, or matching
+///   NULL keys, and an outer join whose side with no match has an `Array`,
+///   `Map` or `Tuple` column (see [`has_a_list_map_or_tuple`]);
+/// - an `UNNEST`;
+/// - a sort by a column [`orders_by_stored_value`], also the sort of a
+///   `DISTINCT ON`, and a `UNION` whose output column lost that type because
+///   its inputs differ;
+/// - a sort or limit directly over a `UNION` (see [`is_a_union`]), which
+///   `ClickHouse` applies to the last `SELECT` of the `UNION` only.
 fn plan_has_a_node_clickhouse_refuses(plan: &LogicalPlan) -> bool {
     let mut found = false;
     let walked = plan.apply_with_subqueries(|node| {
@@ -528,8 +639,42 @@ fn plan_has_a_node_clickhouse_refuses(plan: &LogicalPlan) -> bool {
                     JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
                 ) || join.filter.is_some()
                     || join.null_equality == NullEquality::NullEqualsNull
+                    || matches!(join.join_type, JoinType::Left | JoinType::Full)
+                        && has_a_list_map_or_tuple(&join.right)
+                    || matches!(join.join_type, JoinType::Right | JoinType::Full)
+                        && has_a_list_map_or_tuple(&join.left)
             }
             LogicalPlan::Unnest(_) => true,
+            LogicalPlan::Sort(sort) => {
+                is_a_union(&sort.input)
+                    || sort
+                        .expr
+                        .iter()
+                        .any(|key| reads_a_stored_value(&key.expr, sort.input.schema()))
+            }
+            LogicalPlan::Limit(limit) => is_a_union(&limit.input),
+            LogicalPlan::Distinct(Distinct::On(distinct_on)) => distinct_on
+                .sort_expr
+                .iter()
+                .flatten()
+                .any(|key| reads_a_stored_value(&key.expr, distinct_on.input.schema())),
+            LogicalPlan::Union(union) => {
+                union
+                    .schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .any(|(index, field)| {
+                        !orders_by_stored_value(field)
+                            && union.inputs.iter().any(|input| {
+                                input
+                                    .schema()
+                                    .fields()
+                                    .get(index)
+                                    .is_some_and(|field| orders_by_stored_value(field))
+                            })
+                    })
+            }
             _ => false,
         };
         Ok(if found {
@@ -539,6 +684,36 @@ fn plan_has_a_node_clickhouse_refuses(plan: &LogicalPlan) -> bool {
         })
     });
     walked.is_err() || found
+}
+
+/// Whether `plan` is a `UNION`, also a `UNION` without `ALL`, which is a
+/// `DISTINCT` over the union that the unparser writes into the same query. A
+/// projection over a union is written as a subquery.
+fn is_a_union(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Union(_) => true,
+        LogicalPlan::Distinct(Distinct::All(input)) => is_a_union(input),
+        _ => false,
+    }
+}
+
+/// Whether `plan` outputs an `Array`, `Map` or `Tuple` column. `ClickHouse`
+/// fills an `Array` or `Map` of the side of an outer join with no match with
+/// an empty value, not NULL, and only a server that can make a `Tuple`
+/// nullable returns NULL for one.
+fn has_a_list_map_or_tuple(plan: &LogicalPlan) -> bool {
+    plan.schema().fields().iter().any(|field| {
+        matches!(
+            field.data_type(),
+            DataType::List(_)
+                | DataType::LargeList(_)
+                | DataType::FixedSizeList(..)
+                | DataType::ListView(_)
+                | DataType::LargeListView(_)
+                | DataType::Map(..)
+                | DataType::Struct(_)
+        )
+    })
 }
 
 struct ClickhouseExecutor {
@@ -579,8 +754,11 @@ impl SQLExecutor for ClickhouseExecutor {
     fn supports_filters_pushdown(&self, filters: &[&dyn PhysicalExpr]) -> Vec<SQLFilterPushDown> {
         SQLExecutor::supports_filters_pushdown(self.table.as_ref(), filters)
     }
+    /// A sort pushed into the federated scan is also checked with
+    /// [`Self::can_execute_plan`], which keeps a sort by a column
+    /// [`orders_by_stored_value`] or over a `UNION` in Spice.
     fn supports_sort_pushdown(&self) -> bool {
-        self.table.supports_sort_pushdown()
+        true
     }
     fn execute(
         &self,
@@ -641,13 +819,11 @@ mod tests {
             ));
         #[expect(
             clippy::disallowed_methods,
-            reason = "installs the ClickHouse expression policy with `with_function_support` below"
+            reason = "installs the ClickHouse expression policy with `with_clickhouse_policy` below"
         )]
-        let table = SqlTable::new_with_schema("clickhouse", &pool, schema, "t", None)
-            .with_function_support(Some(function_support()))
-            .with_dialect(Arc::new(ClickHouseDialect::new()));
+        let table = SqlTable::new_with_schema("clickhouse", &pool, schema, "t", None);
         Ok(ClickhouseExecutor {
-            table: Arc::new(table),
+            table: Arc::new(with_clickhouse_policy(table)),
         })
     }
 
@@ -1034,6 +1210,326 @@ mod tests {
             None,
             NullEquality::NullEqualsNull
         )?));
+        Ok(())
+    }
+
+    /// A column with this `ClickHouse` source type.
+    fn sourced(name: &str, data_type: DataType, source_type: &str) -> Field {
+        Field::new(name, data_type, true).with_metadata(
+            [(
+                SOURCE_TYPE_METADATA_KEY.to_string(),
+                source_type.to_string(),
+            )]
+            .into(),
+        )
+    }
+
+    /// `left <op> ANY (SELECT <column> FROM t)` over the columns of
+    /// [`a_column_clickhouse_orders_by_stored_value_stays_local`].
+    fn any(left: Expr, op: Operator, column: &str) -> Expr {
+        let schema = Schema::new(vec![
+            sourced("ip", DataType::Utf8, "IPv4"),
+            sourced("s", DataType::Utf8, "String"),
+        ]);
+        let subquery = table_scan(Some("t"), &schema, None)
+            .and_then(|scan| scan.project(vec![col(column)]))
+            .and_then(LogicalPlanBuilder::build)
+            .expect("subquery");
+        Expr::SetComparison(SetComparison::new(
+            Box::new(left),
+            Subquery {
+                subquery: Arc::new(subquery),
+                outer_ref_columns: vec![],
+                spans: Spans::new(),
+            },
+            op,
+            SetQuantifier::Any,
+        ))
+    }
+
+    #[test]
+    fn a_column_clickhouse_orders_by_stored_value_stays_local() -> Result<()> {
+        use datafusion::functions::expr_fn::{coalesce, concat};
+        use datafusion::functions_aggregate::expr_fn::{count, max, min};
+        use datafusion::functions_window::expr_fn::rank;
+        use datafusion::logical_expr::{ExprFunctionExt, when};
+
+        for (source_type, orders_by_stored_value) in [
+            ("Enum8('b' = 1, 'a' = 2)", true),
+            ("Enum16('a' = 1000)", true),
+            ("Nullable(UUID)", true),
+            ("IPv4", true),
+            ("LowCardinality(Nullable(IPv6))", true),
+            ("Array(UUID)", true),
+            ("Tuple(u UUID, n Int32)", true),
+            ("String", false),
+            ("FixedString(4)", false),
+            ("Map(String, UInt64)", false),
+        ] {
+            assert_eq!(
+                super::orders_by_stored_value(&sourced("c", DataType::Utf8, source_type)),
+                orders_by_stored_value,
+                "{source_type}"
+            );
+        }
+        assert!(!super::orders_by_stored_value(&Field::new(
+            "c",
+            DataType::Utf8,
+            true
+        )));
+
+        let schema = Schema::new(vec![
+            sourced("e", DataType::Utf8, "Enum8('b' = 1, 'a' = 2)"),
+            sourced("ip", DataType::Utf8, "IPv4"),
+            sourced("u", DataType::Utf8, "Nullable(UUID)"),
+            sourced("s", DataType::Utf8, "String"),
+        ]);
+        let scope = DFSchema::try_from(schema.clone())?;
+        let supports = |expr: &Expr| supports_expression(expr, Some(&scope));
+        let like_u = Expr::Like(Like::new(
+            false,
+            Box::new(col("u")),
+            Box::new(lit("0%")),
+            None,
+            false,
+        ));
+        for expr in [
+            col("e").gt(lit("a")),
+            lit("9.0.0.1").lt_eq(col("ip")),
+            col("ip").between(lit("10.0.0.0"), lit("10.0.0.9")),
+            max(col("e")),
+            min(col("u")),
+            coalesce(vec![col("u"), lit("none")]),
+            concat(vec![col("e"), lit("!")]),
+            like_u,
+            rank().order_by(vec![col("ip").sort(true, false)]).build()?,
+            when(col("s").eq(lit("x")), col("e")).otherwise(lit("b"))?,
+            when(col("s").eq(lit("x")), lit("b")).otherwise(col("e"))?,
+            binary_expr(col("ip"), Operator::StringConcat, lit("")),
+            Expr::from(WindowFunction::new(
+                WindowFunctionDefinition::AggregateUDF(
+                    datafusion::functions_aggregate::min_max::max_udaf(),
+                ),
+                vec![col("e")],
+            )),
+            any(col("ip"), Operator::Gt, "s"),
+            any(col("s"), Operator::Lt, "ip"),
+        ] {
+            assert!(!supports(&expr), "{expr}");
+        }
+        for expr in [
+            col("e"),
+            col("e").eq(lit("a")),
+            col("ip").not_eq(lit("9.0.0.1")),
+            col("u").in_list(vec![lit("00000000-0000-0000-0000-000000000002")], false),
+            col("u").is_null(),
+            count(col("e")),
+            col("s").gt(lit("a")),
+            max(col("s")),
+            rank().order_by(vec![col("s").sort(true, false)]).build()?,
+            when(col("e").eq(lit("a")), col("s")).otherwise(lit("b"))?,
+            any(col("ip"), Operator::Eq, "ip"),
+            any(col("s"), Operator::Gt, "s"),
+        ] {
+            assert!(supports(&expr), "{expr}");
+        }
+        // The filters `SqlExec` checks come with no scope to resolve `u` in.
+        let like_u = Expr::Like(Like::new(
+            false,
+            Box::new(col("u")),
+            Box::new(lit("0%")),
+            None,
+            false,
+        ));
+        assert!(!supports_expression(&like_u, None));
+
+        let stored = executor(schema.clone())?;
+        // A filter checked for the scan's own SQL names its columns with the table.
+        let like = |column: &str| {
+            Expr::Like(Like::new(
+                false,
+                Box::new(Expr::Column(Column::new(Some("t"), column))),
+                Box::new(lit("x%")),
+                None,
+                false,
+            ))
+        };
+        let (like_s, like_u) = (like("s"), like("u"));
+        assert_eq!(
+            TableProvider::supports_filters_pushdown(stored.table.as_ref(), &[&like_s, &like_u])?,
+            vec![
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Unsupported
+            ]
+        );
+        let scan = || table_scan(Some("t"), &schema, None);
+        let sorted = |key: &str| scan()?.sort(vec![col(key).sort(true, false)])?.build();
+        assert!(!stored.can_execute_plan(&sorted("e")?));
+        assert!(!stored.can_execute_plan(&sorted("u")?));
+        assert!(stored.can_execute_plan(&sorted("s")?));
+        let distinct_on = |keys: &[&str]| {
+            scan()?
+                .distinct_on(
+                    vec![col("s")],
+                    vec![col("s"), col("e")],
+                    Some(keys.iter().map(|key| col(*key).sort(true, false)).collect()),
+                )?
+                .build()
+        };
+        assert!(!stored.can_execute_plan(&distinct_on(&["s", "e"])?));
+        assert!(stored.can_execute_plan(&distinct_on(&["s"])?));
+
+        // A `UNION` of `UUID` and `Nullable(UUID)` columns has no source type.
+        let other = Schema::new(vec![sourced("u", DataType::Utf8, "UUID")]);
+        let union_with = |schema: &Schema| {
+            scan()?
+                .project(vec![col("u")])?
+                .union(table_scan(Some("o"), schema, None)?.build()?)?
+                .build()
+        };
+        assert!(!stored.can_execute_plan(&union_with(&other)?));
+        let same = Schema::new(vec![sourced("u", DataType::Utf8, "Nullable(UUID)")]);
+        assert!(stored.can_execute_plan(&union_with(&same)?));
+
+        // The federated scan checks a pushed sort with `can_execute_plan`, as
+        // above; the table's own scan cannot, so it sorts in Spice.
+        assert!(stored.supports_sort_pushdown());
+        assert!(!SQLExecutor::supports_sort_pushdown(stored.table.as_ref()));
+        let plain = Schema::new(vec![sourced("s", DataType::Utf8, "String")]);
+        assert!(SQLExecutor::supports_sort_pushdown(
+            executor(plain)?.table.as_ref()
+        ));
+        Ok(())
+    }
+
+    /// `ClickHouse` applies an `ORDER BY` or `LIMIT` after a `UNION` to its last
+    /// `SELECT` only; under an alias the unparser writes the `UNION` as a
+    /// subquery.
+    #[test]
+    fn a_sort_or_limit_over_a_union_stays_local() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
+        let executor = executor(schema.clone())?;
+        let union = || -> Result<LogicalPlanBuilder> {
+            table_scan(Some("l"), &schema, None)?
+                .union(table_scan(Some("r"), &schema, None)?.build()?)
+        };
+        let sorted = |builder: LogicalPlanBuilder| -> Result<LogicalPlan> {
+            builder.sort(vec![col("a").sort(true, false)])?.build()
+        };
+        assert!(executor.can_execute_plan(&union()?.build()?));
+        assert!(!executor.can_execute_plan(&sorted(union()?)?));
+        assert!(!executor.can_execute_plan(&union()?.limit(0, Some(1))?.build()?));
+        // `UNION` without `ALL`.
+        assert!(!executor.can_execute_plan(&sorted(union()?.distinct()?)?));
+        assert!(!executor.can_execute_plan(&union()?.distinct()?.limit(0, Some(1))?.build()?));
+        // A projection or an alias over the union is written as a subquery.
+        assert!(executor.can_execute_plan(&sorted(union()?.project(vec![col("a")])?)?));
+        assert!(executor.can_execute_plan(&sorted(union()?.alias("q")?)?));
+        Ok(())
+    }
+
+    /// The federated scan asks `can_execute_plan` before it takes a sort pushed
+    /// down to it, so a sort by a column [`orders_by_stored_value`] stays local.
+    #[test]
+    fn the_federated_scan_declines_a_sort_by_a_stored_value() -> Result<()> {
+        use datafusion::arrow::compute::SortOptions;
+        use datafusion::physical_expr::{PhysicalSortExpr, expressions::Column as PhysicalColumn};
+        use datafusion::physical_plan::{ExecutionPlan, sort_pushdown::SortOrderPushdownResult};
+        use datafusion_federation::sql::VirtualExecutionPlan;
+
+        let schema = Schema::new(vec![
+            sourced("e", DataType::Utf8, "Enum8('b' = 1, 'a' = 2)"),
+            sourced("s", DataType::Utf8, "String"),
+        ]);
+        let scan = VirtualExecutionPlan::new(
+            table_scan(Some("t"), &schema, None)?.build()?,
+            Arc::new(executor(schema.clone())?),
+            Statistics::new_unknown(&schema),
+            None,
+        );
+        let sort_on = |name: &str, index: usize| {
+            vec![PhysicalSortExpr::new(
+                Arc::new(PhysicalColumn::new(name, index)),
+                SortOptions::default(),
+            )]
+        };
+        assert!(matches!(
+            scan.try_pushdown_sort(&sort_on("e", 0))?,
+            SortOrderPushdownResult::Unsupported
+        ));
+        assert!(matches!(
+            scan.try_pushdown_sort(&sort_on("s", 1))?,
+            SortOrderPushdownResult::Exact { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn an_outer_join_that_would_fill_an_array_map_or_tuple_stays_local() -> Result<()> {
+        let plain = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
+        let with = |name: &str, data_type: DataType| {
+            Schema::new(vec![
+                Field::new("b", DataType::Int64, true),
+                Field::new(name, data_type, true),
+            ])
+        };
+        let item = Arc::new(Field::new("item", DataType::Int64, true));
+        let entries = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("keys", DataType::Utf8, false),
+                Field::new("values", DataType::Int64, true),
+            ])),
+            false,
+        ));
+        for other in [
+            with("m", DataType::Map(entries, false)),
+            with(
+                "tp",
+                DataType::Struct(Fields::from(vec![Field::new("x", DataType::Int64, true)])),
+            ),
+        ] {
+            let executor = executor(plain.clone())?;
+            let left = table_scan(Some("l"), &plain, None)?
+                .join(
+                    table_scan(Some("r"), &other, None)?.build()?,
+                    JoinType::Left,
+                    (vec!["a"], vec!["b"]),
+                    None,
+                )?
+                .build()?;
+            assert!(!executor.can_execute_plan(&left), "{}", other.field(1));
+        }
+        let with_list = with("tags", DataType::List(item));
+        let executor = executor(plain.clone())?;
+        let join = |left: &Schema, right: &Schema, join_type: JoinType| -> Result<LogicalPlan> {
+            let key = |schema: &Schema| schema.field(0).name().clone();
+            table_scan(Some("l"), left, None)?
+                .join(
+                    table_scan(Some("r"), right, None)?.build()?,
+                    join_type,
+                    (vec![key(left)], vec![key(right)]),
+                    None,
+                )?
+                .build()
+        };
+        for (join_type, list_on_the_right, list_on_the_left) in [
+            (JoinType::Inner, true, true),
+            (JoinType::Left, false, true),
+            (JoinType::Right, true, false),
+            (JoinType::Full, false, false),
+        ] {
+            assert_eq!(
+                executor.can_execute_plan(&join(&plain, &with_list, join_type)?),
+                list_on_the_right,
+                "{join_type:?}, list on the right"
+            );
+            assert_eq!(
+                executor.can_execute_plan(&join(&with_list, &plain, join_type)?),
+                list_on_the_left,
+                "{join_type:?}, list on the left"
+            );
+        }
         Ok(())
     }
 
