@@ -1360,30 +1360,31 @@ mod data_path {
     /// (`whole`) or of its small files, with the fault `arm` sets on the
     /// dataset's head, restores the store once the fault has fired and the
     /// dataset reads its state back (or the rewrite returned without it), then
-    /// appends 2000 more rows. Every row is there once, and a restart from the
-    /// store serves the same rows. Returns whether the fault fired.
+    /// appends 2000 more rows in four acknowledged appends, which a compaction
+    /// rewrites when `compacts` and nothing rewrites otherwise. Every
+    /// row is there once, and a restart from the store serves the same rows.
+    /// Returns whether the fault fired.
     async fn appends_after_a_rewrite_with_an_unknown_outcome(
         inner: Arc<dyn ObjectStore>,
         whole: bool,
         arm: impl FnOnce(&FaultStore, &Path) -> Arc<std::sync::atomic::AtomicBool>,
-        config: VortexConfig,
+        compacts: bool,
         what: &str,
     ) -> bool {
         let faults = Arc::new(FaultStore::new(inner));
         let store: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
         let native = Arc::new(catalog(&store).await);
         let shared: Arc<dyn MetadataCatalog> = Arc::clone(&native) as Arc<dyn MetadataCatalog>;
-        let placed = place_with_config(&store, &shared, "facts", true, None, false, config).await;
+        let placed =
+            place_with_config(&store, &shared, "facts", true, None, false, compactable()).await;
+        // Held, so the five files stay small and the rewrite below is the first.
+        let held = placed.table.hold_compaction().await;
         for i in 0..5 {
             insert(&placed.ctx, "facts", i * 1000 + 1, (i + 1) * 1000)
                 .await
                 .expect("append");
         }
-        placed
-            .table
-            .drain_in_flight_maintenance()
-            .await
-            .expect("drain");
+        drop(held);
         let armed = arm(&faults, &dataset_head(&native, "facts"));
         let rewrite = {
             let table = Arc::clone(&placed.table);
@@ -1409,26 +1410,55 @@ mod data_path {
         }
         faults.clear_rules();
         let _ = rewrite.await.expect("join the rewrite");
+        let held = if compacts {
+            None
+        } else {
+            Some(placed.table.hold_compaction().await)
+        };
+        let current = || async {
+            shared
+                .get_table("facts")
+                .await
+                .expect("the dataset reads")
+                .current_snapshot_id
+        };
         eventually("the dataset accepts appends again", || async {
-            insert(&placed.ctx, "facts", 5001, 6000).await.is_ok()
+            insert(&placed.ctx, "facts", 5001, 5500).await.is_ok()
         })
         .await;
-        insert(&placed.ctx, "facts", 6001, 7000)
-            .await
-            .expect("another append");
-        placed
-            .table
-            .drain_in_flight_maintenance()
-            .await
-            .expect("drain");
+        let before_appends = current().await;
+        for first in [5501, 6001, 6501] {
+            insert(&placed.ctx, "facts", first, first + 499)
+                .await
+                .expect("an acknowledged append");
+        }
         let expected = vec![7000, 7000, sum_v(1, 7000, 0)];
         assert_eq!(
             keyed_totals(&placed.ctx, "facts").await,
             expected,
             "{what}: after the resume"
         );
+        if compacts {
+            placed
+                .table
+                .drain_in_flight_maintenance()
+                .await
+                .expect("drain");
+            assert_eq!(
+                keyed_totals(&placed.ctx, "facts").await,
+                expected,
+                "{what}: after the appends' compaction"
+            );
+        }
+        assert_eq!(
+            current().await != before_appends,
+            compacts,
+            "{what}: a compaction rewrote the appends"
+        );
         let data_url = placed.data_url.clone();
-        drop((placed, shared, native));
+        // Released only once the table is gone, so no compaction runs before
+        // the restart when `!compacts`.
+        drop((placed, shared, native, held));
         let reopened: Arc<dyn MetadataCatalog> = Arc::new(catalog(&store).await);
         let placed = place(&store, &reopened, "facts", false, Some(data_url)).await;
         assert_eq!(
@@ -1451,7 +1481,7 @@ mod data_path {
                         Arc::new(InMemory::new()),
                         true,
                         |faults, head| lose_the_nth_commit(faults, head, nth, landed),
-                        compactable(),
+                        true,
                         &format!("nth={nth} landed={landed}"),
                     )
                     .await,
@@ -1498,14 +1528,6 @@ mod data_path {
                         } else {
                             Arc::new(InMemory::new())
                         };
-                        let config = if compacts {
-                            compactable()
-                        } else {
-                            VortexConfig {
-                                compaction_trigger_files: 1000,
-                                ..compactable()
-                            }
-                        };
                         let what = format!(
                             "local={local} whole={whole} landed={landed} compacts={compacts}"
                         );
@@ -1516,7 +1538,7 @@ mod data_path {
                                 |faults, head| {
                                     lose_a_commit(faults, head, landed, sets_the_current_snapshot)
                                 },
-                                config,
+                                compacts,
                                 &what,
                             )
                             .await,
