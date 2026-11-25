@@ -56,9 +56,9 @@ use datafusion::physical_plan::{Distribution, ExecutionPlan};
 /// sort, union or distinct anywhere.
 ///
 /// `EnsureRequirements` is here because without a limit the shape has no distribution or ordering
-/// requirement. A limit needs a single input partition, so under one it is skipped only when the
-/// plan already meets every requirement (see [`requirements_met`]); a limit over a
-/// multi-partition scan still gets the coalescing it needs. An operator a table scan returns must
+/// requirement. It is skipped only for a lookup that pins a primary key, and only when the plan
+/// already meets every requirement (see [`is_lookup_chain`]): a limit over a multi-partition scan
+/// still gets the coalescing it needs. An operator a table scan returns must
 /// meet its own input requirements, such as coalescing a multi-partition input. Rules that act on a scan
 /// of a particular connector (`HttpParamsPushdown`) and `propagate_empty_relation` (which shapes
 /// the plan of a contradictory predicate) are not here: they cost well under a microsecond and are
@@ -111,14 +111,23 @@ pub(crate) const SKIPPABLE_RULES: &[&str] = &[
     "CayenneAntiJoinSortMergeRewriter",
 ];
 
-/// A plan [`is_point_lookup`] accepts, and whether a `LIMIT` sits above it.
+/// A plan [`is_point_lookup`] accepts, and whether it pins every primary-key column of its table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PointLookup {
-    limited: bool,
+    keyed: bool,
 }
 
 tokio::task_local! {
+    /// Set only while the lookup's own logical plan is optimized, so a provider that plans another
+    /// query of its own later (a view planned inside its scan) gets every logical rule.
+    static OPTIMIZING_POINT_LOOKUP: PointLookup;
+    /// Set while the lookup is planned physically. Nested planning inherits it, so a physical rule
+    /// is skipped only when the plan it is handed is itself shaped like a lookup.
     static PLANNING_POINT_LOOKUP: PointLookup;
+}
+
+fn optimizing_point_lookup() -> bool {
+    OPTIMIZING_POINT_LOOKUP.try_with(|_| ()).is_ok()
 }
 
 fn planning_point_lookup() -> Option<PointLookup> {
@@ -148,20 +157,50 @@ pub(crate) async fn create_physical_plan(
     let Some(lookup) = point_lookup else {
         return session.create_physical_plan(plan).await;
     };
+    let optimized = optimize_lean(session, plan, lookup)?;
+    let planner = Arc::clone(session.query_planner());
     PLANNING_POINT_LOOKUP
-        .scope(lookup, async {
-            let max_passes = session.config().options().optimizer.max_passes;
-            session.config_mut().options_mut().optimizer.max_passes = 1;
-            let optimized = session.optimize(plan);
-            session.config_mut().options_mut().optimizer.max_passes = max_passes;
-            let mut optimized = optimized?;
-            if has_constant_predicate(&optimized) {
-                optimized = session.optimize(&optimized)?;
-            }
-            let planner = Arc::clone(session.query_planner());
-            planner.create_physical_plan(&optimized, session).await
-        })
+        .scope(lookup, planner.create_physical_plan(&optimized, session))
         .await
+}
+
+/// Optimizes a point lookup's logical plan with one pass and its [`SKIPPABLE_RULES`] skipped, then
+/// with full optimization when that pass leaves work another pass would do.
+pub(crate) fn optimize_lean(
+    session: &mut SessionState,
+    plan: &LogicalPlan,
+    lookup: PointLookup,
+) -> Result<LogicalPlan> {
+    let max_passes = session.config().options().optimizer.max_passes;
+    session.config_mut().options_mut().optimizer.max_passes = 1;
+    let optimized = OPTIMIZING_POINT_LOOKUP.sync_scope(lookup, || session.optimize(plan));
+    session.config_mut().options_mut().optimizer.max_passes = max_passes;
+    let optimized = optimized?;
+    if has_constant_predicate(&optimized) || limit_can_reach_scan(&optimized) {
+        return session.optimize(&optimized);
+    }
+    Ok(optimized)
+}
+
+/// Whether a limit in `plan` sits above a table scan with only projections and aliases between
+/// them, and the scan has no fetch yet. Within one pass `push_down_limit` runs before
+/// `push_down_filter`, so a filter the provider takes exactly leaves the scan only after the limit
+/// stopped at it; the next pass would push the limit into the scan.
+fn limit_can_reach_scan(plan: &LogicalPlan) -> bool {
+    let mut node = plan;
+    let mut below_limit = false;
+    loop {
+        match node {
+            LogicalPlan::Limit(limit) => {
+                below_limit = true;
+                node = limit.input.as_ref();
+            }
+            LogicalPlan::Projection(projection) => node = projection.input.as_ref(),
+            LogicalPlan::SubqueryAlias(alias) => node = alias.input.as_ref(),
+            LogicalPlan::TableScan(scan) => return below_limit && scan.fetch.is_none(),
+            _ => return false,
+        }
+    }
 }
 
 /// Whether a filter in `plan` still holds a boolean or null constant. The next pass's expression
@@ -229,17 +268,15 @@ pub(crate) fn is_point_lookup(plan: &LogicalPlan) -> Option<PointLookup> {
                 predicates.push(&filter.predicate);
                 node = filter.input.as_ref();
             }
-            LogicalPlan::TableScan(scan) => {
-                return scan_is_keyed_by(scan, &predicates).then_some(PointLookup { limited });
-            }
+            LogicalPlan::TableScan(scan) => return scan_is_keyed_by(scan, &predicates),
             _ => return None,
         }
     }
 }
 
-fn scan_is_keyed_by(scan: &TableScan, predicates: &[&Expr]) -> bool {
+fn scan_is_keyed_by(scan: &TableScan, predicates: &[&Expr]) -> Option<PointLookup> {
     if !scan.filters.is_empty() || scan.fetch.is_some() {
-        return false;
+        return None;
     }
     let conjuncts: Vec<&Expr> = predicates
         .iter()
@@ -249,7 +286,7 @@ fn scan_is_keyed_by(scan: &TableScan, predicates: &[&Expr]) -> bool {
         .iter()
         .all(|conjunct| is_simple_comparison(conjunct))
     {
-        return false;
+        return None;
     }
     let schema = scan.source.schema();
     let primary_key = scan.source.constraints().and_then(|constraints| {
@@ -258,7 +295,7 @@ fn scan_is_keyed_by(scan: &TableScan, predicates: &[&Expr]) -> bool {
             _ => None,
         })
     });
-    match primary_key {
+    let keyed = match primary_key {
         Some(primary_key) => primary_key.iter().all(|&index| {
             index < schema.fields().len() && {
                 let name = schema.field(index).name();
@@ -267,12 +304,16 @@ fn scan_is_keyed_by(scan: &TableScan, predicates: &[&Expr]) -> bool {
                     .any(|conjunct| is_equality_on(conjunct, name))
             }
         }),
-        None => schema.fields().iter().any(|field| {
-            conjuncts
-                .iter()
-                .any(|conjunct| is_equality_on(conjunct, field.name()))
-        }),
-    }
+        None => false,
+    };
+    let looked_up = keyed
+        || (primary_key.is_none()
+            && schema.fields().iter().any(|field| {
+                conjuncts
+                    .iter()
+                    .any(|conjunct| is_equality_on(conjunct, field.name()))
+            }));
+    looked_up.then_some(PointLookup { keyed })
 }
 
 /// The most primary keys a query may name and still count as a [bounded key
@@ -471,25 +512,28 @@ fn is_plain_column_or_constant(expr: &Expr) -> bool {
     }
 }
 
-/// Whether `plan` already meets every input requirement its operators state: no operator needs a
-/// single partition from a child that has several, or a particular partitioning or ordering at
-/// all. `EnsureRequirements` changes nothing in such a plan.
-fn requirements_met(plan: &Arc<dyn ExecutionPlan>) -> bool {
+/// Whether `plan` is shaped like a planned point lookup: a chain of single-input operators, none of
+/// which needs a single partition from a child that has several, or a particular partitioning or
+/// ordering at all. A plan with a join, an aggregate across partitions, a window or a sort
+/// requirement is not, and every physical rule runs on it.
+fn is_lookup_chain(plan: &Arc<dyn ExecutionPlan>) -> bool {
     let children = plan.children();
-    let distributions_met =
-        children
-            .iter()
-            .zip(plan.required_input_distribution())
-            .all(|(child, distribution)| match distribution {
-                Distribution::UnspecifiedDistribution => true,
-                Distribution::SinglePartition => {
-                    child.properties().output_partitioning().partition_count() == 1
-                }
-                _ => false,
-            });
+    if children.len() > 1 {
+        return false;
+    }
+    let distributions_met = children
+        .iter()
+        .zip(plan.input_distribution_requirements().into_per_child())
+        .all(|(child, distribution)| match distribution {
+            Distribution::UnspecifiedDistribution => true,
+            Distribution::SinglePartition => {
+                child.properties().output_partitioning().partition_count() == 1
+            }
+            _ => false,
+        });
     distributions_met
         && plan.required_input_ordering().iter().all(Option::is_none)
-        && children.into_iter().all(requirements_met)
+        && children.into_iter().all(is_lookup_chain)
 }
 
 fn is_constant(expr: &Expr) -> bool {
@@ -621,7 +665,7 @@ impl Debug for SkippableAnalyzerRule {
 
 impl AnalyzerRule for SkippableAnalyzerRule {
     fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
-        if planning_point_lookup().is_some() {
+        if optimizing_point_lookup() {
             return Ok(plan);
         }
         self.0.analyze(plan, config)
@@ -648,7 +692,7 @@ impl OptimizerRule for SkippableOptimizerRule {
     fn apply_order(&self) -> Option<ApplyOrder> {
         // A skipped rule is handed the whole plan once and returns it, rather than being driven
         // over every node by the optimizer.
-        if planning_point_lookup().is_some() {
+        if optimizing_point_lookup() {
             None
         } else {
             self.0.apply_order()
@@ -668,7 +712,7 @@ impl OptimizerRule for SkippableOptimizerRule {
         plan: LogicalPlan,
         config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        if planning_point_lookup().is_some() {
+        if optimizing_point_lookup() {
             return Ok(Transformed::no(plan));
         }
         self.0.rewrite(plan, config)
@@ -678,13 +722,15 @@ impl OptimizerRule for SkippableOptimizerRule {
 struct SkippablePhysicalRule(Arc<dyn PhysicalOptimizerRule + Send + Sync>);
 
 impl SkippablePhysicalRule {
-    /// Whether to hand `plan` back untouched: while planning a point lookup, except
-    /// `EnsureRequirements` under a limit when the plan does not yet meet its requirements.
+    /// Whether to hand `plan` back untouched: while planning a point lookup, when the plan it is
+    /// handed is shaped like one ([`is_lookup_chain`]). `EnsureRequirements` also adds
+    /// repartitioning for parallelism by the size of the input, so it is skipped only for a
+    /// lookup that pins a primary key, which reads a handful of rows.
     fn skips(&self, plan: &Arc<dyn ExecutionPlan>) -> bool {
         match planning_point_lookup() {
             None => false,
-            Some(PointLookup { limited }) => {
-                !(limited && self.0.name() == "EnsureRequirements" && !requirements_met(plan))
+            Some(PointLookup { keyed }) => {
+                is_lookup_chain(plan) && (keyed || self.0.name() != "EnsureRequirements")
             }
         }
     }
@@ -742,8 +788,78 @@ mod tests {
 
     use super::{
         MAX_BOUNDED_LOOKUP_KEYS, create_physical_plan, is_bounded_key_lookup, is_point_lookup,
-        wrap_skippable_rules,
+        optimize_lean, wrap_skippable_rules,
     };
+
+    /// A view hidden behind a provider that plans it inside its own scan, as a provider that wraps
+    /// another (an embedding table over a view) does: the lookup's scan starts a nested planning.
+    #[derive(Debug)]
+    struct HiddenView(Arc<dyn datafusion::catalog::TableProvider>);
+
+    #[async_trait::async_trait]
+    impl datafusion::catalog::TableProvider for HiddenView {
+        fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
+            self.0.schema()
+        }
+        fn table_type(&self) -> datafusion::logical_expr::TableType {
+            datafusion::logical_expr::TableType::Base
+        }
+        async fn scan(
+            &self,
+            state: &dyn datafusion::catalog::Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[datafusion::logical_expr::Expr],
+            limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+            self.0.scan(state, projection, filters, limit).await
+        }
+    }
+
+    /// A provider that takes every filter exactly, as Spark Connect does. Only planned, never run.
+    #[derive(Debug)]
+    struct ExactFilters(Arc<Schema>);
+
+    #[async_trait::async_trait]
+    impl datafusion::catalog::TableProvider for ExactFilters {
+        fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
+            Arc::clone(&self.0)
+        }
+        fn table_type(&self) -> datafusion::logical_expr::TableType {
+            datafusion::logical_expr::TableType::Base
+        }
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&datafusion::logical_expr::Expr],
+        ) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>>
+        {
+            Ok(vec![
+                datafusion::logical_expr::TableProviderFilterPushDown::Exact;
+                filters.len()
+            ])
+        }
+        async fn scan(
+            &self,
+            _state: &dyn datafusion::catalog::Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[datafusion::logical_expr::Expr],
+            _limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+            datafusion::common::not_impl_err!("planned only")
+        }
+    }
+
+    /// Registers the tables that need a planned plan: `hidden`, an aggregate over the
+    /// four-partition `split` behind a [`HiddenView`].
+    async fn register_hidden_view(ctx: &SessionContext) {
+        let view = ctx
+            .sql("SELECT DISTINCT region, name FROM split")
+            .await
+            .expect("view")
+            .into_unoptimized_plan();
+        let view = datafusion::catalog::view::ViewTable::new(view, None);
+        ctx.register_table("hidden", Arc::new(HiddenView(Arc::new(view))))
+            .expect("register");
+    }
 
     fn context() -> SessionContext {
         let schema = Arc::new(Schema::new(vec![
@@ -776,14 +892,35 @@ mod tests {
             MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]]).expect("table");
         // Four partitions of 16 rows: a limit above this scan needs its partitions coalesced.
         let split = MemTable::try_new(
-            schema,
+            Arc::clone(&schema),
             (0..4)
                 .map(|part| vec![batch.slice(part * 16, 16)])
                 .collect(),
         )
         .expect("table");
 
-        let mut builder = SessionStateBuilder::new().with_default_features();
+        // 40,000 rows in one partition, far past a batch: full planning repartitions a scan this
+        // size for parallelism.
+        let big_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..40_000)),
+                Arc::new(Int32Array::from_iter_values((0..40_000).map(|i| i % 4))),
+                Arc::new(StringArray::from_iter_values(
+                    (0..40_000).map(|i| format!("n{i}")),
+                )),
+            ],
+        )
+        .expect("batch");
+        let big = MemTable::try_new(Arc::clone(&schema), vec![vec![big_batch]]).expect("table");
+        let exact = ExactFilters(Arc::clone(&schema));
+
+        let config = datafusion::prelude::SessionConfig::new()
+            .with_target_partitions(4)
+            .with_batch_size(8192);
+        let mut builder = SessionStateBuilder::new()
+            .with_config(config)
+            .with_default_features();
         wrap_skippable_rules(&mut builder);
         let ctx = SessionContext::new_with_state(builder.build());
         ctx.register_table("keyed", Arc::new(keyed))
@@ -793,6 +930,9 @@ mod tests {
         ctx.register_table("unkeyed", Arc::new(unkeyed))
             .expect("register");
         ctx.register_table("split", Arc::new(split))
+            .expect("register");
+        ctx.register_table("big", Arc::new(big)).expect("register");
+        ctx.register_table("exact", Arc::new(exact))
             .expect("register");
         ctx
     }
@@ -957,30 +1097,91 @@ mod tests {
             "SELECT * FROM split WHERE region = 1",
             "SELECT 1 AS present FROM (SELECT * FROM split WHERE name = 'n5' LIMIT 1) q",
             "SELECT 1 AS present FROM (SELECT * FROM keyed WHERE id = 5 LIMIT 1) q",
+            // A large unkeyed scan, which full planning repartitions for parallelism.
+            "SELECT * FROM big WHERE region = 1 LIMIT 100000",
+            "SELECT * FROM big WHERE region = 1",
+        ] {
+            assert_lean_matches_full(&ctx, sql).await;
+        }
+    }
+
+    /// Plans `sql` both ways and requires the same physical plan and the same rows.
+    async fn assert_lean_matches_full(ctx: &SessionContext, sql: &str) {
+        let plan = unoptimized(ctx, sql).await;
+        let lookup = is_point_lookup(&plan);
+        assert!(lookup.is_some(), "{sql}");
+        let full = ctx
+            .state()
+            .create_physical_plan(&plan)
+            .await
+            .expect("full plan");
+        let lean = create_physical_plan(&mut ctx.state(), &plan, lookup)
+            .await
+            .expect("lean plan");
+        assert_eq!(
+            displayable(full.as_ref()).indent(true).to_string(),
+            displayable(lean.as_ref()).indent(true).to_string(),
+            "{sql}"
+        );
+        let full_rows = datafusion::physical_plan::collect(full, ctx.task_ctx())
+            .await
+            .expect("full rows");
+        let lean_rows = datafusion::physical_plan::collect(lean, ctx.task_ctx())
+            .await
+            .expect("lean rows");
+        // A plan over several partitions returns its rows in whatever order the partitions
+        // finish, so the rows are compared as a set; the plans above are compared exactly.
+        assert_eq!(sorted_rows(&full_rows), sorted_rows(&lean_rows), "{sql}");
+    }
+
+    /// A provider that plans another query inside its own scan (an embedding table over a view):
+    /// that nested planning must get every rule, though it runs while the lookup is being planned.
+    /// The view's `DISTINCT` cannot be planned at all without `replace_distinct_aggregate`, one of
+    /// the rules a lookup skips.
+    #[tokio::test]
+    async fn planning_nested_inside_a_lookup_scan_gets_every_rule() {
+        let ctx = context();
+        register_hidden_view(&ctx).await;
+        assert_lean_matches_full(&ctx, "SELECT region, name FROM hidden WHERE region = 1").await;
+    }
+
+    fn sorted_rows(batches: &[RecordBatch]) -> Vec<String> {
+        let table = datafusion::arrow::util::pretty::pretty_format_batches(batches)
+            .expect("format")
+            .to_string();
+        let mut rows: Vec<String> = table
+            .lines()
+            .filter(|line| line.starts_with('|'))
+            .map(str::to_string)
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// A provider that takes a filter exactly leaves the filter in the scan only after the first
+    /// pass, so the limit reaches the scan only in a later one. The lean path must still end with
+    /// the limit in the scan, or the provider returns every matching row.
+    #[tokio::test]
+    async fn lean_optimization_pushes_a_limit_into_a_scan_that_took_the_filter() {
+        let ctx = context();
+        for sql in [
+            "SELECT name FROM exact WHERE region = 1 LIMIT 3",
+            "SELECT 1 AS present FROM exact WHERE name = 'n5' LIMIT 1",
         ] {
             let plan = unoptimized(&ctx, sql).await;
-            let lookup = is_point_lookup(&plan);
-            assert!(lookup.is_some(), "{sql}");
-            let full = ctx
-                .state()
-                .create_physical_plan(&plan)
-                .await
-                .expect("full plan");
-            let lean = create_physical_plan(&mut ctx.state(), &plan, lookup)
-                .await
-                .expect("lean plan");
+            let lookup = is_point_lookup(&plan).expect("a point lookup");
+            let full = ctx.state().optimize(&plan).expect("full");
+            let lean = optimize_lean(&mut ctx.state(), &plan, lookup).expect("lean");
             assert_eq!(
-                displayable(full.as_ref()).indent(true).to_string(),
-                displayable(lean.as_ref()).indent(true).to_string(),
+                full.display_indent().to_string(),
+                lean.display_indent().to_string(),
                 "{sql}"
             );
-            let full_rows = datafusion::physical_plan::collect(full, ctx.task_ctx())
-                .await
-                .expect("full rows");
-            let lean_rows = datafusion::physical_plan::collect(lean, ctx.task_ctx())
-                .await
-                .expect("lean rows");
-            assert_eq!(full_rows, lean_rows, "{sql}");
+            assert!(
+                full.display_indent().to_string().contains("fetch="),
+                "the limit reaches the scan: {}",
+                full.display_indent()
+            );
         }
     }
 
