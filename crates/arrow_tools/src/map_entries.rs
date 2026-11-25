@@ -273,6 +273,7 @@ const CONTINUATION_MARKER: [u8; 4] = [0xff; 4];
 /// in place — and [`Error::MapEntriesContainNulls`] for the one map shape no relabelling can
 /// repair.
 pub fn read_ipc_stream(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
+    ensure_messages_fit(bytes).context(UndecodableStreamSnafu)?;
     let reader = StreamReader::try_new(Cursor::new(bytes), None).context(UndecodableStreamSnafu)?;
     let declared = reader.schema();
     let normalizer = MapEntriesNormalizer::for_schema(&declared);
@@ -293,6 +294,49 @@ pub fn read_ipc_stream(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
         .into_iter()
         .map(|batch| normalizer.normalize(batch))
         .collect()
+}
+
+/// Refuses a stream in which a message declares more metadata or body bytes than follow it.
+///
+/// `StreamReader` allocates each message's declared metadata and body length before reading
+/// either, so a few bytes declaring a body of petabytes abort the process on the failed
+/// allocation. The walk stops at the first message it cannot read, which the decode then
+/// refuses before allocating its body.
+fn ensure_messages_fit(bytes: &[u8]) -> std::result::Result<(), ArrowError> {
+    let mut rest = bytes;
+    loop {
+        // The continuation marker is absent only in the pre-0.15 framing.
+        let framed = rest.strip_prefix(&CONTINUATION_MARKER).unwrap_or(rest);
+        let Some((declared, after_length)) = framed.split_first_chunk::<4>() else {
+            return Ok(());
+        };
+        // Zero ends the stream, and the decode refuses a negative length without allocating.
+        let Ok(metadata_len) = usize::try_from(i32::from_le_bytes(*declared)) else {
+            return Ok(());
+        };
+        if metadata_len == 0 {
+            return Ok(());
+        }
+        let Some((metadata, after_metadata)) = after_length.split_at_checked(metadata_len) else {
+            return Err(ArrowError::IpcError(format!(
+                "an Arrow IPC message declares {metadata_len} bytes of metadata, but only {} bytes follow",
+                after_length.len()
+            )));
+        };
+        let Ok(message) = arrow::ipc::root_as_message(metadata) else {
+            return Ok(());
+        };
+        let body_len = message.bodyLength();
+        rest = usize::try_from(body_len)
+            .ok()
+            .and_then(|body_len| after_metadata.get(body_len..))
+            .ok_or_else(|| {
+                ArrowError::IpcError(format!(
+                    "an Arrow IPC message declares a {body_len} byte body, but only {} bytes follow",
+                    after_metadata.len()
+                ))
+            })?;
+    }
 }
 
 /// The IPC schema-message header a decoder has to be handed in place of `data_header`, together
@@ -1092,6 +1136,59 @@ mod tests {
 
         let read_back = read_ipc_stream(&bytes).expect("a conforming stream decodes");
         assert_eq!(read_back, vec![batch]);
+    }
+
+    /// A record batch message whose declared body length the decode would allocate before
+    /// reading — a petabyte, or a negative length cast to one — is refused, rather than aborting
+    /// the process on the failed allocation.
+    #[test]
+    fn a_message_declaring_a_body_longer_than_the_stream_is_refused() {
+        let batch = batch_of(Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef);
+        let stream = ipc_stream(&batch.schema(), std::slice::from_ref(&batch));
+        let framed_len = |at: usize| {
+            assert_eq!(stream[at..at + 4], CONTINUATION_MARKER, "framed message");
+            usize::try_from(u32::from_le_bytes(
+                stream[at + 4..at + 8].try_into().expect("length"),
+            ))
+            .expect("length fits")
+        };
+        // The schema message has no body, so the record batch message follows its metadata.
+        let batch_at = 8 + framed_len(0);
+        let metadata_at = batch_at + 8;
+        let metadata = &stream[metadata_at..metadata_at + framed_len(batch_at)];
+        let message = arrow::ipc::root_as_message(metadata).expect("a message");
+        assert_eq!(
+            message.header_type(),
+            arrow::ipc::MessageHeader::RecordBatch
+        );
+        let body_len = usize::try_from(message.bodyLength()).expect("body length");
+        let slot = message
+            ._tab
+            .vtable()
+            .get(arrow::ipc::Message::VT_BODYLENGTH);
+        assert_ne!(slot, 0, "the writer stores a non-zero body length");
+        let body_len_at = metadata_at + message._tab.loc() + usize::from(slot);
+        // What follows the metadata: the body, then the end-of-stream marker.
+        let following = stream.len() - (metadata_at + metadata.len());
+        assert_eq!(following, body_len + 8);
+
+        for declared in [1_i64 << 50, -1] {
+            let mut bytes = stream.clone();
+            bytes[body_len_at..body_len_at + 8].copy_from_slice(&declared.to_le_bytes());
+
+            let err = read_ipc_stream(&bytes).expect_err("the declared body is not in the stream");
+            assert!(
+                matches!(err, Error::UndecodableStream { .. }),
+                "unexpected error: {err}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "the Arrow IPC stream could not be decoded: Ipc error: an Arrow IPC message \
+                     declares a {declared} byte body, but only {following} bytes follow"
+                )
+            );
+        }
     }
 
     /// Regression test for #7307: a `MAP` column whose `entries` field arrives declared

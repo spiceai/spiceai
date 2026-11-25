@@ -18,9 +18,7 @@ limitations under the License.
 
 use super::{
     Domain, invalid,
-    registry::{
-        DROPPED, ObjectNativeCatalog, REGISTRY, TableDeletionHolds, created_at, delete_under,
-    },
+    registry::{DROPPED, ObjectNativeCatalog, REGISTRY, TableDeletionHolds, delete_under},
     replay_state,
     slot::HeldReservation,
 };
@@ -578,9 +576,21 @@ impl ObjectNativeCatalog {
     /// before it was named. Only what is older than `reclaim_after` goes, since
     /// a newer one may belong to a process that took the registry over after this
     /// one opened it.
+    ///
+    /// Ages are measured on the store's clock alone: a log's time is the one the
+    /// store stamped on its `dropped` marker, or on its newest object when it has
+    /// none, against the time it stamped on the registry's head when this
+    /// process took it over. The process's clock, and the time in a folder's
+    /// name, may be off from the store's by more than `reclaim_after`.
     pub(super) async fn reclaim(&self) -> CatalogResult<()> {
-        let cutoff = chrono::Utc::now()
-            - chrono::Duration::from_std(self.config.reclaim_after).map_err(invalid)?;
+        let store_now = self
+            .store
+            .head(&self.prefix.clone().join("head"))
+            .await
+            .map_err(invalid)?
+            .last_modified;
+        let cutoff =
+            store_now - chrono::Duration::from_std(self.config.reclaim_after).map_err(invalid)?;
         let mut removed = 0;
         let named: HashSet<String> = self
             .registry
@@ -603,7 +613,14 @@ impl ObjectNativeCatalog {
             }
             let ended = match self.store.head(&prefix.clone().join(DROPPED)).await {
                 Ok(marker) => Some(marker.last_modified),
-                Err(object_store::Error::NotFound { .. }) => created_at(folder),
+                Err(object_store::Error::NotFound { .. }) => self
+                    .store
+                    .list(Some(&prefix))
+                    .try_fold(None, |newest, meta| async move {
+                        Ok(newest.max(Some(meta.last_modified)))
+                    })
+                    .await
+                    .map_err(invalid)?,
                 Err(error) => return Err(invalid(error)),
             };
             if ended.is_some_and(|ended| ended < cutoff) {

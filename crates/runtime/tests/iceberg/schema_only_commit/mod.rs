@@ -26,7 +26,7 @@ limitations under the License.
 //!
 //! Each table is read every way a Spice app can reach it: catalog-less from its
 //! root, pinned to its latest metadata file with `iceberg_metadata_path`,
-//! through the Iceberg catalog connector, and accelerated into Arrow. An
+//! through the Iceberg catalog connector, and accelerated into Cayenne. An
 //! unchanged table is the control.
 //!
 //! Guards the `spiceai/iceberg-rust` patch listed in `docs/dev/fork_patches.md`
@@ -257,10 +257,11 @@ fn dataset(table_root: &Path, name: &str, params: &[(&str, String)]) -> Dataset 
 fn readers(table_root: &Path, change: Change) -> anyhow::Result<(Vec<Dataset>, Vec<String>)> {
     let table = change.table();
     let (_, latest) = latest_metadata(table_root)?;
-    let mut arrow = dataset(table_root, &format!("{table}_arrow"), &[]);
-    arrow.acceleration = Some(Acceleration {
+    let mut cayenne = dataset(table_root, &format!("{table}_cayenne"), &[]);
+    cayenne.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("arrow".to_string()),
+        engine: Some("cayenne".to_string()),
+        mode: spicepod::acceleration::Mode::Memory,
         ..Acceleration::default()
     });
     let datasets = vec![
@@ -270,7 +271,7 @@ fn readers(table_root: &Path, change: Change) -> anyhow::Result<(Vec<Dataset>, V
             &format!("{table}_pinned"),
             &[("iceberg_metadata_path", format!("/metadata/{latest}"))],
         ),
-        arrow,
+        cayenne,
     ];
     let mut names: Vec<String> = datasets.iter().map(|d| d.name.clone()).collect();
     names.push(format!("ice.{NAMESPACE}.{table}"));

@@ -116,6 +116,9 @@ pub struct Faults {
     pub delay: Option<Duration>,
     /// How the revision endpoint answers when asked for the files too.
     pub revision_files: RevisionFiles,
+    /// The tree endpoint answers `200` with this body in place of the listing, as an endpoint
+    /// that returns a listing the client cannot read.
+    pub tree_body: Option<String>,
 }
 
 /// How the revision endpoint answers a request for the files with the revision.
@@ -569,6 +572,9 @@ async fn hub_handler(State(mock): State<MockHub>, request: Request<Body>) -> Res
             response(StatusCode::OK, &[], body.to_string())
         }
         ["api", plural, owner, name, "tree", commit, rest @ ..] => {
+            if let Some(body) = &state.faults.tree_body {
+                return response(StatusCode::OK, &[], body.clone());
+            }
             let Some(repo) = state.repos.get(&format!("{plural}/{owner}/{name}")) else {
                 return hub_error(
                     StatusCode::NOT_FOUND,

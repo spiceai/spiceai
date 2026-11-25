@@ -147,14 +147,6 @@ fn slug(name: &str) -> String {
     }
 }
 
-/// When the `UUIDv7` that ends `name` (a transaction id or a dataset folder) was
-/// made, or `None` when `name` does not end in one.
-pub(super) fn created_at(name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    let id = name.get(name.len().checked_sub(36)?..)?;
-    let (seconds, nanos) = uuid::Uuid::parse_str(id).ok()?.get_timestamp()?.to_unix();
-    chrono::DateTime::from_timestamp(i64::try_from(seconds).ok()?, nanos)
-}
-
 /// Delete every object under `prefix`.
 pub(super) async fn delete_under(store: &Arc<dyn ObjectStore>, prefix: &Path) -> CatalogResult<()> {
     let locations = store
