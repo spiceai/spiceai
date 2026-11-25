@@ -29,6 +29,7 @@ use cayenne::metastore::object_native::{
 use cayenne::{CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
+use futures::TryStreamExt;
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
@@ -859,4 +860,264 @@ async fn a_writer_taken_over_mid_sweep_with_deletes_in_flight_deletes_nothing_it
             .value(0)
     };
     assert_eq!((value(0), value(1)), expected(1..=400));
+}
+
+/// A reopens the table, and its load of the persisted lookup-index runs is
+/// paused on a run read. B takes over and persists a run of its own. A's clock
+/// stands still, so its lease's deadline is still ahead, and A's load then
+/// removes the run files that the registered set it read before the pause
+/// does not name. It must not delete the run B registered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paused_index_load_deletes_no_run_its_successor_registers() {
+    let clock = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let objects: Arc<dyn ObjectStore> = Arc::clone(&clock) as Arc<dyn ObjectStore>;
+    let indexed = |builder: CayenneTableProviderBuilder| {
+        builder.with_secondary_indexes(vec![vec!["v".to_string()]])
+    };
+    let a = Instance::start(&objects, "a", LEASE).await;
+    let data_url = a.data_url.clone();
+    let a_first = indexed(a.builder(&data_url))
+        .create(CreateTableOptions {
+            table_name: TABLE.to_string(),
+            schema: schema(),
+            primary_key: Vec::new(),
+            on_conflict: None,
+            base_path: data_url.clone(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                inline_max_rows: 0,
+                inline_max_bytes: 0,
+                ..VortexConfig::default()
+            },
+        })
+        .await
+        .expect("create the table");
+    a.ctx
+        .register_table(TABLE, Arc::new(a_first))
+        .expect("register");
+    a.insert(1, 100).await.expect("A writes");
+    let table_id = a.catalog.get_table(TABLE).await.expect("table").table_id;
+    let runs = |catalog: Arc<dyn MetadataCatalog>, table_id: String| async move {
+        let mut names: Vec<String> = catalog
+            .list_index_runs(&table_id)
+            .await
+            .expect("list runs")
+            .into_iter()
+            .map(|run| format!("{}/{}", run.index_key, run.run_name))
+            .collect();
+        names.sort();
+        names
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while runs(Arc::clone(&a.catalog), table_id.clone())
+        .await
+        .is_empty()
+    {
+        assert!(Instant::now() < deadline, "A persisted no index run");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let a_runs = runs(Arc::clone(&a.catalog), table_id.clone()).await;
+    eprintln!("A's registered runs: {a_runs:?}");
+
+    // A reopens the table; its load pauses on the first run read.
+    let is_run = |path: &Path| path.as_ref().contains("/_lookup_index/");
+    a.requests.gate_reads(is_run);
+    let reopening = {
+        let builder = indexed(a.builder(&data_url));
+        tokio::spawn(async move { builder.open(TABLE).await.map(|_| ()) })
+    };
+    tokio::time::timeout(Duration::from_secs(15), a.requests.wait_gated(1))
+        .await
+        .expect("A's load reads a run");
+
+    // B takes over and persists a run of its own, as its index sync does:
+    // the run file first, then its registration. (B opens no table here: in
+    // this one test process both instances' index loads would share one lock.)
+    let b = Instance::start(&objects, "b", LEASE).await;
+    for op in [Op::Get, Op::GetConditional, Op::Head, Op::Put] {
+        a.requests
+            .fail_while(op, |path: &Path| path.as_ref().contains("/leases/"));
+    }
+    let (key, a_name) = a_runs[0].split_once('/').expect("key/run");
+    let b_name = "00000000000000b1.run";
+    let b_path = {
+        let stored: Vec<String> = objects
+            .list(None)
+            .map_ok(|meta| meta.location.to_string())
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("list");
+        let a_path = stored
+            .into_iter()
+            .find(|path| path.ends_with(&format!("{key}/{a_name}")))
+            .expect("A's run file");
+        Path::from(a_path.replace(a_name, b_name))
+    };
+    let record = cayenne::metadata::IndexRunRecord {
+        table_id: table_id.clone(),
+        index_key: key.to_string(),
+        run_name: b_name.to_string(),
+        row_count: 100,
+        size_bytes: 6,
+    };
+    objects
+        .put(&b_path, PutPayload::from_static(b"b-run!"))
+        .await
+        .expect("B's run file");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if b.catalog.register_index_run(&record).await.is_ok() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "B never became the writer");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let b_runs = runs(Arc::clone(&b.catalog), table_id.clone()).await;
+    eprintln!("B's registered runs: {b_runs:?}");
+
+    // A's clock stood still; its load resumes.
+    a.catalog
+        .data_write_gate(&table_id)
+        .hold_until(Instant::now() + Duration::from_hours(3));
+    a.requests.open_reads();
+    let reopened = tokio::time::timeout(Duration::from_secs(30), reopening)
+        .await
+        .expect("A's reopen finishes")
+        .expect("join");
+    eprintln!("A's reopen: {reopened:?}");
+
+    let stored: Vec<String> = objects
+        .list(None)
+        .map_ok(|meta| meta.location.to_string())
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("list")
+        .into_iter()
+        .filter(|path| path.contains("/_lookup_index/"))
+        .collect();
+    eprintln!("stored run files: {stored:?}");
+    let deletes: Vec<String> = a
+        .requests
+        .log()
+        .into_iter()
+        .filter(|request| {
+            request.op == Op::Delete && request.path.as_ref().contains("/_lookup_index/")
+        })
+        .map(|request| format!("{} ok={}", request.path, request.result.is_ok()))
+        .collect();
+    assert!(
+        deletes.iter().all(|delete| delete.ends_with("ok=false")),
+        "A deletes no run file: {deletes:?}"
+    );
+    let missing: Vec<&String> = b_runs
+        .iter()
+        .filter(|run| !stored.iter().any(|path| path.ends_with(run.as_str())))
+        .collect();
+    assert_eq!(
+        missing,
+        Vec::<&String>::new(),
+        "every run B registered keeps its file"
+    );
+}
+
+/// A run file no run is registered for, as a sync that stopped before
+/// registering it leaves, is retired when the table loads its persisted
+/// lookup index, and the retirement sweep deletes it; the registered run and
+/// its file are kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unregistered_index_run_is_retired_at_load_and_then_deleted() {
+    let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let indexed = |builder: CayenneTableProviderBuilder| {
+        builder.with_secondary_indexes(vec![vec!["v".to_string()]])
+    };
+    let a = Instance::start(&objects, "a", LEASE).await;
+    let data_url = a.data_url.clone();
+    let table = indexed(a.builder(&data_url))
+        .create(CreateTableOptions {
+            table_name: TABLE.to_string(),
+            schema: schema(),
+            primary_key: Vec::new(),
+            on_conflict: None,
+            base_path: data_url.clone(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                inline_max_rows: 0,
+                inline_max_bytes: 0,
+                ..VortexConfig::default()
+            },
+        })
+        .await
+        .expect("create the table");
+    a.ctx
+        .register_table(TABLE, Arc::new(table))
+        .expect("register");
+    a.insert(1, 100).await.expect("A writes");
+    let table_id = a.catalog.get_table(TABLE).await.expect("table").table_id;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let registered = loop {
+        let runs = a.catalog.list_index_runs(&table_id).await.expect("runs");
+        if let Some(run) = runs.into_iter().next() {
+            break run;
+        }
+        assert!(Instant::now() < deadline, "A persisted no index run");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let run_files = || async {
+        objects
+            .list(None)
+            .map_ok(|meta| meta.location.to_string())
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("list")
+            .into_iter()
+            .filter(|path| path.contains("/_lookup_index/"))
+            .collect::<Vec<String>>()
+    };
+    let registered_path = run_files()
+        .await
+        .into_iter()
+        .find(|path| path.ends_with(&registered.run_name))
+        .expect("the registered run's file");
+    let stray = registered_path.replace(&registered.run_name, "00000000000000aa.run");
+    objects
+        .put(
+            &Path::from(stray.as_str()),
+            PutPayload::from_static(b"stray"),
+        )
+        .await
+        .expect("plant an unregistered run file");
+
+    // Reopen: the load retires the stray file and keeps the registered one.
+    let reopened = Arc::new(
+        indexed(a.builder(&data_url))
+            .open(TABLE)
+            .await
+            .expect("reopen"),
+    );
+    let native = a
+        .catalog
+        .as_any()
+        .downcast_ref::<ObjectNativeCatalog>()
+        .expect("the object-native catalog");
+    let retiring = native.retiring(&table_id).await.expect("retired keys");
+    let stray_key = format!(
+        "_lookup_index/{}/00000000000000aa.run",
+        registered.index_key
+    );
+    assert!(
+        retiring.contains(&stray_key),
+        "the unregistered run file is retired: {retiring:?}"
+    );
+    assert!(
+        run_files().await.contains(&stray),
+        "and not deleted before the retention"
+    );
+
+    reopened.reclaim_retired_snapshots_now().await;
+    let files = run_files().await;
+    assert_eq!(
+        (files.contains(&stray), files.contains(&registered_path)),
+        (false, true),
+        "the retirement sweep deletes the unregistered file and keeps the registered run's: {files:?}"
+    );
 }

@@ -2817,10 +2817,26 @@ impl PersistedRuns {
             .into_iter()
             .map(|record| (record.index_key, record.run_name))
             .collect();
+        // A run file is named for its content, so a run can come back under the
+        // name of a file retired and waiting to be deleted. Persisting it now
+        // would register a file the retirement sweep then deletes; a later sync
+        // persists it once that file is gone and forgotten.
+        let retiring = self
+            .native_catalog()
+            .map(|native| native.retiring(&self.table_id));
+        let retiring = match retiring {
+            Some(retiring) => retiring
+                .await
+                .map_err(|e| format!("read retired run files: {e}"))?,
+            None => std::collections::BTreeSet::new(),
+        };
         for (key, view) in views {
             for run in view.run_list() {
                 let name = run_file_name(&run);
                 if existing.remove(&(key.clone(), name.clone())) {
+                    continue;
+                }
+                if retiring.contains(&Self::retired_key(key, &name)) {
                     continue;
                 }
                 let row_count = run.len() as u64;
@@ -3065,8 +3081,28 @@ impl PersistedRuns {
         })?
     }
 
-    /// Deletes every file under the root that `kept` does not list. Runs only
-    /// before the first sync, so no write is in flight.
+    /// The table's catalog when it is the object-native one, whose instances
+    /// can share the table's files.
+    fn native_catalog(&self) -> Option<&crate::metastore::object_native::ObjectNativeCatalog> {
+        self.catalog
+            .as_any()
+            .downcast_ref::<crate::metastore::object_native::ObjectNativeCatalog>()
+    }
+
+    /// The key the retirement record names run `name` of index `key` by,
+    /// relative to the table's directory.
+    fn retired_key(key: &str, name: &str) -> String {
+        format!("{}/{key}/{name}", super::constants::LOOKUP_INDEX_DIR_NAME)
+    }
+
+    /// Removes every file under the root that `kept` does not list. Runs only
+    /// before the first sync, so no write of this process is in flight.
+    ///
+    /// In the object-native location it retires them instead, in one commit,
+    /// and the retirement sweep deletes them after the retention. `kept` was
+    /// read from this instance's view of the table, which is stale once
+    /// another instance has taken writing it over: the commit is refused then,
+    /// so a run the new writer registered is never deleted on that view.
     async fn delete_unregistered(&self, kept: &HashSet<object_store::path::Path>) {
         use futures::TryStreamExt;
         let listed: Vec<ObjectMeta> = match self.store.list(Some(&self.root)).try_collect().await {
@@ -3076,6 +3112,21 @@ impl PersistedRuns {
                 return;
             }
         };
+        if let Some(native) = self.native_catalog() {
+            let keys: Vec<String> = listed
+                .iter()
+                .filter(|meta| !kept.contains(&meta.location))
+                .filter_map(|meta| crate::object_relative(&self.root, &meta.location))
+                .map(|relative| format!("{}/{relative}", super::constants::LOOKUP_INDEX_DIR_NAME))
+                .collect();
+            if keys.is_empty() {
+                return;
+            }
+            if let Err(error) = native.retire_orphans(&self.table_id, &keys).await {
+                tracing::debug!(table = %self.table_name, %error, "Unregistered persisted secondary index runs were not retired; the next open retries");
+            }
+            return;
+        }
         for meta in listed {
             if kept.contains(&meta.location) {
                 continue;

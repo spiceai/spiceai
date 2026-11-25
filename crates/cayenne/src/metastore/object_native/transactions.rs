@@ -843,6 +843,18 @@ impl ObjectNativeCatalog {
             .iter()
             .any(|(_, footprint)| footprint.iter().any(|table| table == table_id))
     }
+    /// The keys of `table_id` retired and not yet forgotten, including those a
+    /// buffered change retires: the retirement sweep may delete each once its
+    /// retention passes, so nothing may name one again meanwhile.
+    /// # Errors
+    /// Returns an error when the table is unknown.
+    pub async fn retiring(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<std::collections::BTreeSet<String>> {
+        self.for_table(table_id).retiring(table_id).await
+    }
+
     /// Retire `keys` of `table_id`, objects the orphan sweep found that no
     /// committed state names, in one commit; the retirement sweep deletes them
     /// after the retention. Returns the keys retired, or `None` while the log

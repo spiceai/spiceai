@@ -1498,6 +1498,17 @@ impl MetadataCatalog for Domain {
 }
 
 impl Domain {
+    /// The keys of `table_id` retired and not yet forgotten, buffered
+    /// retirements included: a key that may be deleted once its retention
+    /// passes, so a write must not name it again meanwhile.
+    pub(super) async fn retiring(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<std::collections::BTreeSet<String>> {
+        let inner = self.inner.take().await;
+        Ok(inner.table(table_id)?.retired.iter().cloned().collect())
+    }
+
     /// Retire `keys` of `table_id` in one commit: objects the orphan sweep
     /// found that no committed state names. Returns the keys it retired,
     /// leaving out any that are live or retired already, or `None`, committing
