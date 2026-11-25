@@ -5,6 +5,7 @@
 import argparse
 import io
 import os
+import sys
 from pathlib import Path
 from uuid import uuid4
 
@@ -24,7 +25,7 @@ args = parser.parse_args()
 
 if args.out_dir.exists():
     print('Error: Output directory already exists.')
-    exit(1)
+    sys.exit(1)
 
 os.mkdir(args.out_dir)
 

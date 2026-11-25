@@ -399,6 +399,14 @@ pub enum Error {
     #[snafu(display("Table {table_name} is not accelerated"))]
     NotAcceleratedTable { table_name: String },
 
+    /// A deferred dataset that no query has initialized: none has referenced it yet, or its
+    /// initialization failed, and a refresh has nothing to refresh before it initializes.
+    /// The message names no cause and promises no retry, because it covers all of these.
+    #[snafu(display(
+        "Dataset {table_name} is not initialized yet: it is initialized by a query that references it, and no query has initialized it. Query the dataset to initialize it, or to see the error that prevents it, then refresh. See: https://spiceai.org/docs/components/data-accelerators/data-refresh#ready-state"
+    ))]
+    DatasetNotInitialized { table_name: String },
+
     #[snafu(display("Schema mismatch: {source}"))]
     SchemaMismatch { source: arrow_tools::schema::Error },
 
@@ -3009,6 +3017,17 @@ impl DataFusion {
         Ok(())
     }
 
+    /// Whether `dataset_name` is a deferred dataset still waiting for the first query that
+    /// references it to initialize it (including one whose attempts have failed).
+    pub async fn awaits_initialization(&self, dataset_name: &TableReference) -> bool {
+        self.has_pending_initializations()
+            && self
+                .pending_initializations
+                .read()
+                .await
+                .contains_key(dataset_name)
+    }
+
     /// Whether `dataset_name` is registered with its loaded provider: registered,
     /// and not a placeholder still awaiting its first-reference initialization
     /// (which stays registered when that initialization fails).
@@ -3861,6 +3880,37 @@ impl DataFusion {
         })
     }
 
+    /// An owned bootstrap that still needs [`Self::initialize_accelerator`], for a retry
+    /// whose replacement init revoked the previous owner and then failed.
+    ///
+    /// Unowned [`BootstrapStatus::None`] would also reinitialize, but
+    /// [`Self::generation_lock`] treats an unowned bootstrap as license to revoke
+    /// whoever currently holds the slot — including a newer dataset configuration
+    /// that took ownership after this failure. Registering a dummy owner keeps the
+    /// retry as the slot's occupant until then; if the slot already has a live
+    /// owner, the dummy is revoked so [`AcceleratorBootstrap::borrow`] rejects the
+    /// superseded retry.
+    pub(crate) fn awaiting_accelerator_reinitialization(
+        &self,
+        name: &TableReference,
+    ) -> AcceleratorBootstrap {
+        let owner = Arc::new(BootstrapOwner::default());
+        let mut owners = self.bootstrap_owners.lock();
+        let resolved = resolve_table_reference(name.clone());
+        if owners.get(&resolved).and_then(Weak::upgrade).is_some() {
+            owner.revoke();
+            return AcceleratorBootstrap {
+                owner: Some(owner),
+                unowned: BootstrapStatus::None,
+            };
+        }
+        owners.insert(resolved, Arc::downgrade(&owner));
+        AcceleratorBootstrap {
+            owner: Some(owner),
+            unowned: BootstrapStatus::None,
+        }
+    }
+
     async fn generation_lock(&self, name: &TableReference) -> Result<GenerationPermit> {
         if let Some(owner) = self
             .bootstrap_owners
@@ -4131,6 +4181,12 @@ impl DataFusion {
                 &dataset.name.to_string(),
                 &refresh_schema,
             )
+            .and_then(|schema| {
+                crate::accelerated::caching::extend_schema_with_cache_request(
+                    &dataset.name.to_string(),
+                    &schema,
+                )
+            })
             .map_err(|source| Error::UnableToCreateDataAccelerator {
                 source: crate::dataaccelerator::Error::InvalidConfiguration {
                     msg: source.to_string(),
@@ -4260,18 +4316,37 @@ impl DataFusion {
         // accelerator storage from earlier Spice versions does not have the
         // column and must be deleted (e.g. drop the SQLite/Postgres/Cayenne
         // backing table) before upgrading.
+        //
+        // A Cayenne caching table also stores a hidden `__spice_cache_request`
+        // column naming the request each row was fetched for, so eviction and
+        // refresh keep a paginated response whole. It is nullable and marked
+        // optional: a table created before it opens without it, and the cache
+        // then declines responses that followed pages, as it did before.
+        // Downgrading is not safe the same way: an earlier release ignores the
+        // column, evicts a cached paginated response page by page and can serve
+        // the pages it keeps as the whole response, so the caching acceleration's
+        // data must be deleted before downgrading, as for the namespace column.
         let storage_schema = if matches!(refresh_mode, RefreshMode::Caching) {
-            Arc::new(
-                crate::accelerated::caching::extend_schema_with_cache_namespace(
-                    &dataset.name.to_string(),
-                    &refresh_schema,
-                )
-                .map_err(|source| Error::UnableToCreateDataAccelerator {
-                    source: crate::dataaccelerator::Error::InvalidConfiguration {
-                        msg: source.to_string(),
-                    },
-                })?,
+            let invalid = |source: DataFusionError| Error::UnableToCreateDataAccelerator {
+                source: crate::dataaccelerator::Error::InvalidConfiguration {
+                    msg: source.to_string(),
+                },
+            };
+            let schema = crate::accelerated::caching::extend_schema_with_cache_namespace(
+                &dataset.name.to_string(),
+                &refresh_schema,
             )
+            .map_err(invalid)?;
+            let schema = if acceleration_settings.engine == Engine::Cayenne {
+                crate::accelerated::caching::extend_schema_with_cache_request(
+                    &dataset.name.to_string(),
+                    &schema,
+                )
+                .map_err(invalid)?
+            } else {
+                schema
+            };
+            Arc::new(schema)
         } else {
             Arc::clone(&refresh_schema)
         };
@@ -6357,6 +6432,13 @@ impl DataFusion {
             return self
                 .forward_refresh_to_executors(partition_service, dataset_name, overrides.as_ref())
                 .await;
+        }
+
+        if self.awaits_initialization(dataset_name).await {
+            return DatasetNotInitializedSnafu {
+                table_name: dataset_name.to_string(),
+            }
+            .fail();
         }
 
         let table = self
