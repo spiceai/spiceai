@@ -1,8 +1,9 @@
-# Known failing (#15540): once rows are in Cayenne's files, a filter with arithmetic
-# between a decimal and an integer (`d * 2`, `d + 1`, `d * big`) is refused
-# ("Failed to bind the Vortex filter to the file's type: incompatible types
-# for arithmetic operation: decimal(10,2)? decimal(20,0)?"). A partitioned
-# table writes files from its first load; any table does once it flushes.
+# Regression test for #15540: once rows are in Cayenne's files, a filter with
+# arithmetic between a decimal and an integer (`d * 2`, `d + 1`, `d * big`) must
+# answer, not be refused with "Failed to bind the Vortex filter to the file's
+# type: incompatible types for arithmetic operation: decimal(10,2)?
+# decimal(20,0)?". A partitioned table writes files from its first load; any
+# table does once it flushes.
 name: cayenne-decimal-int-filter
 description: >
   A filter with arithmetic between a decimal column and an integer answers on
