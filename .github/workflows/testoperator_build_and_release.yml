@@ -6,6 +6,7 @@ on:
       - trunk
     paths:
       - 'tools/testoperator/**'
+      - 'tools/spicescript/**'
       - 'crates/test-framework/**'
       - 'Cargo.lock'
       - '.github/workflows/testoperator_build_and_release.yml'
