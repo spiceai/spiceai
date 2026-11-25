@@ -32,6 +32,25 @@ use util::time_format::{ParsedDateTime, parse_datetime};
 /// This limit prevents stack overflow from maliciously crafted deeply nested data.
 const MAX_RECURSION_DEPTH: usize = 100;
 
+/// The type of a `DynamoDB` attribute, for errors. An attribute's `Debug`
+/// output includes its value (a map prints the whole nested item), which can
+/// hold credentials, so errors name only the type.
+fn attribute_kind(value: &AttributeValue) -> &'static str {
+    match value {
+        AttributeValue::B(_) => "B",
+        AttributeValue::Bool(_) => "BOOL",
+        AttributeValue::Bs(_) => "BS",
+        AttributeValue::L(_) => "L",
+        AttributeValue::M(_) => "M",
+        AttributeValue::N(_) => "N",
+        AttributeValue::Ns(_) => "NS",
+        AttributeValue::Null(_) => "NULL",
+        AttributeValue::S(_) => "S",
+        AttributeValue::Ss(_) => "SS",
+        _ => "an unknown attribute type",
+    }
+}
+
 pub fn dynamodb_items_to_arrow(
     items: &[HashMap<String, AttributeValue>],
     projected_schema: SchemaRef,
@@ -391,7 +410,10 @@ fn append_value_to_builder(
                     return Err(Error::ConversionError {
                         source: Box::new(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("Expected Map or Null for Struct field, got: {value:?}"),
+                            format!(
+                                "Expected Map or Null for Struct field, got: {}",
+                                value.map_or("nothing", attribute_kind)
+                            ),
                         )),
                     });
                 }

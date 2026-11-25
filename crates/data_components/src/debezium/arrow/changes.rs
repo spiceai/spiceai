@@ -227,6 +227,38 @@ mod tests {
         serde_json::from_value(value).expect("valid change event")
     }
 
+    /// The production failure: a change event missing a non-nullable column.
+    /// The stream error that the refresh task logs (`Changes stream error for
+    /// <dataset>: {err}`) must name the column and never the row's values.
+    #[test]
+    fn missing_column_stream_error_never_shows_row_values() {
+        const FAKE_SECRET: &str = "FAKE-api-key-do-not-log-0000";
+        let table_schema: SchemaRef = Arc::new(Schema::new(vec![
+            ArrowField::new("id", DataType::Utf8, false),
+            ArrowField::new("api_key", DataType::Utf8, false),
+            ArrowField::new("ip_allow_list_enabled", DataType::Boolean, false),
+        ]));
+        let event = change_event(&serde_json::json!({
+            "id": "app-1",
+            "api_key": FAKE_SECRET,
+            "api_key_2": FAKE_SECRET,
+        }));
+        let err = vector_to_change_batch(&table_schema, &["id".to_string()], &[&event], None)
+            .expect_err("a row without a non-nullable column must fail");
+        let err = crate::cdc::StreamError::Connector {
+            connector: "Debezium",
+            source: Box::new(err),
+        };
+        for rendered in [err.to_string(), format!("{err:?}")] {
+            assert!(
+                !rendered.contains(FAKE_SECRET),
+                "row value leaked: {rendered}"
+            );
+            assert!(!rendered.contains("app-1"), "row value leaked: {rendered}");
+            assert!(rendered.contains("ip_allow_list_enabled"), "{rendered}");
+        }
+    }
+
     /// A `json_object` catch-all column folds every non-declared `after` field
     /// into one sorted-JSON string column on the Debezium change path.
     #[test]
