@@ -7,7 +7,9 @@ description: >-
   feature or release branch) uses `untrusted/<repository id>/<github.ref>/`, the only keys the
   store lets it write, and reads its own writes there; the repository id keeps two
   repositories' refs apart. Sets CI_STORE_PREFIX for the rest of the job and outputs it. Every
-  writer and reader of those keys takes the segment from here. Given `spicepod`, it also
+  writer takes the segment from here, and so does every reader of the run's own writes. A build
+  another ref made is read where that ref stored it: setup-spiced reads trunk's builds at the
+  shared keys from any ref, and verifies each against its trunk attestation. Given `spicepod`, it also
   rewrites that file's `s3://benchmarks/<fixed prefix>/` locations to the run's own, so spiced
   reads and writes where this run may.
 

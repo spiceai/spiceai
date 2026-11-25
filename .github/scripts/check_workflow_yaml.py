@@ -1041,6 +1041,33 @@ def check_action_expansions(document: dict) -> list[str]:
     return problems
 
 
+# A read of a spiced build under the reader's own CI store prefix. A build lives where the ref
+# that built it stored it, so trunk's builds are at trunk's keys whoever reads them; reading them
+# under this run's `untrusted/<repository id>/<ref>/` finds nothing, or a copy no trunk run made.
+# setup-spiced reads from the build's ref, and verifies a build of trunk's against its attestation.
+OWN_PREFIX_SPICED_READ = re.compile(
+    r"\bmc\s+(?:stat|cp|cat|get)\s+[\"']?spice-minio/artifacts/"
+    r"(?:\$\{?CI_STORE_PREFIX\??\}?|\$\{\{\s*env\.CI_STORE_PREFIX\s*\}\})spiced/"
+)
+
+
+def check_own_prefix_spiced_reads(steps: object, where: str) -> list[str]:
+    """Report a step that reads a spiced build under this run's own store prefix."""
+    if not isinstance(steps, list):
+        return []
+    problems = []
+    for position, step in enumerate(steps, start=1):
+        script = step.get("run") if isinstance(step, dict) else None
+        if isinstance(script, str) and OWN_PREFIX_SPICED_READ.search(COMMENT_LINE.sub("", script)):
+            label = step.get("name") or f"step {position}"
+            problems.append(
+                f"{where}step `{label}` reads a spiced build under this run's own CI store prefix, but a build "
+                "lives where the ref that built it stored it; read spiced with setup-spiced, which reads trunk's "
+                "builds at trunk's keys and verifies their attestation"
+            )
+    return problems
+
+
 def download_executions(script: object) -> list[tuple[int, str]]:
     """The (line number, line) of each line of a script that runs a download as code.
 
@@ -1070,11 +1097,13 @@ def _step_download_executions(steps: object, where: str) -> list[str]:
 
 
 def check_download_execution(jobs: dict) -> list[str]:
-    """Report a workflow step that runs a download as code (DOWNLOAD_EXECUTION)."""
+    """Report a workflow step that runs a download as code (DOWNLOAD_EXECUTION), or reads a
+    spiced build under the run's own store prefix (OWN_PREFIX_SPICED_READ)."""
     problems = []
     for job_name, job in jobs.items():
         if isinstance(job, dict):
             problems.extend(_step_download_executions(job.get("steps"), f"job `{job_name}` "))
+            problems.extend(check_own_prefix_spiced_reads(job.get("steps"), f"job `{job_name}` "))
     return problems
 
 
@@ -1209,6 +1238,7 @@ def check_action(text: str) -> list[str]:
         + check_action_conditions(runs)
         + check_action_expansions(document)
         + _step_download_executions(runs.get("steps") if isinstance(runs, dict) else None, "")
+        + check_own_prefix_spiced_reads(runs.get("steps") if isinstance(runs, dict) else None, "")
     )
 
 

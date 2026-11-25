@@ -1,5 +1,6 @@
 """Unit tests for check_workflow_yaml.py."""
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -817,6 +818,45 @@ class IntegrationAwsCallsTest(unittest.TestCase):
         self.assertEqual(sorted(calls), sorted(called["jobs"]))
         for name, job in called["jobs"].items():
             self.assertEqual(job.get("if"), f"inputs.job == '{name}'", name)
+
+
+class OwnPrefixSpicedReadTest(unittest.TestCase):
+    """A spiced build is read where the ref that built it stored it, not under the reader's prefix."""
+
+    def problems(self, script):
+        text = (
+            "name: Setup\ndescription: Sets up a thing\nruns:\n  using: composite\n  steps:\n"
+            "    - name: Find\n      shell: bash\n      run: |\n"
+            + "".join(f"        {line}\n" for line in script.splitlines())
+        )
+        return [p for p in check_workflow_yaml.check_action(text) if "own CI store prefix" in p]
+
+    def test_a_read_under_the_readers_prefix_is_reported(self):
+        for script in (
+            'mc stat "spice-minio/artifacts/${CI_STORE_PREFIX}spiced/linux-x86_64/$h/spiced.tar.gz"',
+            'mc cp "spice-minio/artifacts/$CI_STORE_PREFIX?spiced/x" ./spiced.tar.gz',
+            "mc cp spice-minio/artifacts/${{ env.CI_STORE_PREFIX }}spiced/x .",
+        ):
+            with self.subTest(script=script):
+                self.assertEqual(len(self.problems(script)), 1)
+
+    def test_a_write_or_a_read_from_the_builds_ref_is_accepted(self):
+        script = (
+            'mc stat "spice-minio/artifacts/${SOURCE_PREFIX}spiced/linux-x86_64/$h/spiced.tar.gz"\n'
+            'mc cp ./spiced.tar.gz "spice-minio/artifacts/${CI_STORE_PREFIX}spiced/linux-x86_64/$h/"\n'
+            '# not this: mc stat "spice-minio/artifacts/${CI_STORE_PREFIX}spiced/x"'
+        )
+        self.assertEqual(self.problems(script), [])
+
+    def test_e1515817d5s_setup_spiced_is_reported(self):
+        old = subprocess.run(
+            ["git", "show", "e1515817d5:.github/actions/setup-spiced/action.yml"],
+            cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True,
+        )
+        if old.returncode != 0:
+            self.skipTest("e1515817d5 is not in this clone")
+        problems = [p for p in check_workflow_yaml.check_action(old.stdout) if "own CI store prefix" in p]
+        self.assertEqual(len(problems), 2, problems)
 
 
 class CheckActionExpansionsTest(unittest.TestCase):

@@ -80,6 +80,16 @@ class VerifyAttestationTest(unittest.TestCase):
             proc.stdout,
         )
 
+    def test_a_runner_without_gh_fails_closed_and_says_why(self):
+        empty = self.dir / "empty"
+        empty.mkdir()
+        env = {"PATH": str(empty), "FILE": str(self.file), "SIGNER_WORKFLOW": ".github/workflows/build_release.yml",
+               "GITHUB_REPOSITORY": "spiceai/spiceai", "GH_TOKEN": "a-token", "SOURCE_COMMIT": ""}
+        proc = subprocess.run(["/bin/bash", str(self.script)], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("The GitHub CLI (gh) is not installed on this runner", proc.stdout)
+        self.assertNotIn("a-token", proc.stdout + proc.stderr)
+
     def test_a_missing_file_fails_without_asking(self):
         proc = self.verify(file=self.dir / "absent.tar.gz")
         self.assertEqual(proc.returncode, 1)

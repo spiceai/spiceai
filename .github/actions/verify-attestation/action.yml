@@ -38,6 +38,10 @@ runs:
           echo "::error::$FILE does not exist, so its attestation cannot be verified."
           exit 1
         fi
+        if ! command -v gh >/dev/null 2>&1; then
+          echo "::error::The GitHub CLI (gh) is not installed on this runner, so $FILE's attestation cannot be verified; not running it."
+          exit 1
+        fi
         signer="${GITHUB_REPOSITORY}/${SIGNER_WORKFLOW#./}"
         if ! out="$(gh attestation verify "$FILE" --repo "$GITHUB_REPOSITORY" \
           --signer-workflow "$signer" --source-ref refs/heads/trunk ${SOURCE_COMMIT:+--source-digest "$SOURCE_COMMIT"} 2>&1)"; then
