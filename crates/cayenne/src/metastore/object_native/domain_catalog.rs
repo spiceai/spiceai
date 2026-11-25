@@ -32,6 +32,24 @@ use async_trait::async_trait;
 use cayenne_metastore_actions::{Action, Kind, ObjRef, proto};
 use std::collections::HashMap;
 
+/// The action that records `files` as manifest rows of `snapshot_id`, refusing a
+/// row of another table or snapshot.
+fn snapshot_manifest_action(
+    table_id: &str,
+    snapshot_id: &str,
+    files: &[SnapshotFile],
+) -> CatalogResult<Action> {
+    if files
+        .iter()
+        .any(|f| f.table_id != table_id || f.snapshot_id != snapshot_id)
+    {
+        return Err(invalid(format!(
+            "snapshot file identity does not match snapshot '{snapshot_id}' of table '{table_id}'"
+        )));
+    }
+    Ok(actions::add_files(table_id, snapshot_id, files, false))
+}
+
 #[async_trait]
 impl MetadataCatalog for Domain {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -653,11 +671,18 @@ impl MetadataCatalog for Domain {
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
         delete_files: &[crate::metadata::DeleteFile],
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()> {
         validate_uuid("table_id", table_id)?;
         validate_uuid("new_snapshot_id", new_snapshot_id)?;
+        let manifest = files
+            .map(|files| snapshot_manifest_action(table_id, new_snapshot_id, files))
+            .transpose()?;
         let mut inner = self.inner.take().await;
         let mut batch = actions::overwrite_clear(table_id, new_snapshot_id);
+        // After the flip, so the record checks the new snapshot's files against
+        // the files it retires.
+        batch.extend(manifest);
         if let Some(data) = inlined {
             batch.push(actions::add_inlined(
                 table_id,
@@ -772,18 +797,13 @@ impl MetadataCatalog for Domain {
         snapshot_id: &str,
         files: &[SnapshotFile],
     ) -> CatalogResult<()> {
-        if files
-            .iter()
-            .any(|f| f.table_id != table_id || f.snapshot_id != snapshot_id)
-        {
-            return Err(invalid("snapshot file identity does not match replacement"));
-        }
+        let manifest = snapshot_manifest_action(table_id, snapshot_id, files)?;
         self.inner
             .take()
             .await
             .commit(vec![
                 actions::remove_files(table_id, proto::Select::Listed, &[snapshot_id.to_string()]),
-                actions::add_files(table_id, snapshot_id, files, false),
+                manifest,
             ])
             .await
     }

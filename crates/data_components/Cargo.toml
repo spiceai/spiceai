@@ -90,6 +90,7 @@ rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex.workspace = true
 reqwest.workspace = true
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
+runtime-object-store = { path = "../runtime-object-store" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-udfs-api = { path = "../runtime-udfs-api" }
 runtime-request-context = { path = "../runtime-request-context", features = [
@@ -242,3 +243,9 @@ workspace = true
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+
+# Installs a counting `#[global_allocator]` to check that decoding an Avro body
+# allocates in proportion to the body, not to the item counts it declares.
+[[test]]
+name = "avro_decode_allocation"
+path = "tests/avro_decode_allocation.rs"

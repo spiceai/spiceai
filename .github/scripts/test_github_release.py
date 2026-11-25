@@ -1,14 +1,15 @@
 """Unit tests for github_release.py."""
+import contextlib
+import io
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 import unittest.mock
 
-# github_release exits at import time if GITHUB_TOKEN is missing.
-os.environ.setdefault("GITHUB_TOKEN", "test-token")
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPTS_DIR)
 import github_release  # noqa: E402
 
 
@@ -247,6 +248,77 @@ class ActionUploadBodyTests(unittest.TestCase):
         self.assertLessEqual(len(body), github_release.MAX_BODY_CHARS)
         self.assertFalse(is_prerelease)
         mock_upload.assert_called_once()
+
+
+class CreateReleaseTests(unittest.TestCase):
+    @unittest.mock.patch("github_release.getReleaseByTag")
+    @unittest.mock.patch("github_release.requests.post")
+    def test_create_race_returns_the_existing_release(self, mock_post, mock_get):
+        # A parallel matrix leg created the release first, so this create fails.
+        release = {"id": 7, "assets": [], "upload_url": "https://example/{?name,label}"}
+        mock_post.return_value = FakeResponse(422, {"message": "Validation Failed"})
+        mock_get.return_value = release
+
+        self.assertEqual(github_release.createRelease("o", "r", "v1.0", "v1.0", "notes", False), release)
+
+    @unittest.mock.patch("github_release.uploadArtifact")
+    @unittest.mock.patch("github_release.requests.post")
+    @unittest.mock.patch("github_release.getReleaseByTag")
+    def test_failed_create_exits_without_uploading(self, mock_get, mock_post, mock_upload):
+        mock_get.return_value = None
+        mock_post.return_value = FakeResponse(422, {"message": "Validation Failed"})
+        args = unittest.mock.Mock(
+            owner="spiceai",
+            repo="spiceai",
+            tag="v2.2.0",
+            release_name="v2.2.0",
+            body="notes",
+            body_file=None,
+            prerelease="false",
+            artifact=["./release/x.tar.gz"],
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                github_release.actionUpload(args)
+
+        self.assertEqual(raised.exception.code, "ERROR: Unable to create or find a release with tag: v2.2.0")
+        mock_upload.assert_not_called()
+
+
+class MainTests(unittest.TestCase):
+    def test_import_without_token_neither_prints_nor_exits(self):
+        env = {k: v for k, v in os.environ.items() if k != "GITHUB_TOKEN"}
+
+        result = subprocess.run(
+            [sys.executable, "-c", "import github_release"],
+            cwd=SCRIPTS_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+
+    @unittest.mock.patch("github_release.actionUpload")
+    @unittest.mock.patch("github_release.token", None)
+    def test_missing_token_exits_before_any_action(self, mock_upload):
+        with unittest.mock.patch("sys.argv", ["github_release.py", "upload", "x.tar.gz"]):
+            with self.assertRaises(SystemExit) as raised:
+                github_release.main()
+
+        self.assertEqual(raised.exception.code, "ERROR: Specify GITHUB_TOKEN environment variable")
+        mock_upload.assert_not_called()
+
+    @unittest.mock.patch("github_release.token", "test-token")
+    def test_unknown_action_exits_with_status_1(self):
+        out = io.StringIO()
+        with unittest.mock.patch("sys.argv", ["github_release.py", "publish", "x.tar.gz"]):
+            with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as raised:
+                github_release.main()
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertTrue(out.getvalue().endswith("Unknown action publish!\n"), out.getvalue())
 
 
 if __name__ == "__main__":
