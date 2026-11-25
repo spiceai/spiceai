@@ -185,11 +185,11 @@ impl FlightService for CookieFlightService {
     ) -> Result<Response<Self::DoGetStream>, Status> {
         // A ticket naming a command this server does not know is refused the
         // way a Spice upstream that predates it refuses it.
-        if let Ok(any) = <arrow_flight::sql::Any as prost::Message>::decode(
-            request.get_ref().ticket.clone(),
-        ) && let arrow_flight::sql::Command::Unknown(any) =
-            arrow_flight::sql::Command::try_from(any)
-                .map_err(|e| Status::invalid_argument(e.to_string()))?
+        if let Ok(any) =
+            <arrow_flight::sql::Any as prost::Message>::decode(request.get_ref().ticket.clone())
+            && let arrow_flight::sql::Command::Unknown(any) =
+                arrow_flight::sql::Command::try_from(any)
+                    .map_err(|e| Status::invalid_argument(e.to_string()))?
         {
             return Err(Status::unimplemented(format!(
                 "Unknown command type: {}",
@@ -453,7 +453,8 @@ async fn substrait_do_get_refuses_an_implausible_decompressed_size()
 #[tokio::test]
 async fn parameterized_substrait_unimplemented_is_reported_as_unsupported()
 -> Result<(), Box<dyn std::error::Error>> {
-    let server = TestServer::start(CookieFlightService::new(Arc::new(AtomicBool::new(false)))).await;
+    let server =
+        TestServer::start(CookieFlightService::new(Arc::new(AtomicBool::new(false)))).await;
     let client = FlightClient::try_new(
         format!("http://{}", server.addr).into(),
         Credentials::anonymous(),
@@ -468,7 +469,10 @@ async fn parameterized_substrait_unimplemented_is_reported_as_unsupported()
             .await
             .expect_err("a server without parameterized tickets must refuse one");
         assert!(
-            matches!(err, flight_client::Error::ParameterizedSubstraitUnsupported { .. }),
+            matches!(
+                err,
+                flight_client::Error::ParameterizedSubstraitUnsupported { .. }
+            ),
             "trace id {trace_id:?}: expected ParameterizedSubstraitUnsupported, got {err:?}"
         );
     }
