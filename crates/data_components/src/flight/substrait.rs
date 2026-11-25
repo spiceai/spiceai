@@ -25,7 +25,10 @@ use arrow::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::{
-    common::{Result, tree_node::TreeNodeRecursion},
+    common::{
+        Result, ScalarValue,
+        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
+    },
     config::ConfigOptions,
     datasource::empty::EmptyTable,
     error::DataFusionError,
@@ -460,12 +463,16 @@ impl FederationPlanner for SpiceFederation {
         let plan = session
             .optimizer()
             .optimize(node.plan().clone(), session, |_, _| {})?;
-        Ok(Arc::new(SubstraitExec::new(
+        let exec = SubstraitExec::new(
             self.client.clone(),
             encode_plan(&plan, Reads::Federated)?,
             Arc::new(node.plan().schema().as_arrow().clone()),
             table_names(node.plan())?,
-        )))
+        );
+        Ok(Arc::new(match PlanParameters::of(plan)? {
+            Some(parameters) => exec.with_parameters(parameters),
+            None => exec,
+        }))
     }
 }
 
@@ -503,7 +510,7 @@ pub(super) fn scan(
     )))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct SubstraitExec {
     client: FlightClient,
     plan: Bytes,
@@ -513,6 +520,215 @@ pub(super) struct SubstraitExec {
     wire_schema: Option<SchemaRef>,
     datasets: String,
     properties: Arc<PlanProperties>,
+    /// Set when `plan` holds dynamic parameters (`$N`): a template, or, once
+    /// [`SubstraitTemplate::bind`] has bound values to it, a bound plan whose
+    /// `plan` carries them as `parameter_bindings`.
+    parameters: Option<Arc<PlanParameters>>,
+}
+
+/// The dynamic parameters of a federated plan, and the values bound to them.
+#[derive(Debug)]
+struct PlanParameters {
+    /// The optimized plan the template was encoded from, still holding its
+    /// placeholders. For an upstream that does not take parameterized plans,
+    /// the values are bound into it and it is encoded again, with literals.
+    plan: Arc<LogicalPlan>,
+    /// Each parameter's anchor (`$N` is `N - 1`) and the type the plan
+    /// declares for it, by anchor.
+    fields: Vec<(u32, DataType)>,
+    /// The values bound to `fields`, in the same order; `None` for a template.
+    values: Option<Vec<ScalarValue>>,
+}
+
+impl PlanParameters {
+    /// The parameters of `plan`, or `None` when it has none. A placeholder
+    /// that is not `$N`, or has no type, leaves the plan without parameters:
+    /// such a plan cannot be bound exactly, and is sent as it is today.
+    fn of(plan: LogicalPlan) -> Result<Option<Self>> {
+        let declared = plan.get_parameter_fields()?;
+        if declared.is_empty() {
+            return Ok(None);
+        }
+        let mut fields = Vec::with_capacity(declared.len());
+        for (id, field) in declared {
+            let (Some(field), Some(anchor)) = (
+                field,
+                id.strip_prefix('$')
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .and_then(|n| n.checked_sub(1)),
+            ) else {
+                return Ok(None);
+            };
+            fields.push((anchor, field.data_type().clone()));
+        }
+        fields.sort_by_key(|(anchor, _)| *anchor);
+        Ok(Some(Self {
+            plan: Arc::new(plan),
+            fields,
+            values: None,
+        }))
+    }
+
+    /// The bound plan encoded with its values inlined as literals: the plan a
+    /// sidecar sent before parameterized plans, for an upstream without them.
+    fn inlined(&self) -> Result<Bytes> {
+        let Some(values) = &self.values else {
+            return Err(DataFusionError::Internal(
+                "A Substrait template has no values to inline".into(),
+            ));
+        };
+        let values: std::collections::HashMap<String, ScalarValue> = self
+            .fields
+            .iter()
+            .zip(values)
+            .map(|((anchor, _), value)| ((u64::from(*anchor) + 1).to_string(), value.clone()))
+            .collect();
+        let plan = Arc::unwrap_or_clone(Arc::clone(&self.plan)).with_param_values(values)?;
+        encode_plan(&plan, Reads::Federated)
+    }
+}
+
+/// Upstream endpoints, by URL, that refused a parameterized plan as
+/// unsupported: they predate it. Their plans are sent with the values inlined
+/// from then on, rather than refused once per query. An upstream upgraded in
+/// place is not asked again until this process restarts.
+static PARAMETERIZED_PLANS_UNSUPPORTED: std::sync::LazyLock<dashmap::DashSet<String>> =
+    std::sync::LazyLock::new(dashmap::DashSet::new);
+
+/// A fully federated plan whose Substrait holds dynamic parameters, planned
+/// once and bound to each request's values.
+///
+/// Holds the [`SubstraitExec`] a physical plan was planned around, and the
+/// plan itself: binding replaces that leaf with one carrying the values and
+/// rebuilds every node above it, so no two executions share a node's state.
+#[derive(Debug, Clone)]
+pub struct SubstraitTemplate {
+    plan: Arc<dyn ExecutionPlan>,
+    leaf: SubstraitExec,
+}
+
+impl SubstraitTemplate {
+    /// The template in `plan`, when `plan` is a chain of single-input nodes
+    /// over exactly one Substrait leaf whose plan holds unbound parameters.
+    /// Anything else (a join of a local and a federated input, a second leaf,
+    /// a leaf without parameters) is `None`.
+    #[must_use]
+    pub fn of(plan: &Arc<dyn ExecutionPlan>) -> Option<Self> {
+        let mut node = plan;
+        loop {
+            let children = node.children();
+            match children.as_slice() {
+                [] => break,
+                [child] => node = *child,
+                _ => return None,
+            }
+        }
+        let leaf = node.downcast_ref::<SubstraitExec>()?;
+        let parameters = leaf.parameters.as_ref()?;
+        if parameters.values.is_some() {
+            return None;
+        }
+        Some(Self {
+            plan: Arc::clone(plan),
+            leaf: leaf.clone(),
+        })
+    }
+
+    /// Each parameter the template's Substrait holds, as its `$N` number and
+    /// the type the plan declares for it, in order. The optimizer may have
+    /// removed a parameter the logical plan had; it is not listed.
+    pub fn parameters(&self) -> impl Iterator<Item = (usize, &DataType)> {
+        self.leaf
+            .parameters
+            .iter()
+            .flat_map(|parameters| parameters.fields.iter())
+            .map(|(anchor, data_type)| (*anchor as usize + 1, data_type))
+    }
+
+    /// The template's plan with `values` bound: `values[N - 1]` is the value
+    /// of `$N`. Values for parameters the template does not hold are ignored.
+    ///
+    /// # Errors
+    /// When a parameter has no value, a value's type is not exactly the type
+    /// the plan declares, or a value cannot be written as a binding.
+    pub fn bind(
+        &self,
+        values: &[ScalarValue],
+        state: &SessionState,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let Some(parameters) = &self.leaf.parameters else {
+            return Err(DataFusionError::Internal(
+                "A Substrait template has no parameters".into(),
+            ));
+        };
+        let mut bound = Vec::with_capacity(parameters.fields.len());
+        for (anchor, data_type) in &parameters.fields {
+            let id = u64::from(*anchor) + 1;
+            let Some(value) = values.get(*anchor as usize) else {
+                return Err(DataFusionError::Plan(format!(
+                    "No value is bound to parameter ${id}"
+                )));
+            };
+            if &value.data_type() != data_type {
+                return Err(DataFusionError::Plan(format!(
+                    "Parameter ${id} is declared as {data_type}, but bound to a {} value",
+                    value.data_type()
+                )));
+            }
+            bound.push(value.clone());
+        }
+        let bindings = super::substrait_parameters::parameter_bindings(
+            parameters
+                .fields
+                .iter()
+                .map(|(anchor, _)| *anchor)
+                .zip(&bound),
+            state,
+        )?;
+        // Concatenated Protobuf messages merge, and a repeated field appends:
+        // the template's bytes followed by a message holding only the bindings
+        // decode as the template with those bindings, without decoding it here.
+        let mut plan = bytes::BytesMut::from(self.leaf.plan.as_ref());
+        Plan {
+            parameter_bindings: bindings,
+            ..Default::default()
+        }
+        .encode(&mut plan)
+        .map_err(|error| DataFusionError::Internal(error.to_string()))?;
+        let leaf: Arc<dyn ExecutionPlan> = Arc::new(SubstraitExec {
+            plan: plan.freeze(),
+            parameters: Some(Arc::new(PlanParameters {
+                plan: Arc::clone(&parameters.plan),
+                fields: parameters.fields.clone(),
+                values: Some(bound),
+            })),
+            ..self.leaf.clone()
+        });
+        Arc::clone(&self.plan)
+            .transform_up(|node| {
+                if node.children().is_empty() {
+                    Ok(Transformed::yes(Arc::clone(&leaf)))
+                } else {
+                    node.reset_state().map(Transformed::yes)
+                }
+            })
+            .map(|transformed| transformed.data)
+    }
+}
+
+/// The federation context of `source` when it is a table this runtime reads
+/// from an upstream Spice runtime through Substrait plans: tables with the same
+/// context are read from the same upstream, as the same principal.
+#[must_use]
+pub fn spice_substrait_context(
+    source: &Arc<dyn datafusion::logical_expr::TableSource>,
+) -> Option<String> {
+    let provider = get_table_source(source).ok()??.federation_provider();
+    if provider.name() == "spice_substrait" {
+        provider.compute_context()
+    } else {
+        None
+    }
 }
 
 impl SubstraitExec {
@@ -537,6 +753,14 @@ impl SubstraitExec {
             wire_schema,
             datasets,
             properties,
+            parameters: None,
+        }
+    }
+
+    fn with_parameters(self, parameters: PlanParameters) -> Self {
+        Self {
+            parameters: Some(Arc::new(parameters)),
+            ..self
         }
     }
 }
@@ -605,7 +829,11 @@ fn extension_metadata(field: &Field) -> Vec<(&String, &String)> {
 
 impl DisplayAs for SubstraitExec {
     fn fmt_as(&self, _format: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "SubstraitExec: plan_bytes={}", self.plan.len())
+        write!(f, "SubstraitExec: plan_bytes={}", self.plan.len())?;
+        if let Some(parameters) = &self.parameters {
+            write!(f, ", parameters={}", parameters.fields.len())?;
+        }
+        Ok(())
     }
 }
 
@@ -671,23 +899,59 @@ impl ExecutionPlan for SubstraitExec {
         }
         let plan = self.plan.clone();
         let datasets = self.datasets.clone();
+        // Only a bound plan is sent parameterized; a template's placeholders
+        // have no values, and are sent as they always were.
+        let parameters = self
+            .parameters
+            .clone()
+            .filter(|parameters| parameters.values.is_some());
         let query = async move {
-            let timeout = deadline.as_ref().map(|deadline| {
-                deadline
-                    .0
-                    .saturating_duration_since(std::time::Instant::now())
-            });
-            client
-                .query_substrait(plan, timeout, propagated_trace_id.as_deref())
-                .await
-                .map_err(|error| match error {
-                    flight_client::Error::SubstraitUnsupported { source } => {
-                        DataFusionError::Execution(format!(
-                            "The upstream Spice runtime for dataset '{datasets}' does not support the required Substrait plan: {source}. Upgrade the upstream runtime, or restart this runtime with `--role server` to use SQL federation."
-                        ))
-                    }
-                    other => DataFusionError::External(Box::new(other)),
+            let timeout = || {
+                deadline.as_ref().map(|deadline| {
+                    deadline
+                        .0
+                        .saturating_duration_since(std::time::Instant::now())
                 })
+            };
+            let map_error = |error| match error {
+                flight_client::Error::SubstraitUnsupported { source } => {
+                    DataFusionError::Execution(format!(
+                        "The upstream Spice runtime for dataset '{datasets}' does not support the required Substrait plan: {source}. Upgrade the upstream runtime, or restart this runtime with `--role server` to use SQL federation."
+                    ))
+                }
+                other => DataFusionError::External(Box::new(other)),
+            };
+            let plan = match parameters {
+                None => plan,
+                Some(parameters) => {
+                    if !PARAMETERIZED_PLANS_UNSUPPORTED.contains(client.url()) {
+                        match client
+                            .query_substrait_parameterized(
+                                plan,
+                                timeout(),
+                                propagated_trace_id.as_deref(),
+                            )
+                            .await
+                        {
+                            Err(flight_client::Error::ParameterizedSubstraitUnsupported {
+                                source,
+                            }) => {
+                                tracing::debug!(
+                                    "The upstream Spice runtime at {} does not take parameterized Substrait plans ({source}); sending plans with their values inlined",
+                                    client.url()
+                                );
+                                PARAMETERIZED_PLANS_UNSUPPORTED.insert(client.url().to_string());
+                            }
+                            result => return result.map_err(map_error),
+                        }
+                    }
+                    parameters.inlined()?
+                }
+            };
+            client
+                .query_substrait(plan, timeout(), propagated_trace_id.as_deref())
+                .await
+                .map_err(map_error)
         };
         let schema = Arc::clone(&self.schema);
         let expected = Arc::clone(&schema);

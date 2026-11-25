@@ -58,6 +58,8 @@ pub mod stream;
 mod substrait;
 pub mod substrait_parameters;
 
+pub use substrait::{SubstraitTemplate, spice_substrait_context};
+
 pub use delegated_search::{
     SEARCH_CALL_TYPE_URL, SEARCH_SCORE_COLUMN, delegated_search, delegated_search_schema,
 };
