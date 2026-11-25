@@ -7087,6 +7087,7 @@ mod tests {
                 .with_rebuild_from_this_batch(true),
             true,
             true,
+            false,
         );
         let apply = task.apply_envelope_run(&mut context, vec![reload]);
         tokio::pin!(apply);
