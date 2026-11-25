@@ -4195,6 +4195,12 @@ impl DataFusion {
                 &dataset.name.to_string(),
                 &refresh_schema,
             )
+            .and_then(|schema| {
+                crate::accelerated::caching::extend_schema_with_cache_request(
+                    &dataset.name.to_string(),
+                    &schema,
+                )
+            })
             .map_err(|source| Error::UnableToCreateDataAccelerator {
                 source: crate::dataaccelerator::Error::InvalidConfiguration {
                     msg: source.to_string(),
@@ -4324,18 +4330,37 @@ impl DataFusion {
         // accelerator storage from earlier Spice versions does not have the
         // column and must be deleted (e.g. drop the SQLite/Postgres/Cayenne
         // backing table) before upgrading.
+        //
+        // A Cayenne caching table also stores a hidden `__spice_cache_request`
+        // column naming the request each row was fetched for, so eviction and
+        // refresh keep a paginated response whole. It is nullable and marked
+        // optional: a table created before it opens without it, and the cache
+        // then declines responses that followed pages, as it did before.
+        // Downgrading is not safe the same way: an earlier release ignores the
+        // column, evicts a cached paginated response page by page and can serve
+        // the pages it keeps as the whole response, so the caching acceleration's
+        // data must be deleted before downgrading, as for the namespace column.
         let storage_schema = if matches!(refresh_mode, RefreshMode::Caching) {
-            Arc::new(
-                crate::accelerated::caching::extend_schema_with_cache_namespace(
-                    &dataset.name.to_string(),
-                    &refresh_schema,
-                )
-                .map_err(|source| Error::UnableToCreateDataAccelerator {
-                    source: crate::dataaccelerator::Error::InvalidConfiguration {
-                        msg: source.to_string(),
-                    },
-                })?,
+            let invalid = |source: DataFusionError| Error::UnableToCreateDataAccelerator {
+                source: crate::dataaccelerator::Error::InvalidConfiguration {
+                    msg: source.to_string(),
+                },
+            };
+            let schema = crate::accelerated::caching::extend_schema_with_cache_namespace(
+                &dataset.name.to_string(),
+                &refresh_schema,
             )
+            .map_err(invalid)?;
+            let schema = if acceleration_settings.engine == Engine::Cayenne {
+                crate::accelerated::caching::extend_schema_with_cache_request(
+                    &dataset.name.to_string(),
+                    &schema,
+                )
+                .map_err(invalid)?
+            } else {
+                schema
+            };
+            Arc::new(schema)
         } else {
             Arc::clone(&refresh_schema)
         };

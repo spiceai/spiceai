@@ -244,3 +244,9 @@ workspace = true
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+
+# Installs a counting `#[global_allocator]` to check that decoding an Avro body
+# allocates in proportion to the body, not to the item counts it declares.
+[[test]]
+name = "avro_decode_allocation"
+path = "tests/avro_decode_allocation.rs"
