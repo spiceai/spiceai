@@ -8,9 +8,10 @@ on:
         description: 'spiced build commit'
         required: false
         type: string
-      # Runs another release's spiced with this ref's testoperator and spec files.
+      # Runs another release's spiced with this ref's testoperator and spec files. A branch's build
+      # runs only in a run on that branch, whose store credentials are that branch's.
       spiced_ref:
-        description: 'Branch or tag whose spiced to run, e.g. v2.1.0 or release/2.4; empty = trunk. A release tag uses that release''s published binary. Ignored when spiced_commit is set'
+        description: 'Tag or branch whose spiced to run, e.g. v2.1.0; empty = trunk. A release tag uses that release''s published binary. A branch other than trunk must be the one this run is on. Ignored when spiced_commit is set'
         required: false
         type: string
         default: ''

@@ -143,7 +143,9 @@ class SetupSpicedTest(unittest.TestCase):
         proc, located = self.locate("refs/heads/feature", spiced_commit=self.feature)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(located, {"ref": "refs/heads/trunk", "prefix": f"untrusted/{REPOSITORY_ID}/refs/heads/feature/", "trunk": "false"})
-        proc, located = self.locate(PULL_REQUEST, ref="refs/heads/release/1.0")
+        # A release branch's own run, such as its leg of the scheduled dispatch.
+        proc, located = self.locate("refs/heads/release/1.0", ref="refs/heads/release/1.0")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(located, {"ref": "refs/heads/release/1.0", "prefix": f"untrusted/{REPOSITORY_ID}/refs/heads/release/1.0/", "trunk": "false"})
         self.stored.write_text(self.key(located["prefix"], self.trunk) + "\n")
         self.run_step("download", {"SOURCE_PREFIX": located["prefix"], "SPICED_COMMIT": self.trunk})
@@ -153,7 +155,8 @@ class SetupSpicedTest(unittest.TestCase):
         proc, located = self.locate(PULL_REQUEST, ref="trunk")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(located, {"ref": "refs/heads/trunk", "prefix": "", "trunk": "true"})
-        proc, located = self.locate(PULL_REQUEST, ref="release/1.0")
+        proc, located = self.locate("refs/heads/release/1.0", ref="release/1.0")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(located["ref"], "refs/heads/release/1.0")
         self.assertEqual(located["prefix"], f"untrusted/{REPOSITORY_ID}/refs/heads/release/1.0/")
 
@@ -171,16 +174,39 @@ class SetupSpicedTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("no spiced commit was chosen", proc.stdout)
 
+    def test_a_run_never_takes_another_refs_build(self):
+        # A build of a ref other than trunk runs only in a run of that ref, with that ref's
+        # credentials: a trunk run's store credentials write trunk's keys.
+        for github_ref, ref, commit in (
+            ("refs/heads/trunk", "refs/heads/feature", ""),
+            ("refs/heads/trunk", "feature", ""),
+            ("refs/heads/trunk", "refs/heads/release/1.0", ""),
+            ("refs/heads/trunk", "refs/heads/feature", "feature"),
+            ("refs/heads/trunk", "refs/heads/trunk", "feature"),
+            (PULL_REQUEST, "refs/heads/release/1.0", ""),
+            ("refs/heads/feature", "refs/heads/release/1.0", ""),
+        ):
+            with self.subTest(github_ref=github_ref, ref=ref, commit=commit):
+                proc, located = self.locate(github_ref, ref=ref, spiced_commit=self.feature if commit else "")
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("runs only a spiced that trunk or this run's own ref built", proc.stdout)
+                self.assertEqual(located, {})
+
+    def test_a_spiced_commit_that_is_not_a_full_hash_is_refused(self):
+        for commit in (f"{self.trunk}\nprefix=", self.trunk[:12], f"{self.trunk[:39]}$(id)", "../../../../x",
+                       self.trunk.upper()):
+            with self.subTest(commit=commit):
+                proc, located = self.locate("refs/heads/feature", spiced_commit=commit)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("must be a full 40-character commit hash", proc.stdout)
+                self.assertEqual(located, {})
+
     def test_a_full_role_job_never_takes_a_branch_build(self):
-        proc, located = self.locate("refs/heads/trunk", ref="refs/heads/release/1.0", verify="true")
+        proc, located = self.locate("refs/heads/release/1.0", ref="refs/heads/release/1.0", verify="true")
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("runs only a spiced built and attested on trunk", proc.stdout)
         self.assertEqual(located, {})
 
-    def test_a_branch_commit_named_on_trunk_is_read_at_trunks_keys_and_must_verify(self):
-        # A trunk run given a branch's commit reads trunk's keys, where no attested build of it is.
-        proc, located = self.locate("refs/heads/trunk", spiced_commit=self.feature)
-        self.assertEqual(located, {"ref": "refs/heads/trunk", "prefix": "", "trunk": "true"})
 
     def test_every_read_at_trunks_keys_is_verified_whatever_the_role(self):
         verify = self.steps["Verify spiced's build attestation"]

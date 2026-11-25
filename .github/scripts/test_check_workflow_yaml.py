@@ -676,6 +676,42 @@ class CheckAttestedBuildsTest(unittest.TestCase):
         text = self.DOC.replace("{cond}", "").split("      - name: Attest")[0]
         self.assertEqual([p for p in check_workflow_yaml.check_workflow(text) if "shared build cache" in p], [])
 
+    def test_a_build_that_a_separate_job_attests_is_covered_too(self):
+        split = (
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-24.04\n    steps:\n"
+            "      - name: Set up sccache\n{cond}        uses: $/.github/actions/setup-sccache\n"
+            "      - run: make\n"
+            "  attest:\n    needs: [build]\n    runs-on: ubuntu-24.04\n    steps:\n"
+            "      - uses: actions/download-artifact@v8\n"
+            "      - name: Attest\n        uses: actions/attest-build-provenance@v4\n"
+            "        with:\n          subject-path: out\n"
+        )
+        found = [p for p in check_workflow_yaml.check_workflow(split.replace("{cond}", ""))
+                 if "shared build cache" in p]
+        self.assertEqual(len(found), 1)
+        self.assertIn("`build`'s output is attested by job `attest`", found[0])
+        kept_off = split.replace("{cond}", "        if: github.ref != 'refs/heads/trunk'\n")
+        self.assertEqual([p for p in check_workflow_yaml.check_workflow(kept_off) if "shared build cache" in p], [])
+
+    def test_integration_llms_signs_its_test_binary_in_a_job_that_builds_nothing(self):
+        # Its build job compiles `ref`, which trunk_tests can set to a release branch's commit.
+        workflow = Path(__file__).resolve().parents[1] / "workflows" / "integration_llms.yml"
+        jobs = yaml.safe_load(workflow.read_text())["jobs"]
+        self.assertEqual(jobs["build"]["permissions"], {"contents": "read"})
+        attest = jobs["attest"]
+        self.assertEqual(attest["needs"], "build")
+        self.assertEqual(attest["permissions"]["id-token"], "write")
+        self.assertEqual(
+            [str(step.get("uses", "")).split("@")[0] for step in attest["steps"]],
+            ["actions/download-artifact", "actions/attest-build-provenance"],
+        )
+        self.assertFalse(any("run" in step for step in attest["steps"]))
+        self.assertIn("attest", jobs["test"]["needs"])
+        for name, job in jobs.items():
+            with self.subTest(job=name):
+                if name != "attest" and "steps" in job:
+                    self.assertNotIn("id-token", job.get("permissions") or {})
+
 
 class CheckCiRoleCallsTest(unittest.TestCase):
     REUSABLE = yaml.safe_load(REUSABLE_CI_ROLE.replace("{steps}", CHOOSE + ASSUME.format(role=CHOSEN)))

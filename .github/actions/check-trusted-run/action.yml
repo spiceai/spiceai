@@ -37,6 +37,13 @@ inputs:
   token:
     description: Token that can read this repository's Actions runs, tags and contents.
     required: true
+  for-ref:
+    description: >-
+      The ref of the run that will run the build (`github.ref`). On refs/heads/trunk the build must
+      also be of a commit on trunk: a trunk run's credentials write trunk's keys, so it runs only
+      trunk's builds, and another branch's build runs in a run of that branch. Empty adds no rule.
+    required: false
+    default: ''
 
 outputs:
   workflow:
@@ -55,6 +62,7 @@ runs:
       env:
         GH_TOKEN: ${{ inputs.token }}
         RUN_ID: ${{ inputs.run-id }}
+        FOR_REF: ${{ inputs.for-ref }}
       run: |
         set -euo pipefail
         [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::run_id must be a numeric run ID, got '$RUN_ID'"; exit 1; }
@@ -160,6 +168,10 @@ runs:
           head_branch="$head_branch (on $trusted)"
         else
           refuse "was built from $head_branch, not trunk, a release branch or a release tag"
+        fi
+        if [ "$FOR_REF" = refs/heads/trunk ]; then
+          fetch_branches
+          on_branch trunk || refuse "built $head_sha, which is not on trunk. A trunk run runs only trunk's builds; run this workflow on the branch that built it."
         fi
 
         echo "Run $RUN_ID is a $workflow $event run of $GITHUB_REPOSITORY @ $head_branch"

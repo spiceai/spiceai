@@ -10,10 +10,12 @@ on:
         type: string
       # Benchmarks another release's spiced with this ref's testoperator and spec files. A release
       # tag installs the spiced_linux_x86_64.tar.gz that release published; a branch or other ref
-      # uses the newest commit within ten of it that has a MinIO build. No result or explain-plan
-      # snapshot is compared or written back, since those record this ref's answers and plans.
+      # uses the newest commit within ten of it that has a MinIO build. A branch other than trunk
+      # must be the one this run is on: its build runs only with that branch's credentials. No
+      # result or explain-plan snapshot is compared or written back, since those record this ref's
+      # answers and plans.
       spiced_ref:
-        description: 'Branch or tag whose spiced to benchmark, e.g. v2.1.0 or release/2.4; empty = trunk. A release tag uses that release''s published binary. Ignored when spiced_commit is set'
+        description: 'Tag or branch whose spiced to benchmark, e.g. v2.1.0; empty = trunk. A release tag uses that release''s published binary. A branch other than trunk must be the one this run is on. Ignored when spiced_commit is set'
         required: false
         type: string
         default: ''

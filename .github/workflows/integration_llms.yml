@@ -154,10 +154,11 @@ jobs:
     name: Build Test Binary
     runs-on: spiceai-macos
     environment: ci
+    # No OIDC token: this job compiles `ref`, which trunk_tests can set to a release branch's
+    # commit, so the code it builds gets neither store credentials nor a signing identity. The
+    # `attest` job signs its output.
     permissions:
       contents: read
-      id-token: write  # signs the test binary's attestation
-      attestations: write  # which the full-role test job verifies before running it
     # Slowest observed success in the 2026-07-25..08-08 window: 17 min, but
     # every sample had a warm sccache. Sized against the other macOS workspace
     # builds (pr.yml peaks at 117 min) so a cold cache cannot turn a passing
@@ -203,18 +204,6 @@ jobs:
           instance-id: ci-${{ github.run_id }}-${{ github.job }}
           machine: ${{ runner.name }}
 
-      - name: Choose the CI store prefix
-        uses: $/.github/actions/ci-store-prefix
-
-      # On trunk the test binary carries this workflow's attestation, which the full-role test job
-      # verifies before running it.
-      - name: Attest the test binary
-        # Only a build of the run's own commit: trunk_tests can pass a release branch's `ref`.
-        if: env.CI_STORE_PREFIX == '' && (inputs.ref == '' || inputs.ref == github.sha)
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: ./llms_integration_test
-
       - name: Upload test binary to spiceio
         if: env.HAS_SPICEIO_SECRET == 'true' && github.ref != 'refs/heads/trunk'
         env:
@@ -238,9 +227,38 @@ jobs:
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
+  # On trunk the test binary carries this workflow's attestation, which the full-role test job
+  # verifies before running it. A job of its own that runs no build code holds the OIDC token that
+  # signs it, so nothing the build job compiles can sign one.
+  attest:
+    name: Attest Test Binary
+    needs: build
+    # Only a build of the run's own commit on trunk: trunk_tests can pass a release branch's `ref`.
+    if: github.ref == 'refs/heads/trunk' && (inputs.ref == '' || inputs.ref == github.sha)
+    runs-on: ubuntu-24.04
+    environment: secret-free
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write  # signs the test binary's attestation
+      attestations: write  # which the full-role test job verifies before running it
+    steps:
+      - name: Download the test binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: llms-integration-test-binary
+          path: ./integration_test
+
+      - name: Attest the test binary
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ./integration_test/llms_integration_test
+
   test:
     # Assumes a CI AWS role, so it runs from integration_llms_aws.yml; see that file.
-    needs: [build, setup-matrix]
+    needs: [build, attest, setup-matrix]
+    # `attest` runs only on trunk; elsewhere it is skipped and the test job still runs.
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.setup-matrix.result == 'success' && (needs.attest.result == 'success' || needs.attest.result == 'skipped') }}
     permissions:
       contents: read
       actions: read

@@ -400,21 +400,34 @@ SHARED_BUILD_CACHES = ("$/.github/actions/setup-sccache", "spiceai/spiceio/.gith
 OFF_TRUNK = re.compile(r"github\.ref\s*!=\s*'refs/heads/trunk'")
 
 
+def _steps(job: object) -> list[dict]:
+    return [s for s in (job.get("steps") or []) if isinstance(s, dict)] if isinstance(job, dict) else []
+
+
 def check_attested_builds(jobs: dict) -> list[str]:
-    """Report a job that attests its output and sets up a shared build cache on trunk."""
-    problems = []
+    """Report a build whose output is attested and that sets up a shared build cache on trunk.
+
+    An attested build is a job that attests its own output, or a job that an attesting job
+    `needs`: an attest job of its own signs what the build job it waits on built.
+    """
+    attested: dict[str, str] = {}
     for name, job in jobs.items():
-        steps = [s for s in (job.get("steps") or []) if isinstance(s, dict)] if isinstance(job, dict) else []
-        if not any("actions/attest-build-provenance" in str(s.get("uses", "")) for s in steps):
+        if not any("actions/attest-build-provenance" in str(s.get("uses", "")) for s in _steps(job)):
             continue
-        for position, step in enumerate(steps, start=1):
+        attested.setdefault(name, f"job `{name}` attests its output")
+        needs = job.get("needs") or []
+        for need in [needs] if isinstance(needs, str) else needs:
+            attested.setdefault(str(need), f"job `{need}`'s output is attested by job `{name}`")
+    problems = []
+    for name, why in attested.items():
+        for position, step in enumerate(_steps(jobs.get(name)), start=1):
             uses = str(step.get("uses", ""))
             if uses.startswith(SHARED_BUILD_CACHES) and not OFF_TRUNK.search(str(step.get("if", ""))):
                 label = step.get("name") or f"step {position}"
                 problems.append(
-                    f"job `{name}` attests its output, but step `{label}` sets up a shared build cache "
-                    "without `github.ref != 'refs/heads/trunk'` in its `if:`; other refs can write that "
-                    "cache, so trunk's attested build must not read it"
+                    f"{why}, but step `{label}` of `{name}` sets up a shared build cache without "
+                    "`github.ref != 'refs/heads/trunk'` in its `if:`; other refs can write that cache, "
+                    "so trunk's attested build must not read it"
                 )
     return problems
 

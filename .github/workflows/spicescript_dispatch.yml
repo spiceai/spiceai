@@ -3,6 +3,8 @@ name: spicescript dispatch
 
 # Runs this ref's spicescript and scripts against another run's Linux spiced, such as a
 # release branch's build_and_release. Scripts for features that build predates fail; triage by hand.
+# A run on trunk takes only a build of a trunk commit, so a release branch's build is tested from
+# a run on that branch.
 
 run-name: spicescript dispatch - spiced from run ${{ inputs.run_id }}
 
@@ -48,6 +50,7 @@ jobs:
         with:
           run-id: ${{ inputs.run_id }}
           token: ${{ secrets.GITHUB_TOKEN }}
+          for-ref: ${{ github.ref }}
 
       - name: Find the build's artifacts
         id: find

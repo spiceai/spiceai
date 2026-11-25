@@ -29,7 +29,9 @@ name: Trunk tests
 # merge_group run of trunk or a release branch, with the scripts of the commit
 # that run built (`gh workflow run trunk_tests.yml -f run_id=<run>`). A pull
 # request's run is refused: its author built that spiced and wrote those
-# scripts, and these jobs have id-token: write on the self-hosted runners.
+# scripts, and these jobs have id-token: write on the self-hosted runners. A
+# run on trunk takes only a build of a trunk commit; a release branch's build
+# is tested in a run on that branch (`--ref <branch>`).
 
 on:
   schedule:
@@ -82,6 +84,7 @@ jobs:
         with:
           run-id: ${{ inputs.run_id }}
           token: ${{ secrets.GITHUB_TOKEN }}
+          for-ref: ${{ github.ref }}
 
       - name: Find the build
         id: build
@@ -98,6 +101,9 @@ jobs:
             # check-trusted-run accepts builds from: these jobs hold credentials,
             # and an arbitrary release/* branch may not be protected.
             [[ "$BRANCH" =~ ^release/[0-9]+\.[0-9]+(\.[0-9]+)?(-rc\.?[0-9]+)?$ ]] || { echo "::error::branch must be a versioned release branch (release/X.Y), not '$BRANCH'"; exit 1; }
+            # A branch's code and build run only in a run of that branch, whose credentials write
+            # only that branch's keys.
+            [ "$GITHUB_REF" = "refs/heads/$BRANCH" ] || { echo "::error::A run on $GITHUB_REF tests only its own branch's builds. Run it on $BRANCH: gh workflow run trunk_tests.yml --ref $BRANCH -f branch=$BRANCH"; exit 1; }
           fi
           holds_build() {
             gh api "repos/$GITHUB_REPOSITORY/actions/runs/$1/artifacts" \
@@ -109,9 +115,9 @@ jobs:
             run="$RUN_ID"
             sha=$(gh run view "$RUN_ID" -R "$GITHUB_REPOSITORY" --json headSha -q .headSha)
           else
-            # Trunk, or a release branch named by `branch`, whatever ref a
-            # dispatch ran from: these jobs hold credentials, and other code
-            # gets them only through a trusted run_id. A
+            # Trunk, or the release branch named by `branch` that this run is
+            # on: these jobs hold credentials, and other code gets them only
+            # through a trusted run_id, which on trunk must be a build of trunk. A
             # scheduled run tests the commit it started at, its own head_sha,
             # so that the next run's commit range starts at the commit this run
             # actually tested; a dispatch tests trunk HEAD. The merge-queue run
@@ -151,6 +157,7 @@ jobs:
         with:
           run-id: ${{ steps.build.outputs.run }}
           token: ${{ secrets.GITHUB_TOKEN }}
+          for-ref: ${{ github.ref }}
 
       - name: Record the commit range
         env:

@@ -8,7 +8,8 @@ description: 'composite action'
 # are read at trunk's keys from any ref, and every one of them runs only once build_release.yml's
 # trunk attestation of it, for that commit, verifies. Any ref may write those keys until the store
 # limits them to trunk, so the attestation is what makes such a read safe. Another ref's build
-# has no attestation; a job with the full CI roles (`verify`) never runs one.
+# has no attestation, and runs only in a run of that same ref, whose store credentials write only
+# that ref's keys; a job with the full CI roles (`verify`) never runs one.
 #
 # Requires the MinIO CLI to be installed and configured to use this action
 inputs:
@@ -16,7 +17,7 @@ inputs:
     description: 'spiced build commit'
     required: false
   ref: # optionally override the branch to fetch latest 10 commits from
-    description: 'target ref'
+    description: 'target ref: trunk, or the ref this run is on'
     required: false
     default: 'refs/heads/trunk'
   verify: # `steps.ci-role.outputs.full` in a job with a CI AWS role
@@ -62,7 +63,9 @@ runs:
 
     # Which ref built the spiced to read, and so where it is stored: trunk for the latest build of
     # trunk and for a `spiced_commit` on trunk; otherwise `ref`, or this run's own ref when `ref`
-    # is trunk. Outputs `prefix` (empty for trunk) and `trunk`.
+    # is trunk. That ref must be trunk or this run's own: a ref's build runs only in a run of that
+    # ref, whose credentials write only that ref's keys. Outputs `prefix` (empty for trunk) and
+    # `trunk`.
     - name: Locate spiced's build
       id: locate
       shell: bash
@@ -100,8 +103,10 @@ runs:
           GIT_NO_LAZY_FETCH=1 git --git-dir "$git_dir" merge-base --is-ancestor "$1" refs/remotes/origin/trunk 2>/dev/null
         }
 
-        if [[ "$INPUT_SPICED_COMMIT" == *$'\n'* || "$INPUT_SPICED_COMMIT" == *$'\r'* ]]; then
-          echo "::error::setup-spiced: spiced_commit must not contain a newline"
+        # Builds are stored under the full hash of the commit that built them, and the commit is
+        # part of a store key and of later steps' outputs, so anything else is refused first.
+        if [ -n "$INPUT_SPICED_COMMIT" ] && ! [[ "$INPUT_SPICED_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::error::setup-spiced: spiced_commit must be a full 40-character commit hash."
           exit 1
         fi
         # A bare branch name is that branch (`trunk`, `release/2.4`), as the dispatch inputs
@@ -120,15 +125,23 @@ runs:
         fi
         if [ -z "$INPUT_SPICED_COMMIT" ]; then
           source_ref="$REF"
-        elif [[ "$INPUT_SPICED_COMMIT" =~ ^[0-9a-f]{40}$ ]] && on_trunk "$INPUT_SPICED_COMMIT"; then
+        elif on_trunk "$INPUT_SPICED_COMMIT"; then
           source_ref=refs/heads/trunk
         elif [ "$REF" != refs/heads/trunk ]; then
           source_ref="$REF"
-        else
+        elif [ "$GITHUB_REF" != refs/heads/trunk ]; then
           source_ref="$GITHUB_REF"
+        else
+          # Trunk's keys hold no build of a commit trunk lacks.
+          echo "::error::This run, on refs/heads/trunk, runs only a spiced that trunk or this run's own ref built, and $INPUT_SPICED_COMMIT is not on trunk. Run the workflow on the ref that built it."
+          exit 1
         fi
         if ! plain_ref "$source_ref"; then
           echo "::error::setup-spiced: '$source_ref' is not a plain ref."
+          exit 1
+        fi
+        if [ "$source_ref" != refs/heads/trunk ] && [ "$source_ref" != "$GITHUB_REF" ]; then
+          echo "::error::This run, on $GITHUB_REF, runs only a spiced that trunk or this run's own ref built, and $source_ref built this one. Run the workflow on that ref instead: its build runs only with that ref's own credentials."
           exit 1
         fi
         case "$source_ref" in

@@ -43,6 +43,8 @@ on:
       - '.github/scripts/test_setup_nextest.py'
       - '.github/scripts/test_setup_libduckdb.py'
       - '.github/scripts/test_setup_spiced.py'
+      - '.github/scripts/test_check_trusted_run.py'
+      - '.github/scripts/test_testoperator_dispatch.py'
       - 'scripts/libduckdb.py'
       - 'scripts/test_libduckdb.py'
       - 'test/duckdb_versions.json'
@@ -86,6 +88,8 @@ on:
       - '.github/scripts/test_setup_nextest.py'
       - '.github/scripts/test_setup_libduckdb.py'
       - '.github/scripts/test_setup_spiced.py'
+      - '.github/scripts/test_check_trusted_run.py'
+      - '.github/scripts/test_testoperator_dispatch.py'
       - 'scripts/libduckdb.py'
       - 'scripts/test_libduckdb.py'
       - 'test/duckdb_versions.json'
@@ -150,6 +154,8 @@ jobs:
           python .github/scripts/test_setup_nextest.py -v
           python .github/scripts/test_setup_libduckdb.py -v
           python .github/scripts/test_setup_spiced.py -v
+          python .github/scripts/test_check_trusted_run.py -v
+          python .github/scripts/test_testoperator_dispatch.py -v
           python scripts/test_libduckdb.py -v
 
       - name: Validate GitHub Actions definitions

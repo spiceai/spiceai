@@ -112,7 +112,7 @@ jobs:
           INPUT_RUN_ALL_TESTS: ${{ github.event.inputs.run_all_tests }}
         run: |
           FEATURES="flightsql,models,metal,s3_vectors,kafka"
-          if [[ "${INPUT_RUN_ALL_TESTS}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
+          if [[ "${INPUT_RUN_ALL_TESTS}" == "true" ]] || [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
             FEATURES="${FEATURES},bedrock,extended_tests"
             echo "Including extended_tests"
           else
@@ -682,7 +682,7 @@ jobs:
           INPUT_RUN_ALL_TESTS: ${{ github.event.inputs.run_all_tests }}
         run: |
           FEATURES="flightsql,models,s3_vectors,kafka"
-          if [[ "${INPUT_RUN_ALL_TESTS}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
+          if [[ "${INPUT_RUN_ALL_TESTS}" == "true" ]] || [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
             FEATURES="${FEATURES},bedrock,extended_tests"
             echo "Including extended_tests"
           else
