@@ -66,6 +66,7 @@ fn valid_repetitions_parse() {
         "root ::= \"x\"{3}\n",
         "root ::= \"x\"{2,}\n",
         "# a comment first\nroot ::= \"x\"{0,5000}\n",
+        "root ::= <[42]>\n",
     ] {
         check_grammar(grammar).unwrap_or_else(|e| panic!("{grammar}: {e}"));
     }
@@ -73,7 +74,7 @@ fn valid_repetitions_parse() {
 
 #[test]
 fn malformed_grammars_fail() {
-    for grammar in ["", "root ::= missing\n", "root ::= \"x\"{,}\n", "root ::= <[42]>\n"] {
+    for grammar in ["", "root ::= missing\n", "root ::= \"x\"{,}\n", "root ::= <think>\n"] {
         check_grammar(grammar).expect_err(grammar);
     }
 }

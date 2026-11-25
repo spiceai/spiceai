@@ -147,8 +147,8 @@ pub fn json_schema_to_grammar(schema: &str) -> Result<String> {
     })
 }
 
-/// Checks that llama.cpp parses the GBNF `grammar` without a vocabulary, so a grammar with
-/// token references (`<[id]>`, `<token>`) fails. A repetition whose maximum is below its
+/// Checks that llama.cpp parses the GBNF `grammar` without a vocabulary, so a grammar that
+/// names a token by its text (`<think>`) fails; one by its id (`<[42]>`) parses. A repetition whose maximum is below its
 /// minimum (`"x"{3,1}`) fails rather than parsing without end.
 pub fn check_grammar(grammar: &str) -> Result<()> {
     let c_grammar = std::ffi::CString::new(grammar).context(GrammarNulSnafu)?;
