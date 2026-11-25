@@ -74,6 +74,7 @@ pub mod sealed_secrets;
 pub mod secret_cache;
 pub mod service_log;
 pub mod session;
+pub mod state_dir;
 
 mod client;
 mod fingerprint;

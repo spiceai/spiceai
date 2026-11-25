@@ -1817,6 +1817,12 @@ impl AcceleratedTable {
     /// Returns [`Error::InvalidRefreshOverrides`] describing the first problem found.
     pub async fn validate_refresh_overrides(&self, overrides: &RefreshOverrides) -> Result<()> {
         let refresh = self.refresh_params.read().await.clone();
+        let has_primary_key = self.accelerator.constraints().is_some_and(|constraints| {
+            !get_primary_keys_from_constraints(constraints, &self.accelerator.schema()).is_empty()
+        });
+        overrides
+            .validate_append_keys(&refresh, has_primary_key)
+            .context(InvalidRefreshOverridesSnafu)?;
         overrides
             .validate_for(&self.dataset_name, &refresh, self.federated.schema())
             .context(InvalidRefreshOverridesSnafu)
@@ -2340,6 +2346,23 @@ impl AcceleratedTable {
                 })?;
                 // Neither reads the accelerator before the origin answers, so the
                 // scan is planned only if a failing fetch needs it.
+                // Apply row limits above the entry restriction so unrelated
+                // candidate entries cannot hide matching rows.
+                let federated_provider = self.federated.table_provider().await;
+                let restriction = Arc::new(caching::RequestEntryRestriction::for_lookup(
+                    filters,
+                    federated_provider.as_ref(),
+                ));
+                let mut cache_scan_filters = scan_filters.to_vec();
+                if let Some(filter) = restriction.scan_filter(&self.accelerator.schema()) {
+                    cache_scan_filters.push(filter);
+                }
+                let scan_filters = cache_scan_filters.as_slice();
+                let cache_scan_limit = if restriction.is_active(&self.accelerator.schema()) {
+                    None
+                } else {
+                    limit
+                };
                 let input = if caching::uses_source_first(
                     filters,
                     self.cache_ttl,
@@ -2363,7 +2386,7 @@ impl AcceleratedTable {
                             state,
                             scan_projection,
                             scan_filters,
-                            limit,
+                            cache_scan_limit,
                         ),
                         filters_to_reapply,
                         schema,
@@ -2374,7 +2397,7 @@ impl AcceleratedTable {
                     batch_write_tx = batch_write_tx.observe_cache_scan();
                     let input = self
                         .accelerator
-                        .scan(state, scan_projection, scan_filters, limit)
+                        .scan(state, scan_projection, scan_filters, cache_scan_limit)
                         .await?;
                     caching::CachingScanInput::Planned(wrap_with_filter(
                         input,
@@ -2383,7 +2406,6 @@ impl AcceleratedTable {
                     )?)
                 };
 
-                let federated_provider = self.federated.table_provider().await;
                 Arc::new(caching::CachingAccelerationScanExec::new(
                     input,
                     self.cache_ttl,
@@ -2393,6 +2415,7 @@ impl AcceleratedTable {
                     Arc::clone(&self.accelerator),
                     self.dataset_name.to_string(),
                     self.io_runtime.clone(),
+                    restriction,
                     filters.to_vec(),
                     projection.cloned(),
                     limit,
@@ -2948,6 +2971,7 @@ fn extend_projection_for_caching(
     for col in [
         caching::CACHE_REFRESHED_AT_COLUMN,
         caching::CACHE_NAMESPACE_COLUMN,
+        caching::CACHE_REQUEST_COLUMN,
     ] {
         let Ok(idx) = schema.index_of(col) else {
             continue;

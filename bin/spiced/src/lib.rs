@@ -26,7 +26,6 @@ compile_error!(
 
 use std::collections::HashMap;
 use std::env;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,11 +33,10 @@ use std::time::Duration;
 use tokio::sync::SetOnce;
 
 use app::spicepod::component::runtime::{
-    ClientAuthMode as SpicepodClientAuthMode, OtelExporterConfig, OtelSignal,
-    Runtime as SpicepodRuntime, TelemetryConfig, validate_metric_prefix,
+    OtelExporterConfig, OtelSignal, Runtime as SpicepodRuntime, TelemetryConfig,
+    validate_metric_prefix,
 };
 use app::{App, AppBuilder};
-use clap::{ArgAction, Parser, ValueEnum};
 // Force-linkage for connectors that self-register via `register_data_connector!` (the linkme
 // distributed slice). A crate contributes its slice entry only when it is actually linked, and a
 // plain Cargo dependency is not enough -- the linker drops the unreferenced static -- so every
@@ -121,9 +119,7 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
 use otel_arrow::OtelArrowExporter;
 use podswatcher::PodsWatcher;
-use repl::ReplConfig;
 use runtime::cluster::ResolvedClusterConfig;
-use runtime::config::Config as RuntimeConfig;
 use runtime::config::{ClusterRole, Role};
 use runtime::datafusion::DataFusion;
 use runtime::spice_metrics;
@@ -146,7 +142,8 @@ const TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE: &str = "Usage telemetry is ano
 
 mod cloud_connect;
 pub use cloud_connect::{
-    BootstrapEnrollmentError, bootstrap_enrollment as cloud_connect_bootstrap,
+    BootstrapEnrollmentError, StateDirectoryError, bootstrap_enrollment as cloud_connect_bootstrap,
+    prepare_state_directory as cloud_connect_prepare_state,
 };
 mod connection_report;
 pub mod crash_handler;
@@ -154,6 +151,7 @@ mod log_capture;
 pub mod open_file_limit;
 mod runtime_lock;
 pub use runtime_lock::{InstanceClaim, claim_instance_directory};
+pub use spiced_args::{Args, ClientAuthMode, EnrollmentKeyArg, try_parse_from as try_parse_args};
 #[path = "tracing.rs"]
 mod spiced_tracing;
 pub use spiced_tracing::otel_logs;
@@ -259,250 +257,6 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Clap mirror of [`SpicepodClientAuthMode`]. Defined here so we can
-/// derive `ValueEnum` for the `--tls-client-auth-mode` CLI flag
-/// without pulling clap into the `spicepod` crate. The two enums
-/// are trivially convertible via [`ClientAuthMode::into_spicepod`]
-/// and [`ClientAuthMode::from_spicepod`].
-#[derive(ValueEnum, Debug, Copy, Clone, PartialEq, Eq, Default)]
-#[clap(rename_all = "snake_case")]
-pub enum ClientAuthMode {
-    /// No client-cert authentication. The server runs
-    /// `with_no_client_auth()` at the rustls layer and never sends a
-    /// `CertificateRequest`. This is the out-of-the-box default.
-    #[default]
-    None,
-    /// Request but do not require a client cert. The server sends a
-    /// `CertificateRequest`; presented certs must be signed by the
-    /// configured client CA, but no-cert handshakes are admitted.
-    /// Useful for migration windows and audit-only deployments.
-    Request,
-    /// Require every connection to present a valid X.509 client cert
-    /// signed by the configured client CA.
-    Required,
-}
-
-impl ClientAuthMode {
-    #[must_use]
-    pub fn into_spicepod(self) -> SpicepodClientAuthMode {
-        match self {
-            ClientAuthMode::None => SpicepodClientAuthMode::None,
-            ClientAuthMode::Request => SpicepodClientAuthMode::Request,
-            ClientAuthMode::Required => SpicepodClientAuthMode::Required,
-        }
-    }
-
-    #[must_use]
-    pub fn from_spicepod(value: SpicepodClientAuthMode) -> Self {
-        match value {
-            SpicepodClientAuthMode::None => ClientAuthMode::None,
-            SpicepodClientAuthMode::Request => ClientAuthMode::Request,
-            SpicepodClientAuthMode::Required => ClientAuthMode::Required,
-        }
-    }
-}
-
-#[derive(Parser, Debug)]
-#[clap(about = "Spice.ai OSS Runtime")]
-#[clap(rename_all = "kebab-case")]
-#[expect(clippy::struct_excessive_bools)]
-pub struct Args {
-    /// Enable Prometheus metrics. (disabled by default)
-    #[arg(long, value_name = "BIND_ADDRESS", help_heading = "Metrics")]
-    pub metrics: Option<SocketAddr>,
-
-    /// Deprecated OpenTelemetry bind address (no effect).
-    #[arg(
-        long = "open_telemetry",
-        value_name = "OPEN_TELEMETRY_BIND_ADDRESS",
-        default_value = "127.0.0.1:50052",
-        action
-    )]
-    pub open_telemetry_bind_address: SocketAddr,
-
-    /// Print the version and exit.
-    #[arg(long)]
-    pub version: bool,
-
-    /// All runtime related arguments
-    #[clap(flatten)]
-    pub runtime: RuntimeConfig,
-
-    /// Starts a SQL REPL to interactively query against the runtime's Flight endpoint.
-    #[arg(long, help_heading = "SQL REPL")]
-    pub repl: bool,
-
-    #[clap(flatten)]
-    pub repl_config: ReplConfig,
-
-    /// Enable TLS for the runtime.
-    #[arg(long, default_value_t = false, action = ArgAction::Set)]
-    pub tls_enabled: bool,
-
-    /// The TLS PEM-encoded certificate.
-    #[arg(long, value_name = "-----BEGIN CERTIFICATE-----...")]
-    pub tls_certificate: Option<String>,
-
-    /// Path to the TLS PEM-encoded certificate file.
-    #[arg(long, value_name = "cert.pem")]
-    pub tls_certificate_file: Option<String>,
-
-    /// The TLS PEM-encoded private key.
-    #[arg(long, value_name = "-----BEGIN PRIVATE KEY-----...")]
-    pub tls_key: Option<String>,
-
-    /// Path to the TLS PEM-encoded private key file.
-    #[arg(long, value_name = "key.pem")]
-    pub tls_key_file: Option<String>,
-
-    /// Path to a PEM-encoded CA bundle used to verify client certificates
-    /// when `--tls-client-auth-mode request` or `required` (or the
-    /// equivalent spicepod `runtime.tls.client_auth_mode`) is set.
-    /// Eligible for hot-reload via the same watcher that picks up
-    /// server cert / key rotations.
-    #[arg(long, value_name = "client-ca.pem")]
-    pub tls_client_auth_ca_file: Option<String>,
-
-    /// Inline PEM-encoded CA bundle used to verify client certificates.
-    /// Mutually exclusive with `--tls-client-auth-ca-file`. Inline material
-    /// is not hot-reloaded.
-    #[arg(long, value_name = "-----BEGIN CERTIFICATE-----...")]
-    pub tls_client_auth_ca: Option<String>,
-
-    /// How the runtime treats client certificates on the public TLS
-    /// endpoints. `none` disables client-cert authentication (default).
-    /// `request` sends `CertificateRequest` but accepts no-cert
-    /// handshakes; presented certs must be signed by the client CA.
-    /// `required` enables strict mTLS — the server demands a valid
-    /// cert signed by `--tls-client-auth-ca` / `--tls-client-auth-ca-file`.
-    #[arg(long, value_enum)]
-    pub tls_client_auth_mode: Option<ClientAuthMode>,
-
-    /// Enable anonymous telemetry collection. In Open Source builds that include anonymous telemetry,
-    /// `false` is ignored; build without the `anonymous_telemetry` feature to remove anonymous usage telemetry.
-    #[arg(long)]
-    pub telemetry_enabled: Option<bool>,
-
-    /// Enable pods watcher (disabled by default).
-    #[arg(long, default_value_t = false, action = ArgAction::SetTrue)]
-    pub pods_watcher_enabled: bool,
-
-    /// One-time Spice Cloud enrollment key (`spice-enroll-…`) for Cloud
-    /// Connect. When set, spiced enrolls this instance with Spice Cloud
-    /// BEFORE the runtime is built or any listener binds — the process
-    /// stays unready until the enrolled identity is durable on disk — then
-    /// discards the key and starts normally. If a valid identity already
-    /// exists in this instance's `.spice` directory, it wins and the key is
-    /// NOT redeemed. Without this flag, an existing identity alone
-    /// reconnects the instance; a `spiced` with no identity never connects
-    /// to the cloud. The value is visible to same-host process listings for
-    /// the full lifetime of the enrollment process (the operating system retains
-    /// its original argv even after this field is dropped); it is single-use,
-    /// short-lived, and never written by spiced to any file. Container and
-    /// pod deployments should be recreated without this flag immediately
-    /// after the runtime becomes ready.
-    #[arg(
-        long,
-        value_name = "ENROLLMENT_KEY",
-        conflicts_with = "repl",
-        help_heading = "Spice Cloud Connect"
-    )]
-    pub token: Option<EnrollmentKeyArg>,
-
-    /// Optional host-location label recorded on the instance at enrollment
-    /// (for example `us-west-2` or `on-prem-syd`): 2-64 lowercase letters,
-    /// digits, or hyphens. Only meaningful with `--token`; omitting it
-    /// leaves any previously recorded region unchanged.
-    #[arg(
-        long,
-        value_name = "REGION",
-        requires = "token",
-        help_heading = "Spice Cloud Connect"
-    )]
-    pub region: Option<String>,
-
-    #[arg(short, long, action = ArgAction::Count)]
-    pub verbose: u8,
-
-    /// Enable very verbose logging. In conjunction with `verbose` can be set via -vv or --very-verbose.
-    #[arg(long)]
-    pub very_verbose: bool,
-
-    /// Path to the Spicepod directory or file. Supports local paths and remote URLs (i.e. `s3://my_bucket/spicepod.yaml`)
-    ///
-    /// When specified, the behavior to automatically reload changes to the Spicepod is disabled.
-    #[arg(value_name = "PATH")]
-    pub spicepod: Option<PathBuf>,
-
-    /// Overrides for the runtime configuration (--set-runtime key1.subkey=value1)
-    #[arg(long, action = ArgAction::Append, value_parser = parse_set_string)]
-    pub set_runtime: Vec<(String, String)>,
-
-    /// How many CPUs the runtime should behave as though it has, as a
-    /// Kubernetes CPU quantity (`4`, `3.5`, `3500m`). `auto` (the default)
-    /// detects it from the cgroup CPU limit, a bounded multiple of the pod's
-    /// `requests.cpu`, or the host. `all` uses every available core regardless
-    /// of the request, still respecting a CPU limit. Takes precedence over
-    /// `SPICE_CPU_CORES` and `runtime.cpu.cores`.
-    #[arg(long, value_name = "CORES")]
-    pub cpu_cores: Option<String>,
-
-    /// Write the console log to bounded, rotating files in this directory
-    /// instead of relying on the supervisor to store it.
-    ///
-    /// Set by `spice cloud service install` on a supervisor that owns no log
-    /// store of its own — launchd writes whatever a job prints to the files its
-    /// definition names and never bounds them, so the runtime bounds its own
-    /// output instead. The policy is fixed
-    /// (`runtime_cloud_connect::service_log`) because `spice cloud service
-    /// logs` reads these files back against the same constants.
-    ///
-    /// Hidden: this is the service installer's interface to the runtime, not an
-    /// operator's. `spice cloud logs` is how the files are read.
-    #[arg(long, value_name = "PATH", hide = true)]
-    pub service_log_dir: Option<PathBuf>,
-
-    #[arg(skip)]
-    pub open_telemetry_deprecated: bool,
-
-    /// What raising the open file limit at startup did, set by `main`.
-    #[arg(skip)]
-    pub open_file_limit: Option<open_file_limit::OpenFileLimit>,
-}
-
-/// The raw `--token` argument: an unvalidated enrollment-key candidate.
-///
-/// Deliberately accepts any string at parse time (`FromStr` is infallible)
-/// so clap never rejects — and therefore never **echoes** — a malformed
-/// secret in its own error output. Validation happens in the Cloud Connect
-/// bootstrap through the canonical `spice-enroll-` parser, whose errors
-/// never reproduce the value. `Debug` is redacted so the key cannot leak
-/// through argument logging, error chains, traces, or panic reports.
-#[derive(Clone)]
-pub struct EnrollmentKeyArg(zeroize::Zeroizing<String>);
-
-impl EnrollmentKeyArg {
-    /// The raw candidate value, handed only to the canonical parser.
-    #[must_use]
-    pub fn expose_secret(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::str::FromStr for EnrollmentKeyArg {
-    type Err = std::convert::Infallible;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        Ok(Self(zeroize::Zeroizing::new(raw.to_string())))
-    }
-}
-
-impl std::fmt::Debug for EnrollmentKeyArg {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "EnrollmentKeyArg([REDACTED])")
-    }
-}
-
 /// Spawn a tokio task that listens for `SIGHUP` and asks the
 /// process-wide [`runtime_tls::TlsControl`] to reload every TLS
 /// material the runtime is watching. Mirrors the `nginx -s reload` /
@@ -595,8 +349,8 @@ fn spawn_cpu_share_drift_task() {
 /// same way a local spicepod's does.
 pub struct AppBundle {
     pub app: Option<Arc<App>>,
-    /// Why the local `spicepod.yaml` did not load, in pods-watcher mode where
-    /// that is not fatal.
+    /// Why the local `spicepod.yaml` did not load, in pods-watcher mode on an
+    /// instance with a Cloud Connect identity, where that is not fatal.
     spicepod_load_error: Option<app::Error>,
     /// The spicepod the app was loaded from, when it came from the cloud-managed
     /// file. `None` means the runtime is serving something a deployment did not
@@ -673,7 +427,13 @@ fn declare_vortex_parallelism() {
     }
 }
 
-pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
+/// Run the runtime. `open_file_limit` is what raising the open file limit at
+/// startup did, logged once the runtime's subscriber is installed.
+pub async fn run(
+    args: Args,
+    app_bundle: AppBundle,
+    open_file_limit: Option<open_file_limit::OpenFileLimit>,
+) -> Result<()> {
     // Register external data connectors before runtime initialization.
     // This makes connectors from extracted crates available to the runtime.
     register_external_connectors().await;
@@ -897,7 +657,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         .await;
     }
 
-    if let Some(open_file_limit) = &args.open_file_limit {
+    if let Some(open_file_limit) = &open_file_limit {
         open_file_limit.log();
     }
 
@@ -1443,6 +1203,68 @@ fn awaiting_deployed_spicepod(cloud_connect_configured: bool, error: &app::Error
     cloud_connect_configured && error.is_spicepod_missing()
 }
 
+/// Waits until the spicepod in `spicepod_path` loads, for a pods-watcher start
+/// whose spicepod did not, and returns it.
+///
+/// The runtime decides its endpoint authentication once, from the spicepod it
+/// starts with, and so does everything that depends on it: which routes need
+/// credentials and how a client certificate is used. A runtime that started
+/// without a spicepod would serve every endpoint without authentication until a
+/// restart, whatever `runtime.auth` the spicepod set once it loaded. So nothing
+/// is bound until the spicepod loads, and the runtime then starts as it does
+/// from a valid one.
+///
+/// The spicepod is loaded again on every change the pods watcher reports, and
+/// once more after the watch begins, so an edit made before then is not missed.
+async fn wait_for_valid_spicepod(spicepod_path: &Path, error: &app::Error) -> Result<App> {
+    tracing::warn!("{}", waiting_for_spicepod_warning(spicepod_path, error));
+    let mut watcher = PodsWatcher::new(spicepod_path);
+    let mut changes = watcher
+        .watch()
+        .await
+        .context(UnableToInitializePodsWatcherSnafu)?;
+    let mut last_error = error.to_string();
+    loop {
+        match AppBuilder::build_from_path(spicepod_path.to_path_buf()).await {
+            Ok(app) => {
+                tracing::info!("{}", spicepod_loaded_message(spicepod_path));
+                return Ok(app);
+            }
+            Err(e) => {
+                let message = e.to_string();
+                if message != last_error {
+                    tracing::warn!("{}", waiting_for_spicepod_warning(spicepod_path, &e));
+                    last_error = message;
+                }
+            }
+        }
+        if changes.recv().await.is_none() {
+            return Err(Error::GenericError {
+                reason: format!(
+                    "Stopped watching '{}' for spicepod changes before a valid spicepod.yaml loaded. Report this bug on GitHub: https://github.com/spiceai/spiceai/issues",
+                    spicepod_path.display()
+                ),
+            });
+        }
+    }
+}
+
+/// The warning a pods-watcher start logs while its spicepod does not load.
+fn waiting_for_spicepod_warning(spicepod_path: &Path, error: &app::Error) -> String {
+    format!(
+        "Failed to load the spicepod in '{}', so the runtime does not start serving until it loads. Fix spicepod.yaml and the runtime starts. Cause: {error}",
+        spicepod_path.display()
+    )
+}
+
+/// The message a pods-watcher start logs when the spicepod it waited for loads.
+fn spicepod_loaded_message(spicepod_path: &Path) -> String {
+    format!(
+        "Loaded the spicepod in '{}'; starting the runtime.",
+        spicepod_path.display()
+    )
+}
+
 /// What `build_app` decided about which spicepod this start serves, logged once
 /// tracing exists.
 enum DeploymentNote {
@@ -1614,7 +1436,14 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
     let local_manifest = local_spicepod_manifest(&spicepod_path);
 
     if let Some(deployed) = cloud_managed_spicepod {
-        match AppBuilder::build_from_path(deployed.path.clone()).await {
+        // Built from the bytes that were read and checked, not by reopening the
+        // path, which could name another file by now.
+        match AppBuilder::build_from_manifest_bytes(
+            deployed.spicepod_yaml.as_bytes().to_vec(),
+            &deployed.path,
+        )
+        .await
+        {
             Ok(mut app) => {
                 app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
                 deployment_note = Some(cloud_managed_deployed_note(
@@ -1664,11 +1493,18 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
             Some(Arc::new(app))
         }
         Err(e) => {
-            // In pods watcher mode, allow runtime to start without a valid spicepod
-            // It will load the spicepod when it becomes available
             if args.pods_watcher_enabled && args.spicepod.is_none() && !cloud_managed_state {
-                spicepod_load_error = Some(e);
-                None
+                if cloud_connect_identity.is_some() {
+                    // Cloud Connect declines the pods watcher, so nothing would
+                    // load this file: the instance starts and waits for a
+                    // deployment instead.
+                    spicepod_load_error = Some(e);
+                    None
+                } else {
+                    let mut app = wait_for_valid_spicepod(&spicepod_path, &e).await?;
+                    app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
+                    Some(Arc::new(app))
+                }
             // `take()` cannot lose a note here: the `Loaded` case returned
             // above, so what is left is either nothing or the rejection this
             // arm folds the local failure into.
@@ -2004,15 +1840,6 @@ fn should_warn_telemetry_disabled_setting_ignored(
     }
 }
 
-fn parse_set_string(s: &str) -> Result<(String, String), String> {
-    let parts: Vec<&str> = s.split('=').collect();
-    if parts.len() != 2 {
-        return Err("Invalid set format. Use key=value".into());
-    }
-
-    Ok((parts[0].to_string(), parts[1].to_string()))
-}
-
 fn apply_overrides(
     runtime_config: SpicepodRuntime,
     overrides: &[(String, String)],
@@ -2114,6 +1941,7 @@ fn apply_override(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser as _;
 
     #[cfg(feature = "anonymous_telemetry")]
     #[test]
@@ -2492,5 +2320,77 @@ mod tests {
 
         // A manifest file path resolves to itself when it exists.
         assert_eq!(local_spicepod_manifest(&manifest), Some(manifest));
+    }
+
+    const SPICEPOD_WITH_API_KEY: &str = "version: v1
+kind: Spicepod
+name: waits-for-spicepod
+runtime:
+  auth:
+    api-key:
+      enabled: true
+      keys: [k1:rw]
+";
+
+    /// A pods-watcher start whose spicepod does not load waits for it, and
+    /// returns it, `runtime.auth` included, once an edit makes it load.
+    #[tokio::test]
+    async fn a_pods_watcher_start_waits_until_its_spicepod_loads() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // Canonical, as the working directory `spiced` watches is: the platform
+        // watcher reports canonical paths, and macOS temp directories are
+        // reached through a symlink.
+        let root = dir.path().canonicalize().expect("canonical temp dir");
+        let manifest = root.join("spicepod.yaml");
+        std::fs::write(&manifest, SPICEPOD_WITH_API_KEY.replace("keys:", "keyz:"))
+            .expect("write a spicepod.yaml with an unknown field");
+        let error = AppBuilder::build_from_path(&root)
+            .await
+            .expect_err("a spicepod with an unknown field does not load");
+
+        let wait = wait_for_valid_spicepod(&root, &error);
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut wait)
+                .await
+                .is_err(),
+            "the wait ended while the spicepod still did not load"
+        );
+
+        std::fs::write(&manifest, SPICEPOD_WITH_API_KEY).expect("write a valid spicepod.yaml");
+        let app = tokio::time::timeout(Duration::from_secs(30), wait)
+            .await
+            .expect("the wait ends once the spicepod loads")
+            .expect("the spicepod loads");
+        assert_eq!(app.name, "waits-for-spicepod");
+        let api_key = app
+            .runtime
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.api_key.as_ref())
+            .expect("the loaded spicepod keeps its `runtime.auth`");
+        assert!(api_key.enabled);
+        assert_eq!(api_key.keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_waiting_messages_name_the_directory_and_what_happens_next() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let error = missing_spicepod_error(dir.path()).await;
+
+        assert_eq!(
+            waiting_for_spicepod_warning(dir.path(), &error),
+            format!(
+                "Failed to load the spicepod in '{}', so the runtime does not start serving until it loads. Fix spicepod.yaml and the runtime starts. Cause: {error}",
+                dir.path().display()
+            )
+        );
+        assert_eq!(
+            spicepod_loaded_message(dir.path()),
+            format!(
+                "Loaded the spicepod in '{}'; starting the runtime.",
+                dir.path().display()
+            )
+        );
     }
 }

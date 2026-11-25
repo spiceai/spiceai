@@ -4,30 +4,56 @@ inputs:
   build-path:
     description: 'Directory containing Spice binaries'
     required: true
+  install-scope:
+    description: |
+      Where to install `spice` and `spiced` (not used on Windows, which always
+      installs into `$HOME\.spice\bin`). `user` (the default) installs into
+      `$HOME/.spice/bin`, the directory `spice install` and `spice upgrade` manage.
+      `job` installs into `spice/bin` under the runner's temporary directory
+      (`RUNNER_TEMP`), which belongs to this job alone. Pass `job` on a self-hosted
+      runner whose instances share a host and a user: two jobs installing into one
+      shared `$HOME/.spice/bin` replace each other's binaries, so a job can start
+      the other job's `spiced`. `spice run` starts the `spiced` beside the `spice`
+      it runs, so the two stay paired in either directory. The action picks the
+      directory itself rather than taking a path, so no caller-supplied string is
+      added to `PATH`.
+    required: false
+    default: 'user'
 
 runs:
   using: 'composite'
   steps:
     - name: Install Spice binaries
+      id: install
       shell: bash
       if: runner.os != 'Windows'
       env:
         INPUT_BUILD_PATH: ${{ inputs.build-path }}
+        INPUT_INSTALL_SCOPE: ${{ inputs.install-scope }}
       run: |
+        case "$INPUT_INSTALL_SCOPE" in
+          user | '') install_dir="$HOME/.spice/bin" ;;
+          job) install_dir="${RUNNER_TEMP:?RUNNER_TEMP is not set}/spice/bin" ;;
+          *)
+            echo "::error::install-spice: install-scope must be 'user' or 'job'"
+            exit 1
+            ;;
+        esac
+        echo "dir=$install_dir" >> "$GITHUB_OUTPUT"
         echo "Installing Spice from local folder: ${INPUT_BUILD_PATH}"
 
         chmod +x "${INPUT_BUILD_PATH}/spice"
         chmod +x "${INPUT_BUILD_PATH}/spiced"
 
-        mkdir -p "$HOME/.spice/bin"
+        mkdir -p "$install_dir"
 
-        mv "${INPUT_BUILD_PATH}/spice" "$HOME/.spice/bin"
-        mv "${INPUT_BUILD_PATH}/spiced" "$HOME/.spice/bin"
+        mv "${INPUT_BUILD_PATH}/spice" "$install_dir"
+        mv "${INPUT_BUILD_PATH}/spiced" "$install_dir"
 
-        echo "$HOME/.spice/bin" >> $GITHUB_PATH
+        echo "$install_dir" >> "$GITHUB_PATH"
 
-        echo "Spice binaries installed successfully into $HOME/.spice/bin."
-        ls -la "$HOME/.spice/bin"
+        echo "Spice binaries installed successfully into $install_dir."
+        ls -la "$install_dir"
 
     - name: Install Spice binaries (Windows)
       shell: pwsh
@@ -61,23 +87,35 @@ runs:
     - name: Verify Spice installation
       shell: bash
       if: runner.os != 'Windows'
+      env:
+        INSTALL_DIR: ${{ steps.install.outputs.dir }}
       run: |
+        install_dir="${INSTALL_DIR:?the install step reported no directory}"
         # Verify binaries exist and are executable
-        if [ ! -x "$HOME/.spice/bin/spice" ]; then
+        if [ ! -x "$install_dir/spice" ]; then
           echo "ERROR: spice binary not found or not executable"
           exit 1
         fi
-        if [ ! -x "$HOME/.spice/bin/spiced" ]; then
+        if [ ! -x "$install_dir/spiced" ]; then
           echo "ERROR: spiced binary not found or not executable"
           exit 1
         fi
+        # Later steps call `spice` and `spiced` by name, so the ones on PATH must be
+        # the ones just installed, not a copy another job left elsewhere on the host.
+        for name in spice spiced; do
+          found="$(command -v "$name" || true)"
+          if [ "$found" != "$install_dir/$name" ]; then
+            echo "ERROR: '$name' on PATH is '${found:-nothing}', not the one installed at '$install_dir/$name'"
+            exit 1
+          fi
+        done
         echo "Spice binaries verified successfully"
         # Test spiced --version directly to debug any issues
         echo "Testing spiced --version:"
-        "$HOME/.spice/bin/spiced" --version 2>&1 || echo "spiced --version failed with exit code $?"
+        "$install_dir/spiced" --version 2>&1 || echo "spiced --version failed with exit code $?"
         # Show spice version (which calls spiced --version internally)
         echo "Testing spice version:"
-        "$HOME/.spice/bin/spice" version 2>&1 || echo "spice version failed with exit code $?"
+        "$install_dir/spice" version 2>&1 || echo "spice version failed with exit code $?"
 
     - name: Verify Spice installation (Windows)
       if: runner.os == 'Windows'

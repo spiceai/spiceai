@@ -546,7 +546,7 @@ async fn load_spicepods(
 
     for dependency in &root_spicepod.dependencies {
         let dependency_pathbuf = PathBuf::from("spicepods")
-            .join(dependency)
+            .join(dependency.from())
             .join("spicepod.yaml");
         let dependency_path = Path::parse(dependency_pathbuf.to_string_lossy())
             .context(LinkedFileNotAValidPathSnafu)?;
