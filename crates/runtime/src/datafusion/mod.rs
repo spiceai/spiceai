@@ -150,6 +150,7 @@ pub mod app_context_extension;
 pub mod builder;
 pub(crate) mod caching_retention;
 mod change_generations;
+pub mod federated_template;
 use change_generations::{
     ChangeGenerations, GenerationOwner, GenerationPermit, PreparedGeneration,
 };
@@ -1493,6 +1494,9 @@ pub struct DataFusion {
     /// resolved a definition the clear retired would outlive it. A write holds the read
     /// guard across its check and insert, so a clear cannot count in between.
     plans_generation: TokioRwLock<u64>,
+    /// Physical plans of fully federated queries, one per query shape, bound to
+    /// each request's literal values (see [`federated_template`]).
+    federated_templates: federated_template::FederatedTemplates,
     /// First 10 distinct SQL results-cache plan shapes, replayed after the
     /// first full/append refresh until the cache is full. No-op unless
     /// `runtime.caching.sql_results.warmup` is `on_first_refresh`.
@@ -7351,6 +7355,7 @@ impl DataFusion {
                 .config_mut()
                 .set_extension(Arc::new(PlansGeneration(*generation)));
         }
+        self.federated_templates.clear();
         if let Some(cache_provider) = self.plans_cache_provider() {
             cache_provider.invalidate_all().await;
         }
