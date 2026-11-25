@@ -18,7 +18,7 @@ total even when its hash list contains only 25 entries. Runtime logs, API reques
 and actual SQL rows are saved under the artifact directory, including on failure.
 Pass a fresh artifact directory on each invocation.
 
-The live smoke test uses `github-arrow-smoke.yaml` in this directory. It accelerates
+The live smoke test uses `github-cayenne-smoke.yaml` in this directory. It accelerates
 five rows per GraphQL dataset and the README from the `v1.0.0` tag. `check_live.py`
 requires exact row counts, populated unique keys, and downloaded file content.
 Readiness is polled with a deadline; a fixed startup delay is not used.

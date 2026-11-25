@@ -356,7 +356,7 @@ const IGNORED_SNAPSHOT_RESULT_QUERIES: &[(&str, &[&str])] = {
     &[
         // This scenario has refresh_sql with limit - which makes these queries non-deterministic
         (
-            "s3[parquet]-arrow-partitioned",
+            "s3[parquet]-cayenne[file]-partitioned",
             &[
                 "clickbench_q2",
                 "clickbench_q5",
@@ -588,7 +588,6 @@ mod tests {
     #[test]
     fn float_source_scenarios_round_their_float_columns() {
         for scenario in [
-            "dynamodb-arrow",
             "dynamodb-federated",
             "dynamodb-cayenne[file]",
             "dynamodb-scylladb-alternator-federated",
@@ -604,7 +603,7 @@ mod tests {
         }
         // The deny-list still wins over rounding.
         assert_eq!(
-            snapshot_predicate("dynamodb-arrow", "tpcds_q77"),
+            snapshot_predicate("dynamodb-cayenne[file]", "tpcds_q77"),
             SnapshotMode::Skip
         );
     }

@@ -25,9 +25,10 @@ const QUERIES: usize = 2;
 /// A real time: the tick and the event's position within it. Positions are
 /// kept only with S = 0, as dense ranks within each tick.
 type Time = (u8, u8);
-/// Whether an event at `t` happened no earlier than S before `start`.
+/// Whether an event at `t` happened no earlier than S before `start`. Ticks
+/// are summed in `u16`, so any S the constructor accepts fits.
 fn within(t: Time, s: u8, start: Time) -> bool {
-    (t.0 + s, t.1) >= start
+    (u16::from(t.0) + u16::from(s), t.1) >= (u16::from(start.0), start.1)
 }
 /// Every time a state records.
 fn times(s: &mut State) -> impl Iterator<Item = &mut Time> {
@@ -144,11 +145,46 @@ impl Protocol {
         } else if self.has("tick-only") {
             // Freshness wrongly compared by tick alone, so a GET sent earlier in
             // the query's tick counts as sent after it started.
-            cache.sent.0 + self.s >= q.start.0
+            u16::from(cache.sent.0) + u16::from(self.s) >= u16::from(q.start.0)
         } else {
             // Freshness counts from when the GET was sent.
             within(cache.sent, self.s, q.start)
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::{Copy, Protocol, Query, within};
+
+    /// S = 0 orders events within a tick; S > 0 compares ticks only.
+    #[test]
+    fn within_compares_ticks_then_positions() {
+        assert!(within((1, 2), 0, (1, 1)));
+        assert!(!within((1, 0), 0, (1, 1)));
+        assert!(!within((0, 5), 0, (1, 0)));
+        assert!(within((0, 0), 1, (1, 0)));
+        assert!(!within((0, 0), 1, (2, 0)));
+    }
+
+    /// The constructor saturates S at `u8::MAX`; adding it to a tick in `u8`
+    /// overflowed from S = 253 at the last tick of the clock.
+    #[test]
+    fn a_bound_past_the_clock_covers_every_earlier_event() {
+        assert!(within((3, 0), 253, (3, 1)));
+        assert!(within((3, 0), u8::MAX, (3, 1)));
+        let q = Query {
+            start: (3, 0),
+            token: 0,
+            served: None,
+            from: None,
+            waited: false,
+        };
+        let cache = Copy {
+            commit: 0,
+            sent: (3, 0),
+            received: (3, 0),
+        };
+        assert!(Protocol::new("reads-tick-only", 300).fresh(cache, q));
     }
 }
 impl Model for Protocol {
