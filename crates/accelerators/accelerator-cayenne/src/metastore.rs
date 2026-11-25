@@ -36,8 +36,8 @@ use tokio::sync::OnceCell;
 
 use super::{
     AccelerationInitializationFailedSnafu, CAYENNE_MIGRATION_DOCS, CayenneAccelerator, Error,
-    InvalidConfigurationSnafu, Result, TursoMetastoreOnDiskSnafu, native_sidecar,
-    overlapping_metastore_dir, path_exists,
+    InvalidConfigurationSnafu, Result, TursoMetastoreOnDiskSnafu, UnsupportedSetting,
+    ensure_setting_supported, native_sidecar, overlapping_metastore_dir, path_exists,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -311,6 +311,7 @@ impl CayenneAccelerator {
             .acceleration()
             .is_some_and(|acceleration| !acceleration.partition_by.is_empty());
         if vnext {
+            ensure_setting_supported(&table_name, object_native_data_unsupported(source))?;
             let location_supported = url::Url::parse(
                 &effective_state_location(&source.app())?.location,
             )
@@ -318,7 +319,7 @@ impl CayenneAccelerator {
                 location_datasets_url(&location, &object_store::path::Path::default()).is_some()
             });
             ensure!(
-                location_supported && object_native_data_unsupported(source).is_none(),
+                location_supported,
                 InvalidConfigurationSnafu {
                     detail: Arc::from(cayenne::metastore_layout::object_native_data_path_refusal(
                         &table_name
@@ -894,40 +895,35 @@ pub(super) fn location_datasets_url(
     }
 }
 
-/// What `source` needs that data in the object-native location does not support yet,
-/// as the setting to name in a message; `None` when its data can go there. Covered:
+/// What `source` needs that data in the object-native location does not support yet;
+/// `None` when its data can go there. Covered:
 /// `refresh_mode: full`, `append` and `changes`, with or without a primary key.
 /// Upserts and deletes write deletion vectors through the dataset's store, and a
 /// change stream's acknowledged position commits with the data it covers, so a
 /// dataset reopened from the location alone resumes from it.
 pub(super) fn object_native_data_unsupported(
     source: &dyn AccelerationSource,
-) -> Option<&'static str> {
+) -> Option<UnsupportedSetting> {
     let acceleration = source.acceleration()?;
     match resolved_refresh_mode(source, acceleration) {
         RefreshMode::Full | RefreshMode::Append | RefreshMode::Changes => {}
-        RefreshMode::Caching => return Some("`refresh_mode: caching`"),
-        RefreshMode::Snapshot => return Some("`refresh_mode: snapshot`"),
-        RefreshMode::Disabled => return Some("`refresh_mode: disabled`"),
+        RefreshMode::Caching => return Some(UnsupportedSetting::RefreshMode("caching")),
+        RefreshMode::Snapshot => return Some(UnsupportedSetting::RefreshMode("snapshot")),
+        RefreshMode::Disabled => return Some(UnsupportedSetting::RefreshMode("disabled")),
     }
-    for param in [
+    [
         "cayenne_file_path",
         "cayenne_s3_zone_ids",
         "cayenne_datalake_location",
-    ] {
-        if acceleration
+    ]
+    .into_iter()
+    .find(|param| {
+        acceleration
             .params
-            .get(param)
+            .get(*param)
             .is_some_and(|value| !value.trim().is_empty())
-        {
-            return Some(match param {
-                "cayenne_file_path" => "`cayenne_file_path`",
-                "cayenne_s3_zone_ids" => "`cayenne_s3_zone_ids`",
-                _ => "`cayenne_datalake_location`",
-            });
-        }
-    }
-    None
+    })
+    .map(UnsupportedSetting::Param)
 }
 
 #[cfg(test)]

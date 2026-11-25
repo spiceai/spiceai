@@ -11,6 +11,8 @@ mod format;
 mod key_blocks;
 pub mod metrics;
 mod opener;
+#[cfg(test)]
+mod pushdown_differential;
 mod reader;
 mod segment_cache;
 mod sink;
@@ -28,6 +30,8 @@ pub use format::VortexFormatFactory;
 pub use format::VortexTableOptions;
 pub use format::WriteShardConfig;
 pub use format::bounds_account_for_nan;
+pub use format::column_stats;
+pub use format::singleton_distinct_count;
 pub use segment_cache::{
     install_process_segment_cache, process_segment_cache_capacity_bytes,
     register_segment_cache_metrics,
@@ -404,7 +408,7 @@ mod tests {
     /// Returns the indented physical plan for `sql`, used to assert whether a
     /// predicate pushed into the Vortex scan (shown as `predicate:` on the
     /// `DataSourceExec`) or was left in a `FilterExec` above it.
-    async fn physical_plan_display(
+    pub(super) async fn physical_plan_display(
         session: &datafusion::prelude::SessionContext,
         sql: &str,
     ) -> anyhow::Result<String> {
@@ -1077,6 +1081,63 @@ mod tests {
         Ok(())
     }
 
+    /// A cast that `DataFusion` refuses for a value fails the query the same way when the
+    /// filter reaches a Vortex table, and one that cannot fail is answered in the scan.
+    ///
+    /// Vortex answers `CAST(d AS BIGINT) > 0` without casting a `DECIMAL(19, 0)` of
+    /// `10^19 - 1`, which is past `BIGINT`, and so returned that row where `DataFusion`'s
+    /// cast fails the query. A cast that can fail for some value of its source type has to
+    /// stay above the scan; a `BOOLEAN` to `INT` cast cannot, and is pushed down.
+    #[tokio::test]
+    async fn a_cast_that_can_fail_fails_the_query_instead_of_returning_rows() -> anyhow::Result<()>
+    {
+        let ctx = TestSessionContext::new(true);
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE casts (id INT NOT NULL, d DECIMAL(19, 0), b BOOLEAN) \
+                 STORED AS vortex LOCATION '/casts/'",
+            )
+            .await?;
+        insert_rows(
+            &ctx,
+            "casts",
+            &[
+                "1, 5, true",
+                "2, -7, false",
+                "3, NULL, NULL",
+                "4, 9999999999999999999, true",
+            ],
+        )
+        .await?;
+
+        let overflow = "SELECT id FROM casts WHERE CAST(d AS BIGINT) > 0";
+        let plan = physical_plan_display(&ctx.session, overflow).await?;
+        assert!(
+            !plan.contains("predicate:"),
+            "a decimal to integer cast can fail, so it stays above the scan:\n{plan}"
+        );
+        let error = ctx
+            .session
+            .sql(overflow)
+            .await?
+            .collect()
+            .await
+            .expect_err("10^19 - 1 is past BIGINT, so the cast fails the query");
+        assert!(
+            error.to_string().contains("out of range"),
+            "the cast's own error: {error}"
+        );
+
+        let boolean = "SELECT count(*) FROM casts WHERE CAST(b AS INT) = 1";
+        let plan = physical_plan_display(&ctx.session, boolean).await?;
+        assert!(
+            plan.contains("predicate:"),
+            "a boolean to integer cast cannot fail, so it is answered in the scan:\n{plan}"
+        );
+        assert_eq!(scalar_count(&ctx, boolean).await?, 2, "rows 1 and 4");
+        Ok(())
+    }
+
     /// A join of a Vortex table to a decimal key returns every match.
     ///
     /// `DataFusion` casts the Vortex table's key to a decimal, so the dynamic filter
@@ -1325,7 +1386,7 @@ mod tests {
     }
 
     /// Append `rows` to `table` in one statement, which the sink writes as one file.
-    async fn insert_rows(
+    pub(super) async fn insert_rows(
         ctx: &TestSessionContext,
         table: &str,
         rows: &[&str],

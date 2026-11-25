@@ -144,8 +144,10 @@ def get_run_meta(repo: str, run_id: int) -> dict:
             "--repo",
             repo,
             "--json",
-            "databaseId,displayTitle,workflowName,headBranch,event,status,"
-            "conclusion,createdAt,updatedAt,url,jobs",
+            (
+                "databaseId,displayTitle,workflowName,headBranch,event,status,"
+                "conclusion,createdAt,updatedAt,url,jobs"
+            ),
         ]
     )
 
