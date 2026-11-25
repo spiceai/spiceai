@@ -948,17 +948,15 @@ mod tests {
     fn repetition_flags_are_validated() {
         assert!(parse_args(["spicescript", "--runs-per-script", "0", "s.yaml"]).is_err());
         for flag in ["--record-durations", "--record-failures"] {
-            let cli =
-                parse_args(["spicescript", "--runs-per-script", "3", flag, "s.yaml"])
-                    .expect("valid CLI syntax");
+            let cli = parse_args(["spicescript", "--runs-per-script", "3", flag, "s.yaml"])
+                .expect("valid CLI syntax");
             assert_eq!(
                 validate_repetitions(&cli)
                     .expect_err("recording repetitions is rejected")
                     .to_string(),
                 "--runs-per-script >1 cannot be combined with --record-durations or --record-failures: repetitions would overwrite the recordings"
             );
-            let cli =
-                parse_args(["spicescript", flag, "s.yaml"]).expect("default repetition");
+            let cli = parse_args(["spicescript", flag, "s.yaml"]).expect("default repetition");
             validate_repetitions(&cli).expect("one run may record");
         }
     }
