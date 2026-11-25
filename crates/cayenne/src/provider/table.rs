@@ -9682,38 +9682,16 @@ impl CayenneTableProvider {
         self.context.scan_from_manifest() || self.data_in_object_native_location()
     }
 
-    /// Records the files of `snapshot_id`, a protected snapshot this write has
-    /// just written under a new id and is about to publish at `sequence`, in its
-    /// manifest, for a table in the object-native location: its scans read only
-    /// the manifest, so the files must be there before the snapshot is visible.
-    /// The range is `[sequence, sequence]`, as the post-write rebuild tags a
-    /// protected snapshot. The files are the ones this write put there (see
-    /// [`super::uncommitted_files`]), never a listing of the directory. Other
-    /// tables are left to the post-write rebuild.
-    pub(crate) async fn record_new_protected_snapshot_files(
-        &self,
-        snapshot_id: &str,
-        sequence: i64,
-    ) -> CatalogResult<()> {
-        if !self.data_in_object_native_location() {
-            return Ok(());
-        }
-        self.upsert_snapshot_manifest_from_files(
-            snapshot_id,
-            ManifestSequenceTag::Uniform {
-                min: sequence,
-                max: sequence,
-            },
-        )
-        .await
-        .map(|_| ())
-    }
-
-    /// The manifest rows [`Self::record_new_protected_snapshot_files`] would
-    /// record, for a commit that names them itself; empty for a table outside
-    /// the object-native location. The files stay in the writer's record until
-    /// that commit lands.
-    async fn new_protected_snapshot_manifest(
+    /// The manifest of `snapshot_id`, a protected snapshot this write has just
+    /// written under a new id and publishes at `sequence`, for the commit that
+    /// makes it live to name; empty for a table outside the object-native
+    /// location, which the post-write rebuild records. Such a table scans only
+    /// its manifest, so the files must be named no later than that commit. The
+    /// range is `[sequence, sequence]`, as the post-write rebuild tags a
+    /// protected snapshot, and the files are the ones this write put there (see
+    /// [`super::uncommitted_files`]), never a listing of the directory. They stay
+    /// in the writer's record until that commit lands.
+    pub(crate) async fn new_protected_snapshot_manifest(
         &self,
         snapshot_id: &str,
         sequence: i64,
@@ -9721,17 +9699,8 @@ impl CayenneTableProvider {
         if !self.data_in_object_native_location() {
             return Ok(Vec::new());
         }
-        let (_, rows) = self
-            .snapshot_manifest_rows(
-                snapshot_id,
-                ManifestSequenceTag::Uniform {
-                    min: sequence,
-                    max: sequence,
-                },
-                Vec::new(),
-            )
-            .await?;
-        Ok(rows)
+        self.uniform_snapshot_manifest_rows(snapshot_id, sequence, sequence)
+            .await
     }
 
     /// Records `files` (`(file name, size)` in `snapshot_id`'s directory) in the
@@ -13201,13 +13170,32 @@ impl CayenneTableProvider {
         sequence_number: i64,
     ) -> CatalogResult<()> {
         self.sync_local_snapshot_dir(snapshot_id).await?;
-        self.record_new_protected_snapshot_files(snapshot_id, sequence_number)
-            .await?;
+        self.set_new_protected_snapshot_sequence(snapshot_id, sequence_number)
+            .await
+    }
 
+    /// Records `snapshot_id`, a protected snapshot this write has just written
+    /// under a new id, at `sequence`, naming its files in the same commit for a
+    /// table in the object-native location: committed apart, a crash between the
+    /// two leaves the files of a snapshot that never became live named, where no
+    /// sweep reclaims them.
+    async fn set_new_protected_snapshot_sequence(
+        &self,
+        snapshot_id: &str,
+        sequence: i64,
+    ) -> CatalogResult<()> {
+        let files = self
+            .new_protected_snapshot_manifest(snapshot_id, sequence)
+            .await?;
         self.catalog
-            .set_snapshot_sequence(&self.table_metadata.table_id, snapshot_id, sequence_number)
+            .set_snapshot_sequence(
+                &self.table_metadata.table_id,
+                snapshot_id,
+                sequence,
+                (!files.is_empty()).then_some(files.as_slice()),
+            )
             .await?;
-
+        self.uncommitted_files.forget(snapshot_id);
         Ok(())
     }
 
@@ -27952,7 +27940,7 @@ impl CayenneTableProvider {
     /// The manifest rows of `files`, written at their final keys into
     /// `snapshot_id`, a protected snapshot that a write publishes at
     /// `sequence`: the range `[sequence, sequence]`, as
-    /// [`Self::record_new_protected_snapshot_files`] tags them.
+    /// [`Self::new_protected_snapshot_manifest`] tags them.
     pub(crate) async fn new_protected_snapshot_manifest_rows(
         &self,
         snapshot_id: &str,
@@ -28032,6 +28020,48 @@ impl CayenneTableProvider {
             )
             .await?;
         Ok(rows)
+    }
+
+    /// The manifest of `snapshot_id`, the output of a `pass` merge, tagged
+    /// `[min, max]`. A table in the object-native location gets it back for the
+    /// swap that makes the snapshot live to record, so no crash between two
+    /// commits leaves its files named but never live; such a table scans only
+    /// its manifest, so a failure discards the output. Other tables record it
+    /// here, ahead of the swap, and get `None`, best-effort: a failure leaves
+    /// the scan on directory listing.
+    async fn merged_snapshot_manifest(
+        &self,
+        snapshot_id: &str,
+        (min_sequence, max_sequence): (i64, i64),
+        pass: &str,
+    ) -> Result<Option<Vec<SnapshotFile>>> {
+        let in_location = self.data_in_object_native_location();
+        let recorded = match self
+            .uniform_snapshot_manifest_rows(snapshot_id, min_sequence, max_sequence)
+            .await
+        {
+            Ok(rows) if in_location => return Ok(Some(rows)),
+            Ok(rows) => self.record_snapshot_manifest(snapshot_id, &rows).await,
+            Err(error) => Err(error),
+        };
+        match recorded {
+            Ok(()) => Ok(None),
+            Err(error) if in_location => {
+                self.cleanup_failed_compaction_snapshot(snapshot_id).await;
+                Err(Error::Catalog { source: error })
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    new_snapshot_id = snapshot_id,
+                    "Failed to record the files of dataset '{}' merged by {pass}, so its queries find the merged files by listing storage until the next rebuild records them. Cause: {error}",
+                    self.table_metadata.table_name
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Fold the manifest of every snapshot in `snapshot_ids` into one
@@ -31966,48 +31996,31 @@ impl CayenneTableProvider {
 
         // Manifest snapshot model: AUTHOR the merged output's manifest with its
         // true merged commit-seq range — `[min, max]` over the SELECTED INPUTS'
-        // manifest files — BEFORE the swap publishes the new snapshot. This is
-        // the data-commit range, NOT the protected-set value the swap stores
-        // (`fence_max_delete_seq`, a DELETE sequence — never a write range). The
-        // later `rebuild_live_snapshot_manifests` re-lists this (now-protected)
-        // snapshot in PreserveOrUniform mode, which keeps the range authored here
-        // rather than clobbering it with `[fence_max_delete_seq, ...]`. When no
-        // input manifest is available, fall back to the conservative
-        // `[0, fence_max_delete_seq]` (always bake-eligible — `min = 0` — so a
-        // missing input manifest can never make the output wrongly referenced and
-        // resurrect a deleted row). Best-effort + upsert-only (matches the
+        // manifest files — no later than the swap that publishes the new
+        // snapshot (in that swap's record, for a table in the object-native
+        // location). This is the data-commit range, NOT the protected-set value
+        // the swap stores (`fence_max_delete_seq`, a DELETE sequence — never a
+        // write range). The later `rebuild_live_snapshot_manifests` re-lists this
+        // (now-protected) snapshot in PreserveOrUniform mode, which keeps the
+        // range authored here rather than clobbering it with
+        // `[fence_max_delete_seq, ...]`. When no input manifest is available,
+        // fall back to the conservative `[0, fence_max_delete_seq]` (always
+        // bake-eligible — `min = 0` — so a missing input manifest can never make
+        // the output wrongly referenced and resurrect a deleted row). Outside
+        // the object-native location it is best-effort (matches the
         // full-rewrite path): a manifest failure leaves the scan on directory
         // listing, never loses rows.
         let (merged_min, merged_max) = self
             .merged_sequence_range_over_snapshots(&old_ids)
             .await
             .unwrap_or((0, fence_max_delete_seq));
-        if let Err(error) = self
-            .upsert_snapshot_manifest_from_files(
+        let manifest = self
+            .merged_snapshot_manifest(
                 &new_snapshot_id,
-                ManifestSequenceTag::Uniform {
-                    min: merged_min,
-                    max: merged_max,
-                },
+                (merged_min, merged_max),
+                "subset-compaction",
             )
-            .await
-        {
-            // A table in the object-native location scans only its manifest, so
-            // its compaction does not commit a snapshot the manifest lacks.
-            if self.data_in_object_native_location() {
-                self.cleanup_failed_compaction_snapshot(&new_snapshot_id)
-                    .await;
-                return Err(Error::Catalog { source: error });
-            }
-            tracing::warn!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
-                %error,
-                new_snapshot_id = new_snapshot_id.as_str(),
-                "Failed to author merged subset-compaction manifest before swap; \
-                 scan falls back to directory listing"
-            );
-        }
+            .await?;
 
         // --- Phase 3: CAS commit. ---
         let phase2_rewrite_ms = phase2_start.elapsed().as_millis();
@@ -32019,6 +32032,7 @@ impl CayenneTableProvider {
                 &old_ids,
                 &new_snapshot_id,
                 fence_max_delete_seq,
+                manifest.as_deref(),
             )
             .await
         {
@@ -32048,6 +32062,7 @@ impl CayenneTableProvider {
             );
             return Ok(false);
         }
+        self.uncommitted_files.forget(&new_snapshot_id);
 
         #[cfg(test)]
         self.run_test_pre_publish_hook().await;
@@ -32765,32 +32780,13 @@ impl CayenneTableProvider {
             .merged_sequence_range_over_snapshots(&old_ids)
             .await
             .unwrap_or((0, fence_max_delete_seq));
-        if let Err(error) = self
-            .upsert_snapshot_manifest_from_files(
+        let manifest = self
+            .merged_snapshot_manifest(
                 &new_snapshot_id,
-                ManifestSequenceTag::Uniform {
-                    min: merged_min,
-                    max: merged_max,
-                },
+                (merged_min, merged_max),
+                "seq-prefix-bake",
             )
-            .await
-        {
-            // A table in the object-native location scans only its manifest, so
-            // its compaction does not commit a snapshot the manifest lacks.
-            if self.data_in_object_native_location() {
-                self.cleanup_failed_compaction_snapshot(&new_snapshot_id)
-                    .await;
-                return Err(Error::Catalog { source: error });
-            }
-            tracing::warn!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
-                %error,
-                new_snapshot_id = new_snapshot_id.as_str(),
-                "Failed to author merged seq-prefix-bake manifest before swap; \
-                 scan falls back to directory listing"
-            );
-        }
+            .await?;
 
         // --- Phase 3: CAS commit (atomically deactivate inputs, activate M). ---
         let swapped = match self
@@ -32800,6 +32796,7 @@ impl CayenneTableProvider {
                 &old_ids,
                 &new_snapshot_id,
                 fence_max_delete_seq,
+                manifest.as_deref(),
             )
             .await
         {
@@ -32825,6 +32822,7 @@ impl CayenneTableProvider {
             );
             return Ok(false);
         }
+        self.uncommitted_files.forget(&new_snapshot_id);
 
         #[cfg(test)]
         self.run_test_pre_publish_hook().await;
@@ -42990,17 +42988,7 @@ impl CayenneTableProvider {
             chunk_count
         );
 
-        // A table in the object-native location scans only its manifest: the
-        // snapshot's files are recorded before the commit that publishes it.
-        self.record_new_protected_snapshot_files(&new_snapshot_id, sequence_number)
-            .await?;
-        // Record the snapshot's sequence number in the catalog
-        self.catalog
-            .set_snapshot_sequence(
-                &self.table_metadata.table_id,
-                &new_snapshot_id,
-                sequence_number,
-            )
+        self.set_new_protected_snapshot_sequence(&new_snapshot_id, sequence_number)
             .await?;
 
         // Protect this snapshot using its OWN allocated `sequence_number` as the
@@ -43169,6 +43157,7 @@ impl CayenneTableProvider {
         let stats = {
             let _fence = self.listing_fence.write().await;
 
+            let mut inline_cleared = false;
             let stats = if self.pk_deletion_strategy.is_position_based() {
                 let target_size_bytes = self.context.target_file_size_bytes();
                 let (_rows, _ops, stats) = self
@@ -43181,6 +43170,19 @@ impl CayenneTableProvider {
                         super::delta_encoding::WritePolicy::DELTA,
                     )
                     .await?;
+                stats
+            } else if self.data_in_object_native_location() {
+                let sequence_number = self.reserve_sequences_local(1).await?;
+                let stats = self
+                    .fold_inline_into_new_snapshot(
+                        stream,
+                        sequence_number,
+                        ctx.state().config().target_partitions(),
+                        estimated_bytes,
+                        &flushed_int64_pks,
+                    )
+                    .await?;
+                inline_cleared = true;
                 stats
             } else {
                 // Lever B2: the checkpoint flush's new snapshot sequence comes
@@ -43207,12 +43209,14 @@ impl CayenneTableProvider {
             // the files the flush wrote into the current snapshot are recorded in
             // the same record that clears the inline rows they hold.
             let current_snapshot_id = self.get_current_snapshot_id();
-            let flushed_into_current = if self.data_in_object_native_location() {
+            let flushed_into_current = if self.data_in_object_native_location() && !inline_cleared {
                 self.uncommitted_files.files(&current_snapshot_id)
             } else {
                 Vec::new()
             };
-            if flushed_into_current.is_empty() {
+            if inline_cleared {
+                self.clear_inlined_state_after_checkpoint();
+            } else if flushed_into_current.is_empty() {
                 self.clear_inlined_metadata_after_checkpoint().await?;
             } else {
                 let (recorded, deletes) = crate::catalog::with_same_record_commits(async {
@@ -43244,6 +43248,60 @@ impl CayenneTableProvider {
             .await;
 
         Ok(u64::try_from(total_rows).unwrap_or(u64::MAX))
+    }
+
+    /// Writes the inline corpus `stream` into a new protected snapshot at
+    /// `sequence_number`, for a keyed table in the object-native location, and
+    /// commits it in one record: the snapshot's files, the switch that makes it
+    /// live, the insert records that keep the re-inserted `flushed_pks` visible
+    /// after a restart, and the clear of the inline rows it now holds. Committed
+    /// apart, a crash after the snapshot is live and before the clear serves
+    /// every folded row twice, and one between naming the files and making the
+    /// snapshot live leaves files that no sweep reclaims.
+    async fn fold_inline_into_new_snapshot(
+        &self,
+        stream: SendableRecordBatchStream,
+        sequence_number: i64,
+        target_partitions: usize,
+        estimated_bytes: Option<u64>,
+        flushed_pks: &[i64],
+    ) -> Result<Arc<ColumnStatsAccumulator>> {
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let (_rows, _chunks, stats) = self
+            .write_to_snapshot(
+                stream,
+                self.context.target_file_size_bytes(),
+                &new_snapshot_id,
+                target_partitions,
+                estimated_bytes,
+                super::delta_encoding::WritePolicy::DELTA,
+            )
+            .await?;
+        self.sync_local_snapshot_dir(&new_snapshot_id).await?;
+        let manifest_files = self
+            .new_protected_snapshot_manifest(&new_snapshot_id, sequence_number)
+            .await?;
+        let insert_records = self.flushed_pk_insert_records(flushed_pks, false).await?;
+        self.catalog
+            .commit_mem_tier_durable(MemTierDurableCommit {
+                table_id: self.table_metadata.table_id.clone(),
+                sequence_number,
+                snapshot_sequence: Some(SnapshotSequenceCommit {
+                    snapshot_id: new_snapshot_id.clone(),
+                    sequence_number,
+                }),
+                clear_inlined: true,
+                insert_records,
+                manifest_files,
+                ..MemTierDurableCommit::default()
+            })
+            .await?;
+        self.uncommitted_files.forget(&new_snapshot_id);
+        self.commit_protected_snapshot_with_scan_lock(&new_snapshot_id, sequence_number)
+            .await;
+        // As `upgrade_tombstones_for_flushed_pks` does, with the records above.
+        self.upgrade_flushed_pk_tombstones_in_memory(flushed_pks, sequence_number);
+        Ok(stats)
     }
 
     async fn clear_inlined_metadata_after_checkpoint(&self) -> Result<()> {
