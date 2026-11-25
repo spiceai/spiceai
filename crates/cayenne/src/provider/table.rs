@@ -13782,10 +13782,12 @@ impl CayenneTableProvider {
             self.record_current_snapshot_files_added(writer_ops);
         }
 
-        // The write's files are complete; its caller makes them visible next.
+        // The write's files are complete; its caller makes them visible next. A
+        // rewrite replaces files, so it is covered before its caller swaps it in;
+        // an append's run is finished off the write path, its files read in full
+        // until it publishes.
         if let Some((state, observer)) = index_observer {
-            // A rewrite replaces files: it is covered before its caller swaps it in.
-            state.finish_write(&observer).await;
+            state.finish_write_off_path(observer).await;
         }
 
         Ok((total_rows, writer_ops, stats_accumulator))

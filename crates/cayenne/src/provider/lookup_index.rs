@@ -19,14 +19,14 @@ limitations under the License.
 //!
 //! Each key is a [`TieredIndex`] of immutable runs, and a run covers the files
 //! it was built from. Every write builds a run from exactly the rows it writes,
-//! as the Vortex sink reports them, and publishes it when the write returns,
-//! just before the write becomes visible. That holds for every write: a CDC
-//! append, a full-refresh overwrite, a compaction's rewrite, a memory-tier
-//! checkpoint. So a file is indexed from the moment a scan can read it, and
-//! nothing an append, a compaction or a refresh does leaves the index stale.
-//! The one exception is an append of more than 2^20 rows,
-//! which finishes its run in the background: its files are read in full until
-//! the run publishes.
+//! as the Vortex sink reports them. A write that replaces files (a full-refresh
+//! overwrite, a compaction's rewrite, a memory-tier checkpoint) publishes its
+//! run when it returns, just before it becomes visible, so the files it swaps
+//! in are indexed from the moment a scan can read them. An append finishes its
+//! run off the write path: it does not wait while its keys are encoded, sorted
+//! and published, and its files are read in full until the run publishes,
+//! moments later. Nothing an append, a compaction or a refresh does leaves the
+//! index stale.
 //! A file no run covers — written before a restart, or by a write whose run
 //! could not be built — is read in full, and a lookup that meets one asks for
 //! a background build that reads back only the files not yet covered, paced
@@ -2074,6 +2074,31 @@ impl LookupIndexState {
         }
         // Whatever happened, the builders' working memory goes with them.
         observer.reservation.lock().free();
+    }
+
+    /// [`Self::finish_write`] without holding up an additive write (an append):
+    /// the append returns, and becomes visible, while its observer is still
+    /// encoding its keys and before its run is sorted and published. Its files
+    /// are uncovered, and a lookup reads them in full, until the run publishes,
+    /// as for an append of more than [`DEFER_FINISH_ROWS`] rows; a run that
+    /// arrives after a background build covered the same files, or after a
+    /// compaction retired them, is dropped, so each live row is still found
+    /// once. A write that replaces files (a compaction, an overwrite) is
+    /// finished before this returns, so the files it swaps in are covered
+    /// from the moment they are visible.
+    pub(crate) async fn finish_write_off_path(self: &Arc<Self>, observer: Arc<RunObserver>) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.finish_write(&observer).await;
+            return;
+        };
+        if observer.replaces {
+            self.finish_write(&observer).await;
+            return;
+        }
+        let state = Arc::clone(self);
+        runtime.spawn(async move {
+            state.finish_write(&observer).await;
+        });
     }
 
     /// [`Self::finish_write`] for a large write, off the write path. The
