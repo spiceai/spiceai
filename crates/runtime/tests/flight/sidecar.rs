@@ -216,15 +216,14 @@ async fn sidecar_substrait_connector_roundtrip() -> anyhow::Result<()> {
 }
 
 /// A Flight proxy in front of an upstream Spice runtime that counts the
-/// Substrait tickets it forwards by kind. With `refuse_parameterized`, it
-/// answers a parameterized plan as an upstream that predates one does:
-/// `Unimplemented`, for a command it does not know.
+/// Substrait tickets it forwards by kind, and plays an upstream of a chosen
+/// [`ticket_proxy::Mode`]; the mode can change while it runs.
 mod ticket_proxy {
     use std::{
         pin::Pin,
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicU8, AtomicUsize, Ordering},
         },
     };
 
@@ -233,10 +232,12 @@ mod ticket_proxy {
         HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
         flight_service_client::FlightServiceClient,
         flight_service_server::{FlightService, FlightServiceServer},
-        sql::{Any, CommandStatementSubstraitPlan, ProstMessageExt},
+        sql::{Any, CommandGetSqlInfo, CommandStatementSubstraitPlan, ProstMessageExt},
     };
     use flight_client::{
-        parameterized_ticket::PARAMETERIZED_SUBSTRAIT_PLAN_TYPE_URL,
+        parameterized_ticket::{
+            PARAMETERIZED_SUBSTRAIT_PLAN_TYPE_URL, SQL_INFO_PARAMETERIZED_SUBSTRAIT,
+        },
         traced_ticket::TRACED_TICKET_TYPE_URL,
     };
     use futures::{Stream, StreamExt};
@@ -245,10 +246,40 @@ mod ticket_proxy {
 
     type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
+    /// The upstream the proxy plays.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[repr(u8)]
+    pub(super) enum Mode {
+        /// The upstream as it is: it advertises and takes parameterized plans.
+        Current = 0,
+        /// An upstream that predates parameterized plans: its `GetSqlInfo`
+        /// answer has no code 10,000, and it refuses the ticket as unknown.
+        Old = 1,
+        /// Advertises parameterized plans, then refuses them as unknown, as a
+        /// rolling upgrade can when the probe reaches a new runtime and the
+        /// query an old one.
+        AdvertisesButRefuses = 2,
+    }
+
     #[derive(Default)]
     pub(super) struct Counts {
         pub(super) parameterized: AtomicUsize,
         pub(super) plain: AtomicUsize,
+        mode: AtomicU8,
+    }
+
+    impl Counts {
+        pub(super) fn set_mode(&self, mode: Mode) {
+            self.mode.store(mode as u8, Ordering::SeqCst);
+        }
+
+        fn mode(&self) -> Mode {
+            match self.mode.load(Ordering::SeqCst) {
+                0 => Mode::Current,
+                1 => Mode::Old,
+                _ => Mode::AdvertisesButRefuses,
+            }
+        }
     }
 
     impl Counts {
@@ -262,22 +293,19 @@ mod ticket_proxy {
 
     struct Proxy {
         upstream: FlightServiceClient<Channel>,
-        refuse_parameterized: bool,
         counts: Arc<Counts>,
     }
 
-    /// Starts a proxy to `upstream` and returns its endpoint and counts.
-    pub(super) async fn start(
-        upstream: &str,
-        refuse_parameterized: bool,
-    ) -> anyhow::Result<(String, Arc<Counts>)> {
+    /// Starts a proxy to `upstream` playing `mode`, and returns its endpoint
+    /// and counts.
+    pub(super) async fn start(upstream: &str, mode: Mode) -> anyhow::Result<(String, Arc<Counts>)> {
         let channel = Channel::from_shared(upstream.to_string())?
             .connect()
             .await?;
         let counts = Arc::new(Counts::default());
+        counts.set_mode(mode);
         let proxy = Proxy {
             upstream: FlightServiceClient::new(channel),
-            refuse_parameterized,
             counts: Arc::clone(&counts),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -350,10 +378,19 @@ mod ticket_proxy {
             &self,
             request: Request<FlightDescriptor>,
         ) -> Result<Response<FlightInfo>, Status> {
-            self.upstream
-                .clone()
-                .get_flight_info(forward(request))
-                .await
+            let mut request = forward(request);
+            // An old upstream does not know code 10,000; the ticket the
+            // upstream answers with carries the rewritten command.
+            if self.counts.mode() == Mode::Old
+                && let Ok(any) = Any::decode(request.get_ref().cmd.clone())
+                && let Ok(Some(mut command)) = any.unpack::<CommandGetSqlInfo>()
+            {
+                command
+                    .info
+                    .retain(|code| *code != SQL_INFO_PARAMETERIZED_SUBSTRAIT);
+                request.get_mut().cmd = command.as_any().encode_to_vec().into();
+            }
+            self.upstream.clone().get_flight_info(request).await
         }
 
         async fn poll_flight_info(
@@ -380,7 +417,7 @@ mod ticket_proxy {
             match command_type(request.get_ref()).as_deref() {
                 Some(PARAMETERIZED_SUBSTRAIT_PLAN_TYPE_URL) => {
                     self.counts.parameterized.fetch_add(1, Ordering::SeqCst);
-                    if self.refuse_parameterized {
+                    if self.counts.mode() != Mode::Current {
                         return Err(Status::unimplemented(format!(
                             "Unknown command type: {PARAMETERIZED_SUBSTRAIT_PLAN_TYPE_URL}"
                         )));
@@ -428,79 +465,113 @@ mod ticket_proxy {
     }
 }
 
+/// An upstream serving `remote_lookups`, and the rows it holds.
+async fn lookup_upstream() -> anyhow::Result<(String, RecordBatch)> {
+    let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str(API_KEY)]))
+        as Arc<dyn FlightBasicAuth + Send + Sync>;
+    let (_channel, upstream, metrics_port) =
+        start_spice_test_app_with_metrics_port(Some(auth), None, None, None).await?;
+    let input = RecordBatch::try_from_iter(vec![
+        (
+            "id",
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as arrow::array::ArrayRef,
+        ),
+        (
+            "label",
+            Arc::new(StringArray::from(vec![
+                Some("雪"),
+                Some(""),
+                None,
+                Some("x"),
+            ])),
+        ),
+        (
+            "active",
+            Arc::new(arrow::array::BooleanArray::from(vec![
+                Some(true),
+                Some(false),
+                None,
+                Some(true),
+            ])),
+        ),
+    ])?;
+    upstream
+        .ctx
+        .register_batch("remote_lookups", input.clone())?;
+    Ok((format!("http://127.0.0.1:{}", metrics_port - 1), input))
+}
+
+/// A sidecar with a `spice.ai:remote_lookups` dataset per `(name, endpoint)`,
+/// and an oracle holding `input` under each name.
+async fn lookup_sidecar(
+    tables: &[(&str, &str)],
+    input: &RecordBatch,
+) -> anyhow::Result<(Arc<Runtime>, SessionContext)> {
+    let oracle = SessionContext::new();
+    let mut app = AppBuilder::new("sidecar_parameterized_lookups");
+    for (name, endpoint) in tables {
+        oracle.register_batch(*name, input.clone())?;
+        let mut dataset = Dataset::new("spice.ai:remote_lookups".to_string(), (*name).to_string());
+        dataset.params = Some(Params::from_string_map(HashMap::from([
+            ("spiceai_endpoint".to_string(), (*endpoint).to_string()),
+            ("spiceai_api_key".to_string(), API_KEY.to_string()),
+        ])));
+        app = app.with_dataset(dataset);
+    }
+    let sidecar = Arc::new(
+        Runtime::builder()
+            .with_app(app.build())
+            .with_runtime_config(Config {
+                cluster: ClusterConfig::default().with_role(Role::Sidecar),
+                ..Config::default()
+            })
+            .build()
+            .await,
+    );
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        Arc::clone(&sidecar).load_components(),
+    )
+    .await?;
+    Ok((sidecar, oracle))
+}
+
+async fn assert_lookup(
+    sidecar: &Arc<Runtime>,
+    oracle: &SessionContext,
+    sql: &str,
+) -> anyhow::Result<()> {
+    let expected = oracle.sql(sql).await?.collect().await?;
+    assert_same_rows(&rows(sidecar, sql).await?, &expected, sql)
+}
+
 /// Lookups that differ only in their key values plan one template per query
 /// shape and bind each request's values to it, returning each value's own
-/// rows. Through an upstream that takes parameterized plans, every lookup is
-/// sent as one; through an upstream that refuses them as unknown, the first
-/// lookup is retried with its values inlined, and every later one is sent
-/// inlined without asking again.
+/// rows. An upstream that advertises parameterized plans in `GetSqlInfo` is
+/// sent every lookup as one; an upstream that does not is sent none. One that
+/// advertises them and then refuses each as unknown has each lookup resent
+/// with its values inlined, and is offered the next one parameterized again.
 #[tokio::test]
 async fn sidecar_lookups_bind_their_values_to_one_planned_template() -> anyhow::Result<()> {
     test_request_context()
         .scope(async {
-            let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str(API_KEY)]))
-                as Arc<dyn FlightBasicAuth + Send + Sync>;
-            let (_channel, upstream, metrics_port) =
-                start_spice_test_app_with_metrics_port(Some(auth), None, None, None).await?;
-            let upstream_endpoint = format!("http://127.0.0.1:{}", metrics_port - 1);
-            let input = RecordBatch::try_from_iter(vec![
-                (
-                    "id",
-                    Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as arrow::array::ArrayRef,
-                ),
-                (
-                    "label",
-                    Arc::new(StringArray::from(vec![
-                        Some("雪"),
-                        Some(""),
-                        None,
-                        Some("x"),
-                    ])),
-                ),
-                (
-                    "active",
-                    Arc::new(arrow::array::BooleanArray::from(vec![
-                        Some(true),
-                        Some(false),
-                        None,
-                        Some(true),
-                    ])),
-                ),
-            ])?;
-            upstream
-                .ctx
-                .register_batch("remote_lookups", input.clone())?;
-
-            let (current, current_counts) = ticket_proxy::start(&upstream_endpoint, false).await?;
-            let (legacy, legacy_counts) = ticket_proxy::start(&upstream_endpoint, true).await?;
-            let oracle = SessionContext::new();
-            let mut app = AppBuilder::new("sidecar_parameterized_lookups");
-            for (name, endpoint) in [("lookups", &current), ("legacy_lookups", &legacy)] {
-                oracle.register_batch(name, input.clone())?;
-                let mut dataset =
-                    Dataset::new("spice.ai:remote_lookups".to_string(), name.to_string());
-                dataset.params = Some(Params::from_string_map(HashMap::from([
-                    ("spiceai_endpoint".to_string(), endpoint.clone()),
-                    ("spiceai_api_key".to_string(), API_KEY.to_string()),
-                ])));
-                app = app.with_dataset(dataset);
-            }
-            let sidecar = Arc::new(
-                Runtime::builder()
-                    .with_app(app.build())
-                    .with_runtime_config(Config {
-                        cluster: ClusterConfig::default().with_role(Role::Sidecar),
-                        ..Config::default()
-                    })
-                    .build()
-                    .await,
-            );
-            tokio::time::timeout(
-                Duration::from_secs(30),
-                Arc::clone(&sidecar).load_components(),
+            use ticket_proxy::Mode;
+            let (upstream, input) = lookup_upstream().await?;
+            let (current, current_counts) = ticket_proxy::start(&upstream, Mode::Current).await?;
+            let (legacy, legacy_counts) = ticket_proxy::start(&upstream, Mode::Old).await?;
+            let (refusing, refusing_counts) =
+                ticket_proxy::start(&upstream, Mode::AdvertisesButRefuses).await?;
+            let (sidecar, oracle) = lookup_sidecar(
+                &[
+                    ("lookups", &current),
+                    ("legacy_lookups", &legacy),
+                    ("refusing_lookups", &refusing),
+                ],
+                &input,
             )
             .await?;
             let stats = || sidecar.datafusion().federated_template_stats();
+            let refused_before = data_components::flight::parameterized_plans_refused();
 
             // Each group is one query shape: the first lookup plans its template and
             // every other lookup binds its own values to it.
@@ -523,14 +594,12 @@ async fn sidecar_lookups_bind_their_values_to_one_planned_template() -> anyhow::
                     "SELECT id FROM {table} WHERE active = false ORDER BY id",
                 ],
             ];
-            let mut lookups = 0;
-            for table in ["lookups", "legacy_lookups"] {
+            let lookups: usize = shapes.iter().map(|shape| shape.len()).sum();
+            for table in ["lookups", "legacy_lookups", "refusing_lookups"] {
                 for shape in shapes {
                     let before = stats();
                     for sql in shape {
-                        let sql = sql.replace("{table}", table);
-                        let expected = oracle.sql(&sql).await?.collect().await?;
-                        assert_same_rows(&rows(&sidecar, &sql).await?, &expected, &sql)?;
+                        assert_lookup(&sidecar, &oracle, &sql.replace("{table}", table)).await?;
                     }
                     let after = stats();
                     assert_eq!(
@@ -538,9 +607,6 @@ async fn sidecar_lookups_bind_their_values_to_one_planned_template() -> anyhow::
                         (1, shape.len() as u64 - 1),
                         "{table}: {shape:?}"
                     );
-                    if table == "lookups" {
-                        lookups += shape.len();
-                    }
                 }
             }
             assert_eq!(
@@ -550,16 +616,75 @@ async fn sidecar_lookups_bind_their_values_to_one_planned_template() -> anyhow::
             );
             assert_eq!(
                 legacy_counts.get(),
-                (1, lookups),
-                "only the first lookup is offered parameterized to an upstream without it"
+                (0, lookups),
+                "an upstream that does not advertise parameterized plans is sent none"
+            );
+            assert_eq!(
+                refusing_counts.get(),
+                (lookups, lookups),
+                "every refused lookup is resent inlined, and the next offered parameterized again"
+            );
+            assert_eq!(
+                data_components::flight::parameterized_plans_refused() - refused_before,
+                lookups as u64,
+                "each refusal is counted"
             );
 
             // A plan folding `now()` into a constant is never a template.
             let before = stats();
             let sql = "SELECT id FROM lookups WHERE id = 2 AND now() > to_timestamp(0)";
-            let expected = oracle.sql(sql).await?.collect().await?;
-            assert_same_rows(&rows(&sidecar, sql).await?, &expected, sql)?;
+            assert_lookup(&sidecar, &oracle, sql).await?;
             assert_eq!(stats(), before, "{sql}");
+
+            sidecar.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// What a probe found stands only until it expires: an upstream upgraded in
+/// place to take parameterized plans is sent them once its earlier answer
+/// expires, without a sidecar restart.
+#[tokio::test]
+async fn sidecar_probes_an_upgraded_upstream_again() -> anyhow::Result<()> {
+    test_request_context()
+        .scope(async {
+            use ticket_proxy::Mode;
+            // Other tests' upstreams are probed more often while this is set; that
+            // changes no answer they get.
+            data_components::flight::set_parameterized_probe_intervals_for_tests(
+                data_components::flight::ParameterizedProbeIntervals {
+                    answered: Duration::from_millis(300),
+                    failed: Duration::from_millis(300),
+                },
+            );
+            let (upstream, input) = lookup_upstream().await?;
+            let (endpoint, counts) = ticket_proxy::start(&upstream, Mode::Old).await?;
+            let (sidecar, oracle) = lookup_sidecar(&[("lookups", &endpoint)], &input).await?;
+
+            assert_lookup(&sidecar, &oracle, "SELECT label FROM lookups WHERE id = 2").await?;
+            assert_eq!(counts.get(), (0, 1), "an old upstream is sent a plain plan");
+
+            counts.set_mode(Mode::Current);
+            // Each lookup's text is new, so none is answered from the sidecar's
+            // results cache without reaching the upstream.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            let mut bound = 1000;
+            while counts.get().0 == 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the upgraded upstream was never sent a parameterized plan: {:?}",
+                    counts.get()
+                );
+                bound += 1;
+                assert_lookup(
+                    &sidecar,
+                    &oracle,
+                    &format!("SELECT label FROM lookups WHERE id = 2 AND id < {bound}"),
+                )
+                .await?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
 
             sidecar.shutdown().await;
             Ok(())

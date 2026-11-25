@@ -58,7 +58,10 @@ pub mod stream;
 mod substrait;
 pub mod substrait_parameters;
 
-pub use substrait::{SubstraitTemplate, spice_substrait_context};
+pub use substrait::{
+    ParameterizedProbeIntervals, SubstraitTemplate, parameterized_plans_refused,
+    set_parameterized_probe_intervals_for_tests, spice_substrait_context,
+};
 
 pub use delegated_search::{
     SEARCH_CALL_TYPE_URL, SEARCH_SCORE_COLUMN, delegated_search, delegated_search_schema,

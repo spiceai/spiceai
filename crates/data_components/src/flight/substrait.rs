@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Typed plan federation between a sidecar and an upstream Spice runtime.
 
-use std::{borrow::Cow, fmt, sync::Arc};
+use std::{borrow::Cow, fmt, sync::Arc, time::Duration};
 
 use arrow::{
     array::RecordBatch,
@@ -59,7 +59,12 @@ use datafusion_substrait::{
         version::version_with_producer,
     },
 };
-use flight_client::FlightClient;
+use flight_client::{
+    FlightClient,
+    parameterized_ticket::{
+        PARAMETERIZED_SUBSTRAIT_VERSION, SPICE_SERVER_NAME, SQL_INFO_PARAMETERIZED_SUBSTRAIT,
+    },
+};
 use futures::StreamExt;
 use prost::Message;
 use runtime_request_context::{SPICE_TRACE_ID_HEADER, TRACEPARENT_HEADER};
@@ -588,12 +593,150 @@ impl PlanParameters {
     }
 }
 
-/// Upstream endpoints, by URL, that refused a parameterized plan as
-/// unsupported: they predate it. Their plans are sent with the values inlined
-/// from then on, rather than refused once per query. An upstream upgraded in
-/// place is not asked again until this process restarts.
-static PARAMETERIZED_PLANS_UNSUPPORTED: std::sync::LazyLock<dashmap::DashSet<String>> =
-    std::sync::LazyLock::new(dashmap::DashSet::new);
+/// How long a probe's finding that an upstream does or does not take
+/// parameterized plans stands, and how long a failed probe (an unreachable
+/// upstream, a refused credential) stands before the next query asks again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParameterizedProbeIntervals {
+    pub answered: Duration,
+    pub failed: Duration,
+}
+
+/// Ten minutes: an upstream upgraded in place, or rolled back, is sent the
+/// plans it takes within that long. A failed probe is retried after 30 seconds.
+const DEFAULT_PROBE_INTERVALS: ParameterizedProbeIntervals = ParameterizedProbeIntervals {
+    answered: Duration::from_secs(600),
+    failed: Duration::from_secs(30),
+};
+
+/// How long a probe may take; one that takes longer counts as failed.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+static PROBE_INTERVALS: std::sync::RwLock<ParameterizedProbeIntervals> =
+    std::sync::RwLock::new(DEFAULT_PROBE_INTERVALS);
+
+/// Sets the probe intervals of [`UpstreamCapability`] entries probed from now
+/// on. For tests: an interval short enough to watch an upstream change. Not a
+/// runtime setting.
+#[doc(hidden)]
+pub fn set_parameterized_probe_intervals_for_tests(intervals: ParameterizedProbeIntervals) {
+    if let Ok(mut current) = PROBE_INTERVALS.write() {
+        *current = intervals;
+    }
+}
+
+/// What a probe of an upstream found, and how long it stands.
+#[derive(Debug, Clone, Copy)]
+struct UpstreamCapability {
+    parameterized: bool,
+    stands_for: Duration,
+}
+
+struct CapabilityExpiry;
+
+impl moka::Expiry<String, UpstreamCapability> for CapabilityExpiry {
+    fn expire_after_create(
+        &self,
+        _url: &String,
+        capability: &UpstreamCapability,
+        _created_at: std::time::Instant,
+    ) -> Option<Duration> {
+        Some(capability.stands_for)
+    }
+}
+
+/// Whether each upstream, by URL, takes parameterized plans, as its
+/// `GetSqlInfo` answered. Probed on the first parameterized plan for an
+/// upstream, once however many queries arrive together, and again once the
+/// finding expires.
+static UPSTREAM_CAPABILITIES: std::sync::LazyLock<moka::future::Cache<String, UpstreamCapability>> =
+    std::sync::LazyLock::new(|| {
+        moka::future::Cache::builder()
+            .max_capacity(1024)
+            .expire_after(CapabilityExpiry)
+            .build()
+    });
+
+/// Whether `client`'s upstream takes parameterized plans, probing it if no
+/// finding for it stands.
+async fn takes_parameterized_plans(client: &FlightClient) -> bool {
+    let probe = async {
+        let intervals = PROBE_INTERVALS
+            .read()
+            .map_or(DEFAULT_PROBE_INTERVALS, |intervals| *intervals);
+        let info = [
+            arrow_flight::sql::SqlInfo::FlightSqlServerName as u32,
+            SQL_INFO_PARAMETERIZED_SUBSTRAIT,
+        ];
+        match client.get_sql_info(&info, Some(PROBE_TIMEOUT)).await {
+            Ok(values) => UpstreamCapability {
+                parameterized: advertises_parameterized_plans(&values),
+                stands_for: intervals.answered,
+            },
+            Err(error) => {
+                tracing::debug!(
+                    "Unable to ask the upstream Spice runtime at {} whether it takes parameterized Substrait plans ({error}); sending plans with their values inlined",
+                    client.url()
+                );
+                UpstreamCapability {
+                    parameterized: false,
+                    stands_for: intervals.failed,
+                }
+            }
+        }
+    };
+    UPSTREAM_CAPABILITIES
+        .get_with(client.url().to_string(), probe)
+        .await
+        .parameterized
+}
+
+/// Whether a `GetSqlInfo` answer advertises the parameterized Substrait
+/// ticket this build sends. The code is custom, so it is read only from a
+/// server that names itself Spice: any other server's code 10,000 means
+/// whatever that server defines it to.
+fn advertises_parameterized_plans(
+    values: &std::collections::HashMap<u32, flight_client::SqlInfoValue>,
+) -> bool {
+    use arrow_flight::sql::SqlInfo;
+    use flight_client::SqlInfoValue;
+    let spice = matches!(
+        values.get(&(SqlInfo::FlightSqlServerName as u32)),
+        Some(SqlInfoValue::String(name)) if name == SPICE_SERVER_NAME
+    );
+    let version = match values.get(&SQL_INFO_PARAMETERIZED_SUBSTRAIT) {
+        Some(SqlInfoValue::Int32(version)) => i64::from(*version),
+        Some(SqlInfoValue::BigInt(version)) => *version,
+        _ => 0,
+    };
+    spice && version >= i64::from(PARAMETERIZED_SUBSTRAIT_VERSION)
+}
+
+static METER: std::sync::LazyLock<opentelemetry::metrics::Meter> =
+    std::sync::LazyLock::new(|| opentelemetry::global::meter("flight"));
+
+/// Parameterized plans an upstream refused as unknown after advertising them,
+/// each then sent with its values inlined.
+static PARAMETERIZED_PLANS_REFUSED: std::sync::LazyLock<opentelemetry::metrics::Counter<u64>> =
+    std::sync::LazyLock::new(|| {
+        METER
+            .u64_counter("flight_substrait_parameterized_refused")
+            .with_description(
+                "Parameterized Substrait plans an upstream refused as unknown after advertising them; each was resent with its values inlined.",
+            )
+            .build()
+    });
+
+/// [`PARAMETERIZED_PLANS_REFUSED`], readable in process.
+static PARAMETERIZED_PLANS_REFUSED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many parameterized plans an upstream refused as unknown after
+/// advertising them, in this process.
+#[must_use]
+pub fn parameterized_plans_refused() -> u64 {
+    PARAMETERIZED_PLANS_REFUSED_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// A fully federated plan whose Substrait holds dynamic parameters, planned
 /// once and bound to each request's values.
@@ -924,7 +1067,7 @@ impl ExecutionPlan for SubstraitExec {
             let plan = match parameters {
                 None => plan,
                 Some(parameters) => {
-                    if !PARAMETERIZED_PLANS_UNSUPPORTED.contains(client.url()) {
+                    if takes_parameterized_plans(&client).await {
                         match client
                             .query_substrait_parameterized(
                                 plan,
@@ -933,14 +1076,20 @@ impl ExecutionPlan for SubstraitExec {
                             )
                             .await
                         {
+                            // Advertised, then refused: such as a rolling
+                            // upgrade, where the probe reached a new runtime
+                            // and this query an old one. This query is resent
+                            // inlined; the next is offered parameterized again.
                             Err(flight_client::Error::ParameterizedSubstraitUnsupported {
                                 source,
                             }) => {
+                                PARAMETERIZED_PLANS_REFUSED.add(1, &[]);
+                                PARAMETERIZED_PLANS_REFUSED_COUNT
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 tracing::debug!(
-                                    "The upstream Spice runtime at {} does not take parameterized Substrait plans ({source}); sending plans with their values inlined",
+                                    "The upstream Spice runtime at {} advertised parameterized Substrait plans but refused one ({source}); resending it with its values inlined",
                                     client.url()
                                 );
-                                PARAMETERIZED_PLANS_UNSUPPORTED.insert(client.url().to_string());
                             }
                             result => return result.map_err(map_error),
                         }
@@ -1042,6 +1191,28 @@ mod tests {
         let error = encode_plan(&scan(Some(vec![0, 2])), Reads::Direct)
             .expect_err("Substrait has no fixed-size list type");
         assert!(error.to_string().contains("FixedSizeList"), "{error}");
+    }
+
+    /// Code 10,000 is custom, so another server reporting it is not taken to
+    /// accept parameterized plans; Spice reporting version 0 or no code does
+    /// not either.
+    #[test]
+    fn only_spice_advertising_a_version_takes_parameterized_plans() {
+        use flight_client::SqlInfoValue;
+        use std::collections::HashMap;
+        let answer = |name: &str, version: Option<SqlInfoValue>| {
+            let mut values = HashMap::from([(0, SqlInfoValue::String(name.to_string()))]);
+            if let Some(version) = version {
+                values.insert(10_000, version);
+            }
+            super::advertises_parameterized_plans(&values)
+        };
+        assert!(answer("Spice.ai", Some(SqlInfoValue::Int32(1))));
+        assert!(answer("Spice.ai", Some(SqlInfoValue::Int32(2))));
+        assert!(!answer("Spice.ai", Some(SqlInfoValue::Int32(0))));
+        assert!(!answer("Spice.ai", None));
+        assert!(!answer("Some Other Server", Some(SqlInfoValue::Int32(1))));
+        assert!(!answer("spice.ai", Some(SqlInfoValue::Int32(1))));
     }
 
     fn batch(nullable: bool, values: Vec<Option<i64>>) -> RecordBatch {
