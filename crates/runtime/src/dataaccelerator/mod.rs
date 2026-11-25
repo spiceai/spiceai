@@ -598,19 +598,27 @@ mod test {
                 let acceleration_settings = Acceleration {
                     enabled: true,
                     mode: Mode::Memory,
-                    engine: Engine::Arrow,
-                    params: HashMap::from([("arrow_key".to_string(), "${ env:KEY }".to_string())]),
+                    engine: Engine::Cayenne,
+                    params: HashMap::from([(
+                        "cayenne_key".to_string(),
+                        "${ env:KEY }".to_string(),
+                    )]),
                     ..Acceleration::default()
                 };
+                // Cayenne creates a table only for a source.
+                let source = runtime_acceleration::testing::TestAccelerationSource::new(
+                    "cayenne_secret_expansion",
+                )
+                .with_acceleration(acceleration_settings.clone());
                 runtime
                     .accelerator_engine_registry
                     .create_accelerator_table(
-                        "arrow_secret_expansion".into(),
+                        "cayenne_secret_expansion".into(),
                         schema,
                         None,
                         &acceleration_settings,
                         secrets,
-                        None,
+                        Some(&source),
                         ctx,
                     )
                     .await
@@ -759,7 +767,6 @@ mod accelerator_compat_tests {
         // Test both memory and file modes for databases
         // Format: (engine, mode, metastore_type)
         let test_configs = vec![
-            (Engine::Arrow, "memory", None),
             (Engine::Cayenne, "memory", None),
             (Engine::Cayenne, "file", Some("sqlite")), // Cayenne with SQLite metastore
         ];

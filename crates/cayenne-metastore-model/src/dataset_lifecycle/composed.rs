@@ -4,6 +4,7 @@
 //! Shared file lifecycle with prepared mutations, reads bounded by retention, or byte-batch recovery.
 use super::{
     Action as LocalAction, Data, File, Keys, Op, Protocol as Local, Record, Rows, State as Dataset,
+    draw_dataset, rows_text,
 };
 use crate::core::{Store, record};
 use stateright::{Model, Property};
@@ -691,6 +692,111 @@ impl Model for Protocol {
             }
         }
         (n != *s).then_some(n)
+    }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Local(a) => self.local().format_action(a),
+            Action::RebaseBuffer => "rebase buffered sequence numbers past the head".into(),
+            Action::Prepare => "prepare the buffered operations (two-phase)".into(),
+            Action::Decide(true) => "the transaction decides: commit".into(),
+            Action::Decide(false) => "the transaction decides: abort".into(),
+            Action::Resolve => "resolve the prepared operations".into(),
+            Action::CollectPrepared => "collect the prepared operations' objects".into(),
+            Action::SelectRows => "collection selects removed, unreferenced objects".into(),
+            Action::Tick => "the clock advances".into(),
+            Action::Dispatch => "the query requests its next file".into(),
+            Action::Complete => "the query's file read completes".into(),
+            Action::Observe => "observe a stable cut of the byte window".into(),
+            Action::Seal(j) => format!("upload observed cut {j} as a batch"),
+            Action::PublishFloor(c) => format!("publish a checkpoint and move the floor to {c}"),
+            Action::CollectStorage => "collect batches and pages below the retained floor".into(),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        let result = match &s.result {
+            None => "running".to_string(),
+            Some(Ok(rows)) => format!("rows {}", rows_text(rows)),
+            Some(Err(())) => "error".to_string(),
+        };
+        Some(crate::explorer::summary(&[
+            format!("reader sees:  {}", rows_text(&s.dataset.data.rows())),
+            format!("source says:  {}", rows_text(&s.dataset.oracle)),
+            format!(
+                "query: started at {:?}, file {} of its snapshot, waiting on {:?}, result {result}",
+                s.dataset.queries.first(),
+                s.cursor,
+                s.pending
+            ),
+            format!("clock {} (query retention until {})", s.clock, s.expires),
+            format!(
+                "transaction decision: {:?}, resolved {}",
+                s.decision, s.resolved
+            ),
+            crate::explorer::flags(&[
+                ("query read a missing file", s.missing_read_error),
+                ("completed after expiry", s.expired_completion),
+                ("collection while prepared", s.gc_while_prepared),
+                ("query while prepared", s.query_while_prepared),
+                ("maintenance while prepared", s.maintained_pending),
+                ("window collected", s.window_collected),
+            ]),
+        ]))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{StoreView, Svg, Tone};
+        let s = path.last_state();
+        let mut svg = Svg::new();
+        let mut bottom = draw_dataset(&s.dataset, &mut svg);
+        if let Some(v) = s.dataset.queries.first() {
+            let files: Vec<String> = Self::scan_files(&s.dataset.versions[*v])
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    let mark = if i < s.cursor {
+                        "read"
+                    } else if s.pending == Some(f.id) {
+                        "requested"
+                    } else {
+                        "to read"
+                    };
+                    format!("#{} t{}.k{} ({mark})", f.id, f.table, f.key)
+                })
+                .collect();
+            // "snapshot rows or error" allows an error (a missing delayed object
+            // erroring is a witness), so an error is drawn as an outcome, not a
+            // violation; wrong rows show in the summary against the source.
+            let wrong = !crate::explorer::holds(self, s, "snapshot rows or error");
+            let tone = if wrong {
+                Tone::Bad
+            } else if s.result == Some(Err(())) {
+                Tone::Gone
+            } else {
+                Tone::Actor
+            };
+            bottom = svg
+                .node(
+                    0,
+                    bottom + 20,
+                    0,
+                    &format!(
+                        "QUERY on commit {v} (retained until clock {}){}",
+                        s.expires,
+                        if wrong { " - WRONG ROWS" } else { "" }
+                    ),
+                    &files,
+                    tone,
+                )
+                .bottom();
+        }
+        if self.bytes() {
+            let mut view = StoreView::of("BYTE-WINDOW STORAGE (journal records)", &s.store, |r| {
+                format!("c{}", r.2)
+            });
+            view.pin("query's captured head", s.captured.as_ref());
+            view.draw(&mut svg, 0, bottom + 24);
+        }
+        Some(svg.finish())
     }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![

@@ -2611,6 +2611,16 @@ impl MetadataCatalog for CayenneCatalog {
         crate::provider::append_commit::commit_transaction(txn, publications[0].table_id).await
     }
 
+    fn data_write_gate(&self, _table_id: &str) -> crate::catalog::DataWriteGate {
+        // One process writes a SQLite metastore's tables.
+        crate::catalog::DataWriteGate::open()
+    }
+
+    async fn follow_commits(&self, _table_id: &str) -> CatalogResult<u64> {
+        // One process writes a SQLite metastore; its state is always current.
+        Ok(0)
+    }
+
     async fn init(&self) -> CatalogResult<()> {
         // Create database directory if it doesn't exist.
         //
@@ -4148,6 +4158,7 @@ impl MetadataCatalog for CayenneCatalog {
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
         delete_files: &[crate::metadata::DeleteFile],
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()> {
         // Same retry-on-conflict shape as commit_compaction; the only
         // additional work happens inside the transaction via
@@ -4169,10 +4180,22 @@ impl MetadataCatalog for CayenneCatalog {
                 }
             })?;
 
-            match self
-                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id, inlined, delete_files)
+            let applied = async {
+                if let Some(files) = files {
+                    self.replace_snapshot_files_in_txn(&mut *tx, table_id, new_snapshot_id, files)
+                        .await?;
+                }
+                self.commit_overwrite_in_txn(
+                    &mut *tx,
+                    table_id,
+                    new_snapshot_id,
+                    inlined,
+                    delete_files,
+                )
                 .await
-            {
+            }
+            .await;
+            match applied {
                 Ok(()) => match tx.commit().await {
                     Ok(()) => return Ok(()),
                     Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {

@@ -7,7 +7,8 @@ It is a finite protocol abstraction, not the Spice engine or an object-store imp
 Lifecycle and coverage start with one live row per key, with two valid tier
 placements preserving warm-subset and cold-file witnesses. Live-row counts are
 checked independently of value selection and count identical physical rows.
-No model check runs through `cargo test`.
+No model check runs through `cargo test`; it runs the Explorer render test and
+the mem-tier trace replays.
 The `seq-order-two-writers-*` runs are the concurrent-ingest scenarios of
 Milestone 3.
 
@@ -17,6 +18,35 @@ nice -n 10 cargo run --release -p cayenne-metastore-model -- quick
 EXHAUST=1 nice -n 10 cargo run --release -p cayenne-metastore-model -- all
 nice -n 10 cargo run --release -p cayenne-metastore-model -- run seq-order-two-writers-2-exhaust
 EXHAUST=1 nice -n 10 cargo run --release -p cayenne-metastore-model -- run seq-order-no-shift
+```
+
+## Run kinds
+
+Every run demonstrates one of five things; `list` prints the kind first, and
+`RESULT` lines carry `kind=`:
+
+| Kind | What the run shows | How it is declared |
+|---|---|---|
+| `holds` | The design's properties hold: exhaustively within the bound, or not violated on a simulation run's sampled paths (a sampled run has a seed and cannot establish exhaustive safety) | No expected failure |
+| `rule-required` | A safeguard or an assumption is removed and the run must find the named failure, so the design needs it | An expected failure |
+| `rule-not-required` | A safeguard or an assumption is removed and every property still holds, so the design does not need it for safety in that graph | `RULE_NOT_REQUIRED` in `src/lib.rs` |
+| `stronger-property` | The run checks a property stronger than the design guarantees and must find the named failure; no safeguard is removed, so the failure is not evidence that the design needs a rule | `STRONGER_PROPERTIES` in `src/lib.rs` |
+| `current-defect` | The model follows the current code, not the design, and reproduces a known defect in it | `CURRENT_DEFECTS` in `src/lib.rs` |
+
+Separately, a run is `replayed` when the implementation's own tests replay its
+traces: the trace files under `crates/cayenne/tests/traces` and
+`crates/object_store_occ/tests/traces`, and the runs `crates/cayenne`'s mem-tier
+replay names. Those runs check the code; every other run checks the design.
+`REPLAYED_AGAINST_CODE` lists them, and a test keeps that list equal to the runs
+the replay files name. Another test requires every run whose mode names a
+removal (`-no-`, `-ignores-` or `-without-`) and still holds to be listed as
+`rule-not-required`; removals named otherwise, such as `standby-early-safety`,
+are listed by hand.
+
+```sh
+target/release/cayenne-metastore-model list rule-not-required
+target/release/cayenne-metastore-model list current-defect
+target/release/cayenne-metastore-model list replayed
 ```
 
 `cite-check` checks the design documents' model citations: every code span
@@ -34,7 +64,74 @@ Retirement graphs have a 30-minute watchdog for the combined scan, restore-point
 and retention-clock interleavings; other graphs keep the 9-minute watchdog.
 A watchdog timeout is incomplete, never an exhaustive safety result.
 
-Checkers use 6 threads by default; set `MODEL_THREADS` to change it. Results do not depend on the thread count, and the binary uses mimalloc, because cloning states dominates checking. Models list candidate actions and reject disabled ones in `next_state`, so each successor is computed once; simulation runs, whose checker cannot replay a rejected pick, list only enabled actions. Controls require `EXHAUST=1`. A control stops once it has found its expected failure and every witness it must reach; its other safety properties print `NOT_FOUND`, not `HOLDS`, because the rest of its graph is not explored. A wrong outcome, missing
+## Exploring runs in the Stateright Explorer
+
+`serve <run> [address]` checks a run as `run` does, then serves the
+[Stateright Explorer](https://docs.rs/stateright/0.31.0/stateright/struct.CheckerBuilder.html#method.serve)
+on `address` (default `127.0.0.1:3000`) until stopped. Use it to walk someone
+through a counterexample or a witness, or to step a model by hand.
+
+```sh
+cargo build --release -p cayenne-metastore-model
+target/release/cayenne-metastore-model serve mem-tier-current-3-exhaust
+target/release/cayenne-metastore-model serve standby 127.0.0.1:3001
+```
+
+For each failed or reached property the run prints an `EXPLORE` line whose link
+opens the minimized trace in the Explorer:
+
+```text
+EXPLORE FAIL recovered reads match the source http://127.0.0.1:3000/#/steps/0/6/6/3/1/7/6/6/2/2/2/2/2/2
+```
+
+From any step the Explorer lists the enabled actions, so a trace can be extended
+by hand. Controls do not need `EXHAUST=1` when served, since their counterexample
+is usually what is worth showing. The Explorer's own "Run to completion"
+re-explores the graph without the run's symmetry reduction or early stop, so on
+large runs prefer the printed links.
+
+**What the Explorer shows.** Every model names its actions in plain language
+(the path and the next-action list) and, under "Current State", summarizes the
+facts its drawing leaves out: the serial history or source, what a reader sees
+next to what the source says, and the witness and violation flags that are set.
+"Complete State?" still shows the raw `Debug` state. Most models also draw their
+state; the drawings live in `src/explorer.rs` and come in three kinds: Action labels describe the protocol's own step. Where a control changes what a
+step visibly publishes (a split staging call, a late stamp, a takeover without a
+head generation, an A record with no intent, data and position in two commits),
+the label says so; where a control only removes a guard inside the step, the label
+is the protocol's, and the control's run and its row in the controls tables below
+say what it removes. Red never depends on a label: it comes from the model's own
+properties.
+
+| Drawing | What it shows | Families |
+|---|---|---|
+| Object store | The head (floor, batch index, inline window) with arrows to the batch objects it indexes and the checkpoint root; staged roots, observed cuts and unreferenced or collected batches; a running query's or reader's captured head and the batches it still needs | `window`, `floors`, `commits`, `transactions`, `concurrent`, the byte window of `lifecycle-composed` |
+| Table layout | The dataset head (sequence highs, delete vectors, key page, prepared operations) with arrows to each file by tier, the files each delete vector hides, and stored objects the head does not reference (or references but are missing); in-flight maintenance plans, checkpoints and queries | `dataset-lifecycle`, `remote-maintenance`, `cold-promotion`, `lifecycle-composed`; `mem-tier` draws its durable catalog, memory tier and restart result the same way |
+| Trace timeline | One lane per actor (instances, writers, the lease object, heads, GC, replication, readers) and one row per step, with the current state in boxes above | `standby`, `intent-roll-forward` (with each intent in A pointing at the record that applies it in B), `reads`, `retention`, `replicas`, `source-positions`, `seq-order`, `read-programs`, `mem-tier`; `object-names` draws head references pointing at named objects, and `data-files` draws the head's live and retired files pointing at the stored files (orphans, deletes in flight, and missing files in red) above a timeline of writers, the store, readers and the sweep |
+
+Colors: white is committed (referenced by the authoritative head), dashed yellow
+is written but not referenced or in flight, grey is collected or superseded, red
+is missing or violated (a duplicate live key, a reference to a missing object, a
+restart that disagrees with the source) or a crash or pause in a timeline, and
+green is an actor. Red follows the properties: an outcome a property allows, such
+as a query error once its retention has passed or live rows that lag the source
+while recovery redelivers it, is not drawn red, and a red read says which property
+it breaks (a failure within the window, or wrong rows from a missing object read
+as empty). In every timeline, a step after which one of the model's `always`
+properties no longer holds is drawn red with `BREAKS <property>`, evaluated by the
+model's own property, not by the drawing. `position-deletes`,
+`state-rules`, `read-delivery`, `predicate-progress` and `action-compatibility`
+show text only.
+
+The drawings read state fields and call the model's own functions (`visible`,
+`recovered_rows`, `reference`); they never re-derive the protocol, and the
+checker never calls them, so they cannot change what is checked.
+`cargo test -p cayenne-metastore-model` walks every run along seeded random
+paths and renders each step as the Explorer does (every enabled action's label
+and text, and the drawing), failing on a panic, an empty label, malformed SVG,
+or a family that stops drawing.
+
+Checkers use 6 threads by default; set `MODEL_THREADS` to change it. Results do not depend on the thread count, and the binary uses mimalloc, because cloning states dominates checking. Models list candidate actions and reject disabled ones in `next_state`, so each successor is computed once; simulation runs, whose checker cannot replay a rejected pick, list only enabled actions. Every run whose kind is not `holds` requires `EXHAUST=1`; the README calls these controls. A control stops once it has found its expected failure and every witness it must reach; its other safety properties print `NOT_FOUND`, not `HOLDS`, because the rest of its graph is not explored. A wrong outcome, missing
 required control failure, invalid witness, or checker timeout makes the command fail.
 A sampled run reports `NOT_FOUND`, which does not establish exhaustive safety.
 New exhaustive safe graphs require their essential reachability witnesses; missing
@@ -178,7 +275,9 @@ as a separate maintenance process does.
 
 ## Negative controls
 
-`list` prints every individual bound, seed and expected downstream failure.
+`list` prints every individual bound, seed and expected downstream failure. Rows below
+that hold are `rule-not-required` runs, `replicas-readers-adoption-all-present`
+is a `stronger-property` run, and the rest are `rule-required`.
 
 | Control suffix | Removed safeguard and required downstream failure |
 |---|---|
@@ -955,12 +1054,27 @@ write their usual reinsert vector stamps and precomputed insert records.
 publication of every staged catalog call. Its `Flush` is idempotent and has no
 durability effect; the object-native run also accepts an empty `Flush`.
 
-All four negative controls are based on `mem-tier-seal-delete-only`. They keep
-requiring their named downstream failure even if exhaustive exploration finds
-none; a missing failure is reported rather than relabeled safe or hidden. Bounds
-are three source applies, one seal, two explicit checkpoints, one bake attempt,
+All four mutations are based on `mem-tier-seal-delete-only`. Three are negative
+controls: they keep requiring their named downstream failure even if exhaustive
+exploration finds none, and a missing failure is reported rather than relabeled
+safe or hidden. The fourth, `mem-tier-late-stamp`, is a `rule-not-required` run:
+it expects to hold, because its
+mutation is unobservable rather than unexplored: an insert stamp makes a row
+visible only on the current snapshot's scan, and only while no protected
+snapshot exists (`table.rs`, `InsertRecordHandling`; the key-delete pushdown
+also reads stamps, but only to skip keys before that filter), and every
+checkpoint that writes
+insert records also publishes a protected snapshot. A full rewrite removes that
+snapshot only together with every stamp at or below its cutoff. The run checks
+that a late stamp stays safe under that rule; the
+[object-native design](../../docs/design/object-native-metastore-technical.md#commit-numbers-and-sequence-numbers)
+records why a design that read the stamp elsewhere would make it required
+again. Bounds
+are three source applies, two seals, two explicit checkpoints, one bake attempt,
 one full-rewrite attempt and one crash/recovery, with budgets retained across
-restart. Six threads and the shared 540-second watchdog apply.
+restart. The second seal is what lets a later seal acknowledge an apply that
+landed while an earlier seal was in flight; with one seal, the source redelivers
+that apply after a restart and `no-capture-reservation` has nothing to break. Six threads and the shared 540-second watchdog apply.
 
 ```sh
 nice -n 10 cargo build --release -p cayenne-metastore-model
@@ -1021,7 +1135,12 @@ records are stored separately in the symbolic catalog so this distinction also
 holds during recovery. Unreferenced physical file reclamation is not modeled.
 
 The bake merges all protected snapshots using partial deletion filters, tags the
-output with the capped delete fence, and prunes only the RAM index at that fence.
+output with the capped delete fence, and prunes only the RAM index, at or below
+the lower of that fence and the highest sequence among the snapshots it folds
+(`table.rs::bake_seq_prefix_protected_snapshots_inner`; the engine also caps it
+below its cold-tier files, which the model does not have). A tombstone above the
+folded snapshots may still hide an inline seal shadow, which the bake does not
+fold.
 It retains durable vectors and insert records. The replay configures the
 existing `compaction_trigger_protected_snapshots` threshold to 2, so the engine
 keeps zero recent snapshots. The model enables `Bake` only with at least two
@@ -1055,7 +1174,7 @@ The optional `protected survivor excluded by pushdown` diagnostic is hypothesis 
 | `mem-tier-no-one-call` | Stage seal shadow before pure vectors; stage checkpoint insert records after snapshot/vectors/clear, allowing flush/crash between | `recovered reads match the source` |
 | `mem-tier-no-insert-records` | Omit checkpoint insert records and hidden-key RAM upgrade, retaining checkpoint vector stamps | `recovered reads match the source` |
 | `mem-tier-no-capture-reservation` | Reserve the pure-delete seal's shadow sequence after releasing capture | `recovered reads match the source` |
-| `mem-tier-late-stamp` | Reserve a fresh insert-record stamp at checkpoint staging after a post-capture apply | `recovered reads match the source` |
+| `mem-tier-late-stamp` | Reserve a fresh insert-record stamp at checkpoint staging after a post-capture apply | none: holds (see above) |
 
 Control names retain their original API; their modes have the
 `mem-tier-seal-delete-only-no-` prefix (`no-early-stamp` for late stamping).

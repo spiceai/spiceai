@@ -502,7 +502,9 @@ mod delta {
                 tracing::warn!("{}", table.catalog_managed_skip_warning());
                 return None;
             }
-            let storage_location = table.storage_location.as_deref()?;
+            // Refused here, before vending, because a table that cannot be vended
+            // falls back to `DeltaTable::from`, which would open any location.
+            let storage_location = table.object_storage_location()?;
             // Don't append a trailing slash here — `DeltaTable::from` calls
             // `ensure_folder_location` which already adds one when needed.
             Some(TableReference::bare(storage_location.to_string()))
@@ -684,6 +686,26 @@ mod tests {
                 assert!(
                     err.to_string().contains(scheme),
                     "error message missing scheme '{scheme}': {err}"
+                );
+            }
+        }
+
+        /// Every scheme a catalog table may be read from must be one vending can
+        /// build a store for, so vending never refuses a location that
+        /// `UCTable::object_storage_location` accepted.
+        #[tokio::test]
+        async fn test_supported_storage_schemes_are_vendable() {
+            for scheme in crate::unity_catalog::SUPPORTED_STORAGE_SCHEMES {
+                let url = Url::parse(&format!(
+                    "{scheme}://container@account.dfs.core.windows.net/path"
+                ))
+                .expect("valid url");
+                let result =
+                    vended_object_store(&url, dummy_credentials(), Some("us-west-2".to_string()))
+                        .await;
+                assert!(
+                    !matches!(result, Err(Error::UnsupportedScheme { .. })),
+                    "vending refuses supported scheme '{scheme}'"
                 );
             }
         }
