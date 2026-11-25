@@ -256,14 +256,16 @@ impl Model for Protocol {
                     }
                     a.push(Action::UpsertKey(k));
                 }
-                for mask in 1..1 << s.files.len() {
-                    if s.files
-                        .iter()
-                        .enumerate()
-                        .any(|(i, f)| !f.cold && mask & (1 << i) != 0)
-                    {
-                        a.push(Action::Compact(mask));
-                    }
+                // `rewrite` compacts warm files only, so a mask with a cold bit
+                // repeats the successor of the same mask without it.
+                let cold = s
+                    .files
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, f)| f.cold)
+                    .fold(0, |m, (i, _)| m | 1 << i);
+                for mask in (1..1 << s.files.len()).filter(|mask| mask & cold == 0) {
+                    a.push(Action::Compact(mask));
                 }
                 if s.files.iter().any(|f| f.cold) {
                     a.push(Action::Promote);

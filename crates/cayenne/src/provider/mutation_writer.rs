@@ -64,7 +64,6 @@ limitations under the License.
 //! exceeded.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use arrow::record_batch::RecordBatch;
@@ -1999,9 +1998,7 @@ impl<'a> AppendMutationWriter<'a> {
             // staging directory. Mark it "dirty" so recovery/root cleanup
             // (on this or a future writer, or on recovery after a crash) will
             // actually perform the cleanup instead of taking the fast path.
-            self.table
-                .staging_may_have_files()
-                .store(true, Ordering::Release);
+            self.table.mark_staging_may_have_files(&staging_snapshot_id);
         }
 
         let write_start = Instant::now();
@@ -2116,11 +2113,8 @@ impl<'a> AppendMutationWriter<'a> {
         Arc<ColumnStatsAccumulator>,
         PreparedStagedAppend,
     )> {
-        if !self.table.is_final_key_write(&target.staging_snapshot_id) {
-            self.table
-                .staging_may_have_files()
-                .store(true, Ordering::Release);
-        }
+        self.table
+            .mark_staging_may_have_files(&target.staging_snapshot_id);
 
         // IVM staged capture (Edit B): when the table has a retraction-capable
         // maintained aggregate, buffer the insert batches and re-stream them into

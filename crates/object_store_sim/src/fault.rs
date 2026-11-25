@@ -22,8 +22,8 @@
 //!
 //! Two more controls serve protocol replays: a read gate that holds plain GETs
 //! of chosen paths, so a reader can read a head and fetch what it lists later,
-//! and a store clock that runs ahead, stamping each object's `LastModified`
-//! when it is written, as a real store does.
+//! and a store clock that runs ahead of or behind the process's, stamping each
+//! object's `LastModified` when it is written, as a real store does.
 use std::{
     collections::{BTreeMap, HashMap},
     fmt,
@@ -99,10 +99,13 @@ struct State {
     blocked: Vec<(Path, PutPayload, PutOptions)>,
     /// Plain GETs of matching paths wait here until the gate opens.
     read_gate: Option<Predicate>,
+    /// Whether conditional GETs (`If-None-Match` polls) wait at the gate too.
+    gate_polls: bool,
     /// GETs waiting at the gate now.
     gated: usize,
     /// How far the store's clock runs ahead of the inner store's, in
-    /// milliseconds. Each write takes the offset current when it lands.
+    /// milliseconds; negative when it runs behind. Each write takes the offset
+    /// current when it lands.
     clock_offset_ms: i64,
     /// The clock offset each object was last written at, which every GET, HEAD
     /// and LIST adds to its `LastModified`, so an object's time stays fixed
@@ -335,9 +338,22 @@ impl FaultStore {
         self.shared.state.lock().read_gate = Some(Arc::new(predicate));
     }
 
+    /// Hold conditional GETs (`If-None-Match` polls) of matching paths before
+    /// I/O until [`Self::open_reads`], as [`Self::gate_reads`] holds plain ones,
+    /// so a poll can be caught in flight.
+    pub fn gate_polls(&self, predicate: impl Fn(&Path) -> bool + Send + Sync + 'static) {
+        let mut state = self.shared.state.lock();
+        state.read_gate = Some(Arc::new(predicate));
+        state.gate_polls = true;
+    }
+
     /// Release every GET held at the gate, and stop holding new ones.
     pub fn open_reads(&self) {
-        self.shared.state.lock().read_gate = None;
+        {
+            let mut state = self.shared.state.lock();
+            state.read_gate = None;
+            state.gate_polls = false;
+        }
         self.shared.reads_opened.notify_waiters();
     }
 
@@ -359,6 +375,15 @@ impl FaultStore {
         let by = i64::try_from(by.as_millis()).unwrap_or(i64::MAX);
         let mut state = self.shared.state.lock();
         state.clock_offset_ms = state.clock_offset_ms.saturating_add(by);
+    }
+
+    /// Run the store's clock behind by `by`: an object written from now on
+    /// carries a `LastModified` that much earlier than the inner store gives
+    /// it, as a store whose clock lags the process's does.
+    pub fn set_clock_back(&self, by: std::time::Duration) {
+        let by = i64::try_from(by.as_millis()).unwrap_or(i64::MAX);
+        let mut state = self.shared.state.lock();
+        state.clock_offset_ms = state.clock_offset_ms.saturating_sub(by);
     }
 
     /// Wait at the read gate while it holds `path`.
@@ -548,7 +573,9 @@ impl ObjectStore for FaultStore {
         } else {
             Op::Get
         };
-        if op == Op::Get {
+        let gated =
+            op == Op::Get || (op == Op::GetConditional && self.shared.state.lock().gate_polls);
+        if gated {
             self.wait_at_gate(path).await;
         }
         if self.shared.fault(op, path).is_some() {
