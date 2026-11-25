@@ -6326,6 +6326,7 @@ dependencies = [
  "bytes",
  "chrono",
  "connector-postgres-common",
+ "cpu-budget",
  "criterion 0.7.0",
  "dashmap",
  "dataformat-json",
