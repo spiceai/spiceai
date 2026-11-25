@@ -563,7 +563,9 @@ impl DataConnector for Debezium {
             self.batching,
             projection,
         )
-        .with_column_defaults(column_defaults);
+        .with_column_defaults(column_defaults)
+        .with_dataset_name(dataset.name.to_string())
+        .with_runtime_status(context.runtime_status());
 
         if let Some(debezium_kafka_sys) = debezium_kafka_sys {
             debezium_kafka = debezium_kafka.with_offset_commit_hook(Arc::new(

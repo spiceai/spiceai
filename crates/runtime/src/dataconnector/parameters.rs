@@ -104,6 +104,10 @@ impl ConnectorContext for RuntimeConnectorContext {
         Arc::clone(&self.app)
     }
 
+    fn runtime_status(&self) -> Arc<crate::status::RuntimeStatus> {
+        self.runtime.status()
+    }
+
     fn http_rate_control_registry(&self) -> Arc<HttpRateControlRegistry> {
         self.runtime.http_rate_control_registry()
     }
