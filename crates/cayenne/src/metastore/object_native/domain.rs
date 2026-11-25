@@ -72,6 +72,7 @@ impl WriterLease {
             path: super::WriteUnit::Dataset.lease_path(prefix),
             store: Arc::clone(store),
             dataset: Arc::from(dataset),
+            declined: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -142,6 +143,9 @@ impl Domain {
         let Some(lease) = &self.lease else {
             return false;
         };
+        if lease.declined.load(std::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
         // The lease is read and written without the log's state: a slow lease
         // request delays no query or commit.
         let role = match lease.acquire().await {
@@ -224,6 +228,44 @@ impl Domain {
         if matches!(inner.head, Head::Writer(_)) {
             inner.data_writes.set(false);
             lease.release().await;
+        }
+    }
+
+    /// Stop taking this log's writer lease, and hand it back if this instance
+    /// holds it, reading the log as a replica from then on: this instance's
+    /// Spicepod defines the dataset differently from its copy, so it must not
+    /// write the copy, and the instance whose definition matches takes the
+    /// lease over without waiting for it to lapse.
+    pub(super) async fn decline_lease(&self) {
+        let Some(lease) = &self.lease else {
+            return;
+        };
+        lease
+            .declined
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut inner = self.inner.take().await;
+        if !matches!(inner.head, Head::Writer(_)) {
+            return;
+        }
+        inner.data_writes.set(false);
+        lease.release().await;
+        if let Err(error) = inner.reload_committed().await {
+            // The gate stays closed and the next writer's head fences this one,
+            // so a reload that fails leaves nothing to write here.
+            tracing::debug!(
+                "{} handed back its writer lease, and could not reload as a replica: {error}",
+                subject(&lease.dataset)
+            );
+        }
+    }
+
+    /// Take this log's writer lease again when it is free: this instance's
+    /// Spicepod defines the dataset as its copy records it.
+    pub(super) fn accept_lease(&self) {
+        if let Some(lease) = &self.lease {
+            lease
+                .declined
+                .store(false, std::sync::atomic::Ordering::Release);
         }
     }
 

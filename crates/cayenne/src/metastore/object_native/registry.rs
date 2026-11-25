@@ -16,15 +16,17 @@ limitations under the License.
 
 //! The dataset registry and catalog routing.
 
-use super::{Domain, NativeCatalogConfig, OpenSummary, ValueChange, invalid, position};
+use super::{Domain, NativeCatalogConfig, OpenSummary, ValueChange, invalid, position, subject};
 use crate::{
     catalog::{CatalogError, CatalogResult, MetadataCatalog},
+    definition::{DatasetDefinition, DefinitionRecord},
     metadata::CreateTableOptions,
 };
 use cayenne_metastore_actions::proto;
 use futures::{StreamExt, TryStreamExt};
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload, path::Path};
 use parking_lot::RwLock;
+use prost::Message;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -39,6 +41,75 @@ pub(super) const DROPPED: &str = "dropped";
 
 /// The registry's bookkeeping key holding [`ObjectNativeCatalog::location_id`].
 const LOCATION_ID_KEY: &str = "spice_sys_location_id";
+
+/// The key in a dataset's log of the [`DefinitionRecord`] its copy was built from.
+const DEFINITION_KEY: &str = "cayenne:definition";
+
+/// The first byte of a registry entry that lists a dataset's copies. An entry was
+/// a folder name before copies recorded their definitions; a folder name is text
+/// and never starts with this byte. Nor is an entry that does valid text, so a
+/// build that reads entries as folder names refuses the location rather than
+/// misread one, and never takes a copy's folder for one nothing names.
+const COPIES_MARKER: u8 = 0xFF;
+
+/// A registry entry: the copies of one dataset. A copy per definition (#16252)
+/// adds copies here, each keyed by its definition's id; this build writes and
+/// serves one. Numbered fields are a persistent contract.
+#[derive(Clone, PartialEq, Message)]
+struct RegisteredDataset {
+    #[prost(message, repeated, tag = "1")]
+    copies: Vec<RegisteredCopy>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct RegisteredCopy {
+    /// The copy's folder under `datasets/`.
+    #[prost(string, tag = "1")]
+    folder: String,
+    /// [`DatasetDefinition::id`] of the definition the copy was built from; empty
+    /// for a copy no Spicepod defines, or one built before definitions were kept.
+    #[prost(bytes = "vec", tag = "2")]
+    definition: Vec<u8>,
+}
+
+/// The registry entry for a dataset with one copy, in `folder`.
+fn registry_entry(folder: &str, definition: Option<&DatasetDefinition>) -> Vec<u8> {
+    let entry = RegisteredDataset {
+        copies: vec![RegisteredCopy {
+            folder: folder.to_string(),
+            definition: definition.map(|d| d.id().to_vec()).unwrap_or_default(),
+        }],
+    };
+    let mut bytes = vec![COPIES_MARKER];
+    bytes.extend(entry.encode_to_vec());
+    bytes
+}
+
+/// Every copy's folder that the registry entry `value` of `dataset` names.
+pub(super) fn registered_folders(dataset: &str, value: &[u8]) -> CatalogResult<Vec<String>> {
+    let Some((&COPIES_MARKER, encoded)) = value.split_first() else {
+        return Ok(vec![String::from_utf8(value.to_vec()).map_err(invalid)?]);
+    };
+    let entry = RegisteredDataset::decode(encoded).map_err(|error| {
+        invalid(format!(
+            "{} has a registry entry this version of Spice cannot read: {error}",
+            subject(dataset)
+        ))
+    })?;
+    Ok(entry.copies.into_iter().map(|copy| copy.folder).collect())
+}
+
+/// The folder of the one copy of `dataset` this build serves.
+fn registered_folder(dataset: &str, value: &[u8]) -> CatalogResult<String> {
+    let mut folders = registered_folders(dataset, value)?;
+    match folders.len() {
+        1 => Ok(folders.remove(0)),
+        copies => Err(invalid(format!(
+            "{} has {copies} copies in the state location, one per definition, which this version of Spice does not serve. Upgrade Spice to serve it.",
+            subject(dataset)
+        ))),
+    }
+}
 
 /// The name registry and every dataset's log.
 pub struct ObjectNativeCatalog {
@@ -70,6 +141,8 @@ pub struct ObjectNativeCatalog {
     /// and resolved against it on every read, so a copy of the location opened
     /// at another URL reads its own data.
     anchor: Option<Arc<str>>,
+    /// The state location the catalog was opened at, as messages name it.
+    location: Option<Arc<str>>,
 }
 
 /// Which log holds each table.
@@ -177,9 +250,9 @@ pub async fn dataset_log_at(
     state
         .positions
         .get(&(REGISTRY.to_string(), dataset.to_string()))
-        .map(|folder| {
-            let folder = std::str::from_utf8(folder).map_err(invalid)?;
-            Ok(sibling(prefix, "datasets").join(folder))
+        .map(|entry| {
+            let folder = registered_folder(dataset, entry)?;
+            Ok(sibling(prefix, "datasets").join(folder.as_str()))
         })
         .transpose()
 }
@@ -278,7 +351,7 @@ impl ObjectNativeCatalog {
             let datasets = datasets.clone();
             let anchor = anchor.clone();
             async move {
-                let folder = String::from_utf8(folder).map_err(invalid)?;
+                let folder = registered_folder(&name, &folder)?;
                 let prefix = datasets.join(folder.as_str());
                 match store.head(&prefix.clone().join("head")).await {
                     Ok(_) => {}
@@ -329,6 +402,7 @@ impl ObjectNativeCatalog {
             dropping: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             deletion_holds: parking_lot::Mutex::new(HashMap::new()),
             anchor,
+            location: None,
         };
         catalog.recover().await?;
         catalog.reclaim().await?;
@@ -427,6 +501,20 @@ impl ObjectNativeCatalog {
             (routes.by_name.get(&name).cloned(), parent)
         };
         if let Some(domain) = existing.or(parent) {
+            let own = self
+                .routes
+                .read()
+                .datasets
+                .get(&name)
+                .is_some_and(|own| Arc::ptr_eq(own, &domain));
+            if own {
+                self.serve_only_its_definition(
+                    &name,
+                    &domain,
+                    options.vortex_config.definition.as_deref(),
+                )
+                .await?;
+            }
             let id = domain.create_table(options).await?;
             let tables = domain.tables().await;
             self.routes.write().refresh(&domain, tables);
@@ -450,11 +538,13 @@ impl ObjectNativeCatalog {
         domain.folder.clone_from(&folder);
         let domain = Arc::new(domain);
         keep_lease_while_open(&domain);
+        let definition = options.vortex_config.definition.clone();
         let id = domain.create_table(options).await?;
         // The dataset's bookkeeping kept while it had no log moves to its log,
         // which commits before the registry names it: a crash between leaves a
         // log nothing names and the values where they were.
         let moved = self.registry.positions_of(&name).await;
+        // The copy records the definition it is built from in the same commit.
         domain
             .commit_actions(
                 moved
@@ -462,11 +552,22 @@ impl ObjectNativeCatalog {
                     .map(|((source, partition), value)| {
                         position(source, partition, Some(value.clone()))
                     })
+                    .chain(definition.as_deref().map(|definition| {
+                        position(
+                            DEFINITION_KEY,
+                            "",
+                            Some(definition.record().encode_to_vec()),
+                        )
+                    }))
                     .collect(),
             )
             .await?;
         domain.commit_pending().await?;
-        let mut register = vec![position(REGISTRY, &name, Some(folder.into_bytes()))];
+        let mut register = vec![position(
+            REGISTRY,
+            &name,
+            Some(registry_entry(&folder, definition.as_deref())),
+        )];
         register.extend(
             moved
                 .iter()
@@ -478,6 +579,82 @@ impl ObjectNativeCatalog {
         routes.refresh(&domain, tables);
         routes.datasets.insert(name, domain);
         Ok(id)
+    }
+
+    /// Serve the copy of `name` in `domain` only when it was built from `requested`.
+    /// A copy built from another definition, another Spicepod's or an earlier one of
+    /// this Spicepod's, holds that definition's rows: serving it would return them,
+    /// and writing it would mix this definition's rows into them. So the instance
+    /// fails the dataset, and stops taking the copy's writer lease, so the instance
+    /// whose definition matches keeps writing it. The app name is recorded and
+    /// reported, never compared: a renamed app keeps its copies.
+    async fn serve_only_its_definition(
+        &self,
+        name: &str,
+        domain: &Arc<Domain>,
+        requested: Option<&DatasetDefinition>,
+    ) -> CatalogResult<()> {
+        let Some(requested) = requested else {
+            return Ok(());
+        };
+        let Some(stored) = domain.sidecar_value(DEFINITION_KEY).await? else {
+            // A copy built before copies recorded their definitions: it takes this
+            // one, recorded by the instance that writes it.
+            domain.accept_lease();
+            self.record_definition(name, domain, requested).await;
+            return Ok(());
+        };
+        let stored = DefinitionRecord::decode_stored(&stored)
+            .map_err(|reason| invalid(format!("{} cannot be opened: {reason}", subject(name))))?;
+        let changes = stored.changes(requested);
+        if !changes.is_empty() {
+            domain.decline_lease().await;
+            return Err(CatalogError::DefinitionChanged {
+                table_name: name.to_string(),
+                location: self.location(),
+                changes: changes.join(", "),
+            });
+        }
+        domain.accept_lease();
+        if !stored.app.is_empty() && stored.app != requested.app() {
+            tracing::info!(
+                "{}",
+                super::app_changed_message(name, &stored.app, &self.location(), requested.app())
+            );
+        }
+        // The same definition, under another app name or with a setting written
+        // another way that reads the same value: recorded as it is now, so a later
+        // change is named against the current Spicepod.
+        if stored != requested.record() {
+            self.record_definition(name, domain, requested).await;
+        }
+        Ok(())
+    }
+
+    /// Record `definition`, with its app, as the one `name`'s copy was built from,
+    /// when this instance writes the copy; a replica records nothing.
+    async fn record_definition(&self, name: &str, domain: &Domain, definition: &DatasetDefinition) {
+        if !domain.data_writes.allows() {
+            return;
+        }
+        if let Err(error) = domain
+            .set_sidecar_value(DEFINITION_KEY, Some(definition.record().encode_to_vec()))
+            .await
+        {
+            tracing::warn!(
+                "{} could not record that app '{}' now uses its copy, so its next load compares with, and reports, the copy's previous record again. Cause: {error}",
+                subject(name),
+                definition.app()
+            );
+        }
+    }
+
+    /// The state location, as messages name it.
+    fn location(&self) -> String {
+        self.location
+            .as_deref()
+            .or(self.anchor.as_deref())
+            .map_or_else(|| self.prefix.to_string(), str::to_string)
     }
 
     /// Dropping a dataset removes its name from the registry, which ends its
@@ -677,7 +854,7 @@ impl ObjectNativeCatalog {
         config: NativeCatalogConfig,
     ) -> CatalogResult<Self> {
         let anchor = location_anchor(location, &prefix);
-        let (catalog, verb) = match store.head(&prefix.clone().join("head")).await {
+        let (mut catalog, verb) = match store.head(&prefix.clone().join("head")).await {
             Ok(_) => (
                 Self::open_at(store, prefix, config, anchor).await?,
                 "Opened",
@@ -688,6 +865,7 @@ impl ObjectNativeCatalog {
             ),
             Err(error) => return Err(invalid(error)),
         };
+        catalog.location = Some(Arc::from(location.trim_end_matches('/')));
         let (datasets, tables, replayed) = catalog.summary();
         let OpenSummary { lease, .. } = catalog.registry.opened;
         tracing::info!(
@@ -743,7 +921,7 @@ impl ObjectNativeCatalog {
             if self.routes.read().datasets.contains_key(&name) {
                 continue;
             }
-            let folder = String::from_utf8(folder).map_err(invalid)?;
+            let folder = registered_folder(&name, &folder)?;
             let prefix = self.datasets.clone().join(folder.as_str());
             match self.store.head(&prefix.clone().join("head")).await {
                 Ok(_) => {}

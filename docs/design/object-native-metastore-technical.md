@@ -149,7 +149,7 @@ Internal constants, not head fields and not user settings:
 | S | Staleness bound for a head confirmation | Per dataset, from its freshness need |
 | T_O | Age limit for uncommitted uploads | About a day |
 | Margin | Allowance in the writer's age check for one-second timestamps and skew between the store's servers | Set in step 1 |
-| Evidence horizon | Retention of attempt ids in checkpoint roots, measured as the head's store time | T_O |
+| Evidence horizon | Retention of attempt ids in checkpoint roots, measured on the store time of the batch each checkpoint ends at | T_O |
 
 The budgets must satisfy R ≤ B and H ≥ B + R + M; otherwise the record that makes
 a batch final may not fit beside it. H ≥ B + R is not enough, because the head's
@@ -312,8 +312,11 @@ attempt, while a **new attempt** has a fresh id and may carry re-planned bytes.
   unresolved*: it is never retried, as a database reports a connection dropped
   during `COMMIT`. Nothing is lost: it was never acknowledged, and a CDC position
   commits with its data, so a new owner resumes from the head and the source
-  re-delivers the rest. The horizon is T_O, measured on the head's store time,
-  and checkpoint roots drop older attempt ids, which bounds their size. Any
+  re-delivers the rest. The horizon is T_O, measured on the store time of the
+  batch a checkpoint ends at, and checkpoint roots drop older attempt ids, which
+  bounds their size. That batch is immutable, so a checkpoint's bytes are a
+  function of the log: a writer that stages a checkpoint again, after one that
+  landed without being recorded, finds an equal object. Any
   horizon is safe, because past it resolution reports unresolved, never
   rejected. T_O covers every retry that references an upload, since the age
   check refuses older uploads.

@@ -276,6 +276,18 @@ pub enum CatalogError {
     ))]
     PkConflictDetectionEnabledOnExistingTable { table_name: String },
 
+    /// The dataset's copy in a shared state location was built from a different
+    /// definition than the one requested (see [`crate::DatasetDefinition`]): opening it
+    /// would serve, and then write, one definition's rows in another's copy.
+    #[snafu(display(
+        "Failed to load dataset '{table_name}' (cayenne): its copy in the state location '{location}' was built from a different definition ({changes}), so this instance neither serves nor writes it rather than mix rows from two definitions in one copy. Revert the change. To replace the copy for every instance that shares the location, restart once with `acceleration.mode: file_create`, which rebuilds it from the source; to keep both, give this Spicepod its own `runtime.state.location`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    DefinitionChanged {
+        table_name: String,
+        location: String,
+        changes: String,
+    },
+
     /// [`Self::PkConflictDetectionEnabledOnExistingTable`] for a table the caller would
     /// rebuild, but holds until its source can be read
     /// (`SettingsChangeAction::HoldUntilSourceReadable`): the stored rows cannot be

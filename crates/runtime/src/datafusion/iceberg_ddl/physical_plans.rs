@@ -162,6 +162,11 @@ impl AccelerationSource for IcebergDdlAccelerationSource {
         None
     }
 
+    fn definition(&self) -> Option<runtime_acceleration::SourceDefinition> {
+        // A table created by DDL has no Spicepod definition.
+        None
+    }
+
     fn allows_write(&self) -> bool {
         // The point of the table is to be written by DML, so a scan of it must always
         // read its own writes.

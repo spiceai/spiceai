@@ -162,8 +162,10 @@ pub(super) struct Checkpoint {
     pub incarnation: Vec<u8>,
     #[prost(uint64, tag = "4")]
     pub commit: u64,
-    /// For each of `attempts`, the head's store time (Unix milliseconds) at the
-    /// first checkpoint that listed it: no earlier than its acceptance.
+    /// For each of `attempts`, the store time (Unix milliseconds) of the batch
+    /// that ends at the first checkpoint that listed it: no earlier than its
+    /// acceptance, since a batch is copied from a published head. Every writer
+    /// reads the same time for a given checkpoint, so its bytes are fixed.
     #[prost(uint64, repeated, tag = "5")]
     pub seen_ms: Vec<u64>,
 }

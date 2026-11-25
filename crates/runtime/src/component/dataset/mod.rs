@@ -214,6 +214,15 @@ impl AccelerationSource for Dataset {
         Some(self.on_schema_change)
     }
 
+    fn definition(&self) -> Option<runtime_acceleration::SourceDefinition> {
+        Some(runtime_acceleration::SourceDefinition {
+            from: self.from.clone(),
+            params: self.params.clone(),
+            refresh_sql: self.refresh_sql(),
+            columns: runtime_acceleration::SourceDefinition::declared_columns(&self.columns),
+        })
+    }
+
     fn allows_write(&self) -> bool {
         // A read-write dataset requires BOTH `access: read_write` and a ReadWrite API
         // key, and `access()` is the check that folds those together.

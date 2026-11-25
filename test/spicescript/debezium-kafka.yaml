@@ -186,4 +186,9 @@ steps:
   - source-query: { kafka: "last() { timeout 10 rpk topic consume ${sources.src.namespace}.public.t -X brokers=127.0.0.1:9093 -o -1 -n 1 -f '%v'; }; for i in $(seq 1 120); do last | grep -q '\"n\":5000' && break; sleep 1; done; last | grep -c '\"n\":5000'" }
     expect: { rows: [['1']] }
   - start: { patch: { datasets: { t: { params: { batch_max_size: '1' } } } } }
+    except: object-native
+  # In the object-native metastore the copy records its connection settings, so
+  # a new `batch_max_size` would be another definition (#16246).
+  - start: {}
+    only: object-native
   - query: SELECT * FROM t

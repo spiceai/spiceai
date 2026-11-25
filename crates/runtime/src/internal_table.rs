@@ -203,6 +203,11 @@ impl AccelerationSource for InternalAccelerationSource {
         None
     }
 
+    fn definition(&self) -> Option<runtime_acceleration::SourceDefinition> {
+        // No Spicepod defines an internal table: the runtime does.
+        None
+    }
+
     fn allows_write(&self) -> bool {
         // The runtime writes these tables directly, so a scan must read its own writes.
         true

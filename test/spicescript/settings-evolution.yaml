@@ -131,6 +131,23 @@ steps:
 
   - restart:
       patch: { datasets: { trips: { acceleration: { primary_key: '(id, city)' } } } }
+    except: object-native
+  # In the object-native metastore a copy records its definition, and a new
+  # primary key is another one (#16246): the dataset fails, naming the setting,
+  # until `mode: file_create` rebuilds the copy from the source.
+  - restart:
+      ready: false
+      patch: { datasets: { trips: { acceleration: { primary_key: '(id, city)' } } } }
+    only: object-native
+  - assert-status: { dataset: trips, status: Error, message-contains: "(`primary_key` changed)" }
+    eventually: 60s
+    only: object-native
+  - restart:
+      patch: { datasets: { trips: { acceleration: { mode: file_create } } } }
+    only: object-native
+  - restart:
+      patch: { datasets: { trips: { acceleration: { mode: file } } } }
+    only: object-native
   - query: SELECT * FROM trips
     eventually: 60s
   - source-exec: { src: "UPDATE trips SET note = 'rekeyed' WHERE id % 97 = 5; INSERT INTO trips VALUES (10005, 'city 5', 49.99, NULL); DELETE FROM trips WHERE id = 50" }

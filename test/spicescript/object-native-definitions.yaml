@@ -1,0 +1,180 @@
+name: object-native-definitions
+description: >
+  Two Spicepods, apps 'shop' and 'store', run on one state location. Both
+  declare a dataset 'orders' with the same `from`, each read from its own
+  Postgres server, and both declare 'common' from the same server. The copy of
+  'orders' records the definition it was built from, connection settings
+  included, so the second app's 'orders' fails with an error naming the setting
+  that differs, never its value, and neither app's rows ever appear in the
+  other's results. 'common' has one definition, so the second app serves the
+  first app's copy. The app that cannot serve 'orders' never takes over writing
+  it: with the first app stopped and started again, its 'orders' follows its
+  source. Renaming the first app keeps its copies, and changing only
+  `refresh_sql` is a different definition. Every answer is checked against its
+  own source.
+
+sources:
+  # Two Postgres servers with the same table name and schema, different rows.
+  shop_db: { kind: postgres, shared: true }
+  store_db: { kind: postgres, shared: true }
+  # Its shared bucket holds the state location both apps use.
+  lake: { kind: rustfs }
+
+variants:
+  shop:
+    datasets: { orders: { params: '${sources.shop_db.params}' } }
+  store:
+    spicepod: { name: store }
+    datasets: { orders: { params: '${sources.store_db.params}' } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: shop
+  runtime:
+    params: { cayenne_vnext: enabled }
+    state:
+      location: s3://${sources.lake.shared_bucket}/state/
+      params:
+        s3_endpoint: ${sources.lake.endpoint}
+        s3_region: us-east-1
+        s3_auth: key
+        s3_key: ${sources.lake.key}
+        s3_secret: ${sources.lake.secret}
+        allow_http: 'true'
+  datasets:
+    - from: postgres:public.orders
+      name: orders
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        refresh_check_interval: 2s
+    - from: postgres:public.common
+      name: common
+      params: ${sources.shop_db.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        refresh_check_interval: 2s
+
+defaults:
+  # The apps share one location, so they run side by side.
+  run-variants: side-by-side
+  compare-variants: false
+
+steps:
+  - source-exec:
+      shop_db: |
+        CREATE TABLE orders (o_id bigint PRIMARY KEY, o_owner text, o_total numeric(15, 2));
+        INSERT INTO orders SELECT i, 'shop', i * 1.25 FROM generate_series(1, 300) AS i;
+        CREATE TABLE common (c_id bigint PRIMARY KEY, c_v bigint);
+        INSERT INTO common SELECT i, i * 10 FROM generate_series(1, 50) AS i;
+    only: shop
+  - source-exec:
+      store_db: |
+        CREATE TABLE orders (o_id bigint PRIMARY KEY, o_owner text, o_total numeric(15, 2));
+        INSERT INTO orders SELECT i, 'store', i * 2.5 FROM generate_series(1, 200) AS i;
+    only: shop
+
+  # shop starts first and builds both copies.
+  - start: {}
+    only: shop
+  - query: SELECT o_owner, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_owner
+    expect: { oracle: shop_db }
+    eventually: 60s
+    only: shop
+
+  # store's 'orders' reads another server, so it is a different definition: it
+  # fails, naming the setting and not its value. Its 'common' is the same
+  # definition, so it serves shop's copy, and reports the app it was built for.
+  - start: { ready: false }
+    only: store
+  - assert-status:
+      dataset: orders
+      status: Error
+      message-contains: "Failed to load dataset 'orders' (cayenne): its copy in the state location"
+    eventually: 60s
+    only: store
+  - assert-status:
+      dataset: orders
+      status: Error
+      message-contains: "was built from a different definition (`pg_port` changed), so this instance neither serves nor writes it"
+    only: store
+  - query: SELECT count(*) AS n, sum(c_v) AS total FROM common
+    expect: { oracle: shop_db }
+    eventually: 60s
+    only: store
+  - assert-log:
+      contains: ["Dataset 'common' \\(cayenne\\) is shared with app 'shop', which last used '[^']+'\\. This Spicepod is app 'store'; datasets whose definitions match keep their copies\\."]
+    only: store
+  - query: SELECT count(*) AS n FROM orders
+    expect-error: true
+    only: store
+
+  # store's rows never reach shop's copy while shop keeps refreshing it.
+  - source-exec:
+      shop_db: "INSERT INTO orders SELECT i, 'shop', i * 1.25 FROM generate_series(301, 400) AS i"
+    only: shop
+  - source-exec:
+      store_db: "INSERT INTO orders SELECT i, 'store', i * 2.5 FROM generate_series(201, 500) AS i"
+    only: shop
+  - query: SELECT o_owner, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_owner
+    expect: { oracle: shop_db }
+    eventually: 60s
+    only: shop
+  - query: SELECT o_owner, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_owner
+    expect: { oracle: shop_db }
+    consistently: 6s
+    only: shop
+
+  # shop stops, and its writer lease on 'orders' lapses. store, which cannot
+  # serve 'orders', must not take it over: started again, shop writes 'orders'
+  # and follows its source.
+  - kill-spiced: {}
+    only: shop
+  - source-exec:
+      shop_db: "UPDATE orders SET o_total = o_total + 1000 WHERE o_id % 3 = 0"
+    only: shop
+  # Past the 30 s writer lease, so store would have taken 'orders' over by now.
+  - sleep: 45s
+    only: shop
+  - assert-log:
+      lacks: ["Dataset 'orders' \\(cayenne\\) is now written by this instance"]
+    only: store
+  - start: {}
+    only: shop
+  - query: SELECT o_owner, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_owner
+    expect: { oracle: shop_db }
+    eventually: 120s
+    only: shop
+  - assert-log:
+      lacks: ["Dataset 'orders' \\(cayenne\\) is now written by this instance"]
+    only: store
+
+  # A renamed app keeps its copies, and logs the change.
+  - restart: { patch: { spicepod: { name: shop-renamed } } }
+    only: shop
+  - query: SELECT o_owner, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_owner
+    expect: { oracle: shop_db }
+    eventually: 60s
+    only: shop
+  - assert-log:
+      contains: ["Dataset 'orders' \\(cayenne\\) is shared with app 'shop', which last used '[^']+'\\. This Spicepod is app 'shop-renamed'; datasets whose definitions match keep their copies\\."]
+      lacks: ['was built from a different definition']
+    only: shop
+
+  # `refresh_sql` alone is a different definition.
+  - restart:
+      ready: false
+      patch: { datasets: { orders: { acceleration: { refresh_sql: SELECT * FROM orders WHERE o_id <= 100 } } } }
+    only: shop
+  - assert-status:
+      dataset: orders
+      status: Error
+      message-contains: "was built from a different definition (`refresh_sql` changed)"
+    eventually: 60s
+    only: shop

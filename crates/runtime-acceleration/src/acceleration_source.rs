@@ -24,6 +24,43 @@ use tokio::sync::RwLock;
 pub type InitializedSourcesFuture<'a> =
     Pin<Box<dyn Future<Output = Vec<Arc<dyn AccelerationSource>>> + Send + 'a>>;
 
+/// The settings in a Spicepod that define the rows an acceleration of a source
+/// stores. An engine that keeps the acceleration as a copy in a shared state
+/// location records them with the copy, and never serves a copy built from others.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceDefinition {
+    /// Where the rows come from: a dataset's `from`, or a view's SQL.
+    pub from: String,
+    /// The source's connection settings (a dataset's `params`), as written: a
+    /// `${ secrets:… }` reference is resolved by the engine that records them.
+    pub params: std::collections::HashMap<String, String>,
+    /// `acceleration.refresh_sql`.
+    pub refresh_sql: Option<String>,
+    /// The columns the Spicepod declares, each with its declared type and
+    /// nullability, in declaration order. A description is not part of it.
+    pub columns: Vec<String>,
+}
+
+impl SourceDefinition {
+    /// The definition parts of `columns`, as [`Self::columns`] holds them.
+    #[must_use]
+    pub fn declared_columns(columns: &[spicepod::semantic::Column]) -> Vec<String> {
+        columns
+            .iter()
+            .map(|column| {
+                format!(
+                    "{}\u{0}{}\u{0}{}",
+                    column.name,
+                    column.r#type.as_deref().unwrap_or_default(),
+                    column
+                        .nullable
+                        .map_or("", |nullable| if nullable { "null" } else { "not null" })
+                )
+            })
+            .collect()
+    }
+}
+
 /// Represents an acceleration source component, such as a dataset or a view.
 /// Provides additional information about the source, such as its name and associated metadata.
 pub trait AccelerationSource: Send + Sync {
@@ -78,6 +115,14 @@ pub trait AccelerationSource: Send + Sync {
     /// [`Self::connector_name`]: a default would let a new source silently inherit
     /// somebody else's schema-change policy.
     fn on_schema_change(&self) -> Option<OnSchemaChange>;
+
+    /// The settings in this source's Spicepod that define the rows its acceleration
+    /// stores, or `None` for a source no Spicepod defines (a table created by DDL, an
+    /// internal table).
+    ///
+    /// Deliberately has NO default implementation: a source that silently answered
+    /// `None` would let an engine serve it another definition's copy.
+    fn definition(&self) -> Option<SourceDefinition>;
 
     /// Whether rows can reach this source through anything other than its refresh path
     /// — `access: read_write` on a dataset, or DML against a DDL-created table.

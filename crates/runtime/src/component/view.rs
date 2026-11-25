@@ -198,6 +198,19 @@ impl AccelerationSource for View {
         None
     }
 
+    fn definition(&self) -> Option<runtime_acceleration::SourceDefinition> {
+        // A view's rows come from its SQL, so the SQL is where they come from.
+        Some(runtime_acceleration::SourceDefinition {
+            from: self.sql.to_string(),
+            params: self.params.clone(),
+            refresh_sql: self
+                .acceleration
+                .as_ref()
+                .and_then(|acceleration| acceleration.refresh_sql.clone()),
+            columns: runtime_acceleration::SourceDefinition::declared_columns(&self.columns),
+        })
+    }
+
     fn on_schema_change(&self) -> Option<runtime_acceleration::OnSchemaChange> {
         // A view declares no `on_schema_change`: its columns follow its SQL, so there is
         // no source schema for an accelerator to reconcile against.

@@ -1363,6 +1363,7 @@ fn rejects_stored_table(error: &(dyn std::error::Error + 'static)) -> bool {
             Some(
                 cayenne::CatalogError::PkConflictDetectionEnabledOnExistingTable { .. }
                     | cayenne::CatalogError::PkConflictDetectionChangeHeld { .. }
+                    | cayenne::CatalogError::DefinitionChanged { .. }
             )
         )
     })
@@ -2958,6 +2959,57 @@ impl CayenneAccelerator {
         Ok(Some(builder))
     }
 
+    /// `source`'s definition: the settings in its Spicepod that define the rows
+    /// its copy stores, with its connection settings as the source reads them
+    /// (secrets resolved), so two hosts behind one `from` differ. `None` for a
+    /// source no Spicepod defines.
+    async fn dataset_definition(
+        source: &dyn AccelerationSource,
+        primary_keys: &[String],
+        pk_conflict_detection: &str,
+    ) -> Result<Option<cayenne::DatasetDefinition>> {
+        use secrecy::ExposeSecret;
+        let Some(declared) = source.definition() else {
+            return Ok(None);
+        };
+        let params = runtime_secrets::try_get_params_with_secrets(source.secrets(), &declared.params)
+            .await
+            .map_err(|error| Error::InvalidConfiguration {
+                detail: Arc::from(format!(
+                    "Failed to load dataset '{}' (cayenne): {error}",
+                    source.name()
+                )),
+            })?;
+        let partition_by: Vec<String> = source
+            .acceleration()
+            .map(|acceleration| {
+                acceleration
+                    .partition_by
+                    .iter()
+                    .map(|partition| format!("{}\u{0}{}", partition.name, partition.expression))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Some(
+            cayenne::DatasetDefinition::new(source.app().name.clone())
+                .with_setting("from", &declared.from)
+                .with_optional_setting("refresh_sql", declared.refresh_sql.as_deref())
+                .with_list_setting("columns", &declared.columns)
+                .with_list_setting("primary_key", primary_keys)
+                .with_list_setting("partition_by", &partition_by)
+                .with_setting("cayenne_pk_conflict_detection", pk_conflict_detection)
+                .with_connection(
+                    declared
+                        .params
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.as_str())),
+                    params
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.expose_secret())),
+                ),
+        ))
+    }
+
     #[expect(clippy::too_many_arguments)]
     async fn create_cayenne_table_provider(
         &self,
@@ -3066,6 +3118,18 @@ impl CayenneAccelerator {
         } else if rebuild_held(acceleration) {
             vortex_config.settings_change =
                 cayenne::metadata::SettingsChangeAction::HoldUntilSourceReadable;
+        }
+
+        // A copy in the state location records the definition it was built from,
+        // and opens only for the same one (see `cayenne::DatasetDefinition`).
+        if !memory_mode && Self::vnext_enabled(source)? {
+            vortex_config.definition = Self::dataset_definition(
+                source,
+                &primary_keys,
+                vortex_config.pk_conflict_detection.as_str(),
+            )
+            .await?
+            .map(Arc::new);
         }
 
         // Build S3 object store if using S3 Express One Zone storage. Memory mode
@@ -5553,6 +5617,13 @@ mod tests {
         assert!(rejects_stored_table(&wrapped(
             cayenne::CatalogError::PkConflictDetectionChangeHeld {
                 table_name: "checking".to_string(),
+            }
+        )));
+        assert!(rejects_stored_table(&wrapped(
+            cayenne::CatalogError::DefinitionChanged {
+                table_name: "checking".to_string(),
+                location: "s3://bucket/state".to_string(),
+                changes: "`pg_host` changed".to_string(),
             }
         )));
         assert!(!rejects_stored_table(&wrapped(

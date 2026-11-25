@@ -67,6 +67,7 @@ pub use ddl::CayenneDdlHandler;
 pub(crate) mod bounded_fifo;
 pub mod cte_materialization;
 pub mod dataset_storage;
+pub mod definition;
 pub mod logical_optimizer;
 pub mod maintained_aggregate;
 pub mod metadata;
@@ -125,6 +126,7 @@ pub mod stats;
 pub mod stats_aggregate;
 
 pub use catalog::MetadataCatalog;
+pub use definition::DatasetDefinition;
 pub use catalog::{CatalogError, CatalogResult};
 pub use catalog_provider::{
     CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider,

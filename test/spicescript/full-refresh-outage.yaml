@@ -92,6 +92,20 @@ steps:
   # acceleration serves the same rows, also with the source down.
   - restart:
       patch: { datasets: { items: { acceleration: { primary_key: '(id, name)', indexes: { price: enabled } } } } }
+    except: object-native
+  # In the object-native metastore a copy records its definition, and a new
+  # primary key is another one (#16246): the dataset fails, naming the setting,
+  # until `mode: file_create` rebuilds the copy from the source.
+  - restart:
+      ready: false
+      patch: { datasets: { items: { acceleration: { primary_key: '(id, name)', indexes: { price: enabled } } } } }
+    only: object-native
+  - assert-status: { dataset: items, status: Error, message-contains: "(`primary_key` changed)" }
+    eventually: 60s
+    only: object-native
+  - restart:
+      patch: { datasets: { items: { acceleration: { mode: file_create } } } }
+    only: object-native
   - query: SELECT * FROM items
     expect: { same-as: final }
   - stop-source: src
