@@ -759,17 +759,17 @@ mod tests {
         let yaml = "
 tests:
   load:
-    spicepod_path: accelerated/file[parquet]-arrow.yaml
+    spicepod_path: accelerated/file[parquet]-cayenne[memory].yaml
     query_set: tpch
     runner_type: spiceai-dev-large-runners
     layout: primary_key
   throughput:
-    - spicepod_path: accelerated/file[parquet]-arrow.yaml
+    - spicepod_path: accelerated/file[parquet]-cayenne[memory].yaml
       query_set: tpch
       runner_type: spiceai-dev-large-runners
       postgres_version: '17'
       layouts: [primary_key, indexes]
-    - spicepod_path: accelerated/file[parquet]-arrow.yaml
+    - spicepod_path: accelerated/file[parquet]-cayenne[memory].yaml
       query_set: tpch
       runner_type: spiceai-dev-large-runners
 ";
@@ -1175,7 +1175,7 @@ tests:
         let yaml = "
 tests:
   htap:
-    spicepod_path: accelerated/postgres-arrow.yaml
+    spicepod_path: accelerated/postgres-cayenne[memory].yaml
     runner_type: spiceai-dev-runners
     scale_factor: 10
     duration: 600

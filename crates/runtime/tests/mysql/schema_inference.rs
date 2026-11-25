@@ -92,7 +92,7 @@ fn inventory_dataset(port: u16) -> Dataset {
     dataset.params = Some(Params::from_string_map(mysql_params(port)));
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("arrow".to_string()),
+        engine: Some("cayenne".to_string()),
         mode: Mode::Memory,
         refresh_mode: Some(RefreshMode::Changes),
         ..Acceleration::default()

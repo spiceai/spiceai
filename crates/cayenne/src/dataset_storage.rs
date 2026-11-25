@@ -251,6 +251,7 @@ impl DatasetStorage {
         table_path: &str,
         dataset_id: &str,
         store: Arc<dyn ObjectStore>,
+        writes: crate::catalog::DataWriteGate,
     ) -> Result<Self, String> {
         let recorded = url::Url::parse(table_path)
             .map_err(|error| format!("data path '{table_path}' is not a URL: {error}"))?;
@@ -283,6 +284,7 @@ impl DatasetStorage {
             authority: recorded_authority.clone(),
             dataset: Arc::clone(&dataset),
             table_path: Arc::clone(&table_path),
+            writes,
         });
         Ok(Self {
             store: scoped,
@@ -489,6 +491,47 @@ pub(crate) async fn delete_in_batches(
     outcome
 }
 
+/// A multipart upload of a dataset's store that sends no further part, and
+/// does not complete, once the instance stops writing the dataset: the upload
+/// then never becomes visible, and its parts are an unfinished upload the
+/// writer's orphan handling reclaims. A part already sent is not recalled.
+#[derive(Debug)]
+struct GatedUpload {
+    inner: Box<dyn MultipartUpload>,
+    writes: crate::catalog::DataWriteGate,
+    dataset: Arc<str>,
+}
+
+#[async_trait]
+impl MultipartUpload for GatedUpload {
+    fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
+        if !self.writes.allows() {
+            let refused = replica_write(&self.dataset);
+            return Box::pin(async move { Err(refused) });
+        }
+        self.inner.put_part(data)
+    }
+
+    async fn complete(&mut self) -> Result<PutResult, ObjectStoreError> {
+        if !self.writes.allows() {
+            return Err(replica_write(&self.dataset));
+        }
+        self.inner.complete().await
+    }
+
+    async fn abort(&mut self) -> Result<(), ObjectStoreError> {
+        self.inner.abort().await
+    }
+}
+
+/// The refusal of a data write on an instance that does not write `dataset`.
+fn replica_write(dataset: &str) -> ObjectStoreError {
+    ObjectStoreError::Generic {
+        store: STORE_NAME,
+        source: crate::metastore::object_native::not_writer_message(dataset).into(),
+    }
+}
+
 fn outside(authority: &str, location: &str) -> ObjectStoreError {
     let shown = if location.contains("://") {
         location.to_string()
@@ -515,9 +558,22 @@ struct DatasetScopedStore {
     /// committed file the store cannot serve.
     dataset: Arc<str>,
     table_path: Arc<str>,
+    /// Closed while another instance writes the dataset: then this store sends
+    /// no write or delete, so this instance leaves no object behind. A request
+    /// already sent when it closes is not recalled.
+    writes: crate::catalog::DataWriteGate,
 }
 
 impl DatasetScopedStore {
+    /// `Err` when another instance writes the dataset.
+    fn check_writes(&self) -> Result<(), ObjectStoreError> {
+        if self.writes.allows() {
+            Ok(())
+        } else {
+            Err(replica_write(&self.dataset))
+        }
+    }
+
     /// A failed read of `location` as the dataset sees it: a committed file that is
     /// not in the store keeps its `NotFound` kind, so callers that probe for a file
     /// still recognize it, and carries [`DataFileError::Missing`] as its source; a
@@ -616,6 +672,7 @@ impl ObjectStore for DatasetScopedStore {
         opts: PutOptions,
     ) -> Result<PutResult, ObjectStoreError> {
         self.check(location)?;
+        self.check_writes()?;
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -625,7 +682,13 @@ impl ObjectStore for DatasetScopedStore {
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>, ObjectStoreError> {
         self.check(location)?;
-        self.inner.put_multipart_opts(location, opts).await
+        self.check_writes()?;
+        let upload = self.inner.put_multipart_opts(location, opts).await?;
+        Ok(Box::new(GatedUpload {
+            inner: upload,
+            writes: self.writes.clone(),
+            dataset: Arc::clone(&self.dataset),
+        }))
     }
 
     async fn get_opts(
@@ -695,8 +758,11 @@ impl ObjectStore for DatasetScopedStore {
         let prefix = self.prefix.clone();
         let authority = self.authority.clone();
         let inner = Arc::clone(&self.inner);
+        let writes = self.writes.clone();
+        let dataset = Arc::clone(&self.dataset);
         // Paths outside the dataset fail in place; each batch of the rest goes to
-        // the inner store's own batched delete.
+        // the inner store's own batched delete, unless another instance writes
+        // the dataset by the time the batch is sent.
         locations
             .ready_chunks(DELETE_BATCH)
             .flat_map(move |batch| {
@@ -713,6 +779,12 @@ impl ObjectStore for DatasetScopedStore {
                 }
                 let deleted = if inside.is_empty() {
                     stream::empty().boxed()
+                } else if !writes.allows() {
+                    let refusals: Vec<Result<Path, ObjectStoreError>> = inside
+                        .iter()
+                        .map(|_| Err(replica_write(&dataset)))
+                        .collect();
+                    stream::iter(refusals).boxed()
                 } else {
                     inner.delete_stream(stream::iter(inside.into_iter().map(Ok)).boxed())
                 };
@@ -758,6 +830,7 @@ impl ObjectStore for DatasetScopedStore {
     ) -> Result<(), ObjectStoreError> {
         self.check(from)?;
         self.check(to)?;
+        self.check_writes()?;
         self.inner.copy_opts(from, to, options).await
     }
 
@@ -769,6 +842,7 @@ impl ObjectStore for DatasetScopedStore {
     ) -> Result<(), ObjectStoreError> {
         self.check(from)?;
         self.check(to)?;
+        self.check_writes()?;
         self.inner.rename_opts(from, to, options).await
     }
 }
@@ -785,6 +859,7 @@ mod tests {
             table_path,
             "0193aaaa-bbbb-7ccc-8ddd-eeeeffff0000",
             Arc::clone(store),
+            crate::catalog::DataWriteGate::open(),
         )
         .expect("storage")
     }
@@ -907,6 +982,61 @@ mod tests {
         assert!(
             matches!(listed.as_slice(), [Err(_)]),
             "listing the whole store is refused: {listed:?}"
+        );
+    }
+
+    /// An upload that started while this instance wrote the dataset sends no
+    /// further part and never completes once another instance writes it, so
+    /// the object never becomes visible.
+    #[tokio::test]
+    async fn an_upload_stops_when_the_instance_stops_writing() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let gate = crate::catalog::DataWriteGate::open();
+        let storage = DatasetStorage::new(
+            "orders",
+            "s3://bucket/p/a",
+            "0193aaaa-bbbb-7ccc-8ddd-eeeeffff0000",
+            Arc::clone(&inner),
+            gate.for_table(),
+        )
+        .expect("storage");
+        let path = Path::from("p/a/file.vortex");
+        let mut upload = storage
+            .store()
+            .put_multipart(&path)
+            .await
+            .expect("an upload starts while this instance writes");
+        upload
+            .put_part(PutPayload::from_static(b"first"))
+            .await
+            .expect("a part goes while this instance writes");
+
+        gate.set(false);
+        let part = upload
+            .put_part(PutPayload::from_static(b"second"))
+            .await
+            .expect_err("no part goes once another instance writes");
+        assert!(
+            part.to_string()
+                .contains("accepts no change from this table"),
+            "{part}"
+        );
+        let complete = upload
+            .complete()
+            .await
+            .expect_err("the upload does not complete");
+        assert!(
+            complete
+                .to_string()
+                .contains("accepts no change from this table"),
+            "{complete}"
+        );
+        assert!(
+            matches!(
+                inner.head(&path).await,
+                Err(object_store::Error::NotFound { .. })
+            ),
+            "the object never becomes visible"
         );
     }
 

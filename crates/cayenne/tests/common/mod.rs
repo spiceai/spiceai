@@ -822,22 +822,48 @@ impl TestFixture {
         store: Option<Arc<dyn object_store::ObjectStore>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = Arc::new(TempDir::new()?);
-        let data_path = temp_dir.path().join("data");
-        std::fs::create_dir_all(&data_path)?;
-        let db_path = temp_dir.path().join("test.db");
-
-        let (catalog, data_store): (Arc<FixtureCatalog>, FixtureDataStore) = match (backend, store)
-        {
-            (BackendType::Sqlite, Some(_)) => return Err(UNSUPPORTED_PAIRING.into()),
-            (BackendType::Sqlite, None) => (
-                fixture_catalog(format!("sqlite://{}", db_path.to_string_lossy())).await?,
-                FixtureDataStore::local(&data_path),
-            ),
+        match (backend, store) {
+            (BackendType::Sqlite, Some(_)) => Err(UNSUPPORTED_PAIRING.into()),
+            (BackendType::Sqlite, None) => Self::build(temp_dir, backend, None).await,
             (BackendType::ObjectNative, store) => {
                 let location = match store {
                     Some(store) => ObjectNativeLocation::new(store, "cayenne-test", ""),
                     None => FixtureDataStore::location_from_env(temp_dir.path())?,
                 };
+                Self::build(temp_dir, backend, Some(location)).await
+            }
+        }
+    }
+
+    /// An object-native fixture in the store `CAYENNE_TEST_DATA_STORE` names, with
+    /// the catalog and every table going through `wrap(store)`. Returns the fixture
+    /// and the unwrapped store, for reading and writing objects outside Cayenne.
+    pub async fn object_native_through(
+        wrap: impl FnOnce(Arc<dyn object_store::ObjectStore>) -> Arc<dyn object_store::ObjectStore>,
+    ) -> Result<(Self, Arc<dyn object_store::ObjectStore>), Box<dyn std::error::Error>> {
+        let temp_dir = Arc::new(TempDir::new()?);
+        let mut location = FixtureDataStore::location_from_env(temp_dir.path())?;
+        let raw = Arc::clone(&location.store);
+        location.store = wrap(Arc::clone(&raw));
+        let fixture = Self::build(temp_dir, BackendType::ObjectNative, Some(location)).await?;
+        Ok((fixture, raw))
+    }
+
+    async fn build(
+        temp_dir: Arc<TempDir>,
+        backend: BackendType,
+        location: Option<ObjectNativeLocation>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let data_path = temp_dir.path().join("data");
+        std::fs::create_dir_all(&data_path)?;
+        let db_path = temp_dir.path().join("test.db");
+
+        let (catalog, data_store): (Arc<FixtureCatalog>, FixtureDataStore) = match location {
+            None => (
+                fixture_catalog(format!("sqlite://{}", db_path.to_string_lossy())).await?,
+                FixtureDataStore::local(&data_path),
+            ),
+            Some(location) => {
                 let catalog = location.open().await?;
                 let data_store = location.data_store(&catalog)?;
                 OBJECT_NATIVE_LOCATIONS
@@ -926,6 +952,8 @@ pub fn require_process_per_test(why: &str) {
 /// | `mutation_model_test::test_publication_without_reinsert_sequence_impl` | Writes deletion vectors by hand at a local path. |
 /// | `mutation_property_test::prop_auto_crossing_observes_position_then_key_switch_impl` | `deletion_mode: auto` starts on position deletes only for a table on a local directory. |
 /// | `mutation_property_test::prop_sequential_auto_crossing_impl` | As above. |
+/// | `mutation_property_test::prop_sequential_cold_impl` | Cold tier, which object-native data does not support. |
+/// | `mutation_property_test::prop_sequential_cold_upsert_replay_impl` | As above. |
 /// | `scan_view_retention_test::scan_view_selection_during_retention` | Holds a scan's planning on retention's unlink of a data file; a table in the object-native location keeps a retired file for `DATA_FILE_RETENTION`, so the delete unlinks nothing. |
 /// | `stats_edge_cases_test::test_stats_correct_after_overwrite` | Open defect on the local-location store: under concurrent load, the table statistics after `INSERT OVERWRITE` can keep the pre-overwrite row count. |
 /// | `file_based_retention_delete_test` (all but `test_loader_errors_on_missing_needed_dv_impl`) | File-based retention (whole-file deletes) runs only for local data files; a table in an object store deletes the expired rows through deletion vectors, so the file counts, deleted-row counts and orphaned deletion vectors these tests assert differ. The two list-files cache tests also need a listing the table never makes. |
@@ -933,7 +961,6 @@ pub fn require_process_per_test(why: &str) {
 /// | `file_scan_statistics_source_test::scan_file_statistics_counters_match_the_store_and_the_metastore` | As above. |
 /// | `integration_test::test_cayenne_catalog_persistence_impl` | Reopens a SQLite catalog file. |
 /// | `listing_cache_retention_race_test` (all) | Races a snapshot-directory listing through the list-files cache; a table in the object-native location never lists its files. |
-/// | `mem_tier_overwrite_retention_test::retention_judges_a_key_by_its_live_version_impl` | Fails intermittently on the local-location store when many tests run at once, with a RAM-tier row that matches `retention_sql` still visible after the retention pass; the cause is not yet known. |
 /// | `mem_tier_overwrite_retention_test::a_waiting_publish_does_not_hold_back_the_other_partitions_impl` | Commits partitions' overwrites in one SQLite metastore transaction; the object-native metastore does not hold partitioned tables. |
 /// | `orphan_dv_compaction_test::provider_open_replays_an_orphan_backlog_left_by_a_crash_impl` | Writes deletion vectors and their catalog rows by hand at a local path. |
 /// | `orphan_dv_compaction_test::scheduled_cleanup_waits_for_the_orphan_threshold_impl` | As above. |

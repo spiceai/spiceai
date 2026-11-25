@@ -28,7 +28,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use object_store_spawn::DestinationGuard;
 pub use object_store_spawn::{
-    DestinationRefused, REDIRECT_CHAIN_REFUSED, redirect_continues_off_origin,
+    DestinationRefused, OFF_ORIGIN_REDIRECT_REFUSED, REDIRECT_CHAIN_REFUSED,
+    redirect_continues_off_origin, redirect_leaves_origin,
 };
 use url::Url;
 
@@ -225,9 +226,6 @@ impl reqwest::dns::Resolve for RedirectHostResolver {
 /// Why [`guard_redirects`] refuses a redirect.
 const OFF_HOST_REDIRECT_REFUSED: &str = "a redirect off the request's host to a private, loopback, or link-local address is not followed";
 
-/// Why [`guard_redirects`] refuses a redirect under [`RedirectScope::RequestOrigin`].
-const OFF_ORIGIN_REDIRECT_REFUSED: &str = "a request that carries a custom credential header follows a redirect only to its own scheme, host, and port. Configure the endpoint URL as the redirect target directly.";
-
 /// Which redirects [`guard_redirects`] follows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RedirectScope {
@@ -262,11 +260,7 @@ enum RedirectCheck {
 /// Classifies a redirect to `target` from a request whose URLs so far are `previous`, the
 /// request's own URL first.
 fn check_redirect(scope: RedirectScope, previous: &[Url], target: &Url) -> RedirectCheck {
-    if scope == RedirectScope::RequestOrigin
-        && previous
-            .first()
-            .is_none_or(|own| own.origin() != target.origin())
-    {
+    if scope == RedirectScope::RequestOrigin && redirect_leaves_origin(previous, target) {
         return RedirectCheck::OffOrigin;
     }
     if scope == RedirectScope::PublicHostsWithCredentials
