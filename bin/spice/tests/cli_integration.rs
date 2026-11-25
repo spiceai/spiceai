@@ -416,6 +416,140 @@ mod login {
         }
     }
 
+    /// Everything `spice` printed, both streams, for asserting on an error
+    /// whichever stream it is written to.
+    fn combined_output(output: &std::process::Output) -> String {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    /// A checkout can ship `.env` or `.env.local` as a link to any file the user
+    /// can write. `spice login` must refuse it rather than rewrite, `chmod`, and
+    /// place a credential in whatever the link names.
+    #[cfg(unix)]
+    #[test]
+    fn test_login_refuses_a_linked_env_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for name in [".env", ".env.local"] {
+            let temp_dir = TempDir::new().expect("temp dir should be creatable");
+            let target = temp_dir.path().join("unrelated.conf");
+            fs::write(&target, "untouched\n").expect("write the link target");
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o644))
+                .expect("set the target mode");
+            let link = temp_dir.path().join(name);
+            std::os::unix::fs::symlink(&target, &link).expect("create the env link");
+
+            let output = spice_cmd()
+                .current_dir(temp_dir.path())
+                .args(["login", "--key", "sk_test_abc123"])
+                .output()
+                .expect("run spice login");
+
+            let printed = combined_output(&output);
+            assert!(
+                !output.status.success(),
+                "{name}: login must fail: {printed}"
+            );
+            assert!(
+                printed.contains(&format!(
+                    "Failed to update configuration at '{name}': it is a symbolic link. `spice login` writes credentials only to a regular file, never through a link, so they cannot land in the file it points to. Replace '{name}' with a regular file, or store credentials in the keychain with `spice login --output keychain`. See: https://spiceai.org/docs/cli/reference/login"
+                )),
+                "{name}: the error must name the file, the reason and the fix: {printed}"
+            );
+            assert_eq!(
+                fs::read_to_string(&target).expect("read the link target"),
+                "untouched\n",
+                "{name}: the link target must not be rewritten"
+            );
+            assert_eq!(
+                fs::metadata(&target)
+                    .expect("stat the link target")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644,
+                "{name}: the link target's mode must not change"
+            );
+            assert!(
+                fs::symlink_metadata(&link)
+                    .expect("stat the link")
+                    .file_type()
+                    .is_symlink(),
+                "{name}: the link itself is left for the user to replace"
+            );
+        }
+    }
+
+    /// Something other than a regular file at `.env` is refused the same way.
+    #[test]
+    fn test_login_refuses_an_env_path_that_is_not_a_file() {
+        let temp_dir = TempDir::new().expect("temp dir should be creatable");
+        fs::create_dir(temp_dir.path().join(".env")).expect("create a directory at .env");
+
+        let output = spice_cmd()
+            .current_dir(temp_dir.path())
+            .args(["login", "--key", "sk_test_abc123"])
+            .output()
+            .expect("run spice login");
+
+        let printed = combined_output(&output);
+        assert!(!output.status.success(), "login must fail: {printed}");
+        assert!(
+            printed.contains(
+                "Failed to update configuration at '.env': it is not a regular file. `spice login` writes credentials only to a regular file. Replace '.env' with a regular file, or store credentials in the keychain with `spice login --output keychain`. See: https://spiceai.org/docs/cli/reference/login"
+            ),
+            "{printed}"
+        );
+    }
+
+    /// An existing regular `.env` keeps its other variables, ends up
+    /// owner-only, and no staging file is left beside it.
+    #[test]
+    fn test_login_merges_into_an_existing_env_file() {
+        let temp_dir = TempDir::new().expect("temp dir should be creatable");
+        let env_path = temp_dir.path().join(".env");
+        fs::write(&env_path, "OTHER_SETTING=kept\n").expect("write the existing .env");
+
+        spice_cmd()
+            .current_dir(temp_dir.path())
+            .args(["login", "--key", "sk_test_abc123"])
+            .assert()
+            .success();
+
+        assert_eq!(
+            fs::read_to_string(&env_path).expect("read .env"),
+            "OTHER_SETTING=kept\nSPICE_SPICEAI_API_KEY=sk_test_abc123\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&env_path)
+                    .expect("stat .env")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "the credential file must be owner-only"
+            );
+        }
+        let entries: Vec<String> = fs::read_dir(temp_dir.path())
+            .expect("list the directory")
+            .map(|entry| {
+                entry
+                    .expect("read an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(entries, [".env"], "no staging file may be left behind");
+    }
+
     /// Provider regression guard: the `SharePoint` and ABFS logins keep their
     /// OAuth device-code flows and vocabulary — their help still asks for the
     /// Azure AD tenant/client pair rather than anything session-based.
@@ -871,6 +1005,968 @@ mod add {
                 .join("spicepod.yaml")
                 .exists(),
             "local yml dependency should be normalized to spicepod.yaml"
+        );
+    }
+
+    /// `spice add` names a host program the added Spicepod declares, and how to
+    /// trust it. Re-adding a dependency already listed in the mapping form adds
+    /// no second entry, and a trusted one gets no note.
+    #[test]
+    fn test_add_names_a_host_program_and_keeps_a_trusted_mapping_entry() {
+        let temp_dir = TempDir::new().expect("create the project");
+        fs::write(
+            temp_dir.path().join("spicepod.yaml"),
+            "version: v2\nkind: Spicepod\nname: app\n",
+        )
+        .expect("write spicepod.yaml");
+        let pod = temp_dir.path().join("localpod");
+        fs::create_dir_all(&pod).expect("create the pod");
+        fs::write(
+            pod.join("spicepod.yaml"),
+            "version: v2\nkind: Spicepod\nname: localpod\ntools:\n  - name: fetch\n    from: mcp:docker\n",
+        )
+        .expect("write the pod");
+
+        let output = spice_cmd()
+            .current_dir(temp_dir.path())
+            .arg("add")
+            .arg(&pod)
+            .output()
+            .expect("run spice add");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}");
+        assert!(
+            stdout.contains("Note: 'spicepods/localpod' declares tool 'fetch', which starts the program 'docker' on this host. It is not loaded until you trust this dependency: replace `- spicepods/localpod` under `dependencies:` with `- { from: spicepods/localpod, trust: full }`."),
+            "{stdout}"
+        );
+
+        let trusted = "version: v2\nkind: Spicepod\nname: app\ndependencies:\n  - from: spicepods/localpod\n    trust: full\n";
+        fs::write(temp_dir.path().join("spicepod.yaml"), trusted).expect("trust the dependency");
+        let output = spice_cmd()
+            .current_dir(temp_dir.path())
+            .arg("add")
+            .arg(&pod)
+            .output()
+            .expect("run spice add again");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}");
+        assert!(
+            !stdout.contains("Note:"),
+            "a trusted dependency gets no note: {stdout}"
+        );
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("spicepod.yaml")).expect("read spicepod.yaml"),
+            trusted,
+            "the mapping entry is recognized, not duplicated"
+        );
+    }
+
+    /// What the stub registry answers a pod request with.
+    enum RegistryReply {
+        /// A complete archive, with its `Content-Length`.
+        Archive(Vec<u8>),
+        /// Only a `Content-Length` header claiming this many bytes.
+        Claims(u64),
+        /// A chunked body of zeros, sent until the client hangs up.
+        Endless,
+    }
+
+    /// A Spicerack registry answering every request with `reply`, from a thread
+    /// of this process. Returns its base URL, for `SPICERACK_BASE_URL`.
+    fn stub_registry(reply: RegistryReply) -> String {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the stub registry");
+        let port = listener.local_addr().expect("stub registry address").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let Ok(reader) = stream.try_clone() else {
+                    continue;
+                };
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                    line.clear();
+                }
+                match &reply {
+                    RegistryReply::Archive(body) => {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(body);
+                    }
+                    RegistryReply::Claims(len) => {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: {len}\r\nConnection: close\r\n\r\nPK"
+                        );
+                    }
+                    RegistryReply::Endless => {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                        );
+                        let chunk = vec![0_u8; 1024 * 1024];
+                        while write!(stream, "{:x}\r\n", chunk.len()).is_ok()
+                            && stream.write_all(&chunk).is_ok()
+                            && stream.write_all(b"\r\n").is_ok()
+                        {}
+                    }
+                }
+            }
+        });
+        format!("http://127.0.0.1:{port}/v1")
+    }
+
+    /// A stored archive holding `entries`.
+    fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, contents) in entries {
+            writer.start_file(*name, options).expect("start an entry");
+            writer.write_all(contents).expect("write an entry");
+        }
+        writer.finish().expect("finish the archive").into_inner()
+    }
+
+    const POD_MANIFEST: &[u8] = b"version: v1\nkind: Spicepod\nname: pod\n";
+
+    /// Run `spice add evil/pod` in `project` against the registry at `base_url`.
+    fn add_from_registry(project: &std::path::Path, base_url: &str) -> std::process::Output {
+        spice_cmd()
+            .current_dir(project)
+            .env("SPICERACK_BASE_URL", base_url)
+            .args(["add", "evil/pod"])
+            .timeout(std::time::Duration::from_mins(2))
+            .output()
+            .expect("run spice add")
+    }
+
+    fn printed(output: &std::process::Output) -> String {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    /// Assert `spice add` failed with `expected` in its error and left no
+    /// trace: no pod directory, no staging directory, no dependency entry.
+    fn assert_refused_and_nothing_installed(
+        project: &std::path::Path,
+        output: &std::process::Output,
+        expected: &str,
+    ) {
+        let printed = printed(output);
+        assert!(!output.status.success(), "spice add must fail: {printed}");
+        assert!(
+            printed.contains(expected),
+            "expected '{expected}' in: {printed}"
+        );
+        assert!(
+            printed.contains("so nothing was installed. Check the Spicepod name and retry, or install from a local path with `spice add <path>`. See: https://spiceai.org/docs/cli/reference/add"),
+            "a size limit is advised as a size limit: {printed}"
+        );
+        assert!(
+            !project.join("spicepods").exists(),
+            "a refused archive must leave no pods directory: {:?}",
+            fs::read_dir(project.join("spicepods")).map(|entries| entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>())
+        );
+        assert!(
+            !project.join("spicepod.yaml").exists(),
+            "a refused archive must not be registered as a dependency"
+        );
+    }
+
+    /// An archive whose entries declare more expanded bytes than a package may
+    /// hold is refused before anything is written.
+    #[test]
+    fn test_add_refuses_an_archive_that_expands_past_the_package_limit() {
+        let mut body = archive(&[("spicepod.yaml", POD_MANIFEST), ("data.bin", &[0_u8; 16])]);
+        // Declare 2 GiB for `data.bin` in the central directory, which is what a
+        // highly compressed entry of that size looks like before it is read.
+        let central = body
+            .windows(4)
+            .rposition(|window| window == b"PK\x01\x02")
+            .expect("the archive has a central directory entry");
+        body[central + 24..central + 28].copy_from_slice(&0x8000_0000_u32.to_le_bytes());
+
+        let project = TempDir::new().expect("create the project");
+        let output =
+            add_from_registry(project.path(), &stub_registry(RegistryReply::Archive(body)));
+        assert_refused_and_nothing_installed(
+            project.path(),
+            &output,
+            "the archive expands to 2.0 GiB, more than the 1 GiB a Spicepod package may expand to",
+        );
+    }
+
+    #[test]
+    fn test_add_refuses_an_archive_with_too_many_entries() {
+        let names: Vec<String> = (0..10_001).map(|i| format!("f/{i}.txt")).collect();
+        let entries: Vec<(&str, &[u8])> =
+            names.iter().map(|name| (name.as_str(), &b""[..])).collect();
+
+        let project = TempDir::new().expect("create the project");
+        let output = add_from_registry(
+            project.path(),
+            &stub_registry(RegistryReply::Archive(archive(&entries))),
+        );
+        assert_refused_and_nothing_installed(
+            project.path(),
+            &output,
+            "the archive holds 10,001 entries, more than the 10,000 a Spicepod package may hold",
+        );
+    }
+
+    /// An entry naming a path outside the pod directory fails the install
+    /// instead of being skipped, and an earlier install of the pod is untouched.
+    #[test]
+    fn test_add_refuses_an_archive_entry_outside_the_pod_directory() {
+        let project = TempDir::new().expect("create the project");
+        let installed = project.path().join("spicepods/evil/pod");
+        fs::create_dir_all(&installed).expect("create an earlier install");
+        fs::write(installed.join("spicepod.yaml"), "earlier\n").expect("write the earlier install");
+
+        let output = add_from_registry(
+            project.path(),
+            &stub_registry(RegistryReply::Archive(archive(&[
+                ("spicepod.yaml", POD_MANIFEST),
+                ("../../../escaped.txt", b"outside\n"),
+            ]))),
+        );
+
+        let printed = printed(&output);
+        assert!(!output.status.success(), "spice add must fail: {printed}");
+        assert!(
+            printed.contains("Failed to install Spicepod 'evil/pod' from spicerack.org: its entry '../../../escaped.txt' is outside the Spicepod directory, so the package cannot be installed and nothing was installed. Report it to the Spicepod's publisher, or install from a local path with `spice add <path>`. See: https://spiceai.org/docs/cli/reference/add"),
+            "{printed}"
+        );
+        assert_eq!(
+            fs::read_to_string(installed.join("spicepod.yaml")).expect("read the earlier install"),
+            "earlier\n",
+            "a refused archive must leave the earlier install as it was"
+        );
+        let leftovers: Vec<_> = fs::read_dir(project.path().join("spicepods"))
+            .expect("list the pods directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            leftovers,
+            ["evil"],
+            "no staging directory may be left behind"
+        );
+        assert!(!project.path().join("escaped.txt").exists());
+    }
+
+    /// `spice add` never writes through a symbolic link on the way to or in
+    /// the install: not a linked `spicepods` directory, not a linked pod
+    /// directory, and not a linked directory inside it. Extraction never
+    /// creates links, so one there was put there by someone else.
+    #[cfg(unix)]
+    #[test]
+    fn test_add_refuses_to_write_through_a_linked_install_directory() {
+        for (layout, linked) in [
+            ("a directory inside the install", "spicepods/evil/pod/docs"),
+            ("the install directory itself", "spicepods/evil/pod"),
+            ("the spicepods directory", "spicepods"),
+        ] {
+            let project = TempDir::new().expect("create the project");
+            let outside = TempDir::new().expect("create the outside directory");
+            let pod = project.path().join("spicepods/evil/pod");
+            let has_earlier_install = linked == "spicepods/evil/pod/docs";
+            if has_earlier_install {
+                fs::create_dir_all(&pod).expect("create the earlier install");
+                fs::write(pod.join("spicepod.yaml"), "earlier\n")
+                    .expect("write the earlier install");
+            } else if linked == "spicepods/evil/pod" {
+                fs::create_dir_all(pod.parent().expect("a parent"))
+                    .expect("create the org directory");
+            }
+            std::os::unix::fs::symlink(outside.path(), project.path().join(linked))
+                .expect("plant the link");
+
+            let output = add_from_registry(
+                project.path(),
+                &stub_registry(RegistryReply::Archive(archive(&[
+                    ("spicepod.yaml", POD_MANIFEST),
+                    ("docs/README.md", b"written by the package\n"),
+                ]))),
+            );
+
+            let printed = printed(&output);
+            assert!(!output.status.success(), "{layout}: {printed}");
+            assert!(
+                printed.contains(&format!("Failed to install Spicepod 'evil/pod' from spicerack.org: '{linked}' is a symbolic link, so the package would be written outside the Spicepod directory and nothing was installed. Replace the link with a directory, or remove it, and run `spice add` again. See: https://spiceai.org/docs/cli/reference/add")),
+                "{layout}: {printed}"
+            );
+            assert_eq!(
+                fs::read_dir(outside.path())
+                    .expect("list the outside directory")
+                    .count(),
+                0,
+                "{layout}: nothing may be written outside the project"
+            );
+            if has_earlier_install {
+                assert_eq!(
+                    fs::read_to_string(pod.join("spicepod.yaml"))
+                        .expect("read the earlier install"),
+                    "earlier\n",
+                    "{layout}: a refused install leaves the earlier one as it was"
+                );
+            }
+        }
+    }
+
+    /// A registry that announces a body larger than a package may be is
+    /// refused before the body is read.
+    #[test]
+    fn test_add_refuses_an_announced_download_larger_than_a_package() {
+        let project = TempDir::new().expect("create the project");
+        let output = add_from_registry(
+            project.path(),
+            &stub_registry(RegistryReply::Claims(10 * 1024 * 1024 * 1024)),
+        );
+        assert_refused_and_nothing_installed(
+            project.path(),
+            &output,
+            "the archive is 10,240.0 MiB, more than the 256 MiB a Spicepod package may be",
+        );
+    }
+
+    /// Without a `Content-Length`, the download stops as soon as it passes the
+    /// limit rather than when the registry stops sending.
+    #[test]
+    fn test_add_stops_an_unannounced_download_at_the_package_limit() {
+        let project = TempDir::new().expect("create the project");
+        let output = add_from_registry(project.path(), &stub_registry(RegistryReply::Endless));
+        assert_refused_and_nothing_installed(
+            project.path(),
+            &output,
+            "the archive is larger than the 256 MiB a Spicepod package may be",
+        );
+    }
+
+    /// A package within the limits installs, and installing it again writes its
+    /// files over the earlier install, leaving no staging directory behind.
+    #[test]
+    fn test_add_installs_and_reinstalls_a_registry_package() {
+        let project = TempDir::new().expect("create the project");
+        let first = stub_registry(RegistryReply::Archive(archive(&[
+            ("spicepod.yaml", POD_MANIFEST),
+            ("docs/README.md", b"first\n"),
+        ])));
+        let output = add_from_registry(project.path(), &first);
+        assert!(output.status.success(), "{}", printed(&output));
+
+        let pod = project.path().join("spicepods/evil/pod");
+        fs::write(pod.join("local-notes.md"), "mine\n").expect("add a file of the user's own");
+        let second = stub_registry(RegistryReply::Archive(archive(&[
+            ("spicepod.yaml", POD_MANIFEST),
+            ("docs/README.md", b"second\n"),
+        ])));
+        let output = add_from_registry(project.path(), &second);
+        assert!(output.status.success(), "{}", printed(&output));
+
+        assert_eq!(
+            fs::read(pod.join("spicepod.yaml")).expect("read the manifest"),
+            POD_MANIFEST
+        );
+        assert_eq!(
+            fs::read_to_string(pod.join("docs/README.md")).expect("read the readme"),
+            "second\n"
+        );
+        assert_eq!(
+            fs::read_to_string(pod.join("local-notes.md")).expect("read the user's file"),
+            "mine\n",
+            "re-adding writes the package over the install, as before, and keeps other files"
+        );
+        let entries: Vec<_> = fs::read_dir(project.path().join("spicepods"))
+            .expect("list the pods directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(entries, ["evil"], "no staging directory may be left behind");
+    }
+}
+
+// ============================================================================
+// Build Command Tests
+// ============================================================================
+
+#[cfg(unix)]
+mod build {
+    use super::*;
+    use sha2::Digest as _;
+
+    /// A function whose `build:` command writes `module_bytes` to `out.wasm`
+    /// in `workdir`, without needing a compiler.
+    fn function_yaml(name: &str, workdir: &str, module: &str, command: &str) -> String {
+        format!(
+            "  - name: {name}\n    from: wasm\n    signature:\n      args: []\n      returns: int64\n    params:\n      module: {module}\n    build:\n      command: {command}\n      workdir: {workdir}\n"
+        )
+    }
+
+    fn write_project(dir: &std::path::Path, functions: &str, dependencies: &str) -> String {
+        let spicepod = format!(
+            "version: v2\nkind: Spicepod\nname: app\n{dependencies}functions:\n{functions}"
+        );
+        fs::write(dir.join("spicepod.yaml"), &spicepod).expect("write spicepod.yaml");
+        spicepod
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        format!("{:x}", sha2::Sha256::digest(bytes))
+    }
+
+    fn printed(output: &std::process::Output) -> String {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    /// `spice build` runs the command in its workdir, prints the digest of the
+    /// module it wrote, and never edits `spicepod.yaml`.
+    #[test]
+    fn test_build_writes_the_module_and_prints_its_digest() {
+        let project = TempDir::new().expect("create the project");
+        fs::create_dir_all(project.path().join("functions/score")).expect("create the workdir");
+        let spicepod = write_project(
+            project.path(),
+            &function_yaml(
+                "score",
+                "./functions/score",
+                "./functions/score/out.wasm",
+                "\"sh -c 'printf module-bytes > out.wasm'\"",
+            ),
+            "",
+        );
+
+        let output = spice_cmd()
+            .current_dir(project.path())
+            .arg("build")
+            .output()
+            .expect("run spice build");
+
+        let printed = printed(&output);
+        assert!(output.status.success(), "{printed}");
+        assert!(
+            printed.contains("Building function 'score' in ./functions/score: sh -c 'printf module-bytes > out.wasm'"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains(&format!(
+                "Built 'score' -> ./functions/score/out.wasm (sha256 {})",
+                sha256_hex(b"module-bytes")
+            )),
+            "{printed}"
+        );
+        assert_eq!(
+            fs::read_to_string(project.path().join("spicepod.yaml")).expect("read spicepod.yaml"),
+            spicepod,
+            "spice build never edits spicepod.yaml"
+        );
+    }
+
+    /// The first failed build stops `spice build` with the command's own
+    /// output and a non-zero exit.
+    #[test]
+    fn test_build_stops_at_a_failed_build() {
+        let project = TempDir::new().expect("create the project");
+        write_project(
+            project.path(),
+            &(function_yaml(
+                "broken",
+                ".",
+                "./broken.wasm",
+                "\"sh -c 'echo the compiler says no >&2; exit 3'\"",
+            ) + &function_yaml(
+                "never",
+                ".",
+                "./never.wasm",
+                "\"sh -c 'printf x > never.wasm'\"",
+            )),
+            "",
+        );
+
+        let output = spice_cmd()
+            .current_dir(project.path())
+            .arg("build")
+            .output()
+            .expect("run spice build");
+
+        let printed = printed(&output);
+        assert!(!output.status.success(), "{printed}");
+        assert!(printed.contains("the compiler says no"), "{printed}");
+        assert!(
+            printed.contains("Failed to build function 'broken': `sh -c 'echo the compiler says no >&2; exit 3'` failed (exit status: 3). See: https://spiceai.org/docs/components/functions/wasm"),
+            "{printed}"
+        );
+        assert!(
+            !project.path().join("never.wasm").exists(),
+            "nothing after the failed build runs"
+        );
+    }
+
+    /// A function from a dependency `spicepod.yaml` does not trust is not
+    /// built; the others still are, and the command exits 1 at the end.
+    #[test]
+    fn test_build_refuses_an_untrusted_dependency_until_it_is_trusted() {
+        let project = TempDir::new().expect("create the project");
+        let dependency = project.path().join("spicepods/acme/scoring");
+        fs::create_dir_all(&dependency).expect("create the dependency");
+        fs::write(
+            dependency.join("spicepod.yaml"),
+            format!(
+                "version: v2\nkind: Spicepod\nname: scoring\nfunctions:\n{}",
+                function_yaml(
+                    "score",
+                    ".",
+                    "./score.wasm",
+                    "\"sh -c 'printf dep > score.wasm'\""
+                )
+            ),
+        )
+        .expect("write the dependency");
+        let own = function_yaml(
+            "own",
+            ".",
+            "./own.wasm",
+            "\"sh -c 'printf own > own.wasm'\"",
+        );
+
+        write_project(project.path(), &own, "dependencies:\n  - acme/scoring\n");
+        let output = spice_cmd()
+            .current_dir(project.path())
+            .arg("build")
+            .output()
+            .expect("run spice build");
+        let refused = printed(&output);
+        assert_eq!(output.status.code(), Some(1), "{refused}");
+        assert!(
+            refused.contains("Failed to build function 'score' from Spicepod dependency 'acme/scoring': its `build:` command runs a program on this host, and a dependency may do that only when spicepod.yaml trusts it. To trust it, replace `- acme/scoring` under `dependencies:` with `- { from: acme/scoring, trust: full }`. See: https://spiceai.org/docs/reference/spicepod#dependencies"),
+            "{refused}"
+        );
+        assert!(
+            project.path().join("own.wasm").exists(),
+            "the root's own function still builds"
+        );
+        assert!(!project.path().join("score.wasm").exists(), "{refused}");
+
+        write_project(
+            project.path(),
+            &own,
+            "dependencies:\n  - from: acme/scoring\n    trust: full\n",
+        );
+        let output = spice_cmd()
+            .current_dir(project.path())
+            .arg("build")
+            .output()
+            .expect("run spice build");
+        assert!(output.status.success(), "{}", printed(&output));
+        assert_eq!(
+            fs::read(project.path().join("score.wasm")).expect("the trusted build ran"),
+            b"dep"
+        );
+    }
+
+    /// `spice run` builds before it starts the runtime: the runtime started
+    /// with the module already written.
+    #[test]
+    fn test_run_builds_before_starting_the_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = TempDir::new().expect("create the project");
+        write_project(
+            project.path(),
+            &function_yaml(
+                "score",
+                ".",
+                "./score.wasm",
+                "\"sh -c 'printf built > score.wasm'\"",
+            ),
+            "",
+        );
+        let bin = TempDir::new().expect("create the runtime directory");
+        let spiced = bin.path().join("spiced");
+        let seen = project.path().join("runtime-saw");
+        fs::write(
+            &spiced,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'v2.5.0'; exit 0; fi\nif [ -f '{module}' ]; then echo built > '{seen}'; else echo missing > '{seen}'; fi\nexit 0\n",
+                module = project.path().join("score.wasm").display(),
+                seen = seen.display()
+            ),
+        )
+        .expect("write the stub runtime");
+        fs::set_permissions(&spiced, fs::Permissions::from_mode(0o755))
+            .expect("make the stub runtime executable");
+
+        let output = spice_cmd()
+            .current_dir(project.path())
+            .env("SPICED_PATH", &spiced)
+            .arg("run")
+            .timeout(std::time::Duration::from_mins(1))
+            .output()
+            .expect("run spice run");
+
+        let printed = printed(&output);
+        assert!(
+            printed.contains("Building function 'score' in .: sh -c 'printf built > score.wasm'"),
+            "{printed}"
+        );
+        assert_eq!(
+            fs::read_to_string(&seen)
+                .expect("the stub runtime ran")
+                .trim(),
+            "built",
+            "the module must exist before the runtime starts: {printed}"
+        );
+    }
+
+    /// What a stub runtime saw when `spice run` started it.
+    struct RuntimeSaw {
+        /// Its working directory.
+        cwd: std::path::PathBuf,
+        /// The bytes of `./score.wasm`, read relative to its working
+        /// directory the way the runtime reads a relative `params.module`.
+        module: String,
+        /// Its arguments, among them the Spicepod it was told to load.
+        args: Vec<String>,
+    }
+
+    /// A stub runtime that records [`RuntimeSaw`] in `record`.
+    fn stub_runtime(bin: &TempDir, record: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let spiced = bin.path().join("spiced");
+        fs::write(
+            &spiced,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'v2.5.0'; exit 0; fi\n{{ pwd -P; if [ -f ./score.wasm ]; then cat ./score.wasm; else printf missing; fi; echo; printf '%s\\n' \"$@\"; }} > '{record}'\nexit 0\n",
+                record = record.display()
+            ),
+        )
+        .expect("write the stub runtime");
+        fs::set_permissions(&spiced, fs::Permissions::from_mode(0o755))
+            .expect("make the stub runtime executable");
+        spiced
+    }
+
+    fn runtime_saw(record: &std::path::Path, printed: &str) -> RuntimeSaw {
+        let record = fs::read_to_string(record)
+            .unwrap_or_else(|err| panic!("the stub runtime never ran ({err}): {printed}"));
+        let mut lines = record.lines();
+        RuntimeSaw {
+            cwd: lines.next().unwrap_or_default().into(),
+            module: lines.next().unwrap_or_default().to_string(),
+            args: lines.map(str::to_string).collect(),
+        }
+    }
+
+    /// `spice run production.yaml` builds the functions of `production.yaml`,
+    /// the manifest the runtime is given, not of the `spicepod.yaml` beside it,
+    /// wherever the path stands among the runtime's options.
+    #[test]
+    fn test_run_builds_the_manifest_it_names() {
+        for args in [
+            &["production.yaml"][..],
+            &["--very-verbose", "production.yaml"],
+            &["--tls-enabled", "false", "production.yaml"],
+            &[
+                "--set-runtime=results_cache.enabled=false",
+                "production.yaml",
+            ],
+            &["production.yaml", "--very-verbose"],
+        ] {
+            let project = two_manifest_project();
+            let bin = TempDir::new().expect("create the runtime directory");
+            let record = bin.path().join("runtime-saw");
+            let spiced = stub_runtime(&bin, &record);
+
+            let output = spice_cmd()
+                .current_dir(project.path())
+                .env("SPICED_PATH", &spiced)
+                .arg("run")
+                .args(args)
+                .timeout(std::time::Duration::from_mins(1))
+                .output()
+                .expect("run spice run");
+
+            let printed = printed(&output);
+            assert!(
+                printed.contains(&format!(
+                    "Built 'score' -> ./score.wasm (sha256 {})",
+                    sha256_hex(b"production")
+                )),
+                "{args:?}: {printed}"
+            );
+            assert!(!printed.contains("decoy"), "{args:?}: {printed}");
+            assert!(
+                !project.path().join("decoy.wasm").exists(),
+                "{args:?}: the other manifest's build must not run: {printed}"
+            );
+            let saw = runtime_saw(&record, &printed);
+            assert!(
+                saw.args.iter().any(|arg| arg == "production.yaml"),
+                "{args:?}: the runtime loads the same manifest: {:?} {printed}",
+                saw.args
+            );
+            assert_eq!(saw.module, "production", "{args:?}: {printed}");
+        }
+    }
+
+    /// When `spice run` cannot tell which manifest the runtime loads, it
+    /// builds neither and says so, rather than run the commands of a
+    /// manifest the runtime may never load.
+    #[test]
+    fn test_run_builds_nothing_when_it_cannot_tell_which_manifest_the_runtime_loads() {
+        let project = two_manifest_project();
+        let bin = TempDir::new().expect("create the runtime directory");
+        let record = bin.path().join("runtime-saw");
+        let spiced = stub_runtime(&bin, &record);
+
+        let output = spice_cmd()
+            .current_dir(project.path())
+            .env("SPICED_PATH", &spiced)
+            .args(["run", "--not-a-runtime-option", "production.yaml"])
+            .timeout(std::time::Duration::from_mins(1))
+            .output()
+            .expect("run spice run");
+
+        let printed = printed(&output);
+        assert!(
+            printed.contains("`spice run` does not recognize the runtime argument '--not-a-runtime-option', so it cannot tell which Spicepod the runtime will load and built no function module. Run `spice build` to build them, or `spice upgrade` if the runtime is newer than the CLI. See: https://spiceai.org/docs/components/functions/wasm"),
+            "{printed}"
+        );
+        assert!(!printed.contains("Building function"), "{printed}");
+        assert!(!project.path().join("decoy.wasm").exists(), "{printed}");
+        assert!(!project.path().join("score.wasm").exists(), "{printed}");
+    }
+
+    /// An `--endpoint` the runtime cannot be started on is refused before
+    /// anything is built, and the runtime never starts.
+    #[test]
+    fn test_run_builds_nothing_for_an_endpoint_it_refuses() {
+        let project = two_manifest_project();
+        let bin = TempDir::new().expect("create the runtime directory");
+        let record = bin.path().join("runtime-saw");
+        let spiced = stub_runtime(&bin, &record);
+
+        let output = spice_cmd()
+            .current_dir(project.path())
+            .env("SPICED_PATH", &spiced)
+            .args(["run", "--endpoint", "ftp://127.0.0.1:1"])
+            .timeout(std::time::Duration::from_mins(1))
+            .output()
+            .expect("run spice run");
+
+        let printed = printed(&output);
+        assert!(
+            printed.contains("Unrecognized scheme in --endpoint 'ftp://127.0.0.1:1'. Use http://, https://, grpc://, or grpc+tls://"),
+            "{printed}"
+        );
+        assert_eq!(output.status.code(), Some(1), "{printed}");
+        assert!(!printed.contains("Building function"), "{printed}");
+        assert!(!project.path().join("decoy.wasm").exists(), "{printed}");
+        assert!(!record.exists(), "the runtime must not start: {printed}");
+    }
+
+    /// Arguments the runtime refuses build nothing, whichever check refuses
+    /// them: a value, a repeated option, or an option that requires another.
+    /// The runtime is still started with exactly those arguments, so its own
+    /// parser reports the refusal.
+    #[test]
+    fn test_run_builds_nothing_when_the_runtime_refuses_its_arguments() {
+        for args in [
+            &["--tls-enabled", "maybe"][..],
+            &["--metrics", "not-an-address"],
+            &["--region", "us-west-2"],
+            &["--telemetry-enabled", "maybe"],
+            &["--set-runtime", "noequals"],
+            &["--metrics", "127.0.0.1:9090", "--metrics", "127.0.0.1:9091"],
+        ] {
+            let project = two_manifest_project();
+            let bin = TempDir::new().expect("create the runtime directory");
+            let record = bin.path().join("runtime-saw");
+            let spiced = stub_runtime(&bin, &record);
+
+            let output = spice_cmd()
+                .current_dir(project.path())
+                .env("SPICED_PATH", &spiced)
+                .arg("run")
+                .args(args)
+                .timeout(std::time::Duration::from_mins(1))
+                .output()
+                .expect("run spice run");
+
+            let printed = printed(&output);
+            assert!(
+                !printed.contains("Building function"),
+                "{args:?}: {printed}"
+            );
+            assert!(
+                !project.path().join("decoy.wasm").exists(),
+                "{args:?}: nothing may be built for a runtime that refuses its arguments: {printed}"
+            );
+            assert!(
+                !printed.contains("does not recognize"),
+                "{args:?}: every option here is one the runtime has: {printed}"
+            );
+            let saw = runtime_saw(&record, &printed);
+            assert!(
+                args.iter()
+                    .all(|arg| saw.args.iter().any(|seen| seen == arg)),
+                "{args:?}: the runtime is started with the arguments it refuses: {:?}",
+                saw.args
+            );
+        }
+    }
+
+    /// An app directory holding `spicepod.yaml`, whose function `decoy`
+    /// builds `decoy.wasm`, and `production.yaml`, whose function `score`
+    /// writes `production` to `score.wasm`.
+    fn two_manifest_project() -> TempDir {
+        let project = TempDir::new().expect("create the project");
+        write_project(
+            project.path(),
+            &function_yaml(
+                "decoy",
+                ".",
+                "./decoy.wasm",
+                "\"sh -c 'printf decoy > decoy.wasm'\"",
+            ),
+            "",
+        );
+        fs::write(
+            project.path().join("production.yaml"),
+            format!(
+                "version: v2\nkind: Spicepod\nname: production\nfunctions:\n{}",
+                function_yaml(
+                    "score",
+                    ".",
+                    "./score.wasm",
+                    "\"sh -c 'printf production > score.wasm'\""
+                )
+            ),
+        )
+        .expect("write production.yaml");
+        project
+    }
+
+    /// From the app's parent directory, `spice run ./app/spicepod.yaml` builds
+    /// a relative `params.module` where the runtime then loads it: in the
+    /// directory the runtime runs in, which is where `spice run` was invoked.
+    /// The runtime never starts on a stale module there while the new one sits
+    /// beside the Spicepod.
+    #[test]
+    fn test_run_from_a_parent_directory_builds_the_module_the_runtime_loads() {
+        let parent = TempDir::new().expect("create the parent directory");
+        let app = parent.path().join("app");
+        fs::create_dir_all(&app).expect("create the app directory");
+        write_project(
+            &app,
+            &function_yaml(
+                "score",
+                ".",
+                "./score.wasm",
+                "\"sh -c 'printf fresh > score.wasm'\"",
+            ),
+            "",
+        );
+        fs::write(parent.path().join("score.wasm"), "stale").expect("write a stale module");
+        let bin = TempDir::new().expect("create the runtime directory");
+        let record = bin.path().join("runtime-saw");
+        let spiced = stub_runtime(&bin, &record);
+
+        let output = spice_cmd()
+            .current_dir(parent.path())
+            .env("SPICED_PATH", &spiced)
+            .args(["run", "./app/spicepod.yaml"])
+            .timeout(std::time::Duration::from_mins(1))
+            .output()
+            .expect("run spice run");
+
+        let printed = printed(&output);
+        let saw = runtime_saw(&record, &printed);
+        assert_eq!(
+            saw.cwd,
+            parent.path().canonicalize().expect("canonical parent"),
+            "{printed}"
+        );
+        assert!(
+            saw.args.iter().any(|arg| arg == "./app/spicepod.yaml"),
+            "{:?} {printed}",
+            saw.args
+        );
+        assert_eq!(
+            saw.module, "fresh",
+            "the runtime must load the module that was just built: {printed}"
+        );
+        assert!(
+            printed.contains(&format!(
+                "Built 'score' -> ./score.wasm (sha256 {})",
+                sha256_hex(b"fresh")
+            )),
+            "the printed digest must be the module the runtime loads: {printed}"
+        );
+        assert!(!app.join("score.wasm").exists(), "{printed}");
+    }
+
+    /// A `build.workdir` that does not exist fails the build and names the
+    /// directory. It is never reported as a missing build tool, so `spice run`
+    /// does not fall back to the existing module and start the runtime on it.
+    #[test]
+    fn test_run_stops_at_a_build_workdir_that_does_not_exist() {
+        let project = TempDir::new().expect("create the project");
+        write_project(
+            project.path(),
+            &function_yaml(
+                "score",
+                "./functions/score",
+                "./score.wasm",
+                "\"sh -c 'printf fresh > ../../score.wasm'\"",
+            ),
+            "",
+        );
+        fs::write(project.path().join("score.wasm"), "stale").expect("write a stale module");
+        let bin = TempDir::new().expect("create the runtime directory");
+        let record = bin.path().join("runtime-saw");
+        let spiced = stub_runtime(&bin, &record);
+
+        let output = spice_cmd()
+            .current_dir(project.path())
+            .env("SPICED_PATH", &spiced)
+            .arg("run")
+            .timeout(std::time::Duration::from_mins(1))
+            .output()
+            .expect("run spice run");
+
+        let printed = printed(&output);
+        assert_eq!(output.status.code(), Some(1), "{printed}");
+        assert!(
+            printed.contains(&format!(
+                "Failed to build function 'score': its `build.workdir` './functions/score' is not a directory in '{}', where relative paths in the Spicepod resolve. Run `spice` from the directory those paths are written for, or correct `build.workdir`. See: https://spiceai.org/docs/components/functions/wasm",
+                project.path().canonicalize().expect("canonical project").display()
+            )),
+            "{printed}"
+        );
+        assert!(!printed.contains("was not found"), "{printed}");
+        assert!(
+            !record.exists(),
+            "the runtime must not start after a failed build: {printed}"
         );
     }
 }

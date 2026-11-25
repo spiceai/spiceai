@@ -674,6 +674,58 @@ async fn offline_mode_with_a_cold_cache_says_how_to_fill_it() {
     assert!(fixture.mock.seen().is_empty());
 }
 
+/// `TRANSFORMERS_OFFLINE` keeps Spice off the Hub as `HF_HUB_OFFLINE` does, and a message
+/// names the variable that is set, so that its fix unsets what keeps the cache read alone.
+#[tokio::test]
+async fn transformers_offline_is_named_as_what_keeps_the_hub_unread() {
+    let fixture = Fixture::new().await;
+    fixture.mock.commit(MODEL, C1, model_files());
+    fixture.mock.branch(MODEL, "main", C1);
+
+    let error = fixture
+        .try_open(None, &[("TRANSFORMERS_OFFLINE", "1")])
+        .await
+        .expect_err("nothing is cached");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): `TRANSFORMERS_OFFLINE` is set and revision 'main' of the repo is not in the Hugging Face cache at '{}'. Run `hf download o/m --revision main` while online, or unset `TRANSFORMERS_OFFLINE`. See: https://spiceai.org/docs/components/models/huggingface",
+            fixture.cache().display()
+        )
+    );
+    assert!(fixture.mock.seen().is_empty());
+
+    fixture
+        .open(None, &[])
+        .await
+        .download(&["config.json"])
+        .await
+        .expect("the config downloads");
+    fixture.mock.clear_seen();
+    let snapshot = fixture
+        .open(
+            None,
+            &[("TRANSFORMERS_OFFLINE", "1"), ("HF_HUB_OFFLINE", "1")],
+        )
+        .await;
+    assert_eq!(
+        snapshot.cache_only_reason().as_deref(),
+        Some("`HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE` are set")
+    );
+    let error = snapshot
+        .download(&["tokenizer.json"])
+        .await
+        .expect_err("the tokenizer was never downloaded");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE` are set and the Hugging Face cache at '{}' does not hold 'tokenizer.json'. Run `hf download o/m --revision main` while online, or unset `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE`. See: https://spiceai.org/docs/components/models/huggingface",
+            fixture.cache().display()
+        )
+    );
+    assert!(fixture.mock.seen().is_empty(), "{:?}", fixture.mock.seen());
+}
+
 #[tokio::test]
 async fn a_hub_outage_loads_the_cached_snapshot() {
     let fixture = Fixture::new().await;
@@ -1048,6 +1100,52 @@ async fn a_rejected_token_is_named_by_its_source() {
         .expect("the token file's token is accepted");
 }
 
+/// A rejected token falls back to the cache, as every failure but a missing repository,
+/// revision or file does, and what the cache then lacks is reported as the token's fault, with
+/// its fix, not as a network failure.
+#[tokio::test]
+async fn a_rejected_token_with_a_cached_snapshot_says_to_fix_the_token() {
+    let fixture = Fixture::new().await;
+    fixture.mock.commit(MODEL, C1, model_files());
+    fixture.mock.branch(MODEL, "main", C1);
+    fixture
+        .open(None, &[])
+        .await
+        .download(&["config.json"])
+        .await
+        .expect("the config downloads");
+
+    fixture.mock.require_token("hf_right");
+    let snapshot = fixture.open(None, &[("HF_TOKEN", "hf_wrong")]).await;
+    assert_eq!(snapshot.commit(), C1);
+    assert_eq!(
+        snapshot.cache_only_reason().as_deref(),
+        Some("the Hugging Face Hub refused the request (token rejected, HTTP 401)")
+    );
+    snapshot
+        .download(&["config.json"])
+        .await
+        .expect("the cached config loads");
+
+    let error = snapshot
+        .download(&["tokenizer.json"])
+        .await
+        .expect_err("the tokenizer was never downloaded");
+    assert_eq!(
+        error.to_string(),
+        "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): the Hub rejected the token from `HF_TOKEN` (HTTP 401), so Spice read only the Hugging Face cache, which does not hold 'tokenizer.json'. Set `HF_TOKEN` to a token with access to this repo, or set `hf_token`. See: https://spiceai.org/docs/components/models/huggingface"
+    );
+    assert!(!error.is_configuration_error());
+
+    let error =
+        huggingface_hub::DownloadError::unusable(&snapshot, "there is no file 'model.gguf'");
+    assert_eq!(
+        error.to_string(),
+        "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): the Hub rejected the token from `HF_TOKEN` (HTTP 401), so Spice read only the Hugging Face cache, where there is no file 'model.gguf'. Set `HF_TOKEN` to a token with access to this repo, or set `hf_token`. See: https://spiceai.org/docs/components/models/huggingface"
+    );
+    assert!(!error.is_configuration_error());
+}
+
 #[tokio::test]
 async fn a_path_that_leaves_the_snapshot_is_refused() {
     let fixture = Fixture::new().await;
@@ -1142,6 +1240,199 @@ async fn offline_mode_names_a_needed_file_the_cache_lacks() {
     );
     // `hf download` can fill the cache while Spice runs: a retry may succeed.
     assert!(!error.is_configuration_error());
+}
+
+/// What a component cannot use in the Hub's listing is a mistake in the Spicepod, which no
+/// retry fixes. In a listing of the cache alone it is a gap in the cache, which `hf download`
+/// or the Hub's return can fill: the error says only the cache was read, and how to fill it,
+/// and a retry may succeed.
+#[tokio::test]
+async fn an_unusable_listing_read_from_the_cache_says_so_and_is_retried() {
+    const WHY: &str = "there is no file 'model.gguf'";
+    let fixture = Fixture::new().await;
+    fixture.mock.commit(MODEL, C1, model_files());
+    fixture.mock.branch(MODEL, "main", C1);
+    let online = fixture.open(None, &[]).await;
+    online
+        .download(&["config.json"])
+        .await
+        .expect("the config downloads");
+    assert_eq!(online.cache_only_reason(), None);
+    let error = huggingface_hub::DownloadError::unusable(&online, WHY);
+    assert_eq!(
+        error.to_string(),
+        "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): there is no file 'model.gguf'. See: https://spiceai.org/docs/components/models/huggingface"
+    );
+    assert!(error.is_configuration_error());
+
+    let offline = fixture.open(None, &[("HF_HUB_OFFLINE", "1")]).await;
+    assert_eq!(
+        offline.cache_only_reason().as_deref(),
+        Some("`HF_HUB_OFFLINE` is set")
+    );
+    let error = huggingface_hub::DownloadError::unusable(&offline, WHY);
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): `HF_HUB_OFFLINE` is set, so Spice read only the Hugging Face cache at '{}', where there is no file 'model.gguf'. Run `hf download o/m --revision main` while online, or unset `HF_HUB_OFFLINE`. See: https://spiceai.org/docs/components/models/huggingface",
+            fixture.cache().display()
+        )
+    );
+    assert!(!error.is_configuration_error());
+
+    fixture.mock.faults(|faults| faults.hub_down = true);
+    let outage = fixture.open(None, &[]).await;
+    assert_eq!(
+        outage.cache_only_reason().as_deref(),
+        Some("the Hugging Face Hub could not be reached (HTTP 503)")
+    );
+    let error = huggingface_hub::DownloadError::unusable(&outage, WHY);
+    assert_eq!(
+        error.to_string(),
+        "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): the Hugging Face Hub could not be reached (HTTP 503), so Spice read only the Hugging Face cache, where there is no file 'model.gguf'. Spice retries the download; check the network connection. See: https://spiceai.org/docs/components/models/huggingface"
+    );
+    assert!(!error.is_configuration_error());
+}
+
+/// A file the snapshot holds whose content cannot be used is a mistake in the repository when the
+/// Hub was read. Read from the cache alone, the copy need not be the one the repository committed,
+/// so the error says only the cache was read. Offline, retries read the same copy, so it is not
+/// retried, and it says to unset the variable so that Spice compares the copy with the Hub. In an
+/// outage it is retried, since the Hub's return lets Spice do that itself.
+#[tokio::test]
+async fn a_file_whose_content_cannot_be_used_is_retried_only_in_an_outage() {
+    const WHY: &str = "'model.safetensors.index.json' has no `weight_map`";
+    let fixture = Fixture::new().await;
+    fixture.mock.commit(MODEL, C1, model_files());
+    fixture.mock.branch(MODEL, "main", C1);
+    let online = fixture.open(None, &[]).await;
+    online
+        .download(&["config.json"])
+        .await
+        .expect("the config downloads");
+    let offline = fixture.open(None, &[("HF_HUB_OFFLINE", "1")]).await;
+    fixture.mock.faults(|faults| faults.hub_down = true);
+    let outage = fixture.open(None, &[]).await;
+
+    for (snapshot, message, permanent) in [
+        (
+            &online,
+            "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): 'model.safetensors.index.json' has no `weight_map`. See: https://spiceai.org/docs/components/models/huggingface".to_string(),
+            true,
+        ),
+        (
+            &offline,
+            format!(
+                "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): `HF_HUB_OFFLINE` is set, so Spice read only the Hugging Face cache at '{}', where 'model.safetensors.index.json' has no `weight_map`. Unset `HF_HUB_OFFLINE` so that Spice compares the cache's copy with the Hugging Face Hub and downloads it again if its size differs. See: https://spiceai.org/docs/components/models/huggingface",
+                fixture.cache().display()
+            ),
+            true,
+        ),
+        (
+            &outage,
+            "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): the Hugging Face Hub could not be reached (HTTP 503), so Spice read only the Hugging Face cache, where 'model.safetensors.index.json' has no `weight_map`. Spice retries the download; check the network connection. See: https://spiceai.org/docs/components/models/huggingface".to_string(),
+            false,
+        ),
+    ] {
+        let error = huggingface_hub::DownloadError::invalid_file(snapshot, WHY);
+        assert_eq!(error.to_string(), message);
+        assert_eq!(error.is_configuration_error(), permanent, "{message}");
+    }
+}
+
+/// A copy in the cache can be short: a copy made where the filesystem has no links, or a blob
+/// another writer renamed into place, cut off by a crash. Read from the cache alone it is used as
+/// it is; once the Hub's listing is read, a copy whose size differs is downloaded again. That is
+/// what retrying in an outage, and reading the Hub when offline, rely on.
+#[tokio::test]
+async fn a_short_copy_in_the_cache_is_downloaded_again_once_the_hub_is_read() {
+    const INDEX: &str = r#"{"metadata":{},"weight_map":{"a":"model-00001-of-00001.safetensors"}}"#;
+    const NAME: &str = "model.safetensors.index.json";
+    for damage in ["short copy", "empty copy", "truncated blob"] {
+        let fixture = Fixture::new().await;
+        fixture.mock.commit(
+            MODEL,
+            C1,
+            vec![
+                ("config.json", MockFile::text("{}")),
+                (NAME, MockFile::text(INDEX)),
+            ],
+        );
+        fixture.mock.branch(MODEL, "main", C1);
+        let online = fixture.open(None, &[]).await;
+        online.download(&[NAME]).await.expect("the index downloads");
+        let entry = online.dir().join(NAME);
+        let damaged: &[u8] = match damage {
+            "short copy" => &INDEX.as_bytes()[..30],
+            _ => b"",
+        };
+        if damage == "truncated blob" {
+            let blob = std::fs::canonicalize(&entry).expect("the entry links to a blob");
+            assert_ne!(blob, entry, "the cache links the entry to its blob");
+            std::fs::write(&blob, damaged).expect("truncates the blob");
+        } else {
+            std::fs::remove_file(&entry).expect("removes the entry");
+            std::fs::write(&entry, damaged).expect("writes the copy");
+        }
+
+        fixture.mock.faults(|faults| faults.hub_down = true);
+        let outage = fixture.open(None, &[]).await;
+        assert!(outage.cache_only_reason().is_some(), "{damage}");
+        let read = outage
+            .fetch_quietly(&[NAME])
+            .await
+            .expect("the cache lists the index");
+        assert_eq!(
+            std::fs::read(&read[0]).expect("reads the copy"),
+            damaged,
+            "{damage}: read from the cache alone, the copy is used as it is"
+        );
+
+        fixture.mock.faults(|faults| faults.hub_down = false);
+        let back = fixture.open(None, &[]).await;
+        assert_eq!(back.cache_only_reason(), None, "{damage}");
+        let read = back
+            .fetch_quietly(&[NAME])
+            .await
+            .expect("the index downloads again");
+        assert_eq!(
+            std::fs::read_to_string(&read[0]).expect("reads the index"),
+            INDEX,
+            "{damage}: with the Hub read, the copy is the committed index again"
+        );
+    }
+}
+
+/// What a response the client cannot read held prints as printable ASCII wherever the failure
+/// is quoted, so the endpoint cannot break a line: here a listing whose entry type carries a
+/// newline and an escape sequence, which the JSON error quotes as it came.
+#[tokio::test]
+async fn a_listing_that_cannot_be_read_is_quoted_as_printable_ascii() {
+    const QUOTED: &str = "the Hugging Face Hub could not be reached (the Hugging Face Hub returned an unexpected response for model 'o/m': a page of the file listing could not be read (unknown variant `file\\nnext line\\u{1b}[2K`, expected `file` or `directory` at line 1 column 35))";
+    let fixture = Fixture::new().await;
+    fixture.mock.commit(MODEL, C1, model_files());
+    fixture.mock.branch(MODEL, "main", C1);
+    fixture
+        .open(None, &[])
+        .await
+        .download(&["config.json"])
+        .await
+        .expect("the config downloads");
+
+    fixture.mock.faults(|faults| {
+        faults.revision_files = RevisionFiles::Omitted;
+        faults.tree_body =
+            Some(r#"[{"type":"file\nnext line\u001b[2K","path":"a.gguf","size":1}]"#.to_string());
+    });
+    let snapshot = fixture.open(None, &[]).await;
+    assert_eq!(snapshot.cache_only_reason().as_deref(), Some(QUOTED));
+    let error = huggingface_hub::DownloadError::unusable(&snapshot, "x");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): {QUOTED}, so Spice read only the Hugging Face cache, where x. Spice retries the download; check the network connection. See: https://spiceai.org/docs/components/models/huggingface"
+        )
+    );
 }
 
 #[tokio::test]

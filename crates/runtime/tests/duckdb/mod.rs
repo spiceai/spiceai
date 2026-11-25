@@ -31,6 +31,8 @@ use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::dataset::Dataset;
 use tempfile::NamedTempFile;
 
+mod federation_differential;
+
 fn make_duckdb_dataset(ds_name: &str, fn_name: &str, path_str: &str) -> Dataset {
     let mut dataset = Dataset::new(
         format!("duckdb:read_{fn_name}({path_str})"),
@@ -69,7 +71,7 @@ async fn duckdb_from_functions() -> Result<(), String> {
         .with_dataset(make_duckdb_dataset(
             "csv_remote",
             "csv",
-            "'s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.csv', HEADER=true",
+            "'s3://spice-datasets-gjezag77s0hu/taxi_small_samples/taxi_sample.csv', HEADER=true",
         ))
         .with_dataset(make_duckdb_dataset(
             "csv_local",
@@ -79,12 +81,12 @@ async fn duckdb_from_functions() -> Result<(), String> {
         .with_dataset(make_duckdb_dataset(
             "parquet_remote",
             "parquet",
-            "'s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet'",
+            "'s3://spice-datasets-gjezag77s0hu/taxi_small_samples/taxi_sample.parquet'",
         ))
         .with_dataset(make_duckdb_dataset(
             "json_remote",
             "json",
-            "'s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.json'",
+            "'s3://spice-datasets-gjezag77s0hu/taxi_small_samples/taxi_sample.json'",
         ))
         .with_dataset(make_duckdb_dataset(
             "json_local",
@@ -932,7 +934,7 @@ async fn duckdb_binary_literal_filters_agree_with_local_evaluation() -> Result<(
 
             let app = AppBuilder::new("duckdb_binary_literal_filters")
                 .with_dataset(dataset("federated", None))
-                .with_dataset(dataset("local", Some("arrow")))
+                .with_dataset(dataset("local", Some("cayenne")))
                 .build();
 
             configure_test_datafusion();

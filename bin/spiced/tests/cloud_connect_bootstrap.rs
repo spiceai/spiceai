@@ -248,7 +248,11 @@ fn enrollment_failure_happens_before_any_listener_or_readiness() {
         "the HTTP listener became reachable before enrollment completed"
     );
     assert!(
-        !config_dir.path().join("identity.json").exists(),
+        !config_dir
+            .path()
+            .join("cloud-connect")
+            .join("identity.json")
+            .exists(),
         "a failed enrollment must not create an identity"
     );
     respond_tx.send(()).expect("release enrollment response");
@@ -349,7 +353,10 @@ fn successful_enrollment_is_durable_before_the_runtime_listener_binds() {
         .spawn()
         .expect("start spiced");
 
-    let identity_path = config_dir.path().join("identity.json");
+    let identity_path = config_dir
+        .path()
+        .join("cloud-connect")
+        .join("identity.json");
     let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         let http_reachable =
@@ -391,6 +398,16 @@ fn successful_enrollment_is_durable_before_the_runtime_listener_binds() {
 
     let identity = std::fs::read_to_string(&identity_path).expect("read durable identity");
     assert!(identity.contains("inst_process_bootstrap"), "{identity}");
+    // `--token` creates the state directory owner-only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(config_dir.path().join("cloud-connect"))
+            .expect("stat the state directory")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "state directory mode {mode:o}");
+    }
     assert!(
         !identity.contains(&key),
         "identity leaked the key: {identity}"

@@ -597,7 +597,7 @@ jobs:
     needs: [build]
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
     runs-on: spiceai-macos-large
-    # Holds the ARN of the IAM role the tests call Bedrock as (`AWS_BEDROCK_ROLE_ARN`).
+    # Holds the ARN of the IAM role the tests call Bedrock as (`CI_AWS_BEDROCK_ROLE_ARN`).
     environment: ci
     permissions:
       contents: write
@@ -625,10 +625,10 @@ jobs:
       # no build-cache endpoint can reach the STS call.
       - name: Check for the Bedrock role
         env:
-          AWS_BEDROCK_ROLE_ARN: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          CI_AWS_BEDROCK_ROLE_ARN: ${{ secrets.CI_AWS_BEDROCK_ROLE_ARN }}
         run: |
-          if [ -z "$AWS_BEDROCK_ROLE_ARN" ]; then
-            echo "::error::AWS_BEDROCK_ROLE_ARN is not set in the ci environment, so the Bedrock tests cannot authenticate. Create the IAM role that trusts this repository's GitHub OIDC tokens and set the secret to its ARN."
+          if [ -z "$CI_AWS_BEDROCK_ROLE_ARN" ]; then
+            echo "::error::CI_AWS_BEDROCK_ROLE_ARN is not set in the ci environment, so the Bedrock tests cannot authenticate. Create the IAM role that trusts this repository's GitHub OIDC tokens and set the secret to its ARN."
             exit 1
           fi
 
@@ -636,7 +636,7 @@ jobs:
         id: bedrock-role
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_BEDROCK_ROLE_ARN }}
           role-session-name: gha-bedrock-${{ github.run_id }}
           aws-region: us-east-1
           output-env-credentials: false
@@ -704,7 +704,7 @@ jobs:
       - name: Run a Bedrock test with web identity credentials
         if: ${{ !cancelled() }}
         env:
-          AWS_ROLE_ARN: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          AWS_ROLE_ARN: ${{ secrets.CI_AWS_BEDROCK_ROLE_ARN }}
           AWS_ROLE_SESSION_NAME: gha-bedrock-web-identity-${{ github.run_id }}
         run: |
           set -euo pipefail

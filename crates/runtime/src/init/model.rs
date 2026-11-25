@@ -129,7 +129,11 @@ impl Runtime {
             ],
         );
 
-        tracing::info!("Loading model [{}] from {}...", m.name, m.from);
+        tracing::info!(
+            "Loading model [{}] from {}...",
+            m.name,
+            crate::http::v1::redact_source_credentials(&m.from)
+        );
 
         // TODO: Have downstream code using model parameters to accept `Hashmap<String, Value>`.
         // This will require handling secrets with `Value` type.
@@ -497,6 +501,15 @@ impl LoadTasks {
         if let Some(previous) = tasks.insert(name.to_string(), tokio::spawn(load)) {
             previous.abort();
         }
+    }
+
+    /// Whether a load of `name` is running.
+    #[cfg(test)]
+    pub(crate) fn is_running(&self, name: &str) -> bool {
+        self.tasks
+            .lock()
+            .get(name)
+            .is_some_and(|task| !task.is_finished())
     }
 
     /// Stops the load of `name`. When this returns, no attempt to load it is

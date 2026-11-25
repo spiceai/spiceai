@@ -24,6 +24,7 @@ pub use crate::namespace_key::namespace_key_header;
 use async_openai::types::embeddings::CreateEmbeddingRequest;
 use async_openai::types::embeddings::EmbeddingInput;
 use datafusion::common::ParamValues;
+use datafusion::common::ScalarValue;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::sqlparser::ast::Expr;
 
@@ -139,18 +140,20 @@ impl<'a> CacheKey<'a> {
                 if let Some(params) = param_values {
                     match params {
                         ParamValues::List(vec) => {
+                            vec.len().hash(hasher);
                             for item in vec {
-                                item.value().hash(hasher);
+                                hash_parameter(item.value(), hasher);
                             }
                         }
                         ParamValues::Map(hash_map) => {
+                            hash_map.len().hash(hasher);
                             // implementing Hash for HashMap
                             let mut pairs: Vec<_> = hash_map.iter().collect();
                             pairs.sort_by(|a, b| a.0.cmp(b.0)); // Sort by keys
 
                             for (key, value) in pairs {
                                 key.hash(hasher);
-                                value.value().hash(hasher);
+                                hash_parameter(value.value(), hasher);
                             }
                         }
                     }
@@ -206,6 +209,14 @@ impl<'a> CacheKey<'a> {
         self.hash_payload(&mut hasher);
         RawCacheKey(hasher.finish())
     }
+}
+
+/// Hash a bound parameter's type and value. `ScalarValue`'s `Hash` covers only
+/// the value, so `Float64(1.0)` and `Int64(4607182418800017408)` (the same 64
+/// bits), or two NULLs of different types, would otherwise hash alike.
+fn hash_parameter<T: Hasher>(value: &ScalarValue, hasher: &mut T) {
+    value.data_type().hash(hasher);
+    value.hash(hasher);
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy)]
@@ -345,6 +356,94 @@ mod tests {
             same_a != bare,
             "a client-keyed entry is distinct from the bare SQL entry"
         );
+    }
+
+    /// Calls `check` with a function that keys `SELECT id, name FROM t WHERE id = <p>`
+    /// bound to one parameter value, under every configured hashing algorithm, for
+    /// both a positional (`$1`) and a named (`$id`) parameter.
+    fn for_each_one_parameter_key(mut check: impl FnMut(&str, &dyn Fn(ScalarValue) -> u64)) {
+        use spicepod::component::caching::HashingAlgorithm;
+
+        for named in [false, true] {
+            let sql = if named {
+                "SELECT id, name FROM t WHERE id = $id"
+            } else {
+                "SELECT id, name FROM t WHERE id = $1"
+            };
+            for algorithm in [
+                HashingAlgorithm::Ahash,
+                HashingAlgorithm::Siphash,
+                HashingAlgorithm::Blake3,
+                HashingAlgorithm::XXH3,
+                HashingAlgorithm::XXH32,
+                HashingAlgorithm::XXH64,
+                HashingAlgorithm::XXH128,
+            ] {
+                let builder = crate::get_hash_builder(algorithm).expect("a supported algorithm");
+                let key = |value: ScalarValue| {
+                    let params = if named {
+                        ParamValues::from(vec![("id", value)])
+                    } else {
+                        ParamValues::from(vec![value])
+                    };
+                    CacheKey::Query(sql, Some(&params))
+                        .as_raw_key_in_namespace(builder.build_hasher(), 0, b"")
+                        .as_u64()
+                };
+                let kind = if named { "named" } else { "positional" };
+                check(&format!("{algorithm:?}, {kind}"), &key);
+            }
+        }
+    }
+
+    #[test]
+    fn same_bits_of_a_different_type_get_a_different_sql_key() {
+        // 4607182418800017408 is 0x3FF0_0000_0000_0000, the bit pattern of 1.0f64.
+        let float = ScalarValue::Float64(Some(1.0));
+        let int = ScalarValue::Int64(Some(4_607_182_418_800_017_408));
+        for_each_one_parameter_key(|case, key| {
+            assert_ne!(
+                key(float.clone()),
+                key(int.clone()),
+                "{case}: Float64(1.0) and Int64(4607182418800017408) must not share a key"
+            );
+            assert_eq!(
+                key(float.clone()),
+                key(float.clone()),
+                "{case}: identical Float64 parameters must share a key"
+            );
+            assert_eq!(
+                key(int.clone()),
+                key(int.clone()),
+                "{case}: identical Int64 parameters must share a key"
+            );
+        });
+    }
+
+    #[test]
+    fn nulls_of_different_types_get_different_sql_keys() {
+        let nulls = [
+            ScalarValue::Float64(None),
+            ScalarValue::Int64(None),
+            ScalarValue::Utf8(None),
+            ScalarValue::Boolean(None),
+        ];
+        for_each_one_parameter_key(|case, key| {
+            for (i, a) in nulls.iter().enumerate() {
+                assert_eq!(
+                    key(a.clone()),
+                    key(a.clone()),
+                    "{case}: identical {a:?} parameters must share a key"
+                );
+                for b in &nulls[i + 1..] {
+                    assert_ne!(
+                        key(a.clone()),
+                        key(b.clone()),
+                        "{case}: {a:?} and {b:?} must not share a key"
+                    );
+                }
+            }
+        });
     }
 
     #[test]

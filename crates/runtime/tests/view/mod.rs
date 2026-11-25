@@ -44,7 +44,7 @@ async fn accelerated_view_cayenne() -> Result<(), anyhow::Error> {
             let temp_dir = tempfile::tempdir()?;
             let db_path = temp_dir.path().join("cayenne");
 
-            let dataset = Dataset::new("s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet", "taxi_trips");
+            let dataset = Dataset::new("s3://spice-datasets-gjezag77s0hu/taxi_small_samples/taxi_sample.parquet", "taxi_trips");
             let mut view = View::new("taxi_trips_vw".to_string());
             view.sql = Some("SELECT VendorID, AVG(trip_distance) AS avg_trip_distance, AVG(fare_amount) AS avg_fare_amount FROM taxi_trips GROUP BY VendorID".to_string());
             view.acceleration = Some(Acceleration {
@@ -1087,7 +1087,8 @@ async fn test_view_follows_a_replaced_or_removed_dataset() -> Result<(), anyhow:
             let accelerated = |mut dataset: Dataset| {
                 dataset.acceleration = Some(Acceleration {
                     enabled: true,
-                    engine: Some("arrow".to_string()),
+                    engine: Some("cayenne".to_string()),
+                    mode: spicepod::acceleration::Mode::Memory,
                     refresh_mode: Some(RefreshMode::Full),
                     ..Acceleration::default()
                 });

@@ -143,6 +143,11 @@ async fn overwrite_then_upsert_layers_keep_the_last_copy_through_its_lifecycle()
             visible(&provider).await,
             provider.protected_snapshot_ids().len(),
         );
+        // Hand the table over as the runtime does when it reopens a dataset: the
+        // old instance's maintenance has its own `compaction_lock`, so a post-write
+        // pass it spawned would otherwise commit under the new instance's passes
+        // and make them abort.
+        provider.quiesce().await;
         let reopened =
             CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
                 .open("t")
@@ -180,15 +185,19 @@ async fn overwrite_then_upsert_layers_keep_the_last_copy_through_its_lifecycle()
             visible(&reopened).await,
             reopened.protected_snapshot_ids().len(),
         );
-        reopened
-            .sort_and_rewrite_data(64 * 1024 * 1024)
-            .await
-            .expect("full rewrite");
+        assert!(
+            reopened
+                .force_full_compaction()
+                .await
+                .expect("full rewrite"),
+            "the full compaction must commit"
+        );
         check(
             "after full rewrite",
             visible(&reopened).await,
             reopened.protected_snapshot_ids().len(),
         );
+        reopened.quiesce().await;
         let reopened =
             CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
                 .open("t")

@@ -325,6 +325,18 @@ pub struct MemTierDurableCommit {
     pub inline_data: Vec<InlinedData>,
     /// Clear the superseded inline corpus AND its deletion markers.
     pub clear_inlined: bool,
+    /// Keys re-inserted at `sequence_number` that a delete-only vector from an
+    /// earlier commit may still hide, recorded as per-key insert records.
+    pub insert_records: Vec<Vec<u8>>,
+    /// The table's statistics including this commit's rows.
+    pub table_statistics: Option<TableStatistics>,
+    /// Drop the per-file statistics of every snapshot except this one.
+    pub keep_file_statistics_of: Option<String>,
+    /// Manifest rows of the data files this commit's rows landed in, upserted
+    /// with it: a table whose data is in the object-native location scans only
+    /// its manifest, so its files and the clear of the rows they hold commit
+    /// together.
+    pub manifest_files: Vec<SnapshotFile>,
 }
 
 /// One table's durable append publication. A slice is one atomic transaction.
@@ -1136,12 +1148,18 @@ pub trait MetadataCatalog: Send + Sync {
     ///
     /// `delete_files` are position deletion vectors on the new snapshot, hiding
     /// the copies of keys its incoming data repeated across record batches.
+    ///
+    /// `files` is the new snapshot's complete manifest, possibly empty, recorded
+    /// in the same commit as the flip so that no crash leaves the files of a
+    /// snapshot that never became current named, where no sweep reclaims them.
+    /// `None` when the caller recorded the manifest already.
     async fn commit_overwrite(
         &self,
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
         delete_files: &[crate::metadata::DeleteFile],
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()>;
 
     /// Add a partition to a table.

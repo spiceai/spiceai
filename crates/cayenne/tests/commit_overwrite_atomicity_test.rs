@@ -48,7 +48,7 @@ use std::sync::Arc;
 use arrow::array::{BinaryArray, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
-use cayenne::metadata::{CreateTableOptions, DeletionType, VortexConfig};
+use cayenne::metadata::{CreateTableOptions, DeletionType, SnapshotFile, VortexConfig};
 use cayenne::{
     CayenneCatalog, DeleteFile, InlinedData, InlinedDelete, MetadataCatalog, TableStatistics,
 };
@@ -295,7 +295,7 @@ async fn commit_overwrite_clears_all_per_snapshot_state() {
 
     let new_snapshot = uuid::Uuid::now_v7().to_string();
     catalog
-        .commit_overwrite(&table_id, &new_snapshot, None, &[])
+        .commit_overwrite(&table_id, &new_snapshot, None, &[], None)
         .await
         .expect("commit_overwrite happy path");
 
@@ -368,7 +368,7 @@ async fn commit_overwrite_replaces_inlined_corpus_atomically() {
 
     let new_snapshot = uuid::Uuid::now_v7().to_string();
     catalog
-        .commit_overwrite(&table_id, &new_snapshot, Some(&replacement), &[])
+        .commit_overwrite(&table_id, &new_snapshot, Some(&replacement), &[], None)
         .await
         .expect("commit_overwrite with inline payload");
 
@@ -411,7 +411,7 @@ async fn commit_overwrite_replaces_inlined_corpus_atomically() {
     };
     let third_snapshot = uuid::Uuid::now_v7().to_string();
     catalog
-        .commit_overwrite(&table_id, &third_snapshot, Some(&second), &[])
+        .commit_overwrite(&table_id, &third_snapshot, Some(&second), &[], None)
         .await
         .expect("second inlined overwrite");
     let rows = catalog
@@ -524,7 +524,7 @@ async fn commit_overwrite_isolated_by_table_id() {
 
     let new_snap_a = uuid::Uuid::now_v7().to_string();
     catalog
-        .commit_overwrite(&table_a, &new_snap_a, None, &[])
+        .commit_overwrite(&table_a, &new_snap_a, None, &[], None)
         .await
         .expect("commit_overwrite table_a");
 
@@ -559,7 +559,7 @@ async fn commit_overwrite_succeeds_on_empty_pre_state() {
     // No state planted — fresh table.
     let new_snapshot = uuid::Uuid::now_v7().to_string();
     catalog
-        .commit_overwrite(&table_id, &new_snapshot, None, &[])
+        .commit_overwrite(&table_id, &new_snapshot, None, &[], None)
         .await
         .expect("commit_overwrite on empty pre-state");
 
@@ -614,7 +614,7 @@ async fn commit_overwrite_clears_inlined_state_unlike_commit_compaction() {
         .await
         .expect("commit_compaction");
     catalog
-        .commit_overwrite(&overwrite_id, &new_overwrite_snap, None, &[])
+        .commit_overwrite(&overwrite_id, &new_overwrite_snap, None, &[], None)
         .await
         .expect("commit_overwrite");
 
@@ -770,5 +770,171 @@ async fn commit_overwrite_in_txn_partial_failure_rolls_back_full_bundle() {
     assert_eq!(
         before, after,
         "rolled-back shared txn must restore EVERY side-table row and the snapshot pointer"
+    );
+}
+
+/// Manifest rows for `files` in `snapshot_id`, one row and one sequence each.
+fn manifest_rows(table_id: &str, snapshot_id: &str, files: &[&str]) -> Vec<SnapshotFile> {
+    files
+        .iter()
+        .zip(1_i64..)
+        .map(|(file, n)| SnapshotFile {
+            table_id: table_id.to_string(),
+            snapshot_id: snapshot_id.to_string(),
+            file_path: (*file).to_string(),
+            row_count: 10 * n,
+            file_size_bytes: 1_000 * n,
+            min_sequence: n,
+            max_sequence: n,
+            digest: Some(format!("xxh3-128:{n:032x}")),
+        })
+        .collect()
+}
+
+type ManifestRow = (String, String, i64, i64, i64, i64, Option<String>);
+
+/// Every manifest row of `table_id`, sorted, as comparable tuples.
+async fn manifest_of(catalog: &CayenneCatalog, table_id: &str) -> Vec<ManifestRow> {
+    let mut rows: Vec<ManifestRow> = catalog
+        .get_all_snapshot_files(table_id)
+        .await
+        .expect("read the manifest")
+        .into_iter()
+        .map(|file| {
+            assert_eq!(file.table_id, table_id, "a row of another table");
+            (
+                file.snapshot_id,
+                file.file_path,
+                file.row_count,
+                file.file_size_bytes,
+                file.min_sequence,
+                file.max_sequence,
+                file.digest,
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn as_manifest(files: &[SnapshotFile]) -> Vec<ManifestRow> {
+    let mut rows: Vec<ManifestRow> = files
+        .iter()
+        .map(|file| {
+            (
+                file.snapshot_id.clone(),
+                file.file_path.clone(),
+                file.row_count,
+                file.file_size_bytes,
+                file.min_sequence,
+                file.max_sequence,
+                file.digest.clone(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+// ============================================================================
+// Test 9 — an overwrite that carries its manifest records exactly those rows
+// for the new snapshot in the commit that makes it current, and leaves the
+// rows of every other snapshot as they were.
+// ============================================================================
+#[tokio::test]
+async fn commit_overwrite_with_manifest_records_it_with_the_flip() {
+    let (catalog, tmp) = fresh_catalog().await;
+    let (table_id, old_snapshot) = create_test_table(&catalog, &tmp, "overwrite_manifest").await;
+    let old_rows = manifest_rows(&table_id, &old_snapshot, &["old-a.vortex"]);
+    catalog
+        .replace_snapshot_files(&table_id, &old_snapshot, &old_rows)
+        .await
+        .expect("record the old snapshot's manifest");
+    plant_full_pre_overwrite_state(&catalog, &table_id, &old_snapshot).await;
+
+    let new_snapshot = uuid::Uuid::now_v7().to_string();
+    let new_rows = manifest_rows(
+        &table_id,
+        &new_snapshot,
+        &["new-a.vortex", "new-b.vortex", "new-c.vortex"],
+    );
+    catalog
+        .commit_overwrite(&table_id, &new_snapshot, None, &[], Some(&new_rows))
+        .await
+        .expect("commit_overwrite with a manifest");
+
+    let after = probe_state(&catalog, &table_id, "overwrite_manifest").await;
+    assert_eq!(after.current_snapshot_id, new_snapshot, "the flip landed");
+    assert_eq!(after.delete_files, 0, "the bundle's clears landed with it");
+    assert_eq!(
+        after.inlined_records, 0,
+        "the bundle's clears landed with it"
+    );
+    let mut expected = as_manifest(&old_rows);
+    expected.extend(as_manifest(&new_rows));
+    expected.sort();
+    assert_eq!(
+        manifest_of(&catalog, &table_id).await,
+        expected,
+        "the commit records exactly the new snapshot's rows and keeps the old snapshot's"
+    );
+
+    // An empty manifest is recorded too: the new snapshot names no file.
+    let empty_snapshot = uuid::Uuid::now_v7().to_string();
+    catalog
+        .commit_overwrite(&table_id, &empty_snapshot, None, &[], Some(&[]))
+        .await
+        .expect("commit_overwrite with an empty manifest");
+    let after = probe_state(&catalog, &table_id, "overwrite_manifest").await;
+    assert_eq!(after.current_snapshot_id, empty_snapshot);
+    assert_eq!(
+        manifest_of(&catalog, &table_id).await,
+        expected,
+        "an empty manifest adds no row"
+    );
+}
+
+// ============================================================================
+// Test 10 — a commit that fails after its manifest rows were written inside
+// the transaction leaves the old snapshot current and none of those rows.
+// The new snapshot id is not a UUID: the manifest rows carry it and are
+// written, and the snapshot flip after them rejects it.
+// ============================================================================
+#[tokio::test]
+async fn commit_overwrite_failing_after_its_manifest_leaves_no_rows() {
+    let (catalog, tmp) = fresh_catalog().await;
+    let (table_id, old_snapshot) =
+        create_test_table(&catalog, &tmp, "overwrite_manifest_fails").await;
+    let old_rows = manifest_rows(&table_id, &old_snapshot, &["old-a.vortex"]);
+    catalog
+        .replace_snapshot_files(&table_id, &old_snapshot, &old_rows)
+        .await
+        .expect("record the old snapshot's manifest");
+    plant_full_pre_overwrite_state(&catalog, &table_id, &old_snapshot).await;
+    let before = probe_state(&catalog, &table_id, "overwrite_manifest_fails").await;
+
+    let bad_snapshot = "not-a-uuid";
+    let new_rows = manifest_rows(&table_id, bad_snapshot, &["new-a.vortex", "new-b.vortex"]);
+    let failed = catalog
+        .commit_overwrite(&table_id, bad_snapshot, None, &[], Some(&new_rows))
+        .await;
+    let error = failed.expect_err("the flip rejects a snapshot id that is not a UUID");
+    assert!(
+        error
+            .to_string()
+            .contains("new_snapshot_id is not a valid UUID"),
+        "the commit failed at the flip, after the manifest: {error}"
+    );
+
+    let after = probe_state(&catalog, &table_id, "overwrite_manifest_fails").await;
+    assert_eq!(
+        before, after,
+        "a failed commit leaves the old snapshot current and every side table as it was"
+    );
+    assert_eq!(after.current_snapshot_id, old_snapshot);
+    assert_eq!(
+        manifest_of(&catalog, &table_id).await,
+        as_manifest(&old_rows),
+        "a failed commit records none of its manifest rows"
     );
 }

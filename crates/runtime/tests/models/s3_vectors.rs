@@ -985,7 +985,7 @@ pub fn get_package_delivery_dataset(
     embedding_model: &str,
 ) -> Dataset {
     let mut dataset = Dataset::new(
-        format!("s3://spiceai-public-datasets/test_array_json/package-delivery/{path}"),
+        format!("s3://spice-datasets-gjezag77s0hu/test_array_json/package-delivery/{path}"),
         ds_name.to_string(),
     );
     dataset.params = Some(Params::from_string_map(
@@ -995,7 +995,7 @@ pub fn get_package_delivery_dataset(
             ("flatten_json".to_string(), "true".to_string()),
             (
                 "schema_source_path".to_string(),
-                "s3://spiceai-public-datasets/test_array_json/package-delivery/data/01.json"
+                "s3://spice-datasets-gjezag77s0hu/test_array_json/package-delivery/data/01.json"
                     .to_string(),
             ),
             ("client_timeout".to_string(), "120s".to_string()),

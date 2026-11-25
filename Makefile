@@ -246,14 +246,38 @@ print-rust-gate-features:
 # the accelerator registry on temp dirs: stored data files, partitioning, lookup
 # indexes, snapshot restore and source acknowledgement. It needs no service.
 NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(bedrock_nova_reasoning|anthropic_stream_errors|list_models_errors|model2vec_hf_cache|safetensors_hf_cache|gguf_hf_cache)::/)) + (binary_id(=llms-llamacpp::integration) & test(/^load_errors::/)) + binary_id(=llama-cpp::integration) + binary_id(=duckdb-oracle::integration) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use)) + (package(=runtime-datafusion) & binary(=is_distinct_from_precedence)) + binary_id(=accelerator-cayenne::integration)
+# Tests that run after merge, in `trunk_tests.yml` (`make nextest-post-merge`),
+# and not in the gate that sign-off and the merge queue run. Each is slow, and
+# none has caught a defect in the gate:
+#
+# - The SF1 result-correctness lanes: Cayenne against standalone DuckDB and
+#   SQLite over TPC-H, TPC-DS, ClickBench, CH-benCHmark and SpiceBench. They run
+#   a few at a time (the `result-correctness` group in `.config/nextest.toml`),
+#   so in the merge queue they finished last: from 2026-11-20 to 11-22 they ran a
+#   median 589s after every other test had finished, 62% of the run. In the
+#   merge queue from 2026-09-23 and the failed sign-offs from 2026-10-06, their
+#   only failures were time-limit kills on one runner. The micro, SQLancer and
+#   SSB lanes take seconds and stay in the gate.
+# - `sim_regret_report`, which prints a report of the tuning simulation and
+#   asserts nothing.
+#
+# Only `test(=…)` terms: nextest rejects a `binary_id(=…)` that matches no built
+# binary, which a narrowed run (NEXTEST_FILTER_EXTRA) that does not build
+# `cayenne` would hit. The names are module-qualified and unique in the
+# workspace. They are exact, so a renamed test leaves this filter and runs in the
+# gate again; `nextest-post-merge` fails when the filter selects fewer tests
+# than it names. `nextest-packages`, sign-off's targeted pre-check, leaves them
+# out too: `sim_regret_report` is a `cayenne` unit test, which it would
+# otherwise run whenever a branch touches `cayenne`.
+NEXTEST_POST_MERGE_FILTER := test(=result_correctness_vs_duckdb_test::chbench_sf1_load_mode_matrix_vs_duckdb) | test(=result_correctness_vs_duckdb_test::tpcds_and_clickbench_parity_vs_duckdb) | test(=result_correctness_vs_duckdb_test::spicebench_sf1_tpch_scenario_parity_vs_duckdb) | test(=result_correctness_vs_duckdb_test::tpch_full_result_parity_vs_duckdb) | test(=result_correctness_vs_sqlite_test::tpcds_full_result_parity_vs_sqlite) | test(=result_correctness_vs_sqlite_test::tpch_full_result_parity_vs_sqlite) | test(=result_correctness_vs_sqlite_test::chbench_full_result_parity_vs_sqlite) | test(=provider::tuning_sim::sim_regret_report)
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
 # match everything the first one excluded and widen the run instead.
 ifneq ($(strip $(NEXTEST_FILTER_EXTRA)),)
-_NEXTEST_FILTER := ($(NEXTEST_FILTER)) & ($(NEXTEST_FILTER_EXTRA))
+_NEXTEST_FILTER := (($(NEXTEST_FILTER)) - ($(NEXTEST_POST_MERGE_FILTER))) & ($(NEXTEST_FILTER_EXTRA))
 else
-_NEXTEST_FILTER := $(NEXTEST_FILTER)
+_NEXTEST_FILTER := ($(NEXTEST_FILTER)) - ($(NEXTEST_POST_MERGE_FILTER))
 endif
 # A filterset smuggled in through NEXTEST_FLAG would silently widen the run for
 # the reason above, and a gate that runs more than it was asked to reads as green.
@@ -282,6 +306,24 @@ nextest:
 	@$(_WITH_LIBDUCKDB) \
 	targets="$$($(_NEXTEST_TARGETS_CMD))" || exit $$?; \
 	cargo nextest run $(NEXTEST_SELECTION) $$targets $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E '$(_NEXTEST_FILTER)'
+
+# The tests the gate leaves to after merge (NEXTEST_POST_MERGE_FILTER above), run
+# by `trunk_tests.yml`. Only `cayenne` holds them, so this builds that package
+# alone, with the gate's DuckDB result-correctness feature. It lists the
+# selection first and fails unless every test the filter names is in it, so a
+# renamed test cannot quietly drop out of both runs.
+_POST_MERGE_SELECTION = -p cayenne --features cayenne/result-correctness-duckdb --lib --test integration $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
+.PHONY: nextest-post-merge
+nextest-post-merge:
+	@$(_WITH_LIBDUCKDB) \
+	named=$$(printf '%s' '$(NEXTEST_POST_MERGE_FILTER)' | grep -o 'test(=' | wc -l | tr -d ' '); \
+	listed=$$(cargo nextest list $(_POST_MERGE_SELECTION) --message-format oneline -E '$(NEXTEST_POST_MERGE_FILTER)') || exit $$?; \
+	count=$$(printf '%s\n' "$$listed" | grep -c .); \
+	if [ "$$count" != "$$named" ]; then \
+	  echo "nextest-post-merge: NEXTEST_POST_MERGE_FILTER names $$named tests but selects $$count, so a named test was renamed or removed. Update the filter in the Makefile." >&2; \
+	  exit 1; \
+	fi; \
+	cargo nextest run $(_POST_MERGE_SELECTION) -E '$(NEXTEST_POST_MERGE_FILTER)'
 
 # Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
 # the crates a branch touched, before the full workspace gate. Same lib-only
@@ -318,7 +360,7 @@ verify-cli:
 nextest-packages:
 	@test -n "$(strip $(PACKAGES))" || { echo 'nextest-packages requires PACKAGES="crate1 crate2"' >&2; exit 1; }
 	@$(_WITH_LIBDUCKDB) \
-	cargo nextest run --no-tests=pass $(_LINT_PKG_FLAGS) --lib $(_FEATURES_FLAGS) $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
+	cargo nextest run --no-tests=pass $(_LINT_PKG_FLAGS) --lib $(_FEATURES_FLAGS) $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E 'not ($(NEXTEST_POST_MERGE_FILTER))'
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
@@ -474,7 +516,6 @@ check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features --features flightsql
 	cargo check $(CARGO_PROFILE) --no-default-features --features http-functions
 	cargo check $(CARGO_PROFILE) --no-default-features --features wasm-functions
-	cargo check $(CARGO_PROFILE) --no-default-features --features wasm-functions-compile
 	cargo check $(CARGO_PROFILE) --no-default-features --features aws-secrets-manager
 	cargo check $(CARGO_PROFILE) --no-default-features --features databricks
 	cargo check $(CARGO_PROFILE) --no-default-features --features delta_lake
@@ -542,9 +583,7 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # accelerator and acceleration snapshots, which `default` does not. Recompute the difference
 # before relying on it rather than trusting a comment, from this list and the
 # `default = [...]` array in bin/spiced/Cargo.toml.
-#
-# Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
-SPICED_DATA_FEATURES := adbc,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb
+SPICED_DATA_FEATURES := adbc,postgres,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb
 
 .PHONY: install
 install: build

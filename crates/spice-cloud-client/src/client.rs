@@ -19,17 +19,18 @@ limitations under the License.
 use std::time::Duration;
 
 use futures::StreamExt as _;
+use reqwest::header::HeaderMap;
 use reqwest::{Client, RequestBuilder};
 use snafu::ResultExt;
 
 use crate::error::{self, HttpRequestSnafu, Result};
 use crate::redirect::same_origin_redirect_policy;
 use crate::types::{
-    ApiKeysResponse, AuthContext, AuthContextRaw, AuthExchangeRequest, AuthExchangeResponse,
-    ContainerImagesResponse, CreateDeploymentRequest, CreateProjectRequest, Deployment,
-    DeploymentsResponse, LogsResponse, MetricsResponse, OAuthTokenRequest, OAuthTokenResponse, Org,
-    OrgsResponse, Project, ProjectsResponse, RegenerateApiKeyRequest, RegenerateApiKeyResponse,
-    RegionsResponse, Secret, SecretsResponse, SetSecretRequest, UpdateProjectRequest,
+    ApiKeysResponse, AuthContext, AuthContextRaw, ContainerImagesResponse, CreateDeploymentRequest,
+    CreateProjectRequest, Deployment, DeploymentsResponse, LogsResponse, MetricsResponse,
+    OAuthTokenRequest, OAuthTokenResponse, Org, OrgsResponse, Project, ProjectsResponse,
+    RegenerateApiKeyRequest, RegenerateApiKeyResponse, RegionsResponse, Secret, SecretsResponse,
+    SetSecretRequest, UpdateProjectRequest,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
@@ -44,8 +45,9 @@ const ORG_HEADER: &str = "X-Org-Name";
 /// Build the underlying HTTP client.
 ///
 /// Both constructors go through here so the settings cannot drift apart — in particular the
-/// same-origin redirect policy, which is what keeps a bearer token, and the auth code that
-/// `exchange_code` puts in a request body, from following a `Location` off origin.
+/// same-origin redirect policy, which is what keeps a bearer token, and the client secret
+/// that `exchange_client_credentials` puts in a request body, from following a `Location`
+/// off origin.
 fn build_http_client(_base_url: &str, timeout: Duration) -> Result<Client> {
     Client::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -63,6 +65,8 @@ pub struct CloudClient {
     client: Client,
     token: Option<String>,
     org: Option<String>,
+    api_headers: HeaderMap,
+    portal_headers: HeaderMap,
 }
 
 #[expect(
@@ -82,6 +86,8 @@ impl CloudClient {
             client,
             token: None,
             org: None,
+            api_headers: HeaderMap::new(),
+            portal_headers: HeaderMap::new(),
         })
     }
 
@@ -99,6 +105,8 @@ impl CloudClient {
             client,
             token: None,
             org: None,
+            api_headers: HeaderMap::new(),
+            portal_headers: HeaderMap::new(),
         })
     }
 
@@ -124,6 +132,21 @@ impl CloudClient {
         self
     }
 
+    /// Send `headers` with every request to the Cloud API host.
+    #[must_use]
+    pub fn with_api_headers(mut self, headers: HeaderMap) -> Self {
+        self.api_headers = headers;
+        self
+    }
+
+    /// Send `headers` with every request to the portal host, which serves
+    /// sign-in and identity.
+    #[must_use]
+    pub fn with_portal_headers(mut self, headers: HeaderMap) -> Self {
+        self.portal_headers = headers;
+        self
+    }
+
     /// Override the HTTP request timeout (default: 30 s).
     ///
     /// # Errors
@@ -143,49 +166,6 @@ impl CloudClient {
     // ========================================================================
     // Auth
     // ========================================================================
-
-    /// Build the browser auth URL for the device login flow.
-    #[must_use]
-    pub fn get_auth_url(&self, auth_code: &str) -> String {
-        format!("{}/auth/token?code={}", self.oauth_base_url(), auth_code)
-    }
-
-    /// Exchange a device auth code for an access token.
-    ///
-    /// Returns `Ok(None)` while the user has not yet completed the browser flow.
-    /// Returns [`error::Error::AuthorizationDenied`] when the user denies the
-    /// browser authorization request. Other errors represent HTTP transport
-    /// failures, non-success API responses, or response parsing failures.
-    pub async fn exchange_code(&self, auth_code: &str) -> Result<Option<AuthExchangeResponse>> {
-        let url = format!("{}/auth/token/exchange", self.oauth_base_url());
-        let request = AuthExchangeRequest { code: auth_code };
-        let response = self
-            .client
-            .post(&url)
-            .json(&request)
-            .send()
-            .await
-            .context(HttpRequestSnafu)?;
-
-        let status = response.status();
-        if auth_exchange_status_is_pending(status) {
-            return Ok(None);
-        }
-
-        if !status.is_success() {
-            self.handle_empty_response_with_sensitive(response, &[auth_code])
-                .await?;
-            return Err(error::Error::Api {
-                status: status.as_u16(),
-                message: "Unexpected non-success status while exchanging auth code".to_string(),
-            });
-        }
-
-        let body: AuthExchangeResponse = self
-            .handle_response_with_sensitive(response, &[auth_code])
-            .await?;
-        auth_exchange_result(body)
-    }
 
     /// Returns the base URL for OAuth endpoints by stripping the API host segment.
     /// For example, `https://api.spice.ai` → `https://spice.ai`,
@@ -226,6 +206,7 @@ impl CloudClient {
         let response = self
             .client
             .post(&url)
+            .headers(self.portal_headers.clone())
             .json(&body)
             .send()
             .await
@@ -255,12 +236,11 @@ impl CloudClient {
     /// for that org's default app, so it doubles as a membership probe. A caller
     /// that is not a member gets a `Forbidden` or `NotFound` error.
     pub async fn get_auth_context_for_org(&self, org: Option<&str>) -> Result<AuthContext> {
-        let url = format!("{}/api/spice-cli/auth", self.oauth_base_url());
-        let mut request = self.authed(self.client.get(&url));
-        if let Some(org) = org {
-            request = request.query(&[("org_name", org)]);
-        }
-        let response = request.send().await.context(HttpRequestSnafu)?;
+        let response = self
+            .identity_request(org)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
 
         let raw: AuthContextRaw = self.handle_response(response).await?;
         Ok(raw.into())
@@ -712,12 +692,31 @@ impl CloudClient {
         Ok(redacted)
     }
 
+    /// The portal identity request behind [`Self::get_auth_context_for_org`].
+    fn identity_request(&self, org: Option<&str>) -> RequestBuilder {
+        let url = format!("{}/api/spice-cli/auth", self.oauth_base_url());
+        let request = self
+            .bearer_and_org(self.client.get(&url))
+            .headers(self.portal_headers.clone());
+        match org {
+            Some(org) => request.query(&[("org_name", org)]),
+            None => request,
+        }
+    }
+
+    /// Prepare a Cloud API request: the bearer token, the org context header
+    /// when set, and the configured API headers.
+    fn authed(&self, request: RequestBuilder) -> RequestBuilder {
+        self.bearer_and_org(request)
+            .headers(self.api_headers.clone())
+    }
+
     /// Apply the bearer token and, when set, the org context header.
     ///
     /// An org name that cannot be encoded as a header value surfaces as a
     /// request error at send time rather than being dropped, so a command never
     /// silently runs against the token's default org instead of the requested one.
-    fn authed(&self, request: RequestBuilder) -> RequestBuilder {
+    fn bearer_and_org(&self, request: RequestBuilder) -> RequestBuilder {
         let request = request.bearer_auth(self.token_str());
         match &self.org {
             Some(org) => request.header(ORG_HEADER, org),
@@ -779,29 +778,6 @@ fn redact_json_strings(value: &mut serde_json::Value, sensitive: &str) {
     }
 }
 
-fn auth_exchange_result(body: AuthExchangeResponse) -> Result<Option<AuthExchangeResponse>> {
-    if body.access_denied {
-        return error::AuthorizationDeniedSnafu.fail();
-    }
-
-    if body.access_token.is_none() {
-        return Ok(None);
-    }
-
-    if body.access_token.as_deref().is_some_and(str::is_empty) {
-        return error::InvalidResponseSnafu {
-            message: "Auth token exchange completed without an access token".to_string(),
-        }
-        .fail();
-    }
-
-    Ok(Some(body))
-}
-
-fn auth_exchange_status_is_pending(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::ACCEPTED
-}
-
 fn body_or<'a>(fallback: &'a str, body: &'a str) -> &'a str {
     if body.trim().is_empty() {
         fallback
@@ -830,12 +806,9 @@ fn oauth_host(host: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CloudClient, DEFAULT_TIMEOUT, auth_exchange_result, auth_exchange_status_is_pending,
-        redact_response_body, same_origin_redirect_policy,
-    };
+    use super::{CloudClient, DEFAULT_TIMEOUT, redact_response_body, same_origin_redirect_policy};
+    use crate::error;
     use crate::types::{AuthContext, AuthContextApp, AuthContextOrg, AuthContextRaw};
-    use crate::{error, types::AuthExchangeResponse};
 
     #[tokio::test]
     async fn an_oversized_error_body_preserves_the_authoritative_status() {
@@ -916,8 +889,8 @@ mod tests {
     }
 
     /// Both constructors must install the same-origin redirect policy, or a bearer token —
-    /// and the auth code `exchange_code` puts in a request body — could follow a `Location`
-    /// off origin.
+    /// and the client secret `exchange_client_credentials` puts in a request body — could
+    /// follow a `Location` off origin.
     ///
     /// `reqwest` exposes no getter for the policy, so its `Client` `Debug` rendering is the
     /// only thing available. Rather than matching the word `reqwest` happens to print
@@ -1045,15 +1018,6 @@ mod tests {
     }
 
     #[test]
-    fn auth_url_uses_oauth_token_path() {
-        let client = CloudClient::new("https://api.spice.ai").expect("cloud client should build");
-        assert_eq!(
-            client.get_auth_url("ABCD1234"),
-            "https://spice.ai/auth/token?code=ABCD1234"
-        );
-    }
-
-    #[test]
     fn the_identity_probe_does_not_ask_about_a_particular_org() {
         // `get_auth_context` must report the org the token is *bound to*. If it
         // forwarded this client's org it would become a membership probe whose
@@ -1140,9 +1104,48 @@ mod tests {
 
         assert_eq!(
             applications, 1,
-            "`{needle}` must appear exactly once — inside `authed`. A new call site \
-             means some request carries the token without the org header; build it \
-             with `self.authed(self.client.post(&url))` instead."
+            "`{needle}` must appear exactly once — inside `bearer_and_org`. A new call \
+             site means some request carries the token without the org header; build \
+             it with `self.authed(self.client.post(&url))` instead."
+        );
+    }
+
+    #[test]
+    fn each_host_gets_only_its_own_configured_headers() {
+        let header = |value: &'static str| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("x-test", reqwest::header::HeaderValue::from_static(value));
+            headers
+        };
+        let client = CloudClient::new("https://api.spice.ai")
+            .expect("cloud client should build")
+            .with_token("token")
+            .with_api_headers(header("api"))
+            .with_portal_headers(header("portal"));
+
+        let api = client
+            .authed(client.client.get("https://api.spice.ai/v1/apps"))
+            .build()
+            .expect("request should build");
+        let identity = client
+            .identity_request(None)
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            api.headers()
+                .get("x-test")
+                .map(reqwest::header::HeaderValue::as_bytes),
+            Some(&b"api"[..])
+        );
+        assert_eq!(identity.url().host_str(), Some("spice.ai"));
+        assert_eq!(
+            identity
+                .headers()
+                .get_all("x-test")
+                .iter()
+                .collect::<Vec<_>>(),
+            [&reqwest::header::HeaderValue::from_static("portal")]
         );
     }
 
@@ -1160,65 +1163,6 @@ mod tests {
         assert!(
             !request.headers().contains_key(super::ORG_HEADER),
             "no org context should mean no org header, so the server uses the token's own org"
-        );
-    }
-
-    #[test]
-    fn auth_exchange_denial_is_error() {
-        let result = auth_exchange_result(AuthExchangeResponse {
-            access_token: None,
-            access_denied: true,
-        });
-
-        let Err(error::Error::AuthorizationDenied) = result else {
-            panic!("denied auth exchange should return an authorization-denied error");
-        };
-    }
-
-    #[test]
-    fn auth_exchange_without_token_is_pending() {
-        let result = auth_exchange_result(AuthExchangeResponse {
-            access_token: None,
-            access_denied: false,
-        })
-        .expect("pending auth exchange should not fail");
-
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn auth_exchange_empty_token_is_error() {
-        let result = auth_exchange_result(AuthExchangeResponse {
-            access_token: Some(String::new()),
-            access_denied: false,
-        });
-
-        let Err(error::Error::InvalidResponse { message }) = result else {
-            panic!("empty auth token should return an invalid-response error");
-        };
-        assert!(message.contains("without an access token"));
-    }
-
-    #[test]
-    fn auth_exchange_accepted_status_is_pending() {
-        assert!(auth_exchange_status_is_pending(
-            reqwest::StatusCode::ACCEPTED
-        ));
-        assert!(!auth_exchange_status_is_pending(reqwest::StatusCode::OK));
-    }
-
-    #[test]
-    fn auth_exchange_with_token_is_success() {
-        let result = auth_exchange_result(AuthExchangeResponse {
-            access_token: Some("token".to_string()),
-            access_denied: false,
-        })
-        .expect("completed auth exchange should not fail");
-
-        // The completed exchange hands back the issued token itself.
-        assert_eq!(
-            result.and_then(|response| response.access_token).as_deref(),
-            Some("token")
         );
     }
 

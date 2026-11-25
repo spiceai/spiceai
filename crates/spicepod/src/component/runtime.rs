@@ -1286,14 +1286,16 @@ fn default_allowed_origins() -> Vec<String> {
 /// Localhost origins used when `runtime.cors.allowed_origins` is `"*"` or
 /// empty. `"*"` is not a valid RFC 6454 origin; expanding it here keeps the
 /// rmcp allow-list non-empty so default spicepods enforce the 2026-07-28
-/// Origin check. Entries omit a port so any port on that host matches.
+/// Origin check. Entries use rmcp's `:*` suffix so any port on that host
+/// matches, including non-default ports such as `http://localhost:5173`,
+/// without the portless-origin deprecation warning.
 const DEFAULT_MCP_ALLOWED_ORIGINS: &[&str] = &[
-    "http://localhost",
-    "http://127.0.0.1",
-    "http://[::1]",
-    "https://localhost",
-    "https://127.0.0.1",
-    "https://[::1]",
+    "http://localhost:*",
+    "http://127.0.0.1:*",
+    "http://[::1]:*",
+    "https://localhost:*",
+    "https://127.0.0.1:*",
+    "https://[::1]:*",
 ];
 
 impl Default for CorsConfig {
@@ -1309,15 +1311,18 @@ impl Default for CorsConfig {
 /// [`CorsConfig::allowed_origins`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpOrigins<'a> {
-    /// `"*"` or an empty list: the localhost defaults, on any port.
+    /// `"*"` or an empty list: the localhost defaults, on any port (`:*`).
     LocalhostDefaults,
     /// A concrete list: an `Origin` must match the scheme, host and port of
     /// one entry. An omitted default port (80, 443) equals the explicit one.
+    /// Portless user entries are left as written so that exact-port semantics
+    /// stay unchanged; they are not rewritten with `:*`.
     Explicit(&'a [String]),
 }
 
 impl McpOrigins<'_> {
-    /// The allow-list entries. The localhost defaults carry no port.
+    /// The allow-list entries. The localhost defaults carry rmcp's `:*`
+    /// any-port suffix. User-configured entries are passed through as-is.
     #[must_use]
     pub fn entries(self) -> Vec<String> {
         match self {
@@ -1341,6 +1346,8 @@ impl CorsConfig {
     ///
     /// A concrete list is the 2026-07-28 Streamable HTTP origin policy:
     /// a mismatched `Origin` is 403. Requests with no `Origin` still pass.
+    /// User-configured entries are not rewritten with `:*`; a portless
+    /// entry keeps exact-port matching in Spice (scheme default port).
     #[must_use]
     pub fn mcp_origins(&self) -> McpOrigins<'_> {
         if self.allowed_origins.iter().any(|origin| origin == "*")
@@ -4162,7 +4169,7 @@ datasets:
     fn mcp_allowed_origins_default_wildcard_expands_to_localhost() {
         let origins = CorsConfig::default().mcp_allowed_origins();
         assert!(
-            origins.iter().any(|origin| origin == "http://localhost"),
+            origins.iter().any(|origin| origin == "http://localhost:*"),
             "default CORS * must expand to localhost defaults, got {origins:?}"
         );
         assert!(
@@ -4176,6 +4183,27 @@ datasets:
     }
 
     #[test]
+    fn mcp_allowed_origins_defaults_use_any_port_suffix() {
+        let origins = CorsConfig::default().mcp_allowed_origins();
+        assert_eq!(
+            origins,
+            vec![
+                "http://localhost:*".to_string(),
+                "http://127.0.0.1:*".to_string(),
+                "http://[::1]:*".to_string(),
+                "https://localhost:*".to_string(),
+                "https://127.0.0.1:*".to_string(),
+                "https://[::1]:*".to_string(),
+            ],
+            "default MCP origins must use rmcp's `:*` any-port suffix"
+        );
+        assert!(
+            origins.iter().all(|origin| origin.ends_with(":*")),
+            "no default MCP origin may be portless, got {origins:?}"
+        );
+    }
+
+    #[test]
     fn mcp_allowed_origins_wildcard_expands_to_localhost() {
         let cors = CorsConfig {
             enabled: true,
@@ -4183,7 +4211,7 @@ datasets:
         };
         let origins = cors.mcp_allowed_origins();
         assert!(
-            origins.iter().any(|origin| origin == "http://localhost"),
+            origins.iter().any(|origin| origin == "http://localhost:*"),
             "CORS * must expand to localhost defaults, got {origins:?}"
         );
         assert!(
@@ -4200,7 +4228,7 @@ datasets:
         };
         let origins = cors.mcp_allowed_origins();
         assert!(
-            origins.iter().any(|origin| origin == "http://localhost"),
+            origins.iter().any(|origin| origin == "http://localhost:*"),
             "empty CORS list (no *) must expand to localhost defaults, got {origins:?}"
         );
         assert!(

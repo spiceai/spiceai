@@ -533,10 +533,8 @@ async fn main() {
     .expect("register");
     time_queries(&ctx, keys, "before compaction").await;
     let start = Instant::now();
-    provider
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("compaction");
+    let committed = provider.force_full_compaction().await.expect("compaction");
+    assert!(committed, "the full compaction must commit");
     println!("  compaction_s={:.2}", start.elapsed().as_secs_f64());
     let ctx = SessionContext::new();
     ctx.register_table(

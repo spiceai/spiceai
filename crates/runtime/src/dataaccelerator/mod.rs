@@ -41,6 +41,10 @@ mod test {
     use ::arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
+    // Links the `sqlite` engine's registration into this test binary, which
+    // `test_file_mode_sqlite_creation` resolves through the engine registry.
+    #[cfg(feature = "sqlite")]
+    use accelerator_sqlite as _;
     // Config types now live in `runtime-component`/`runtime-acceleration` (not re-exported
     // by the accelerator shim glob), and `Secrets` in `runtime-secrets`.
     use crate::component::dataset::acceleration::{Acceleration, Engine, IndexType, Mode};
@@ -594,19 +598,27 @@ mod test {
                 let acceleration_settings = Acceleration {
                     enabled: true,
                     mode: Mode::Memory,
-                    engine: Engine::Arrow,
-                    params: HashMap::from([("arrow_key".to_string(), "${ env:KEY }".to_string())]),
+                    engine: Engine::Cayenne,
+                    params: HashMap::from([(
+                        "cayenne_key".to_string(),
+                        "${ env:KEY }".to_string(),
+                    )]),
                     ..Acceleration::default()
                 };
+                // Cayenne creates a table only for a source.
+                let source = runtime_acceleration::testing::TestAccelerationSource::new(
+                    "cayenne_secret_expansion",
+                )
+                .with_acceleration(acceleration_settings.clone());
                 runtime
                     .accelerator_engine_registry
                     .create_accelerator_table(
-                        "arrow_secret_expansion".into(),
+                        "cayenne_secret_expansion".into(),
                         schema,
                         None,
                         &acceleration_settings,
                         secrets,
-                        None,
+                        Some(&source),
                         ctx,
                     )
                     .await
@@ -755,11 +767,7 @@ mod accelerator_compat_tests {
         // Test both memory and file modes for databases
         // Format: (engine, mode, metastore_type)
         let test_configs = vec![
-            #[cfg(feature = "sqlite")]
-            (Engine::Sqlite, "memory", None),
-            #[cfg(feature = "sqlite")]
-            (Engine::Sqlite, "file", None),
-            (Engine::Arrow, "memory", None),
+            (Engine::Cayenne, "memory", None),
             (Engine::Cayenne, "file", Some("sqlite")), // Cayenne with SQLite metastore
         ];
 
@@ -828,20 +836,6 @@ mod accelerator_compat_tests {
             };
 
             let table = match engine {
-                #[cfg(feature = "sqlite")]
-                Engine::Sqlite => {
-                    use accelerator_sqlite::SqliteAccelerator;
-                    match SqliteAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new(), None)
-                        .await
-                    {
-                        Ok(table) => table,
-                        Err(e) => {
-                            println!("  Skipping SQLite - unsupported types: {}", e);
-                            continue;
-                        }
-                    }
-                }
                 Engine::Arrow => {
                     use crate::dataaccelerator::arrow::ArrowAccelerator;
                     match ArrowAccelerator::new()
@@ -2046,14 +2040,6 @@ mod accelerator_compat_tests {
                 };
 
                 let bool_table: Arc<dyn TableProvider> = match engine {
-                    #[cfg(feature = "sqlite")]
-                    Engine::Sqlite => {
-                        use accelerator_sqlite::SqliteAccelerator;
-                        SqliteAccelerator::new()
-                            .create_external_table(external_table, None, Vec::new(), None)
-                            .await
-                            .expect("SQLite table should be created")
-                    }
                     Engine::Arrow => {
                         use crate::dataaccelerator::arrow::ArrowAccelerator;
                         ArrowAccelerator::new()

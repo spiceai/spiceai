@@ -1,0 +1,81 @@
+# Two datasets of a sidecar read one upstream dataset over its append stream
+# (`DoExchange`). Each is a dataset of its own to the sidecar, so its append
+# stream reports its staleness under the name the sidecar's spicepod gives it,
+# not under the upstream dataset's: a dashboard finds each dataset under its
+# own name, and a reload of one cannot clear the other's stale flag. A restart
+# of the upstream reloads each dataset from the upstream's new snapshot, and
+# once that reload is swapped in each reads current again.
+name: sidecar-append-stream
+description: >
+  Two sidecar datasets that read one upstream dataset over its append stream
+  each load the upstream's rows, reload them after the upstream restarts, and
+  each reports its append-stream staleness, current after the reload, under its
+  own name.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: sidecar-append-stream-upstream
+  datasets:
+    - from: 'postgres:public.orders'
+      name: orders
+      params: '${sources.src.params}'
+      acceleration: { enabled: true }
+
+# The sidecar reads the upstream with no key, as the upstream requires none.
+sidecar:
+  spicepod:
+    version: v1
+    kind: Spicepod
+    name: sidecar-append-stream-app
+    datasets:
+      - from: spice.ai:orders
+        name: east
+        params: { spiceai_endpoint: 'http://127.0.0.1:${instance.flight_port}' }
+        acceleration: { enabled: true, refresh_mode: append }
+      - from: spice.ai:orders
+        name: west
+        params: { spiceai_endpoint: 'http://127.0.0.1:${instance.flight_port}' }
+        acceleration: { enabled: true, refresh_mode: append }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - generate:
+      src:
+        table: orders
+        rows: 2000
+        seed: 16433
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: customer_id, int: [1, 320], nulls: 0.05 }
+          - { name: amount, decimal: { range: [0, 1000], scale: 2 } }
+  - start: {}
+  # Each dataset loads the upstream's snapshot, row for row.
+  - query: SELECT id, customer_id, amount FROM east
+    oracle-sql: SELECT id, customer_id, amount FROM orders
+    eventually: 60s
+  - query: SELECT id, customer_id, amount FROM west
+    oracle-sql: SELECT id, customer_id, amount FROM orders
+    eventually: 60s
+  # Each reports its staleness, at 0 while its stream runs, under its own name.
+  - wait-metric: { name: dataset_append_stream_stale_seconds, labels: { dataset: east }, below: 1, timeout: 60s }
+  - wait-metric: { name: dataset_append_stream_stale_seconds, labels: { dataset: west }, below: 1, timeout: 60s }
+  # The upstream restarts with more rows, so each sidecar dataset reloads from
+  # its new snapshot, swapped in whole.
+  - source-exec: { src: "INSERT INTO orders (id, customer_id, amount) SELECT id + 2000, customer_id, amount FROM orders WHERE id <= 100" }
+  - restart: {}
+  - query: SELECT id, customer_id, amount FROM east
+    oracle-sql: SELECT id, customer_id, amount FROM orders
+    eventually: 120s
+  - query: SELECT id, customer_id, amount FROM west
+    oracle-sql: SELECT id, customer_id, amount FROM orders
+    eventually: 120s
+  - assert-log: { count: { "The source of dataset '(east|west)' restarted, so the dataset is reloading": 2 } }
+  # The reload committed, so neither dataset reads stale.
+  - wait-metric: { name: dataset_append_stream_stale_seconds, labels: { dataset: east }, below: 1, timeout: 30s }
+  - wait-metric: { name: dataset_append_stream_stale_seconds, labels: { dataset: west }, below: 1, timeout: 30s }
