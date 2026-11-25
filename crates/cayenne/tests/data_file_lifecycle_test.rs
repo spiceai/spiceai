@@ -263,6 +263,14 @@ impl Instance {
     fn take_deletes(&self) -> Vec<Vec<String>> {
         std::mem::take(&mut *self.state.deletes.lock())
     }
+
+    /// The delete requests since the last call that carried a deletion vector.
+    fn take_deletion_vector_deletes(&self) -> Vec<Vec<String>> {
+        self.take_deletes()
+            .into_iter()
+            .filter(|paths| paths.iter().any(|path| has_extension(path, "arrow")))
+            .collect()
+    }
 }
 
 impl InstanceState {
@@ -691,6 +699,16 @@ impl Location {
             .collect()
     }
 
+    /// Every deletion vector stored under the dataset, by object key.
+    async fn arrow_objects(&self) -> BTreeSet<String> {
+        self.probe
+            .objects(&self.data_prefix)
+            .await
+            .into_keys()
+            .filter(|key| has_extension(key, "arrow"))
+            .collect()
+    }
+
     /// The stored data files of table `table_id` that `keys` (paths relative to
     /// the table) name, by object key.
     async fn files_of(&self, table_id: &str, keys: &[String]) -> BTreeSet<String> {
@@ -729,15 +747,19 @@ impl Process {
             .filter(|file| !retired.contains(&file.file_path))
             .map(|file| format!("{}/{table_id}/{}", location.data_prefix, file.file_path))
             .collect();
-        for dv in self
-            .catalog
-            .get_table_delete_files(&table_id)
+        named.extend(self.deletion_vector_keys().await);
+        named
+    }
+
+    /// The deletion vectors the committed state names, by object key.
+    async fn deletion_vector_keys(&self) -> BTreeSet<String> {
+        self.catalog
+            .get_table_delete_files(self.table.table_id())
             .await
             .expect("read the deletion vectors")
-        {
-            named.insert(dv.path.trim_start_matches("s3://bucket/").to_string());
-        }
-        named
+            .into_iter()
+            .map(|dv| dv.path.trim_start_matches("s3://bucket/").to_string())
+            .collect()
     }
 
     /// The manifest rows of snapshots the table does not serve, as
@@ -794,6 +816,20 @@ impl Process {
                     .into_iter()
                     .collect()
             })
+    }
+
+    /// The retired deletion vectors, by object key.
+    async fn retired_deletion_vectors(&self, location: &Location) -> BTreeSet<String> {
+        self.catalog
+            .retired_files(self.table.table_id())
+            .await
+            .expect("read the retired files")
+            .expect("the retired files are settled")
+            .into_iter()
+            // A retired key is `<snapshot>/deletions/<file>`, under the data prefix.
+            .filter(|key| key.contains("deletions/"))
+            .map(|key| format!("{}/{key}", location.data_prefix))
+            .collect()
     }
 
     async fn rows(&self, name: &str) -> Vec<(i64, i64)> {
@@ -1002,80 +1038,45 @@ async fn retired_files_are_deleted_in_batched_requests_after_the_retiring_commit
     // reclaim only commits their removal, which retires them: each stays
     // stored for the retention, like a data file, so a query that loaded them
     // before still finds them.
-    let arrow_objects = async || -> BTreeSet<String> {
-        location
-            .probe
-            .objects(&location.data_prefix)
-            .await
-            .into_keys()
-            .filter(|key| has_extension(key, "arrow"))
-            .collect()
-    };
-    let retired_dvs = async || -> Vec<String> {
-        process
-            .catalog
-            .retired_files(process.table.table_id())
-            .await
-            .expect("read the retired files")
-            .expect("the retired files are settled")
-            .into_iter()
-            .filter(|key| key.contains("deletions/"))
-            .collect()
-    };
-    let dvs_before = arrow_objects().await;
+    let dvs_before = location.arrow_objects().await;
     process.table.drain_orphan_dv_sweep(1).await;
-    let removed_dvs = retired_dvs().await;
+    let removed_dvs = process.retired_deletion_vectors(&location).await;
     assert!(
         removed_dvs.len() >= 2,
         "the orphaned deletion vectors are removed and retired: {removed_dvs:?}"
     );
-    let removed_objects: BTreeSet<String> = dvs_before
-        .iter()
-        .filter(|key| {
-            removed_dvs
-                .iter()
-                .any(|removed| key.ends_with(&format!("/{removed}")))
-        })
-        .cloned()
-        .collect();
-    assert_eq!(
-        removed_objects.len(),
-        removed_dvs.len(),
+    assert!(
+        removed_dvs.is_subset(&dvs_before),
         "each retired deletion vector is a stored object: {removed_dvs:?} in {dvs_before:?}"
     );
     process.table.sweep_retired_files_now().await;
     assert_eq!(
-        arrow_objects().await,
+        location.arrow_objects().await,
         dvs_before,
         "a removed deletion vector is kept until the retention has passed"
     );
-    assert!(
-        process
-            .instance
-            .take_deletes()
-            .iter()
-            .all(|paths| paths.iter().all(|path| !has_extension(path, "arrow"))),
+    assert_eq!(
+        process.instance.take_deletion_vector_deletes(),
+        Vec::<Vec<String>>::new(),
         "nothing deletes a deletion vector inside the retention"
     );
 
     process.table.elapse_data_file_retention();
     process.table.sweep_retired_files_now().await;
-    let dvs_after = arrow_objects().await;
     assert_eq!(
-        dvs_after,
+        location.arrow_objects().await,
         dvs_before
-            .difference(&removed_objects)
+            .difference(&removed_dvs)
             .cloned()
             .collect::<BTreeSet<String>>(),
         "the retired deletion vectors, and only they, are deleted once the retention has passed"
     );
-    assert_eq!(retired_dvs().await, Vec::<String>::new(), "and forgotten");
-    let dv_requests: Vec<Vec<String>> = process
-        .instance
-        .take_deletes()
-        .into_iter()
-        .filter(|paths| paths.iter().any(|path| has_extension(path, "arrow")))
-        .collect();
+    assert_eq!(
+        process.retired_deletion_vectors(&location).await,
+        BTreeSet::new(),
+        "and forgotten"
+    );
+    let dv_requests = process.instance.take_deletion_vector_deletes();
     assert_eq!(
         dv_requests.len(),
         1,
@@ -1353,6 +1354,249 @@ async fn a_retired_file_is_kept_until_the_retention_elapses() {
         .await;
 }
 
+/// A full rewrite folds the key deletion vectors into its output and clears
+/// their rows in its commit, which retires them. Each stays stored for the
+/// retention, like a retired data file, so a query that loaded the head before
+/// the rewrite still finds it; once the retention has passed, the sweep deletes
+/// them in one batched request and forgets them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cleared_deletion_vector_is_kept_until_the_retention_elapses() {
+    let (location, process) = keyed_with_protected_snapshots("orders", UPSERTS).await;
+    let named_dvs = process.deletion_vector_keys().await;
+    let dvs_before = location.arrow_objects().await;
+    assert!(
+        named_dvs.len() >= 2 && named_dvs == dvs_before,
+        "the upserts wrote key deletion vectors, each a stored object: {named_dvs:?} in {dvs_before:?}"
+    );
+
+    process.instance.take_deletes();
+    assert!(
+        process
+            .table
+            .force_full_compaction()
+            .await
+            .expect("full rewrite"),
+        "the full rewrite commits"
+    );
+    assert_eq!(process.rows("orders").await, upserted(UPSERTS));
+    assert_eq!(
+        process.deletion_vector_keys().await,
+        BTreeSet::new(),
+        "the rewrite cleared every deletion vector row"
+    );
+    assert_eq!(
+        process.retired_deletion_vectors(&location).await,
+        named_dvs,
+        "the commit that cleared the deletion vectors retired them"
+    );
+
+    // Any delete of a cleared vector is fenced like the sweep's: once a hold
+    // is granted, no such delete is still running.
+    drop(process.table.hold_file_deletions().await);
+    process.table.sweep_retired_files_now().await;
+    assert_eq!(
+        location.arrow_objects().await,
+        dvs_before,
+        "a cleared deletion vector is kept until the retention has passed"
+    );
+    assert_eq!(
+        process.instance.take_deletion_vector_deletes(),
+        Vec::<Vec<String>>::new(),
+        "nothing deletes a deletion vector inside the retention"
+    );
+
+    process.table.elapse_data_file_retention();
+    process.table.sweep_retired_files_now().await;
+    assert_eq!(
+        location.arrow_objects().await,
+        BTreeSet::new(),
+        "the cleared deletion vectors are deleted once the retention has passed"
+    );
+    assert_eq!(
+        process.retired_deletion_vectors(&location).await,
+        BTreeSet::new(),
+        "and forgotten"
+    );
+    let dv_requests = process.instance.take_deletion_vector_deletes();
+    assert_eq!(
+        dv_requests.len(),
+        1,
+        "{} cleared deletion vectors go out in one delete request: {dv_requests:?}",
+        named_dvs.len()
+    );
+    assert_eq!(process.rows("orders").await, upserted(UPSERTS));
+    process
+        .assert_named_files_stored(&location, "after the sweep")
+        .await;
+}
+
+/// A second position delete in a data file writes one vector holding every
+/// deleted position of the file, and its commit drops the earlier vector's row,
+/// which retires it. The earlier vector stays stored for the retention, so a
+/// query planned before the second delete still reads it, and the sweep deletes
+/// it once the retention has passed; the newer vector is live and kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_superseded_deletion_vector_is_kept_until_the_retention_elapses() {
+    let position = VortexConfig {
+        deletion_mode: DeletionMode::Position,
+        ..parked()
+    };
+    let (location, process) =
+        Location::create_with("events", false, SessionConfig::new(), &position).await;
+    common::insert_batch(&process.table, batch(0..KEYS, |id| id))
+        .await
+        .expect("load");
+    let delete = async |sql: &str| {
+        process
+            .ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("delete");
+    };
+
+    delete("DELETE FROM events WHERE id < 10").await;
+    let first = process.deletion_vector_keys().await;
+    assert_eq!(first.len(), 1, "one position vector: {first:?}");
+    delete("DELETE FROM events WHERE id < 20").await;
+    let second = process.deletion_vector_keys().await;
+    assert_eq!(second.len(), 1, "one position vector: {second:?}");
+    assert!(
+        first.is_disjoint(&second),
+        "the second delete replaced the vector"
+    );
+    assert_eq!(
+        process.retired_deletion_vectors(&location).await,
+        first,
+        "the commit that dropped the earlier vector retired it"
+    );
+    let expected: Vec<(i64, i64)> = (20..KEYS).map(|id| (id, id)).collect();
+    assert_eq!(process.rows("events").await, expected);
+
+    process.instance.take_deletes();
+    // Any delete of a dropped vector is fenced like the sweep's: once a hold
+    // is granted, no such delete is still running.
+    drop(process.table.hold_file_deletions().await);
+    process.table.sweep_retired_files_now().await;
+    assert_eq!(
+        location.arrow_objects().await,
+        first.union(&second).cloned().collect(),
+        "a superseded deletion vector is kept until the retention has passed"
+    );
+    assert_eq!(
+        process.instance.take_deletion_vector_deletes(),
+        Vec::<Vec<String>>::new(),
+        "nothing deletes a deletion vector inside the retention"
+    );
+
+    process.table.elapse_data_file_retention();
+    process.table.sweep_retired_files_now().await;
+    assert_eq!(
+        location.arrow_objects().await,
+        second,
+        "the superseded vector is deleted once the retention has passed, and the live one kept"
+    );
+    assert_eq!(
+        process.retired_deletion_vectors(&location).await,
+        BTreeSet::new(),
+        "and forgotten"
+    );
+    assert_eq!(process.rows("events").await, expected);
+    process
+        .assert_named_files_stored(&location, "after the sweep")
+        .await;
+}
+
+/// The vector a position delete supersedes is deleted once the retention has
+/// passed even when the table takes no further write and no sweep was pending:
+/// the delete's own commit starts the retention. The table is reopened before
+/// the deletes so no earlier write's sweep is waiting, and nothing runs a sweep
+/// by hand; only the retention clock is moved.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_superseded_deletion_vector_of_an_idle_table_is_deleted_after_the_retention() {
+    let position = VortexConfig {
+        deletion_mode: DeletionMode::Position,
+        // The background maintenance tick runs, as it does in the runtime.
+        compaction_background_interval_ms: 100,
+        ..parked()
+    };
+    let (location, process) =
+        Location::create_with("events", false, SessionConfig::new(), &position).await;
+    common::insert_batch(&process.table, batch(0..KEYS, |id| id))
+        .await
+        .expect("load");
+    process
+        .table
+        .drain_in_flight_maintenance()
+        .await
+        .expect("drain");
+    process.table.quiesce().await;
+    drop(process);
+    let process = location
+        .open("events", &position, SessionConfig::new())
+        .await;
+    // Background maintenance, as the accelerator starts it for every table.
+    assert!(
+        process
+            .table
+            .spawn_background_compaction(Arc::new(tokio::sync::Semaphore::new(1))),
+        "background compaction"
+    );
+    let delete = async |sql: &str| {
+        process
+            .ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("delete");
+    };
+
+    delete("DELETE FROM events WHERE id < 10").await;
+    let first = process.deletion_vector_keys().await;
+    assert_eq!(first.len(), 1, "one position vector: {first:?}");
+    delete("DELETE FROM events WHERE id < 20").await;
+    let second = process.deletion_vector_keys().await;
+    assert_eq!(second.len(), 1, "one position vector: {second:?}");
+    assert!(
+        first.is_disjoint(&second),
+        "the second delete replaced the vector"
+    );
+    assert_eq!(
+        process.retired_deletion_vectors(&location).await,
+        first,
+        "the commit that dropped the earlier vector retired it"
+    );
+
+    eventually(
+        Duration::from_secs(30),
+        "the idle table deletes the superseded vector once the retention has passed",
+        async || {
+            process.table.elapse_data_file_retention();
+            let stored = location.arrow_objects().await;
+            (stored == second, stored)
+        },
+    )
+    .await;
+    eventually(
+        Duration::from_secs(10),
+        "the deleted vector leaves the retirement record",
+        async || {
+            let retired = process.retired_deletion_vectors(&location).await;
+            (retired.is_empty(), retired)
+        },
+    )
+    .await;
+    let expected: Vec<(i64, i64)> = (20..KEYS).map(|id| (id, id)).collect();
+    assert_eq!(process.rows("events").await, expected);
+    process
+        .assert_named_files_stored(&location, "after the sweep")
+        .await;
+}
+
 /// A captured file list has the same retention bound as a remote reader:
 /// after T, reading a retired file fails rather than returning other rows.
 #[tokio::test(flavor = "multi_thread")]
@@ -1379,6 +1623,7 @@ async fn a_scan_past_retention_gets_the_data_file_missing_error() {
         &location.data_url,
         &table_id,
         Arc::clone(&process.instance) as Arc<dyn ObjectStore>,
+        cayenne::catalog::DataWriteGate::open(),
     )
     .expect("dataset storage");
     for key in &captured {
