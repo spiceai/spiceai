@@ -961,7 +961,6 @@ pub fn require_process_per_test(why: &str) {
 /// | `integration_test::test_cayenne_catalog_persistence_impl` | Reopens a SQLite catalog file. |
 /// | `listing_cache_retention_race_test` (all) | Races a snapshot-directory listing through the list-files cache; a table in the object-native location never lists its files. |
 /// | `mem_tier_overwrite_retention_test::a_waiting_publish_does_not_hold_back_the_other_partitions_impl` | Commits partitions' overwrites in one SQLite metastore transaction; the object-native metastore does not hold partitioned tables. |
-/// | `orphan_dv_compaction_test::bake_publication_schedules_orphan_dv_cleanup_impl` | On the object-native stores, the deletion vectors the sweep after a seq-prefix bake drops from the catalog stay in the store once the data-file retention ends, while the same check after a protected-subset merge passes; the cause is not yet known. |
 /// | `orphan_dv_compaction_test::provider_open_replays_an_orphan_backlog_left_by_a_crash_impl` | Writes deletion vectors and their catalog rows by hand at a local path. |
 /// | `orphan_dv_compaction_test::scheduled_cleanup_waits_for_the_orphan_threshold_impl` | As above. |
 /// | `orphan_dv_compaction_test::scheduled_cleanup_keeps_a_deletion_vector_the_cold_tier_needs_impl` | Cold tier, which object-native data does not support. |

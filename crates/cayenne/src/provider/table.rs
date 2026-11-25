@@ -26104,6 +26104,15 @@ impl CayenneTableProvider {
             );
             return OrphanDvSweepPass::Complete;
         }
+        // The writer record holds a deletion vector from before its upload until
+        // something releases it, and the retirement sweep skips a held file. The
+        // commit above dropped these, so nothing else would release them.
+        super::delete::vector_io::release_deletion_files(
+            self.dataset_storage.as_deref(),
+            orphaned
+                .iter()
+                .map(|df| std::path::Path::new(df.path.as_str())),
+        );
         let reclaimed_tombstones = orphaned.iter().fold(0_u64, |total, df| {
             total.saturating_add(u64::try_from(df.delete_count).unwrap_or(0))
         });
