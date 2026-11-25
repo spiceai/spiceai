@@ -32,6 +32,24 @@ use async_trait::async_trait;
 use cayenne_metastore_actions::{Action, Kind, ObjRef, proto};
 use std::collections::HashMap;
 
+/// The action that records `files` as manifest rows of `snapshot_id`, refusing a
+/// row of another table or snapshot.
+fn snapshot_manifest_action(
+    table_id: &str,
+    snapshot_id: &str,
+    files: &[SnapshotFile],
+) -> CatalogResult<Action> {
+    if files
+        .iter()
+        .any(|f| f.table_id != table_id || f.snapshot_id != snapshot_id)
+    {
+        return Err(invalid(format!(
+            "snapshot file identity does not match snapshot '{snapshot_id}' of table '{table_id}'"
+        )));
+    }
+    Ok(actions::add_files(table_id, snapshot_id, files, false))
+}
+
 #[async_trait]
 impl MetadataCatalog for Domain {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -99,13 +117,25 @@ impl MetadataCatalog for Domain {
     async fn pending_write_back_count(&self, table_id: &str) -> CatalogResult<i64> {
         self.read().await?.reader.pending_write_back_count(table_id)
     }
+    fn data_write_gate(&self, _table_id: &str) -> crate::catalog::DataWriteGate {
+        self.data_writes.clone()
+    }
+    async fn follow_commits(&self, _table_id: &str) -> CatalogResult<u64> {
+        // Only a table that may not write asks: a replica's, or one opened
+        // before this instance last became the writer.
+        self.inner.take().await.follow().await
+    }
     async fn init(&self) -> CatalogResult<()> {
         self.read().await?;
         Ok(())
     }
     async fn shutdown(&self) -> CatalogResult<()> {
-        let mut inner = self.inner.take().await;
-        inner.flush().await?;
+        {
+            let mut inner = self.inner.take().await;
+            inner.flush().await?;
+        }
+        // Hand the writer lease back, so another instance takes over at once.
+        self.release_lease().await;
         Ok(())
     }
     async fn list_table_names(&self) -> CatalogResult<Vec<String>> {
@@ -641,11 +671,18 @@ impl MetadataCatalog for Domain {
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
         delete_files: &[crate::metadata::DeleteFile],
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()> {
         validate_uuid("table_id", table_id)?;
         validate_uuid("new_snapshot_id", new_snapshot_id)?;
+        let manifest = files
+            .map(|files| snapshot_manifest_action(table_id, new_snapshot_id, files))
+            .transpose()?;
         let mut inner = self.inner.take().await;
         let mut batch = actions::overwrite_clear(table_id, new_snapshot_id);
+        // After the flip, so the record checks the new snapshot's files against
+        // the files it retires.
+        batch.extend(manifest);
         if let Some(data) = inlined {
             batch.push(actions::add_inlined(
                 table_id,
@@ -696,22 +733,8 @@ impl MetadataCatalog for Domain {
     }
     async fn upsert_table_statistics(&self, stats: &TableStatistics) -> CatalogResult<()> {
         let mut inner = self.inner.take().await;
-        let blob = Some(inner.blob(&stats.statistics_blob).await?);
-        let ndv = match &stats.ndv_sketches {
-            Some(bytes) => Some(inner.blob(bytes).await?),
-            None => None,
-        };
-        inner
-            .commit(vec![Action::new(Kind::SetTableStats(
-                proto::SetTableStats {
-                    table_id: stats.table_id.clone(),
-                    blob,
-                    ndv,
-                    num_rows: stats.num_rows,
-                    exact: stats.num_rows_exact,
-                },
-            ))])
-            .await
+        let action = inner.table_stats_action(stats).await?;
+        inner.commit(vec![action]).await
     }
     async fn clear_table_statistics(&self, table_id: &str) -> CatalogResult<()> {
         self.inner
@@ -774,18 +797,13 @@ impl MetadataCatalog for Domain {
         snapshot_id: &str,
         files: &[SnapshotFile],
     ) -> CatalogResult<()> {
-        if files
-            .iter()
-            .any(|f| f.table_id != table_id || f.snapshot_id != snapshot_id)
-        {
-            return Err(invalid("snapshot file identity does not match replacement"));
-        }
+        let manifest = snapshot_manifest_action(table_id, snapshot_id, files)?;
         self.inner
             .take()
             .await
             .commit(vec![
                 actions::remove_files(table_id, proto::Select::Listed, &[snapshot_id.to_string()]),
-                actions::add_files(table_id, snapshot_id, files, false),
+                manifest,
             ])
             .await
     }
@@ -1129,6 +1147,10 @@ impl MetadataCatalog for Domain {
             snapshot_sequence,
             inline_data,
             clear_inlined,
+            insert_records,
+            table_statistics,
+            keep_file_statistics_of,
+            manifest_files,
         } = commit;
         if !insert_pk_bytes.is_empty()
             && !reinsert_delete_files
@@ -1154,6 +1176,10 @@ impl MetadataCatalog for Domain {
         pure_delete_files.append(&mut reinsert_delete_files);
         if pure_delete_files.iter().any(|f| f.table_id != table_id)
             || inline_data.iter().any(|d| d.table_id != table_id)
+            || table_statistics
+                .as_ref()
+                .is_some_and(|stats| stats.table_id != table_id)
+            || manifest_files.iter().any(|f| f.table_id != table_id)
         {
             return Err(invalid(format!(
                 "Mem-tier commit rows must belong to table '{table_id}'"
@@ -1173,6 +1199,19 @@ impl MetadataCatalog for Domain {
             .collect();
         let (_, deletes) = inner.delete_batch(&pure_delete_files)?;
         batch.extend(deletes);
+        let mut by_snapshot: Vec<(&str, Vec<SnapshotFile>)> = Vec::new();
+        for file in &manifest_files {
+            match by_snapshot
+                .iter_mut()
+                .find(|(snapshot, _)| *snapshot == file.snapshot_id)
+            {
+                Some((_, rows)) => rows.push(file.clone()),
+                None => by_snapshot.push((&file.snapshot_id, vec![file.clone()])),
+            }
+        }
+        for (snapshot, rows) in &by_snapshot {
+            batch.push(actions::add_files(&table_id, snapshot, rows, true));
+        }
         if let Some(snapshot) = snapshot_sequence {
             batch.push(actions::set_group(
                 &table_id,
@@ -1186,6 +1225,28 @@ impl MetadataCatalog for Domain {
                 &table_id,
                 proto::Select::All,
                 &[],
+            ));
+        }
+        if !insert_records.is_empty() {
+            batch.push(Action::new(Kind::AddInsertRecords(proto::AddKeys {
+                table_id: table_id.clone(),
+                keys: insert_records
+                    .into_iter()
+                    .map(|pk| proto::PkSeq {
+                        pk,
+                        seq: sequence_number,
+                    })
+                    .collect(),
+            })));
+        }
+        if let Some(stats) = &table_statistics {
+            batch.push(inner.table_stats_action(stats).await?);
+        }
+        if let Some(snapshot_id) = keep_file_statistics_of {
+            batch.push(actions::remove_file_stats(
+                &table_id,
+                proto::Select::AllExcept,
+                &[snapshot_id],
             ));
         }
         if batch.is_empty() {

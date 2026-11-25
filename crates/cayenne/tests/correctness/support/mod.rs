@@ -103,6 +103,49 @@ pub fn fixture_is_current(dir: &Path, revision: &str) -> bool {
     std::fs::read_to_string(dir.join(FIXTURE_STAMP)).is_ok_and(|stamp| stamp.trim() == revision)
 }
 
+/// Make `dir` hold a complete fixture built by `revision`, generating it with
+/// `generate` when it does not, and return whether it does.
+///
+/// Lanes run in concurrent nextest processes and share fixtures, so the check
+/// and the generation happen under the fixture's lock: the first lane to need a
+/// fixture writes it while the others wait, then find it current, rather than
+/// all of them writing the same files at once. `generate` writes every file and
+/// returns `false` when the environment cannot supply the fixture, in which
+/// case nothing is stamped. Every fixture the lanes share goes through here.
+pub fn ensure_fixture(dir: &Path, revision: &str, generate: impl FnOnce(&Path) -> bool) -> bool {
+    let _lock = lock_fixture(dir);
+    if fixture_is_current(dir, revision) {
+        return true;
+    }
+    if !generate(dir) {
+        return false;
+    }
+    mark_fixture_complete(dir, revision);
+    true
+}
+
+/// Hold an exclusive lock on `dir`'s fixture until the returned file drops.
+#[must_use]
+pub fn lock_fixture(dir: &Path) -> std::fs::File {
+    let mut name = dir
+        .file_name()
+        .expect("fixture dir has a name")
+        .to_os_string();
+    name.push(".lock");
+    let path = dir.with_file_name(name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create the fixture lock's dir");
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .expect("open the fixture lock");
+    file.lock().expect("lock the fixture");
+    file
+}
+
 /// Record that `dir` now holds a complete fixture built by `revision`.
 ///
 /// Call only once every file is written: the stamp is what a later run trusts.

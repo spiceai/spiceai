@@ -2611,6 +2611,16 @@ impl MetadataCatalog for CayenneCatalog {
         crate::provider::append_commit::commit_transaction(txn, publications[0].table_id).await
     }
 
+    fn data_write_gate(&self, _table_id: &str) -> crate::catalog::DataWriteGate {
+        // One process writes a SQLite metastore's tables.
+        crate::catalog::DataWriteGate::open()
+    }
+
+    async fn follow_commits(&self, _table_id: &str) -> CatalogResult<u64> {
+        // One process writes a SQLite metastore; its state is always current.
+        Ok(0)
+    }
+
     async fn init(&self) -> CatalogResult<()> {
         // Create database directory if it doesn't exist.
         //
@@ -3294,6 +3304,10 @@ impl MetadataCatalog for CayenneCatalog {
                 .inline_data
                 .iter()
                 .any(|data| data.table_id != *table_id)
+            || commit
+                .table_statistics
+                .as_ref()
+                .is_some_and(|stats| stats.table_id != *table_id)
         {
             return Err(CatalogError::InvalidOperationNoSource {
                 message: format!("Mem-tier commit rows must belong to table '{table_id}'"),
@@ -3339,6 +3353,49 @@ impl MetadataCatalog for CayenneCatalog {
                             })
                             .await?;
                         }
+                    }
+                    // Three parameters per row, below SQLite's 32 766 limit.
+                    for chunk in commit.insert_records.chunks(32_000 / 3) {
+                        let (sql, params) = Self::build_insert_records_chunk_sql(
+                            table_id,
+                            chunk,
+                            commit.sequence_number,
+                        );
+                        tx.execute(ExecuteParams { sql: &sql, params }).await?;
+                    }
+                    if let Some(stats) = &commit.table_statistics {
+                        tx.execute(ExecuteParams {
+                            sql: TABLE_STATISTICS_UPSERT_SQL,
+                            params: vec![
+                                MetastoreValue::Text(stats.table_id.clone()),
+                                MetastoreValue::Blob(stats.statistics_blob.clone()),
+                                MetastoreValue::Integer(stats.num_rows),
+                                stats
+                                    .ndv_sketches
+                                    .clone()
+                                    .map_or(MetastoreValue::Null, MetastoreValue::Blob),
+                                MetastoreValue::Integer(i64::from(stats.num_rows_exact)),
+                            ],
+                        })
+                        .await?;
+                    }
+                    for file in &commit.manifest_files {
+                        tx.execute(ExecuteParams {
+                            sql: SNAPSHOT_FILE_UPSERT_SQL,
+                            params: snapshot_file_params(file),
+                        })
+                        .await?;
+                    }
+                    if let Some(snapshot_id) = &commit.keep_file_statistics_of {
+                        tx.execute(ExecuteParams {
+                            sql: "DELETE FROM cayenne_snapshot_file_statistics \
+                                  WHERE table_id = ?1 AND snapshot_id != ?2",
+                            params: vec![
+                                MetastoreValue::Text(table_id.clone()),
+                                MetastoreValue::Text(snapshot_id.clone()),
+                            ],
+                        })
+                        .await?;
                     }
                     CatalogResult::Ok(())
                 }
@@ -4101,6 +4158,7 @@ impl MetadataCatalog for CayenneCatalog {
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
         delete_files: &[crate::metadata::DeleteFile],
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()> {
         // Same retry-on-conflict shape as commit_compaction; the only
         // additional work happens inside the transaction via
@@ -4122,10 +4180,22 @@ impl MetadataCatalog for CayenneCatalog {
                 }
             })?;
 
-            match self
-                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id, inlined, delete_files)
+            let applied = async {
+                if let Some(files) = files {
+                    self.replace_snapshot_files_in_txn(&mut *tx, table_id, new_snapshot_id, files)
+                        .await?;
+                }
+                self.commit_overwrite_in_txn(
+                    &mut *tx,
+                    table_id,
+                    new_snapshot_id,
+                    inlined,
+                    delete_files,
+                )
                 .await
-            {
+            }
+            .await;
+            match applied {
                 Ok(()) => match tx.commit().await {
                     Ok(()) => return Ok(()),
                     Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {

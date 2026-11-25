@@ -28,13 +28,14 @@ use data_connector_api::ConnectorContext;
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DEFAULT_SPICE_CLIENT_TIMEOUT, DataConnector,
     DataConnectorError, DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
-    RedirectScope, default_spice_client,
+    RedirectScope, default_spice_client_builder,
 };
 use data_http_rate_control as http_rate_control;
 use data_http_rate_control::{
     HttpRateControlMetricSource, HttpRateControlMetrics, HttpRateControlMetricsProvider,
 };
 use datafusion::datasource::TableProvider;
+use datafusion::execution::memory_pool::MemoryPool;
 use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::MetricsProvider;
 use runtime_parameters::{ParameterSpec, Parameters};
@@ -165,9 +166,11 @@ impl DataConnectorFactory for GraphQLFactory {
 }
 
 impl GraphQL {
+    /// The client for `dataset`, whose response bodies are charged to `memory_pool`.
     async fn get_client(
         &self,
         dataset: &DatasetSpec,
+        memory_pool: Arc<dyn MemoryPool>,
     ) -> DataConnectorResult<(
         GraphQLClient,
         http_rate_control::SharedRateControllerReservation,
@@ -245,16 +248,16 @@ impl GraphQL {
         // leaves the endpoint's origin.
         let redirects = if auth_header.is_some() && token.is_some() {
             RedirectScope::RequestOrigin
+        } else if token.is_some()
+            || user.is_some()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+        {
+            RedirectScope::PublicHostsWithCredentials
         } else {
             RedirectScope::PublicHosts
         };
-        let client = default_spice_client("application/json", redirects)
-            .boxed()
-            .map_err(|source| DataConnectorError::InternalWithSource {
-                dataconnector: "graphql".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                source,
-            })?;
+        let client = default_spice_client_builder("application/json", redirects);
 
         let mut rate_control = http_rate_control::resolve_config_for_component(
             &self.params,
@@ -262,7 +265,7 @@ impl GraphQL {
             &ConnectorComponent::from(dataset),
             "graphql",
         )?;
-        // The GraphQL client is `default_spice_client`, so its request timeout
+        // The GraphQL client is `default_spice_client_builder`'s, so its request timeout
         // is the `client_timeout` equivalent the acquire bound defaults to.
         rate_control.apply_default_acquire_timeout(DEFAULT_SPICE_CLIENT_TIMEOUT);
         let rate_limiter = self
@@ -295,7 +298,8 @@ impl GraphQL {
         .with_rate_limiter(Some(rate_limiter))
         .with_rate_controller(rate_controller.shared().controller.clone())
         .with_auth_header(auth_header)
-        .build(client)
+        .with_source(dataset.name.to_string(), "graphql")
+        .build(client, memory_pool)
         .boxed();
 
         match client_result {
@@ -320,7 +324,7 @@ impl DataConnector for GraphQL {
 
     async fn read_provider(
         &self,
-        _context: &dyn ConnectorContext,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let query = self.params.get("query").expose().ok_or_else(|p| {
@@ -331,7 +335,15 @@ impl DataConnector for GraphQL {
             }
         })?;
 
-        let (client, rate_controller) = self.get_client(dataset).await?;
+        // Response bodies are held to the runtime's query memory pool, at registration as
+        // in queries.
+        let memory_pool = Arc::clone(
+            &context
+                .datafusion_session_context()
+                .runtime_env()
+                .memory_pool,
+        );
+        let (client, rate_controller) = self.get_client(dataset, memory_pool).await?;
 
         match GraphQLTableProviderBuilder::new(client).build(query).await {
             Ok(provider) => {
@@ -343,21 +355,7 @@ impl DataConnector for GraphQL {
             }
             Err(e) => {
                 rate_controller.rollback().await;
-                if matches!(&e, graphql::Error::InvalidGraphQLQuery { .. }) {
-                    let message = format!("{e}");
-                    Err(DataConnectorError::InvalidConfiguration {
-                        dataconnector: "graphql".to_string(),
-                        connector_component: ConnectorComponent::from(dataset),
-                        source: e.into(),
-                        message,
-                    })
-                } else {
-                    Err(DataConnectorError::InternalWithSource {
-                        dataconnector: "graphql".to_string(),
-                        connector_component: ConnectorComponent::from(dataset),
-                        source: e.into(),
-                    })
-                }
+                Err(read_provider_error(e, ConnectorComponent::from(dataset)))
             }
         }
     }
@@ -382,6 +380,42 @@ pub const CONNECTOR_NAME: &str = "graphql";
 #[must_use]
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     GraphQLFactory::new_arc()
+}
+
+/// Maps a provider build failure to the connector error the runtime retries on.
+///
+/// An invalid query, a resource the API reports as `NOT_FOUND`, and a refusal the API
+/// named (HTTP 401/403, a `FORBIDDEN` or `UNAUTHENTICATED` GraphQL error) are permanent:
+/// retrying cannot change the answer. Everything else, including a refusal inferred from
+/// an ambiguous message, is retriable.
+fn read_provider_error(
+    e: graphql::Error,
+    connector_component: ConnectorComponent,
+) -> DataConnectorError {
+    match &e {
+        graphql::Error::InvalidGraphQLQuery { .. } | graphql::Error::ResourceNotFound { .. } => {
+            let message = format!("{e}");
+            DataConnectorError::InvalidConfiguration {
+                dataconnector: "graphql".to_string(),
+                connector_component,
+                source: e.into(),
+                message,
+            }
+        }
+        graphql::Error::InvalidCredentialsOrPermissions {
+            kind: graphql::RefusalKind::Explicit,
+            ..
+        } => DataConnectorError::InsufficientPermissions {
+            dataconnector: "graphql".to_string(),
+            connector_component,
+            source: e.into(),
+        },
+        _ => DataConnectorError::InternalWithSource {
+            dataconnector: "graphql".to_string(),
+            connector_component,
+            source: e.into(),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -469,7 +503,10 @@ mod tests {
         let dataset = test_dataset("https://graphql-dataset-params.example.com/graphql").await;
 
         let (_, reservation) = graphql
-            .get_client(&dataset)
+            .get_client(
+                &dataset,
+                Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+            )
             .await
             .expect("GraphQL client should build with rate-control params");
         reservation.commit().await;
@@ -501,7 +538,10 @@ mod tests {
         let dataset = test_dataset("https://graphql-runtime-defaults.example.com/graphql").await;
 
         let (_, reservation) = graphql
-            .get_client(&dataset)
+            .get_client(
+                &dataset,
+                Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+            )
             .await
             .expect("GraphQL client should build with runtime rate-control defaults");
         reservation.commit().await;
@@ -523,7 +563,13 @@ mod tests {
         };
         let dataset = test_dataset("https://graphql-invalid-limit.example.com/graphql").await;
 
-        let Err(error) = graphql.get_client(&dataset).await else {
+        let Err(error) = graphql
+            .get_client(
+                &dataset,
+                Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+            )
+            .await
+        else {
             panic!("zero GraphQL rate-control limit should be rejected");
         };
 
@@ -568,12 +614,8 @@ mod tests {
         wiremock::ResponseTemplate::new(307).insert_header("location", location)
     }
 
-    /// Queries `endpoint` with the client a dataset with `params` gets.
-    async fn query_users(
-        params: &[(&str, &str)],
-        endpoint: &str,
-    ) -> graphql::Result<graphql::client::GraphQLQueryResult> {
-        let connector = GraphQL {
+    async fn test_connector(params: &[(&str, &str)]) -> GraphQL {
+        GraphQL {
             app_name: std::sync::Arc::from("test_app"),
             params: test_params(params).await,
             runtime_rate_control_params: None,
@@ -581,10 +623,21 @@ mod tests {
             metrics: Arc::new(HttpRateControlMetrics::default()),
             emit_rate_control_metrics: true,
             rate_control_metric_source: None,
-        };
+        }
+    }
+
+    /// Queries `endpoint` with the client a dataset with `params` gets.
+    async fn query_users(
+        params: &[(&str, &str)],
+        endpoint: &str,
+    ) -> graphql::Result<graphql::client::GraphQLQueryResult> {
+        let connector = test_connector(params).await;
         let dataset = test_dataset(endpoint).await;
         let (client, reservation) = connector
-            .get_client(&dataset)
+            .get_client(
+                &dataset,
+                Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+            )
             .await
             .expect("the GraphQL client builds");
         reservation.commit().await;
@@ -592,6 +645,58 @@ mod tests {
             graphql::client::GraphQLQuery::try_from(Arc::<str>::from("query { users { id } }"))
                 .expect("the query parses");
         client.execute(&query, None, None, None, None, None).await
+    }
+
+    /// Builds the table provider of a dataset with `params` at `endpoint` as `read_provider`
+    /// does, and returns the connector error its failure maps to.
+    async fn read_provider_failure(params: &[(&str, &str)], endpoint: &str) -> DataConnectorError {
+        let connector = test_connector(params).await;
+        let dataset = test_dataset(endpoint).await;
+        let (client, reservation) = connector
+            .get_client(
+                &dataset,
+                Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+            )
+            .await
+            .expect("the GraphQL client builds");
+        let Err(error) = GraphQLTableProviderBuilder::new(client)
+            .build("query { users { id } }")
+            .await
+        else {
+            panic!("the table provider must fail to build against {endpoint}");
+        };
+        reservation.rollback().await;
+        read_provider_error(error, ConnectorComponent::from(&dataset))
+    }
+
+    /// A GraphQL `NOT_FOUND` names a resource that does not exist, so registration fails with a
+    /// configuration error that startup does not retry, even behind an earlier bare timeout.
+    #[tokio::test]
+    async fn a_not_found_resource_is_a_permanent_configuration_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(
+                r#"{"data": null, "errors": [{"message": "upstream timeout"}, {"message": "no such repository", "type": "NOT_FOUND"}]}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+
+        let error = read_provider_failure(
+            &[("json_pointer", "/data/users")],
+            &format!("{}/graphql", server.uri()),
+        )
+        .await;
+
+        assert!(
+            matches!(error, DataConnectorError::InvalidConfiguration { .. }),
+            "a NOT_FOUND maps to InvalidConfiguration, got {error:?}"
+        );
+        assert!(!error.is_retriable());
+        assert!(
+            error.to_string().contains("no such repository"),
+            "the error names the missing resource: {error}"
+        );
     }
 
     #[tokio::test]
@@ -692,6 +797,127 @@ mod tests {
                 .sum();
             assert_eq!(rows, 1);
         }
+    }
+
+    /// A refusal the API named stays permanent at the connector boundary, so startup
+    /// does not retry it; an inferred refusal stays retriable.
+    #[tokio::test]
+    async fn an_explicit_refusal_is_a_permanent_permission_error() {
+        let dataset = test_dataset("http://localhost:1/graphql").await;
+        let component = ConnectorComponent::from(&dataset);
+
+        let explicit = read_provider_error(
+            graphql::Error::InvalidCredentialsOrPermissions {
+                message: "FORBIDDEN".to_string(),
+                kind: graphql::RefusalKind::Explicit,
+            },
+            component.clone(),
+        );
+        assert!(
+            matches!(explicit, DataConnectorError::InsufficientPermissions { .. }),
+            "an explicit refusal maps to InsufficientPermissions, got {explicit:?}"
+        );
+        assert!(!explicit.is_retriable());
+
+        let inferred = read_provider_error(
+            graphql::Error::InvalidCredentialsOrPermissions {
+                message: "not authorized".to_string(),
+                kind: graphql::RefusalKind::Inferred,
+            },
+            component,
+        );
+        assert!(inferred.is_retriable());
+    }
+
+    /// An endpoint that redirects to `/a` on another port, whose server redirects `/a` to its own
+    /// `/b` and serves users at `/b`. Returns the endpoint URL and both servers.
+    async fn redirect_chain() -> (String, wiremock::MockServer, wiremock::MockServer) {
+        let target = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/a"))
+            .respond_with(redirect_response("/b"))
+            .mount(&target)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::path("/b"))
+            .respond_with(users_response())
+            .mount(&target)
+            .await;
+        let endpoint = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(redirect_response(&format!("{}/a", target.uri())))
+            .mount(&endpoint)
+            .await;
+        (format!("{}/graphql", endpoint.uri()), endpoint, target)
+    }
+
+    async fn requests_for(server: &wiremock::MockServer, path: &str) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("requests are recorded")
+            .iter()
+            .filter(|request| request.url.path() == path)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_dataset_with_credentials_does_not_follow_a_redirect_chain_that_continues_on_another_host()
+     {
+        for (userinfo, params) in [
+            (
+                "",
+                &[
+                    ("graphql_auth_token", "test-token"),
+                    ("json_pointer", "/data/users"),
+                ][..],
+            ),
+            (
+                "",
+                &[
+                    ("graphql_auth_user", "user"),
+                    ("json_pointer", "/data/users"),
+                ][..],
+            ),
+            ("svc:s3cret@", &[("json_pointer", "/data/users")][..]),
+        ] {
+            let (endpoint_url, _endpoint, target) = redirect_chain().await;
+            let endpoint_url = endpoint_url.replacen("://", &format!("://{userinfo}"), 1);
+
+            let Err(error) = query_users(params, &endpoint_url).await else {
+                panic!("the redirect chain must be refused with {params:?}");
+            };
+
+            assert!(
+                error.to_string().contains(&format!(
+                    "Refused to follow the redirect to {}/b",
+                    target.uri()
+                )),
+                "unexpected error with {params:?}: {error}"
+            );
+            assert_eq!(requests_for(&target, "/a").await, 1);
+            assert_eq!(
+                requests_for(&target, "/b").await,
+                0,
+                "the second hop on the target must not be requested with {params:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dataset_without_credentials_follows_a_redirect_chain_that_continues_on_another_host()
+    {
+        let (endpoint_url, _endpoint, target) = redirect_chain().await;
+
+        let result = query_users(&[("json_pointer", "/data/users")], &endpoint_url)
+            .await
+            .expect("the redirect chain is followed");
+
+        let rows: usize = result
+            .records
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 1);
+        assert_eq!(requests_for(&target, "/b").await, 1);
     }
 }
 

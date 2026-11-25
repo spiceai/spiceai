@@ -503,9 +503,11 @@ fn window_distinct_is_renderable(expr: &Expr) -> bool {
 /// it needs if the quotient is an integer; [`divides_by_a_possible_zero`]
 /// refuses a `/` or `%` whose divisor could be zero, which `MySQL` answers as
 /// `NULL`; [`distinct_is_renderable_in_mysql`] refuses a `DISTINCT`
-/// aggregate `MySQL` cannot parse; and [`compares_a_decimal_with_a_float`]
+/// aggregate `MySQL` cannot parse; [`compares_a_decimal_with_a_float`]
 /// refuses a comparison of a decimal with a float, which `MySQL` makes in
-/// `DOUBLE` where `DataFusion` makes it in decimal.
+/// `DOUBLE` where `DataFusion` makes it in decimal; and
+/// [`holds_a_backslash_string`] refuses a string with a backslash, which
+/// `MySQL` reads as an escape.
 #[must_use]
 pub fn mysql_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
     integer_cast_is_renderable(expr, scope)
@@ -514,6 +516,36 @@ pub fn mysql_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> b
         && !divides_by_a_possible_zero(expr)
         && distinct_is_renderable_in_mysql(expr)
         && !compares_a_decimal_with_a_float(expr, scope)
+        && !holds_a_backslash_string(expr)
+}
+
+/// Whether `expr` is a string literal that holds a backslash, or a `LIKE`,
+/// `ILIKE` or `SIMILAR TO` whose escape character is a backslash.
+///
+/// `MySQL` reads a backslash in a string literal as an escape, and the unparser
+/// writes the value unchanged, so `MySQL` would read different text: `C:\new`
+/// holds a newline, and a backslash before a quote, or at the end of the value,
+/// ends the literal somewhere else. Writing `\\` instead is wrong on a server
+/// with `NO_BACKSLASH_ESCAPES`, so such a node is evaluated locally.
+fn holds_a_backslash_string(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(value, _) => value_holds_a_backslash(value),
+        Expr::Like(like) | Expr::SimilarTo(like) => like.escape_char == Some('\\'),
+        _ => false,
+    }
+}
+
+fn value_holds_a_backslash(value: &ScalarValue) -> bool {
+    match value {
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => s.contains('\\'),
+        ScalarValue::Dictionary(_, inner) | ScalarValue::RunEndEncoded(_, _, inner) => {
+            value_holds_a_backslash(inner)
+        }
+        _ if value.data_type().is_nested() => value.to_string().contains('\\'),
+        _ => false,
+    }
 }
 
 /// Whether `expr` is a comparison (`=`, `<`, `IS DISTINCT FROM`, `BETWEEN`,
@@ -1223,6 +1255,66 @@ mod tests {
             assert!(duckdb_can_evaluate_expression(&expr, Some(&scope)));
             assert!(postgres_can_evaluate_expression(&expr, Some(&scope)));
             assert!(mysql_can_evaluate_expression(&expr, Some(&scope)));
+        }
+    }
+
+    /// A string with a backslash stays local on `MySQL`, which reads the
+    /// backslash as an escape: `C:\new` would hold a newline, and `a\'b` or
+    /// `trail\` would end the literal somewhere else. So does a `LIKE` or
+    /// `SIMILAR TO` whose escape character is a backslash.
+    #[test]
+    fn mysql_keeps_a_backslash_string_local() {
+        use datafusion::logical_expr::expr::Like;
+
+        let like = |escape_char: Option<char>| {
+            Like::new(
+                false,
+                Box::new(col("s")),
+                Box::new(lit("a!%")),
+                escape_char,
+                false,
+            )
+        };
+        for value in ["a\\'b", "trail\\", "C:\\new", "a\\\\'b", "\\"] {
+            for literal in [
+                lit(value),
+                lit(ScalarValue::LargeUtf8(Some(value.to_string()))),
+                lit(ScalarValue::Utf8View(Some(value.to_string()))),
+                lit(ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::from(value)),
+                )),
+            ] {
+                assert!(!mysql_can_evaluate_expression(&literal, None), "{literal}");
+            }
+        }
+        let nested = ScalarValue::List(ScalarValue::new_list_nullable(
+            &[ScalarValue::from("plain"), ScalarValue::from("a\\'b")],
+            &DataType::Utf8,
+        ));
+        let run_end = ScalarValue::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int32, false)),
+            Arc::new(Field::new("values", DataType::Utf8, true)),
+            Box::new(ScalarValue::from("trail\\")),
+        );
+        for expr in [lit(nested), lit(run_end)] {
+            assert!(!mysql_can_evaluate_expression(&expr, None), "{expr}");
+        }
+        for expr in [
+            Expr::Like(like(Some('\\'))),
+            Expr::SimilarTo(like(Some('\\'))),
+        ] {
+            assert!(!mysql_can_evaluate_expression(&expr, None), "{expr}");
+        }
+        for expr in [
+            lit("plain"),
+            lit("x''y"),
+            lit("a\"b"),
+            lit(ScalarValue::Utf8(None)),
+            Expr::Like(like(None)),
+            Expr::Like(like(Some('!'))),
+        ] {
+            assert!(mysql_can_evaluate_expression(&expr, None), "{expr}");
         }
     }
 

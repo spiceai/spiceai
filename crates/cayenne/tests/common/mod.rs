@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CreateTableOptions, ObjectStoreConfig};
-use cayenne::metastore::object_native::{NativeCatalogConfig, ObjectNativeCatalog};
+use cayenne::metastore::object_native::{
+    NativeCatalogConfig, ObjectNativeCatalog, new_dataset_folder,
+};
 use cayenne::{CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -423,7 +425,25 @@ impl FixtureDataStore {
         runtime_env: Arc<RuntimeEnv>,
         options: CreateTableOptions,
     ) -> Result<CayenneTableProvider, Box<dyn std::error::Error>> {
-        let table = self.builder(catalog, runtime_env).create(options).await?;
+        self.create_with_retention(catalog, runtime_env, options, Vec::new())
+            .await
+    }
+
+    /// [`Self::create`] with `retention` as the table's retention filters.
+    /// # Errors
+    /// As [`Self::create`].
+    pub async fn create_with_retention(
+        &self,
+        catalog: Arc<dyn MetadataCatalog>,
+        runtime_env: Arc<RuntimeEnv>,
+        options: CreateTableOptions,
+        retention: Vec<datafusion::logical_expr::Expr>,
+    ) -> Result<CayenneTableProvider, Box<dyn std::error::Error>> {
+        let table = self
+            .builder(catalog, runtime_env)
+            .with_retention_filters(retention)
+            .create(options)
+            .await?;
         self.check_placement(&table)?;
         Ok(table)
     }
@@ -483,6 +503,21 @@ impl FixtureDataStore {
 /// metastore can never be paired with object-store data files: that pairing
 /// panics with [`UNSUPPORTED_PAIRING`]. `fixture_pairing_test` holds the suite
 /// to it.
+/// The catalog prefix of an object-native location at `s3://bucket/state/cayenne/v1`,
+/// so a dataset's data path in it has the `…/v1/datasets/<folder>/data` shape the
+/// object-native metastore requires.
+pub const LOCATION_CATALOG: &str = "state/cayenne/v1/catalog";
+
+/// The data path of a new dataset `name` in `catalog`'s object-native location.
+#[must_use]
+pub fn location_data_url(catalog: &ObjectNativeCatalog, name: &str) -> String {
+    format!(
+        "s3://bucket/{}/{}/data",
+        catalog.datasets_prefix(),
+        new_dataset_folder(name)
+    )
+}
+
 pub fn table_builder_on_store(
     catalog: Arc<dyn MetadataCatalog>,
     runtime_env: Arc<RuntimeEnv>,
@@ -510,22 +545,48 @@ impl TestFixture {
         store: Option<Arc<dyn object_store::ObjectStore>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = Arc::new(TempDir::new()?);
-        let data_path = temp_dir.path().join("data");
-        std::fs::create_dir_all(&data_path)?;
-        let db_path = temp_dir.path().join("test.db");
-
-        let (catalog, data_store): (Arc<FixtureCatalog>, FixtureDataStore) = match (backend, store)
-        {
-            (BackendType::Sqlite, Some(_)) => return Err(UNSUPPORTED_PAIRING.into()),
-            (BackendType::Sqlite, None) => (
-                fixture_catalog(format!("sqlite://{}", db_path.to_string_lossy())).await?,
-                FixtureDataStore::local(&data_path),
-            ),
+        match (backend, store) {
+            (BackendType::Sqlite, Some(_)) => Err(UNSUPPORTED_PAIRING.into()),
+            (BackendType::Sqlite, None) => Self::build(temp_dir, backend, None).await,
             (BackendType::ObjectNative, store) => {
                 let location = match store {
                     Some(store) => ObjectNativeLocation::new(store, "cayenne-test", ""),
                     None => FixtureDataStore::location_from_env(temp_dir.path())?,
                 };
+                Self::build(temp_dir, backend, Some(location)).await
+            }
+        }
+    }
+
+    /// An object-native fixture in the store `CAYENNE_TEST_DATA_STORE` names, with
+    /// the catalog and every table going through `wrap(store)`. Returns the fixture
+    /// and the unwrapped store, for reading and writing objects outside Cayenne.
+    pub async fn object_native_through(
+        wrap: impl FnOnce(Arc<dyn object_store::ObjectStore>) -> Arc<dyn object_store::ObjectStore>,
+    ) -> Result<(Self, Arc<dyn object_store::ObjectStore>), Box<dyn std::error::Error>> {
+        let temp_dir = Arc::new(TempDir::new()?);
+        let mut location = FixtureDataStore::location_from_env(temp_dir.path())?;
+        let raw = Arc::clone(&location.store);
+        location.store = wrap(Arc::clone(&raw));
+        let fixture = Self::build(temp_dir, BackendType::ObjectNative, Some(location)).await?;
+        Ok((fixture, raw))
+    }
+
+    async fn build(
+        temp_dir: Arc<TempDir>,
+        backend: BackendType,
+        location: Option<ObjectNativeLocation>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let data_path = temp_dir.path().join("data");
+        std::fs::create_dir_all(&data_path)?;
+        let db_path = temp_dir.path().join("test.db");
+
+        let (catalog, data_store): (Arc<FixtureCatalog>, FixtureDataStore) = match location {
+            None => (
+                fixture_catalog(format!("sqlite://{}", db_path.to_string_lossy())).await?,
+                FixtureDataStore::local(&data_path),
+            ),
+            Some(location) => {
                 let catalog = location.open().await?;
                 let data_store = location.data_store(&catalog)?;
                 OBJECT_NATIVE_LOCATIONS

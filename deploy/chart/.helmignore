@@ -1,0 +1,2 @@
+# Render tests for the chart, run by CI; not part of the packaged chart.
+tests/

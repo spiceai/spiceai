@@ -346,10 +346,13 @@ async fn sort_and_rewrite_uses_observed_filter_column() {
         Some("region")
     );
 
-    provider
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("sort_and_rewrite with auto columns");
+    assert!(
+        provider
+            .force_full_compaction()
+            .await
+            .expect("full compaction with auto columns"),
+        "the full compaction must commit"
+    );
 
     // Row count preserved.
     let session = SessionContext::new();

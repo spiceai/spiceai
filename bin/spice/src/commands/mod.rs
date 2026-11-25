@@ -18,6 +18,7 @@ limitations under the License.
 
 pub mod acceleration;
 pub mod add;
+pub mod build;
 pub mod catalogs;
 pub mod chat;
 pub mod cloud;

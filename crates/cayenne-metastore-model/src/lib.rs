@@ -10,9 +10,11 @@ mod concurrent;
 mod core;
 mod data_files;
 mod dataset_lifecycle;
+mod explorer;
 mod floors;
 mod intent_partitioned;
 mod intent_roll_forward;
+mod mem_tier;
 mod object_names;
 mod position_deletes;
 mod read_programs;
@@ -36,6 +38,144 @@ pub struct Run {
     seed: Option<u64>,
     failure: &'static str,
 }
+
+/// What a run demonstrates. A run that expects no failure is [`Kind::Holds`]
+/// and one that expects a failure is [`Kind::RuleRequired`], unless it is
+/// listed in [`RULE_NOT_REQUIRED`], [`STRONGER_PROPERTIES`] or
+/// [`CURRENT_DEFECTS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Kind {
+    /// The design's properties hold: exhaustively within the run's bound, or
+    /// not violated on the sampled paths of a simulation run.
+    Holds,
+    /// A safeguard or an assumption is removed and the run must find the named
+    /// failure, which shows the design needs it.
+    RuleRequired,
+    /// A safeguard or an assumption is removed and every property still holds,
+    /// which shows the design does not need it for safety in this graph.
+    RuleNotRequired,
+    /// The run checks a property stronger than the design guarantees and must
+    /// find the named failure: the design does not promise that property, and
+    /// no safeguard is removed.
+    StrongerProperty,
+    /// The model follows the current code rather than the design and must
+    /// find the named failure: a known defect, not a design rule.
+    CurrentDefect,
+}
+impl Kind {
+    pub const ALL: [Kind; 5] = [
+        Kind::Holds,
+        Kind::RuleRequired,
+        Kind::RuleNotRequired,
+        Kind::StrongerProperty,
+        Kind::CurrentDefect,
+    ];
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Holds => "holds",
+            Kind::RuleRequired => "rule-required",
+            Kind::RuleNotRequired => "rule-not-required",
+            Kind::StrongerProperty => "stronger-property",
+            Kind::CurrentDefect => "current-defect",
+        }
+    }
+}
+
+/// Runs that remove a safeguard or an assumption and still hold.
+const RULE_NOT_REQUIRED: [&str; 14] = [
+    "transactions-txn-no-owner-resolve-1-exhaust",
+    "dataset-byte-window-metadata-prefix-no-sealed-floor-without-readers",
+    "dataset-query-expiry-no-delete-selection",
+    "dataset-query-expiry-no-log-expiry",
+    "remote-maintenance-minimal-no-file-set-lease",
+    "remote-maintenance-no-file-set-lease",
+    "remote-maintenance-no-guard-revalidation",
+    "remote-maintenance-minimal-no-guard-revalidation",
+    "read-transaction-minimal-no-overlay-read-keys",
+    "read-transaction-widened-no-overlay-read-keys",
+    "mem-tier-late-stamp",
+    "data-files-retire-prepared-lean-3-retire-ignores-reservation",
+    "standby-early-safety",
+    "intent-roll-forward-partitioned-without-done-2-exhaust",
+];
+
+/// Runs that check a property stronger than the design guarantees, and fail it.
+const STRONGER_PROPERTIES: [&str; 1] = ["replicas-readers-adoption-all-present"];
+
+/// Runs that model the current code and reproduce a known defect in it.
+const CURRENT_DEFECTS: [&str; 1] = ["mem-tier-current-3-exhaust"];
+
+/// Runs whose traces are replayed against the implementation: the trace files
+/// under `crates/cayenne/tests/traces` and `crates/object_store_occ/tests/traces`
+/// (including the data-file replay),
+/// and the runs `crates/cayenne`'s mem-tier replay names directly. A test keeps
+/// this list equal to the runs those files name.
+const REPLAYED_AGAINST_CODE: [&str; 35] = [
+    "commits-restart-no-persist-before-send",
+    "commits-restart-turnover",
+    "data-files",
+    "data-files-retire",
+    "data-files-retire-3",
+    "data-files-retire-3-retires-carried",
+    "data-files-retire-forget-early",
+    "data-files-retire-ignores-restore-hold",
+    "data-files-retire-local-ignores-retention",
+    "data-files-retire-prepared",
+    "data-files-retire-prepared-orphan-ignores-reservation",
+    "data-files-retire-remote",
+    "data-files-retire-remote-ignores-retention",
+    "data-files-retire-sweep-uncommitted",
+    "data-files-retire-whole-snapshot",
+    "mem-tier-current-3-exhaust",
+    "mem-tier-no-capture-reservation",
+    "mem-tier-no-one-call",
+    "mem-tier-seal-delete-only",
+    "mem-tier-seal-delete-only-sqlite",
+    "source-ack-before-acceptance",
+    "source-no-redelivery-skip",
+    "source-position-before-data",
+    "source-positions",
+    "transactions-txn-1-exhaust",
+    "transactions-txn-no-coordinator-wait-0-exhaust",
+    "transactions-txn-no-create-once-0-exhaust",
+    "transactions-txn-no-fence-check-0-exhaust",
+    "transactions-txn-no-intent-check-1-exhaust",
+    "transactions-txn-no-matching-0-exhaust",
+    "transactions-txn-no-prepared-check-1-exhaust",
+    "transactions-txn-no-reservation-0-exhaust",
+    "window-storage-7-exhaust",
+    "window-storage-gc-early-5-exhaust",
+    "window-storage-no-exists-5-exhaust",
+];
+
+impl Run {
+    /// What this run demonstrates.
+    #[must_use]
+    pub fn kind(&self) -> Kind {
+        if CURRENT_DEFECTS.contains(&self.name) {
+            Kind::CurrentDefect
+        } else if RULE_NOT_REQUIRED.contains(&self.name) {
+            Kind::RuleNotRequired
+        } else if STRONGER_PROPERTIES.contains(&self.name) {
+            Kind::StrongerProperty
+        } else if self.failure.is_empty() {
+            Kind::Holds
+        } else {
+            Kind::RuleRequired
+        }
+    }
+    /// Whether the implementation's tests replay this run's traces.
+    #[must_use]
+    pub fn replayed(&self) -> bool {
+        REPLAYED_AGAINST_CODE.contains(&self.name)
+    }
+    /// A sampled (simulation) run, which cannot establish exhaustive safety.
+    #[must_use]
+    pub fn sampled(&self) -> bool {
+        self.seed.is_some()
+    }
+}
 /// Checker threads unless `MODEL_THREADS` says otherwise. Results do not depend
 /// on it; past about six, the shared state set gains little.
 const DEFAULT_THREADS: usize = 6;
@@ -43,6 +183,65 @@ const DEFAULT_THREADS: usize = 6;
 #[must_use]
 pub fn runs() -> Vec<Run> {
     let mut declared = vec![
+        Run {
+            name: "mem-tier-current-3-exhaust",
+            family: "mem-tier",
+            mode: "mem-tier-current",
+            bound: 3,
+            seed: None,
+            failure: "recovered reads match the source",
+        },
+        Run {
+            name: "mem-tier-seal-delete-only",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only",
+            bound: 3,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "mem-tier-seal-delete-only-sqlite",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only-sqlite",
+            bound: 3,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "mem-tier-no-one-call",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only-no-one-call",
+            bound: 3,
+            seed: None,
+            failure: "recovered reads match the source",
+        },
+        Run {
+            name: "mem-tier-no-insert-records",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only-no-insert-records",
+            bound: 3,
+            seed: None,
+            failure: "recovered reads match the source",
+        },
+        Run {
+            name: "mem-tier-no-capture-reservation",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only-no-capture-reservation",
+            bound: 3,
+            seed: None,
+            failure: "recovered reads match the source",
+        },
+        Run {
+            name: "mem-tier-late-stamp",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only-no-early-stamp",
+            bound: 3,
+            seed: None,
+            // A late stamp never makes a row visible while the snapshot it
+            // describes is live, so this mutation must hold (see the mem-tier
+            // README).
+            failure: "",
+        },
         Run {
             name: "dataset-lifecycle",
             family: "dataset-lifecycle",
@@ -1108,10 +1307,10 @@ pub fn runs() -> Vec<Run> {
             failure: "I4 Prepare and visible objects survive",
         },
         Run {
-            name: "window-storage-6-exhaust",
+            name: "window-storage-7-exhaust",
             family: "window",
             mode: "storage",
-            bound: 6,
+            bound: 7,
             seed: None,
             failure: "",
         },
@@ -1170,6 +1369,14 @@ pub fn runs() -> Vec<Run> {
             bound: 5,
             seed: None,
             failure: "I8 recovery replay equality including payload bytes",
+        },
+        Run {
+            name: "window-storage-gc-early-5-exhaust",
+            family: "window",
+            mode: "storage-gc-early",
+            bound: 5,
+            seed: None,
+            failure: "I7 query within retention reads its snapshot",
         },
         Run {
             name: "window-storage-no-final-5-exhaust",
@@ -2671,27 +2878,20 @@ where
         }
     }
 }
-fn check<M>(model: M, run: Run) -> bool
-where
-    M: Model + Send + Sync + 'static,
-    M::State: Clone + std::fmt::Debug + Send + Sync + std::hash::Hash + PartialEq,
-    M::Action: Clone + PartialEq + std::fmt::Debug + Send + Sync,
-{
-    check_with_symmetry(model, run, None)
-}
 type Representative<S> = fn(&S) -> S;
 fn check_with_symmetry<M>(
     model: M,
     run: Run,
     representative: Option<Representative<M::State>>,
-) -> bool
+    explore: Option<&str>,
+) -> Result<bool, String>
 where
-    M: Model + Send + Sync + 'static,
+    M: Model + Clone + Send + Sync + 'static,
     M::State: Clone + std::fmt::Debug + Send + Sync + std::hash::Hash + PartialEq,
     M::Action: Clone + PartialEq + std::fmt::Debug + Send + Sync,
 {
     if let Ok(spec) = std::env::var("WALK") {
-        return walk(&model, &run, &spec);
+        return Ok(walk(&model, &run, &spec));
     }
     println!("START {}", run.name);
     let _simulating = Simulating::start(run.seed.is_some());
@@ -2740,15 +2940,12 @@ where
     } else {
         stateright::HasDiscoveries::AllOf(targets)
     };
-    let builder = model
-        .checker()
-        .threads(
-            std::env::var("MODEL_THREADS")
-                .ok()
-                .and_then(|t| t.parse().ok())
-                .unwrap_or(DEFAULT_THREADS),
-        )
-        .finish_when(finish);
+    let threads = std::env::var("MODEL_THREADS")
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(DEFAULT_THREADS);
+    let explorer_model = explore.map(|_| model.clone());
+    let builder = model.checker().threads(threads).finish_when(finish);
     let builder = if let Some(f) = representative {
         builder.symmetry_fn(f)
     } else {
@@ -2763,6 +2960,7 @@ where
                 .join(),
             &run,
             start,
+            explore,
         )
     } else if run.failure.is_empty()
         || run.family == "dataset-lifecycle"
@@ -2771,16 +2969,32 @@ where
         || run.family == "read-delivery"
         || run.family == "remote-maintenance"
         || run.family == "position-deletes"
+        || run.family == "mem-tier"
         || run.family.ends_with("-progress")
         || run.mode.contains("symmetry")
     {
-        output(&builder.spawn_dfs().join(), &run, start)
+        output(&builder.spawn_dfs().join(), &run, start, explore)
     } else {
-        output(&builder.spawn_bfs().join(), &run, start)
+        output(&builder.spawn_bfs().join(), &run, start, explore)
     };
     drop(finished);
     let joined = watchdog.join().is_ok();
-    result && joined
+    if let (Some(address), Some(model)) = (explore, explorer_model) {
+        // The check can run for minutes after `serve` first tried the address,
+        // so try it again just before serving. Stateright binds the address
+        // itself and panics if that fails; this leaves only the instant between
+        // the two binds for another process to take it.
+        if let Err(error) = std::net::TcpListener::bind(address) {
+            return Err(format!("Cannot serve the Explorer on {address}: {error}"));
+        }
+        println!(
+            "EXPLORER {} ({}) serving http://{address}/ (Ctrl-C to stop)",
+            run.name,
+            run.kind().name()
+        );
+        model.checker().threads(threads).serve(address);
+    }
+    Ok(result && joined)
 }
 /// Whether a run must reach the `sometimes` property `name`.
 fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
@@ -2947,7 +3161,33 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
             "handoff drained before the new owner ingests" => run.mode.contains("handoff"),
             _ => false,
         };
-    intent_required
+    // The positive window graph must delete below the floor, collect while a
+    // reader of an older head is still within its retention, and collect again
+    // after the collector restarts.
+    let window_required = run.family == "window"
+        && run.failure.is_empty()
+        && run.seed.is_none()
+        && matches!(
+            name,
+            "batches and a checkpoint collected"
+                | "collection deletes while a reader of an older head is within retention"
+                | "expired reader of an older head finds an object collected"
+                | "collector restarted after losing a stamp collects"
+        );
+    window_required
+        || (run.family == "mem-tier"
+            && run.failure.is_empty()
+            && matches!(
+                name,
+                "flush between checkpoint stage and end"
+                    | "crash between checkpoint stage and publish"
+                    | "bake prunes then reinsert checkpoints"
+                    | "seal shadow recovered"
+                    | "full rewrite committed"
+                    | "full rewrite interleaves apply"
+                    | "full rewrite retains later protected snapshot"
+            ))
+        || intent_required
         || added_required
         || standby_required
         || remote_retention_required
@@ -2978,7 +3218,7 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
                 _ => false,
             }
 }
-fn output<M: Model, C: Checker<M>>(c: &C, run: &Run, start: Instant) -> bool
+fn output<M: Model, C: Checker<M>>(c: &C, run: &Run, start: Instant, explore: Option<&str>) -> bool
 where
     M::State: Clone + PartialEq + std::fmt::Debug,
     M::Action: Clone + PartialEq + std::fmt::Debug,
@@ -3057,6 +3297,16 @@ where
                 "MINIMIZED enabled={valid} steps={} {action:?}",
                 action.len()
             );
+            if let Some(address) = explore
+                && let Some(path) =
+                    stateright::Path::from_actions(c.model(), initial.clone(), &action)
+            {
+                println!(
+                    "EXPLORE {status} {} http://{address}/#/steps/{}",
+                    p.name,
+                    path.encode(c.model())
+                );
+            }
             trace_json(&format!(
                 "{{\"kind\":\"witness\",\"run\":{},\"family\":{},\"mode\":{},\"property\":{},\"status\":{},\"valid\":{valid},\"initial_index\":{},\"actions\":{}}}",
                 json_string(run.name),
@@ -3074,6 +3324,7 @@ where
                 || run.family == "position-deletes"
                 || run.family == "cold-promotion"
                 || run.family == "seq-order"
+                || run.family == "mem-tier"
                 || run.family == "lifecycle-composed"
                 || run.family == "state-rules"
                 || run.name.starts_with("dataset-lifecycle")
@@ -3100,8 +3351,9 @@ where
     }
     good &= expected_found;
     println!(
-        "RESULT {} expected={} matched={good} seconds={:.3}",
+        "RESULT {} kind={} expected={} matched={good} seconds={:.3}",
         run.name,
+        run.kind().name(),
         if run.failure.is_empty() {
             "holds"
         } else {
@@ -3116,36 +3368,78 @@ where
 /// # Errors
 /// Returns an error for an unknown run, missing control opt-in, or an unexpected result.
 pub fn run(name: &str) -> Result<(), String> {
+    run_checks(name, None)
+}
+
+/// Check a named configuration as [`run`] does, print a Stateright Explorer
+/// link for each counterexample and witness it finds, then serve the Explorer
+/// on `address` until the process is stopped. Controls do not need
+/// `EXHAUST=1`: their counterexample is usually what is worth showing.
+///
+/// # Errors
+/// Returns an error for an unknown run or an address that cannot be bound.
+pub fn serve(name: &str, address: &str) -> Result<(), String> {
+    // The Explorer panics on a bind failure; check the address first so a busy
+    // port is an error rather than a panic after the check has run.
+    drop(
+        std::net::TcpListener::bind(address)
+            .map_err(|e| format!("Cannot serve the Explorer on {address}: {e}"))?,
+    );
+    run_checks(name, Some(address))
+}
+
+fn run_checks(name: &str, explore: Option<&str>) -> Result<(), String> {
     let r = runs()
         .into_iter()
         .find(|r| r.name == name)
         .ok_or_else(|| format!("Unknown run {name}; use list"))?;
-    if (r.mode.contains("-no-") || !r.failure.is_empty())
+    if explore.is_none()
+        && r.kind() != Kind::Holds
         && std::env::var("EXHAUST").as_deref() != Ok("1")
     {
         return Err("Controls require EXHAUST=1".into());
     }
-    let good = match r.family {
-        "remote-maintenance" => check(
+    let mut checker = CheckRun {
+        explore,
+        serve_error: None,
+    };
+    let good = dispatch(r, &mut checker).unwrap_or(false);
+    if let Some(error) = checker.serve_error {
+        return Err(error);
+    }
+    if good {
+        Ok(())
+    } else {
+        Err(format!("Unexpected outcome for {name}"))
+    }
+}
+
+/// Builds the model a run names and hands it to `visitor`; `None` for a run
+/// of an unknown family.
+fn dispatch(r: Run, v: &mut impl Visitor) -> Option<bool> {
+    Some(match r.family {
+        "remote-maintenance" => v.visit(
             dataset_lifecycle::remote_maintenance::Protocol::new(r.mode, r.bound),
             r,
+            None,
         ),
-        "position-deletes" => check(position_deletes::Protocol::new(r.mode), r),
-        "lifecycle-composed" => check(
+        "position-deletes" => v.visit(position_deletes::Protocol::new(r.mode), r, None),
+        "lifecycle-composed" => v.visit(
             dataset_lifecycle::composed::Protocol::new(r.mode, r.bound),
             r,
+            None,
         ),
-        "dataset-lifecycle" => check(dataset_lifecycle::Protocol::new(r.mode, r.bound), r),
-        "source-positions" => check(source_positions::Protocol::new(r.mode, r.bound), r),
-        "standby" => check(standby::Protocol::new(r.mode), r),
-        "object-names" => check(object_names::Protocol::new(r.mode, r.bound), r),
-        "reads" => check(reads::Protocol::new(r.mode, r.bound), r),
-        "data-files" => check(data_files::Protocol::new(r.mode, r.bound), r),
-        "action-compatibility" => check(action_compatibility::Protocol::new(r.mode), r),
-        "retention" => check(retention::Protocol::new(r.mode), r),
-        "replicas" => check(replicas::Protocol::new(r.mode), r),
-        "commits" => check(commits::Protocol::new(r.mode, r.bound), r),
-        "transactions" => check_with_symmetry(
+        "dataset-lifecycle" => v.visit(dataset_lifecycle::Protocol::new(r.mode, r.bound), r, None),
+        "source-positions" => v.visit(source_positions::Protocol::new(r.mode, r.bound), r, None),
+        "standby" => v.visit(standby::Protocol::new(r.mode), r, None),
+        "object-names" => v.visit(object_names::Protocol::new(r.mode, r.bound), r, None),
+        "reads" => v.visit(reads::Protocol::new(r.mode, r.bound), r, None),
+        "data-files" => v.visit(data_files::Protocol::new(r.mode, r.bound), r, None),
+        "action-compatibility" => v.visit(action_compatibility::Protocol::new(r.mode), r, None),
+        "retention" => v.visit(retention::Protocol::new(r.mode), r, None),
+        "replicas" => v.visit(replicas::Protocol::new(r.mode), r, None),
+        "commits" => v.visit(commits::Protocol::new(r.mode, r.bound), r, None),
+        "transactions" => v.visit(
             transactions::Protocol::new(r.mode, r.bound),
             r,
             r.mode
@@ -3153,20 +3447,27 @@ pub fn run(name: &str) -> Result<(), String> {
                 .then_some(transactions::Protocol::representative),
         ),
         "intent-roll-forward" if r.mode.contains("partitioned") => {
-            check(intent_partitioned::Protocol::new(r.mode, r.bound), r)
+            v.visit(intent_partitioned::Protocol::new(r.mode, r.bound), r, None)
         }
-        "intent-roll-forward" => check(intent_roll_forward::Protocol::new(r.mode, r.bound), r),
-        "window" => check(window::Protocol::new(r.mode, r.bound), r),
-        "floors" => check(floors::Protocol::new(r.mode, r.bound), r),
-        "concurrent" => check(concurrent::Protocol::new(r.mode, r.bound), r),
-        "state-rules" => check(state_rules::Protocol::new(r.mode, r.bound), r),
-        "seq-order" => check(seq_order::Protocol::new(r.mode, r.bound), r),
-        "predicate-progress" => check(read_programs::PredicateProgress::new(r.bound), r),
-        "cold-promotion" => check(dataset_lifecycle::promotion::Protocol::new(r.mode), r),
-        "read-delivery" => check(read_programs::delivery::Protocol::new(r.mode, r.bound), r),
+        "intent-roll-forward" => {
+            v.visit(intent_roll_forward::Protocol::new(r.mode, r.bound), r, None)
+        }
+        "window" => v.visit(window::Protocol::new(r.mode, r.bound), r, None),
+        "floors" => v.visit(floors::Protocol::new(r.mode, r.bound), r, None),
+        "concurrent" => v.visit(concurrent::Protocol::new(r.mode, r.bound), r, None),
+        "state-rules" => v.visit(state_rules::Protocol::new(r.mode, r.bound), r, None),
+        "mem-tier" => v.visit(mem_tier::Protocol::new(r.mode, r.bound), r, None),
+        "seq-order" => v.visit(seq_order::Protocol::new(r.mode, r.bound), r, None),
+        "predicate-progress" => v.visit(read_programs::PredicateProgress::new(r.bound), r, None),
+        "cold-promotion" => v.visit(dataset_lifecycle::promotion::Protocol::new(r.mode), r, None),
+        "read-delivery" => v.visit(
+            read_programs::delivery::Protocol::new(r.mode, r.bound),
+            r,
+            None,
+        ),
         "read-programs" => {
             let model = read_programs::Protocol::new(r.mode, r.bound);
-            let good = check(model.clone(), r);
+            let good = v.visit(model.clone(), r, None);
             println!("COMMIT_COST_PROFILES {} {:?}", r.name, model.profiles());
             println!(
                 "MODEL_COUNTS {} max_winners={} max_rows_evaluated={}",
@@ -3176,12 +3477,46 @@ pub fn run(name: &str) -> Result<(), String> {
             );
             good
         }
-        _ => false,
-    };
-    if good {
-        Ok(())
-    } else {
-        Err(format!("Unexpected outcome for {name}"))
+        _ => return None,
+    })
+}
+
+/// What to do with a run's model: check it, serve it, or (in tests) render it.
+trait Visitor {
+    fn visit<M>(
+        &mut self,
+        model: M,
+        run: Run,
+        representative: Option<Representative<M::State>>,
+    ) -> bool
+    where
+        M: Model + Clone + Send + Sync + 'static,
+        M::State: Clone + std::fmt::Debug + Send + Sync + std::hash::Hash + PartialEq,
+        M::Action: Clone + PartialEq + std::fmt::Debug + Send + Sync;
+}
+
+/// Checks a run, then serves it in the Explorer when `explore` names an address.
+struct CheckRun<'a> {
+    explore: Option<&'a str>,
+    /// Why serving the Explorer failed after the check, if it did.
+    serve_error: Option<String>,
+}
+impl Visitor for CheckRun<'_> {
+    fn visit<M>(
+        &mut self,
+        model: M,
+        run: Run,
+        representative: Option<Representative<M::State>>,
+    ) -> bool
+    where
+        M: Model + Clone + Send + Sync + 'static,
+        M::State: Clone + std::fmt::Debug + Send + Sync + std::hash::Hash + PartialEq,
+        M::Action: Clone + PartialEq + std::fmt::Debug + Send + Sync,
+    {
+        check_with_symmetry(model, run, representative, self.explore).unwrap_or_else(|error| {
+            self.serve_error = Some(error);
+            false
+        })
     }
 }
 
@@ -3190,11 +3525,24 @@ pub fn run(name: &str) -> Result<(), String> {
 /// `None` for an unknown run, a run of another family, or an action the run does
 /// not enable at that point.
 #[must_use]
-pub fn window_head_after(run: &str, actions: &[String]) -> Option<(Vec<usize>, Vec<usize>)> {
+pub fn window_outcome_after(run: &str, actions: &[String]) -> Option<WindowOutcome> {
     let run = runs()
         .into_iter()
         .find(|r| r.name == run && r.family == "window")?;
-    window::head_after(run.mode, run.bound, actions)
+    window::outcome_after(run.mode, run.bound, actions)
+}
+pub use window::Outcome as WindowOutcome;
+
+pub use mem_tier::{CatalogView as MemTierCatalogView, Step as MemTierStep};
+
+/// Per-action live rows, durable action lists and crash/recover/replay rows.
+/// Returns `None` for an unknown family/run or a disabled/unknown action.
+#[must_use]
+pub fn mem_tier_steps(run: &str, actions: &[String]) -> Option<Vec<MemTierStep>> {
+    let run = runs()
+        .into_iter()
+        .find(|r| r.name == run && r.family == "mem-tier")?;
+    mem_tier::steps(run.mode, run.bound, actions)
 }
 
 pub use transactions::Step as TransactionStep;
@@ -3398,4 +3746,228 @@ fn citations(block: &str) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::{Representative, Run, Visitor, dispatch, runs};
+    use stateright::{Model, Path};
+    use std::collections::BTreeSet;
+
+    /// Families that show text only; every other family draws its state.
+    const TEXT_ONLY: [&str; 5] = [
+        "action-compatibility",
+        "position-deletes",
+        "predicate-progress",
+        "read-delivery",
+        "state-rules",
+    ];
+
+    /// Walks each run's model along seeded random paths and renders every
+    /// step the way the Explorer does: every enabled action's label and
+    /// outcome text, and the drawing of the path so far.
+    #[derive(Default)]
+    struct Render {
+        families: BTreeSet<&'static str>,
+        drawn: BTreeSet<&'static str>,
+        steps: usize,
+    }
+    impl Visitor for Render {
+        fn visit<M>(&mut self, model: M, run: Run, _: Option<Representative<M::State>>) -> bool
+        where
+            M: Model + Clone + Send + Sync + 'static,
+            M::State: Clone + std::fmt::Debug + Send + Sync + std::hash::Hash + PartialEq,
+            M::Action: Clone + PartialEq + std::fmt::Debug + Send + Sync,
+        {
+            self.families.insert(run.family);
+            for seed in 1..=3_u64 {
+                let mut rng = seed;
+                let mut next = |bound: usize| {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    usize::try_from(rng % u64::try_from(bound).unwrap_or(1)).unwrap_or(0)
+                };
+                let inits = model.init_states();
+                let init = inits[next(inits.len())].clone();
+                let mut state = init.clone();
+                let mut actions = vec![];
+                for _ in 0..30 {
+                    let mut candidates = vec![];
+                    model.actions(&state, &mut candidates);
+                    let enabled: Vec<M::Action> = candidates
+                        .into_iter()
+                        .filter(|a| {
+                            assert!(
+                                !model.format_action(a).is_empty(),
+                                "{}: empty label",
+                                run.name
+                            );
+                            model.next_state(&state, a.clone()).is_some()
+                        })
+                        .collect();
+                    if enabled.is_empty() {
+                        break;
+                    }
+                    for a in &enabled {
+                        let text = model.format_step(&state, a.clone());
+                        assert!(
+                            text.is_some_and(|t| !t.is_empty()),
+                            "{} seed {seed}: no step text for {a:?}",
+                            run.name
+                        );
+                    }
+                    let action = enabled[next(enabled.len())].clone();
+                    state = model
+                        .next_state(&state, action.clone())
+                        .expect("an enabled action has a successor");
+                    actions.push(action);
+                    let path = Path::from_actions(&model, init.clone(), &actions)
+                        .expect("the walk replays");
+                    if let Some(svg) = model.as_svg(path) {
+                        assert!(
+                            svg.starts_with("<svg ") && svg.ends_with("</svg>"),
+                            "{} seed {seed}: not an SVG document",
+                            run.name
+                        );
+                        assert_eq!(
+                            svg.matches("<text").count(),
+                            svg.matches("</text>").count(),
+                            "{} seed {seed}: unbalanced text elements",
+                            run.name
+                        );
+                        assert!(svg.contains("<rect"), "{}: draws nothing", run.name);
+                        self.drawn.insert(run.family);
+                    }
+                    self.steps += 1;
+                }
+            }
+            true
+        }
+    }
+
+    #[test]
+    fn every_run_renders_in_the_explorer() {
+        let mut render = Render::default();
+        for run in runs() {
+            assert_eq!(dispatch(run, &mut render), Some(true), "{}", run.name);
+        }
+        let expected: BTreeSet<&str> = render
+            .families
+            .iter()
+            .copied()
+            .filter(|f| !TEXT_ONLY.contains(f))
+            .collect();
+        assert_eq!(render.drawn, expected);
+        assert_eq!(render.families.len(), 25, "{:?}", render.families);
+        assert!(
+            render.steps > 10_000,
+            "only {} steps rendered",
+            render.steps
+        );
+    }
+}
+
+#[cfg(test)]
+mod run_kind_tests {
+    use super::{
+        CURRENT_DEFECTS, Kind, REPLAYED_AGAINST_CODE, RULE_NOT_REQUIRED, STRONGER_PROPERTIES, runs,
+    };
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    /// Every quoted name after `marker` in `text`.
+    fn quoted_after<'a>(text: &'a str, marker: &str) -> Vec<&'a str> {
+        text.match_indices(marker)
+            .filter_map(|(at, _)| {
+                let rest = &text[at + marker.len()..];
+                rest.find('"').map(|end| &rest[..end])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn listed_runs_exist_and_match_their_expected_outcome() {
+        let all = runs();
+        let find = |name: &str| {
+            all.iter()
+                .find(|r| r.name == name)
+                .unwrap_or_else(|| panic!("{name} is listed but is not a run"))
+        };
+        for name in RULE_NOT_REQUIRED {
+            assert!(find(name).failure.is_empty(), "{name} expects a failure");
+            assert_eq!(find(name).kind(), Kind::RuleNotRequired);
+        }
+        for name in STRONGER_PROPERTIES {
+            assert!(!find(name).failure.is_empty(), "{name} expects no failure");
+            assert_eq!(find(name).kind(), Kind::StrongerProperty);
+        }
+        for name in CURRENT_DEFECTS {
+            assert!(!find(name).failure.is_empty(), "{name} expects no failure");
+            assert_eq!(find(name).kind(), Kind::CurrentDefect);
+        }
+        for name in REPLAYED_AGAINST_CODE {
+            assert!(find(name).replayed());
+        }
+    }
+
+    /// A run whose mode names a removal (`-no-`, `-ignores-` or `-without-`) and
+    /// still holds must be classified, so a new one cannot pass as a plain
+    /// positive. Removals named otherwise are listed by hand.
+    #[test]
+    fn every_holding_safeguard_removal_is_rule_not_required() {
+        let unclassified: Vec<&str> = runs()
+            .iter()
+            .filter(|r| {
+                ["-no-", "-ignores-", "-without-"]
+                    .iter()
+                    .any(|marker| r.mode.contains(marker))
+                    && r.failure.is_empty()
+            })
+            .filter(|r| r.kind() != Kind::RuleNotRequired)
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(unclassified, Vec::<&str>::new());
+    }
+
+    /// The replayed list equals the runs the implementation's replay tests name:
+    /// a missing entry or a stale one fails.
+    #[test]
+    fn replayed_runs_are_the_runs_the_replay_tests_name() {
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates directory");
+        let mut named = BTreeSet::new();
+        for dir in ["cayenne/tests/traces", "object_store_occ/tests/traces"] {
+            let entries =
+                std::fs::read_dir(crates.join(dir)).unwrap_or_else(|e| panic!("{dir}: {e}"));
+            for entry in entries {
+                let path = entry.expect("trace directory entry").path();
+                if path.extension().is_some_and(|e| e == "jsonl") {
+                    let text = std::fs::read_to_string(&path).expect("trace file");
+                    named.extend(
+                        quoted_after(&text, "\"run\":\"")
+                            .into_iter()
+                            .map(String::from),
+                    );
+                }
+            }
+        }
+        let replay = std::fs::read_to_string(
+            crates.join("cayenne/src/provider/table/tests/mem_tier_model_replay.rs"),
+        )
+        .expect("mem-tier replay source");
+        for call in [
+            "mem_tier_steps(\"",
+            "transaction_steps(\"",
+            "window_head_after(\"",
+        ] {
+            named.extend(quoted_after(&replay, call).into_iter().map(String::from));
+        }
+        let listed: BTreeSet<String> = REPLAYED_AGAINST_CODE
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(listed, named);
+    }
 }

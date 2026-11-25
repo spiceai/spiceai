@@ -1264,3 +1264,201 @@ fn the_unparser_compiles_its_identifier_pattern_once() {
          pattern on every call again (spiceai/datafusion#301)"
     );
 }
+
+/// spiceai/datafusion#303. A bzip2, xz or zstd CSV file made of two
+/// concatenated members, as `cat a.csv.zst b.csv.zst` makes, returns every row
+/// when it is read from an object store, as it does from a local file.
+/// Unpatched, the object-store read stops after the first member and returns
+/// only its rows, with no error.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compressed_file_of_concatenated_members_is_read_in_full_from_an_object_store() {
+    use object_store::memory::InMemory;
+    use object_store::path::Path as ObjectPath;
+    use object_store::{ObjectStore, ObjectStoreExt};
+    use std::sync::Arc;
+    use url::Url;
+
+    let ctx = spice_session(|_| {});
+    let store = Arc::new(InMemory::new());
+    ctx.register_object_store(
+        &Url::parse("memory://").expect("memory URL"),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+    );
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let mut answers = Vec::new();
+    for (codec, extension) in [("bzip2", "bz2"), ("xz", "xz"), ("zstd", "zst")] {
+        let mut file = Vec::new();
+        for (member, first, last, header) in [(0, 0, 9_999, true), (1, 10_000, 19_999, false)] {
+            let name = format!("member{member}.csv.{extension}");
+            run_statements(
+                &ctx,
+                &[&format!(
+                    "COPY (SELECT value AS a FROM generate_series({first}, {last})) \
+                     TO 'memory:///{name}' STORED AS CSV \
+                     OPTIONS ('format.compression' '{codec}', 'format.has_header' '{header}')"
+                )],
+            )
+            .await;
+            let bytes = store
+                .get(&ObjectPath::from(name))
+                .await
+                .expect("member written")
+                .bytes()
+                .await
+                .expect("member read");
+            file.extend_from_slice(&bytes);
+        }
+        let name = format!("members.csv.{extension}");
+        let local = dir.path().join(&name);
+        std::fs::write(&local, &file).expect("concatenated file written to a local file");
+        store
+            .put(&ObjectPath::from(name.as_str()), file.into())
+            .await
+            .expect("concatenated file written to the object store");
+
+        for (source, location) in [
+            ("object_store", format!("memory:///{name}")),
+            ("local_file", local.display().to_string()),
+        ] {
+            let table = format!("members_{codec}_{source}");
+            run_statements(
+                &ctx,
+                &[&format!(
+                    "CREATE EXTERNAL TABLE {table} (a BIGINT) STORED AS CSV LOCATION '{location}' \
+                     OPTIONS ('format.compression' '{codec}', 'format.has_header' 'true')"
+                )],
+            )
+            .await;
+            let rows = answer(&ctx, &format!("SELECT count(a), sum(a) FROM {table}")).await;
+            answers.push((table, rows));
+        }
+    }
+    // Both members' rows: 20,000 values, 0 to 19,999, summing to 19,999 * 20,000 / 2.
+    let expected = Ok(owned(&["20000,199990000"]));
+    let wrong: Vec<_> = answers
+        .iter()
+        .filter(|(_, rows)| *rows != expected)
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "expected {expected:?} from every table, got {wrong:#?}"
+    );
+}
+
+/// spiceai/datafusion#308. The simplifier rewrote a regex that matches a
+/// backslash to `LIKE`, where `\` is the escape character, so the rewritten
+/// filter selected other rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_regex_that_matches_a_backslash_is_not_rewritten_to_like() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &[r"CREATE TABLE backslash_strings(s VARCHAR) AS VALUES ('a\b'), ('a%'), ('plain')"],
+    )
+    .await;
+    for sql in [
+        r"SELECT s FROM backslash_strings WHERE s ~ '\\'",
+        r"SELECT s FROM backslash_strings WHERE regexp_like(s, '^a\\')",
+    ] {
+        assert_eq!(
+            sorted_answer(&ctx, sql).await,
+            Ok(owned(&[r"a\b"])),
+            "{sql}"
+        );
+    }
+}
+
+/// spiceai/datafusion#309. The unparser wrote the qualifier of a wildcard
+/// inside an expression bare, so `coalesce(("a b".*))` reached the source as
+/// SQL it rejects.
+#[test]
+fn the_unparser_quotes_the_qualifier_of_a_wildcard() {
+    use datafusion::common::TableReference;
+    use datafusion::logical_expr::{Expr, expr::WildcardOptions};
+    use datafusion::sql::unparser::Unparser;
+
+    #[expect(deprecated)]
+    let wildcard = |qualifier: &str| Expr::Wildcard {
+        qualifier: Some(TableReference::bare(qualifier)),
+        options: Box::new(WildcardOptions::default()),
+    };
+    let unparser = Unparser::default();
+    for (qualifier, expected) in [("a b", r#""a b".*"#), ("q", "q.*")] {
+        assert_eq!(
+            unparser
+                .expr_to_sql(&wildcard(qualifier))
+                .expect("a wildcard unparses")
+                .to_string(),
+            expected
+        );
+    }
+}
+
+/// spiceai/datafusion#310. `RewriteSetComparison` gave the column of an
+/// `ANY`/`ALL` subquery the outer column's name, so a subquery over the outer
+/// query's own table compared each row with itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_any_or_all_subquery_over_the_outer_table_reads_its_own_rows() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &["CREATE TABLE set_cmp_self(id INT, age INT) AS VALUES (1, 10), (2, 20), (3, 30)"],
+    )
+    .await;
+    for (sql, expected) in [
+        (
+            "SELECT id FROM set_cmp_self WHERE age = ANY (SELECT age FROM set_cmp_self WHERE id < 3)",
+            &["1", "2"][..],
+        ),
+        (
+            "SELECT id FROM set_cmp_self WHERE age > ANY (SELECT age FROM set_cmp_self WHERE id < 3)",
+            &["2", "3"][..],
+        ),
+        (
+            "SELECT id FROM set_cmp_self WHERE age <> ALL (SELECT age FROM set_cmp_self WHERE id < 3)",
+            &["3"][..],
+        ),
+    ] {
+        assert_eq!(
+            sorted_answer(&ctx, sql).await,
+            Ok(sorted(expected)),
+            "{sql}"
+        );
+    }
+}
+
+/// spiceai/datafusion#311 (apache/datafusion#25391, #26544 and #26677).
+/// Decorrelating an aggregate without `GROUP BY` dropped the outer rows with no
+/// inner row, although `count(*)` still returns a row for them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_correlated_count_without_group_by_keeps_the_rows_with_no_match() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &[
+            "CREATE TABLE count_bug_outer(id INT) AS VALUES (11), (22), (33), (44)",
+            "CREATE TABLE count_bug_inner(id INT) AS VALUES (11), (22), (44)",
+        ],
+    )
+    .await;
+    for (sql, expected) in [
+        (
+            "SELECT id FROM count_bug_outer o WHERE EXISTS (SELECT count(*) FROM count_bug_inner i WHERE i.id = o.id)",
+            &["11", "22", "33", "44"][..],
+        ),
+        (
+            "SELECT id FROM count_bug_outer o WHERE EXISTS (SELECT count(*) FROM count_bug_inner i WHERE i.id = o.id HAVING count(*) = 0)",
+            &["33"][..],
+        ),
+        (
+            "SELECT id FROM count_bug_outer o WHERE 0 = ANY (SELECT count(*) FROM count_bug_inner i WHERE i.id = o.id)",
+            &["33"][..],
+        ),
+    ] {
+        assert_eq!(
+            sorted_answer(&ctx, sql).await,
+            Ok(sorted(expected)),
+            "{sql}"
+        );
+    }
+}

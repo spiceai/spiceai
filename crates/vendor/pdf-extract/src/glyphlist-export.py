@@ -1,8 +1,8 @@
 glyphlist = []
 glyphs_seen = {}
 def read_glyphs(name):
-    f = open(name)
-    lines = f.readlines()
+    with open(name) as f:
+        lines = f.readlines()
     import re
     for l in lines:
         if l[0] == '#' or l[0] == '\n':

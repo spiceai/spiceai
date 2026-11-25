@@ -1,4 +1,5 @@
 name: edge-values
+tags: [long]
 description: >
   The boundary values of each type answer through Spice as PostgreSQL answers
   them: NaN, infinities and negative zero in ordering, grouping, comparison and

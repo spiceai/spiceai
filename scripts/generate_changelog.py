@@ -179,7 +179,8 @@ def main():
                             "--json", "number,author",
                             "--repo", f"{owner}/{repo}"
                         ]))
-                except:
+                except subprocess.CalledProcessError:
+                    # `gh pr view` exits non-zero for a number it cannot resolve.
                     print(f"- !!!! (PR NOT FOUND): {commit_title} - https://github.com/{owner}/{repo}/commit/{commit_hash}/")
                     continue
 
