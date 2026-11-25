@@ -1054,10 +1054,10 @@ write their usual reinsert vector stamps and precomputed insert records.
 publication of every staged catalog call. Its `Flush` is idempotent and has no
 durability effect; the object-native run also accepts an empty `Flush`.
 
-All four mutations are based on `mem-tier-seal-delete-only`. Three are negative
+All five mutations are based on `mem-tier-seal-delete-only`. Four are negative
 controls: they keep requiring their named downstream failure even if exhaustive
 exploration finds none, and a missing failure is reported rather than relabeled
-safe or hidden. The fourth, `mem-tier-late-stamp`, is a `rule-not-required` run:
+safe or hidden. The fifth, `mem-tier-late-stamp`, is a `rule-not-required` run:
 it expects to hold, because its
 mutation is unobservable rather than unexplored: an insert stamp makes a row
 visible only on the current snapshot's scan, and only while no protected
@@ -1070,19 +1070,35 @@ that a late stamp stays safe under that rule; the
 [object-native design](../../docs/design/object-native-metastore-technical.md#commit-numbers-and-sequence-numbers)
 records why a design that read the stamp elsewhere would make it required
 again. Bounds
-are three source applies, two seals, two explicit checkpoints, one bake attempt,
+are three source applies, two seals, two explicit checkpoints, two bakes,
 one full-rewrite attempt and one crash/recovery, with budgets retained across
 restart. The second seal is what lets a later seal acknowledge an apply that
 landed while an earlier seal was in flight; with one seal, the source redelivers
-that apply after a restart and `no-capture-reservation` has nothing to break. Six threads and the shared 540-second watchdog apply.
+that apply after a restart and `no-capture-reservation` has nothing to break.
+The second bake is what reads the first bake's residue: the first prunes a delete
+from the RAM index while its vector stays in the catalog, and a key upserted
+again after that delete writes no tombstone of its own. With one bake,
+`no-pruned-floor` has nothing to break (#16706). Six threads and the shared 540-second watchdog apply.
+
+`mem-tier-seal-delete-only-deep` and `mem-tier-seal-delete-only-sqlite-deep` run
+the same protocols with two crash/recoveries and two full-rewrite attempts. A
+second of each is reachable, and each alone multiplies the graph several times
+over: together about 200 million states in 215 s and 53 million in 61 s on an
+M-series Mac, against 14 million in 19 s and 4 million in 5 s for the default
+runs. They are not in `quick`, so a pull request does not run them; `all` (the
+scheduled run) does. Each must reach `second crash` and `second full rewrite
+committed`.
 
 ```sh
 nice -n 10 cargo build --release -p cayenne-metastore-model
 EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-current-3-exhaust
 nice -n 10 target/release/cayenne-metastore-model run mem-tier-seal-delete-only
+EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-seal-delete-only-deep
+EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-seal-delete-only-sqlite-deep
 EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-no-one-call
 EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-no-insert-records
 EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-no-capture-reservation
+EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-no-pruned-floor
 EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-late-stamp
 nice -n 10 cargo clippy -p cayenne-metastore-model --release --tests --no-deps -- -D warnings
 nice -n 10 cargo test -p cayenne-metastore-model --release --test mem_tier_steps -- --nocapture
@@ -1141,7 +1157,12 @@ the lower of that fence and the highest sequence among the snapshots it folds
 below its cold-tier files, which the model does not have). A tombstone above the
 folded snapshots may still hide an inline seal shadow, which the bake does not
 fold.
-It retains durable vectors and insert records. The replay configures the
+It retains durable vectors and insert records. The tag starts from the RAM
+index's delete max raised to the pruned-delete floor, the newest delete a bake or
+full rewrite has pruned from that index, clamped to a delete the index held
+(`table.rs::protected_merge_delete_fence`, `pruned_through`); the cap below a
+pending delete applies after it. The floor is in-process state: a crash resets it,
+and recovery reloads the pruned deletes from their vectors instead. The replay configures the
 existing `compaction_trigger_protected_snapshots` threshold to 2, so the engine
 keeps zero recent snapshots. The model enables `Bake` only with at least two
 eligible inputs and a clean physical current-file prefix. The all-protected
@@ -1165,7 +1186,8 @@ so its durability survives a later crash. Parsing and enablement follow
 not exhaustive checks during `cargo test`.
 
 Mandatory positive witnesses cover checkpoint stage/flush, stage/crash before
-publish, recovered seal shadow, bake/prune/reinsert/checkpoint, full rewrite,
+publish, recovered seal shadow, bake/prune/reinsert/checkpoint, a bake whose tag
+the pruned-delete floor raises, full rewrite,
 an apply overlapping rewrite, and a later protected snapshot retained by rewrite.
 The optional `protected survivor excluded by pushdown` diagnostic is hypothesis B.
 
@@ -1174,6 +1196,7 @@ The optional `protected survivor excluded by pushdown` diagnostic is hypothesis 
 | `mem-tier-no-one-call` | Stage seal shadow before pure vectors; stage checkpoint insert records after snapshot/vectors/clear, allowing flush/crash between | `recovered reads match the source` |
 | `mem-tier-no-insert-records` | Omit checkpoint insert records and hidden-key RAM upgrade, retaining checkpoint vector stamps | `recovered reads match the source` |
 | `mem-tier-no-capture-reservation` | Reserve the pure-delete seal's shadow sequence after releasing capture | `recovered reads match the source` |
+| `mem-tier-no-pruned-floor` | Tag a bake from the RAM index's delete max alone, without the pruned-delete floor | `recovered reads match the source` |
 | `mem-tier-late-stamp` | Reserve a fresh insert-record stamp at checkpoint staging after a post-capture apply | none: holds (see above) |
 
 Control names retain their original API; their modes have the
@@ -1220,6 +1243,7 @@ plus the existing worktree changes (locations relative to `crates/cayenne/src/`)
 | Checkpoint capture, empty/data arms, precomputed insert records, atomic visibility publish | `provider/table.rs:36381`, `:36481`, `:36682`, `:36923`, `:37001`; `:18294` and `:18348` |
 | Buffered catalog-live state, table flush, position commit before ack | `metastore/object_native.rs:595`, `:642`, `:712`; `provider/table.rs:37878` |
 | Bake fence, clean-prefix gate, partial-filter scan without query pushdown, per-side RAM prune | `provider/table.rs:30780`, `:28799`, `:29210`, `:29430`, `:31338`; `provider/deletion_index.rs:843` |
+| Bake tag raised to the pruned-delete floor, clamped to the index's delete max (#16706) | `provider/table.rs` `protected_merge_delete_fence`, `pruned_through`, `raise_pruned_delete_floor` |
 | Recovery merges vector and record inserts; inline watermark; protected reload | `provider/table.rs:39454`, `:39571`, `:39709`; `provider/delete/vector_io.rs:657`; `provider/table.rs:33190` |
 | Full rewrite capture, drain and fenced publication | `provider/table.rs:25608`, `:25912`, `:25950`, `:26325`, `:26401` |
 | Rewrite scan skips tombstone pushdown | `provider/table.rs:26546`, `:26561` |

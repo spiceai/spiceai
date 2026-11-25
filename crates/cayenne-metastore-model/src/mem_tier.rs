@@ -7,6 +7,10 @@
 use stateright::{Model, Property};
 
 type Rows = Vec<(usize, usize)>;
+/// Bakes per path. A bake's prune leaves residue the next bake reads (an
+/// emptied RAM index beside durable vectors), so one bake cannot show it
+/// (#16706).
+const BAKE_BUDGET: usize = 2;
 type Index = [(usize, usize); 2]; // (delete, insert), zero = absent
 
 #[derive(Clone, Debug)]
@@ -169,14 +173,19 @@ pub(crate) struct State {
     capture: Option<Capture>,
     seals: usize,
     checkpoints: usize,
-    baked: bool,
+    bakes: usize,
+    /// Highest delete sequence a bake or rewrite pruned from the RAM index;
+    /// in-process, so a crash resets it.
+    pruned_floor: usize,
+    floor_raised_tag: bool,
     rewrite: Option<Rewrite>,
-    rewrite_used: bool,
-    rewritten: bool,
+    rewrites: u8,
+    /// Full rewrites committed; `rewrites` counts captures.
+    rewrites_committed: u8,
     rewrite_interleaved: bool,
     rewrite_preserved: bool,
     crashed: bool,
-    crash_used: bool,
+    crashes: u8,
     replay: Option<usize>,
     flushed_checkpoint: bool,
     crashed_stage: bool,
@@ -323,8 +332,14 @@ fn reference(source: &[(usize, Option<usize>)]) -> Rows {
 }
 // The replay configures keep_recent=0. The real bake still needs two
 // eligible inputs and a physically clean current snapshot before it can merge.
-fn can_bake(state: &State) -> bool {
-    let durable_max = state.index.iter().map(|&(d, _)| d).max().unwrap_or(0);
+fn can_bake(state: &State, floor: usize) -> bool {
+    let durable_max = state
+        .index
+        .iter()
+        .map(|&(d, _)| d)
+        .max()
+        .unwrap_or(0)
+        .max(floor);
     let pending_min = tombstones(&state.tier)
         .into_iter()
         .filter_map(|(d, _)| (d > 0).then_some(d))
@@ -350,6 +365,28 @@ impl Protocol {
     }
     fn has(&self, flag: &str) -> bool {
         self.mode.contains(flag)
+    }
+    /// Crashes and full rewrites per path: one by default, two in a `deep` run.
+    /// A second of each is reachable and multiplies the graph more than tenfold,
+    /// so the default run keeps one and the `-deep` runs check two.
+    fn repeats(&self) -> u8 {
+        if self.has("deep") { 2 } else { 1 }
+    }
+    /// The pruned-delete floor a bake's tag starts from; zero when the control
+    /// removes it.
+    fn floor(&self, state: &State) -> usize {
+        if self.has("no-pruned-floor") {
+            0
+        } else {
+            state.pruned_floor
+        }
+    }
+    /// `table.rs::pruned_through` / `raise_pruned_delete_floor`: clamped to the
+    /// newest delete in the index, so a prune past every sequence cannot lift a
+    /// later tag above deletes not yet written.
+    fn raise_pruned_floor(state: &mut State, cutoff: usize) {
+        let newest = state.index.iter().map(|&(d, _)| d).max().unwrap_or(0);
+        state.pruned_floor = state.pruned_floor.max(cutoff.min(newest));
     }
     fn stage(state: &mut State, changes: Vec<Change>) {
         // object_native.rs::commit/buffer: catalog-live before durable publication.
@@ -549,14 +586,16 @@ impl Model for Protocol {
             capture: None,
             seals: 0,
             checkpoints: 0,
-            baked: false,
+            bakes: 0,
+            pruned_floor: 0,
+            floor_raised_tag: false,
             rewrite: None,
-            rewrite_used: false,
-            rewritten: false,
+            rewrites: 0,
+            rewrites_committed: 0,
             rewrite_interleaved: false,
             rewrite_preserved: false,
             crashed: false,
-            crash_used: false,
+            crashes: 0,
             replay: None,
             flushed_checkpoint: false,
             crashed_stage: false,
@@ -584,14 +623,14 @@ impl Model for Protocol {
         }
         // A table flush is idempotent, including after an early publication.
         actions.push(Action::Flush);
-        if !state.crash_used {
+        if state.crashes < self.repeats() {
             actions.push(Action::Crash);
         }
         if state.rewrite.is_some() {
             actions.push(Action::FullRewrite);
         }
         if state.rewrite.is_none()
-            && !state.rewrite_used
+            && state.rewrites < self.repeats()
             && state.capture.is_none()
             && state.replay.is_none()
             && state.tier.is_empty()
@@ -621,7 +660,10 @@ impl Model for Protocol {
             if state.checkpoints < 2 && !state.tier.is_empty() {
                 actions.push(Action::CkCapture);
             }
-            if !state.baked && state.rewrite.is_none() && can_bake(state) {
+            if state.bakes < BAKE_BUDGET
+                && state.rewrite.is_none()
+                && can_bake(state, self.floor(state))
+            {
                 actions.push(Action::Bake);
             }
         }
@@ -778,7 +820,7 @@ impl Model for Protocol {
                 Self::flush(&mut next);
             }
             Action::Bake => {
-                next.baked = true;
+                next.bakes += 1;
                 // table.rs::bake_clean_prefix_holds checks PHYSICAL current-file
                 // ranges, even when deletions hide every row of those files.
                 let durable_max = next.index.iter().map(|&(d, _)| d).max()?;
@@ -786,7 +828,12 @@ impl Model for Protocol {
                     .into_iter()
                     .filter_map(|(d, _)| (d > 0).then_some(d))
                     .min();
-                let fence = pending_min.map_or(durable_max, |d| durable_max.min(d - 1));
+                // table.rs::protected_merge_delete_fence: the index max raised to
+                // the newest delete a prune dropped from it, whose vector stays in
+                // the catalog, then capped below a pending delete (#16706).
+                let floor = self.floor(&next);
+                let uncapped = durable_max.max(floor);
+                let fence = pending_min.map_or(uncapped, |d| uncapped.min(d - 1));
                 // table.rs::bake_seq_prefix_protected_snapshots_inner: T is the
                 // highest data sequence of the baked inputs. The clean-prefix gate
                 // is judged at T, and the prune is capped at both T and the delete
@@ -816,17 +863,19 @@ impl Model for Protocol {
                         min_sequence: next.snapshots.iter().map(|s| s.min_sequence).min()?,
                         rows,
                     };
+                    next.floor_raised_tag |= fence > durable_max;
                     Self::stage(&mut next, vec![Change::Bake(snapshot.clone())]);
                     Self::flush(&mut next);
                     next.snapshots = vec![snapshot];
                     for (key, entry) in next.index.iter().enumerate() {
                         next.pruned[key] |= entry.0 > 0 && entry.0 <= cutoff;
                     }
+                    Self::raise_pruned_floor(&mut next, cutoff);
                     prune_index(&mut next.index, cutoff);
                 }
             }
             Action::FullRewriteCapture => {
-                next.rewrite_used = true;
+                next.rewrites += 1;
                 let min_sequence = next
                     .snapshots
                     .iter()
@@ -854,9 +903,10 @@ impl Model for Protocol {
                 next.rewrite_preserved |=
                     next.snapshots.iter().any(|s| !rewrite.folded.contains(s));
                 next.snapshots.retain(|s| !rewrite.folded.contains(s));
+                Self::raise_pruned_floor(&mut next, rewrite.cutoff);
                 prune_index(&mut next.index, rewrite.cutoff);
                 next.pk_cache = None;
-                next.rewritten = true;
+                next.rewrites_committed += 1;
             }
             Action::Crash => {
                 next.crashed_stage |= state
@@ -864,7 +914,8 @@ impl Model for Protocol {
                     .as_ref()
                     .is_some_and(|c| c.checkpoint && c.phase == 3);
                 next.crashed = true;
-                next.crash_used = true;
+                next.crashes += 1;
+                next.pruned_floor = 0;
                 next.pending.clear();
                 next.tier.clear();
                 next.capture = None;
@@ -936,8 +987,12 @@ impl Model for Protocol {
             format!("seals {}, checkpoints {}", s.seals, s.checkpoints),
             crate::explorer::flags(&[
                 ("crashed", s.crashed),
-                ("baked", s.baked),
-                ("full rewrite committed", s.rewritten),
+                ("baked", s.bakes > 0),
+                (
+                    "bake tag raised to the pruned-delete floor",
+                    s.floor_raised_tag,
+                ),
+                ("full rewrite committed", s.rewrites_committed > 0),
                 ("rewrite interleaved with apply", s.rewrite_interleaved),
                 (
                     "rewrite kept a later protected snapshot",
@@ -1166,9 +1221,19 @@ impl Model for Protocol {
             Property::sometimes("bake prunes then reinsert checkpoints", |_, s: &State| {
                 s.checkpointed_reinsert
             }),
-            Property::sometimes("full rewrite committed", |_, s: &State| s.rewritten),
+            Property::sometimes(
+                "bake tag raised to the pruned-delete floor",
+                |_, s: &State| s.floor_raised_tag,
+            ),
+            Property::sometimes("second crash", |_, s: &State| s.crashes >= 2),
+            Property::sometimes("second full rewrite committed", |_, s: &State| {
+                s.rewrites_committed >= 2
+            }),
+            Property::sometimes("full rewrite committed", |_, s: &State| {
+                s.rewrites_committed > 0
+            }),
             Property::sometimes("full rewrite interleaves apply", |_, s: &State| {
-                s.rewritten && s.rewrite_interleaved
+                s.rewrites_committed > 0 && s.rewrite_interleaved
             }),
             Property::sometimes(
                 "full rewrite retains later protected snapshot",
@@ -1458,11 +1523,11 @@ pub(crate) fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<
             recovered_rows_plus_pending: Protocol::recovered_rows(&early),
             sequence_high_water: state.high,
             bake_enabled: !state.crashed
-                && !state.baked
+                && state.bakes < BAKE_BUDGET
                 && state.capture.is_none()
                 && state.rewrite.is_none()
                 && state.replay.is_none()
-                && can_bake(&state),
+                && can_bake(&state, protocol.floor(&state)),
             durable_current_rows: durable.current.iter().map(|r| (r.key, r.value)).collect(),
             durable_protected_rows: durable
                 .snapshots
