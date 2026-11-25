@@ -267,6 +267,8 @@ mod ticket_proxy {
     pub(super) struct Counts {
         pub(super) parameterized: AtomicUsize,
         pub(super) plain: AtomicUsize,
+        /// `GetSqlInfo` requests: the sidecar's capability probes.
+        pub(super) probes: AtomicUsize,
         mode: AtomicU8,
     }
 
@@ -385,6 +387,11 @@ mod ticket_proxy {
             request: Request<FlightDescriptor>,
         ) -> Result<Response<FlightInfo>, Status> {
             let mut request = forward(request);
+            if let Ok(any) = Any::decode(request.get_ref().cmd.clone())
+                && let Ok(Some(_)) = any.unpack::<CommandGetSqlInfo>()
+            {
+                self.counts.probes.fetch_add(1, Ordering::SeqCst);
+            }
             // An old upstream does not know code 10,000; the ticket the
             // upstream answers with carries the rewritten command.
             if self.counts.mode() == Mode::Old
@@ -723,6 +730,43 @@ async fn sidecar_probes_an_upgraded_upstream_again() -> anyhow::Result<()> {
             Ok(())
         })
         .await
+}
+
+/// One upstream is probed once for all lookups, whatever trace each carries:
+/// a lookup's trace headers say which request it is, not which upstream, so
+/// they must not split the probe's answer.
+#[tokio::test]
+async fn differently_traced_lookups_share_one_probe() -> anyhow::Result<()> {
+    use runtime_request_context::{Protocol, RequestContext};
+    use ticket_proxy::Mode;
+    let (upstream, input) = lookup_upstream().await?;
+    let (endpoint, counts) = ticket_proxy::start(&upstream, Mode::Current).await?;
+    let (sidecar, oracle) = test_request_context()
+        .scope(lookup_sidecar(&[("lookups", &endpoint)], &input))
+        .await?;
+    let probes_before = counts.probes.load(std::sync::atomic::Ordering::SeqCst);
+    for id in 1..=8_i64 {
+        let traced = Arc::new(
+            RequestContext::builder(Protocol::Internal)
+                .with_client_trace_id(Some(format!("{id:032x}").into()))
+                .build(),
+        );
+        traced
+            .scope(assert_lookup(
+                &sidecar,
+                &oracle,
+                &format!("SELECT label FROM lookups WHERE id = {id}"),
+            ))
+            .await?;
+    }
+    assert_eq!(counts.get(), (8, 0), "every lookup is sent parameterized");
+    assert_eq!(
+        counts.probes.load(std::sync::atomic::Ordering::SeqCst) - probes_before,
+        1,
+        "one probe answers every lookup to the same upstream"
+    );
+    sidecar.shutdown().await;
+    Ok(())
 }
 
 /// Two plans that read the same table name, with the same schema, from two

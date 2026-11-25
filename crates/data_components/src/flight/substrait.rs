@@ -1063,6 +1063,11 @@ impl ExecutionPlan for SubstraitExec {
                 "SubstraitExec has one partition".into(),
             ));
         }
+        // The capability probe is shared by every query to this upstream, so it
+        // is asked with the connector's own client: the trace headers added
+        // below name one request, and would give each traced request a probe
+        // of its own.
+        let probe_client = self.client.clone();
         let mut client = self.client.clone();
         let deadline = context
             .session_config()
@@ -1108,7 +1113,7 @@ impl ExecutionPlan for SubstraitExec {
             let plan = match parameters {
                 None => plan,
                 Some(parameters) => {
-                    if takes_parameterized_plans(&client).await {
+                    if takes_parameterized_plans(&probe_client).await {
                         match client
                             .query_substrait_parameterized(
                                 plan,
