@@ -50,7 +50,7 @@ use std::{
 };
 
 use arrow::datatypes::{DataType, Field};
-use data_components::flight::{SubstraitTemplate, spice_substrait_context};
+use data_components::flight::{SpiceSubstraitRead, SubstraitTemplate, spice_substrait_read};
 use datafusion::{
     common::{
         DFSchema, Result, ScalarValue,
@@ -67,17 +67,22 @@ use runtime_request_context::{CacheNamespace, RequestContext};
 
 use super::{DataFusion, PlansGeneration};
 
-/// How many query shapes keep a planned template. Each holds a logical plan
-/// and its encoded Substrait.
-const MAX_TEMPLATES: u64 = 1024;
+/// The approximate bytes the templates may hold: the plans cache's entry
+/// budget at 128 KiB a shape. The plans cache bounds entries, not bytes; a
+/// template also holds its Substrait and a physical plan, so it is bounded by
+/// its weight instead (see [`Entry::weight`]), and expires as a cached plan
+/// does.
+const MAX_TEMPLATE_BYTES: u64 =
+    crate::init::caching::DEFAULT_CACHED_PLANS_MAX_CAPACITY * 128 * 1024;
 
 pub(crate) struct FederatedTemplates {
     cache: moka::sync::Cache<u64, Arc<Entry>>,
     planned: AtomicU64,
     reused: AtomicU64,
+    declined: AtomicU64,
 }
 
-/// How often a template was planned, and how often an existing one was bound.
+/// How the template cache answered requests whose query shape it considers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FederatedTemplateStats {
     /// Requests that planned their query shape (a template, or a shape found
@@ -85,23 +90,50 @@ pub struct FederatedTemplateStats {
     pub planned: u64,
     /// Requests that bound their values to a template planned earlier.
     pub reused: u64,
+    /// Requests whose shape was found earlier not to federate as a template,
+    /// and were planned as before.
+    pub declined: u64,
 }
 
 struct Entry {
     template: LogicalPlan,
+    /// The upstream table each scan of `template` reads, in traversal order.
+    /// `TableScan` equality ignores the provider, so two plans over the same
+    /// table name from different upstreams, or as different principals, are
+    /// told apart only by this.
+    reads: Vec<SpiceSubstraitRead>,
     namespace: CacheNamespace,
     generation: u64,
     /// `None` when the template's physical plan is not a single parameterized
     /// Substrait leaf, so requests of this shape are planned as before.
     physical: Option<SubstraitTemplate>,
+    weight: u32,
+}
+
+impl Entry {
+    /// An estimate of the bytes the entry holds: its encoded Substrait, twice
+    /// its logical plan's printed length (the template here and the optimized
+    /// plan the Substrait leaf keeps for an upstream without parameterized
+    /// plans), and 4 KiB for the physical plan and bookkeeping. A rough
+    /// measure: it bounds the cache's growth, not its exact footprint.
+    fn weight(template: &LogicalPlan, physical: Option<&SubstraitTemplate>) -> u32 {
+        let printed = template.display_indent().to_string().len();
+        let encoded = physical.map_or(0, SubstraitTemplate::encoded_len);
+        u32::try_from(4096 + 2 * printed + encoded).unwrap_or(u32::MAX)
+    }
 }
 
 impl Default for FederatedTemplates {
     fn default() -> Self {
         Self {
-            cache: moka::sync::Cache::new(MAX_TEMPLATES),
+            cache: moka::sync::Cache::builder()
+                .weigher(|_key, entry: &Arc<Entry>| entry.weight)
+                .max_capacity(MAX_TEMPLATE_BYTES)
+                .time_to_live(crate::init::caching::CACHED_PLANS_TTL)
+                .build(),
             planned: AtomicU64::new(0),
             reused: AtomicU64::new(0),
+            declined: AtomicU64::new(0),
         }
     }
 }
@@ -115,6 +147,7 @@ impl FederatedTemplates {
         FederatedTemplateStats {
             planned: self.planned.load(Ordering::Relaxed),
             reused: self.reused.load(Ordering::Relaxed),
+            declined: self.declined.load(Ordering::Relaxed),
         }
     }
 }
@@ -142,9 +175,7 @@ impl DataFusion {
         if super::query::owned_flight_session(request_context).is_some() {
             return None;
         }
-        if !reads_one_upstream(plan) {
-            return None;
-        }
+        let reads = upstream_reads(plan)?;
         let (template, values) = match parameterize(plan) {
             Ok(Some(parameterized)) => parameterized,
             Ok(None) => return None,
@@ -162,19 +193,20 @@ impl DataFusion {
         let key = {
             let mut hasher = std::hash::DefaultHasher::new();
             namespace.hash(&mut hasher);
+            reads.hash(&mut hasher);
             template.hash(&mut hasher);
             hasher.finish()
         };
 
         let templates = &self.federated_templates;
-        let physical = match templates.cache.get(&key) {
+        let (physical, cached) = match templates.cache.get(&key) {
             Some(entry)
                 if entry.generation == generation
                     && entry.namespace == namespace
+                    && entry.reads == reads
                     && entry.template == template =>
             {
-                templates.reused.fetch_add(1, Ordering::Relaxed);
-                entry.physical.clone()?
+                (entry.physical.clone(), true)
             }
             _ => {
                 templates.planned.fetch_add(1, Ordering::Relaxed);
@@ -183,22 +215,36 @@ impl DataFusion {
                 // copied before a clear may hold a definition the clear retired.
                 let current = self.plans_generation.read().await;
                 if *current == generation {
+                    let weight = Entry::weight(&template, physical.as_ref());
                     templates.cache.insert(
                         key,
                         Arc::new(Entry {
                             template,
+                            reads,
                             namespace,
                             generation,
                             physical: physical.clone(),
+                            weight,
                         }),
                     );
                 }
-                physical?
+                (physical, false)
             }
+        };
+        let Some(physical) = physical else {
+            if cached {
+                templates.declined.fetch_add(1, Ordering::Relaxed);
+            }
+            return None;
         };
 
         match physical.bind(&values, session) {
-            Ok(bound) => Some(bound),
+            Ok(bound) => {
+                if cached {
+                    templates.reused.fetch_add(1, Ordering::Relaxed);
+                }
+                Some(bound)
+            }
             Err(error) => {
                 tracing::debug!(%error, "Unable to bind a federated query's values");
                 None
@@ -233,22 +279,22 @@ async fn plan_template(
     (physical.schema().fields() == plan.schema().as_arrow().fields()).then_some(substrait)
 }
 
-/// Whether every table `plan` reads, at least one, is federated through
-/// Substrait to the same upstream, and `plan` is a query whose planning does
-/// not depend on when it is planned.
-fn reads_one_upstream(plan: &LogicalPlan) -> bool {
-    let mut context: Option<String> = None;
+/// The upstream table each scan of `plan` reads, in traversal order, when
+/// every table it reads, at least one, is federated through Substrait to the
+/// same upstream as the same principal, and `plan` is a query whose planning
+/// does not depend on when it is planned.
+fn upstream_reads(plan: &LogicalPlan) -> Option<Vec<SpiceSubstraitRead>> {
+    let mut reads: Vec<SpiceSubstraitRead> = Vec::new();
     let mut eligible = true;
     let walk = plan.apply_with_subqueries(|node| {
         let ok = match node {
-            LogicalPlan::TableScan(scan) => match spice_substrait_context(&scan.source) {
-                Some(scan_context) => {
-                    if let Some(existing) = &context {
-                        *existing == scan_context
-                    } else {
-                        context = Some(scan_context);
-                        true
-                    }
+            LogicalPlan::TableScan(scan) => match spice_substrait_read(&scan.source) {
+                Some(read) => {
+                    let same_upstream = reads
+                        .first()
+                        .is_none_or(|first| first.context == read.context);
+                    reads.push(read);
+                    same_upstream
                 }
                 None => false,
             },
@@ -269,7 +315,7 @@ fn reads_one_upstream(plan: &LogicalPlan) -> bool {
             TreeNodeRecursion::Stop
         })
     });
-    walk.is_ok() && eligible && context.is_some()
+    (walk.is_ok() && eligible && !reads.is_empty()).then_some(reads)
 }
 
 /// Whether every function in `node`'s expressions returns the same result for

@@ -594,23 +594,24 @@ impl PlanParameters {
 }
 
 /// How long a probe's finding that an upstream does or does not take
-/// parameterized plans stands, and how long a failed probe (an unreachable
-/// upstream, a refused credential) stands before the next query asks again.
+/// parameterized plans stands, how long a failed probe (an unreachable
+/// upstream, a refused or stalled credential exchange) stands before the next
+/// query asks again, and how long a probe may take before it counts as failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParameterizedProbeIntervals {
     pub answered: Duration,
     pub failed: Duration,
+    pub timeout: Duration,
 }
 
 /// Ten minutes: an upstream upgraded in place, or rolled back, is sent the
-/// plans it takes within that long. A failed probe is retried after 30 seconds.
+/// plans it takes within that long. A failed probe is retried after 30
+/// seconds. A probe, its authentication included, may take 10 seconds.
 const DEFAULT_PROBE_INTERVALS: ParameterizedProbeIntervals = ParameterizedProbeIntervals {
     answered: Duration::from_secs(600),
     failed: Duration::from_secs(30),
+    timeout: Duration::from_secs(10),
 };
-
-/// How long a probe may take; one that takes longer counts as failed.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 static PROBE_INTERVALS: std::sync::RwLock<ParameterizedProbeIntervals> =
     std::sync::RwLock::new(DEFAULT_PROBE_INTERVALS);
@@ -637,7 +638,7 @@ struct CapabilityExpiry;
 impl moka::Expiry<String, UpstreamCapability> for CapabilityExpiry {
     fn expire_after_create(
         &self,
-        _url: &String,
+        _upstream: &String,
         capability: &UpstreamCapability,
         _created_at: std::time::Instant,
     ) -> Option<Duration> {
@@ -645,10 +646,12 @@ impl moka::Expiry<String, UpstreamCapability> for CapabilityExpiry {
     }
 }
 
-/// Whether each upstream, by URL, takes parameterized plans, as its
-/// `GetSqlInfo` answered. Probed on the first parameterized plan for an
-/// upstream, once however many queries arrive together, and again once the
-/// finding expires.
+/// Whether each upstream takes parameterized plans, as its `GetSqlInfo`
+/// answered, keyed by federation context: the endpoint with the credentials,
+/// metadata and client certificate it is reached with, so one principal's
+/// failed or stalled authentication never decides another's. Probed on the
+/// first parameterized plan for an upstream, once however many queries arrive
+/// together, and again once the finding expires.
 static UPSTREAM_CAPABILITIES: std::sync::LazyLock<moka::future::Cache<String, UpstreamCapability>> =
     std::sync::LazyLock::new(|| {
         moka::future::Cache::builder()
@@ -668,7 +671,16 @@ async fn takes_parameterized_plans(client: &FlightClient) -> bool {
             arrow_flight::sql::SqlInfo::FlightSqlServerName as u32,
             SQL_INFO_PARAMETERIZED_SUBSTRAIT,
         ];
-        match client.get_sql_info(&info, Some(PROBE_TIMEOUT)).await {
+        // The whole probe is bounded, the handshake that authenticates it
+        // included: a stalled handshake is a failed probe.
+        let answer = tokio::time::timeout(intervals.timeout, client.get_sql_info(&info, None))
+            .await
+            .unwrap_or_else(|_| {
+                Err(flight_client::Error::UnableToQuery {
+                    source: format!("no answer within {:?}", intervals.timeout).into(),
+                })
+            });
+        match answer {
             Ok(values) => UpstreamCapability {
                 parameterized: advertises_parameterized_plans(&values),
                 stands_for: intervals.answered,
@@ -686,9 +698,15 @@ async fn takes_parameterized_plans(client: &FlightClient) -> bool {
         }
     };
     UPSTREAM_CAPABILITIES
-        .get_with(client.url().to_string(), probe)
+        .get_with(client.federation_context(), probe)
         .await
         .parameterized
+}
+
+/// [`takes_parameterized_plans`], for tests that probe an upstream directly.
+#[doc(hidden)]
+pub async fn probe_takes_parameterized_plans_for_tests(client: &FlightClient) -> bool {
+    takes_parameterized_plans(client).await
 }
 
 /// Whether a `GetSqlInfo` answer advertises the parameterized Substrait
@@ -788,6 +806,12 @@ impl SubstraitTemplate {
             .map(|(anchor, data_type)| (*anchor as usize + 1, data_type))
     }
 
+    /// The size of the template's encoded Substrait plan, in bytes.
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        self.leaf.plan.len()
+    }
+
     /// The template's plan with `values` bound: `values[N - 1]` is the value
     /// of `$N`. Values for parameters the template does not hold are ignored.
     ///
@@ -859,19 +883,36 @@ impl SubstraitTemplate {
     }
 }
 
-/// The federation context of `source` when it is a table this runtime reads
-/// from an upstream Spice runtime through Substrait plans: tables with the same
-/// context are read from the same upstream, as the same principal.
+/// Which upstream table a scan reads through Substrait plans.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SpiceSubstraitRead {
+    /// The federation context: the upstream endpoint, the credentials and
+    /// metadata it is read with, and its client certificate identity. Reads
+    /// with the same context reach the same upstream as the same principal.
+    pub context: String,
+    /// The upstream's name for the table.
+    pub table: String,
+}
+
+/// The upstream table `source` reads, when it is a table this runtime reads
+/// from an upstream Spice runtime through Substrait plans.
 #[must_use]
-pub fn spice_substrait_context(
+pub fn spice_substrait_read(
     source: &Arc<dyn datafusion::logical_expr::TableSource>,
-) -> Option<String> {
-    let provider = get_table_source(source).ok()??.federation_provider();
-    if provider.name() == "spice_substrait" {
-        provider.compute_context()
-    } else {
-        None
+) -> Option<SpiceSubstraitRead> {
+    let federated = get_table_source(source).ok()??;
+    let provider = federated.federation_provider();
+    if provider.name() != "spice_substrait" {
+        return None;
     }
+    let table = (federated.as_ref() as &dyn std::any::Any)
+        .downcast_ref::<SQLTableSource>()?
+        .table_reference()
+        .to_string();
+    Some(SpiceSubstraitRead {
+        context: provider.compute_context()?,
+        table,
+    })
 }
 
 impl SubstraitExec {

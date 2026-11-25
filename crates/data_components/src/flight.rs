@@ -59,8 +59,9 @@ mod substrait;
 pub mod substrait_parameters;
 
 pub use substrait::{
-    ParameterizedProbeIntervals, SubstraitTemplate, parameterized_plans_refused,
-    set_parameterized_probe_intervals_for_tests, spice_substrait_context,
+    ParameterizedProbeIntervals, SpiceSubstraitRead, SubstraitTemplate,
+    parameterized_plans_refused, probe_takes_parameterized_plans_for_tests,
+    set_parameterized_probe_intervals_for_tests, spice_substrait_read,
 };
 
 pub use delegated_search::{

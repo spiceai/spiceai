@@ -259,6 +259,8 @@ mod ticket_proxy {
         /// rolling upgrade can when the probe reaches a new runtime and the
         /// query an old one.
         AdvertisesButRefuses = 2,
+        /// Accepts the credential exchange and never answers it.
+        StallHandshake = 3,
     }
 
     #[derive(Default)]
@@ -277,7 +279,8 @@ mod ticket_proxy {
             match self.mode.load(Ordering::SeqCst) {
                 0 => Mode::Current,
                 1 => Mode::Old,
-                _ => Mode::AdvertisesButRefuses,
+                2 => Mode::AdvertisesButRefuses,
+                _ => Mode::StallHandshake,
             }
         }
     }
@@ -353,6 +356,9 @@ mod ticket_proxy {
             &self,
             request: Request<Streaming<HandshakeRequest>>,
         ) -> Result<Response<Self::HandshakeStream>, Status> {
+            if self.counts.mode() == Mode::StallHandshake {
+                std::future::pending::<()>().await;
+            }
             let (metadata, _, stream) = request.into_parts();
             // The client sends one handshake message; forward what arrives.
             let messages: Vec<HandshakeRequest> = stream
@@ -467,6 +473,11 @@ mod ticket_proxy {
 
 /// An upstream serving `remote_lookups`, and the rows it holds.
 async fn lookup_upstream() -> anyhow::Result<(String, RecordBatch)> {
+    lookup_upstream_labelled(["雪", "", "", "x"]).await
+}
+
+/// [`lookup_upstream`] with the labels of ids 1 to 4 (id 3's is NULL).
+async fn lookup_upstream_labelled(labels: [&str; 4]) -> anyhow::Result<(String, RecordBatch)> {
     let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str(API_KEY)]))
         as Arc<dyn FlightBasicAuth + Send + Sync>;
     let (_channel, upstream, metrics_port) =
@@ -479,10 +490,10 @@ async fn lookup_upstream() -> anyhow::Result<(String, RecordBatch)> {
         (
             "label",
             Arc::new(StringArray::from(vec![
-                Some("雪"),
-                Some(""),
+                Some(labels[0]),
+                Some(labels[1]),
                 None,
-                Some("x"),
+                Some(labels[3]),
             ])),
         ),
         (
@@ -636,6 +647,27 @@ async fn sidecar_lookups_bind_their_values_to_one_planned_template() -> anyhow::
             assert_lookup(&sidecar, &oracle, sql).await?;
             assert_eq!(stats(), before, "{sql}");
 
+            // An IN subquery is evaluated in the sidecar, so the shape plans as a
+            // join of two Substrait leaves, not a template: it is planned once,
+            // declined from then on, and never counted as reused.
+            let before = stats();
+            for id in [1, 4] {
+                let sql = format!(
+                    "SELECT id FROM lookups WHERE id = {id} AND label IN (SELECT label FROM lookups WHERE active = true)"
+                );
+                assert_lookup(&sidecar, &oracle, &sql).await?;
+            }
+            let after = stats();
+            assert_eq!(
+                (
+                    after.planned - before.planned,
+                    after.reused - before.reused,
+                    after.declined - before.declined
+                ),
+                (1, 0, 1),
+                "a shape that is not a template"
+            );
+
             sidecar.shutdown().await;
             Ok(())
         })
@@ -656,6 +688,7 @@ async fn sidecar_probes_an_upgraded_upstream_again() -> anyhow::Result<()> {
                 data_components::flight::ParameterizedProbeIntervals {
                     answered: Duration::from_millis(300),
                     failed: Duration::from_millis(300),
+                    timeout: Duration::from_secs(10),
                 },
             );
             let (upstream, input) = lookup_upstream().await?;
@@ -685,6 +718,184 @@ async fn sidecar_probes_an_upgraded_upstream_again() -> anyhow::Result<()> {
                 .await?;
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
+
+            sidecar.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// Two plans that read the same table name, with the same schema, from two
+/// different upstreams are two query shapes: a template planned for the first
+/// upstream must never answer the second's lookup. Plans built from providers
+/// (`QueryBuilder::from_plan`) name the table alike whichever upstream it
+/// reads, and `TableScan` equality ignores the provider.
+#[tokio::test]
+async fn a_template_is_never_shared_between_upstreams() -> anyhow::Result<()> {
+    test_request_context()
+        .scope(async {
+            use datafusion::{
+                datasource::provider_as_source,
+                logical_expr::{LogicalPlanBuilder, col, lit},
+            };
+            let (first, _) = lookup_upstream_labelled(["a-one", "a-two", "", "a-four"]).await?;
+            let (second, _) = lookup_upstream_labelled(["b-one", "b-two", "", "b-four"]).await?;
+            let empty = RecordBatch::new_empty(Arc::new(arrow::datatypes::Schema::empty()));
+            let (sidecar, _) = lookup_sidecar(&[], &empty).await?;
+
+            let lookup = |endpoint: String, id: i64| {
+                let df = sidecar.datafusion();
+                async move {
+                    let credentials = Credentials::new("", SecretString::from(API_KEY));
+                    let client =
+                        FlightClient::try_new(endpoint.into(), credentials, None, None).await?;
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "the test connects to a real Spice runtime"
+                    )]
+                    let factory =
+                        FlightFactory::new("spice.ai", client, Arc::new(DefaultDialect {}))
+                            .with_substrait(true);
+                    let provider = factory
+                        .table_provider(TableReference::bare("remote_lookups"))
+                        .await
+                        .map_err(anyhow::Error::from_boxed)?;
+                    let plan =
+                        LogicalPlanBuilder::scan("lookups", provider_as_source(provider), None)?
+                            .filter(col("id").eq(lit(id)))?
+                            .project(vec![col("label")])?
+                            .build()?;
+                    let batches: Vec<RecordBatch> =
+                        QueryBuilder::from_plan(plan, format!("lookup {id}"), df)
+                            .build()
+                            .run()
+                            .await?
+                            .into_record_batch_stream()
+                            .try_collect()
+                            .await?;
+                    Ok::<_, anyhow::Error>(pretty_format_batches(&batches)?.to_string())
+                }
+            };
+            let label =
+                |label: &str| format!("+-------+\n| label |\n+-------+\n| {label} |\n+-------+");
+            assert_eq!(lookup(first, 1).await?, label("a-one"));
+            assert_eq!(lookup(second, 2).await?, label("b-two"));
+
+            sidecar.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// A probe is bounded as a whole: an upstream that accepts the credential
+/// exchange and never answers it is found not to take parameterized plans
+/// within the probe timeout, and asked again once the failed-probe interval
+/// passes.
+#[tokio::test]
+async fn a_probe_whose_handshake_stalls_fails_within_its_timeout() -> anyhow::Result<()> {
+    test_request_context().scope(a_stalled_probe()).await
+}
+
+async fn a_stalled_probe() -> anyhow::Result<()> {
+    use ticket_proxy::Mode;
+    let (upstream, _) = lookup_upstream().await?;
+    let (endpoint, counts) = ticket_proxy::start(&upstream, Mode::StallHandshake).await?;
+    data_components::flight::set_parameterized_probe_intervals_for_tests(
+        data_components::flight::ParameterizedProbeIntervals {
+            answered: Duration::from_millis(300),
+            failed: Duration::from_millis(300),
+            timeout: Duration::from_millis(500),
+        },
+    );
+    let credentials = Credentials::new("", SecretString::from(API_KEY));
+    let client = FlightClient::try_new(endpoint.into(), credentials, None, None).await?;
+
+    let probe = tokio::time::timeout(
+        Duration::from_secs(5),
+        data_components::flight::probe_takes_parameterized_plans_for_tests(&client),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the probe outlived its timeout"))?;
+    assert!(!probe, "a stalled probe is a failed one");
+
+    counts.set_mode(Mode::Current);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !data_components::flight::probe_takes_parameterized_plans_for_tests(&client).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a failed probe was never retried"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+/// Concurrent lookups bound to one cached template each return their own key's
+/// row: no execution shares another's values or node state.
+#[tokio::test]
+async fn concurrent_lookups_bound_to_one_template_keep_their_own_values() -> anyhow::Result<()> {
+    test_request_context()
+        .scope(async {
+            let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str(API_KEY)]))
+                as Arc<dyn FlightBasicAuth + Send + Sync>;
+            let (_channel, upstream, metrics_port) =
+                start_spice_test_app_with_metrics_port(Some(auth), None, None, None).await?;
+            let ids: Vec<i64> = (1..=64).collect();
+            let input = RecordBatch::try_from_iter(vec![
+                (
+                    "id",
+                    Arc::new(Int64Array::from(ids.clone())) as arrow::array::ArrayRef,
+                ),
+                (
+                    "label",
+                    Arc::new(StringArray::from(
+                        ids.iter()
+                            .map(|id| format!("label-{id}"))
+                            .collect::<Vec<_>>(),
+                    )),
+                ),
+            ])?;
+            upstream
+                .ctx
+                .register_batch("remote_lookups", input.clone())?;
+            let endpoint = format!("http://127.0.0.1:{}", metrics_port - 1);
+            let (sidecar, _) = lookup_sidecar(&[("lookups", &endpoint)], &input).await?;
+            let stats = || sidecar.datafusion().federated_template_stats();
+
+            let lookup = |id: i64| {
+                let sidecar = Arc::clone(&sidecar);
+                test_request_context().scope(async move {
+                    let batches = rows(
+                        &sidecar,
+                        &format!("SELECT label FROM lookups WHERE id = {id}"),
+                    )
+                    .await?;
+                    let mut labels = Vec::new();
+                    for batch in &batches {
+                        for row in 0..batch.num_rows() {
+                            labels.push(arrow::util::display::array_value_to_string(
+                                batch.column(0),
+                                row,
+                            )?);
+                        }
+                    }
+                    Ok::<_, anyhow::Error>((id, labels))
+                })
+            };
+            lookup(1).await?;
+            let before = stats();
+            let answers =
+                futures::future::try_join_all((2..=17).map(|id| tokio::spawn(lookup(id)))).await?;
+            for answer in answers {
+                let (id, labels) = answer?;
+                assert_eq!(labels, vec![format!("label-{id}")], "id {id}");
+            }
+            let after = stats();
+            assert_eq!(
+                (after.planned - before.planned, after.reused - before.reused),
+                (0, 16),
+                "every lookup bound the one template"
+            );
 
             sidecar.shutdown().await;
             Ok(())
