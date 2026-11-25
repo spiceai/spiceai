@@ -545,6 +545,15 @@ def check_reusable_secrets(workflows: dict[str, dict]) -> list[str]:
                     f"{where} passes secret `{secret}`, which {target} does not declare in "
                     "on.workflow_call.secrets"
                 )
+            # A role workflow gets each secret under its own name, so a role ARN cannot be fed
+            # another secret's value by a mapping nobody reads closely.
+            if target in role_workflows:
+                for secret in sorted(given & declared):
+                    if re.sub(r"\s+", "", str(passed[secret])) != f"${{{{secrets.{secret}}}}}":
+                        problems.append(
+                            f"{where} passes `{secret}: {passed[secret]}`; pass the secret of the same "
+                            f"name, `{secret}: ${{{{ secrets.{secret} }}}}`"
+                        )
     return problems
 
 

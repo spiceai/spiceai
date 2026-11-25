@@ -772,6 +772,13 @@ class CheckReusableSecretsTest(unittest.TestCase):
         self.assertEqual(len(problems), 2, problems)
         self.assertIn("is not declared `required: true`", problems[0])
 
+    def test_a_ci_role_workflow_gets_each_secret_under_its_own_name(self):
+        swapped = self.by_name()
+        swapped["CI_AWS_PULL_REQUEST_ROLE_ARN"] = "${{ secrets.CI_AWS_DYNAMODB_ROLE_ARN }}"
+        problems = self.problems({"x_aws.yml": self.role_workflow(), "x.yml": self.caller(secrets=swapped)})
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("passes `CI_AWS_PULL_REQUEST_ROLE_ARN: ${{ secrets.CI_AWS_DYNAMODB_ROLE_ARN }}`", problems[0])
+
     def test_a_ci_role_workflow_never_inherits_every_secret(self):
         problems = self.problems({"x_aws.yml": self.role_workflow(), "x.yml": self.caller(secrets="inherit")})
         self.assertEqual(len(problems), 1, problems)
