@@ -1,7 +1,11 @@
 name: Setup spiced
 description: 'composite action'
 
-# Downloads the most recent spiced build from MinIO, within the last 10 commits
+# Downloads the most recent spiced build from MinIO, within the last 10 commits. A build lives
+# where the ref that built it stores it (.github/actions/ci-store-prefix): trunk's builds at the
+# shared keys, another ref's, this release branch's included, under
+# `artifacts/untrusted/<repository id>/<ref>/`. So the place to read is the build's ref, never the
+# reader's: trunk's builds, and a `spiced_commit` on trunk, are read at trunk's keys from any ref.
 #
 # Requires the MinIO CLI to be installed and configured to use this action
 inputs:
@@ -15,6 +19,10 @@ inputs:
   with_odbc: # whether to download the ODBC-enabled binary
     description: 'download the ODBC-enabled spiced binary'
     required: false
+  token:
+    description: A token that can read this repository, to check whether `spiced_commit` is on trunk.
+    required: false
+    default: ${{ github.token }}
 outputs:
   spiced_commit:
     value: ${{ steps.output_spiced_commit.outputs.SPICED_COMMIT || steps.output_spiced_commit_windows.outputs.SPICED_COMMIT }}
@@ -50,11 +58,96 @@ runs:
         echo "arch=x86_64" >> $env:GITHUB_OUTPUT
         echo "ext=zip" >> $env:GITHUB_OUTPUT
 
+    # Which ref built the spiced to read, and so where it is stored: trunk for the latest build of
+    # trunk and for a `spiced_commit` on trunk; otherwise `ref`, or this run's own ref when `ref`
+    # is trunk. Outputs `ref` and `prefix` (empty for trunk).
+    - name: Locate spiced's build
+      id: locate
+      shell: bash
+      env:
+        REF: ${{ inputs.ref }}
+        INPUT_SPICED_COMMIT: ${{ inputs.spiced_commit }}
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        # Trunk's commit history (no trees or blobs), fetched into a scratch repository and never
+        # run. The token goes to git through GIT_CONFIG_*.
+        on_trunk() {
+          local git_dir server auth fetched=""
+          git_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/setup-spiced.XXXXXX")"
+          git init -q --bare "$git_dir"
+          server="${GITHUB_SERVER_URL:-https://github.com}"
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::$auth"
+          for attempt in 1 2 3; do
+            if GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$server/.extraheader" \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+              git --git-dir "$git_dir" fetch -q --no-tags --filter=tree:0 "$server/$GITHUB_REPOSITORY.git" \
+                '+refs/heads/trunk:refs/remotes/origin/trunk'; then
+              fetched=1
+              break
+            fi
+            [ "$attempt" = 3 ] || sleep 5
+          done
+          if [ -z "$fetched" ]; then
+            echo "::error::Could not fetch trunk to tell whether spiced_commit $1 is trunk's build. Re-run the job."
+            exit 1
+          fi
+          # GIT_NO_LAZY_FETCH keeps a commit trunk lacks missing, so: not on trunk.
+          GIT_NO_LAZY_FETCH=1 git --git-dir "$git_dir" merge-base --is-ancestor "$1" refs/remotes/origin/trunk 2>/dev/null
+        }
+        if [[ "$INPUT_SPICED_COMMIT" == *$'\n'* || "$INPUT_SPICED_COMMIT" == *$'\r'* ]]; then
+          echo "::error::setup-spiced: spiced_commit must not contain a newline"
+          exit 1
+        fi
+        # A bare branch name is that branch (`trunk`, `release/2.4`). A ref becomes part of a store
+        # key and of this step's outputs, so anything but a plain ref is refused.
+        plain_ref() {
+          [[ "$1" =~ ^refs/[A-Za-z0-9._/-]+$ ]] && [[ "$1" != *..* && "$1" != *//* && "$1" != */ ]]
+        }
+        case "$REF" in
+          refs/*) ;;
+          *) REF="refs/heads/$REF" ;;
+        esac
+        if ! plain_ref "$REF"; then
+          echo "::error::setup-spiced: ref '$REF' is not a plain ref."
+          exit 1
+        fi
+        if [ -z "$INPUT_SPICED_COMMIT" ]; then
+          source_ref="$REF"
+        elif [[ "$INPUT_SPICED_COMMIT" =~ ^[0-9a-f]{40}$ ]] && on_trunk "$INPUT_SPICED_COMMIT"; then
+          source_ref=refs/heads/trunk
+        elif [ "$REF" != refs/heads/trunk ]; then
+          source_ref="$REF"
+        else
+          source_ref="$GITHUB_REF"
+        fi
+        if ! plain_ref "$source_ref"; then
+          echo "::error::setup-spiced: '$source_ref' is not a plain ref."
+          exit 1
+        fi
+        case "$source_ref" in
+          refs/heads/trunk) prefix='' ;;
+          *)
+            if ! [[ "${GITHUB_REPOSITORY_ID:-}" =~ ^[0-9]+$ ]]; then
+              echo "::error::GITHUB_REPOSITORY_ID is '${GITHUB_REPOSITORY_ID:-}', not a repository id."
+              exit 1
+            fi
+            prefix="untrusted/${GITHUB_REPOSITORY_ID}/${source_ref}/"
+            ;;
+        esac
+        {
+          echo "ref=$REF"
+          echo "prefix=$prefix"
+        } >> "$GITHUB_OUTPUT"
+        echo "Reading the spiced that $source_ref built, at artifacts/${prefix}spiced/."
+
     - name: Find the latest built spiced commit (Linux/macOS)
       if: ${{ !inputs.spiced_commit && runner.os != 'Windows' }}
       shell: bash
       env:
-        REF: ${{ inputs.ref }}
+        REF: ${{ steps.locate.outputs.ref }}
+        SOURCE_PREFIX: ${{ steps.locate.outputs.prefix }}
       run: |
         git fetch --depth=10 origin -- "$REF"
         echo "Fetching latest 10 commits from $REF"
@@ -72,7 +165,7 @@ runs:
 
         for hash in "${commit_hashes[@]}"; do
           echo "Checking $hash in MinIO for $PLATFORM"
-          if mc stat spice-minio/artifacts/spiced/${{ steps.platform.outputs.os }}-${{ steps.platform.outputs.arch }}/$hash/spiced_${features}${PLATFORM}.${EXT}; then
+          if mc stat "spice-minio/artifacts/${SOURCE_PREFIX}spiced/${{ steps.platform.outputs.os }}-${{ steps.platform.outputs.arch }}/$hash/spiced_${features}${PLATFORM}.${EXT}"; then
             echo "Found $hash in MinIO"
             echo "SPICED_COMMIT=$hash" >> $GITHUB_ENV
             exit 0
@@ -86,7 +179,8 @@ runs:
       if: ${{ !inputs.spiced_commit && runner.os == 'Windows' }}
       shell: pwsh
       env:
-        REF: ${{ inputs.ref }}
+        REF: ${{ steps.locate.outputs.ref }}
+        SOURCE_PREFIX: ${{ steps.locate.outputs.prefix }}
       run: |
         $ErrorActionPreference = 'Stop'
         git fetch --depth=10 origin -- "$env:REF"
@@ -105,7 +199,7 @@ runs:
 
         foreach ($hash in $commitHashes) {
           Write-Host "Checking $hash in MinIO for $platform"
-          $statOutput = mc stat "spice-minio/artifacts/spiced/$platform/$hash/spiced_${features}${platform}.${ext}" 2>&1
+          $statOutput = mc stat "spice-minio/artifacts/$($env:SOURCE_PREFIX)spiced/$platform/$hash/spiced_${features}${platform}.${ext}" 2>&1
           if ($LASTEXITCODE -eq 0) {
             Write-Host "Found $hash in MinIO"
             echo "SPICED_COMMIT=$hash" >> $env:GITHUB_ENV
@@ -148,6 +242,8 @@ runs:
     - name: Download spiced from MinIO (Linux/macOS)
       if: runner.os != 'Windows'
       shell: bash
+      env:
+        SOURCE_PREFIX: ${{ steps.locate.outputs.prefix }}
       run: |
         if [[ "${{ inputs.with_odbc }}" == "true" ]]; then
           features="odbc_"
@@ -156,13 +252,15 @@ runs:
         fi
         PLATFORM="${{ steps.platform.outputs.os }}_${{ steps.platform.outputs.arch }}"
         EXT="${{ steps.platform.outputs.ext }}"
-        mc cp "spice-minio/artifacts/spiced/${{ steps.platform.outputs.os }}-${{ steps.platform.outputs.arch }}/$SPICED_COMMIT/spiced_${features}${PLATFORM}.${EXT}" spiced_${features}${PLATFORM}.${EXT}
+        mc cp "spice-minio/artifacts/${SOURCE_PREFIX}spiced/${{ steps.platform.outputs.os }}-${{ steps.platform.outputs.arch }}/$SPICED_COMMIT/spiced_${features}${PLATFORM}.${EXT}" spiced_${features}${PLATFORM}.${EXT}
         tar -xzf spiced_${features}${PLATFORM}.${EXT}
         sudo cp ./spiced /usr/local/bin/spiced
 
     - name: Download spiced from MinIO (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
+      env:
+        SOURCE_PREFIX: ${{ steps.locate.outputs.prefix }}
       run: |
         $ErrorActionPreference = 'Stop'
         if ("${{ inputs.with_odbc }}" -eq "true") {
@@ -173,7 +271,7 @@ runs:
         $platform = "${{ steps.platform-windows.outputs.os }}-${{ steps.platform-windows.outputs.arch }}"
         $ext = "${{ steps.platform-windows.outputs.ext }}"
         $artifact = "spiced_${features}${platform}.${ext}"
-        mc cp "spice-minio/artifacts/spiced/$platform/$env:SPICED_COMMIT/$artifact" $artifact
+        mc cp "spice-minio/artifacts/$($env:SOURCE_PREFIX)spiced/$platform/$env:SPICED_COMMIT/$artifact" $artifact
         Expand-Archive -Path $artifact -DestinationPath . -Force
         $spicedDir = "$env:USERPROFILE\spiced"
         New-Item -ItemType Directory -Force -Path $spicedDir | Out-Null
