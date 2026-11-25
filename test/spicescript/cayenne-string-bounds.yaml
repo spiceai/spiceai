@@ -1,0 +1,55 @@
+name: cayenne-string-bounds
+duration: 5s
+description: >
+  MIN and MAX of strings longer than the 64 bytes a Vortex file keeps of a
+  string column's bounds answer with the whole value, right after the load and
+  after a restart. The file records those bounds cut and inexact. Cayenne
+  persists each file's statistics the first time it scans the file and reads
+  them back after a restart; they must come back inexact, or the restarted
+  runtime answers MIN and MAX from the cut bounds. Federated, the same queries
+  check that the oracle and Spice agree without the acceleration.
+
+sources:
+  src: { kind: postgres }
+
+# Inline storage is off, so the rows reach a data file rather than being held in
+# the metastore, and every answer comes from a Vortex file or its statistics.
+variants:
+  cayenne:
+    datasets:
+      '*': { acceleration: { enabled: true, engine: cayenne, mode: file, params: { cayenne_inline_max_rows: '0' } } }
+  federated: {}
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-string-bounds
+  datasets:
+    - { from: 'postgres:public.w', name: w, params: '${sources.src.params}' }
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  # The lowest and highest values run past the 64-byte bound, and differ from
+  # their cut prefixes only after it. A NULL leaves the bounds unchanged.
+  - source-exec:
+      src: |
+        CREATE TABLE w (id int PRIMARY KEY, s text);
+        INSERT INTO w VALUES
+          (1, 'a' || repeat('b', 120)),
+          (2, 'm'),
+          (3, 'z' || repeat('y', 120)),
+          (4, NULL);
+  - start: {}
+  - query: SELECT min(s) AS lo, max(s) AS hi, count(s) AS n, count(*) AS total FROM w
+  - query: SELECT length(min(s)) AS lo_len, length(max(s)) AS hi_len FROM w
+
+  # With no refresh schedule the restart keeps the acceleration's files, so the
+  # restarted runtime reads their statistics back from what it persisted.
+  - restart: {}
+  - query: SELECT min(s) AS lo, max(s) AS hi, count(s) AS n, count(*) AS total FROM w
+  - query: SELECT length(min(s)) AS lo_len, length(max(s)) AS hi_len FROM w

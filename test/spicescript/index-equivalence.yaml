@@ -9,6 +9,8 @@ description: >
 
 sources:
   src: { kind: postgres }
+  # The state location of the object-native-s3 variants.
+  lake: { kind: rustfs }
 
 matrix:
   refresh_mode: [full, changes]
@@ -19,6 +21,22 @@ variants:
     datasets: { orders: { acceleration: { indexes: { o_custkey: enabled } } } }
   # The spicepod as written, with the prototype object-native Cayenne metastore.
   object-native: object-native
+  # The same with the data in an S3 state location, without and with the index.
+  object-native-s3: object-native-s3
+  indexed-object-native-s3:
+    datasets: { orders: { acceleration: { indexes: { o_custkey: enabled } } } }
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state:
+          location: s3://${sources.lake.bucket}/state/
+          params:
+            s3_endpoint: ${sources.lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.lake.key}
+            s3_secret: ${sources.lake.secret}
+            allow_http: 'true'
 
 spicepod:
   version: v1
@@ -67,10 +85,10 @@ steps:
 
   - explain: SELECT * FROM orders WHERE o_custkey = 42
     contains: "lookup_index=o_custkey"
-    only: indexed
+    only: &indexed [indexed, indexed-object-native-s3]
   - explain: SELECT * FROM orders WHERE o_custkey = 42
     omits: "lookup_index=o_custkey"
-    only: [baseline, object-native]
+    only: [baseline, object-native, object-native-s3]
 
   # Move rows between keys, delete some, add new ones.
   - source-exec:
@@ -103,4 +121,11 @@ steps:
     expect-empty: true
   - explain: SELECT * FROM orders WHERE o_custkey = 42
     contains: "lookup_index=o_custkey"
-    only: indexed
+    only: *indexed
+
+  # Object-native data: the table's data files are in the state location, and
+  # no data file is in the instance's directory.
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: /data/, min: 1 }
+    only: &s3-variants [object-native-s3, indexed-object-native-s3]
+  - assert-files: { lacks: ['(^|/)s3:', '\.vortex$', '\.arrow$'] }
+    only: *s3-variants

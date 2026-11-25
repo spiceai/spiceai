@@ -63,7 +63,7 @@
   "companion/enterprise/spicepodcluster.template.yaml": "feb5d67b160131aea5147c027336208232e749e35eb242fc5ea533fa4880429d",
   "companion/enterprise/spicepodset.template.json": "f8eb0018e50f51e16bdcfcebac4cd28976ad1462953cf810f054aaa44ca95c37",
   "companion/enterprise/spicepodset.template.yaml": "65ea888deaa753ad3c38b5dcb201165378daa38f244ebe6daf26c4fd87f69618",
-  "companion/enterprise/validate.py": "608b87646af8dd5ebfdad94dcc72a3ac47453c3eac5264d0de32c07990f2bf0b",
+  "companion/enterprise/validate.py": "1e808beeb671b5bbfabebc95aeb823a6078cfe154daaf03b379226cfae9fbb88",
   "companion/service.py": "07adb709bf3aef2d73e2cb2bf6b4acd7b8f30c3ae0f6bed5d7c52e5885c58b29",
   "companion/spicepod.arrow.yaml": "6279e516621d44f21b6efd13a93b1cc1719380f7b8ae7930a91e243d0069e427",
   "companion/spicepod.auth.yaml": "56701192747ccbcb92654bc0a74b03a690a202c970f95d26c23c13b36c769f8f",

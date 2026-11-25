@@ -10,6 +10,7 @@ use object_store::ObjectMeta;
 use object_store::path::Path;
 use vortex::dtype::StructFields;
 use vortex::file::Footer;
+use vortex::file::SegmentSpec;
 use vortex::file::VortexFile;
 use vortex::layout::layouts::zoned::{LegacyStats, Zoned};
 
@@ -32,6 +33,10 @@ const FOOTER_BASE_BYTES: usize = 4 * 1024;
 /// materialized that column's layout subtree (its zone-map schema and
 /// statistics are built per column).
 const FOOTER_BYTES_PER_COLUMN: usize = 2_560;
+
+/// Heap a file statistic's partial aggregate state retains. Only a footer cached
+/// at write time holds partial state; one parsed from a file holds values alone.
+const FOOTER_BYTES_PER_PARTIAL_STATISTIC: usize = 64;
 
 /// Heap a cached footer retains per segment, once a scan has materialized the
 /// layout node that owns it.
@@ -61,6 +66,24 @@ fn footer_memory_size(footer: &Footer) -> usize {
         .saturating_add(footer.approx_byte_size().unwrap_or_default())
         .saturating_add(columns.saturating_mul(FOOTER_BYTES_PER_COLUMN))
         .saturating_add(segments.saturating_mul(FOOTER_BYTES_PER_SEGMENT))
+        // The footer holds its segment table twice: as parsed, and with the metadata segments
+        // appended, precomputed so a cached footer opens a file without copying the table.
+        .saturating_add(segments.saturating_mul(size_of::<SegmentSpec>()))
+        .saturating_add(
+            partial_statistics(footer).saturating_mul(FOOTER_BYTES_PER_PARTIAL_STATISTIC),
+        )
+}
+
+/// How many of a footer's file statistics carry partial aggregate state.
+fn partial_statistics(footer: &Footer) -> usize {
+    footer.statistics().map_or(0, |statistics| {
+        statistics
+            .aggregates()
+            .iter()
+            .flat_map(vortex::layout::layouts::file_stats::AggregateStats::iter)
+            .filter(|aggregate| aggregate.partial().is_some())
+            .count()
+    })
 }
 
 impl CachedVortexMetadata {

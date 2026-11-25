@@ -9,15 +9,18 @@ description: >
 
 sources:
   src: { kind: '${matrix.src}' }
+  # The state location of the object-native-s3 variant.
+  lake: { kind: rustfs }
 
 matrix:
   src: [postgres, mysql]
 
 # The spicepod as written, and the same with the prototype object-native Cayenne
-# metastore in place of SQLite.
+# metastore in place of SQLite, and with the data in an S3 state location too.
 variants:
   as-written: federated
   object-native: object-native
+  object-native-s3: object-native-s3
 
 spicepod:
   version: v1
@@ -157,3 +160,16 @@ steps:
     oracle-sql: SELECT * FROM t
   - query: SELECT * FROM other
     oracle-sql: SELECT * FROM t WHERE id <= 10
+
+  # Object-native data: each acceleration's log and data files are in the state
+  # location, and no data file is in the instance's directory.
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/t-, contains: /head, min: 1 }
+    only: object-native-s3
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/t-, contains: /data/, min: 1 }
+    only: object-native-s3
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/acct-, contains: /head, min: 1 }
+    only: object-native-s3
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/acct-, contains: /data/, min: 1 }
+    only: object-native-s3
+  - assert-files: { lacks: ['(^|/)s3:', '\.vortex$', '\.arrow$'] }
+    only: object-native-s3
