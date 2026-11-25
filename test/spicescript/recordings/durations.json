@@ -10,6 +10,7 @@
   "azure-model-credentials": 4,
   "builtins": 8,
   "case-mixed-widths": 16,
+  "cayenne-decimal-int-filter": 4,
   "cayenne-delete-signed-zero": 14,
   "cayenne-file-create-reload": 27,
   "cayenne-scan-pushdown": 5,
