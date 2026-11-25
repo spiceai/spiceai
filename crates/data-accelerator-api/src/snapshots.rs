@@ -34,7 +34,8 @@ use runtime_acceleration::acceleration_source::{AccelerationSource, resolved_ref
 use runtime_acceleration::snapshot::engine::SnapshotEngine;
 use runtime_acceleration::snapshot::notifications;
 use runtime_acceleration::snapshot::{
-    AccelerationEngine, AccelerationLayout, ForceCreate, SnapshotBehavior, SnapshotManager, metrics,
+    AccelerationEngine, AccelerationLayout, ForceCreate, LocalData, SnapshotBehavior,
+    SnapshotManager, metrics,
 };
 use snafu::Snafu;
 
@@ -351,7 +352,15 @@ pub async fn snapshot_before_recreate(
     let lock_guard = mutex.lock_owned().await;
 
     match manager
-        .create_snapshot(&snapshot_schema, lock_guard, None, None, ForceCreate(true))
+        // The file is about to be replaced and was not refreshed in this run, so it
+        // cannot replace a current snapshot that may hold newer data.
+        .create_snapshot(
+            &snapshot_schema,
+            lock_guard,
+            LocalData::Unsynced,
+            None,
+            ForceCreate(true),
+        )
         .await
     {
         Ok(Some(path)) => {

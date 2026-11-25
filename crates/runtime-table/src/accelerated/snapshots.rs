@@ -26,7 +26,7 @@ use runtime_acceleration::acceleration_source::AccelerationSource;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::notifications::Subscription;
 use runtime_acceleration::snapshot::{
-    ForceCreate, SnapshotLockGuard, SnapshotManager, SnapshotUploadError,
+    ForceCreate, LocalData, SnapshotLockGuard, SnapshotManager, SnapshotUploadError,
     metrics as snapshot_metrics,
 };
 use runtime_async::is_shutdown_cancellation;
@@ -665,10 +665,7 @@ async fn create_checkpoint_and_snapshot_once(
     let Some(snapshot_manager) = snapshot_manager else {
         return Ok(());
     };
-    let updated_at = match last_updated_at.load(Ordering::Acquire) {
-        0 => None,
-        i => Some(i),
-    };
+    let local = local_data(last_updated_at.load(Ordering::Acquire));
     // Counted under the write lock so it describes the archived data.
     let row_count = if let Some(accelerator) = accelerator {
         get_row_count(accelerator, dataset_name).await
@@ -686,13 +683,23 @@ async fn create_checkpoint_and_snapshot_once(
         .create_snapshot(
             checkpoint_schema,
             SnapshotLockGuard::from(lock_guard).with((file_deletion_hold, index_hold)),
-            updated_at,
+            local,
             row_count,
             force_create,
         )
         .await
         .map(|_| ())
         .context(UploadSnafu)
+}
+
+/// What the acceleration holds, from `last_updated_at`: the time of its last write in
+/// this run, or of the snapshot it was restored from. `0` means neither happened, so the
+/// acceleration is what an earlier run left on disk, and its age is unknown.
+fn local_data(last_updated_at: i64) -> LocalData {
+    match last_updated_at {
+        0 => LocalData::Unsynced,
+        i => LocalData::synced(Some(i)),
+    }
 }
 
 /// Gets the row count from the accelerator using the `DataFrame` API.
@@ -1040,5 +1047,16 @@ mod tests {
         assert_eq!(field("tag").data_type(), &DataType::Utf8);
         // Non-materialized source column is still appended.
         assert_eq!(field("src_only").data_type(), &DataType::Float64);
+    }
+
+    /// An acceleration with no write or restore in this run is what an earlier run left
+    /// on disk, so it must not be published as if it were current.
+    #[test]
+    fn an_acceleration_not_written_in_this_run_is_unsynced() {
+        assert_eq!(local_data(0), LocalData::Unsynced);
+        assert_eq!(
+            local_data(1_700_000_000_000),
+            LocalData::synced(Some(1_700_000_000_000))
+        );
     }
 }
