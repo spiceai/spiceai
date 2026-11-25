@@ -20498,37 +20498,6 @@ impl CayenneTableProvider {
         }
     }
 
-    /// After a checkpoint flushes rows to a Vortex file at `flush_sequence`,
-    /// upgrade any pre-existing tombstone that still hides one of the flushed
-    /// PKs (`insert_seq` absent or older than `delete_seq`) to record
-    /// `insert_seq=flush_sequence`, durably and then in memory.
-    ///
-    /// Without this upgrade, listing-time pruning via
-    /// `vortex_key_delete_pushdown_filter` and the runtime
-    /// `Int64PkDeletionFilterExec` keep treating those PKs as fully hidden and
-    /// drop the brand-new checkpoint file's rows. A caller that commits its own
-    /// metastore change carries [`Self::flushed_pk_insert_records`] in it and
-    /// calls [`Self::upgrade_flushed_pk_tombstones_in_memory`] after publishing.
-    async fn upgrade_tombstones_for_flushed_pks(
-        &self,
-        flushed_pks: &[i64],
-        flush_sequence: i64,
-    ) -> Result<()> {
-        let insert_pk_bytes = self.flushed_pk_insert_records(flushed_pks, false).await?;
-        if !insert_pk_bytes.is_empty() {
-            self.catalog
-                .add_insert_records_batch(
-                    &self.table_metadata.table_id,
-                    insert_pk_bytes,
-                    flush_sequence,
-                )
-                .await
-                .map_err(|err| Error::Catalog { source: err })?;
-        }
-        self.upgrade_flushed_pk_tombstones_in_memory(flushed_pks, flush_sequence);
-        Ok(())
-    }
-
     /// The flushed PKs to persist as insert records at the flush sequence, so
     /// restart rebuilds the upgrade [`Self::upgrade_flushed_pk_tombstones_in_memory`]
     /// makes. `adds_delete_files` says whether the commit carrying them also adds
@@ -20607,8 +20576,11 @@ impl CayenneTableProvider {
     }
 
     /// Stamp `insert_seq=flush_sequence` on the live in-memory tombstones that
-    /// still hide a flushed PK, so scans see the flushed rows. The durable side
-    /// is [`Self::flushed_pk_insert_records`].
+    /// still hide a flushed PK, so scans see the flushed rows: otherwise
+    /// listing-time pruning via `vortex_key_delete_pushdown_filter` and the
+    /// runtime `Int64PkDeletionFilterExec` drop them from the new file. The
+    /// durable side is [`Self::flushed_pk_insert_records`], committed with the
+    /// flush before this runs.
     fn upgrade_flushed_pk_tombstones_in_memory(&self, flushed_pks: &[i64], flush_sequence: i64) {
         let PkDeletionStrategyWithCache::Int64Pk {
             deletion_snapshot, ..
@@ -40958,7 +40930,7 @@ impl CayenneTableProvider {
         // pure-delete tombstone split at durable-commit time (see
         // `CheckpointCorpusKeys`). Needed whenever the tier carries tombstones
         // on a keyed strategy — and ALWAYS for `Int64Pk`, where the flushed
-        // PKs additionally feed `upgrade_tombstones_for_flushed_pks`: a row
+        // PKs additionally feed `flushed_pk_insert_records`: a row
         // re-inserted cleanly (no in-tier tombstone) after an EARLIER
         // checkpoint's delete-only tombstone would otherwise stay hidden by
         // the sequence-blind pushdown filter once flushed to a file.
@@ -42928,86 +42900,6 @@ impl CayenneTableProvider {
         partitions
     }
 
-    pub(crate) async fn insert_to_new_snapshot_with_sequence(
-        &self,
-        stream: SendableRecordBatchStream,
-        sequence_number: i64,
-        target_partitions: usize,
-        estimated_bytes: Option<u64>,
-    ) -> CatalogResult<(u64, Arc<ColumnStatsAccumulator>)> {
-        let target_size_bytes = self.context.target_file_size_bytes();
-
-        // Generate a new snapshot ID
-        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-
-        // Write data to the new snapshot
-        let (total_rows, chunk_count, stats_acc) = self
-            .write_to_snapshot(
-                stream,
-                target_size_bytes,
-                &new_snapshot_id,
-                target_partitions,
-                estimated_bytes,
-                super::delta_encoding::WritePolicy::DELTA,
-            )
-            .await?;
-
-        // Sync the new snapshot directory for durability before recording the
-        // sequence number in the catalog. This is required for the same reason
-        // as in the sort-rewrite and normal append paths: the Vortex files must
-        // be durably present before the catalog metadata that makes them
-        // visible (via sequence number / protected snapshot) is committed.
-        let is_s3 = self.data_in_store();
-        if !is_s3 {
-            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
-            Self::sync_snapshot_dir(&snapshot_dir).await?;
-        }
-
-        tracing::debug!(
-            "Insert to new snapshot {} completed, wrote {} rows to Vortex in {} chunk(s)",
-            new_snapshot_id,
-            total_rows,
-            chunk_count
-        );
-
-        // A table in the object-native location scans only its manifest: the
-        // snapshot's files are recorded before the commit that publishes it.
-        self.record_new_protected_snapshot_files(&new_snapshot_id, sequence_number)
-            .await?;
-        // Record the snapshot's sequence number in the catalog
-        self.catalog
-            .set_snapshot_sequence(
-                &self.table_metadata.table_id,
-                &new_snapshot_id,
-                sequence_number,
-            )
-            .await?;
-
-        // Protect this snapshot using its OWN allocated `sequence_number` as the
-        // deletion threshold: the same value just persisted to
-        // `cayenne_snapshot_sequence` and reloaded by `load_protected_snapshots` on
-        // restart. The in-memory threshold MUST match the persisted one, or the
-        // partial-deletion filter (`delete_seq > threshold`) returns different rows
-        // before vs after a reload. The live `get_max_delete_sequence()` must NOT be
-        // used here: an unrelated deletion committed between this snapshot's sequence
-        // allocation and this publish can raise the global max past this snapshot's
-        // own sequence, so the in-memory threshold would skip a delete that the
-        // reloaded threshold applies. See `load_protected_snapshots` for the matching
-        // rationale.
-        //
-        // We do NOT clear old protected snapshots because they may still hold valid
-        // data; each applies its own partial deletion filter from when it was created.
-        // Publish under `scan_state_lock` so scans that capture the deletion view,
-        // protected map, and inlined data under `.read()` observe a consistent view.
-        self.commit_protected_snapshot_with_scan_lock(&new_snapshot_id, sequence_number)
-            .await;
-
-        // The listing table stays as-is. Protected snapshots are handled at scan time.
-        // See the doc comment above for why we do NOT update current_snapshot.
-
-        Ok((total_rows, stats_acc))
-    }
-
     /// Durably record a newly written snapshot's sequence number in the catalog
     /// (syncing the snapshot directory first on local filesystems).
     ///
@@ -43166,33 +43058,29 @@ impl CayenneTableProvider {
                 // Lever B2: the checkpoint flush's new snapshot sequence comes
                 // from the same allocator as every other handout for this table.
                 let sequence_number = self.reserve_sequences_local(1).await?;
-                let (_rows, stats) = self
-                    .insert_to_new_snapshot_with_sequence(
-                        stream,
-                        sequence_number,
-                        ctx.state().config().target_partitions(),
-                        estimated_bytes,
-                    )
-                    .await?;
-                // Pair every PK now in the new file with `sequence_number` on
-                // any pre-existing delete-only tombstone, so listing-time
-                // pruning and the runtime deletion filter stop hiding rows
-                // from the just-written checkpoint file.
-                self.upgrade_tombstones_for_flushed_pks(&flushed_int64_pks, sequence_number)
-                    .await?;
-                stats
+                self.fold_inline_into_new_snapshot(
+                    stream,
+                    sequence_number,
+                    ctx.state().config().target_partitions(),
+                    estimated_bytes,
+                    &flushed_int64_pks,
+                )
+                .await?
             };
 
             // A table in the object-native location scans only its manifest, so
             // the files the flush wrote into the current snapshot are recorded in
             // the same record that clears the inline rows they hold.
+            let inline_cleared = !self.pk_deletion_strategy.is_position_based();
             let current_snapshot_id = self.get_current_snapshot_id();
-            let flushed_into_current = if self.data_in_object_native_location() {
+            let flushed_into_current = if self.data_in_object_native_location() && !inline_cleared {
                 self.uncommitted_files.files(&current_snapshot_id)
             } else {
                 Vec::new()
             };
-            if flushed_into_current.is_empty() {
+            if inline_cleared {
+                self.clear_inlined_state_after_checkpoint();
+            } else if flushed_into_current.is_empty() {
                 self.clear_inlined_metadata_after_checkpoint().await?;
             } else {
                 let (recorded, deletes) = crate::catalog::with_same_record_commits(async {
@@ -43224,6 +43112,65 @@ impl CayenneTableProvider {
             .await;
 
         Ok(u64::try_from(total_rows).unwrap_or(u64::MAX))
+    }
+
+    /// Writes the inline corpus `stream` of a keyed table into a new protected
+    /// snapshot at `sequence_number` and commits it in one metastore
+    /// transaction: the switch that makes the snapshot live, its files for a
+    /// table in the object-native location, the insert records that keep the
+    /// re-inserted `flushed_pks` visible after a restart, and the clear of the
+    /// inline rows it now holds. Committed apart, a crash after the snapshot is
+    /// live and before the clear serves every flushed row twice after a restart.
+    async fn fold_inline_into_new_snapshot(
+        &self,
+        stream: SendableRecordBatchStream,
+        sequence_number: i64,
+        target_partitions: usize,
+        estimated_bytes: Option<u64>,
+        flushed_pks: &[i64],
+    ) -> Result<Arc<ColumnStatsAccumulator>> {
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let (_rows, _chunks, stats) = self
+            .write_to_snapshot(
+                stream,
+                self.context.target_file_size_bytes(),
+                &new_snapshot_id,
+                target_partitions,
+                estimated_bytes,
+                super::delta_encoding::WritePolicy::DELTA,
+            )
+            .await?;
+        // The files must be durable before the commit that makes them live.
+        self.sync_local_snapshot_dir(&new_snapshot_id).await?;
+        let manifest_files = self
+            .new_protected_snapshot_manifest(&new_snapshot_id, sequence_number)
+            .await?;
+        let insert_records = self.flushed_pk_insert_records(flushed_pks, false).await?;
+        self.catalog
+            .commit_mem_tier_durable(MemTierDurableCommit {
+                table_id: self.table_metadata.table_id.clone(),
+                sequence_number,
+                snapshot_sequence: Some(SnapshotSequenceCommit {
+                    snapshot_id: new_snapshot_id.clone(),
+                    sequence_number,
+                }),
+                clear_inlined: true,
+                insert_records,
+                manifest_files,
+                ..MemTierDurableCommit::default()
+            })
+            .await?;
+        self.uncommitted_files.forget(&new_snapshot_id);
+        // The snapshot's own sequence is its deletion threshold: the value just
+        // committed, which `load_protected_snapshots` reloads on restart. The
+        // live `get_max_delete_sequence()` would differ once an unrelated delete
+        // lands after the sequence was allocated, and the partial-deletion
+        // filter (`delete_seq > threshold`) would then return different rows
+        // before and after a reload.
+        self.commit_protected_snapshot_with_scan_lock(&new_snapshot_id, sequence_number)
+            .await;
+        self.upgrade_flushed_pk_tombstones_in_memory(flushed_pks, sequence_number);
+        Ok(stats)
     }
 
     async fn clear_inlined_metadata_after_checkpoint(&self) -> Result<()> {
