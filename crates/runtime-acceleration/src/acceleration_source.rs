@@ -24,29 +24,22 @@ use tokio::sync::RwLock;
 pub type InitializedSourcesFuture<'a> =
     Pin<Box<dyn Future<Output = Vec<Arc<dyn AccelerationSource>>> + Send + 'a>>;
 
-/// The settings in a Spicepod that define the rows an acceleration of a source
-/// stores. An engine that keeps the acceleration as a copy in a shared state
-/// location records them with the copy, and never serves a copy built from others.
+/// Which source an acceleration's rows come from. An engine that keeps the
+/// acceleration as a copy in a shared state location records it with the copy,
+/// and never serves an instance a copy of another source.
+///
+/// Settings that shape the rows of one source (`refresh_sql`, refresh frequency,
+/// retention, credentials, tuning) are not part of it: they apply to the stored
+/// acceleration in place, as on a single instance.
 #[derive(Clone, Debug, Default)]
 pub struct SourceDefinition {
-    /// Where the rows come from: a dataset's `from`, or a view's SQL.
+    /// A dataset's `from`; empty for a view, whose source is what it reads.
     pub from: String,
-    /// The source's connection settings, as its connector reads them: each one
-    /// the Spicepod sets and each secret the connector loads from a secret store
-    /// itself, with `${ … }` references resolved. A connector's defaults are not
-    /// part of it, so a release that changes one changes no definition.
+    /// The connection settings that say which source the connector reads: those
+    /// its connector names (`DataConnectorFactory::source_identity`), or every
+    /// setting the Spicepod sets for a connector that names none.
     pub connection: Vec<ConnectionSetting>,
-    /// `acceleration.refresh_sql`.
-    pub refresh_sql: Option<String>,
-    /// The columns the Spicepod declares, each with its declared type and
-    /// nullability, in declaration order. A description is not part of it.
-    pub columns: Vec<String>,
-    /// The other settings that decide which rows the acceleration keeps (refresh
-    /// mode, data window, retention, time column, conflict handling), by the name
-    /// the Spicepod gives them.
-    pub row_settings: Vec<(&'static str, Option<String>)>,
-    /// For a view, the definition of each dataset or view its SQL reads, by name:
-    /// two views with one SQL over different sources hold different rows.
+    /// For a view, the source of each dataset or view its SQL reads, by name.
     pub reads: Vec<(String, SourceDefinition)>,
 }
 
@@ -59,26 +52,6 @@ pub struct ConnectionSetting {
     /// Whether the connector declares the setting secret. A secret is recorded
     /// only together with the other settings, never on its own.
     pub secret: bool,
-}
-
-impl SourceDefinition {
-    /// The definition parts of `columns`, as [`Self::columns`] holds them.
-    #[must_use]
-    pub fn declared_columns(columns: &[spicepod::semantic::Column]) -> Vec<String> {
-        columns
-            .iter()
-            .map(|column| {
-                format!(
-                    "{}\u{0}{}\u{0}{}",
-                    column.name,
-                    column.r#type.as_deref().unwrap_or_default(),
-                    column
-                        .nullable
-                        .map_or("", |nullable| if nullable { "null" } else { "not null" })
-                )
-            })
-            .collect()
-    }
 }
 
 /// What [`AccelerationSource::definition`] returns.

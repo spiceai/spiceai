@@ -134,11 +134,10 @@ steps:
     expect: { rows: [['290']] }
     eventually: 30s
     except: object-native
-  # In the object-native metastore a copy records its connection settings, so
-  # the replica's are another definition (#16246): the dataset fails, naming the
-  # settings and not their values, rather than resume the primary's copy. A
-  # failover keeps its copy once connection settings that cannot change the rows
-  # are left out of the definition.
+  # In the object-native metastore a copy records which server it reads (#16246),
+  # and the replica is another server: the dataset fails, naming the setting,
+  # rather than resume the primary's copy, until a connector can tell a replica
+  # of the same data from another source.
   - start:
       ready: false
       patch:

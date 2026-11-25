@@ -555,4 +555,55 @@ mod tests {
         let identity = connection_identity_from_params(&params).expect("valid params should parse");
         assert_eq!(identity.sslmode.as_deref(), Some("disable"));
     }
+
+    fn source_identity(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        use data_connector_api::DataConnectorFactory;
+        crate::PostgresFactory::new_arc()
+            .source_identity(&params_with_pairs(pairs))
+            .expect("resolves")
+            .expect("PostgreSQL names its source")
+    }
+
+    /// The server and database identify the source, whether written as discrete
+    /// settings or as a connection string; credentials and TLS do not, so a
+    /// rotated password reads the same source.
+    #[test]
+    fn source_identity_is_the_server_and_database() {
+        let discrete = source_identity(&[
+            ("host", "db.internal"),
+            ("port", "5433"),
+            ("user", "reader"),
+            ("pass", "hunter2"),
+            ("db", "shop"),
+        ]);
+        assert_eq!(
+            discrete,
+            vec![
+                ("pg_host".to_string(), "db.internal".to_string()),
+                ("pg_port".to_string(), "5433".to_string()),
+                ("pg_db".to_string(), "shop".to_string()),
+            ]
+        );
+        let rotated = source_identity(&[
+            ("host", "db.internal"),
+            ("port", "5433"),
+            ("user", "writer"),
+            ("pass", "correct horse"),
+            ("db", "shop"),
+            ("sslmode", "require"),
+        ]);
+        assert_eq!(rotated, discrete);
+        let connection_string = source_identity(&[(
+            "connection_string",
+            "host=db.internal port=5433 user=reader password=other dbname=shop",
+        )]);
+        assert_eq!(connection_string, discrete);
+        let other_port = source_identity(&[
+            ("host", "db.internal"),
+            ("port", "5432"),
+            ("user", "reader"),
+            ("db", "shop"),
+        ]);
+        assert_ne!(other_port, discrete);
+    }
 }

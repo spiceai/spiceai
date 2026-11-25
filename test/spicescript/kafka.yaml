@@ -77,11 +77,5 @@ steps:
   - source-exec:
       ref: INSERT INTO t SELECT g, 2, 'backlog', 0.5 FROM generate_series(351, 20350) g;
   - start: { patch: { datasets: { t: { params: { batch_max_size: '1' } } } } }
-    except: object-native
-  # In the object-native metastore the copy records its connection settings, so
-  # a new `batch_max_size` would be another definition (#16246). Its acceleration
-  # is in the state location, and resumes from the committed offset.
-  - start: {}
-    only: object-native
   - query: SELECT count(*) AS n FROM t
     expect: { rows: [['20350']] }

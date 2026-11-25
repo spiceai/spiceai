@@ -111,16 +111,8 @@ steps:
   - query: SELECT * FROM items
     expect: { same-as: caught-up }
     eventually: 15s
-    except: object-native
   - assert-status: { dataset: items, status: Error, message-contains: password }
     eventually: 30s
-    except: object-native
   - assert-status: { dataset: items, ready: true }
     eventually: 30s
-    only: on-load
-  # In the object-native metastore a copy records its connection settings, so a
-  # new password is another definition (#16246): the copy is not served, and
-  # the error names the setting, never its value.
-  - assert-status: { dataset: items, status: Error, message-contains: "(`pg_pass` changed)" }
-    eventually: 30s
-    only: object-native
+    only: [on-load, object-native]

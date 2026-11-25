@@ -115,16 +115,6 @@ steps:
   - edit-spicepod:
       datasets:
         other: { acceleration: { refresh_sql: SELECT * FROM other WHERE id <= 10 } }
-  # In the object-native metastore a copy records its definition, and a new
-  # `refresh_sql` is another one (#16246): the dataset fails, naming the
-  # setting, until `mode: file_create` rebuilds the copy.
-  - assert-status: { dataset: other, status: Error, message-contains: "(`refresh_sql` changed)" }
-    eventually: 60s
-    except: as-written
-  - edit-spicepod:
-      datasets:
-        other: { acceleration: { mode: file_create } }
-    except: as-written
   - query: SELECT count(*) AS n FROM other
     expect: { rows: [['10']] }
     eventually: 60s

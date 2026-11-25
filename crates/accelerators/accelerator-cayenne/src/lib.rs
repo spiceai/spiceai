@@ -1352,8 +1352,8 @@ fn requires_rebuild(error: &(dyn std::error::Error + 'static)) -> bool {
     })
 }
 
-/// The definition `declared` describes, for app `app`: its own settings, its
-/// connection settings, and the definition of each table it reads.
+/// The source `declared` describes, for app `app`: its `from`, the connection
+/// settings that identify it, and the source of each table it reads.
 fn source_definition(
     app: String,
     declared: &runtime_acceleration::SourceDefinition,
@@ -1361,8 +1361,6 @@ fn source_definition(
     use secrecy::ExposeSecret;
     let mut definition = cayenne::DatasetDefinition::new(app.clone())
         .with_setting("from", &declared.from)
-        .with_optional_setting("refresh_sql", declared.refresh_sql.as_deref())
-        .with_list_setting("columns", &declared.columns)
         .with_connection(declared.connection.iter().map(|setting| {
             (
                 setting.name.as_str(),
@@ -1370,9 +1368,6 @@ fn source_definition(
                 setting.secret,
             )
         }));
-    for (name, value) in &declared.row_settings {
-        definition = definition.with_optional_setting(name, value.as_deref());
-    }
     for (table, read) in &declared.reads {
         definition = definition.with_read(table, &source_definition(app.clone(), read));
     }
@@ -2986,14 +2981,13 @@ impl CayenneAccelerator {
         Ok(Some(builder))
     }
 
-    /// `source`'s definition: the settings in its Spicepod that define the rows
-    /// its copy stores, with its connection settings as its connector reads them,
-    /// so two hosts behind one `from` differ, and for a view the definitions of
-    /// the tables it reads. `None` for a source no Spicepod defines.
+    /// `source`'s definition: which source its rows come from, and the settings
+    /// that decide how its stored rows are keyed and partitioned, which cannot
+    /// change in place. `None` for a source no Spicepod defines. Every other
+    /// setting applies to the stored acceleration in place, as on one instance.
     async fn dataset_definition(
         source: &dyn AccelerationSource,
         primary_keys: &[String],
-        pk_conflict_detection: &str,
         on_conflict: Option<&datafusion_table_providers::util::on_conflict::OnConflict>,
     ) -> Result<Option<cayenne::DatasetDefinition>> {
         let declared = source
@@ -3001,7 +2995,7 @@ impl CayenneAccelerator {
             .await
             .map_err(|error| Error::InvalidConfiguration {
                 detail: Arc::from(format!(
-                    "Failed to load dataset '{}' (cayenne): its definition could not be read. Cause: {error}",
+                    "Failed to load dataset '{}' (cayenne): its source settings could not be resolved. Cause: {error}",
                     source.name()
                 )),
             })?;
@@ -3018,13 +3012,10 @@ impl CayenneAccelerator {
                     .collect()
             })
             .unwrap_or_default();
-        let on_conflict = on_conflict.map(ToString::to_string);
         Ok(Some(
             source_definition(source.app().name.clone(), &declared)
-                .with_list_setting("primary_key", primary_keys)
-                .with_list_setting("partition_by", &partition_by)
-                .with_setting("cayenne_pk_conflict_detection", pk_conflict_detection)
-                .with_optional_setting("on_conflict", on_conflict.as_deref()),
+                .with_key(primary_keys, on_conflict)
+                .with_list_setting("partition_by", &partition_by),
         ))
     }
 
@@ -3141,12 +3132,8 @@ impl CayenneAccelerator {
         // A copy in the state location records the definition it was built from,
         // and opens only for the same one (see `cayenne::DatasetDefinition`).
         if !memory_mode && Self::vnext_enabled(source)? {
-            vortex_config.definition = Self::dataset_definition(
-                source,
-                &primary_keys,
-                vortex_config.pk_conflict_detection.as_str(),
-                on_conflict.as_ref(),
-            )
+            vortex_config.definition =
+                Self::dataset_definition(source, &primary_keys, on_conflict.as_ref())
             .await?
             .map(Arc::new);
         }

@@ -169,29 +169,34 @@ impl ConnectorContext for RuntimeConnectorContext {
     }
 }
 
-/// `dataset`'s connection settings as its connector reads them, for the definition
-/// an accelerator records with a copy in a shared state location: each setting the
-/// Spicepod sets and each secret the connector loads from a secret store itself,
-/// with `${ … }` references resolved, named as the Spicepod names them. A
-/// connector's defaults are left out, so a release that changes a default changes
-/// no definition. A source with no connector has none.
+/// The settings that say which source `dataset` reads, besides its `from`, for
+/// the definition an accelerator records with a copy in a shared state location:
+/// the connector's [`DataConnectorFactory::source_identity`], resolved from the
+/// settings the Spicepod sets and the secrets the connector loads itself, with
+/// `${ … }` references resolved, and named as the Spicepod names them.
+///
+/// A connector that does not say which settings identify its source counts every
+/// setting the Spicepod sets, and every secret it loads itself, each marked secret
+/// as the connector declares it. A connector's defaults are left out either way,
+/// so a release that changes a default changes no definition. A source with no
+/// connector has none.
 ///
 /// # Errors
 ///
-/// A connector that is not in this build, or a setting that does not resolve, as
-/// loading the dataset's connector reports it.
-pub async fn connection_settings(
+/// A setting that does not resolve, as loading the dataset's connector reports it.
+pub async fn source_identity(
     dataset: &Dataset,
 ) -> Result<Vec<runtime_acceleration::ConnectionSetting>, Box<dyn std::error::Error + Send + Sync>>
 {
     let connector = DatasetSpec::source(dataset);
-    let (prefix, specs) = {
+    let factory = {
         let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
         let Some(factory) = guard.get(connector) else {
             return Ok(Vec::new());
         };
-        (factory.prefix(), factory.parameters())
+        Arc::clone(factory)
     };
+    let (prefix, specs) = (factory.prefix(), factory.parameters());
     let secrets = dataset.runtime.secrets();
     let params = try_get_params_with_secrets(Arc::clone(&secrets), &dataset.params).await?;
     // The connector's own load reports anything wrong with these settings.
@@ -205,6 +210,16 @@ pub async fn connection_settings(
         Some(secret_sources_from_templates(&dataset.params)),
     )
     .await?;
+    if let Some(identity) = factory.source_identity(&parameters)? {
+        return Ok(identity
+            .into_iter()
+            .map(|(name, value)| runtime_acceleration::ConnectionSetting {
+                name,
+                value: value.into(),
+                secret: false,
+            })
+            .collect());
+    }
     Ok(parameters
         .iter()
         .filter_map(|(name, value)| {

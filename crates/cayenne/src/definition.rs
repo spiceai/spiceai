@@ -14,25 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! A dataset's definition: the settings that define the rows its copy stores.
+//! A dataset's definition: which source its copy's rows come from, and the
+//! settings that decide how they are stored and cannot change in place.
 //!
 //! A copy of a dataset in a shared state location records the definition it was
-//! built from, so an instance whose Spicepod defines the dataset differently never
-//! serves or writes that copy, even when the two definitions share a name and a
-//! `from`. The record holds digests only, never a value, so it stores no secret.
+//! built from, so an instance whose Spicepod reads another source under the same
+//! name never serves or writes that copy. The record holds digests only, never a
+//! value, so it stores no secret.
 //!
-//! - Each dataset setting (`from`, `refresh_sql`, the settings that decide which
-//!   rows are kept, ...) has a digest of its own, and so does the definition of
-//!   each dataset or view a view reads.
-//! - The source's connection settings, as its connector reads them (with every
-//!   `${ … }` reference resolved and each secret it loads itself), have one digest
-//!   together: two hosts behind one `from` differ, and so does a rotated secret.
-//! - Each connection setting the connector does not declare secret also has a
-//!   digest of its own, which names the setting that changed. A secret setting is
-//!   recorded by name only: a digest of it alone could be tested against guesses.
-//! - The definition's id is a digest of the dataset settings and the connection
-//!   digest. A copy per definition is keyed by it, in the registry entry beside the
-//!   copy's folder.
+//! - The source: `from`, a digest of the connection settings the connector says
+//!   identify it (server, database; never credentials), and for a view the source
+//!   of each table it reads. Two hosts behind one `from` differ; a rotated
+//!   password or a changed timeout does not.
+//! - The settings a stored table cannot adopt in place, as on a single instance:
+//!   `primary_key`, the `on_conflict` it acts on, and `partition_by`.
+//! - Everything else (`refresh_sql`, refresh frequency, retention, layout,
+//!   credentials, tuning) is not part of it, and applies to the copy in place.
+//! - Each connection setting has a digest of its own, which names the setting
+//!   that changed, except one the connector declares secret (only for a connector
+//!   that does not say which settings identify its source): a digest of a secret
+//!   alone could be tested against guesses.
+//! - The definition's id is a digest of all of these. A copy per definition is
+//!   keyed by it, in the registry entry beside the copy's folder.
 
 use std::collections::BTreeMap;
 
@@ -136,6 +139,25 @@ impl DatasetDefinition {
             })
             .collect();
         self
+    }
+
+    /// Add the settings that decide how stored rows are keyed: `primary_key`,
+    /// and the `on_conflict` the table acts on with them, as the stored table
+    /// records it. These cannot change in place (see
+    /// `cayenne_catalog::identity_setting_changes`). Conflict detection is left to
+    /// the check every reopen makes: turning it off applies in place, and turning
+    /// it on is refused there.
+    #[must_use]
+    pub fn with_key(
+        self,
+        primary_key: &[String],
+        on_conflict: Option<&datafusion_table_providers::util::on_conflict::OnConflict>,
+    ) -> Self {
+        let on_conflict =
+            crate::provider::table::upsert_on_primary_key(primary_key, on_conflict.cloned())
+                .map(|on_conflict| on_conflict.to_string());
+        self.with_list_setting("primary_key", primary_key)
+            .with_optional_setting("on_conflict", on_conflict.as_deref())
     }
 
     /// Add the definition of `table`, which this one (a view's) reads.
@@ -361,7 +383,6 @@ mod tests {
     fn orders_with(host: &str, pass: &str) -> DatasetDefinition {
         DatasetDefinition::new("shop")
             .with_setting("from", "postgres:public.orders")
-            .with_optional_setting("refresh_sql", None)
             .with_list_setting::<&str>("primary_key", &["id"])
             .with_connection([("pg_host", host, false), ("pg_pass", pass, true)])
     }
@@ -438,20 +459,17 @@ mod tests {
     #[test]
     fn each_dataset_setting_and_each_connection_setting_change_is_named() {
         let a = orders("db");
-        let refresh = a
+        let partitioned = a
             .clone()
-            .with_optional_setting("refresh_sql", Some("SELECT * FROM orders WHERE id < 10"));
-        assert_eq!(changes(&a, &refresh), vec!["`refresh_sql` changed".to_string()]);
-        // Unset and empty are different values.
-        let empty = a.clone().with_optional_setting("refresh_sql", Some(""));
-        assert_eq!(changes(&a, &empty), vec!["`refresh_sql` changed".to_string()]);
-        let window = a
-            .clone()
-            .with_optional_setting("refresh_data_window", Some("7d"));
+            .with_list_setting("partition_by", &["bucket(4, id)"]);
         assert_eq!(
-            changes(&a, &window),
-            vec!["`refresh_data_window` changed".to_string()]
+            changes(&a, &partitioned),
+            vec!["`partition_by` changed".to_string()]
         );
+        // Unset and empty are different values.
+        let unset = DatasetDefinition::new("shop").with_optional_setting("on_conflict", None);
+        let empty = DatasetDefinition::new("shop").with_optional_setting("on_conflict", Some(""));
+        assert_eq!(changes(&unset, &empty), vec!["`on_conflict` changed".to_string()]);
         let key = a.clone().with_list_setting("primary_key", &["id", "region"]);
         assert_eq!(changes(&a, &key), vec!["`primary_key` changed".to_string()]);
         let added = a.clone().with_connection([

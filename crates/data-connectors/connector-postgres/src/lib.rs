@@ -406,6 +406,20 @@ impl DataConnectorFactory for PostgresFactory {
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
     }
+
+    /// The server and database, from `pg_connection_string` or the discrete
+    /// settings, as the connection pool resolves them.
+    fn source_identity(
+        &self,
+        params: &runtime_parameters::Parameters,
+    ) -> Result<Option<Vec<(String, String)>>, String> {
+        let identity = connection::connection_identity_from_params(params)?;
+        Ok(Some(vec![
+            (params.user_param("host").to_string(), identity.host),
+            (params.user_param("port").to_string(), identity.port.to_string()),
+            (params.user_param("db").to_string(), identity.database),
+        ]))
+    }
 }
 
 async fn postgres_comment_metadata(

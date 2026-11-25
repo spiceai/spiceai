@@ -3,18 +3,19 @@ description: >
   Two Spicepods, apps 'shop' and 'store', run on one state location. Both
   declare a dataset 'orders' with the same `from` and no connection settings:
   each reads its own Postgres server through a connection string the connector
-  loads from the environment. The copy of 'orders' records the definition it
-  was built from, connection settings included, so the second app's 'orders'
-  fails with an error naming the secret setting that differs, never its value,
-  and neither app's rows ever appear in the other's results. Each app also
+  loads from the environment. The copy of 'orders' records which source it
+  reads (the server in that connection string), so the second app's 'orders'
+  fails with an error naming the setting that differs, never a value, and
+  neither app's rows ever appear in the other's results. Each app also
   declares 'by_owner', a view with one SQL over an unaccelerated dataset on its
   own server: the view's definition includes what it reads, so the second app's
   view fails too. Both declare 'common' from the same server, so the second app
   serves the first app's copy. The app that cannot serve 'orders' never takes
   over writing it: with the first app stopped and started again, its 'orders'
-  follows its source. Renaming the first app keeps its copies, and changing
-  only `refresh_sql`, or only the refresh data window, is a different
-  definition. Every answer is checked against its own source.
+  follows its source. Renaming the first app keeps its copies, and so does a
+  change that shapes the rows of the same source (`refresh_sql`, the refresh
+  frequency): it applies in place, as on a single instance. Every answer is
+  checked against its own source.
 
 sources:
   # Two Postgres servers with the same table name and schema, different rows.
@@ -121,7 +122,7 @@ steps:
   - assert-status:
       dataset: orders
       status: Error
-      message-contains: "was built from a different definition (one of the secret settings `pg_connection_string` changed), so this instance neither serves nor writes it"
+      message-contains: "was built from a different definition (`pg_port` changed), so this instance neither serves nor writes it"
     only: store
   - query: SELECT * FROM by_owner
     expect: { oracle: shop_db }
@@ -195,26 +196,16 @@ steps:
       lacks: ['was built from a different definition']
     only: shop
 
-  # `refresh_sql` alone is a different definition.
+  # A change that shapes the rows of the same source applies to the copy in
+  # place: `refresh_sql` and the refresh frequency.
   - restart:
-      ready: false
-      patch: { datasets: { orders: { acceleration: { refresh_sql: SELECT * FROM orders WHERE o_id <= 100 } } } }
+      patch: { datasets: { orders: { acceleration: { refresh_sql: SELECT * FROM orders WHERE o_id <= 100, refresh_check_interval: 1s } } } }
     only: shop
-  - assert-status:
-      dataset: orders
-      status: Error
-      message-contains: "was built from a different definition (`refresh_sql` changed)"
+  - query: SELECT o_owner, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_owner
+    expect: { oracle: shop_db }
+    oracle-sql: SELECT o_owner, count(*) AS n, sum(o_total) AS total FROM orders WHERE o_id <= 100 GROUP BY o_owner
     eventually: 60s
     only: shop
-
-  # So is a different refresh data window: it changes which rows are kept.
-  - restart:
-      ready: false
-      patch: { datasets: { orders: { time_column: o_at, acceleration: { refresh_data_window: 7d } } } }
-    only: shop
-  - assert-status:
-      dataset: orders
-      status: Error
-      message-contains: "`refresh_data_window` changed"
-    eventually: 60s
+  - assert-log:
+      lacks: ['was built from a different definition']
     only: shop

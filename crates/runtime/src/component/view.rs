@@ -156,8 +156,9 @@ impl View {
 /// other in a cycle, so this only bounds a misconfiguration.
 const MAX_VIEW_DEPTH: usize = 16;
 
-/// `view`'s definition: its SQL, and the definition of each dataset and view
-/// that SQL reads, so two views with one SQL over different sources differ.
+/// `view`'s source: the source of each dataset and view its SQL reads, so two
+/// views over different sources differ. The SQL itself shapes the rows of those
+/// sources, as `refresh_sql` does a dataset's, and applies in place.
 fn view_definition(
     view: &View,
     depth: usize,
@@ -203,14 +204,8 @@ fn view_definition(
         reads.sort_by(|a, b| a.0.cmp(&b.0));
         reads.dedup_by(|a, b| a.0 == b.0);
         Ok(runtime_acceleration::SourceDefinition {
-            from: view.sql.to_string(),
+            from: String::new(),
             connection: Vec::new(),
-            refresh_sql: view
-                .acceleration
-                .as_ref()
-                .and_then(|acceleration| acceleration.refresh_sql.clone()),
-            columns: runtime_acceleration::SourceDefinition::declared_columns(&view.columns),
-            row_settings: Vec::new(),
             reads,
         })
     })

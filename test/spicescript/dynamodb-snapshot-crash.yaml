@@ -154,32 +154,18 @@ steps:
   # one row.
   - source-exec:
       ddb: touch /tmp/hold-stall_${sources.ddb.namespace}
-    except: cayenne-object-native
   - restart:
       ready: false
       patch: { datasets: { stall: { params: { dynamodb_replication_initial_snapshot: always } } } }
-  # In the object-native metastore a copy records its connection settings, so
-  # a new `dynamodb_replication_initial_snapshot` is another definition
-  # (#16246): the dataset fails, naming the setting, and the reload this
-  # scenario interrupts never starts.
-  - assert-status:
-      dataset: stall
-      status: Error
-      message-contains: "(`dynamodb_replication_initial_snapshot` added)"
-    eventually: 60s
-    only: cayenne-object-native
   - wait-metric:
       name: dataset_acceleration_cdc_apply_burst_rows_total
       labels: { dataset: stall }
       above: 0
       timeout: 60s
-    except: cayenne-object-native
   - source-query: { ddb: *proxy_state }
     expect: { rows: [['2 True']] }
     eventually: 30s
-    except: cayenne-object-native
   - kill-spiced: {}
-    except: cayenne-object-native
   - source-exec:
       ddb: rm -f /tmp/hold-stall_${sources.ddb.namespace}
 
@@ -188,26 +174,20 @@ steps:
   - start:
       ready: false
       patch: { datasets: { stall: { params: { dynamodb_replication_initial_snapshot: disabled } } } }
-    except: cayenne-object-native
   - assert-status:
       dataset: stall
       status: Error
       message-contains: because its last reload was interrupted
     eventually: 60s
-    except: cayenne-object-native
 
   # Back on the default `auto`, the next start loads every row again.
   - restart:
       patch: { datasets: { stall: { params: { dynamodb_replication_initial_snapshot: auto } } } }
-    except: cayenne-object-native
   - query: SELECT id, name FROM stall
     expect: *all_rows
     eventually: 60s
-    except: cayenne-object-native
   - query: SELECT id, name FROM stall
     expect: *all_rows
     consistently: 5s
-    except: cayenne-object-native
   - source-query: { ddb: *proxy_state }
     expect: { rows: [['3 True']] }
-    except: cayenne-object-native

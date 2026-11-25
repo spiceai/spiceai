@@ -324,6 +324,13 @@ impl DataConnectorFactory for KafkaFactory {
         PARAMETERS
     }
 
+    fn source_identity(
+        &self,
+        params: &runtime_parameters::Parameters,
+    ) -> Result<Option<Vec<(String, String)>>, String> {
+        Ok(Some(data_connector_api::source_identity_of(params, &["bootstrap_servers"])))
+    }
+
     fn supports_unsupported_type_action(&self) -> bool {
         false
     }

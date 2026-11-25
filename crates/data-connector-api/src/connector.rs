@@ -241,6 +241,51 @@ pub trait DataConnectorFactory: Send + Sync {
     ) -> Option<SchemaRef> {
         None
     }
+
+    /// The settings that say which source a dataset reads, besides its `from`:
+    /// the server, database or other object, each named as the Spicepod names it
+    /// (`pg_host`) with its value as the connector resolves it from `params`,
+    /// including one held in a connection string. Credentials, TLS, timeouts and
+    /// tuning are not part of it, so rotating a password or tuning a batch size
+    /// reads the same source.
+    ///
+    /// An accelerator that keeps an acceleration as a copy in a shared state
+    /// location serves an instance only a copy of the same source.
+    ///
+    /// `Ok(None)`, the default, when the connector does not say which of its
+    /// settings identify the source: every setting the Spicepod sets then counts.
+    /// That never takes one source for another, and treats a changed credential
+    /// or tuning setting as another source.
+    ///
+    /// # Errors
+    ///
+    /// A setting the connector cannot resolve, as building the connector reports it.
+    fn source_identity(
+        &self,
+        _params: &runtime_parameters::Parameters,
+    ) -> Result<Option<Vec<(String, String)>>, String> {
+        Ok(None)
+    }
+}
+
+/// [`DataConnectorFactory::source_identity`] for a connector whose source is
+/// identified by the settings `names` (spec names, without the prefix): each one
+/// set, with its value. An unset one is left out, so setting it is a change.
+#[must_use]
+pub fn source_identity_of(
+    params: &runtime_parameters::Parameters,
+    names: &[&str],
+) -> Vec<(String, String)> {
+    names
+        .iter()
+        .filter_map(|name| {
+            params
+                .get(name)
+                .expose()
+                .ok()
+                .map(|value| (params.user_param(name).to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 /// A `DataConnector` knows how to retrieve and optionally write or stream data.
