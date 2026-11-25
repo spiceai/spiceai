@@ -40,8 +40,9 @@ inputs:
   for-ref:
     description: >-
       The ref of the run that will run the build (`github.ref`). On refs/heads/trunk the build must
-      also be of a commit on trunk: a trunk run's credentials write trunk's keys, so it runs only
-      trunk's builds, and another branch's build runs in a run of that branch. Empty adds no rule.
+      also be trunk's own: a push or schedule run of the trunk branch, or a merge_group run of
+      trunk's queue, of a commit on trunk. A trunk run's credentials write trunk's keys, so it runs
+      only trunk's builds, and another ref's build runs in a run of that ref. Empty adds no rule.
     required: false
     default: ''
 
@@ -170,6 +171,14 @@ runs:
           refuse "was built from $head_branch, not trunk, a release branch or a release tag"
         fi
         if [ "$FOR_REF" = refs/heads/trunk ]; then
+          # A run of another ref used that ref's caches and store keys, even for a commit on trunk.
+          # A dispatch can run on a tag, and a tag can be called `trunk`, so only a push, a schedule
+          # (default branch only) or a merge_group run of trunk's queue is trunk's.
+          case "$event" in
+            push | schedule) [ "$head_branch" = trunk ] ;;
+            merge_group) [[ "$head_branch" =~ ^gh-readonly-queue/trunk/pr-[0-9]+-[0-9a-f]+$ ]] ;;
+            *) false ;;
+          esac || refuse "is not a push, schedule or merge-queue run of trunk. A trunk run runs only trunk's builds; run this workflow on the ref that built it."
           fetch_branches
           on_branch trunk || refuse "built $head_sha, which is not on trunk. A trunk run runs only trunk's builds; run this workflow on the branch that built it."
         fi

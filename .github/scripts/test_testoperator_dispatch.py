@@ -113,6 +113,11 @@ class TestoperatorDispatchTest(unittest.TestCase):
         self.assertIn('--ref "$RELEASE_BRANCH" -f schedule=release', run)
         self.assertIn("^release/[0-9]+\\.[0-9]+$", run)
 
+    def test_a_scheduled_run_dispatches_no_manual_suite(self):
+        condition = self.jobs["dispatch-input"]["if"]
+        for schedule in ("daily", "weekly", "release"):
+            self.assertIn(f"github.event.inputs.schedule != '{schedule}'", condition)
+
     def test_the_dispatch_job_checks_out_and_reads_only_the_runs_own_branch(self):
         steps = self.jobs["dispatch-scheduled"]["steps"]
         checkout = next(s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@"))

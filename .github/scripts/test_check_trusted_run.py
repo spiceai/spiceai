@@ -8,6 +8,7 @@ from action.yml, against a local Git server holding trunk and a release branch a
 `gh` that answers the run lookup, so nothing reaches GitHub.
 """
 
+import json
 import os
 import subprocess
 import tempfile
@@ -99,6 +100,8 @@ class CheckTrustedRunTest(unittest.TestCase):
             ("merge_group", queue, self.trunk, True),
             ("push", "release/1.0", self.release, False),
             ("merge_group", queue, self.release, False),
+            # Another ref's run of a trunk commit used that ref's caches and store keys.
+            ("push", "release/1.0", self.trunk, False),
         ):
             with self.subTest(event=event, branch=branch, sha=sha):
                 proc = self.check(event, branch, sha, "refs/heads/trunk")
@@ -106,7 +109,7 @@ class CheckTrustedRunTest(unittest.TestCase):
                     self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 else:
                     self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-                    self.assertIn("which is not on trunk. A trunk run runs only trunk's builds", proc.stdout)
+                    self.assertIn("A trunk run runs only trunk's builds", proc.stdout)
 
     def test_another_ref_keeps_the_trusted_builds_it_had(self):
         for for_ref in ("", "refs/heads/release/1.0", "refs/heads/feature"):
@@ -120,11 +123,13 @@ class CheckTrustedRunTest(unittest.TestCase):
         self.assertIn("not trunk, a release branch or a release tag", proc.stdout)
 
 
-# trunk_tests's lookups: a branch's head, and no E2E Test CI run that holds its build.
+# trunk_tests's lookups: a branch's head, the E2E Test CI runs of a commit ($RUNS_JSON), and
+# each run's artifacts: every run holds a build.
 FAKE_TRUNK_TESTS_GH = """#!/usr/bin/env bash
 case "$*" in
-  *branches/*) echo "$BRANCH_SHA" ;;
-  *actions/workflows/*) ;;
+  *branches/* | *commits/trunk*) echo "$BRANCH_SHA" ;;
+  *actions/workflows/*) cat "$RUNS_JSON" ;;
+  *actions/runs/*/artifacts*) echo build_linux_x86_64 ;;
   *) echo "unexpected gh call: $*" >&2; exit 1 ;;
 esac
 """
@@ -133,7 +138,7 @@ esac
 class TrunkTestsBranchTest(unittest.TestCase):
     """trunk_tests tests a release branch's head only in a run on that branch."""
 
-    def find(self, github_ref, branch):
+    def find(self, github_ref, branch, runs=()):
         steps = yaml.safe_load(TRUNK_TESTS.read_text())["jobs"]["resolve"]["steps"]
         script = next(s for s in steps if s.get("id") == "build")["run"]
         with tempfile.TemporaryDirectory() as tmp:
@@ -144,7 +149,10 @@ class TrunkTestsBranchTest(unittest.TestCase):
             (work / "step.sh").write_text(script)
             output = work / "github_output"
             output.write_text("")
+            (work / "runs.json").write_text(json.dumps({"workflow_runs": [
+                {"id": run_id, "event": event, "head_branch": head_branch} for run_id, event, head_branch in runs]}))
             env = {
+                "RUNS_JSON": str(work / "runs.json"),
                 "PATH": f"{work / 'bin'}{os.pathsep}{os.environ['PATH']}",
                 "HOME": str(work),
                 "GITHUB_OUTPUT": str(output),
@@ -167,6 +175,21 @@ class TrunkTestsBranchTest(unittest.TestCase):
         proc, output = self.find("refs/heads/release/1.0", "release/1.0")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn(f"sha={'a' * 40}", output)
+
+    def test_the_build_it_finds_is_a_run_of_the_branch_under_test(self):
+        # Runs of the same commit, newest first: another branch's push and merge queue, then this
+        # branch's merge queue.
+        runs = ((3, "push", "release/1.0"), (2, "merge_group", "gh-readonly-queue/release/1.0/pr-1-abc"),
+                (1, "merge_group", "gh-readonly-queue/trunk/pr-9-abc"), (0, "push", "trunk"))
+        proc, output = self.find("refs/heads/trunk", "", runs)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("run=1\n", output)
+        proc, output = self.find("refs/heads/release/1.0", "release/1.0", runs)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("run=3\n", output)
+        proc, output = self.find("refs/heads/trunk", "", ((3, "push", "release/1.0"), (4, "push", "feature")))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("run=\n", output)
 
 
 if __name__ == "__main__":

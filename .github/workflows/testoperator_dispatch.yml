@@ -415,9 +415,10 @@ jobs:
             "$SPICEPOD_VALIDATOR" "$file"
           done
 
-      # This workflow is trunk's, but the release job checks out the release branch, which can predate
-      # the SF10 memory-mode config (release/2.4 does). Trunk must carry it; a release branch without
-      # it skips only this config and still runs the rest of its suite.
+      # A release branch runs its own copy of this workflow, which can predate the SF10 memory-mode
+      # config, and a release branch cut before the config was added lacks its files. Trunk must
+      # carry it; a release branch without it skips only this config and still runs the rest of its
+      # suite.
       - name: Check for the TPCH SF10 memory-mode config
         id: sf10-memory
         if: ${{ steps.benchmarked.outputs.skip != 'true' }}
@@ -621,7 +622,7 @@ jobs:
       contents: read
       actions: write  # dispatches the benchmark workflows
       id-token: write  # RustFS credentials
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.schedule != 'daily' && github.event.inputs.schedule != 'weekly' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.schedule != 'daily' && github.event.inputs.schedule != 'weekly' && github.event.inputs.schedule != 'release' }}
     concurrency:
       group: testoperator-dispatch-${{ github.event.ref }}
       cancel-in-progress: false

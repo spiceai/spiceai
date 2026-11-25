@@ -133,8 +133,11 @@ jobs:
               sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/trunk" -q .sha)
             fi
             run=""
+            # A run of the branch under test, or of its merge queue: a run of another ref with the
+            # same commit used that ref's caches and store keys.
+            own="${BRANCH:-trunk}"
             for id in $(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/e2e_test_ci.yml/runs?head_sha=$sha&per_page=20" \
-                -q '.workflow_runs[] | select(.event == "merge_group" or .event == "push") | .id'); do
+                | jq -r --arg own "$own" '.workflow_runs[] | select((.event == "push" and .head_branch == $own) or (.event == "merge_group" and (.head_branch | startswith("gh-readonly-queue/" + $own + "/")))) | .id'); do
               if holds_build "$id"; then run="$id"; break; fi
             done
             if [ -n "$run" ]; then
