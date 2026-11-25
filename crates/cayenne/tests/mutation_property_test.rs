@@ -345,7 +345,9 @@ async fn create_table_with_retention(
     let table = Arc::new(
         fixture
             .data_store
-            .create_with_retention(catalog, ctx.runtime_env(), opts, retention)
+            .create_with(catalog, ctx.runtime_env(), opts, |builder| {
+                builder.with_retention_filters(retention)
+            })
             .await?,
     );
     if durability == Durability::Memory {
