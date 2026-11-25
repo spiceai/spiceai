@@ -2213,6 +2213,15 @@ pub enum ScanViewReuse {
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CurrentScanView;
 
+/// Session config extension marking a maintenance pass's read of files that the
+/// pass replaces. Such a scan collects its files' statistics but does not
+/// persist them: once the pass publishes, no scan reads a replaced file's row,
+/// and each row is a metastore commit that the table's writers would wait
+/// behind. A query that joins such a collection shares its answer unpersisted,
+/// so a later process reads that file's footer instead.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ReplacedFilesScan;
+
 /// Demand-driven cache of [`ScanView`] bundles, keyed by scan-visible identity.
 /// Replaces the per-scan merge-on-read memos: a bundle is built only for a
 /// version a scan actually queries (build-only-what's-queried), which relieves the
@@ -33748,7 +33757,11 @@ impl CayenneTableProvider {
         if let Some(store_config) = self.object_store_config.as_ref() {
             self.register_object_store_for_runtime(&runtime_env, store_config);
         }
-        SessionContext::new_with_config_rt(config, runtime_env)
+        // Every pass that scans through this session replaces the files it scans.
+        SessionContext::new_with_config_rt(
+            config.with_extension(Arc::new(ReplacedFilesScan)),
+            runtime_env,
+        )
     }
 
     /// Wrap a plan with a `FilterExec` that enforces the retention filter.
@@ -45944,8 +45957,14 @@ impl CayenneTableProvider {
                 .await?,
         );
 
-        if let Some(blob) =
-            crate::stats::statistics_to_persisted_blob(statistics.as_ref(), table_schema)
+        let persist = request
+            .state
+            .config()
+            .get_extension::<ReplacedFilesScan>()
+            .is_none();
+        if persist
+            && let Some(blob) =
+                crate::stats::statistics_to_persisted_blob(statistics.as_ref(), table_schema)
         {
             let num_rows = match statistics.num_rows {
                 DFPrecision::Exact(rows) | DFPrecision::Inexact(rows) => {
