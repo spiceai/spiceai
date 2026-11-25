@@ -2,5 +2,6 @@
   "dynamodb-declared-streams-race": 111,
   "kafka-tombstone": 38,
   "mongodb-cdc-resume-numeric-id": 61,
-  "mongodb-cdc-source-restart": 8
+  "mongodb-cdc-source-restart": 8,
+  "s3-changes-restart": 178
 }

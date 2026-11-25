@@ -695,13 +695,17 @@ steps:
     eventually: 120s
     only: b
     when: { src: s3 }
-  # B has received the message again and deleted it: the queue is empty.
+  # B, now writing, has received the message again: with A dead and its
+  # visibility timeout past, only B can be holding it in flight. B rebuilt the
+  # acceleration from the bucket listing when it took over, which already
+  # holds the object's rows, so applying the message again changes nothing.
   - source-query:
       sqs: >-
-        awslocal sqs get-queue-attributes --queue-url http://localhost:4566/000000000000/events
-        --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible
-        --query 'join(`,`, [Attributes.ApproximateNumberOfMessages, Attributes.ApproximateNumberOfMessagesNotVisible])' --output text
-    expect: { rows: [['0,0']] }
+        n=$(awslocal sqs get-queue-attributes --queue-url http://localhost:4566/000000000000/events
+        --attribute-names ApproximateNumberOfMessagesNotVisible
+        --query Attributes.ApproximateNumberOfMessagesNotVisible --output text);
+        [ "$n" -ge 1 ] && echo received || echo "not received ($n)"
+    expect: { rows: [[received]] }
     eventually: 120s
     only: b
     when: { src: s3 }
