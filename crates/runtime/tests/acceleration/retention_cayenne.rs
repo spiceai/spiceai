@@ -619,6 +619,7 @@ async fn cayenne_partitioned_file_mode_applies_retention_sql_in_every_partition(
             let mut rows = INITIAL_ROWS.to_vec();
             rows.push(ADDED_ROW);
             write_source(&source, &rows)?;
+            trigger_refresh(&rt, PART_TABLE).await?;
 
             let expected: Vec<(i64, i64)> = rows
                 .iter()
