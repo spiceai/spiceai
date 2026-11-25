@@ -3651,7 +3651,7 @@ steps:
             ),
             (
                 "{ queries: [SELECT 1], duration: 5s, recover-within: 1s, faults: [{ at: 1s, query: SELECT 1 }] }",
-                "a fault runs one of start, stop, kill-spiced, restart, upgrade, wait-ready, kill-executor, start-executors, add-executor, not `query`",
+                "a fault runs one of start, stop, kill-spiced, restart, upgrade, downgrade, wait-ready, kill-executor, start-executors, add-executor, not `query`",
             ),
             (
                 "{ queries: [SELECT 1], duration: 5s, recover-within: 1s, faults: [{ kill-executor: 0 }] }",
