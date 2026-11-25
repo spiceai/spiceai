@@ -125,6 +125,14 @@ pub enum Error {
         table_url: String,
         source: object_store::Error,
     },
+
+    #[snafu(display(
+        "Failed to load Delta Lake table '{table_url}': the load stopped before it finished ({source}). Restart Spice to retry. If it recurs, report it at https://github.com/spiceai/spiceai/issues"
+    ))]
+    LoadTaskFailed {
+        table_url: String,
+        source: tokio::task::JoinError,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -167,7 +175,8 @@ impl Read for DeltaTableFactory {
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let delta_path = table_reference.table().to_string();
-        let delta: DeltaTable = DeltaTable::from(delta_path, self.params.clone(), &self.io_runtime)
+        let delta: DeltaTable = DeltaTable::open(delta_path, self.params.clone(), &self.io_runtime)
+            .await
             .boxed()?
             .with_table_parquet_options(self.table_parquet_options.clone());
         Ok(Arc::new(delta))
@@ -192,7 +201,42 @@ pub struct DeltaTable {
 }
 
 impl DeltaTable {
-    pub fn from(
+    /// Opens the Delta table at `table_location`.
+    ///
+    /// Reading the Delta log blocks the calling thread until the reads finish
+    /// (delta-kernel waits on its own background runtime), so the load runs on
+    /// the blocking pool. On a Tokio worker it would stall every task queued
+    /// behind it, including the tasks that drive the worker's I/O.
+    pub async fn open(
+        table_location: String,
+        options: HashMap<String, SecretString>,
+        io_runtime: &Handle,
+    ) -> Result<Self> {
+        let table_url = table_location.clone();
+        let io_runtime = io_runtime.clone();
+        tokio::task::spawn_blocking(move || Self::from(table_location, options, &io_runtime))
+            .await
+            .context(LoadTaskFailedSnafu { table_url })?
+    }
+
+    /// Opens the Delta table at `table_location` through a pre-built object
+    /// store, bypassing the credential resolution in [`DeltaTable::open`].
+    ///
+    /// Used by Unity Catalog credential vending, where the store
+    /// authenticates with vended, refresh-aware credentials. Like
+    /// [`DeltaTable::open`], the blocking Delta log read runs on the blocking pool.
+    pub async fn open_with_object_store(
+        table_location: String,
+        object_store: Arc<dyn object_store::ObjectStore>,
+    ) -> Result<Self> {
+        let table_url = table_location.clone();
+        tokio::task::spawn_blocking(move || Self::from_object_store(table_location, object_store))
+            .await
+            .context(LoadTaskFailedSnafu { table_url })?
+    }
+
+    /// Blocks until the Delta log is read; async callers use [`DeltaTable::open`].
+    fn from(
         table_location: String,
         options: HashMap<String, SecretString>,
         io_runtime: &Handle,
@@ -292,12 +336,9 @@ impl DeltaTable {
         Ok((parquet_store, engine))
     }
 
-    /// Creates a `DeltaTable` backed by a pre-built object store, bypassing
-    /// the credential resolution in [`DeltaTable::from`].
-    ///
-    /// Used by Unity Catalog credential vending, where the store
-    /// authenticates with vended, refresh-aware credentials.
-    pub fn from_object_store(
+    /// Blocks until the Delta log is read; async callers use
+    /// [`DeltaTable::open_with_object_store`].
+    fn from_object_store(
         table_location: String,
         object_store: Arc<dyn object_store::ObjectStore>,
     ) -> Result<Self> {
