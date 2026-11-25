@@ -315,7 +315,10 @@ async fn test_warm_tier_normalized_clustering_prunes_both_dimensions_impl(
         table.effective_sort_columns_for_rewrite().is_empty(),
         "automatic/inferred sort columns must be disabled by explicit cluster_by"
     );
-    table.sort_and_rewrite_data(1024 * 1024).await?;
+    assert!(
+        table.force_full_compaction().await?,
+        "the full compaction must commit"
+    );
 
     let all_files = planned_files_for(&ctx, "SELECT id FROM warm_cluster_prune_t").await?;
     assert!(

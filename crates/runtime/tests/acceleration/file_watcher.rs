@@ -29,7 +29,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::{
-    acceleration::get_params,
     configure_test_datafusion, init_tracing,
     utils::{runtime_ready_check, test_request_context},
 };
@@ -44,6 +43,24 @@ fn get_dataset() -> Dataset {
 
 const NAMES_CSV: &str = include_str!("data/names.csv");
 
+/// A Cayenne file acceleration whose data directory and metastore both live under
+/// `store`, so tests that run at once never share either, with the file watcher on.
+fn cayenne_watcher_params(store: &Path) -> Params {
+    Params::from_string_map(
+        [
+            ("cayenne_file_path", store.join("data")),
+            ("cayenne_metadata_dir", store.join("cayenne_metadata")),
+        ]
+        .into_iter()
+        .map(|(key, path)| (key.to_string(), path.display().to_string()))
+        .chain(std::iter::once((
+            "file_watcher".to_string(),
+            "enabled".to_string(),
+        )))
+        .collect(),
+    )
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_file_watcher() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -53,21 +70,12 @@ async fn test_file_watcher() -> Result<(), anyhow::Error> {
             // Write the CSV to a file next to the test binary
             std::fs::write("./test_file_watcher.csv", NAMES_CSV).expect("write file");
 
+            let store = tempfile::tempdir().expect("create acceleration directory");
             let mut dataset = get_dataset();
-            let params = get_params(
-                &Mode::File,
-                Some("./test_file_watcher.db".to_string()),
-                "sqlite",
-            )
-            .map(|params| {
-                let mut map = params.as_string_map();
-                map.insert("file_watcher".to_string(), "enabled".to_string());
-                Params::from_string_map(map)
-            });
             dataset.acceleration = Some(Acceleration {
-                params,
+                params: Some(cayenne_watcher_params(store.path())),
                 enabled: true,
-                engine: Some("sqlite".to_string()),
+                engine: Some("cayenne".to_string()),
                 mode: Mode::File,
                 refresh_mode: Some(RefreshMode::Full),
                 refresh_sql: None,
@@ -150,9 +158,6 @@ async fn test_file_watcher() -> Result<(), anyhow::Error> {
             drop(rt);
 
             // Remove the files
-            std::fs::remove_file("./test_file_watcher.db").expect("remove file");
-            let _ = std::fs::remove_file("./test_file_watcher.db-shm");
-            let _ = std::fs::remove_file("./test_file_watcher.db-wal");
             std::fs::remove_file("./test_file_watcher.csv").expect("remove file");
 
             Ok(())
@@ -160,18 +165,12 @@ async fn test_file_watcher() -> Result<(), anyhow::Error> {
         .await
 }
 
-fn watcher_dataset(csv_path: &Path, db_path: &Path) -> Dataset {
+fn watcher_dataset(csv_path: &Path, store: &Path) -> Dataset {
     let mut dataset = Dataset::new(format!("file://{}", csv_path.display()), "names");
-    let params =
-        get_params(&Mode::File, Some(db_path.display().to_string()), "sqlite").map(|params| {
-            let mut map = params.as_string_map();
-            map.insert("file_watcher".to_string(), "enabled".to_string());
-            Params::from_string_map(map)
-        });
     dataset.acceleration = Some(Acceleration {
-        params,
+        params: Some(cayenne_watcher_params(store)),
         enabled: true,
-        engine: Some("sqlite".to_string()),
+        engine: Some("cayenne".to_string()),
         mode: Mode::File,
         refresh_mode: Some(RefreshMode::Full),
         refresh_sql: None,
@@ -182,11 +181,11 @@ fn watcher_dataset(csv_path: &Path, db_path: &Path) -> Dataset {
 
 async fn start_watcher_runtime(
     csv_path: &Path,
-    db_path: &Path,
+    store: &Path,
 ) -> Result<Arc<Runtime>, anyhow::Error> {
     std::fs::write(csv_path, NAMES_CSV).expect("write file");
     let app = AppBuilder::new("test_file_watcher")
-        .with_dataset(watcher_dataset(csv_path, db_path))
+        .with_dataset(watcher_dataset(csv_path, store))
         .build();
     configure_test_datafusion();
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
@@ -248,8 +247,9 @@ async fn test_file_watcher_atomic_replace_then_append() -> Result<(), anyhow::Er
         .scope(async {
             let dir = tempfile::tempdir().expect("tempdir");
             let csv_path = dir.path().join("names.csv");
-            let db_path = dir.path().join("names.db");
-            let rt = start_watcher_runtime(&csv_path, &db_path).await?;
+            let store_dir = tempfile::tempdir().expect("create acceleration directory");
+            let store = store_dir.path().to_path_buf();
+            let rt = start_watcher_runtime(&csv_path, &store).await?;
             wait_for_row_count(&rt, 10).await?;
 
             let tmp = dir.path().join("names.csv.tmp");
@@ -278,8 +278,9 @@ async fn test_file_watcher_trailing_debounce_keeps_burst_appends() -> Result<(),
         .scope(async {
             let dir = tempfile::tempdir().expect("tempdir");
             let csv_path = dir.path().join("names.csv");
-            let db_path = dir.path().join("names.db");
-            let rt = start_watcher_runtime(&csv_path, &db_path).await?;
+            let store_dir = tempfile::tempdir().expect("create acceleration directory");
+            let store = store_dir.path().to_path_buf();
+            let rt = start_watcher_runtime(&csv_path, &store).await?;
             wait_for_row_count(&rt, 10).await?;
 
             let mut expected = 10usize;
@@ -316,8 +317,9 @@ async fn test_file_watcher_large_inplace_rewrite() -> Result<(), anyhow::Error> 
         .scope(async {
             let dir = tempfile::tempdir().expect("tempdir");
             let csv_path = dir.path().join("names.csv");
-            let db_path = dir.path().join("names.db");
-            let rt = start_watcher_runtime(&csv_path, &db_path).await?;
+            let store_dir = tempfile::tempdir().expect("create acceleration directory");
+            let store = store_dir.path().to_path_buf();
+            let rt = start_watcher_runtime(&csv_path, &store).await?;
             wait_for_row_count(&rt, 10).await?;
 
             for n in [3usize, 20, 7] {
@@ -344,9 +346,10 @@ async fn test_file_watcher_symlink_to_another_directory() -> Result<(), anyhow::
             std::fs::write(&real, NAMES_CSV).expect("write target");
             let csv_path = dir.path().join("names.csv");
             std::os::unix::fs::symlink(&real, &csv_path).expect("symlink dataset path");
-            let db_path = dir.path().join("names.db");
+            let store_dir = tempfile::tempdir().expect("create acceleration directory");
+            let store = store_dir.path().to_path_buf();
             // `start_watcher_runtime` writes through the symlink onto the target.
-            let rt = start_watcher_runtime(&csv_path, &db_path).await?;
+            let rt = start_watcher_runtime(&csv_path, &store).await?;
             wait_for_row_count(&rt, 10).await?;
 
             std::fs::OpenOptions::new()

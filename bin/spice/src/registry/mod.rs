@@ -20,6 +20,7 @@ limitations under the License.
 //! - Local file system paths
 //! - Spicerack.org (spicepod registry)
 
+mod install_dir;
 mod local_file;
 mod spicerack;
 
@@ -87,6 +88,25 @@ pub enum Error {
     /// Zip extraction error
     #[snafu(display("Failed to extract Spicepod archive: {source}"))]
     ZipExtraction { source: zip::result::ZipError },
+
+    /// The registry's archive is larger, or expands larger, than a Spicepod package may be
+    #[snafu(display(
+        "Failed to install Spicepod '{pod}' from spicerack.org: the archive {reason}, so nothing was installed. Check the Spicepod name and retry, or install from a local path with `spice add <path>`. See: https://spiceai.org/docs/cli/reference/add"
+    ))]
+    ArchiveLimitExceeded { pod: String, reason: String },
+
+    /// The install directory, or a directory inside it, is a symbolic link
+    #[snafu(display(
+        "Failed to install Spicepod '{pod}' from spicerack.org: '{path}' is a symbolic link, so the package would be written outside the Spicepod directory and nothing was installed. Replace the link with a directory, or remove it, and run `spice add` again. See: https://spiceai.org/docs/cli/reference/add"
+    ))]
+    LinkedInstallPath { pod: String, path: String },
+
+    /// The registry's archive names a file outside the Spicepod directory. The
+    /// published package itself is malformed, so retrying cannot help.
+    #[snafu(display(
+        "Failed to install Spicepod '{pod}' from spicerack.org: its entry '{entry}' is outside the Spicepod directory, so the package cannot be installed and nothing was installed. Report it to the Spicepod's publisher, or install from a local path with `spice add <path>`. See: https://spiceai.org/docs/cli/reference/add"
+    ))]
+    UnsafeArchiveEntry { pod: String, entry: String },
 }
 
 /// Fetch a Spicepod from the appropriate registry.

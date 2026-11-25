@@ -16,7 +16,8 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 
-//! Integration tests for `CayenneTableProvider::sort_and_rewrite_data`.
+//! Integration tests for the full compaction's sorted rewrite, driven through
+//! `CayenneTableProvider::force_full_compaction`.
 //!
 //! These tests exercise the full sort-and-rewrite pipeline:
 //! 1. Read all data from the current listing table
@@ -56,11 +57,27 @@ async fn create_sorted_table(
     sort_columns: Vec<String>,
     runtime_env: Arc<RuntimeEnv>,
 ) -> Arc<CayenneTableProvider> {
-    let vortex_config = VortexConfig {
-        sort_columns,
-        ..VortexConfig::default()
-    };
+    create_table_with_config(
+        fixture,
+        table_name,
+        schema,
+        VortexConfig {
+            sort_columns,
+            ..VortexConfig::default()
+        },
+        runtime_env,
+    )
+    .await
+}
 
+/// [`create_sorted_table`] with a caller-chosen `VortexConfig`.
+async fn create_table_with_config(
+    fixture: &common::TestFixture,
+    table_name: &str,
+    schema: Arc<Schema>,
+    vortex_config: VortexConfig,
+    runtime_env: Arc<RuntimeEnv>,
+) -> Arc<CayenneTableProvider> {
     let context = CayenneContext::new(
         &vortex_config,
         Arc::clone(&runtime_env),
@@ -222,10 +239,13 @@ async fn test_sort_rewrite_basic_impl(
     .await;
 
     // Sort and rewrite
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("sort_and_rewrite_data should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("full compaction should succeed"),
+        "the full compaction must commit"
+    );
 
     // Verify data is sorted (query without ORDER BY to check physical sort order)
     let results = query_all(&ctx, &table, "sort_basic").await;
@@ -270,10 +290,13 @@ async fn test_sort_rewrite_multiple_inserts_impl(
     sql_insert(&table, "sort_multi", "(10, 'batch3_a'), (80, 'batch3_b')").await;
 
     // Sort and rewrite
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("sort_and_rewrite_data should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("full compaction should succeed"),
+        "the full compaction must commit"
+    );
 
     let results = query_all(&ctx, &table, "sort_multi").await;
     assert_eq!(total_rows(&results), 6, "should have 6 rows");
@@ -332,10 +355,13 @@ async fn test_sort_rewrite_with_nulls_impl(
     )
     .await;
 
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("sort_and_rewrite_data should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("full compaction should succeed"),
+        "the full compaction must commit"
+    );
 
     let results = query_all(&ctx, &table, "sort_nulls").await;
     assert_eq!(total_rows(&results), 5, "should have 5 rows");
@@ -382,20 +408,26 @@ async fn test_sort_rewrite_idempotent_impl(
     .await;
 
     // First sort
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("first sort should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("first sort should succeed"),
+        "the full compaction must commit"
+    );
 
     let after_first = query_all(&ctx, &table, "sort_idem").await;
     let ids_first = collect_i64_column(&after_first, "id");
     let data_first = collect_string_column(&after_first, "data");
 
     // Second sort (already sorted)
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("second sort should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("second sort should succeed"),
+        "the full compaction must commit"
+    );
 
     let after_second = query_all(&ctx, &table, "sort_idem").await;
     let ids_second = collect_i64_column(&after_second, "id");
@@ -432,10 +464,13 @@ async fn test_sort_rewrite_empty_table_impl(
     )
     .await;
 
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("sort on empty table should succeed");
+    assert!(
+        !table
+            .force_full_compaction()
+            .await
+            .expect("full compaction of an empty table should succeed"),
+        "an empty table has nothing to compact"
+    );
 
     let results = query_all(&ctx, &table, "sort_empty").await;
     assert_eq!(total_rows(&results), 0, "empty table should stay empty");
@@ -467,10 +502,13 @@ async fn test_sort_rewrite_snapshot_changes_impl(
     let metadata_before = table.metadata().clone();
     let snapshot_before = metadata_before.current_snapshot_id.clone();
 
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("sort should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("sort should succeed"),
+        "the full compaction must commit"
+    );
 
     // The snapshot should have changed (new UUID)
     let catalog = table.catalog();
@@ -516,10 +554,13 @@ async fn test_sort_rewrite_then_insert_impl(
     sql_insert(&table, "sort_then_ins", "(30, 'c'), (10, 'a'), (20, 'b')").await;
 
     // Sort
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("sort should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("sort should succeed"),
+        "the full compaction must commit"
+    );
 
     // Insert more data after sort
     sql_insert(&table, "sort_then_ins", "(5, 'pre'), (25, 'mid')").await;
@@ -548,48 +589,97 @@ async fn test_sort_rewrite_then_insert_impl(
 
 test_with_backends!(test_sort_rewrite_orders_nulls_and_duplicates_across_files_impl);
 
-/// Sort-rewrite sorts each scan partition on its own and merges them. With a
-/// nullable, heavily duplicated key spread over several input files and a small
-/// target size (so the output spans many files), the written order must still
-/// be one ascending, NULLs-last sequence holding every input row exactly once.
+/// The full compaction sorts each scan partition on its own and merges them.
+/// With a nullable, heavily duplicated key spread over several input files and
+/// a 1 MB target file size (so the output rolls over into several files), the
+/// written order must be one ascending, NULLs-last sequence across every file
+/// boundary, holding every input row exactly once.
 async fn test_sort_rewrite_orders_nulls_and_duplicates_across_files_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use arrow::array::BinaryArray;
+    use common::lookup_index::SplitMix64;
+
+    /// Bytes of seeded random padding per row: incompressible, so a 1 MB file
+    /// holds about 5,000 rows and the 30,000 rows below span several files.
+    const PAD_BYTES: usize = 200;
+    const INSERTS: i64 = 6;
+    const ROWS_PER_INSERT: i64 = 5_000;
+
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("k", DataType::Int64, true),
+        Field::new("pad", DataType::Binary, false),
     ]));
     let setup_ctx = SessionContext::new();
-    let table = create_sorted_table(
+    let table = create_table_with_config(
         &fixture,
         "sort_nulls_files",
         Arc::clone(&schema),
-        vec!["k".to_string()],
+        VortexConfig {
+            sort_columns: vec!["k".to_string()],
+            target_vortex_file_size_mb: 1,
+            ..VortexConfig::default()
+        },
         setup_ctx.runtime_env(),
     )
     .await;
 
-    // 6 inserts (6 files) of 2,000 rows; every insert spans the whole key range.
+    // 6 inserts (6 input files); every insert spans the whole key range.
     let key = |id: i64| (id % 37 != 0).then(|| (id * 7_919) % 500);
+    let mut rng = SplitMix64(0x5EED_F11E_5000);
     let mut expected: Vec<(Option<i64>, i64)> = Vec::new();
-    for file in 0..6_i64 {
-        let values: Vec<String> = (0..2_000_i64)
-            .map(|i| {
-                let id = i * 6 + file;
-                expected.push((key(id), id));
-                match key(id) {
-                    Some(k) => format!("({id}, {k})"),
-                    None => format!("({id}, NULL)"),
-                }
+    for file in 0..INSERTS {
+        let ids: Vec<i64> = (0..ROWS_PER_INSERT).map(|i| i * INSERTS + file).collect();
+        let keys: Vec<Option<i64>> = ids.iter().map(|&id| key(id)).collect();
+        let pads: Vec<Vec<u8>> = ids
+            .iter()
+            .map(|_| {
+                (0..PAD_BYTES / 8)
+                    .flat_map(|_| rng.next_u64().to_le_bytes())
+                    .collect()
             })
             .collect();
-        sql_insert(&table, "sort_nulls_files", &values.join(", ")).await;
+        expected.extend(keys.iter().copied().zip(ids.iter().copied()));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int64Array::from(keys)),
+                Arc::new(BinaryArray::from_iter_values(pads.iter())),
+            ],
+        )?;
+        common::insert_batch(&table, batch).await?;
     }
 
     // The second pass reads the snapshot the first attested as sorted; it must
     // write the same single order again.
-    table.sort_and_rewrite_data(64 * 1024).await?;
-    table.sort_and_rewrite_data(64 * 1024).await?;
+    for pass in ["first", "second"] {
+        assert!(table.force_full_compaction().await?, "{pass} pass commits");
+        let files = file_key_ranges(&fixture, &table).await;
+        assert!(
+            files.len() >= 3,
+            "the {pass} pass must roll over into several files, so the order is \
+             checked across file boundaries: {files:?}"
+        );
+        for pair in files.windows(2) {
+            let (prev, next) = (&pair[0], &pair[1]);
+            assert!(
+                prev.nulls == 0 || next.min.is_none(),
+                "NULLs sort last, so only files after one holding NULLs may hold them, \
+                 and those hold nothing else: {files:?}"
+            );
+            if let (Some(prev_max), Some(next_min)) = (prev.max, next.min) {
+                assert!(
+                    prev_max <= next_min,
+                    "{} (max {prev_max}) must end at or before {} (min {next_min}) begins: \
+                     {files:?}",
+                    prev.name,
+                    next.name
+                );
+            }
+        }
+    }
 
     // One partition reads the snapshot's files in order as a single stream, so
     // this is the physical order the rewrite wrote.
@@ -671,10 +761,13 @@ async fn test_sort_rewrite_large_dataset_impl(
     }
 
     // Sort and rewrite
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("sort should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("sort should succeed"),
+        "the full compaction must commit"
+    );
 
     let results = query_all(&ctx, &table, "sort_large").await;
     assert_eq!(total_rows(&results), 500, "should have 500 rows");
@@ -734,10 +827,13 @@ async fn test_sort_rewrite_multi_column_sort_impl(
     .await;
 
     // Sort and rewrite
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("multi-column sort should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("multi-column sort should succeed"),
+        "the full compaction must commit"
+    );
 
     let results = query_all(&ctx, &table, "sort_multi_col").await;
     assert_eq!(total_rows(&results), 6, "should have 6 rows");
@@ -814,10 +910,13 @@ async fn test_sort_rewrite_reopen_table_impl(
     sql_insert(&table, "sort_reopen", "(30, 'c'), (10, 'a'), (20, 'b')").await;
 
     // Sort and rewrite
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("sort should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("sort should succeed"),
+        "the full compaction must commit"
+    );
 
     // Drop the provider and re-open from catalog
     drop(table);
@@ -883,10 +982,13 @@ async fn test_sort_rewrite_duplicate_values_impl(
     )
     .await;
 
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("sort with duplicates should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("sort with duplicates should succeed"),
+        "the full compaction must commit"
+    );
 
     let results = query_all(&ctx, &table, "sort_dups").await;
     assert_eq!(total_rows(&results), 6, "all 6 rows should be preserved");
@@ -920,4 +1022,138 @@ async fn test_sort_rewrite_duplicate_values_impl(
     );
 
     Ok(())
+}
+
+test_with_backends!(test_sort_rewrite_waits_for_a_running_compaction_impl);
+
+/// A forced full compaction waits for a compaction pass already holding the
+/// table rather than running beside it. Two passes over the same snapshot would
+/// race: the one that committed second would find its snapshot replaced and
+/// discard its output, so the table would keep whichever layout landed first.
+async fn test_sort_rewrite_waits_for_a_running_compaction_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+    let ctx = SessionContext::new();
+    let table = create_sorted_table(
+        &fixture,
+        "sort_waits",
+        Arc::clone(&schema),
+        vec!["id".to_string()],
+        ctx.runtime_env(),
+    )
+    .await;
+    sql_insert(&table, "sort_waits", "(3), (1), (2)").await;
+    let snapshot_before = table.current_snapshot_id();
+
+    // Stand in for a compaction pass: hold the table's compaction lock.
+    let compaction = table.hold_compaction().await;
+    let rewriting = Arc::clone(&table);
+    let mut rewrite = tokio::spawn(async move {
+        rewriting
+            .force_full_compaction()
+            .await
+            .map_err(|e| e.to_string())
+    });
+
+    // A rewrite of three rows that did not wait would finish well inside this
+    // bound; one that waits cannot finish at all while the lock is held.
+    let finished_while_held =
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut rewrite).await;
+    assert!(
+        finished_while_held.is_err(),
+        "the rewrite must wait for the compaction holding the table, but it finished \
+         with {finished_while_held:?}"
+    );
+    assert_eq!(
+        table.current_snapshot_id(),
+        snapshot_before,
+        "the rewrite must not commit while a compaction holds the table"
+    );
+
+    drop(compaction);
+    let committed = tokio::time::timeout(std::time::Duration::from_secs(60), rewrite)
+        .await
+        .expect("the rewrite finishes once the compaction releases the table")
+        .expect("rewrite task")
+        .expect("force_full_compaction");
+    assert!(committed, "the full compaction must commit");
+
+    assert_ne!(
+        table.current_snapshot_id(),
+        snapshot_before,
+        "the rewrite commits once it holds the table"
+    );
+    let results = query_all(&ctx, &table, "sort_waits").await;
+    assert_eq!(collect_i64_column(&results, "id"), vec![1, 2, 3]);
+
+    Ok(())
+}
+
+/// The footer statistics of `k` in one data file of a table's current snapshot.
+#[derive(Debug)]
+struct FileKeyRange {
+    name: String,
+    /// `None` when the file holds no non-NULL `k`.
+    min: Option<i64>,
+    max: Option<i64>,
+    nulls: u64,
+}
+
+/// [`FileKeyRange`] of every data file in `table`'s current snapshot, in file
+/// name order, which is the order the rewrite's single writer emitted them.
+async fn file_key_ranges(
+    fixture: &common::TestFixture,
+    table: &Arc<CayenneTableProvider>,
+) -> Vec<FileKeyRange> {
+    use vortex::VortexSessionDefault;
+    use vortex::expr::stats::Stat;
+    use vortex::file::OpenOptionsSessionExt;
+    use vortex_session::VortexSession;
+
+    let dir = fixture
+        .data_path
+        .join(table.table_id())
+        .join(table.current_snapshot_id());
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .expect("read snapshot dir")
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "vortex"))
+        .collect();
+    paths.sort();
+    let column = table.schema().index_of("k").expect("k in schema");
+    let mut ranges = Vec::with_capacity(paths.len());
+    for path in paths {
+        let session = VortexSession::default();
+        let file = session
+            .open_options()
+            .open_path(&path)
+            .await
+            .expect("open data file");
+        let stats = file.file_stats().expect("data file has footer statistics");
+        let (aggregates, dtype) = stats.get(column);
+        let set = aggregates.to_stats_set();
+        let nulls = set
+            .get_as::<u64>(
+                Stat::NullCount,
+                &vortex::dtype::DType::Primitive(
+                    vortex::dtype::PType::U64,
+                    vortex::dtype::Nullability::NonNullable,
+                ),
+            )
+            .into_inner()
+            .expect("footer null count of k");
+        ranges.push(FileKeyRange {
+            name: path
+                .file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .into_owned(),
+            min: set.get_as::<i64>(Stat::Min, dtype).into_inner(),
+            max: set.get_as::<i64>(Stat::Max, dtype).into_inner(),
+            nulls,
+        });
+    }
+    ranges
 }

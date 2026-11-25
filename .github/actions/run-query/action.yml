@@ -44,7 +44,14 @@ runs:
       run: |
         query="${INPUT_QUERY}"
         echo "Executing query: $query"
-        sql_output=$(spice sql <<EOF
+        # Query the runtime at the ports `allocate-spice-ports` exported for this job,
+        # or at spiced's defaults when the job allocated none. `spice sql` queries over
+        # Flight; SPICE_FLIGHT_ENDPOINT is a bare host:port.
+        endpoint_args=(sql)
+        if [[ -n "${SPICE_HTTP_ENDPOINT:-}" && -n "${SPICE_FLIGHT_ENDPOINT:-}" ]]; then
+          endpoint_args=(--http-endpoint "${SPICE_HTTP_ENDPOINT}" sql --endpoint "grpc://${SPICE_FLIGHT_ENDPOINT}")
+        fi
+        sql_output=$(spice "${endpoint_args[@]}" <<EOF
         $query
         .error
         EOF

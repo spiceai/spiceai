@@ -787,8 +787,8 @@ impl Runtime {
             let ds_for_lazy = Arc::clone(&ds);
             let connector_builder: crate::init::dataset_initialization::LazyConnectorBuilder =
                 Box::new(move || {
-                    let runtime = runtime_for_lazy;
-                    let ds = ds_for_lazy;
+                    let runtime = Arc::clone(&runtime_for_lazy);
+                    let ds = Arc::clone(&ds_for_lazy);
                     Box::pin(async move {
                         runtime
                             .get_dataconnector_from_dataset(ds)

@@ -127,9 +127,18 @@ pub struct Args {
     #[arg(long, value_name = "I/N", value_parser = parse_partition)]
     partition: Option<(usize, usize)>,
 
-    /// Cap every wait for a condition (`eventually`, readiness, a refresh)
-    /// at this long, such as `20s`: for scripts expected to fail, which
-    /// otherwise wait out every limit in full.
+    /// Select scripts with any of these tags. Repeat for several tags.
+    #[arg(long, value_enum, value_name = "TAG")]
+    only_tag: Vec<script::Tag>,
+
+    /// Exclude scripts with any of these tags, even when --only-tag matches.
+    #[arg(long, value_enum, value_name = "TAG")]
+    exclude_tag: Vec<script::Tag>,
+
+    /// Cap every check's wait (`eventually`, a refresh) at this long, such
+    /// as `20s`: for scripts expected to fail, which otherwise wait out every
+    /// limit in full. Readiness after start, restart and upgrade keeps its
+    /// own limit (`ready-timeout`, default 3 min).
     #[arg(long = "max-wait", value_name = "DURATION", value_parser = humantime::parse_duration)]
     max_wait: Option<std::time::Duration>,
 
@@ -250,15 +259,21 @@ pub async fn run(cli: Args) -> Result<bool> {
             );
         }
     }
-    if let Some((index, count)) = cli.partition {
-        let share = partition(&scripts, count);
-        (paths, scripts) = paths
-            .into_iter()
-            .zip(scripts)
-            .zip(share)
-            .filter_map(|(pair, share)| (share == index - 1).then_some(pair))
-            .unzip();
+    let selection = select_scripts(&scripts, &cli.only_tag, &cli.exclude_tag, cli.partition);
+    if !cli.only_tag.is_empty() || !cli.exclude_tag.is_empty() {
+        let selected = selection.as_ref().map_or(0, |(_, count)| *count);
+        eprintln!(
+            "Tag filter selected {selected} of {} scripts",
+            scripts.len()
+        );
     }
+    let (indices, _) = selection?;
+    (paths, scripts) = paths
+        .into_iter()
+        .zip(scripts)
+        .enumerate()
+        .filter_map(|(i, pair)| indices.contains(&i).then_some(pair))
+        .unzip();
     if cli.check {
         return check(&paths, &scripts);
     }
@@ -712,25 +727,68 @@ fn parse_partition(text: &str) -> Result<(usize, usize), String> {
     }
 }
 
+/// Select by tags before balancing partitions. Return original indices and the
+/// total selected before partitioning, including when a share is empty.
+fn select_scripts(
+    scripts: &[script::Script],
+    only: &[script::Tag],
+    exclude: &[script::Tag],
+    partition_share: Option<(usize, usize)>,
+) -> Result<(Vec<usize>, usize)> {
+    let selected: Vec<usize> = scripts
+        .iter()
+        .enumerate()
+        .filter(|(_, script)| {
+            (only.is_empty() || only.iter().any(|tag| script.tags.contains(tag)))
+                && !exclude.iter().any(|tag| script.tags.contains(tag))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let count = selected.len();
+    anyhow::ensure!(
+        (only.is_empty() && exclude.is_empty()) || count > 0,
+        "--only-tag/--exclude-tag selected none of the {} scripts given; check the tags in the scripts and on the command line",
+        scripts.len()
+    );
+    let Some((index, shares)) = partition_share else {
+        return Ok((selected, count));
+    };
+    let selected_scripts: Vec<_> = selected.iter().map(|&i| &scripts[i]).collect();
+    let assignments = partition(&selected_scripts, shares);
+    Ok((
+        selected
+            .into_iter()
+            .zip(assignments)
+            .filter_map(|(i, share)| (share == index - 1).then_some(i))
+            .collect(),
+        count,
+    ))
+}
+
 /// Which of `count` shares each script falls in: longest first (a script
 /// without a recorded duration counts as an hour), each to the share with
 /// the least recorded time so far, ties to the lower share. Depends only on
 /// the scripts and their recorded durations, so every job computes the same
 /// split.
-fn partition(scripts: &[script::Script], count: usize) -> Vec<usize> {
+fn partition(scripts: &[impl std::borrow::Borrow<script::Script>], count: usize) -> Vec<usize> {
     let cost = |s: &script::Script| s.duration.unwrap_or(std::time::Duration::from_secs(3600));
     let mut order: Vec<usize> = (0..scripts.len()).collect();
     order.sort_by(|&a, &b| {
-        cost(&scripts[b])
-            .cmp(&cost(&scripts[a]))
-            .then_with(|| scripts[a].dir.cmp(&scripts[b].dir))
-            .then_with(|| scripts[a].file_stem.cmp(&scripts[b].file_stem))
+        cost(scripts[b].borrow())
+            .cmp(&cost(scripts[a].borrow()))
+            .then_with(|| scripts[a].borrow().dir.cmp(&scripts[b].borrow().dir))
+            .then_with(|| {
+                scripts[a]
+                    .borrow()
+                    .file_stem
+                    .cmp(&scripts[b].borrow().file_stem)
+            })
     });
     let mut load = vec![std::time::Duration::ZERO; count];
     let mut share = vec![0; scripts.len()];
     for i in order {
         let least = (0..count).min_by_key(|&k| (load[k], k)).unwrap_or(0);
-        load[least] += cost(&scripts[i]);
+        load[least] += cost(scripts[i].borrow());
         share[i] = least;
     }
     share
@@ -778,6 +836,92 @@ fn targets(specs: &[String]) -> Result<Vec<runner::Target>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tagged_scripts() -> Vec<script::Script> {
+        ["[]", "[long]", "[]"]
+            .into_iter()
+            .map(|tags| {
+                script::Script::parse(&format!(
+                    "name: s\ntags: {tags}\nspicepod: {{}}\nsteps: [{{start: {{}}}}]"
+                ))
+                .expect("tagged script parses")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_tag_selects_the_tagged_scripts() {
+        assert_eq!(
+            select_scripts(&tagged_scripts(), &[script::Tag::Long], &[], None).expect("selection"),
+            (vec![1], 1)
+        );
+    }
+
+    #[test]
+    fn exclude_tag_drops_the_tagged_scripts() {
+        assert_eq!(
+            select_scripts(&tagged_scripts(), &[], &[script::Tag::Long], None).expect("selection"),
+            (vec![0, 2], 2)
+        );
+    }
+
+    #[test]
+    fn no_tag_flags_select_all() {
+        assert_eq!(
+            select_scripts(&tagged_scripts(), &[], &[], None).expect("selection"),
+            (vec![0, 1, 2], 3)
+        );
+    }
+
+    #[test]
+    fn tags_filter_before_partition() {
+        // untagged 100s, long 95s, untagged 10s, untagged 5s. Over the three
+        // untagged scripts, share 2/2 gets 10s and 5s (both behind 100s).
+        // Dealing all four first would put 95s in share 2, the 10s with it and
+        // the 5s in share 1, so filtering afterwards would leave share 2 with
+        // only 10s.
+        let scripts: Vec<script::Script> = [("[]", 100), ("[long]", 95), ("[]", 10), ("[]", 5)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (tags, secs))| {
+                let mut s = script::Script::parse(&format!(
+                    "name: s{i}\ntags: {tags}\nspicepod: {{}}\nsteps: [{{start: {{}}}}]"
+                ))
+                .expect("tagged script parses");
+                s.file_stem = format!("s{i}");
+                s.duration = Some(std::time::Duration::from_secs(secs));
+                s
+            })
+            .collect();
+        let long = [script::Tag::Long];
+        assert_eq!(
+            select_scripts(&scripts, &[], &long, Some((2, 2))).expect("selection"),
+            (vec![2, 3], 3)
+        );
+        assert_eq!(
+            select_scripts(&scripts, &[], &long, Some((1, 2))).expect("selection"),
+            (vec![0], 3)
+        );
+        assert_eq!(
+            select_scripts(&scripts, &[], &long, Some((4, 4))).expect("empty share is allowed"),
+            (vec![], 3)
+        );
+    }
+
+    #[test]
+    fn zero_tag_selection_is_an_error() {
+        assert_eq!(
+            select_scripts(
+                &tagged_scripts(),
+                &[script::Tag::Long],
+                &[script::Tag::Long],
+                None
+            )
+            .expect_err("empty selection")
+            .to_string(),
+            "--only-tag/--exclude-tag selected none of the 3 scripts given; check the tags in the scripts and on the command line"
+        );
+    }
 
     #[test]
     fn repetition_output_preserves_single_run_bytes() {

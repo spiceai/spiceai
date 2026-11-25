@@ -4,7 +4,7 @@ tests:
     - spicepod_path: test/spicepods/search/mteb/msmarco/full_text_search-cayenne[file].yaml
       runner_type: spiceai-dev-runners
       ready_wait: 3600
-    - spicepod_path: test/spicepods/search/mteb/msmarco/hf[all-minilm-l6-v2]-arrow.yaml
+    - spicepod_path: test/spicepods/search/mteb/msmarco/hf[all-minilm-l6-v2]-cayenne[file].yaml
       runner_type: spiceai-dev-runners
       ready_wait: 3600
     - spicepod_path: test/spicepods/search/mteb/msmarco/hybrid[model2vec[potion-multilingual-128M]]-cayenne[file].yaml

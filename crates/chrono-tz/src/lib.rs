@@ -19,6 +19,13 @@ limitations under the License.
 //! dependencies use, with tables `build.rs` generates from the tz database release in `tz/`.
 //! `README.md` says why the crate exists and how to update the tz database.
 //!
+//! # Limitations
+//!
+//! Time-zone transitions in the generated tables are finite (through year 2099). Conversions
+//! for later instants may still succeed, but they use the final generated timespan indefinitely.
+//! That means post-2099 results can have a frozen offset instead of continued seasonal (DST)
+//! transitions, and should not be interpreted as accurate future DST behavior.
+//!
 //! [`Tz`] implements [`chrono::TimeZone`], and parses from an IANA time zone name:
 //!
 //! ```

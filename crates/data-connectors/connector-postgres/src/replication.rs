@@ -1141,9 +1141,6 @@ fn accelerator_is_ephemeral(
         Engine::Sqlite | Engine::Cayenne => {
             matches!(acceleration.mode, Mode::Memory | Mode::FileCreate)
         }
-        // External storage (another Postgres) persists independently of this
-        // process.
-        Engine::PostgreSQL => false,
     }
 }
 
@@ -1440,7 +1437,7 @@ pub(crate) fn missing_primary_key_message(dataset: &DatasetSpec) -> String {
         .unwrap_or_default();
     let on_conflict_note = match engine {
         Engine::Cayenne | Engine::Arrow | Engine::PartitionedArrow => "",
-        _ => " with a matching `acceleration.on_conflict` upsert entry",
+        Engine::Sqlite => " with a matching `acceleration.on_conflict` upsert entry",
     };
     format!(
         "Table `{schema_name}.{table_name}` has no primary key, and `refresh_mode: changes` needs \
@@ -1629,7 +1626,6 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
         for mode in [Mode::Memory, Mode::File, Mode::FileCreate, Mode::FileUpdate] {
             assert!(ephemeral(Engine::Arrow, mode), "arrow {mode}");
             assert!(ephemeral(Engine::PartitionedArrow, mode), "arrow {mode}");
-            assert!(!ephemeral(Engine::PostgreSQL, mode), "postgres {mode}");
         }
     }
 

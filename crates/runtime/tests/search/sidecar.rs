@@ -114,7 +114,7 @@ embeddings:
 datasets:
   - from: file:{csv}
     name: docs
-    acceleration: {{ enabled: true, engine: arrow }}
+    acceleration: {{ enabled: true, engine: cayenne, mode: memory }}
     columns:
       - name: label
         embeddings:
@@ -124,7 +124,7 @@ datasets:
           row_id: [id]
   - from: file:{csv}
     name: notes
-    acceleration: {{ enabled: true, engine: arrow }}
+    acceleration: {{ enabled: true, engine: cayenne, mode: memory }}
     columns:
       - name: label
         full_text_search:
