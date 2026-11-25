@@ -304,19 +304,29 @@ pub(super) async fn snapshot_sequence(
 /// read its state back before it gives up and reports the outcome as unknown.
 const UNKNOWN_OUTCOME_READ_BACK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// [`snapshot_sequence`], retried with a doubling wait while the dataset's state
-/// cannot be read (it is reading its state back after a commit whose outcome is
-/// unknown), for up to [`UNKNOWN_OUTCOME_READ_BACK_WAIT`].
+/// [`snapshot_sequence`], retried while the dataset's state cannot be read (see
+/// [`once_readable`]).
 pub(super) async fn snapshot_sequence_once_readable(
     catalog: &dyn MetadataCatalog,
     table_id: &str,
     snapshot_id: &str,
 ) -> CatalogResult<Option<i64>> {
+    once_readable(|| snapshot_sequence(catalog, table_id, snapshot_id)).await
+}
+
+/// `read`, retried with a doubling wait while the dataset's state cannot be
+/// read (it is reading its state back after a commit whose outcome is unknown),
+/// for up to [`UNKNOWN_OUTCOME_READ_BACK_WAIT`].
+pub(super) async fn once_readable<T, F, Fut>(mut read: F) -> CatalogResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = CatalogResult<T>>,
+{
     let deadline = tokio::time::Instant::now() + UNKNOWN_OUTCOME_READ_BACK_WAIT;
     let mut wait = std::time::Duration::from_millis(20);
     loop {
-        match snapshot_sequence(catalog, table_id, snapshot_id).await {
-            Ok(sequence) => return Ok(sequence),
+        match read().await {
+            Ok(value) => return Ok(value),
             Err(error) if tokio::time::Instant::now() + wait >= deadline => return Err(error),
             Err(_) => {
                 tokio::time::sleep(wait).await;

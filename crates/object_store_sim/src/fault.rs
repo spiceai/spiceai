@@ -43,6 +43,8 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use super::Op;
 
 type Predicate = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+/// Matches a request by its path and, for a put, its bytes.
+type RulePredicate = Arc<dyn Fn(&Path, Option<&PutPayload>) -> bool + Send + Sync>;
 /// Async work executed immediately before a held request reaches storage.
 pub type BeforeHook = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 type SharedUpload = Arc<AsyncMutex<Box<dyn MultipartUpload>>>;
@@ -57,7 +59,7 @@ pub enum Fault {
 
 struct Rule {
     op: Op,
-    predicate: Predicate,
+    predicate: RulePredicate,
     fault: Fault,
     repeat: bool,
 }
@@ -130,12 +132,13 @@ struct Shared {
 }
 
 impl Shared {
-    fn fault(&self, op: Op, path: &Path) -> Option<Fault> {
+    /// The fault of the first rule matching `op` on `path`, with `payload` for a put.
+    fn fault(&self, op: Op, path: &Path, payload: Option<&PutPayload>) -> Option<Fault> {
         let mut state = self.state.lock();
         let index = state
             .rules
             .iter()
-            .position(|r| r.op == op && (r.predicate)(path))?;
+            .position(|r| r.op == op && (r.predicate)(path, payload))?;
         let fault = state.rules[index].fault;
         if !state.rules[index].repeat {
             state.rules.remove(index);
@@ -248,7 +251,26 @@ impl FaultStore {
     ) {
         self.shared.state.lock().rules.push(Rule {
             op,
-            predicate: Arc::new(predicate),
+            predicate: Arc::new(move |path, _| predicate(path)),
+            fault,
+            repeat: false,
+        });
+    }
+
+    /// Arm one put (`Create`, `Cas` or `Put`) whose path and bytes match
+    /// `predicate`, so a test can pick a write by what it writes. Rules are
+    /// consumed in insertion order.
+    pub fn arm_put(
+        &self,
+        op: Op,
+        predicate: impl Fn(&Path, &PutPayload) -> bool + Send + Sync + 'static,
+        fault: Fault,
+    ) {
+        self.shared.state.lock().rules.push(Rule {
+            op,
+            predicate: Arc::new(move |path, payload| {
+                payload.is_some_and(|payload| predicate(path, payload))
+            }),
             fault,
             repeat: false,
         });
@@ -258,7 +280,7 @@ impl FaultStore {
     pub fn fail_while(&self, op: Op, predicate: impl Fn(&Path) -> bool + Send + Sync + 'static) {
         self.shared.state.lock().rules.push(Rule {
             op,
-            predicate: Arc::new(predicate),
+            predicate: Arc::new(move |path, _| predicate(path)),
             fault: Fault::Fail,
             repeat: true,
         });
@@ -489,7 +511,7 @@ impl FaultStore {
         let shared = Arc::clone(&self.shared);
         let prefix = prefix.cloned().unwrap_or_default();
         futures::stream::once(async move {
-            if shared.fault(Op::List, &prefix).is_some() {
+            if shared.fault(Op::List, &prefix, None).is_some() {
                 return futures::stream::iter([Err(refused(Op::List))]).boxed();
             }
             let _guard = shared.applied.lock().await;
@@ -541,7 +563,10 @@ impl ObjectStore for FaultStore {
         payload: PutPayload,
         options: PutOptions,
     ) -> object_store::Result<PutResult> {
-        match self.shared.fault(put_op(&options.mode), path) {
+        match self
+            .shared
+            .fault(put_op(&options.mode), path, Some(&payload))
+        {
             Some(Fault::Fail) => {
                 self.shared
                     .state
@@ -578,7 +603,7 @@ impl ObjectStore for FaultStore {
         if gated {
             self.wait_at_gate(path).await;
         }
-        if self.shared.fault(op, path).is_some() {
+        if self.shared.fault(op, path, None).is_some() {
             return Err(injected("get failed before I/O"));
         }
         let _guard = self.shared.applied.lock().await;
@@ -595,7 +620,7 @@ impl ObjectStore for FaultStore {
         path: &Path,
         options: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        let fault = self.shared.fault(Op::MultipartBegin, path);
+        let fault = self.shared.fault(Op::MultipartBegin, path, None);
         if stops(fault) {
             return Err(refused(Op::MultipartBegin));
         }
@@ -630,7 +655,7 @@ impl ObjectStore for FaultStore {
                 let shared = Arc::clone(&shared);
                 async move {
                     let path = path?;
-                    let fault = shared.fault(Op::Delete, &path);
+                    let fault = shared.fault(Op::Delete, &path, None);
                     if stops(fault) {
                         return Err(refused(Op::Delete));
                     }
@@ -668,7 +693,7 @@ impl ObjectStore for FaultStore {
     }
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
         let at = prefix.cloned().unwrap_or_default();
-        if self.shared.fault(Op::List, &at).is_some() {
+        if self.shared.fault(Op::List, &at, None).is_some() {
             return Err(refused(Op::List));
         }
         let _guard = self.shared.applied.lock().await;
@@ -689,7 +714,7 @@ impl ObjectStore for FaultStore {
         to: &Path,
         options: CopyOptions,
     ) -> object_store::Result<()> {
-        let fault = self.shared.fault(Op::Copy, to);
+        let fault = self.shared.fault(Op::Copy, to, None);
         if stops(fault) {
             return Err(refused(Op::Copy));
         }
@@ -708,7 +733,7 @@ impl ObjectStore for FaultStore {
         to: &Path,
         options: RenameOptions,
     ) -> object_store::Result<()> {
-        let fault = self.shared.fault(Op::Rename, to);
+        let fault = self.shared.fault(Op::Rename, to, None);
         if stops(fault) {
             return Err(refused(Op::Rename));
         }
@@ -741,7 +766,7 @@ impl fmt::Debug for FaultUpload {
 #[async_trait]
 impl MultipartUpload for FaultUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
-        let fault = self.shared.fault(Op::MultipartPart, &self.path);
+        let fault = self.shared.fault(Op::MultipartPart, &self.path, None);
         if stops(fault) {
             return Box::pin(futures::future::ready(Err(refused(Op::MultipartPart))));
         }
@@ -771,7 +796,7 @@ impl MultipartUpload for FaultUpload {
         })
     }
     async fn complete(&mut self) -> object_store::Result<PutResult> {
-        match self.shared.fault(Op::MultipartComplete, &self.path) {
+        match self.shared.fault(Op::MultipartComplete, &self.path, None) {
             Some(Fault::Fail) => Err(refused(Op::MultipartComplete)),
             Some(Fault::Hold) => {
                 self.shared
@@ -788,7 +813,7 @@ impl MultipartUpload for FaultUpload {
         }
     }
     async fn abort(&mut self) -> object_store::Result<()> {
-        let fault = self.shared.fault(Op::MultipartAbort, &self.path);
+        let fault = self.shared.fault(Op::MultipartAbort, &self.path, None);
         if stops(fault) {
             return Err(refused(Op::MultipartAbort));
         }

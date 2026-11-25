@@ -172,11 +172,26 @@ async fn a_fenced_catalog_stops_and_its_change_is_absent() {
     );
 }
 
+/// The catalog actions of one record of a head's window.
+fn record_actions(encoded: &[u8]) -> Vec<cayenne_metastore_actions::Action> {
+    use prost::Message;
+    let record = object_store_occ::headlog::Record::decode(encoded).expect("log record");
+    object_store_occ::headlog::Group::decode(record.payload)
+        .expect("group")
+        .payloads
+        .into_iter()
+        .flat_map(|payload| {
+            cayenne_metastore_actions::Record::decode(payload)
+                .expect("catalog record")
+                .actions
+        })
+        .collect()
+}
+
 /// The source positions each record committed to `dataset`'s log holds, oldest
 /// first, from the head's window (these tests commit too few records to seal a
 /// batch).
 async fn committed_positions(store: &Arc<dyn ObjectStore>, dataset: &str) -> Vec<Vec<String>> {
-    use prost::Message;
     let log = cayenne::metastore::object_native::dataset_log_at(
         Arc::clone(store),
         &Path::from("catalog"),
@@ -194,17 +209,8 @@ async fn committed_positions(store: &Arc<dyn ObjectStore>, dataset: &str) -> Vec
         .window
         .iter()
         .map(|entry| {
-            let record = object_store_occ::headlog::Record::decode(entry.encoded.as_slice())
-                .expect("log record");
-            object_store_occ::headlog::Group::decode(record.payload)
-                .expect("group")
-                .payloads
+            record_actions(&entry.encoded)
                 .into_iter()
-                .flat_map(|payload| {
-                    cayenne_metastore_actions::Record::decode(payload)
-                        .expect("catalog record")
-                        .actions
-                })
                 .filter_map(|action| match action.kind {
                     Some(cayenne_metastore_actions::Kind::AdvanceSourcePosition(position)) => {
                         Some(position.source)
@@ -1194,31 +1200,40 @@ mod data_path {
         nth: usize,
         landed: bool,
     ) -> Arc<std::sync::atomic::AtomicBool> {
+        let seen = std::sync::atomic::AtomicUsize::new(0);
+        lose_a_commit(faults, head, landed, move |_| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == nth
+        })
+    }
+
+    /// Arms the first commit on `head` that `select` picks (asked of each one
+    /// in turn) to land with its response lost (`landed`) or to fail before it
+    /// lands, with every read of the head failing meanwhile; returns whether it
+    /// fired.
+    fn lose_a_commit(
+        faults: &FaultStore,
+        head: &Path,
+        landed: bool,
+        select: impl Fn(&object_store::PutPayload) -> bool + Send + Sync + 'static,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
         let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let cas_head = head.clone();
         let get_head = head.clone();
         let fired_flag = Arc::clone(&fired);
-        let fault = if landed {
-            Fault::DropResponse
-        } else {
-            Fault::Fail
-        };
-        faults.arm(
+        faults.arm_put(
             Op::Cas,
-            move |path: &Path| {
-                if path != &cas_head {
-                    return false;
-                }
-                let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                if n == nth {
+            move |path: &Path, payload: &object_store::PutPayload| {
+                let matches = path == &cas_head && select(payload);
+                if matches {
                     fired_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                    true
-                } else {
-                    false
                 }
+                matches
             },
-            fault,
+            if landed {
+                Fault::DropResponse
+            } else {
+                Fault::Fail
+            },
         );
         let gate = Arc::clone(&fired);
         faults.fail_while(Op::Get, move |path: &Path| {
@@ -1341,65 +1356,105 @@ mod data_path {
         );
     }
 
+    /// Runs a rewrite of `facts` (5000 rows in five files), of the whole table
+    /// (`whole`) or of its small files, with the fault `arm` sets on the
+    /// dataset's head, restores the store once the fault has fired and the
+    /// dataset reads its state back (or the rewrite returned without it), then
+    /// appends 2000 more rows. Every row is there once, and a restart from the
+    /// store serves the same rows. Returns whether the fault fired.
+    async fn appends_after_a_rewrite_with_an_unknown_outcome(
+        inner: Arc<dyn ObjectStore>,
+        whole: bool,
+        arm: impl FnOnce(&FaultStore, &Path) -> Arc<std::sync::atomic::AtomicBool>,
+        config: VortexConfig,
+        what: &str,
+    ) -> bool {
+        let faults = Arc::new(FaultStore::new(inner));
+        let store: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
+        let native = Arc::new(catalog(&store).await);
+        let shared: Arc<dyn MetadataCatalog> = Arc::clone(&native) as Arc<dyn MetadataCatalog>;
+        let placed = place_with_config(&store, &shared, "facts", true, None, false, config).await;
+        for i in 0..5 {
+            insert(&placed.ctx, "facts", i * 1000 + 1, (i + 1) * 1000)
+                .await
+                .expect("append");
+        }
+        placed
+            .table
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain");
+        let armed = arm(&faults, &dataset_head(&native, "facts"));
+        let rewrite = {
+            let table = Arc::clone(&placed.table);
+            tokio::spawn(async move {
+                if whole {
+                    table.force_full_compaction().await
+                } else {
+                    table.compact_current_snapshot_small_files().await
+                }
+            })
+        };
+        eventually("the fault fires or the rewrite returns", || async {
+            armed.load(std::sync::atomic::Ordering::SeqCst) || rewrite.is_finished()
+        })
+        .await;
+        // The rewrite may wait for the dataset to read its state back, which it
+        // can do once the store answers again.
+        if armed.load(std::sync::atomic::Ordering::SeqCst) {
+            eventually("the dataset reads its state back", || async {
+                reading_back(native.as_ref(), "facts").await || rewrite.is_finished()
+            })
+            .await;
+        }
+        faults.clear_rules();
+        let _ = rewrite.await.expect("join the rewrite");
+        eventually("the dataset accepts appends again", || async {
+            insert(&placed.ctx, "facts", 5001, 6000).await.is_ok()
+        })
+        .await;
+        insert(&placed.ctx, "facts", 6001, 7000)
+            .await
+            .expect("another append");
+        placed
+            .table
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain");
+        let expected = vec![7000, 7000, sum_v(1, 7000, 0)];
+        assert_eq!(
+            keyed_totals(&placed.ctx, "facts").await,
+            expected,
+            "{what}: after the resume"
+        );
+        let data_url = placed.data_url.clone();
+        drop((placed, shared, native));
+        let reopened: Arc<dyn MetadataCatalog> = Arc::new(catalog(&store).await);
+        let placed = place(&store, &reopened, "facts", false, Some(data_url)).await;
+        assert_eq!(
+            keyed_totals(&placed.ctx, "facts").await,
+            expected,
+            "{what}: after a restart"
+        );
+        armed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// A whole-table rewrite one of whose commits has an unknown outcome (the
-    /// `nth` of the pass, landed or not): after the background reopen, appends land in
-    /// the snapshot the state points at, every row is there once, and a restart
-    /// from the store serves the same rows.
+    /// `nth` of the pass, landed or not) keeps every row.
     #[tokio::test]
     async fn appends_after_a_compaction_with_an_unknown_outcome_keep_every_row() {
         let mut fired = 0;
         for landed in [true, false] {
             for nth in 1..=3 {
-                let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
-                let store: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
-                let native = Arc::new(catalog(&store).await);
-                let shared: Arc<dyn MetadataCatalog> =
-                    Arc::clone(&native) as Arc<dyn MetadataCatalog>;
-                let placed =
-                    place_with_config(&store, &shared, "facts", true, None, false, compactable())
-                        .await;
-                for i in 0..5 {
-                    insert(&placed.ctx, "facts", i * 1000 + 1, (i + 1) * 1000)
-                        .await
-                        .expect("append");
-                }
-                placed
-                    .table
-                    .drain_in_flight_maintenance()
-                    .await
-                    .expect("drain");
-                let armed =
-                    lose_the_nth_commit(&faults, &dataset_head(&native, "facts"), nth, landed);
-                // A whole-table rewrite: its commits are the ones that lose.
-                let _ = placed.table.force_full_compaction().await;
-                fired += usize::from(armed.load(std::sync::atomic::Ordering::SeqCst));
-                faults.clear_rules();
-                eventually("the dataset accepts appends again", || async {
-                    insert(&placed.ctx, "facts", 5001, 6000).await.is_ok()
-                })
-                .await;
-                insert(&placed.ctx, "facts", 6001, 7000)
-                    .await
-                    .expect("another append");
-                placed
-                    .table
-                    .drain_in_flight_maintenance()
-                    .await
-                    .expect("drain");
-                let expected = vec![7000, 7000, sum_v(1, 7000, 0)];
-                assert_eq!(
-                    keyed_totals(&placed.ctx, "facts").await,
-                    expected,
-                    "nth={nth} landed={landed}: after the resume"
-                );
-                let data_url = placed.data_url.clone();
-                drop((placed, shared, native));
-                let reopened: Arc<dyn MetadataCatalog> = Arc::new(catalog(&store).await);
-                let placed = place(&store, &reopened, "facts", false, Some(data_url)).await;
-                assert_eq!(
-                    keyed_totals(&placed.ctx, "facts").await,
-                    expected,
-                    "nth={nth} landed={landed}: after a restart"
+                fired += usize::from(
+                    appends_after_a_rewrite_with_an_unknown_outcome(
+                        Arc::new(InMemory::new()),
+                        true,
+                        |faults, head| lose_the_nth_commit(faults, head, nth, landed),
+                        compactable(),
+                        &format!("nth={nth} landed={landed}"),
+                    )
+                    .await,
                 );
             }
         }
@@ -1407,6 +1462,70 @@ mod data_path {
             fired >= 2,
             "the compaction's commits lost their outcome ({fired} fired)"
         );
+    }
+
+    /// Whether a head write's newest record sets a table's current snapshot,
+    /// as a rewrite's own commit does.
+    fn sets_the_current_snapshot(payload: &object_store::PutPayload) -> bool {
+        use prost::Message;
+        let head = object_store_occ::headlog::Head::decode(payload.as_ref().concat().as_slice())
+            .expect("a head");
+        head.window.last().is_some_and(|newest| {
+            record_actions(&newest.encoded)
+                .iter()
+                .any(|action| action.name() == "SetCurrentSnapshot")
+        })
+    }
+
+    /// A rewrite, of the whole table or of its small files, whose own commit,
+    /// the one that makes its output current, has an unknown outcome (landed or
+    /// not) keeps every row, with and without a compaction of the appends that
+    /// follow it, in memory and in a local directory.
+    #[tokio::test]
+    async fn appends_after_a_rewrite_whose_own_commit_has_an_unknown_outcome_keep_every_row() {
+        for local in [false, true] {
+            for whole in [true, false] {
+                for landed in [true, false] {
+                    for compacts in [true, false] {
+                        let directory = tempfile::tempdir().expect("a directory");
+                        let inner: Arc<dyn ObjectStore> = if local {
+                            Arc::new(
+                                object_store_occ::LocalConditionalPut::new_durable(
+                                    directory.path(),
+                                )
+                                .expect("a local store"),
+                            )
+                        } else {
+                            Arc::new(InMemory::new())
+                        };
+                        let config = if compacts {
+                            compactable()
+                        } else {
+                            VortexConfig {
+                                compaction_trigger_files: 1000,
+                                ..compactable()
+                            }
+                        };
+                        let what = format!(
+                            "local={local} whole={whole} landed={landed} compacts={compacts}"
+                        );
+                        assert!(
+                            appends_after_a_rewrite_with_an_unknown_outcome(
+                                inner,
+                                whole,
+                                |faults, head| {
+                                    lose_a_commit(faults, head, landed, sets_the_current_snapshot)
+                                },
+                                config,
+                                &what,
+                            )
+                            .await,
+                            "{what}: the rewrite's commit lost its outcome"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// A transaction across datasets whose `Resolve` on one dataset fails with
