@@ -29,8 +29,9 @@ runs:
         cache="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/libduckdb.XXXXXX")"
         cache="$(cd "$cache" && pwd -P)"
         dir="$(LIBDUCKDB_CACHE_DIR="$cache" python3 scripts/libduckdb.py)"
-        # GITHUB_ENV takes one variable per line, so the path goes there only if it is inside
-        # this cache and on one line.
+        # GITHUB_ENV takes one variable per line, and ADBC_DRIVER_PATH is a list split at
+        # ':', so the path goes there only if it is inside this cache, on one line, and
+        # without a ':'.
         case "$dir" in
           "$cache"/*) ;;
           *)
@@ -38,8 +39,8 @@ runs:
             exit 1
             ;;
         esac
-        if [[ "$dir" == *$'\n'* || "$dir" == *$'\r'* ]]; then
-          echo "::error::scripts/libduckdb.py printed a directory with a line break in it; it is not registered."
+        if [[ "$dir" == *$'\n'* || "$dir" == *$'\r'* || "$dir" == *:* ]]; then
+          echo "::error::scripts/libduckdb.py printed a directory with a line break or a ':' in it; it is not registered."
           exit 1
         fi
         echo "ADBC_DRIVER_PATH=${dir}${ADBC_DRIVER_PATH:+:${ADBC_DRIVER_PATH}}" >> "$GITHUB_ENV"

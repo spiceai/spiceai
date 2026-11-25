@@ -134,14 +134,28 @@ class InstallCacheTest(unittest.TestCase):
             self.install()
         self.assertEqual(self.downloads, [])
 
-    def test_a_lock_that_is_a_link_is_not_followed(self):
+    def test_a_lock_that_is_a_link_is_replaced_not_followed(self):
         outside = Path(self.tmp.name) / "outside"
         outside.write_text("keep me")
         self.cache.mkdir(parents=True)
         (self.cache / f".{VERSION}.lock").symlink_to(outside)
+        self.assert_genuine(self.install())
+        self.assertEqual(outside.read_text(), "keep me")
+        self.assertFalse((self.cache / f".{VERSION}.lock").is_symlink())
+
+    def test_a_cache_path_with_a_path_separator_is_refused(self):
+        self.cache = Path(self.tmp.name).resolve() / f"evil{os.pathsep}cache"
         with self.assertRaises(libduckdb.Error):
             self.install()
-        self.assertEqual(outside.read_text(), "keep me")
+        self.assertEqual(self.downloads, [])
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can read anything")
+    def test_an_install_that_cannot_be_read_is_replaced(self):
+        target = self.install()
+        target.chmod(0)
+        self.addCleanup(lambda: target.exists() and target.chmod(0o755))
+        self.assert_genuine(self.install())
+        self.assertEqual(len(self.downloads), 2)
 
     def test_a_download_that_does_not_match_fails_and_installs_nothing(self):
         self.served = release_archive(b"planted library")

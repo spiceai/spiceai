@@ -27,6 +27,8 @@ os.makedirs(target, exist_ok=True)
 open(os.path.join(target, "duckdb.toml"), "w").write('[Driver]\\nshared = "x"\\n')
 if mode == "line-break":
     target = os.path.join(cache, "9.9.9\\nBASH_ENV=/tmp/evil.sh")
+elif mode == "separator":
+    target = os.path.join(cache, "9.9.9:/tmp/evil")
 elif mode == "outside":
     target = os.environ["STUB_OUTSIDE"]
 print(target)
@@ -81,7 +83,13 @@ class SetupLibduckdbTest(unittest.TestCase):
     def test_a_directory_with_a_line_break_is_not_written(self):
         proc = self.run_step("line-break")
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        self.assertIn("with a line break in it", proc.stdout)
+        self.assertIn("a line break or a ':' in it", proc.stdout)
+        self.assertEqual(self.github_env.read_text(), "")
+
+    def test_a_directory_with_a_path_separator_is_not_written(self):
+        proc = self.run_step("separator")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("a line break or a ':' in it", proc.stdout)
         self.assertEqual(self.github_env.read_text(), "")
 
     def test_a_directory_outside_the_cache_is_not_written(self):
