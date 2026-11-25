@@ -143,6 +143,7 @@
   "postgres-cdc-parity": 607,
   "postgres-cdc-partitioned-table": 17,
   "postgres-cdc-random-queries": 275,
+  "postgres-cdc-replay-after-reconnect": 669,
   "postgres-cdc-shared-slot": 50,
   "postgres-cdc-truncate": 67,
   "postgres-dml": 12,
