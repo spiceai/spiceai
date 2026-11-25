@@ -201,7 +201,9 @@ wait, and a source close during the partition is lost. After `heal-source`, a
 client that writes on a connection the source closed during the partition gets
 a TCP RST; one that never writes remains connected and silent. The proxy
 terminates the client TCP connection, so it answers TCP keepalive probes and a
-client's keepalive cannot detect that lost source close.
+client's keepalive cannot detect that lost source close. It does not model TCP
+retransmission or backpressure: it holds up to 1 MiB per direction, then stops
+reading that side until the partition heals.
 
 **DuckDB releases.** `spiced` reads `duckdb:` and `ducklake:` through the
 DuckDB library installed on the host, so each `duckdb` or `ducklake` source

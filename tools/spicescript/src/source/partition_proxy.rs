@@ -14,9 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! A TCP proxy that simulates a network partition, including a lost close from
-//! the upstream. Toxiproxy cannot model this: its timeout toxic delivers the
-//! close once the toxic is removed.
+//! A TCP proxy that simulates a source closing a connection while the network
+//! drops its packets, so the client never learns of the close. Toxiproxy cannot
+//! model this: its timeout toxic delivers the close once the toxic is removed.
+//!
+//! It does not model TCP retransmission or `net_write_timeout`: during a
+//! partition it holds what each side sends, up to [`HOLD_LIMIT`] per direction,
+//! and then stops reading that side.
 
 use std::future::pending;
 use std::io;
@@ -31,6 +35,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
+
+/// Bytes held per direction during a partition before the proxy stops reading.
+const HOLD_LIMIT: usize = 1 << 20;
 
 /// A loopback listener that can black-hole the path to `upstream`.
 pub struct PartitionProxy {
@@ -207,13 +214,14 @@ impl Connection {
                         self.drain_upstream_at_heal();
                     }
                 }
-                read = self.client.read_buf(&mut self.from_client), if self.client_state == SideState::Open => {
+                read = self.client.read_buf(&mut self.from_client), if self.client_state == SideState::Open && self.from_client.len() < HOLD_LIMIT => {
                     match read {
                         Ok(0) | Err(_) => self.client_state = SideState::Eof,
                         Ok(_) => {}
                     }
                 }
-                read = read_connected(self.upstream.as_mut(), &mut self.from_upstream), if !self.severed => {
+                // A close left unread here is found when the partition heals.
+                read = read_connected(self.upstream.as_mut(), &mut self.from_upstream), if !self.severed && self.from_upstream.len() < HOLD_LIMIT => {
                     match read {
                         Ok(0) | Err(_) => self.mark_severed(),
                         Ok(_) => {}
