@@ -446,6 +446,19 @@
               }
             }
           },
+          "409": {
+            "description": "The dataset is deferred and no query has initialized it yet: none has referenced it, or its initialization failed. Query the dataset to initialize it, or to see the error that prevents it, then refresh",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                },
+                "example": {
+                  "message": "Dataset eth_recent_blocks is not initialized yet: it is initialized by a query that references it, and no query has initialized it. Query the dataset to initialize it, or to see the error that prevents it, then refresh. See: https://spiceai.org/docs/components/data-accelerators/data-refresh#ready-state"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error occurred while processing refresh",
             "content": {
