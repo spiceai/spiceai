@@ -7,9 +7,10 @@ name: Trunk tests
 # when its failures go unaddressed. Add a job here, and to `needs` of the
 # `Trunk tests` job at the end, to move a test out of the merge queue.
 #
-# It runs the model integration tests (integration_llms.yml), the nextest tests
-# the gate leaves to after merge (`make nextest-post-merge`,
-# NEXTEST_POST_MERGE_FILTER in the Makefile), and spicescript
+# It runs the model integration tests (integration_llms.yml), the Cayenne
+# object-native set (cayenne_object_native.yml), the nextest tests the gate
+# leaves to after merge (`make nextest-post-merge`, NEXTEST_POST_MERGE_FILTER
+# in the Makefile), and spicescript
 # (tools/spicescript):
 # - every script in test/spicescript, including those tagged `long`, which the
 #   merge queue skips;
@@ -457,6 +458,21 @@ jobs:
       id-token: write
     secrets: inherit
 
+  # The metastore model's `all` set with its controls, and the object-native
+  # data-path suites on every store at full depth (cayenne_object_native.yml).
+  # Pull requests and the merge queue run its quick set.
+  cayenne-object-native:
+    name: Cayenne object-native
+    needs: resolve
+    uses: ./.github/workflows/cayenne_object_native.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+      set: all
+    # The called jobs' own permissions: its path filter reads pull requests.
+    permissions:
+      contents: read
+      pull-requests: read
+
   # The nextest tests that sign-off and the merge queue skip: the SF1
   # result-correctness lanes, which compare Cayenne with standalone DuckDB and
   # SQLite, and the tuning simulation's report. Built from source at the commit
@@ -616,7 +632,7 @@ jobs:
     environment: secret-free
     name: Trunk tests
     if: ${{ !cancelled() }}
-    needs: [resolve, build, spicescript, models, nextest, default-features]
+    needs: [resolve, build, spicescript, models, cayenne-object-native, nextest, default-features]
     runs-on: spiceai-dev-runners
     timeout-minutes: 5
     permissions:
