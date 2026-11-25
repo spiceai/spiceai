@@ -684,4 +684,64 @@ mod tests {
             ]
         );
     }
+
+    const SECRET: &str = "s3cr3t-token-value";
+
+    fn required_id_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]))
+    }
+
+    /// HTTP ingest still uses [`vector_to_change_batch`]: one bad event fails the
+    /// whole vector. The Kafka changes stream decodes per event instead.
+    #[test]
+    fn vector_to_change_batch_fails_the_whole_chunk_when_one_event_is_bad() {
+        let schema = required_id_schema();
+        let pk = ["id".to_string()];
+        let valid = event("c", serde_json::Value::Null, serde_json::json!({"id": 1}));
+        let bad = event(
+            "c",
+            serde_json::Value::Null,
+            serde_json::json!({"secret": SECRET}),
+        );
+        let later = event("c", serde_json::Value::Null, serde_json::json!({"id": 3}));
+        let err = vector_to_change_batch(&schema, &pk, &[&valid, &bad, &later], None)
+            .expect_err("one bad event must fail the whole vector");
+        assert_eq!(err.kind(), "missing_required_field");
+    }
+
+    #[test]
+    fn decoding_each_event_keeps_valid_neighbors_of_a_bad_event() {
+        let schema = required_id_schema();
+        let pk = ["id".to_string()];
+        let valid = event("c", serde_json::Value::Null, serde_json::json!({"id": 1}));
+        let bad = event(
+            "c",
+            serde_json::Value::Null,
+            serde_json::json!({"secret": SECRET}),
+        );
+        let later = event("c", serde_json::Value::Null, serde_json::json!({"id": 3}));
+
+        let mut ids = Vec::new();
+        let mut skipped_kind = None;
+        for change in [&valid, &bad, &later] {
+            match to_change_batch(&schema, &pk, change, None) {
+                Ok(batch) => ids.push(id_of(&batch.data(0))),
+                Err(err) => {
+                    assert_eq!(err.kind(), "missing_required_field");
+                    assert!(
+                        !err.kind().contains(SECRET),
+                        "kind must not carry the field value, got {}",
+                        err.kind()
+                    );
+                    skipped_kind = Some(err.kind());
+                }
+            }
+        }
+        assert_eq!(ids, vec![Some(1), Some(3)]);
+        assert_eq!(skipped_kind, Some("missing_required_field"));
+    }
 }
