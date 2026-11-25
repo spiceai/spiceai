@@ -16,7 +16,7 @@ limitations under the License.
 
 //! State slots and transaction reservations.
 
-use super::{super::state_reader::DatasetStateReader, Domain, Inner, Stop, subject};
+use super::{super::state_reader::DatasetStateReader, Domain, Head, Inner, Stop, subject};
 use arc_swap::ArcSwapOption;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -37,6 +37,10 @@ pub(super) struct StateSlot {
     /// whose commit is still in flight: a commit applies its record to the
     /// lease's state, which is published only when the lease is returned.
     pub(super) published: ArcSwapOption<DatasetStateReader>,
+    /// Whether [`Self::published`] is a replica's state, which may lack the
+    /// writer's latest commits until the replica follows them. Stored before
+    /// the state it describes.
+    pub(super) replica: std::sync::atomic::AtomicBool,
     /// Runs in [`Self::published`] between its reservation check and its load,
     /// so a test can take a reservation there.
     #[cfg(test)]
@@ -102,16 +106,30 @@ impl StateSlot {
         published
     }
 
+    /// [`Self::published`], when it is the state of the instance that writes
+    /// the log. A load that races a change of role returns the state either
+    /// role published, each as of a commit already made.
+    pub(super) fn published_by_writer(&self) -> Option<Arc<DatasetStateReader>> {
+        if self.replica.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        self.published()
+    }
+
     /// Publish `inner`'s state for reads, or withdraw it while the log serves
     /// none. The lease's state is shared, not copied: a change copies a shared
     /// state first ([`Inner::apply_record`]), so a state that changed is never
     /// the one already published, and a lease that changed nothing publishes
     /// nothing.
     fn publish(&self, inner: &Inner) {
-        if !matches!(inner.stop, None | Some(Stop::Fenced { reloaded: true })) {
+        if !matches!(inner.stop, None | Some(Stop::Replica)) {
             self.published.store(None);
             return;
         }
+        self.replica.store(
+            matches!(inner.head, Head::Replica(_)),
+            std::sync::atomic::Ordering::Release,
+        );
         if self
             .published
             .load()
@@ -271,6 +289,7 @@ mod tests {
             available: Notify::new(),
             reserved: AtomicBool::new(false),
             published: ArcSwapOption::from(Some(Arc::clone(&before))),
+            replica: AtomicBool::new(false),
             before_load: Mutex::new(None),
         };
         let published = Arc::clone(&resolved);

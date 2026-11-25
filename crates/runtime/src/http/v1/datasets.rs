@@ -419,6 +419,12 @@ pub struct AccelerationRequest {
                 "message": "Dataset taxi_trips not found"
             })
         ))),
+        (status = 409, description = "The dataset is deferred and no query has initialized it yet: none has referenced it, or its initialization failed. Query the dataset to initialize it, or to see the error that prevents it, then refresh", content((
+            MessageResponse = "application/json",
+            example = json!({
+                "message": "Dataset eth_recent_blocks is not initialized yet: it is initialized by a query that references it, and no query has initialized it. Query the dataset to initialize it, or to see the error that prevents it, then refresh. See: https://spiceai.org/docs/components/data-accelerators/data-refresh#ready-state"
+            })
+        ))),
         (status = 400, description = "Dataset is not accelerated, or the overrides are invalid: a `refresh_mode` other than `full` or `append`, or a `refresh_sql` that does not parse or omits the dataset's `time_column`", content((
             MessageResponse = "application/json",
             example = json!({
@@ -524,6 +530,13 @@ pub(crate) async fn refresh(
             },
         ) => (
             status::StatusCode::BAD_REQUEST,
+            Json(MessageResponse {
+                message: format!("{err}"),
+            }),
+        )
+            .into_response(),
+        Err(err @ crate::datafusion::Error::DatasetNotInitialized { .. }) => (
+            status::StatusCode::CONFLICT,
             Json(MessageResponse {
                 message: format!("{err}"),
             }),

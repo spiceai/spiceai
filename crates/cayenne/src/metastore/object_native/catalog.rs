@@ -69,6 +69,12 @@ impl MetadataCatalog for ObjectNativeCatalog {
         }
     }
 
+    fn data_write_gate(&self, table_id: &str) -> crate::catalog::DataWriteGate {
+        self.for_table(table_id).data_write_gate(table_id)
+    }
+    async fn follow_commits(&self, table_id: &str) -> CatalogResult<u64> {
+        self.for_table(table_id).follow_commits(table_id).await
+    }
     async fn init(&self) -> CatalogResult<()> {
         self.on_every_log(|domain| async move { domain.init().await })
             .await

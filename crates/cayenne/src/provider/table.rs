@@ -1719,6 +1719,9 @@ pub(crate) struct SeqAllocator {
     next: i64,
     /// Highest value durably written to `cayenne_table.current_sequence_number`.
     persisted_hi: i64,
+    /// Whether this table may write: bound when it opened, so a table seeded
+    /// before another instance wrote the dataset refuses until it reopens.
+    writes: crate::catalog::DataWriteGate,
 }
 
 /// Reserve `count` (>= 1) consecutive sequence numbers from a shared in-memory
@@ -1740,6 +1743,14 @@ pub(crate) async fn reserve_sequences_in(
 ) -> CatalogResult<i64> {
     let count = i64::from(count.max(1));
     let mut allocator = allocator.lock().await;
+    // Every write of the table reserves its sequences here first, so a table
+    // that may not write (a replica, or one seeded before another instance
+    // wrote the dataset) refuses before it changes anything.
+    if !allocator.writes.allows() {
+        return Err(CatalogError::InvalidOperationNoSource {
+            message: crate::metastore::object_native::not_writer_message(table_name),
+        });
+    }
 
     if allocator.next + count - 1 > allocator.persisted_hi {
         let bump = std::cmp::max(SEQ_RESERVE_BLOCK, count);
@@ -2853,6 +2864,25 @@ pub struct CayenneTableProvider {
     /// loads plus a cache-hit inlined read); writers take **write** around the
     /// matching publish.
     scan_state_lock: Arc<tokio::sync::RwLock<()>>,
+    /// Whether this table may write: bound to the generation current when it
+    /// opened. Closed on a replica, and on a table whose instance stopped
+    /// writing the dataset since; such a table's queries confirm the dataset
+    /// head when they build a scan view (see [`Self::serves_from_writer`]).
+    table_writes: crate::catalog::DataWriteGate,
+    /// When a query last planned a scan of this table, as nanoseconds since
+    /// [`scan_view_clock_epoch`]; `u64::MAX` until one does (a query in the
+    /// epoch's first nanosecond stores 0). A replica's background refresh runs only
+    /// while queries use the table; its own view requests do not count.
+    /// Shared across all clones for the same table.
+    last_query_ns: Arc<AtomicU64>,
+    /// The catalog revision this table last reloaded its caches at
+    /// ([`Self::confirm_head`]); `u64::MAX` until it has. Shared across all
+    /// clones for the same table.
+    loaded_revision: Arc<AtomicU64>,
+    /// How long a replica's scan view serves queries, in nanoseconds: zero
+    /// (strict) unless set ([`Self::set_replica_view_lag`]). Shared across all
+    /// clones for the same table.
+    replica_view_lag_ns: Arc<AtomicU64>,
     /// The dataset's store, for a table whose data path is an object-store URL:
     /// `url` is `cayenne://<table id>/` and `store` is [`Self::dataset_storage`]'s
     /// store, registered under that URL in each `RuntimeEnv` the table uses.
@@ -3053,6 +3083,9 @@ pub struct CayenneTableProvider {
     /// `ArcSwap`: scan paths take `Arc::clone` instead of cloning the
     /// `HashMap`; writes use `rcu` to publish a copy-on-write update.
     protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
+    /// Highest delete sequence a prune has dropped from the in-memory deletion
+    /// index, or 0. See [`Self::protected_merge_delete_fence`].
+    pruned_delete_sequence: Arc<AtomicI64>,
     /// Table-scoped warning dedupe for protected snapshot ids that cannot
     /// provide a `UUIDv7` timestamp for age-triggered maintenance.
     protected_snapshot_age_warning_keys: Arc<ParkingMutex<BoundedFifoSet>>,
@@ -12076,6 +12109,12 @@ impl CayenneTableProvider {
         // its own store, under a URL of its own (see `crate::dataset_storage`).
         // A `file://` table given no store (the `cayenne_vnext` flag off) keeps the
         // local data path, as it always has.
+        // Whether this table may write, bound once to the generation current
+        // now and shared by its data store, its sequence allocator and its
+        // reads (see `serves_from_writer`).
+        let table_writes = catalog
+            .data_write_gate(&table_metadata.table_id)
+            .for_table();
         let (object_store_config, dataset_storage) =
             if crate::is_object_store_path(&table_metadata.path)
                 && (object_store_config.is_some() || !table_metadata.path.starts_with("file://"))
@@ -12093,6 +12132,7 @@ impl CayenneTableProvider {
                     &table_metadata.path,
                     &table_metadata.table_id,
                     config.store,
+                    table_writes.clone(),
                 )
                 .map_err(|message| Error::Internal {
                     table: table_name.to_string(),
@@ -12257,6 +12297,7 @@ impl CayenneTableProvider {
         let seq_allocator = Arc::new(tokio::sync::Mutex::new(SeqAllocator {
             next: persisted_hi + 1,
             persisted_hi,
+            writes: table_writes.clone(),
         }));
 
         // A store-backed table's staging is only found by listing it, so its open
@@ -12461,6 +12502,10 @@ impl CayenneTableProvider {
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
             scan_state_lock: Arc::new(tokio::sync::RwLock::new(())),
+            table_writes,
+            last_query_ns: Arc::new(AtomicU64::new(u64::MAX)),
+            loaded_revision: Arc::new(AtomicU64::new(u64::MAX)),
+            replica_view_lag_ns: Arc::new(AtomicU64::new(0)),
             object_store_config,
             dataset_storage,
             data_root,
@@ -12469,6 +12514,7 @@ impl CayenneTableProvider {
                 object_store_registered_runtime_envs,
             )),
             protected_snapshots: Arc::new(ArcSwap::from_pointee(protected_snapshots)),
+            pruned_delete_sequence: Arc::new(AtomicI64::new(0)),
             protected_snapshot_age_warning_keys: Arc::new(ParkingMutex::new(
                 BoundedFifoSet::with_capacity(PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT),
             )),
@@ -14913,6 +14959,10 @@ impl CayenneTableProvider {
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             visibility_lock: Arc::clone(&self.visibility_lock),
             scan_state_lock: Arc::clone(&self.scan_state_lock),
+            table_writes: self.table_writes.clone(),
+            last_query_ns: Arc::clone(&self.last_query_ns),
+            loaded_revision: Arc::clone(&self.loaded_revision),
+            replica_view_lag_ns: Arc::clone(&self.replica_view_lag_ns),
             object_store_config: self.object_store_config.clone(),
             dataset_storage: self.dataset_storage.clone(),
             data_root: Arc::clone(&self.data_root),
@@ -14992,6 +15042,7 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_rewrite_post_capture_hook: Arc::clone(&self.test_rewrite_post_capture_hook),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
+            pruned_delete_sequence: Arc::clone(&self.pruned_delete_sequence),
             protected_snapshot_age_warning_keys: Arc::clone(
                 &self.protected_snapshot_age_warning_keys,
             ),
@@ -31399,7 +31450,7 @@ impl CayenneTableProvider {
             // the eligibility filter below.
             let (fence_max_delete_seq, pending_floor) = self
                 .protected_snapshot_merge_fence_and_floor(
-                    deletion_snapshot.max_sequence_number().unwrap_or(0),
+                    self.protected_merge_delete_fence(&deletion_snapshot),
                 );
 
             // While a pending mem-tier delete exists, fold only inputs with
@@ -32351,7 +32402,7 @@ impl CayenneTableProvider {
             // floor also gates the prefix eligibility stop below.
             let (fence_max_delete_seq, pending_floor) = self
                 .protected_snapshot_merge_fence_and_floor(
-                    deletion_snapshot.max_sequence_number().unwrap_or(0),
+                    self.protected_merge_delete_fence(&deletion_snapshot),
                 );
             (
                 ids,
@@ -32772,11 +32823,11 @@ impl CayenneTableProvider {
             });
         }
         if clean_prefix_holds {
-            // Capped at the delete fence: every tombstone at or below it was in the
-            // index the merge applied, so it hides no row of the merged output, while
-            // one published after the capture with a sequence between the fence and
-            // the prefix cutoff may still hide one (the output applies deletions
-            // above the fence).
+            // Capped at the delete fence: every tombstone at or below it was applied,
+            // by this merge or by an earlier prune, so it hides no row of the merged
+            // output, while one published after the capture with a sequence between
+            // the fence and the prefix cutoff may still hide one (the output applies
+            // deletions above the fence).
             let off_fence_cutoff = prune_cutoff.min(fence_max_delete_seq);
             // A writer recording a tombstone meanwhile only shrinks the difference,
             // which overstates the yield: the error is toward baking as before.
@@ -34132,13 +34183,57 @@ impl CayenneTableProvider {
             .min()
     }
 
-    /// The deletion fence to tag a freshly-merged protected snapshot with — the
-    /// just-loaded durable deletion-index max, CAPPED strictly below the smallest
-    /// still-pending mem-tier delete — plus that pending floor itself, so ONE
-    /// coherent floor load drives both the cap and the caller's input-eligibility
-    /// rule (fold only inputs at or below the fence while a floor exists).
+    /// The delete fence a protected-snapshot merge starts from, before
+    /// [`Self::protected_snapshot_merge_fence_and_floor`] caps it below a pending
+    /// mem-tier delete: the newest tombstone in `deletion_snapshot`, raised to the
+    /// newest one a prune has dropped from the index.
     ///
-    /// The uncapped durable max over-claims. Under N>1 off-fence CDC a later
+    /// A scan applies to a protected snapshot only the deletions above its tag,
+    /// and ignores re-inserts there. The seq-prefix bake drops tombstones from the
+    /// index while their deletion vectors stay in the catalog until the
+    /// orphaned-vector sweep reclaims them. A tag below those vectors lets a
+    /// reopen reload them and hide the merged rows written after them, including
+    /// a key upserted again after its delete.
+    fn protected_merge_delete_fence(&self, deletion_snapshot: &PkDeletionSnapshot) -> i64 {
+        deletion_snapshot
+            .max_sequence_number()
+            .unwrap_or(0)
+            .max(self.pruned_delete_sequence.load(Ordering::Acquire))
+    }
+
+    /// The newest delete sequence a prune at `cutoff` drops from the index, read
+    /// before the prune.
+    fn pruned_through(&self, cutoff: i64) -> Option<i64> {
+        // Clamped to a tombstone that exists: a prune at a cutoff above every
+        // sequence (`i64::MAX`) would otherwise lift every later merge's tag above
+        // deletions not yet written, and those would never apply to its rows.
+        self.deletion_index_max_sequence()
+            .map(|newest| cutoff.min(newest))
+    }
+
+    /// Raise the floor of [`Self::protected_merge_delete_fence`] once a prune
+    /// has published.
+    fn raise_pruned_delete_floor(&self, pruned_through: Option<i64>) {
+        // Delete sequences only increase, so the floor only rises and is never
+        // reset: a later deletion is above it and still applies.
+        if let Some(pruned_through) = pruned_through {
+            self.pruned_delete_sequence
+                .fetch_max(pruned_through, Ordering::AcqRel);
+        }
+    }
+
+    /// The deletion fence to tag a freshly-merged protected snapshot with —
+    /// `uncapped_fence`, CAPPED strictly below the smallest still-pending mem-tier
+    /// delete — plus that pending floor itself, so ONE coherent floor load drives
+    /// both the cap and the caller's input-eligibility rule (fold only inputs at or
+    /// below the fence while a floor exists).
+    ///
+    /// `uncapped_fence` is [`Self::protected_merge_delete_fence`]: the just-loaded
+    /// durable deletion-index max, raised to the pruned-delete floor. The cap
+    /// applies after that floor, so a pending delete below the floor still lowers
+    /// the fence.
+    ///
+    /// The uncapped fence over-claims. Under N>1 off-fence CDC a later
     /// apply's delete can fold into the durable index ahead of an earlier apply's
     /// (cross-shard / commit reorder), so the durable max can sit ABOVE a delete
     /// that is still pending in the mem tier and therefore was NEVER baked into
@@ -34152,17 +34247,12 @@ impl CayenneTableProvider {
     /// apply, so its reinsert row is ALSO pending (never in these durable merged
     /// files). Lowering the fence can only apply MORE deletes to the old rows the
     /// merge carried, never hide a reinsert that was baked in. The cap fires only
-    /// when a pending delete sits below the durable max (the reorder gap); with no
-    /// pending mem-tier delete it is the durable max unchanged.
+    /// when a pending delete sits below the uncapped fence (the reorder gap); with
+    /// no pending mem-tier delete it is the uncapped fence unchanged.
     #[must_use]
-    fn protected_snapshot_merge_fence_and_floor(
-        &self,
-        durable_max_delete_seq: i64,
-    ) -> (i64, Option<i64>) {
+    fn protected_snapshot_merge_fence_and_floor(&self, uncapped_fence: i64) -> (i64, Option<i64>) {
         let pending_floor = self.min_pending_mem_tier_delete_sequence();
-        let fence = pending_floor.map_or(durable_max_delete_seq, |floor| {
-            durable_max_delete_seq.min(floor - 1)
-        });
+        let fence = pending_floor.map_or(uncapped_fence, |floor| uncapped_fence.min(floor - 1));
         (fence, pending_floor)
     }
 
@@ -34479,6 +34569,9 @@ impl CayenneTableProvider {
         merged_snapshot_id: &str,
         input_ids: &[String],
     ) -> Result<()> {
+        // This off-fence publish bypasses `prune_deletion_index_at_or_below`, so it
+        // raises the floor itself.
+        let pruned_through = self.pruned_through(cutoff);
         let bake = BakeOutput {
             snapshot_at_capture,
             merged_snapshot_id,
@@ -34542,9 +34635,11 @@ impl CayenneTableProvider {
             PkDeletionStrategyWithCache::PositionBased { .. } => return Ok(()),
         };
         match outcome {
-            OffFencePrune::Published
-            | OffFencePrune::NothingToPrune
-            | OffFencePrune::OutputNotLive => return Ok(()),
+            OffFencePrune::Published => {
+                self.raise_pruned_delete_floor(pruned_through);
+                return Ok(());
+            }
+            OffFencePrune::NothingToPrune | OffFencePrune::OutputNotLive => return Ok(()),
             OffFencePrune::LostRace => {}
         }
         let _fence = self.listing_fence.write().await;
@@ -34756,6 +34851,7 @@ impl CayenneTableProvider {
     /// public surface.
     #[doc(hidden)]
     pub fn prune_deletion_index_at_or_below(&self, cutoff: i64) {
+        let pruned_through = self.pruned_through(cutoff);
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk {
                 deletion_snapshot, ..
@@ -34787,6 +34883,8 @@ impl CayenneTableProvider {
                 // path, so there is nothing to prune by sequence here.
             }
         }
+
+        self.raise_pruned_delete_floor(pruned_through);
 
         tracing::debug!(
             cutoff,
@@ -35200,7 +35298,111 @@ impl CayenneTableProvider {
 
         // Acquire the write lock so no insert/delete is in-flight while we reload state.
         let _write_guard = self.write_lock.lock().await;
+        self.reload_from_catalog().await
+    }
 
+    /// Whether this table serves another instance's writes: its data is in an
+    /// object-native location and it may not write it (a replica, or a table
+    /// whose instance stopped writing the dataset since it opened). Its scan
+    /// views then confirm the dataset head before they capture (see
+    /// [`Self::confirm_head`]), and are reused for [`Self::replica_view_lag`]
+    /// whatever the table's own reuse mode.
+    fn serves_from_writer(&self) -> bool {
+        !self.table_writes.allows() && self.data_in_object_native_location()
+    }
+
+    /// How long a replica's scan view serves queries before a query confirms
+    /// the head again. Zero by default: every query serves at least each commit
+    /// acknowledged before it started, waiting for the first view whose head
+    /// read was sent after it arrived and sharing it with the queries around it.
+    fn replica_view_lag(&self) -> Duration {
+        Duration::from_nanos(self.replica_view_lag_ns.load(Ordering::Relaxed))
+    }
+
+    /// Let a replica's queries serve a scan view up to `lag` old, rather than
+    /// confirm the head for each round of queries.
+    #[doc(hidden)]
+    pub fn set_replica_view_lag(&self, lag: Duration) {
+        self.replica_view_lag_ns.store(
+            u64::try_from(lag.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Bring this table up to the commits the instance that writes it has
+    /// made: one conditional read of the dataset head, and a reload of what
+    /// the table caches from the catalog whenever the catalog's revision
+    /// differs from the one the table last loaded at: after the head moved,
+    /// after a reload of its own that failed, and after another table on the
+    /// same log followed the writer or the log was handed over. Called while
+    /// building a scan view, under its build admission, so concurrent queries
+    /// share one read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the head cannot be read or the reload fails; the
+    /// query then fails rather than answer from a state it could not confirm.
+    ///
+    /// The caller holds `write_lock`, taken before the scan view's build
+    /// admission: a rewrite takes them in that order too.
+    async fn confirm_head(&self) -> Result<()> {
+        let revision = self
+            .catalog
+            .follow_commits(&self.table_metadata.table_id)
+            .await
+            .map_err(|source| Error::Catalog { source })?;
+        if self.loaded_revision.load(Ordering::Acquire) != revision {
+            self.reload_from_catalog().await?;
+            self.reload_cached_statistics_and_inline_state().await?;
+            self.loaded_revision.store(revision, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// The table statistics and inline-corpus counters, read again from the
+    /// catalog after another instance changed them.
+    async fn reload_cached_statistics_and_inline_state(&self) -> Result<()> {
+        let (statistics, count_exact) =
+            Self::load_table_statistics(&self.catalog, &self.table_metadata).await;
+        {
+            let mut cache = self.table_statistics.write();
+            cache.optimizer_inexact = statistics
+                .as_ref()
+                .map(|s| Self::statistics_to_inexact(s.clone()));
+            cache.optimizer = statistics;
+            cache.raw = None;
+            cache.count_exact = count_exact;
+        }
+        let table_id = &self.table_metadata.table_id;
+        let inlined = self
+            .catalog
+            .get_inlined_data_stats(table_id)
+            .await
+            .map_err(|source| Error::Catalog { source })?;
+        let sequence = self
+            .catalog
+            .get_sequence_number(table_id)
+            .await
+            .map_err(|source| Error::Catalog { source })?;
+        // Drop the materialized inline view first: invalidating also zeroes the
+        // counters, which are then set to what the catalog holds, and the
+        // structural bump publishes them to the next scan.
+        self.invalidate_inlined_cache();
+        self.inlined_row_count
+            .store(inlined.record_count, Ordering::Release);
+        self.durable_inlined_row_count
+            .store(inlined.record_count, Ordering::Release);
+        self.inlined_tombstone_bytes
+            .store(inlined.tombstone_metastore_bytes(), Ordering::Release);
+        self.published_inlined_seq
+            .fetch_max(sequence, Ordering::AcqRel);
+        self.bump_inlined_structural_epoch();
+        Ok(())
+    }
+
+    /// Reload deletion vectors, protected snapshots, the current snapshot and the
+    /// listing from the catalog. The caller holds `write_lock`.
+    async fn reload_from_catalog(&self) -> Result<()> {
         // Reload deletion vectors from the catalog (SQLite) — the source of truth.
         // This picks up any deletions committed by writes that completed after the
         // source provider was opened.
@@ -38158,6 +38360,16 @@ impl CayenneTableProvider {
     /// Tick period of the background [`Self::run_scan_view_evictor`] sweep.
     /// Also the idle window for [`ScanViewReuse::UntilInvalidated`].
     const SCAN_VIEW_EVICTION_INTERVAL: Duration = Duration::from_secs(5);
+    /// How often a strict replica refreshes its scan view in the background
+    /// while queries use it, so a query's own read of the head usually finds
+    /// it unchanged and the view already built.
+    const REPLICA_STRICT_REFRESH_PERIOD: Duration = Duration::from_secs(1);
+    /// How often the background view refresh of a table that writes its
+    /// dataset wakes to notice the table's teardown, while it waits for the
+    /// table to stop writing.
+    const WRITER_REFRESH_RECHECK: Duration = Duration::from_secs(30);
+    /// The shortest period between a replica's background view refreshes.
+    const REPLICA_VIEW_REFRESH_MIN_PERIOD: Duration = Duration::from_millis(100);
 
     /// Initialize the demand scan-view cache once the provider is wrapped in an `Arc`:
     /// record a weak self-reference (so the cache can obtain an owned `Arc<Self>` for
@@ -38171,7 +38383,93 @@ impl CayenneTableProvider {
         // per real provider (never per `clone_for_write` clone, which shares the cache).
         if self.weak_self.set(Arc::downgrade(self)).is_ok() {
             task::spawn(Self::run_scan_view_evictor(Arc::downgrade(self)));
+            if self.data_in_object_native_location() {
+                task::spawn(Self::run_replica_view_refresh(Arc::downgrade(self)));
+            }
         }
+    }
+
+    /// Background refresh of a replica's scan view: while queries use the
+    /// table, it confirms the head and rebuilds the view every half lag (every
+    /// [`Self::REPLICA_STRICT_REFRESH_PERIOD`] for a strict replica). A lagging
+    /// replica's queries then find a view within their lag and read nothing
+    /// themselves; a strict replica's queries still confirm the head, but
+    /// usually find it unchanged and the view already built. A table no query
+    /// has used within the idle window sends no request. Holds only a
+    /// `Weak<Self>` and exits after the table is torn down; a table that
+    /// writes the dataset skips each round, and refreshes again once it
+    /// serves another writer.
+    async fn run_replica_view_refresh(weak: std::sync::Weak<Self>) {
+        loop {
+            let (period, writes) = {
+                let Some(provider) = weak.upgrade() else {
+                    return;
+                };
+                let lag = provider.replica_view_lag();
+                let period = if lag.is_zero() {
+                    Self::REPLICA_STRICT_REFRESH_PERIOD
+                } else {
+                    (lag / 2).max(Self::REPLICA_VIEW_REFRESH_MIN_PERIOD)
+                };
+                (period, provider.table_writes.clone())
+            };
+            if writes.allows() {
+                // The writer's table has nothing to refresh: wait until it
+                // stops writing, waking now and then to notice a teardown.
+                let mut role = writes.watch();
+                tokio::select! {
+                    _ = role.wait_for(|allowed| !*allowed) => {}
+                    () = tokio::time::sleep(Self::WRITER_REFRESH_RECHECK) => {}
+                }
+                continue;
+            }
+            tokio::time::sleep(period).await;
+            let Some(provider) = weak.upgrade() else {
+                return;
+            };
+            if !provider.serves_from_writer() || !provider.queried_recently(Instant::now()) {
+                continue;
+            }
+            let refreshed = if provider.replica_view_lag().is_zero() {
+                // A strict query reuses no view built before it arrived, so
+                // only the read of the head and the reload are done ahead of it.
+                let _reload_guard = provider.write_lock.lock().await;
+                provider
+                    .confirm_head()
+                    .await
+                    .map_err(|error| error.to_string())
+            } else {
+                // Rebuilt every round unless a query rebuilt it within the last
+                // half period: rounds and builds drift against each other, and
+                // a view kept only when younger than a whole period could be
+                // reused at one round and expire before the next.
+                provider
+                    .scan_view_confirming_head(ScanViewReuse::WithinLag(period / 2), true)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            };
+            if let Err(error) = refreshed {
+                // A query that finds the view past its lag confirms the head
+                // itself, and fails with the error a user can act on.
+                tracing::debug!(
+                    table = %provider.table_metadata.table_name,
+                    %error,
+                    "Did not refresh the replica's scan view; the next query confirms the dataset head itself"
+                );
+            }
+        }
+    }
+
+    /// Whether a query planned a scan of this table within the idle window
+    /// the evictor keeps a scan view for.
+    fn queried_recently(&self, now: Instant) -> bool {
+        let idle_window =
+            Self::scan_view_idle_window(ScanViewReuse::WithinLag(self.replica_view_lag()));
+        let last_query_ns = self.last_query_ns.load(Ordering::Relaxed);
+        last_query_ns != u64::MAX
+            && now.saturating_duration_since(scan_view_instant_from_ns(last_query_ns))
+                <= idle_window
     }
 
     /// Background sweep that drops a cached `latest_complete` once it has gone
@@ -38190,13 +38488,19 @@ impl CayenneTableProvider {
         }
     }
 
+    /// How long a cached scan view under `reuse` is kept after it was last
+    /// served.
+    fn scan_view_idle_window(reuse: ScanViewReuse) -> Duration {
+        match reuse {
+            ScanViewReuse::UntilInvalidated => Self::SCAN_VIEW_EVICTION_INTERVAL,
+            ScanViewReuse::WithinLag(lag) => lag.max(Self::SCAN_VIEW_EVICTION_INTERVAL),
+        }
+    }
+
     /// One eviction step: drain completed builds, then drop `latest_complete`
     /// iff it has not been served within the idle window (last-access, not age).
     fn evict_stale_scan_view(&self, now: Instant) {
-        let idle_window = match self.scan_view_reuse {
-            ScanViewReuse::UntilInvalidated => Self::SCAN_VIEW_EVICTION_INTERVAL,
-            ScanViewReuse::WithinLag(lag) => lag.max(Self::SCAN_VIEW_EVICTION_INTERVAL),
-        };
+        let idle_window = Self::scan_view_idle_window(self.scan_view_reuse);
         {
             let mut in_flight = self.scan_view_cache.in_flight.lock();
             self.scan_view_cache.drain_completed(&mut in_flight);
@@ -38319,6 +38623,22 @@ impl CayenneTableProvider {
         &self,
         reuse: ScanViewReuse,
     ) -> datafusion_common::Result<Arc<ScanView>> {
+        self.scan_view_confirming_head(reuse, false).await
+    }
+
+    /// [`Self::scan_view_at_current_input`], and with `confirm_head` a view
+    /// built on a miss first confirms the dataset head ([`Self::confirm_head`])
+    /// and is stamped with the time that confirmation was sent, so a
+    /// [`ScanViewReuse::WithinLag`] reuse measures freshness against the
+    /// writer's commits. The confirmation runs under the build admission, so
+    /// the queries queued behind a build share it. Only the query path and the
+    /// replica's background refresh confirm: maintenance does not run on a
+    /// replica, and may hold `write_lock`, which a reload takes.
+    async fn scan_view_confirming_head(
+        &self,
+        reuse: ScanViewReuse,
+        confirm_head: bool,
+    ) -> datafusion_common::Result<Arc<ScanView>> {
         let requested_at = Instant::now();
         if let Some(view) = self.try_reuse_scan_view(reuse, requested_at) {
             return Ok(view);
@@ -38340,12 +38660,31 @@ impl CayenneTableProvider {
         // first such scan admitted rebuilds once, and because that capture
         // happens after every scan still queued arrived, they are served by it
         // rather than each rebuilding in turn.
+        // A reload takes `write_lock`, which a rewrite holds while it waits
+        // for build admission: take it first, in the same order.
+        let reload_guard = if confirm_head {
+            Some(self.write_lock.lock().await)
+        } else {
+            None
+        };
         let build_permit = Arc::clone(&self.scan_view_cache.build_lock)
             .lock_owned()
             .await;
         if let Some(view) = self.try_reuse_scan_view(reuse, requested_at) {
             return Ok(view);
         }
+        // Stamped before the read is sent: the view holds at least every
+        // commit the head named by then.
+        let confirmed_at = if let Some(reload_guard) = reload_guard {
+            let sent_at = Instant::now();
+            self.confirm_head()
+                .await
+                .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            drop(reload_guard);
+            Some(sent_at)
+        } else {
+            None
+        };
 
         // Capture the CURRENT state under the structural seqlock, retrying across a
         // (rare) live schema-evolution that leaves the generation odd/torn, and
@@ -38359,7 +38698,7 @@ impl CayenneTableProvider {
             // capture read: freshness checks compare it with when a scan asked,
             // and a stamp taken after the capture would let a write that
             // completed in between pass for already included.
-            let captured_at = Instant::now();
+            let captured_at = confirmed_at.unwrap_or_else(Instant::now);
             let order_before = self.scan_input_version.load(Ordering::Acquire);
             let (structural_version, raw) = match self
                 .structural_version
@@ -46912,12 +47251,13 @@ fn i64_eq_literal_on_schema(schema: &SchemaRef, filters: &[Expr]) -> Option<(usi
 
 impl CayenneTableProvider {
     /// What a scan does before it captures its view (see [`Self::plan_scan_from_view`]),
-    /// and how that capture may reuse a cached view.
+    /// how that capture may reuse a cached view, and whether it confirms the
+    /// dataset head first ([`Self::serves_from_writer`], read once per scan).
     async fn prepare_scan(
         &self,
         state: &dyn Session,
         filters: &[Expr],
-    ) -> datafusion_common::Result<ScanViewReuse> {
+    ) -> datafusion_common::Result<(ScanViewReuse, bool)> {
         // F4 default-on layout: record which columns this scan filters on so
         // background compaction can cluster cold files without spicepod setup.
         // Cheap (mutex + HashMap bump); empty filters are a no-op.
@@ -46966,13 +47306,22 @@ impl CayenneTableProvider {
         // or once every file has been verified this process.
         self.verify_data_file_integrity().await?;
 
-        Ok(
-            if state.config().get_extension::<CurrentScanView>().is_some() {
-                ScanViewReuse::UntilInvalidated
+        let current = state.config().get_extension::<CurrentScanView>().is_some();
+        let follows = self.serves_from_writer();
+        let reuse = if follows {
+            // No write of this instance invalidates a replica's view: it is
+            // reused for the replica's lag, and "as it is now" confirms the head.
+            ScanViewReuse::WithinLag(if current {
+                Duration::ZERO
             } else {
-                self.scan_view_reuse
-            },
-        )
+                self.replica_view_lag()
+            })
+        } else if current {
+            ScanViewReuse::UntilInvalidated
+        } else {
+            self.scan_view_reuse
+        };
+        Ok((reuse, follows))
     }
 
     /// A scan's plan over `scan_view`. Everything the plan reads descends from that
@@ -47566,7 +47915,7 @@ impl TableProvider for CayenneTableProvider {
             self.ensure_publication_outcome_known()
                 .map_err(|error| DataFusionError::External(Box::new(error)))?;
         }
-        let reuse = self.prepare_scan(state, filters).await?;
+        let (reuse, confirm_head) = self.prepare_scan(state, filters).await?;
         // Obtain the scan-view bundle from the demand cache. See
         // [`Self::scan_view_at_current_input`]. The KDI merge + visible mem-tier
         // segments are computed OFF the query path (in `spawn_blocking`) and
@@ -47579,7 +47928,11 @@ impl TableProvider for CayenneTableProvider {
         //
         // The fields are cloned out (cheap `Arc` / short-`String` / `im`-HAMT clones)
         // so downstream plan-build owns them exactly as when it captured inline.
-        let scan_view = self.scan_view_at_current_input(reuse).await?;
+        if confirm_head {
+            self.last_query_ns
+                .store(scan_view_instant_as_ns(Instant::now()), Ordering::Relaxed);
+        }
+        let scan_view = self.scan_view_confirming_head(reuse, confirm_head).await?;
         #[cfg(test)]
         {
             let hook = self.test_post_scan_view_selection_hook.lock().take();
