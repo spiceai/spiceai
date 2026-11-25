@@ -66,10 +66,11 @@ impl QueryPlanner for ExtensionPlanQueryPlanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Before the condition is reduced to a filter list that can no longer
         // express it. See `crate::dml_guard`.
-        crate::dml_guard::ensure_dml_restriction_reaches_the_table(logical_plan)?;
+        let logical_plan = crate::dml_guard::rewrite_dml_for_the_table(logical_plan)?;
+        crate::dml_guard::ensure_dml_restriction_reaches_the_table(&logical_plan)?;
 
         self.physical_planner
-            .create_physical_plan(logical_plan, session_state)
+            .create_physical_plan(&logical_plan, session_state)
             .await
     }
 }
