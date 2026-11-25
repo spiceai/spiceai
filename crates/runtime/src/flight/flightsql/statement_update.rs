@@ -72,11 +72,7 @@ pub(crate) async fn do_put(
                     "Accepting a statement update the scheduler forwarded to this executor"
                 );
             } else {
-                // No principal: a request without credentials, which a listener beyond
-                // loopback serves read-only (`runtime.auth` refuses one before it gets here).
-                return Err(Status::permission_denied(
-                    runtime_auth::anonymous::write_route_refusal(),
-                ));
+                return Err(crate::flight::write_without_credentials_refusal(&context));
             }
         }
     }

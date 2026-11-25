@@ -155,6 +155,17 @@ pub(crate) fn cluster_peer_role(context: &RequestContext) -> Option<ClusterPeerR
     context.extension::<ClusterPeer>().map(|peer| peer.role())
 }
 
+/// Whether a request without credentials in `context` may only read.
+///
+/// On an executor's Flight server, where [`ClusterPeerLayer`] records the node that sent the
+/// request, only another executor may only read: the scheduler forwards writes there, and a
+/// cluster without mTLS identifies no node. On every other listener a request without
+/// credentials may only read; the local operator of a loopback-only listener carries a
+/// principal (see `runtime_auth::anonymous`).
+pub(crate) fn request_without_credentials_is_read_only(context: &RequestContext) -> bool {
+    cluster_peer_role(context).is_none_or(|role| role == ClusterPeerRole::Executor)
+}
+
 /// Records on each request to an executor's Flight server which cluster node
 /// sent it. Must run inside the request-context layer, which puts the
 /// [`RequestContext`] on the request, and before authorization.

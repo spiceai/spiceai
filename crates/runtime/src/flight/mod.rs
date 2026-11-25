@@ -914,18 +914,21 @@ pub(crate) fn transaction_outcome_to_flight_stream(
 }
 
 /// Returns `true` when the request may only read: its principal lacks write permission
-/// (`"write"` or `"read_write"` group), or it has none. A request without credentials has none
-/// unless it is the local operator, on a loopback-only listener of a runtime without
-/// `runtime.auth` (see `runtime_auth::anonymous`).
+/// (`"write"` or `"read_write"` group), or it has none and
+/// [`crate::cluster::peer::request_without_credentials_is_read_only`] says so. A request
+/// without credentials has no principal unless it is the local operator, on a loopback-only
+/// listener of a runtime without `runtime.auth` (see `runtime_auth::anonymous`).
 pub(crate) fn is_auth_read_only(context: &RequestContext) -> bool {
-    !context
-        .auth_principal()
-        .is_some_and(runtime_auth::principal_has_write_access)
+    match context.auth_principal() {
+        Some(principal) => !runtime_auth::principal_has_write_access(principal),
+        None => crate::cluster::peer::request_without_credentials_is_read_only(context),
+    }
 }
 
 /// Why `context` may not write, for a Flight call that changes data: `read_only_key` for a
-/// principal without write access, or the refusal of a request without credentials, which a
-/// listener beyond loopback serves read-only. `None` when it may write.
+/// principal without write access, or the refusal of a request without credentials that may
+/// only read ([`crate::cluster::peer::request_without_credentials_is_read_only`]). `None` when
+/// it may write.
 pub(crate) fn write_access_refusal(
     context: &RequestContext,
     read_only_key: &str,
@@ -933,7 +936,27 @@ pub(crate) fn write_access_refusal(
     match context.auth_principal() {
         Some(principal) if runtime_auth::principal_has_write_access(principal) => None,
         Some(_) => Some(read_only_key.to_string()),
-        None => Some(runtime_auth::anonymous::write_route_refusal()),
+        None if crate::cluster::peer::request_without_credentials_is_read_only(context) => {
+            Some(runtime_auth::anonymous::write_route_refusal())
+        }
+        None => None,
+    }
+}
+
+/// The refusal of a Flight write (a `DoPut` or a statement update) that arrives without
+/// credentials and that the scheduler did not forward.
+///
+/// On an executor's Flight server it came from another cluster node, which the executor does
+/// not take writes from: it is refused as unauthenticated. On any other listener it reached
+/// Spice over the network or through a proxy, which a runtime without `runtime.auth` serves
+/// read-only (`runtime.auth` refuses a request without credentials before it gets here).
+pub(crate) fn write_without_credentials_refusal(context: &RequestContext) -> Status {
+    if crate::cluster::peer::cluster_peer_role(context).is_some() {
+        Status::unauthenticated(
+            "Flight DoPut requires authentication.\nFor auth details, visit https://spiceai.org/docs/api/auth",
+        )
+    } else {
+        Status::permission_denied(runtime_auth::anonymous::write_route_refusal())
     }
 }
 

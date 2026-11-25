@@ -130,24 +130,32 @@ pub(crate) fn principal_has_write_access(principal: &AuthPrincipalRef) -> bool {
         .any(|group| *group == "write" || *group == "read_write")
 }
 
-/// Whether the request may only read: its principal lacks write access, or it has none. A
-/// request without credentials has none unless it is the local operator, on a loopback-only
+/// Whether the request may only read: its principal lacks write access, or it has none and
+/// [`crate::cluster::peer::request_without_credentials_is_read_only`] says so. A request
+/// without credentials has no principal unless it is the local operator, on a loopback-only
 /// listener of a runtime without `runtime.auth` (see `runtime_auth::anonymous`).
 pub(crate) async fn current_principal_requires_read_only() -> bool {
     let context = RequestContext::current(AsyncMarker::new().await);
-    !runtime_auth::AuthRequestContext::auth_principal(context.as_ref())
-        .is_some_and(principal_has_write_access)
+    match runtime_auth::AuthRequestContext::auth_principal(context.as_ref()) {
+        Some(principal) => !principal_has_write_access(principal),
+        None => crate::cluster::peer::request_without_credentials_is_read_only(&context),
+    }
 }
 
 /// Why the current request may not write, for a route that changes data: a read-only API key,
-/// or a request without credentials that is not the local operator's (it reached Spice over the
-/// network or through a proxy). `None` when it may write.
+/// or a request without credentials that may only read
+/// ([`crate::cluster::peer::request_without_credentials_is_read_only`]): it is not the local
+/// operator's, because it reached Spice over the network or through a proxy. `None` when it
+/// may write.
 pub(crate) async fn write_access_refusal() -> Option<String> {
     let context = RequestContext::current(AsyncMarker::new().await);
     match runtime_auth::AuthRequestContext::auth_principal(context.as_ref()) {
         Some(principal) if principal_has_write_access(principal) => None,
         Some(_) => Some("API key does not allow write access".to_string()),
-        None => Some(runtime_auth::anonymous::write_route_refusal()),
+        None if crate::cluster::peer::request_without_credentials_is_read_only(&context) => {
+            Some(runtime_auth::anonymous::write_route_refusal())
+        }
+        None => None,
     }
 }
 

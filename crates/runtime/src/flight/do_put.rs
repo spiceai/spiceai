@@ -177,12 +177,8 @@ pub(crate) async fn handle(
             if crate::cluster::peer::is_from_scheduler(&context) {
                 tracing::debug!("Accepting a DoPut the scheduler forwarded to this executor");
             } else {
-                // No principal: a request without credentials, which a listener beyond
-                // loopback serves read-only (`runtime.auth` refuses one before it gets here).
                 let _start = metrics::track_flight_request("do_put", None).await;
-                return Err(Status::permission_denied(
-                    runtime_auth::anonymous::write_route_refusal(),
-                ));
+                return Err(crate::flight::write_without_credentials_refusal(&context));
             }
         }
     }
