@@ -1861,6 +1861,8 @@ async fn a_failed_overwrite_commit_leaves_its_files_to_the_orphan_sweep() {
         .await
         .expect("the orphan sweep");
     assert_eq!(report.skipped, None, "the orphan sweep ran");
+    // It retires them, and the retirement sweep deletes them.
+    process.table.reclaim_retired_snapshots_now().await;
     let left: Vec<String> = location
         .data_files()
         .await
@@ -1869,8 +1871,8 @@ async fn a_failed_overwrite_commit_leaves_its_files_to_the_orphan_sweep() {
         .collect();
     assert!(
         left.is_empty(),
-        "the orphan sweep left the failed overwrite's files: {left:?} (it deleted {:?})",
-        report.deleted
+        "the orphan sweep left the failed overwrite's files: {left:?} (it retired {:?})",
+        report.retired
     );
     process
         .assert_named_files_stored(&location, "after the orphan sweep")
