@@ -89,12 +89,27 @@ class SpicedDockerDevTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("on_trunk=false", output)
 
-    def test_the_build_jobs_keep_no_git_credentials(self):
+    def test_the_build_jobs_build_the_commit_setup_checked_and_keep_no_git_credentials(self):
         for job in ("build-arm64", "build-amd64"):
             with self.subTest(job=job):
                 checkout = next(s for s in job_steps("spiced_docker_dev.yml", job)
                                 if str(s.get("uses", "")).startswith("actions/checkout@"))
+                self.assertEqual(checkout["with"]["ref"], "${{ needs.setup.outputs.revision }}")
                 self.assertIs(checkout["with"]["persist-credentials"], False)
+
+    def test_an_image_tag_is_validated(self):
+        steps = job_steps("spiced_docker_dev.yml", "setup")
+        script = next(s for s in steps if s.get("id") == "set_image_metadata")["run"]
+        for tag, ok in (("my-feature", True), ("trunk-0123456789ab", True), ("a b", False),
+                        ("x\nimage=evil", False), ("-x", False), ("a" * 129, False)):
+            with self.subTest(tag=tag):
+                with tempfile.TemporaryDirectory() as tmp:
+                    output = Path(tmp) / "out"
+                    output.write_text("")
+                    proc = subprocess.run(["bash", "-e", "-c", script], capture_output=True, text=True,
+                                          env={"PATH": os.environ["PATH"], "INPUT_TAG": tag, "GITHUB_OUTPUT": str(output)})
+                    self.assertEqual(proc.returncode == 0, ok, proc.stdout + proc.stderr)
+                    self.assertEqual(output.read_text() != "", ok)
 
 
 class ClusterImageTest(unittest.TestCase):

@@ -97,6 +97,11 @@ jobs:
         env:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
+          # An image tag: it is written to GITHUB_OUTPUT and passed to `docker buildx` unquoted.
+          if ! [[ "${INPUT_TAG}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::'${INPUT_TAG}' is not an image tag (letters, digits, _, . and -, at most 128)."
+            exit 1
+          fi
           echo "image=ghcr.io/spiceai/spiceai-dev:${INPUT_TAG}" >> "$GITHUB_OUTPUT"
           echo "tag=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
 
@@ -212,9 +217,10 @@ jobs:
       RUST_PROFILE: release
 
     steps:
+      # The commit setup checked, not `ref` again: a branch can move in between.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ needs.setup.outputs.revision }}
           persist-credentials: false
 
       - name: Add dev postfix to version in Cargo.toml
@@ -308,9 +314,10 @@ jobs:
       RUST_PROFILE: release
 
     steps:
+      # The commit setup checked, not `ref` again: a branch can move in between.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ needs.setup.outputs.revision }}
           persist-credentials: false
 
       - name: Add dev postfix to version in Cargo.toml

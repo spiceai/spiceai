@@ -86,7 +86,8 @@ runs:
           exit 1
         fi
         echo "${asset} of ${RELEASE} matches ${source}."
-        commit="$(curl -fsSL "${auth[@]}" "${api}/commits/${RELEASE}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')"
+        # By its full name: a branch can share a tag's name.
+        commit="$(curl -fsSL "${auth[@]}" "${api}/commits/refs/tags/${RELEASE}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')"
         if ! [[ "${commit}" =~ ^[0-9a-f]{40}$ ]]; then
           echo "::error::Could not read the commit ${RELEASE} names"
           exit 1

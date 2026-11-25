@@ -72,7 +72,7 @@ class SetupReleasedSpicedTest(unittest.TestCase):
         (self.dir / "release.json").write_text(json.dumps({"assets": assets}))
         routes[f"{api}/releases/tags/{tag}"] = self.dir / "release.json"
         (self.dir / "commit.json").write_text(json.dumps({"sha": COMMIT}))
-        routes[f"{api}/commits/{tag}"] = self.dir / "commit.json"
+        routes[f"{api}/commits/refs/tags/{tag}"] = self.dir / "commit.json"
         (self.dir / "routes").write_text("".join(f"{url}\t{path}\n" for url, path in routes.items()))
         (self.dir / "digests.json").write_text(json.dumps({"releases": digests or {}}))
 
