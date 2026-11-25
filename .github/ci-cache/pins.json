@@ -24,6 +24,15 @@
       "x86_64-apple-darwin": "2526753e4f10ce8a0c9c45ba634e59d7c07e4aace9a21304a0fa86fb089b7039"
     }
   },
+  "cargo-nextest": {
+    "version": "0.9.89",
+    "url": "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-{version}/cargo-nextest-{version}-{target}.tar.gz",
+    "sha256": {
+      "x86_64-unknown-linux-gnu": "d90785677e767a0b8b50fbaffc465f3ab2d67d1f692137898130ae9d338070b9",
+      "aarch64-unknown-linux-gnu": "8f00921063058b650e44246549c476e42e850a4925892b0b1a4f9b2b45bb7035",
+      "universal-apple-darwin": "e7686274224c5e32469cd1da66495663b87620cf2bf800d7b406fb58f4938b82"
+    }
+  },
   "rustup-init": {
     "version": "1.29.3",
     "url": "https://static.rust-lang.org/rustup/archive/{version}/{target}/rustup-init",

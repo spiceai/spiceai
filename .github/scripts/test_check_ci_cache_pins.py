@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Tests for check_ci_cache_pins.py, run on a copy of the files it reads.
 
-Each test copies the checker, pins.json, rust-toolchain.toml and the install-cargo-deny
-and setup-rust actions into a temporary tree laid out like the repository, changes one of
-them, and runs the checker there as CI does.
+Each test copies the checker, pins.json, rust-toolchain.toml, Dockerfile-cuda and the
+install-cargo-deny, setup-rust and setup-nextest actions into a temporary tree laid out
+like the repository, changes one of them, and runs the checker there as CI does.
 """
 
 import json
@@ -20,6 +20,8 @@ FILES = [
     ".github/ci-cache/pins.json",
     ".github/actions/install-cargo-deny/action.yml",
     ".github/actions/setup-rust/action.yml",
+    ".github/actions/setup-nextest/action.yml",
+    "Dockerfile-cuda",
     "rust-toolchain.toml",
 ]
 
@@ -111,6 +113,32 @@ class CheckCiCachePinsTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("Found no `<os>-<arch>) host_triple=<triple> ;;` arm", result.stdout)
 
+
+    def test_every_target_setup_nextest_installs_must_be_pinned(self):
+        self.edit_pins(lambda pins: pins["cargo-nextest"]["sha256"].pop("universal-apple-darwin"))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("cargo-nextest.sha256 has no pin for universal-apple-darwin", result.stdout)
+
+    def test_a_cargo_nextest_pin_off_its_release_page_fails(self):
+        def change(pins):
+            pins["cargo-nextest"]["url"] = "https://get.nexte.st/{version}/{target}"
+            pins["cargo-nextest"]["sha256"]["x86_64-unknown-linux-gnu"] = "ABC"
+
+        self.edit_pins(change)
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("cargo-nextest.url must start with https://github.com/nextest-rs/nextest/releases/download/", result.stdout)
+        self.assertIn("cargo-nextest.sha256.x86_64-unknown-linux-gnu is not a lowercase hex SHA-256.", result.stdout)
+
+    def test_dockerfile_cuda_must_install_the_pinned_rustup_init(self):
+        self.edit_pins(lambda pins: pins["rustup-init"]["sha256"].update({"x86_64-unknown-linux-gnu": "1" * 64}))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Dockerfile-cuda has ARG RUSTUP_INIT_SHA256_X86_64=", result.stdout)
+        self.edit_pins(lambda pins: pins["rustup-init"].update({"version": "9.9.9"}))
+        result = self.run_check()
+        self.assertIn("Dockerfile-cuda has ARG RUSTUP_VERSION=", result.stdout)
 
 if __name__ == "__main__":
     unittest.main()

@@ -39,6 +39,13 @@ on:
       - '.github/scripts/test_mssql_tpch_restore.py'
       - '.github/scripts/extract_snapshot_archives.py'
       - '.github/scripts/test_extract_snapshot_archives.py'
+      - '.github/scripts/test_install_spice.py'
+      - '.github/scripts/test_setup_nextest.py'
+      - 'scripts/libduckdb.py'
+      - 'scripts/test_libduckdb.py'
+      - 'test/duckdb_versions.json'
+      - '**/Dockerfile*'
+      - '**/*.Dockerfile'
   push:
     branches:
       - trunk
@@ -70,6 +77,13 @@ on:
       - '.github/scripts/test_mssql_tpch_restore.py'
       - '.github/scripts/extract_snapshot_archives.py'
       - '.github/scripts/test_extract_snapshot_archives.py'
+      - '.github/scripts/test_install_spice.py'
+      - '.github/scripts/test_setup_nextest.py'
+      - 'scripts/libduckdb.py'
+      - 'scripts/test_libduckdb.py'
+      - 'test/duckdb_versions.json'
+      - '**/Dockerfile*'
+      - '**/*.Dockerfile'
   workflow_dispatch:
 
 concurrency:
@@ -122,6 +136,9 @@ jobs:
           python .github/scripts/test_check_ci_cache_pins.py -v
           python .github/scripts/test_mssql_tpch_restore.py -v
           python .github/scripts/test_extract_snapshot_archives.py -v
+          python .github/scripts/test_install_spice.py -v
+          python .github/scripts/test_setup_nextest.py -v
+          python scripts/test_libduckdb.py -v
 
       - name: Validate GitHub Actions definitions
         run: python .github/scripts/check_workflow_yaml.py

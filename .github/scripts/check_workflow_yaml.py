@@ -47,8 +47,8 @@
 # same split by `job_workflow_ref` and `ref`; this keeps the workflows asking for what AWS
 # would grant.
 #
-# And no script under `.github/` (a workflow or composite action `run:`, or a `.sh` file)
-# runs a download as code: piped into a shell, read through `<(curl …)`, passed to
+# And no script under `.github/` (a workflow or composite action `run:`, or a shell or
+# PowerShell file), and no Dockerfile in the repository, runs a download as code: piped into a shell, read through `<(curl …)`, passed to
 # `sh -c "$(curl …)"`, or given to PowerShell's `iex`, nor names the unpinned rustup
 # installers (sh.rustup.rs, win.rustup.rs). A download is kept as a file, checked against
 # a pinned SHA-256, and then run.
@@ -57,6 +57,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
@@ -992,12 +993,31 @@ def check_download_execution(jobs: dict) -> list[str]:
 
 
 SCRIPT_SUFFIXES = (".sh", ".bash", ".zsh", ".ksh", ".ps1")
+# Directories a Dockerfile search skips: build output and other tools' trees.
+NOT_SOURCE = frozenset({".git", "target", "node_modules"})
+
+
+def is_dockerfile(name: str) -> bool:
+    return name.startswith("Dockerfile") or name.lower().endswith(".dockerfile")
+
+
+def repository_dockerfiles(root: Path) -> list[Path]:
+    """Every Dockerfile under `root`, outside build output and hidden directories."""
+    found = []
+    for directory, subdirectories, files in os.walk(root):
+        subdirectories[:] = [
+            d for d in subdirectories if d not in NOT_SOURCE and (not d.startswith(".") or d == ".github")
+        ]
+        found.extend(Path(directory, name) for name in files if is_dockerfile(name))
+    return sorted(found)
 
 
 def check_script_downloads(github_dir: Path) -> list[str]:
-    """Report a shell or PowerShell script under the .github directory that runs a download as code."""
+    """Report a shell or PowerShell script under the .github directory, or a Dockerfile in the
+    repository, that runs a download as code."""
     problems = []
-    for path in sorted(p for p in github_dir.rglob("*") if p.suffix in SCRIPT_SUFFIXES):
+    scripts = [p for p in github_dir.rglob("*") if p.suffix in SCRIPT_SUFFIXES]
+    for path in sorted(scripts) + repository_dockerfiles(github_dir.resolve().parent):
         if path.is_file():
             problems.extend(
                 f"{path}:{number}: runs a download as code (`{line}`): {DOWNLOAD_EXECUTION_REMEDY}"

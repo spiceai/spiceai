@@ -1443,6 +1443,26 @@ runs:
             self.assertEqual(len(failures), 1, failures)
             self.assertTrue(failures[0].startswith(f"{script}:3: runs a download as code"), failures[0])
 
+    def test_the_repositorys_dockerfiles_are_checked_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            github_dir = root / ".github"
+            (github_dir / "workflows").mkdir(parents=True)
+            (github_dir / "workflows" / "pr.yml").write_text(VALID_WORKFLOW)
+            (root / "Dockerfile-cuda").write_text(
+                "FROM ubuntu\n# not this: curl x | sh\nRUN curl https://sh.rustup.rs -sSf | bash -s -- -y\n"
+            )
+            (root / "tools" / "x").mkdir(parents=True)
+            (root / "tools" / "x" / "release.Dockerfile").write_text("FROM ubuntu\nRUN wget -qO- https://x | sh\n")
+            (root / "tools" / "x" / "Dockerfile").write_text("FROM ubuntu\nRUN curl -fsSLo /tmp/x https://x\n")
+            (root / "target" / "debug").mkdir(parents=True)
+            (root / "target" / "debug" / "Dockerfile").write_text("RUN curl https://x | sh\n")
+            failures = check_workflow_yaml.check_definitions(github_dir)
+            self.assertEqual(
+                [f.split(": runs a download as code")[0] for f in failures],
+                [f"{root / 'Dockerfile-cuda'}:3", f"{root / 'tools' / 'x' / 'release.Dockerfile'}:2"],
+            )
+
     def test_the_repository_runs_no_download_as_code(self):
         github_dir = Path(__file__).resolve().parents[1]
         self.assertEqual(

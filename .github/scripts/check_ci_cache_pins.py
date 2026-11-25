@@ -18,6 +18,14 @@ ROOT = Path(__file__).resolve().parents[2]
 PINS_PATH = ROOT / ".github" / "ci-cache" / "pins.json"
 INSTALL_CARGO_DENY = ROOT / ".github" / "actions" / "install-cargo-deny" / "action.yml"
 SETUP_RUST = ROOT / ".github" / "actions" / "setup-rust" / "action.yml"
+SETUP_NEXTEST = ROOT / ".github" / "actions" / "setup-nextest" / "action.yml"
+DOCKERFILE_CUDA = ROOT / "Dockerfile-cuda"
+NEXTEST_RELEASES = "https://github.com/nextest-rs/nextest/releases/download/"
+# Dockerfile-cuda's rustup-init ARGs, and the host each SHA-256 is for.
+DOCKERFILE_RUSTUP = {
+    "RUSTUP_INIT_SHA256_X86_64": "x86_64-unknown-linux-gnu",
+    "RUSTUP_INIT_SHA256_AARCH64": "aarch64-unknown-linux-gnu",
+}
 SHA256 = re.compile(r"[0-9a-f]{64}")
 # The arms of install-cargo-deny's `case "$(uname -s)-$(uname -m)"`, such as
 # `Darwin-arm64) target=aarch64-apple-darwin ;;`: the targets it can ask pins.json for.
@@ -74,6 +82,12 @@ def main() -> int:
                 f"cargo-deny-{deny['version']}-{target}.tar.gz from the release."
             )
 
+    nextest = pins.get("cargo-nextest")
+    if nextest is None:
+        errors.append(f"{PINS_PATH.relative_to(ROOT)} has no cargo-nextest entry, so setup-nextest cannot install it.")
+    else:
+        errors.extend(cargo_nextest_errors(nextest))
+
     rustup = pins.get("rustup-init")
     if rustup is None:
         errors.append(
@@ -82,15 +96,64 @@ def main() -> int:
         )
     else:
         errors.extend(rustup_init_errors(rustup))
+        errors.extend(dockerfile_rustup_errors(rustup))
 
     for error in errors:
         print(f"::error file={PINS_PATH.relative_to(ROOT)}::{error}")
     if not errors:
         print(
             f"OK: {PINS_PATH.relative_to(ROOT)} pins Rust {', '.join(rust['toolchains'])}, "
-            f"cargo-deny {deny['version']} and rustup-init {rustup['version']}."
+            f"cargo-deny {deny['version']}, cargo-nextest {nextest['version']} and rustup-init {rustup['version']}."
         )
     return 1 if errors else 0
+
+
+def cargo_nextest_errors(nextest: dict) -> list:
+    """The cargo-nextest pin: a release on GitHub, for every host setup-nextest maps."""
+    errors = []
+    version = nextest.get("version", "")
+    url = nextest.get("url", "")
+    hashes = nextest.get("sha256", {})
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        errors.append(f"cargo-nextest.version '{version}' is not a release version.")
+    if not url.startswith(NEXTEST_RELEASES) or "{version}" not in url or "{target}" not in url:
+        errors.append(f"cargo-nextest.url must start with {NEXTEST_RELEASES} and contain {{version}} and {{target}}.")
+    for target, sha256 in hashes.items():
+        if not SHA256.fullmatch(sha256):
+            errors.append(f"cargo-nextest.sha256.{target} is not a lowercase hex SHA-256.")
+    targets = ACTION_TARGET.findall(SETUP_NEXTEST.read_text())
+    if not targets:
+        errors.append(
+            f"Found no `<os>-<arch>) target=<target> ;;` arm in {SETUP_NEXTEST.relative_to(ROOT)}, so the "
+            "cargo-nextest targets to require cannot be read; update this check with the action."
+        )
+    for target in targets:
+        if target not in hashes:
+            errors.append(
+                f"cargo-nextest.sha256 has no pin for {target}, which {SETUP_NEXTEST.relative_to(ROOT)} installs "
+                f"on that platform, so cargo-nextest would fail to install there. Add the SHA-256 that "
+                f"`cargo-nextest-{version}-{target}.sha256` in the release lists, and check it against a download."
+            )
+    return errors
+
+
+def dockerfile_rustup_errors(rustup: dict) -> list:
+    """Dockerfile-cuda installs the same rustup-init, so its ARGs must equal the pins."""
+    text = DOCKERFILE_CUDA.read_text()
+    args = dict(re.findall(r"^ARG\s+(RUSTUP_\w+)=(\S*)\s*$", text, re.M))
+    errors = []
+    if args.get("RUSTUP_VERSION") != rustup.get("version"):
+        errors.append(
+            f"{DOCKERFILE_CUDA.relative_to(ROOT)} has ARG RUSTUP_VERSION={args.get('RUSTUP_VERSION')}, but "
+            f"rustup-init.version is {rustup.get('version')}; keep them equal."
+        )
+    for arg, host in DOCKERFILE_RUSTUP.items():
+        if args.get(arg) != rustup.get("sha256", {}).get(host):
+            errors.append(
+                f"{DOCKERFILE_CUDA.relative_to(ROOT)} has ARG {arg}={args.get(arg)}, but rustup-init.sha256.{host} "
+                "is different; keep them equal."
+            )
+    return errors
 
 
 def rustup_init_errors(rustup: dict) -> list:

@@ -42,13 +42,19 @@ download the same file with no bound.
   before.
 - **`cargo-deny`**: the release archive for each target, installed by the
   `install-cargo-deny` action.
+- **`cargo-nextest`**: the release archive for each target `setup-nextest` maps (Linux
+  x86_64 and aarch64, and the universal macOS build). `setup-nextest` extracts only
+  `cargo-nextest` from the checked archive into `CARGO_HOME`'s bin. Windows has no pin, so
+  it fails there rather than downloading one unchecked.
 - **`rustup-init`**: one rustup release, with the SHA-256 of `rustup-init` for each Linux
   and macOS host `setup-rust` maps. It is the only way `setup-rust` installs rustup: on a
   runner without one, fetched through `cached_fetch.sh` and run with `--no-modify-path -y
   --default-toolchain none`, with rustup's self-update then turned off so it stays at the
   pinned release. A missing or mismatched `rustup-init` fails the job; nothing falls back
   to an installer piped into a shell (`check_workflow_yaml.py` refuses one anywhere under
-  `.github/`). On Windows, which it pins none for, a runner without rustup fails.
+  `.github/` or in a Dockerfile). On Windows, which it pins none for, a runner without rustup
+  fails. `Dockerfile-cuda` installs the same release, and `check_ci_cache_pins.py` keeps its
+  `RUSTUP_*` ARGs equal to these pins.
 - **The self-hosted Macs' Rust homes.** There, `setup-rust` gives each job its own
   `CARGO_HOME` and `RUSTUP_HOME` in `$RUNNER_TEMP/rust-home`, which the runner empties when
   a job starts and ends (skipping what it cannot delete), and never reads the host's shared `~/.cargo` or `~/.rustup`, which
