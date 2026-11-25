@@ -183,6 +183,7 @@
   "sidecar-append-stream": 35,
   "sidecar-append-stream-keyed": 6,
   "sidecar-cluster": 119,
+  "sidecar-parameterized-lookups": 6,
   "sidecar-substrait-field-metadata": 6,
   "slow-refresh-warning": 59,
   "slt-strings": 30,

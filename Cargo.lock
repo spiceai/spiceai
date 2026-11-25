@@ -6366,6 +6366,7 @@ dependencies = [
  "object_store 0.13.2",
  "object_store_spawn",
  "opendal",
+ "opentelemetry 0.32.0",
  "oracle",
  "parking_lot",
  "parquet",
