@@ -124,7 +124,7 @@ class SetupSpicedTest(unittest.TestCase):
         # The cold-start regression: a pull request looked for trunk's builds under its own prefix.
         proc, located = self.locate(PULL_REQUEST)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(located, {"prefix": "", "trunk": "true"})
+        self.assertEqual(located, {"ref": "refs/heads/trunk", "prefix": "", "trunk": "true"})
         self.stored.write_text(self.key("", self.trunk) + "\n")
         proc, found = self.run_step("Find the latest built spiced commit", {"REF": "refs/heads/trunk", "SOURCE_PREFIX": ""})
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -137,17 +137,39 @@ class SetupSpicedTest(unittest.TestCase):
             with self.subTest(github_ref=github_ref):
                 proc, located = self.locate(github_ref, spiced_commit=self.trunk)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-                self.assertEqual(located, {"prefix": "", "trunk": "true"})
+                self.assertEqual(located, {"ref": "refs/heads/trunk", "prefix": "", "trunk": "true"})
 
     def test_a_branch_build_is_read_where_that_branch_stored_it(self):
         proc, located = self.locate("refs/heads/feature", spiced_commit=self.feature)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(located, {"prefix": f"untrusted/{REPOSITORY_ID}/refs/heads/feature/", "trunk": "false"})
+        self.assertEqual(located, {"ref": "refs/heads/trunk", "prefix": f"untrusted/{REPOSITORY_ID}/refs/heads/feature/", "trunk": "false"})
         proc, located = self.locate(PULL_REQUEST, ref="refs/heads/release/1.0")
-        self.assertEqual(located, {"prefix": f"untrusted/{REPOSITORY_ID}/refs/heads/release/1.0/", "trunk": "false"})
+        self.assertEqual(located, {"ref": "refs/heads/release/1.0", "prefix": f"untrusted/{REPOSITORY_ID}/refs/heads/release/1.0/", "trunk": "false"})
         self.stored.write_text(self.key(located["prefix"], self.trunk) + "\n")
         self.run_step("download", {"SOURCE_PREFIX": located["prefix"], "SPICED_COMMIT": self.trunk})
         self.assertIn(f"mc cp {self.key(located['prefix'], self.trunk)} ", self.mc_log.read_text())
+
+    def test_a_bare_branch_name_is_that_branch(self):
+        proc, located = self.locate(PULL_REQUEST, ref="trunk")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(located, {"ref": "refs/heads/trunk", "prefix": "", "trunk": "true"})
+        proc, located = self.locate(PULL_REQUEST, ref="release/1.0")
+        self.assertEqual(located["ref"], "refs/heads/release/1.0")
+        self.assertEqual(located["prefix"], f"untrusted/{REPOSITORY_ID}/refs/heads/release/1.0/")
+
+    def test_a_ref_that_is_not_a_plain_ref_is_refused(self):
+        for ref in ("refs/heads/x\nprefix<<E\nE\nz=", "refs/heads/a/../../../../", "refs/heads//x", "refs/heads/x/",
+                    "refs/heads/x y"):
+            with self.subTest(ref=ref):
+                proc, located = self.locate(PULL_REQUEST, ref=ref)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("is not a plain ref", proc.stdout)
+                self.assertEqual(located, {})
+
+    def test_no_spiced_commit_means_no_download(self):
+        proc, outputs = self.run_step("output_spiced_commit", {"SPICED_COMMIT": ""})
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("no spiced commit was chosen", proc.stdout)
 
     def test_a_full_role_job_never_takes_a_branch_build(self):
         proc, located = self.locate("refs/heads/trunk", ref="refs/heads/release/1.0", verify="true")
@@ -158,7 +180,7 @@ class SetupSpicedTest(unittest.TestCase):
     def test_a_branch_commit_named_on_trunk_is_read_at_trunks_keys_and_must_verify(self):
         # A trunk run given a branch's commit reads trunk's keys, where no attested build of it is.
         proc, located = self.locate("refs/heads/trunk", spiced_commit=self.feature)
-        self.assertEqual(located, {"prefix": "", "trunk": "true"})
+        self.assertEqual(located, {"ref": "refs/heads/trunk", "prefix": "", "trunk": "true"})
 
     def test_every_read_at_trunks_keys_is_verified_whatever_the_role(self):
         verify = self.steps["Verify spiced's build attestation"]

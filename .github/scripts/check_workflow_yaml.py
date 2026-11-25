@@ -1046,8 +1046,8 @@ def check_action_expansions(document: dict) -> list[str]:
 # under this run's `untrusted/<repository id>/<ref>/` finds nothing, or a copy no trunk run made.
 # setup-spiced reads from the build's ref, and verifies a build of trunk's against its attestation.
 OWN_PREFIX_SPICED_READ = re.compile(
-    r"\bmc\s+(?:stat|cp|cat|get)\s+[\"']?spice-minio/artifacts/"
-    r"(?:\$\{?CI_STORE_PREFIX\??\}?|\$\{\{\s*env\.CI_STORE_PREFIX\s*\}\})spiced/"
+    r"\bmc\s+(?:stat|cp|cat|get|ls|mirror|find)(?:\s+-{1,2}[A-Za-z][\w-]*(?:=\S+)?)*\s+[\"']?spice-minio/artifacts/"
+    r"(?:\$\{?CI_STORE_PREFIX(?::-|-|\?)?\}?|\$\{\{\s*env\.CI_STORE_PREFIX\s*\}\})spiced/"
 )
 
 

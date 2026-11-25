@@ -104,6 +104,20 @@ runs:
           echo "::error::setup-spiced: spiced_commit must not contain a newline"
           exit 1
         fi
+        # A bare branch name is that branch (`trunk`, `release/2.4`), as the dispatch inputs
+        # document it. A ref becomes part of a store key and of this step's outputs, so anything
+        # but a plain ref is refused.
+        plain_ref() {
+          [[ "$1" =~ ^refs/[A-Za-z0-9._/-]+$ ]] && [[ "$1" != *..* && "$1" != *//* && "$1" != */ ]]
+        }
+        case "$REF" in
+          refs/*) ;;
+          *) REF="refs/heads/$REF" ;;
+        esac
+        if ! plain_ref "$REF"; then
+          echo "::error::setup-spiced: ref '$REF' is not a plain ref."
+          exit 1
+        fi
         if [ -z "$INPUT_SPICED_COMMIT" ]; then
           source_ref="$REF"
         elif [[ "$INPUT_SPICED_COMMIT" =~ ^[0-9a-f]{40}$ ]] && on_trunk "$INPUT_SPICED_COMMIT"; then
@@ -112,6 +126,10 @@ runs:
           source_ref="$REF"
         else
           source_ref="$GITHUB_REF"
+        fi
+        if ! plain_ref "$source_ref"; then
+          echo "::error::setup-spiced: '$source_ref' is not a plain ref."
+          exit 1
         fi
         case "$source_ref" in
           refs/heads/trunk) prefix='' trunk=true ;;
@@ -132,6 +150,7 @@ runs:
           exit 1
         fi
         {
+          echo "ref=$REF"
           echo "prefix=$prefix"
           echo "trunk=$trunk"
         } >> "$GITHUB_OUTPUT"
@@ -141,7 +160,7 @@ runs:
       if: ${{ !inputs.spiced_commit }}
       shell: bash
       env:
-        REF: ${{ inputs.ref }}
+        REF: ${{ steps.locate.outputs.ref }}
         SOURCE_PREFIX: ${{ steps.locate.outputs.prefix }}
         INPUT_WITH_ODBC: ${{ inputs.with_odbc }}
         PLATFORM_OS: ${{ steps.platform.outputs.os }}
@@ -190,7 +209,13 @@ runs:
     - name: Output SPICED_COMMIT
       id: output_spiced_commit
       shell: bash
-      run: echo "SPICED_COMMIT=$SPICED_COMMIT" >> $GITHUB_OUTPUT
+      run: |
+        # The attestation is checked for this commit, so there must be one.
+        if [ -z "${SPICED_COMMIT:-}" ]; then
+          echo "::error::setup-spiced: no spiced commit was chosen."
+          exit 1
+        fi
+        echo "SPICED_COMMIT=$SPICED_COMMIT" >> $GITHUB_OUTPUT
 
     - name: Download spiced from MinIO
       id: download

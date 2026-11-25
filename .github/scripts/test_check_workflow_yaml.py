@@ -836,6 +836,8 @@ class OwnPrefixSpicedReadTest(unittest.TestCase):
             'mc stat "spice-minio/artifacts/${CI_STORE_PREFIX}spiced/linux-x86_64/$h/spiced.tar.gz"',
             'mc cp "spice-minio/artifacts/$CI_STORE_PREFIX?spiced/x" ./spiced.tar.gz',
             "mc cp spice-minio/artifacts/${{ env.CI_STORE_PREFIX }}spiced/x .",
+            'mc cp -q --limit-download=1M "spice-minio/artifacts/${CI_STORE_PREFIX:-}spiced/x" .',
+            'mc ls "spice-minio/artifacts/${CI_STORE_PREFIX}spiced/linux-x86_64/"',
         ):
             with self.subTest(script=script):
                 self.assertEqual(len(self.problems(script)), 1)
@@ -844,6 +846,7 @@ class OwnPrefixSpicedReadTest(unittest.TestCase):
         script = (
             'mc stat "spice-minio/artifacts/${SOURCE_PREFIX}spiced/linux-x86_64/$h/spiced.tar.gz"\n'
             'mc cp ./spiced.tar.gz "spice-minio/artifacts/${CI_STORE_PREFIX}spiced/linux-x86_64/$h/"\n'
+            'mc cp -q ./spiced.tar.gz "spice-minio/artifacts/${CI_STORE_PREFIX}spiced/linux-x86_64/$h/"\n'
             '# not this: mc stat "spice-minio/artifacts/${CI_STORE_PREFIX}spiced/x"'
         )
         self.assertEqual(self.problems(script), [])
