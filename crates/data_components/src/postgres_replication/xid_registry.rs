@@ -66,11 +66,40 @@ limitations under the License.
 //!   normally (aborted delivery, lost unregister, slot far behind, rewound
 //!   source). Runs at startup and periodically thereafter, driven by the
 //!   connector.
+//!
+//! # When an echo is not redundant (#16505)
+//!
+//! Dropping an echo is right only while the accelerator still holds what the
+//! delivery wrote. A delivery reads the accelerator's current rows, then commits
+//! them at the source. A change the stream applies to one of those keys *after*
+//! that read and *before* the echo (a write made directly at the source, whose
+//! transaction committed before the delivery's) replaces the accelerator's copy,
+//! while the source ends with the delivery's row, because the delivery committed
+//! last. The echo is then the one change that carries the source's final row for
+//! that key, and dropping it leaves the two holding different rows for good.
+//!
+//! So the registry also keeps, in memory only, what it needs to recognize that
+//! case per key:
+//!
+//! - [`begin_read`](XidRegistry::begin_read) pins the durable applied position
+//!   (the *read fence*) before a delivery reads the accelerator. Every change at
+//!   or below it is applied and visible to that read.
+//! - [`register_delivery`](XidRegistry::register_delivery) attaches that fence to
+//!   the delivery's transaction id.
+//! - The pump notes the position at which each key last changed through the
+//!   stream ([`EchoKeys::note_changed`]), and keeps an echo's change for a key
+//!   only when that key changed after the delivery's read fence
+//!   ([`EchoKeys::echo_needed`]). Every other change in the echo is dropped as
+//!   before.
+//!
+//! An entry loaded from disk has no fence; it is treated as fence 0, so after a
+//! restart every key that changes through the stream before the echo arrives has
+//! its echo applied.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use parking_lot::RwLock as SyncRwLock;
+use parking_lot::{Mutex as SyncMutex, MutexGuard as SyncMutexGuard, RwLock as SyncRwLock};
 use runtime_checkpoint_api::BlobCheckpointStore;
 use rustc_hash::{FxHashMap, FxHashSet};
 use snafu::{ResultExt, Snafu};
@@ -206,6 +235,142 @@ pub struct XidRegistry {
     /// from `state.entries` after every successful mutation, so it only ever
     /// reflects persisted (or in-memory-authoritative) entries.
     mirror: SyncRwLock<FxHashSet<u32>>,
+    /// In-memory, never persisted: the read fences and per-key change positions
+    /// that decide which of an echo's changes are redundant. See the module docs,
+    /// *When an echo is not redundant*.
+    echo_keys: SyncMutex<EchoKeys>,
+}
+
+/// The per-key half of echo suppression: for each outstanding delivery, the
+/// applied position its accelerator read observed, and for each key, the stream
+/// position at which it last changed. An echo's change for a key is redundant
+/// only when the key has not changed since the delivery read it.
+///
+/// Positions are LSNs. A key's position is the end LSN of the envelope that
+/// carried the change, which is at or after the change's own commit, so every
+/// error is in the direction of keeping an echo's change, never of dropping one
+/// that was needed.
+#[derive(Debug, Default)]
+pub struct EchoKeys {
+    /// The highest durable applied position reported to the registry.
+    applied_lsn: u64,
+    next_read: u64,
+    /// The fence of every delivery read still in progress (taken, not yet
+    /// registered or abandoned), by token.
+    active_reads: FxHashMap<u64, u64>,
+    /// The read fence of each outstanding delivery, by stream xid. An entry with
+    /// no recorded fence (loaded from disk, or registered without one) is 0.
+    delivery_fences: FxHashMap<u32, u64>,
+    /// The position at which each key last changed through the stream.
+    keys_changed_at: FxHashMap<Vec<u8>, u64>,
+    /// The position of the last change that touched every key (a `TRUNCATE`, or a
+    /// change whose key could not be read).
+    all_keys_changed_at: u64,
+    /// The bound the last prune ran at, so a prune with nothing new to drop is
+    /// skipped.
+    pruned_through: u64,
+}
+
+impl EchoKeys {
+    /// Record that `key` changed through the stream at `lsn`.
+    pub fn note_changed(&mut self, key: Vec<u8>, lsn: u64) {
+        let at = self.keys_changed_at.entry(key).or_insert(lsn);
+        *at = (*at).max(lsn);
+    }
+
+    /// Record that every key changed through the stream at `lsn`.
+    pub fn note_all_changed(&mut self, lsn: u64) {
+        self.all_keys_changed_at = self.all_keys_changed_at.max(lsn);
+    }
+
+    /// Whether the echo of delivery `stream_xid` must still apply its change for
+    /// `key` (`None`: a key that could not be read, treated as any key): true
+    /// when the key changed through the stream after the delivery read it.
+    #[must_use]
+    pub fn echo_needed(&self, stream_xid: u32, key: Option<&[u8]>) -> bool {
+        let fence = self.delivery_fences.get(&stream_xid).copied().unwrap_or(0);
+        if self.all_keys_changed_at > fence {
+            return true;
+        }
+        match key {
+            Some(key) => self
+                .keys_changed_at
+                .get(key)
+                .is_some_and(|&changed_at| changed_at > fence),
+            None => self
+                .keys_changed_at
+                .values()
+                .any(|&changed_at| changed_at > fence),
+        }
+    }
+
+    /// Forget every key change no delivery can still need: one at or below the
+    /// applied position (so any read taken from now on observes it) and below
+    /// every outstanding delivery's and in-progress read's fence.
+    pub fn prune(&mut self) {
+        let bound = self
+            .active_reads
+            .values()
+            .chain(self.delivery_fences.values())
+            .copied()
+            .fold(self.applied_lsn, u64::min);
+        if bound <= self.pruned_through {
+            return;
+        }
+        self.pruned_through = bound;
+        self.keys_changed_at
+            .retain(|_, changed_at| *changed_at > bound);
+        if self.all_keys_changed_at <= bound {
+            self.all_keys_changed_at = 0;
+        }
+    }
+
+    /// Bring the per-delivery fences in line with the registry's entries: drop
+    /// those of entries that are gone, and give any entry without one fence 0.
+    fn sync_deliveries(&mut self, outstanding: &FxHashSet<u32>) {
+        self.delivery_fences
+            .retain(|stream_xid, _| outstanding.contains(stream_xid));
+        for &stream_xid in outstanding {
+            self.delivery_fences.entry(stream_xid).or_insert(0);
+        }
+    }
+}
+
+/// A delivery's accelerator read in progress, taken by
+/// [`XidRegistry::begin_read`] before the read. Holds the read's fence, and keeps
+/// the key changes after it from being pruned until the delivery is registered
+/// with [`XidRegistry::register_delivery`] (which carries the fence on with the
+/// transaction id) or abandoned (dropping the guard).
+pub struct EchoReadGuard {
+    registry: Arc<XidRegistry>,
+    token: u64,
+    fence: u64,
+}
+
+impl EchoReadGuard {
+    /// The durable applied position the read is guaranteed to observe.
+    #[must_use]
+    pub fn fence(&self) -> u64 {
+        self.fence
+    }
+}
+
+impl std::fmt::Debug for EchoReadGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EchoReadGuard")
+            .field("fence", &self.fence)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for EchoReadGuard {
+    fn drop(&mut self) {
+        self.registry
+            .echo_keys
+            .lock()
+            .active_reads
+            .remove(&self.token);
+    }
 }
 
 /// Versioned, source-qualified persisted form of the registry, mirroring
@@ -277,7 +442,9 @@ impl XidRegistry {
             }
         };
 
-        let mirror = entries.keys().map(|&xid8| low32(xid8)).collect();
+        let mirror: FxHashSet<u32> = entries.keys().map(|&xid8| low32(xid8)).collect();
+        let mut echo_keys = EchoKeys::default();
+        echo_keys.sync_deliveries(&mirror);
 
         Ok(Arc::new(Self {
             store,
@@ -285,6 +452,7 @@ impl XidRegistry {
             dataset: dataset_name,
             state: RwLock::new(XidState { entries }),
             mirror: SyncRwLock::new(mirror),
+            echo_keys: SyncMutex::new(echo_keys),
         }))
     }
 
@@ -340,6 +508,53 @@ impl XidRegistry {
         self.rebuild_mirror(&candidate);
         guard.entries = candidate;
         Ok(())
+    }
+
+    /// Pin the read fence for a delivery about to read the accelerator: the
+    /// durable applied position, every change at or below which that read
+    /// observes. Take it **before** the read, and pass it to
+    /// [`register_delivery`](Self::register_delivery). See the module docs, *When
+    /// an echo is not redundant*.
+    #[must_use]
+    pub fn begin_read(self: &Arc<Self>) -> EchoReadGuard {
+        let mut echo_keys = self.echo_keys.lock();
+        let token = echo_keys.next_read;
+        echo_keys.next_read = token.wrapping_add(1);
+        let fence = echo_keys.applied_lsn;
+        echo_keys.active_reads.insert(token, fence);
+        EchoReadGuard {
+            registry: Arc::clone(self),
+            token,
+            fence,
+        }
+    }
+
+    /// [`register`](Self::register) a delivery's transaction id, then attach the
+    /// fence of the accelerator read it delivers (`None`: no fence is known, and
+    /// the delivery is treated as having read before every change). The same
+    /// ordering contract as `register` applies: await this before the `COMMIT`.
+    ///
+    /// # Errors
+    ///
+    /// As [`register`](Self::register).
+    pub async fn register_delivery(&self, xid8: u64, read: Option<&EchoReadGuard>) -> Result<()> {
+        self.register(xid8).await?;
+        if let Some(read) = read {
+            // Set after `register`, which gave the entry fence 0: the echo cannot
+            // arrive before the `COMMIT` this precedes, so nothing reads the
+            // fence in between, and 0 is the safe value if anything did.
+            let mut echo_keys = self.echo_keys.lock();
+            if let Some(fence) = echo_keys.delivery_fences.get_mut(&low32(xid8)) {
+                *fence = read.fence;
+            }
+        }
+        Ok(())
+    }
+
+    /// The per-key echo state, for the pump's echo filter. Held only for the
+    /// length of one envelope's filtering.
+    pub fn echo_keys(&self) -> SyncMutexGuard<'_, EchoKeys> {
+        self.echo_keys.lock()
     }
 
     /// Record the post-`COMMIT` WAL upper bound for an entry (best-effort).
@@ -437,6 +652,7 @@ impl XidRegistry {
     /// persistence failure leaves the entry on disk to be re-pruned (it is
     /// already consumed, so no echo re-arrives).
     pub async fn prune_acked(&self, durably_applied_lsn: u64) {
+        self.note_applied(durably_applied_lsn);
         let mut guard = self.state.write().await;
         let before = guard.entries.len();
         guard.entries.retain(|_, entry| {
@@ -508,6 +724,7 @@ impl XidRegistry {
         current_xid8: u64,
         applied_lsn: u64,
     ) {
+        self.note_applied(applied_lsn);
         let mut guard = self.state.write().await;
 
         let mut to_remove: Vec<u64> = Vec::new();
@@ -620,7 +837,17 @@ impl XidRegistry {
     /// delivered-but-not-yet-durably-acked transactions.
     fn rebuild_mirror(&self, entries: &FxHashMap<u64, XidEntry>) {
         let mirror: FxHashSet<u32> = entries.keys().map(|&xid8| low32(xid8)).collect();
+        // Never hold both locks: the pump takes `echo_keys` and then reads the
+        // mirror.
+        self.echo_keys.lock().sync_deliveries(&mirror);
         *self.mirror.write() = mirror;
+    }
+
+    /// Record a durable applied position: the fence of every read taken from
+    /// now on.
+    fn note_applied(&self, durably_applied_lsn: u64) {
+        let mut echo_keys = self.echo_keys.lock();
+        echo_keys.applied_lsn = echo_keys.applied_lsn.max(durably_applied_lsn);
     }
 }
 
@@ -1209,6 +1436,51 @@ mod tests {
         }
         let state = registry.state.read().await;
         assert_eq!(state.entries.len(), 64, "no registration was lost");
+    }
+
+    /// A key change is kept while a read taken before it is in progress, or a
+    /// delivery fenced before it is outstanding, and forgotten once neither is left
+    /// and the applied position has passed it.
+    #[tokio::test]
+    async fn key_changes_are_pruned_once_no_read_or_delivery_can_need_them() {
+        let store = FakeBlobStore::arc();
+        let registry = empty_registry(Arc::clone(&store)).await;
+
+        let read = registry.begin_read();
+        assert_eq!(read.fence(), 0);
+        registry.echo_keys().note_changed(b"k".to_vec(), 200);
+        registry.prune_acked(300).await;
+        registry.echo_keys().prune();
+        assert!(
+            registry
+                .echo_keys()
+                .keys_changed_at
+                .contains_key(b"k".as_slice()),
+            "a read fenced before the change still needs it"
+        );
+
+        registry
+            .register_delivery(10, Some(&read))
+            .await
+            .expect("register the delivery");
+        drop(read);
+        registry.echo_keys().prune();
+        assert!(
+            registry.echo_keys().echo_needed(low32(10), Some(b"k")),
+            "the delivery carries the read's fence, so its echo is applied for the key"
+        );
+
+        registry.unregister(10).await;
+        registry.echo_keys().prune();
+        assert!(
+            registry.echo_keys().keys_changed_at.is_empty(),
+            "nothing outstanding can need a change the applied position has passed"
+        );
+        assert_eq!(
+            registry.begin_read().fence(),
+            300,
+            "a new read is fenced at the applied position"
+        );
     }
 
     /// `register`'s read-lock fast path for an already-registered xid must not take
