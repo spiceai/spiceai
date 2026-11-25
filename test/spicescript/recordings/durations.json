@@ -86,6 +86,8 @@
   "http-caching": 31,
   "http-caching-columns": 7,
   "http-caching-keys": 15,
+  "http-caching-paginated": 66,
+  "http-caching-paginated-upgrade": 71,
   "http-connector": 4,
   "http-errors": 13,
   "http-request-bound": 2,

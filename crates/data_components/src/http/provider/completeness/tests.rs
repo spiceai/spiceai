@@ -87,7 +87,7 @@ async fn only_eof_in_every_partition_completes() {
 #[tokio::test]
 async fn single_request_proof_requires_eof_without_a_followed_page() {
     for followed in [false, true] {
-        let completion = HttpFetchCompletion::new(1);
+        let completion = HttpFetchCompletion::new(1).for_paginated_source();
         let (mut response, progress) = tracked(&completion, 0, false, vec![Ok(batch())]);
         assert!(!completion.is_complete_single_request());
         response.next().await.expect("row").expect("response");
@@ -98,6 +98,12 @@ async fn single_request_proof_requires_eof_without_a_followed_page() {
         assert!(response.next().await.is_none());
         assert!(completion.is_complete());
         assert_eq!(completion.is_complete_single_request(), !followed);
+        assert_eq!(
+            completion.complete_request(),
+            Some(RequestPages::Paginated {
+                followed_pages: followed
+            })
+        );
     }
     let completion = HttpFetchCompletion::new(2);
     for partition in 0..2 {
@@ -170,6 +176,7 @@ async fn actual_http_pagination_tracks_followed_pages_not_configuration() {
             assert_eq!(rows, pages);
             assert!(completion.is_complete());
             assert_eq!(completion.is_complete_single_request(), pages == 1);
+            assert_eq!(completion.complete_request(), Some(RequestPages::Paginated { followed_pages: pages > 1 }));
         }
     }).await.expect("bounded HTTP execution");
 }
