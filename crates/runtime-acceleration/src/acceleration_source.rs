@@ -52,9 +52,11 @@ impl SourceDefinition {
                     "{}\u{0}{}\u{0}{}",
                     column.name,
                     column.r#type.as_deref().unwrap_or_default(),
-                    column
-                        .nullable
-                        .map_or("", |nullable| if nullable { "null" } else { "not null" })
+                    column.nullable.map_or("", |nullable| if nullable {
+                        "null"
+                    } else {
+                        "not null"
+                    })
                 )
             })
             .collect()

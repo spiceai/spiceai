@@ -2972,14 +2972,15 @@ impl CayenneAccelerator {
         let Some(declared) = source.definition() else {
             return Ok(None);
         };
-        let params = runtime_secrets::try_get_params_with_secrets(source.secrets(), &declared.params)
-            .await
-            .map_err(|error| Error::InvalidConfiguration {
-                detail: Arc::from(format!(
-                    "Failed to load dataset '{}' (cayenne): {error}",
-                    source.name()
-                )),
-            })?;
+        let params =
+            runtime_secrets::try_get_params_with_secrets(source.secrets(), &declared.params)
+                .await
+                .map_err(|error| Error::InvalidConfiguration {
+                    detail: Arc::from(format!(
+                        "Failed to load dataset '{}' (cayenne): {error}",
+                        source.name()
+                    )),
+                })?;
         let partition_by: Vec<String> = source
             .acceleration()
             .map(|acceleration| {

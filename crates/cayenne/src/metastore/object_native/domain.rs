@@ -259,6 +259,22 @@ impl Domain {
         }
     }
 
+    /// Take back a writer lease this instance declined, now, before a drop: an
+    /// explicit drop (`mode: file_create`) replaces the copy whatever it was
+    /// built from. A lease another instance holds still leaves this one a
+    /// replica, which refuses the drop.
+    pub(super) async fn reclaim_declined_lease(&self) {
+        let Some(lease) = &self.lease else {
+            return;
+        };
+        if lease
+            .declined
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.keep_lease().await;
+        }
+    }
+
     /// Take this log's writer lease again when it is free: this instance's
     /// Spicepod defines the dataset as its copy records it.
     pub(super) fn accept_lease(&self) {

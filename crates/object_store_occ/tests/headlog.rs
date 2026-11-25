@@ -1368,7 +1368,9 @@ async fn checkpoint_after_a_stopped_writer(
     let mut second = Writer::take_over(store, backend.prefix.clone(), config(), 2)
         .await
         .expect("successor");
-    let staged = second.publish_checkpoint(at, Bytes::from_static(root)).await;
+    let staged = second
+        .publish_checkpoint(at, Bytes::from_static(root))
+        .await;
     (second, at, staged)
 }
 

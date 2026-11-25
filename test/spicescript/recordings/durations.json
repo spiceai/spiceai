@@ -126,6 +126,7 @@
   "mysql-unsigned-negation": 14,
   "newest-by-time": 39,
   "object-native-data": 49,
+  "object-native-definitions": 70,
   "object-native-replicas": 83,
   "object-native-same-bucket": 47,
   "on-zero-results": 43,

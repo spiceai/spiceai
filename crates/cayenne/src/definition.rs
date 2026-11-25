@@ -94,7 +94,10 @@ impl DatasetDefinition {
     /// Add the dataset setting `name` whose value is an ordered list.
     #[must_use]
     pub fn with_list_setting<S: AsRef<str>>(mut self, name: &str, values: &[S]) -> Self {
-        let parts: Vec<&[u8]> = values.iter().map(|value| value.as_ref().as_bytes()).collect();
+        let parts: Vec<&[u8]> = values
+            .iter()
+            .map(|value| value.as_ref().as_bytes())
+            .collect();
         self.settings
             .insert(name.to_string(), setting_digest(name, &parts));
         self
@@ -232,8 +235,8 @@ impl DefinitionRecord {
     /// # Errors
     /// A record that does not decode, or is of a format this build cannot read.
     pub(crate) fn decode_stored(bytes: &[u8]) -> Result<Self, String> {
-        let record =
-            Self::decode(bytes).map_err(|error| format!("its definition record is invalid: {error}"))?;
+        let record = Self::decode(bytes)
+            .map_err(|error| format!("its definition record is invalid: {error}"))?;
         if record.format != RECORD_FORMAT {
             return Err(format!(
                 "its definition record has format {}, which this version of Spice cannot read",
@@ -255,12 +258,12 @@ impl DefinitionRecord {
             .map(|setting| (setting.name.as_str(), setting.digest.as_slice()))
             .collect();
         let mut changes = Vec::new();
-        let names: std::collections::BTreeSet<&str> = stored
+        let setting_names: std::collections::BTreeSet<&str> = stored
             .keys()
             .copied()
             .chain(requested.settings.keys().map(String::as_str))
             .collect();
-        for name in names {
+        for name in setting_names {
             match (stored.get(name), requested.settings.get(name)) {
                 (Some(stored), Some(requested)) if *stored == requested.as_slice() => {}
                 _ => changes.push(format!("`{name}` changed")),
@@ -291,8 +294,7 @@ impl DefinitionRecord {
             // from a secret store or the environment changed.
             if named.is_empty() {
                 named.push(
-                    "a secret or environment value a setting in `params` reads changed"
-                        .to_string(),
+                    "a secret or environment value a setting in `params` reads changed".to_string(),
                 );
             }
             changes.extend(named);
@@ -361,7 +363,7 @@ mod tests {
             ..a.clone()
         };
         assert_eq!(a.id(), renamed.id());
-        assert!(changes(&a, &renamed).is_empty());
+        assert_eq!(changes(&a, &renamed), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -370,11 +372,19 @@ mod tests {
         let refresh = a
             .clone()
             .with_optional_setting("refresh_sql", Some("SELECT * FROM orders WHERE id < 10"));
-        assert_eq!(changes(&a, &refresh), vec!["`refresh_sql` changed".to_string()]);
+        assert_eq!(
+            changes(&a, &refresh),
+            vec!["`refresh_sql` changed".to_string()]
+        );
         // Unset and empty are different values.
         let empty = a.clone().with_optional_setting("refresh_sql", Some(""));
-        assert_eq!(changes(&a, &empty), vec!["`refresh_sql` changed".to_string()]);
-        let key = a.clone().with_list_setting("primary_key", &["id", "region"]);
+        assert_eq!(
+            changes(&a, &empty),
+            vec!["`refresh_sql` changed".to_string()]
+        );
+        let key = a
+            .clone()
+            .with_list_setting("primary_key", &["id", "region"]);
         assert_eq!(changes(&a, &key), vec!["`primary_key` changed".to_string()]);
         let added = a.clone().with_connection(
             [
@@ -416,7 +426,7 @@ mod tests {
         let from_env = DatasetDefinition::new("shop")
             .with_connection([("pg_host", "${ env:PG_HOST }")], [("pg_host", "db")]);
         assert_eq!(inline.id(), from_env.id());
-        assert!(changes(&inline, &from_env).is_empty());
+        assert_eq!(changes(&inline, &from_env), [] as [std::string::String; 0]);
     }
 
     /// The digests are framed, so moving a boundary between two parts of a value

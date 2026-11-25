@@ -671,6 +671,7 @@ impl ObjectNativeCatalog {
         let Some(domain) = domain else {
             return self.registry.drop_table(name).await;
         };
+        domain.reclaim_declined_lease().await;
         let table_ids: Vec<String> = domain
             .tables()
             .await

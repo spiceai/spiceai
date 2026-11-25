@@ -126,7 +126,6 @@ pub mod stats;
 pub mod stats_aggregate;
 
 pub use catalog::MetadataCatalog;
-pub use definition::DatasetDefinition;
 pub use catalog::{CatalogError, CatalogResult};
 pub use catalog_provider::{
     CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider,
@@ -136,6 +135,7 @@ pub use cte_materialization::{
     CTE_SCAN_NODE_NAME, CayenneCteMaterialization, CayenneCteMaterializationPlanner,
     MATERIALIZED_CTE_NODE_NAME,
 };
+pub use definition::DatasetDefinition;
 pub use metadata::{
     CdcDurability, DataFile, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
     ObjectStoreConfig, PartitionMetadata, StorageClass, TableMetadata, TableStatistics,
