@@ -2807,7 +2807,11 @@ fn apply_distributed_execution_config(cfg: SessionConfig) -> SessionConfig {
     // execution requires — among other things it disables CollectLeft broadcast joins
     // (whose left child must be a single partition, invalid once the input is a
     // multi-partition shuffle) and round-robin repartition.
-    let mut cfg = cfg.ballista_restricted_configuration();
+    let mut cfg = cfg
+        .ballista_restricted_configuration()
+        // The adaptive planner plans with its own physical rules, without the
+        // cluster rules that refuse scans an executor cannot read correctly.
+        .with_ballista_adaptive_query_planner(false);
 
     // These optimizations rely on shared mutable state within a single process and are
     // incorrect (or fatal) once a plan is split into stages that run in separate
@@ -3190,6 +3194,16 @@ mod tests {
         assert!(!opts.optimizer.enable_physical_uncorrelated_scalar_subquery);
         // Ballista restricted configuration disables round-robin repartition.
         assert!(!opts.optimizer.enable_round_robin_repartition);
+    }
+
+    #[test]
+    fn distributed_execution_config_keeps_the_static_planner() {
+        use ballista_core::extension::SessionConfigExt;
+        let cfg = super::apply_distributed_execution_config(
+            ::datafusion::prelude::SessionConfig::new_with_ballista()
+                .with_ballista_adaptive_query_planner(true),
+        );
+        assert!(!cfg.ballista_adaptive_query_planner_enabled());
     }
 
     fn create_signed_certificate(

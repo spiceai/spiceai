@@ -20,7 +20,7 @@ limitations under the License.
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::Value;
 
 use crate::script::{HttpStep, Tier, Timing};
@@ -326,10 +326,21 @@ pub(super) async fn http_step(instance: &Instance, step: &HttpStep) -> Result<St
     let path = with_query(&step.path, &query);
     loop {
         let result = async {
-            let (status, got, text) = instance
+            let response = instance
                 .spiced
                 .http(&step.method, &path, &headers, body.as_deref(), &step.key)
-                .await?;
+                .await;
+            if step.refused {
+                return match response {
+                    Err(e) if is_connection_refused(&e) => Ok("connection refused".to_string()),
+                    Err(e) => Err(e.context("expected the connection to be refused")),
+                    Ok((status, _, text)) => Err(anyhow!(
+                        "spiced answered {status}, expected the connection to be refused: {}",
+                        one_line(&text, 200)
+                    )),
+                };
+            }
+            let (status, got, text) = response?;
             let mut problems = Vec::new();
             if let Some(expected) = step.status
                 && status != expected
@@ -391,6 +402,14 @@ pub(super) async fn http_step(instance: &Instance, step: &HttpStep) -> Result<St
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+/// Whether `error` is a request that no listener accepted.
+fn is_connection_refused(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
 }
 
 /// `path` with `query` encoded and appended, after any query string `path`
