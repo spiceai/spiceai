@@ -215,7 +215,8 @@ pub(crate) async fn do_get(
 pub(crate) async fn do_get_parameterized(
     payload: Bytes,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
-    let start = track_flight_request("do_get", Some("statement_substrait_plan_parameterized")).await;
+    let start =
+        track_flight_request("do_get", Some("statement_substrait_plan_parameterized")).await;
     set_flightsql_protocol().await;
 
     let context = RequestContext::current(AsyncMarker::new().await);
@@ -322,13 +323,12 @@ fn decode_parameterized_proto(payload: &[u8]) -> Result<ParameterizedPlan, Statu
     let mut values = Vec::new();
     for binding in &bindings {
         binding.encode_length_delimited(&mut values).map_err(|e| {
-            Status::internal(format!("Failed to encode a Substrait parameter binding: {e}"))
+            Status::internal(format!(
+                "Failed to encode a Substrait parameter binding: {e}"
+            ))
         })?;
     }
-    let results_key = format!(
-        "substrait-params:{template_digest}:{}",
-        sha256_hex(&values)
-    );
+    let results_key = format!("substrait-params:{template_digest}:{}", sha256_hex(&values));
 
     Ok(ParameterizedPlan {
         template,
@@ -992,16 +992,28 @@ mod tests {
         let b = payload(&df, &template, &[ScalarValue::Int64(Some(2))])?;
         assert_eq!(
             run_parameterized(&df, &a).await?,
-            (one.to_string(), CacheStatus::CacheMiss, TemplateSource::Decoded)
+            (
+                one.to_string(),
+                CacheStatus::CacheMiss,
+                TemplateSource::Decoded
+            )
         );
         assert_eq!(
             run_parameterized(&df, &b).await?,
-            (two.to_string(), CacheStatus::CacheMiss, TemplateSource::Cached)
+            (
+                two.to_string(),
+                CacheStatus::CacheMiss,
+                TemplateSource::Cached
+            )
         );
         // The results cache is in use: the first value's rows are now a hit.
         assert_eq!(
             run_parameterized(&df, &a).await?,
-            (one.to_string(), CacheStatus::CacheHit, TemplateSource::Cached)
+            (
+                one.to_string(),
+                CacheStatus::CacheHit,
+                TemplateSource::Cached
+            )
         );
 
         // A different template is decoded, not served the first one's plan.
