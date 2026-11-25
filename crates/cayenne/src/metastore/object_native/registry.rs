@@ -510,6 +510,32 @@ impl ObjectNativeCatalog {
         Ok(dropped)
     }
 
+    /// Forgets the runtime's bookkeeping for `name` that the registry keeps while no
+    /// dataset of that name has a log: what a dropped dataset of that name left (its
+    /// load record, append cursor, and every source position, such as Kafka offsets),
+    /// which [`Self::create_dataset`] would otherwise move into a new, empty dataset's
+    /// log for its source to resume from. Returns how many values it forgot; a dataset
+    /// that has a log keeps its own.
+    /// # Errors
+    /// Returns an error when the registry cannot be written.
+    pub async fn forget_bookkeeping_without_log(&self, name: &str) -> CatalogResult<usize> {
+        if self.routes.read().by_name.contains_key(name) {
+            return Ok(0);
+        }
+        let held = self.registry.positions_of(name).await;
+        if held.is_empty() {
+            return Ok(0);
+        }
+        self.registry
+            .commit_actions(
+                held.iter()
+                    .map(|((source, partition), _)| position(source, partition, None))
+                    .collect(),
+            )
+            .await?;
+        Ok(held.len())
+    }
+
     /// The runtime's bookkeeping value under `key` (a CDC position, a dataset
     /// checkpoint), kept in the log of the dataset it names.
     /// # Errors

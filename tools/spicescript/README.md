@@ -280,6 +280,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `kill-spiced: {}` | SIGKILL; `{ signal: STOP-then-KILL }` freezes it first. |
 | `restart: {}` | Stop (or `{ kill: KILL }`) and start again; takes `start`'s options. |
 | `upgrade: {}` | Like `restart`, but starts the binary under test (see [Upgrades](#upgrades)). |
+| `downgrade: {}` | Like `restart`, but starts the binary the instance started on, the release `from:` or `--from` names: a rollback after an `upgrade`. |
 | `wait-ready: { timeout }` | Wait for `/v1/ready`. |
 | `edit-spicepod: <patch>` | Rewrite the running instance's spicepod (for `--pods-watcher-enabled`). |
 | `start-source`, `stop-source`, `pause-source`, `unpause-source: <name>` | Control a source container; it keeps its host port across a stop. |
@@ -298,11 +299,12 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `explain: <sql>` | `EXPLAIN` (`analyze: true`), requiring `contains:` fragments or the absence of `omits:` ones. |
 | `assert-status: { dataset, status, message-contains, ready, has, lacks }` | Check a dataset's status from `/v1/datasets`. |
 | `assert-log: { contains, lacks, count, clean, allow }` | Check the instance's `spiced.log` with regular expressions; `count: { <pattern>: N \| '>=N' }`. |
-| `assert-files: { contains, lacks, lacks-dirs }` | Check files under the instance's directory, by path relative to it (files only, not empty directories); `lacks-dirs` checks directories, empty ones included, as `<path>/`. |
+| `assert-files: { contains, lacks, lacks-dirs, unchanged-since }` | Check files under the instance's directory, by path relative to it (files only, not empty directories); `lacks-dirs` checks directories, empty ones included, as `<path>/`; `unchanged-since: <id>` requires every file a `mark-files: <id>` recorded to still be there with the same contents (files added since are allowed). |
 | `wipe-instance-dir: { keep }` | Delete everything `spiced` wrote in the instance's directory (`.spice/`, data and metastore files), as if the instance had lost its disk, keeping the spicepod, `spiced.log` and the `keep` paths (relative to the directory, such as a local state location). Refused while `spiced` or an executor runs; put `stop` or `kill-spiced` before it. |
 | `assert-objects: { source, prefix, contains, min, max }` | Require objects under a prefix of an object store or files source; `contains` counts only keys containing that text. `min` defaults to 1, or to 0 when `max` is given (`max: 0` requires none). |
 | `sample-objects: { source, prefix, contains, every, for, max-objects, max-bytes }` | Sample the count and total bytes of the objects under a prefix every `every` for `for` (at least six samples), as a series printed with the step. Fails when a sample is over `max-objects` or `max-bytes`, or when the series trends upward: the peak of its last third is more than a quarter (and at least one) above the peak of its middle third. Pair it with a `background` writer for a fixed-rate run. |
 | `mark-metrics: <id>` | Keep a `/metrics` scrape for a later `wait-metric … since:`. |
+| `mark-files: <id>` or `{ id, matching }` | Record the size and contents of every file under the instance's directory (but `spicepod.yaml` and `spiced.log`), or of those whose relative path matches a `matching` pattern, for a later `assert-files: { unchanged-since: <id> }`. Fails when it records nothing. |
 | `wait-metric: { name, labels, above \| below \| increases \| increased-by, since, timeout, drive }` | Wait for a series to meet a condition. `drive` writes new data each round while waiting, for conditions (such as a compaction) that need new data rather than time. |
 | `background: { id, query \| source-exec, concurrency, every, expect }` | Loop a query or a source write until `stop-background: <id>`. `expect: { column: value }` is an invariant every answer must keep. `${round}` counts iterations. |
 | `stop-background: { id, allow }` | Stop it; fails on any error not matching `allow`. Prints the iteration count, the P99 latency and the commonest allowed errors. |

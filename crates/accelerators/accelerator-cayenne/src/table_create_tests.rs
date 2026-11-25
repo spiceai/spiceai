@@ -223,39 +223,143 @@ async fn row_count(table: &Arc<dyn TableProvider>) -> usize {
         .sum()
 }
 
-/// The `cayenne-vnext` sequence: loaded on `SQLite` with the flag off, moved to the
-/// object-native metastore by a `file_create` start with the flag on, then started with
-/// the flag off again. A plain file-mode start is refused. An explicit `file_create`
-/// moves it to `SQLite` empty, and the load recorded for the first table must not mark
-/// it loaded: the runtime must load the source before reporting a ready dataset.
+/// Every file under `base` but the state location, with its contents.
+fn files_outside_the_location(base: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut pending = vec![base.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("list a directory") {
+            let path = entry.expect("directory entry").path();
+            if path == base.join("state") {
+                continue;
+            }
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let relative = path
+                    .strip_prefix(base)
+                    .expect("under base")
+                    .to_string_lossy()
+                    .into_owned();
+                files.insert(relative, std::fs::read(&path).expect("read a file"));
+            }
+        }
+    }
+    files
+}
+
+/// The files outside the location once nothing writes them any more: a dropped
+/// start's connections close in the background, and the last one checkpoints the
+/// metastore's write-ahead log into it. A release process has exited before an
+/// upgrade starts; here its start is settled when the files have not changed for
+/// two seconds.
+async fn settled_files_outside_the_location(
+    base: &Path,
+) -> std::collections::BTreeMap<String, Vec<u8>> {
+    const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut files = files_outside_the_location(base);
+    let mut unchanged_since = std::time::Instant::now();
+    while unchanged_since.elapsed() < QUIET {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the files outside the location kept changing for 30 s: {:?}",
+            files.keys().collect::<Vec<_>>()
+        );
+        tokio::time::sleep(POLL).await;
+        let now = files_outside_the_location(base);
+        if now != files {
+            files = now;
+            unchanged_since = std::time::Instant::now();
+        }
+    }
+    files
+}
+
+/// An upgrade: a dataset kept on `SQLite` (the flag off, as a release keeps it) starts
+/// with `runtime.params.cayenne_vnext` on, and loads into the object-native metastore as
+/// a new dataset does. Its `SQLite` copy is not opened, so every file of it is unchanged;
+/// the new table starts empty, and the load recorded for the `SQLite` copy does not mark
+/// it loaded, so the runtime loads the source before reporting a ready dataset. Turning
+/// the flag off again serves the `SQLite` copy as it was, as a rollback to the release
+/// does, and a `file_create` start then recreates the dataset on `SQLite` alone.
 #[tokio::test]
-async fn a_table_created_empty_after_a_metastore_move_is_not_marked_loaded() {
+async fn an_upgrade_loads_from_the_source_and_leaves_the_sqlite_copy_untouched() {
     let base = tempfile::tempdir().expect("temp dir");
     let name = "before_flag";
 
-    let flag_off = dataset(base.path(), name, "disabled", Mode::File);
-    let (accelerator, table) = start(&flag_off).await;
-    load(&accelerator, &flag_off, &table, 0..2_000).await;
-    assert_eq!(row_count(&table).await, 2_000);
+    let release = dataset(base.path(), name, "disabled", Mode::File);
+    let (accelerator, table) = start(&release).await;
+    load(&accelerator, &release, &table, 0..2_000).await;
+    accelerator.shutdown().await.expect("shut down");
     drop((accelerator, table));
+    let previous_copy = settled_files_outside_the_location(base.path()).await;
+    assert!(
+        previous_copy
+            .keys()
+            .any(|path| path.ends_with("cayenne.db"))
+            && previous_copy.keys().any(|path| path.ends_with(".vortex")),
+        "the SQLite copy has a metastore and data files: {:?}",
+        previous_copy.keys().collect::<Vec<_>>()
+    );
 
-    let moved = dataset(base.path(), name, "enabled", Mode::FileCreate);
-    let (accelerator, table) = start(&moved).await;
-    assert_eq!(row_count(&table).await, 0, "file_create starts empty");
-    load(&accelerator, &moved, &table, 0..2_000).await;
-    drop((accelerator, table));
-
-    let back = dataset(base.path(), name, "disabled", Mode::File);
-    assert_native_move_refused(&back).await;
-    let back = dataset(base.path(), name, "disabled", Mode::FileCreate);
-    let (accelerator, table) = start(&back).await;
+    let upgraded = dataset(base.path(), name, "enabled", Mode::File);
+    let (accelerator, table) = start(&upgraded).await;
     assert_eq!(
         (
             row_count(&table).await,
-            marked_loaded(&accelerator, &back).await
+            marked_loaded(&accelerator, &upgraded).await
         ),
         (0, false),
-        "the table is new on SQLite and empty, so it must not be marked loaded"
+        "the upgraded table is new in the object-native metastore, empty and not loaded"
+    );
+    load(&accelerator, &upgraded, &table, 0..2_500).await;
+    drop((accelerator, table));
+    let after = files_outside_the_location(base.path());
+    for (path, contents) in &previous_copy {
+        assert!(
+            after.get(path) == Some(contents),
+            "the upgrade changed or removed '{path}' of the SQLite copy"
+        );
+    }
+
+    let rolled_back = dataset(base.path(), name, "disabled", Mode::File);
+    let (accelerator, table) = start(&rolled_back).await;
+    assert_eq!(
+        (
+            row_count(&table).await,
+            marked_loaded(&accelerator, &rolled_back).await
+        ),
+        (2_000, true),
+        "the flag off serves the SQLite copy as the release left it"
+    );
+    drop((accelerator, table));
+
+    // Recreated on SQLite with both metastores holding the dataset: both copies are
+    // dropped, so the new table is empty and unloaded, and the next start finds the
+    // dataset on SQLite alone rather than refusing it as one the object-native
+    // metastore holds.
+    let recreated = dataset(base.path(), name, "disabled", Mode::FileCreate);
+    let (accelerator, table) = start(&recreated).await;
+    assert_eq!(
+        (
+            row_count(&table).await,
+            marked_loaded(&accelerator, &recreated).await
+        ),
+        (0, false),
+        "file_create on SQLite starts empty and unloaded"
+    );
+    load(&accelerator, &recreated, &table, 0..1_500).await;
+    drop((accelerator, table));
+    let (accelerator, table) = start(&rolled_back).await;
+    assert_eq!(
+        (
+            row_count(&table).await,
+            marked_loaded(&accelerator, &rolled_back).await
+        ),
+        (1_500, true),
+        "the next start serves the recreated SQLite table"
     );
 }
 

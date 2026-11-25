@@ -1,0 +1,164 @@
+name: cayenne-vnext-rollback
+description: >
+  An upgrade into the object-native Cayenne metastore, a rollback, and an
+  upgrade again, with a full acceleration and PostgreSQL and MySQL change
+  capture. The release keeps them in the SQLite metastore; the binary under
+  test loads each from its source instead, follows the sources further, and
+  leaves the release's copy exactly as it was. The release then starts again
+  on that copy while the sources changed again, and must answer as its sources
+  do, whatever position the binary under test moved the PostgreSQL slot to
+  (here past changes the release's copy does not hold). Upgrading again
+  serves each dataset from its object-native copy, which catches up from its
+  source in turn.
+
+matrix:
+  from: [2.3.x, 2.4.x]
+from: '${matrix.from}'
+
+sources:
+  pg: { kind: postgres }
+  my: { kind: mysql }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-vnext-rollback
+  runtime: { params: { cayenne_vnext: enabled } }
+  datasets:
+    - from: postgres:public.items
+      name: full
+      params: ${sources.pg.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_check_interval: 1h }
+    - from: postgres:public.ta
+      name: pg_a
+      params: ${sources.pg.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id, on_conflict: { id: upsert } }
+    - from: mysql:ma
+      name: my_a
+      params: ${sources.my.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id, on_conflict: { id: upsert } }
+
+# `on_conflict` is deprecated for Cayenne, but the release requires it for
+# change capture. The release ignores `runtime.params.cayenne_vnext`.
+defaults:
+  compare-variants: false
+
+steps:
+  - source-exec:
+      pg: |
+        CREATE TABLE items (id int PRIMARY KEY, v text);
+        INSERT INTO items SELECT g, 'v' || g FROM generate_series(1, 500) g;
+        CREATE TABLE ta (id int PRIMARY KEY, v text);
+        INSERT INTO ta SELECT g, 'v' || g FROM generate_series(1, 1000) g;
+  - source-exec:
+      my: |
+        CREATE TABLE ma (id int PRIMARY KEY, v varchar(50));
+        INSERT INTO ma SELECT n, CONCAT('v', n) FROM (WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 1000) SELECT n FROM s) s;
+  - start: {}
+  - query: SELECT * FROM pg_a
+    expect: { oracle: pg }
+    oracle-sql: SELECT * FROM ta
+    eventually: 60s
+  - query: SELECT * FROM my_a
+    expect: { oracle: my }
+    oracle-sql: SELECT * FROM ma
+    eventually: 60s
+
+  # Upgraded: each dataset loads from its source (with the changes made while
+  # spiced was down), not from the release's copy, which is left as it was.
+  - stop: {}
+  - mark-files:
+      id: release-copy
+      matching: ['^\.spice/data/(full|pg_a|my_a)/', '^\.spice/data/metadata/cayenne\.db']
+  - source-exec: { pg: "UPDATE items SET v = 'while down' WHERE id <= 20; UPDATE ta SET v = 'while down' WHERE id BETWEEN 500 AND 520" }
+  - source-exec: { my: "UPDATE ma SET v = 'while down' WHERE id BETWEEN 500 AND 520" }
+  # Where the release left the slot acknowledged.
+  - source-exec: { pg: "CREATE TABLE acked AS SELECT confirmed_flush_lsn AS before FROM pg_replication_slots WHERE slot_name LIKE 'spice_pg_a%'" }
+  - upgrade: {}
+  - query: SELECT * FROM full
+    expect: { oracle: pg }
+    oracle-sql: SELECT * FROM items
+  - query: SELECT * FROM pg_a
+    expect: { oracle: pg }
+    oracle-sql: SELECT * FROM ta
+    eventually: 60s
+  - query: SELECT * FROM my_a
+    expect: { oracle: my }
+    oracle-sql: SELECT * FROM ma
+    eventually: 60s
+  - assert-log:
+      contains: ["Dataset 'pg_a' will have its acceleration created by reading the source"]
+      lacks: 'resuming from persisted GTID position dataset=my_a'
+  - assert-files: { unchanged-since: release-copy }
+
+  # Following the sources past what the release saw.
+  - source-exec: { pg: "UPDATE ta SET v = 'after upgrade' WHERE id <= 100; DELETE FROM ta WHERE id BETWEEN 900 AND 950" }
+  - source-exec: { my: "UPDATE ma SET v = 'after upgrade' WHERE id <= 100; DELETE FROM ma WHERE id BETWEEN 900 AND 950" }
+  - query: SELECT * FROM pg_a
+    expect: { oracle: pg }
+    oracle-sql: SELECT * FROM ta
+    eventually: 60s
+  - query: SELECT * FROM my_a
+    expect: { oracle: my }
+    oracle-sql: SELECT * FROM ma
+    eventually: 60s
+  # The binary under test acknowledges the slot past those changes (its
+  # in-memory tier checkpoints within 10 s), past what the release's copy holds.
+  - source-query:
+      pg: "SELECT CASE WHEN bool_and(s.confirmed_flush_lsn > a.before) THEN 'advanced' ELSE 'not yet' END AS slot FROM pg_replication_slots s, acked a WHERE s.slot_name LIKE 'spice_pg_a%'"
+    expect: { rows: [['advanced']] }
+    eventually: 60s
+
+  # Rolled back: the release on its own copy, which holds the state from
+  # before the upgrade, while the sources changed again.
+  - stop: {}
+  - assert-files: { unchanged-since: release-copy }
+  - source-exec: { pg: "UPDATE ta SET v = 'while rolled back' WHERE id BETWEEN 200 AND 250; UPDATE items SET v = 'while rolled back' WHERE id > 480" }
+  - source-exec: { my: "UPDATE ma SET v = 'while rolled back' WHERE id BETWEEN 200 AND 250" }
+  - downgrade: {}
+  - refresh: full
+  - query: SELECT * FROM full
+    expect: { oracle: pg }
+    oracle-sql: SELECT * FROM items
+  - query: SELECT * FROM pg_a
+    expect: { oracle: pg }
+    oracle-sql: SELECT * FROM ta
+    eventually: 60s
+  - query: SELECT * FROM my_a
+    expect: { oracle: my }
+    oracle-sql: SELECT * FROM ma
+    eventually: 60s
+  - query: SELECT count(*) - count(DISTINCT id) AS duplicates FROM pg_a
+    expect: { rows: [['0']] }
+  - query: SELECT count(*) - count(DISTINCT id) AS duplicates FROM my_a
+    expect: { rows: [['0']] }
+  # How: the release finds the PostgreSQL slot acknowledged past the position
+  # its copy recorded as applied, and rebuilds that acceleration from the source
+  # (a full re-read, which keeps no row the source no longer has); it resumes
+  # MySQL from the GTID position its copy recorded, re-reading the binlog since.
+  - assert-log:
+      contains: ["Dataset 'pg_a' will have its acceleration rebuilt from the source"]
+      count: { "resuming from persisted GTID position dataset=my_a": 1 }
+
+  # Upgraded again: each dataset is served from its object-native copy, which
+  # missed the changes made while rolled back, and catches up from its source.
+  - stop: {}
+  - source-exec: { pg: "UPDATE ta SET v = 'upgraded again' WHERE id BETWEEN 300 AND 320; UPDATE items SET v = 'upgraded again' WHERE id <= 5" }
+  - source-exec: { my: "UPDATE ma SET v = 'upgraded again' WHERE id BETWEEN 300 AND 320" }
+  - upgrade: {}
+  - refresh: full
+  - query: SELECT * FROM full
+    expect: { oracle: pg }
+    oracle-sql: SELECT * FROM items
+  - query: SELECT * FROM pg_a
+    expect: { oracle: pg }
+    oracle-sql: SELECT * FROM ta
+    eventually: 60s
+  - query: SELECT * FROM my_a
+    expect: { oracle: my }
+    oracle-sql: SELECT * FROM ma
+    eventually: 60s
+  - query: SELECT count(*) - count(DISTINCT id) AS duplicates FROM pg_a
+    expect: { rows: [['0']] }
+  - query: SELECT count(*) - count(DISTINCT id) AS duplicates FROM my_a
+    expect: { rows: [['0']] }
