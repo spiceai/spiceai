@@ -2010,6 +2010,14 @@ async fn stale_syncs_do_not_modify_replacement_runs() {
             .collect();
         let publications_before = counters(&old).builds_published;
         insert(&old, name, rows(20_000, 20_000)).await;
+        // An append's run publishes off the write path, moments after the append
+        // returns; wait for it, since the late publication is what this exercises.
+        let published_by = tokio::time::Instant::now() + Duration::from_secs(10);
+        while counters(&old).builds_published <= publications_before
+            && tokio::time::Instant::now() < published_by
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(
             counters(&old).builds_published > publications_before,
             "the old provider must publish a run to exercise stale scheduling"
