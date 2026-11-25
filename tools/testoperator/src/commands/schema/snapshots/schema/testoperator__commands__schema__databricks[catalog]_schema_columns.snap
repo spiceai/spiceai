@@ -21,7 +21,7 @@ description: "Schema columns for databricks[catalog]"
 | tpch          | tpch         | customer     | c_address             | 2                | Utf8                                                                                      | YES         |
 | tpch          | tpch         | customer     | c_nationkey           | 3                | Int64                                                                                     | YES         |
 | tpch          | tpch         | customer     | c_phone               | 4                | Utf8                                                                                      | YES         |
-| tpch          | tpch         | customer     | c_acctbal             | 5                | Decimal128(15, 2)                                                                         | YES         |
+| tpch          | tpch         | customer     | c_acctbal             | 5                | Decimal128(8, 4)                                                                          | YES         |
 | tpch          | tpch         | customer     | c_mktsegment          | 6                | Utf8                                                                                      | YES         |
 | tpch          | tpch         | customer     | c_comment             | 7                | Utf8                                                                                      | YES         |
 | tpch          | tpch         | lineitem     | l_orderkey            | 0                | Int64                                                                                     | YES         |
@@ -60,12 +60,12 @@ description: "Schema columns for databricks[catalog]"
 | tpch          | tpch         | part         | p_type                | 4                | Utf8                                                                                      | YES         |
 | tpch          | tpch         | part         | p_size                | 5                | Int64                                                                                     | YES         |
 | tpch          | tpch         | part         | p_container           | 6                | Utf8                                                                                      | YES         |
-| tpch          | tpch         | part         | p_retailprice         | 7                | Decimal128(15, 2)                                                                         | YES         |
+| tpch          | tpch         | part         | p_retailprice         | 7                | Decimal128(8, 4)                                                                          | YES         |
 | tpch          | tpch         | part         | p_comment             | 8                | Utf8                                                                                      | YES         |
 | tpch          | tpch         | partsupp     | ps_partkey            | 0                | Int64                                                                                     | YES         |
 | tpch          | tpch         | partsupp     | ps_suppkey            | 1                | Int64                                                                                     | YES         |
 | tpch          | tpch         | partsupp     | ps_availqty           | 2                | Int64                                                                                     | YES         |
-| tpch          | tpch         | partsupp     | ps_supplycost         | 3                | Decimal128(15, 2)                                                                         | YES         |
+| tpch          | tpch         | partsupp     | ps_supplycost         | 3                | Decimal128(8, 4)                                                                          | YES         |
 | tpch          | tpch         | partsupp     | ps_comment            | 4                | Utf8                                                                                      | YES         |
 | tpch          | tpch         | region       | r_regionkey           | 0                | Int64                                                                                     | YES         |
 | tpch          | tpch         | region       | r_name                | 1                | Utf8                                                                                      | YES         |
@@ -75,6 +75,6 @@ description: "Schema columns for databricks[catalog]"
 | tpch          | tpch         | supplier     | s_address             | 2                | Utf8                                                                                      | YES         |
 | tpch          | tpch         | supplier     | s_nationkey           | 3                | Int64                                                                                     | YES         |
 | tpch          | tpch         | supplier     | s_phone               | 4                | Utf8                                                                                      | YES         |
-| tpch          | tpch         | supplier     | s_acctbal             | 5                | Decimal128(15, 2)                                                                         | YES         |
+| tpch          | tpch         | supplier     | s_acctbal             | 5                | Decimal128(8, 4)                                                                          | YES         |
 | tpch          | tpch         | supplier     | s_comment             | 6                | Utf8                                                                                      | YES         |
 +---------------+--------------+--------------+-----------------------+------------------+-------------------------------------------------------------------------------------------+-------------+

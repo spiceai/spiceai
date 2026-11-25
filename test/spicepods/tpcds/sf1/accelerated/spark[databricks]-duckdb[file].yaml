@@ -2,7 +2,7 @@ version: v1
 kind: Spicepod
 name: spark[databricks]-duckdb[file]
 datasets:
-  - from: spark:spiceai_sandbox.tpcds.catalog_sales
+  - from: spark:spiceai_ci.tpcds.catalog_sales
     name: catalog_sales
     acceleration: &acceleration
       enabled: true
@@ -12,95 +12,95 @@ datasets:
         connection_pool_size: 25
     params: &spark_params
       spark_remote: sc://${ env:DATABRICKS_HOST }:443/;use_ssl=true;user_id=spice.ai;token=${ env:DATABRICKS_TOKEN };x-databricks-cluster-id=${ env:DATABRICKS_CLUSTER_ID };
-  - from: spark:spiceai_sandbox.tpcds.catalog_returns
+  - from: spark:spiceai_ci.tpcds.catalog_returns
     name: catalog_returns
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.inventory
+  - from: spark:spiceai_ci.tpcds.inventory
     name: inventory
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.store_sales
+  - from: spark:spiceai_ci.tpcds.store_sales
     name: store_sales
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.store_returns
+  - from: spark:spiceai_ci.tpcds.store_returns
     name: store_returns
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.web_sales
+  - from: spark:spiceai_ci.tpcds.web_sales
     name: web_sales
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.web_returns
+  - from: spark:spiceai_ci.tpcds.web_returns
     name: web_returns
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.customer
+  - from: spark:spiceai_ci.tpcds.customer
     name: customer
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.customer_address
+  - from: spark:spiceai_ci.tpcds.customer_address
     name: customer_address
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.customer_demographics
+  - from: spark:spiceai_ci.tpcds.customer_demographics
     name: customer_demographics
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.date_dim
+  - from: spark:spiceai_ci.tpcds.date_dim
     name: date_dim
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.household_demographics
+  - from: spark:spiceai_ci.tpcds.household_demographics
     name: household_demographics
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.item
+  - from: spark:spiceai_ci.tpcds.item
     name: item
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.promotion
+  - from: spark:spiceai_ci.tpcds.promotion
     name: promotion
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.ship_mode
+  - from: spark:spiceai_ci.tpcds.ship_mode
     name: ship_mode
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.store
+  - from: spark:spiceai_ci.tpcds.store
     name: store
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.time_dim
+  - from: spark:spiceai_ci.tpcds.time_dim
     name: time_dim
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.warehouse
+  - from: spark:spiceai_ci.tpcds.warehouse
     name: warehouse
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.web_page
+  - from: spark:spiceai_ci.tpcds.web_page
     name: web_page
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.web_site
+  - from: spark:spiceai_ci.tpcds.web_site
     name: web_site
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.reason
+  - from: spark:spiceai_ci.tpcds.reason
     name: reason
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.call_center
+  - from: spark:spiceai_ci.tpcds.call_center
     name: call_center
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.income_band
+  - from: spark:spiceai_ci.tpcds.income_band
     name: income_band
     acceleration: *acceleration
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.catalog_page
+  - from: spark:spiceai_ci.tpcds.catalog_page
     name: catalog_page
     acceleration: *acceleration
     params: *spark_params
