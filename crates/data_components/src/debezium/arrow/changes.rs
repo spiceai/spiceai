@@ -299,7 +299,10 @@ mod tests {
             source: Box::new(err),
         };
         for rendered in [err.to_string(), format!("{err:?}")] {
-            assert!(!rendered.contains(FAKE_SECRET), "row value leaked: {rendered}");
+            assert!(
+                !rendered.contains(FAKE_SECRET),
+                "row value leaked: {rendered}"
+            );
             assert!(!rendered.contains("app-1"), "row value leaked: {rendered}");
             assert!(rendered.contains("ip_allow_list_enabled"), "{rendered}");
         }

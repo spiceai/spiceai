@@ -67,7 +67,10 @@ pub enum Error {
     #[snafu(display(
         "Missing the required field '{field_name}' in a change event row. The row's values are not shown. Make the column nullable or resnapshot the source so every change event carries it"
     ))]
-    MissingFieldInValue { field_name: String },
+    MissingFieldInValue {
+        field_name: String,
+        value: RowNotShown,
+    },
 
     #[snafu(display(
         "Missing field builder at index {data_struct_field_idx} in struct with schema {schema:?}"
@@ -183,6 +186,25 @@ pub enum Error {
     DecimalPrecisionExceeded { value: i128, precision: u8 },
 }
 
+/// Takes the place of a change event row in an error, keeping none of it.
+///
+/// Rows hold source data (including credentials) and errors are logged, so an
+/// error built from a row (`value: row`) stores and prints nothing of it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RowNotShown;
+
+impl From<serde_json::Value> for RowNotShown {
+    fn from(_row: serde_json::Value) -> Self {
+        Self
+    }
+}
+
+impl std::fmt::Debug for RowNotShown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<row not shown>")
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub fn convert_fields_to_arrow_schema(fields: Vec<&ChangeEventField>) -> Result<Schema> {
@@ -256,6 +278,7 @@ pub fn append_value_to_struct_builder(
             None => {
                 return MissingFieldInValueSnafu {
                     field_name: field.name().clone(),
+                    value,
                 }
                 .fail();
             }
@@ -545,7 +568,7 @@ fn append_timestamp<T: ArrowTimestampType>(
 }
 
 /// The kind of a JSON value, for errors that must not show the value itself.
-pub(crate) fn json_kind(value: &Json) -> &'static str {
+fn json_kind(value: &Json) -> &'static str {
     match value {
         Json::Null => "null",
         Json::Bool(_) => "a boolean",
@@ -1212,7 +1235,7 @@ mod tests {
         let err = append_value_to_struct_builder(value, &mut builder, &[])
             .expect_err("Should fail when required field is missing");
         assert!(
-            matches!(&err, Error::MissingFieldInValue { field_name } if field_name == "status"),
+            matches!(&err, Error::MissingFieldInValue { field_name, .. } if field_name == "status"),
             "the missing non-nullable `status` column must be named, got: {err:?}"
         );
     }
@@ -1235,16 +1258,22 @@ mod tests {
         let err = append_value_to_struct_builder(row, &mut builder, &[])
             .expect_err("a row without a required column must fail");
         for rendered in [err.to_string(), format!("{err:?}")] {
-            assert!(!rendered.contains(FAKE_SECRET), "row value leaked: {rendered}");
+            assert!(
+                !rendered.contains(FAKE_SECRET),
+                "row value leaked: {rendered}"
+            );
             assert!(rendered.contains("ip_allow_list_enabled"), "{rendered}");
         }
 
         let err = decode_timestamp(&json!(FAKE_SECRET), TimeUnit::Microsecond, None, None)
             .expect_err("a non-timestamp string must fail");
         for rendered in [err.to_string(), format!("{err:?}")] {
-            assert!(!rendered.contains(FAKE_SECRET), "column value leaked: {rendered}");
-            assert!(rendered.contains("'at'"), "{rendered}");
+            assert!(
+                !rendered.contains(FAKE_SECRET),
+                "column value leaked: {rendered}"
+            );
         }
+        assert!(err.to_string().contains("column 'at'"), "{err}");
     }
 
     #[test]

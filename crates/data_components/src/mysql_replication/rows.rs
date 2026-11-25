@@ -770,15 +770,7 @@ fn value_to_string(value: &Value) -> Result<std::borrow::Cow<'_, str>> {
     }
 }
 
-/// Stands in for a text value that failed to decode, so the error shows only
-/// its length. Row values can hold credentials, and decode errors reach logs.
-struct Redacted(usize);
-
-impl std::fmt::Debug for Redacted {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<{}-byte value not shown>", self.0)
-    }
-}
+use crate::cdc::RedactedValue;
 
 fn value_to_bytes(value: &Value) -> Result<&[u8]> {
     match value {
@@ -798,7 +790,7 @@ fn value_to_bool(value: &Value) -> Result<bool> {
             Ok("0" | "false" | "FALSE") => Ok(false),
             Ok("1" | "true" | "TRUE") => Ok(true),
             _ => DecodeSnafu {
-                message: format!("cannot interpret {:?} as boolean", Redacted(b.len())),
+                message: format!("cannot interpret {:?} as boolean", RedactedValue(b.len())),
             }
             .fail(),
         },
@@ -827,7 +819,7 @@ where
         Value::Bytes(b) => std::str::from_utf8(b)
             .ok()
             .and_then(|s| s.trim().parse::<T>().ok())
-            .ok_or_else(|| out_of_range(&Redacted(b.len()))),
+            .ok_or_else(|| out_of_range(&RedactedValue(b.len()))),
         Value::Float(_) | Value::Double(_) => {
             exact_integer(value).ok_or_else(|| not_exact(value, target))
         }
@@ -926,7 +918,7 @@ fn value_to_f64(value: &Value) -> Result<f64> {
             .ok()
             .and_then(|s| s.trim().parse::<f64>().ok())
             .ok_or_else(|| Error::Decode {
-                message: format!("cannot parse {:?} as a float", Redacted(b.len())),
+                message: format!("cannot parse {:?} as a float", RedactedValue(b.len())),
             }),
         other => DecodeSnafu {
             message: format!("cannot interpret {other:?} as a float"),
@@ -952,7 +944,7 @@ fn value_to_date32(value: &Value) -> Result<Option<i32>> {
             })?;
             let date = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").map_err(|e| {
                 Error::Decode {
-                    message: format!("DATE parse of {:?}: {e}", Redacted(s.len())),
+                    message: format!("DATE parse of {:?}: {e}", RedactedValue(s.len())),
                 }
             })?;
             Ok(Some(days_since_epoch(date)))
@@ -993,7 +985,7 @@ fn value_to_time_nanos(value: &Value) -> Result<i64> {
             })?;
             let t = chrono::NaiveTime::parse_from_str(s.trim(), "%H:%M:%S%.f").map_err(|e| {
                 Error::Decode {
-                    message: format!("TIME parse of {:?}: {e}", Redacted(s.len())),
+                    message: format!("TIME parse of {:?}: {e}", RedactedValue(s.len())),
                 }
             })?;
             Ok(
@@ -1049,7 +1041,7 @@ fn value_to_timestamp_micros(value: &Value) -> Result<Option<i64>> {
                 // Formatted datetime fallback.
                 let dt = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").map_err(
                     |e| Error::Decode {
-                        message: format!("TIMESTAMP parse of {:?}: {e}", Redacted(s.len())),
+                        message: format!("TIMESTAMP parse of {:?}: {e}", RedactedValue(s.len())),
                     },
                 )?;
                 return Ok(Some(dt.and_utc().timestamp_micros()));
@@ -1062,7 +1054,7 @@ fn value_to_timestamp_micros(value: &Value) -> Result<Option<i64>> {
             let secs: i64 = secs_str.parse().map_err(|e| Error::Decode {
                 message: format!(
                     "TIMESTAMP unix-seconds parse of {:?}: {e}",
-                    Redacted(s.len())
+                    RedactedValue(s.len())
                 ),
             })?;
             if secs == 0 && frac_str.is_empty() {
@@ -1135,7 +1127,7 @@ fn decimal_digits_at_scale(s: &str, precision: u8, scale: i8) -> Result<String> 
         || !frac_part.bytes().all(|b| b.is_ascii_digit())
     {
         return DecodeSnafu {
-            message: format!("non-numeric decimal value {:?}", Redacted(s.len())),
+            message: format!("non-numeric decimal value {:?}", RedactedValue(s.len())),
         }
         .fail();
     }

@@ -401,10 +401,7 @@ fn avro_value_to_change_event(value: &AvroValue) -> Result<ChangeEvent> {
         },
         other => {
             return MapPayloadSnafu {
-                message: format!(
-                    "missing or invalid op field: {:?}",
-                    other.map(avro_kind)
-                ),
+                message: format!("missing or invalid op field: {:?}", other.map(avro_kind)),
             }
             .fail();
         }
@@ -557,9 +554,14 @@ mod tests {
             ),
         )]);
         for value in [not_a_record, bad_op] {
-            let err = super::avro_value_to_change_event(&value).expect_err("must not map");
+            let Err(err) = super::avro_value_to_change_event(&value) else {
+                panic!("must not map");
+            };
             for rendered in [err.to_string(), format!("{err:?}")] {
-                assert!(!rendered.contains(FAKE_SECRET), "row value leaked: {rendered}");
+                assert!(
+                    !rendered.contains(FAKE_SECRET),
+                    "row value leaked: {rendered}"
+                );
                 assert!(!rendered.contains("api_key"), "row leaked: {rendered}");
             }
         }

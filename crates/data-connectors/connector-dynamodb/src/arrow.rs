@@ -34,7 +34,6 @@ use util::time_format::{ParsedDateTime, parse_datetime};
 /// This limit prevents stack overflow from maliciously crafted deeply nested data.
 const MAX_RECURSION_DEPTH: usize = 100;
 
-
 /// The type of a `DynamoDB` attribute, for errors. An attribute's `Debug`
 /// output includes its value (a map prints the whole nested item), which can
 /// hold credentials, so errors name only the type.
