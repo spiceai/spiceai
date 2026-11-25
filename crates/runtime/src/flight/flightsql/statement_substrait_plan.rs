@@ -482,6 +482,61 @@ mod tests {
         }
     }
 
+    /// A sidecar sends the plan it optimized, with the limit below the projection. The cluster
+    /// must still recognise the decoded plan as a point lookup, or it plans every lookup with the
+    /// full optimizer.
+    #[tokio::test]
+    async fn a_decoded_sidecar_lookup_is_planned_as_a_point_lookup() -> Result<(), anyhow::Error> {
+        use arrow::array::{ArrayRef, RecordBatch, StringArray};
+        use datafusion::datasource::MemTable;
+        use datafusion_substrait::logical_plan::producer::to_substrait_plan;
+        let df = Arc::new(
+            DataFusion::builder(
+                runtime_status::RuntimeStatus::new(),
+                Arc::new(crate::dataaccelerator::AcceleratorEngineRegistry::default()),
+                tokio::runtime::Handle::current(),
+            )
+            .build(),
+        );
+        let batch = RecordBatch::try_from_iter([
+            (
+                "sender_id",
+                Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+            ),
+            (
+                "reason",
+                Arc::new(StringArray::from(vec!["r", "s"])) as ArrayRef,
+            ),
+        ])?;
+        let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+        df.ctx.register_table("sender_blocklist", Arc::new(table))?;
+        let plan = df
+            .ctx
+            .sql("SELECT 1 AS present FROM sender_blocklist WHERE sender_id = 'a' LIMIT 1")
+            .await?
+            .into_optimized_plan()?;
+        let proto = to_substrait_plan(&plan, &df.ctx.state())?;
+        let (decoded, _, _) = decode_plan(
+            &cmd(Some(SubstraitPlan {
+                plan: Bytes::from(proto.encode_to_vec()),
+                version: "0.62.0".to_string(),
+            })),
+            &df,
+        )
+        .await?;
+        assert!(
+            matches!(&decoded, LogicalPlan::Projection(p) if matches!(p.input.as_ref(), LogicalPlan::Limit(_))),
+            "the shape this guards: the limit below the projection\n{}",
+            decoded.display_indent()
+        );
+        assert!(
+            crate::datafusion::point_lookup::is_point_lookup(&decoded).is_some(),
+            "{}",
+            decoded.display_indent()
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn decode_plan_executes_a_varchar_literal() -> Result<(), anyhow::Error> {
         use datafusion_substrait::{
