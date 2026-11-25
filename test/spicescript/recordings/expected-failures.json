@@ -1048,6 +1048,33 @@
       "group": "cayenne"
     }
   ],
+  "object-native-replicas-takeover": [
+    {
+      "run": "object-native-replicas-takeover[src=postgres]",
+      "who": "b",
+      "key": "query: SELECT count(*) AS n, sum(e.v) AS total FROM events e JOIN marks m ON e.batch = m.batch JOIN acked k ON m.lsn <= k.lsn WHERE k.at = 'cut'",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for events: Acceleration not ready; loading initial data for events",
+      "group": "cayenne"
+    },
+    {
+      "run": "object-native-replicas-takeover[src=postgres]",
+      "who": "b",
+      "key": "query: SELECT batch, count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events GROUP BY batch ORDER BY batch #2",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for events: Acceleration not ready; loading initial data for events",
+      "group": "cayenne"
+    },
+    {
+      "run": "object-native-replicas-takeover[src=postgres]",
+      "who": "a",
+      "key": "query: SELECT batch, count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events GROUP BY batch ORDER BY batch #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"n\", row_number: 5, expected: \"\\\"1000\\\"\", actual: \"\\\"2000\\\"\" }",
+      "group": "cayenne",
+      "may-pass": true
+    }
+  ],
   "postgres-cdc-atomicity": [
     {
       "run": "postgres-cdc-atomicity",

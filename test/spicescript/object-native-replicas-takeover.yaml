@@ -248,6 +248,11 @@ steps:
   # A, still writing, is cut off from the location but not from the source.
   # It can no longer commit, so it must acknowledge nothing more; B takes over
   # once A's lease lapses and resumes the slot from the last commit.
+  # Expected to fail for now (recordings/expected-failures.json): A only learns
+  # it lost the lease once it reaches the location again, so it keeps the slot
+  # and B cannot stream until then (#16757); and A, demoted, cannot replace its
+  # writer table, so it serves the rows it applied but never committed beside
+  # B's.
   - pause-source: cut
     when: { src: postgres }
   - source-exec:
