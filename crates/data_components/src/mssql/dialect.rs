@@ -16,7 +16,7 @@ limitations under the License.
 
 //! MSSQL (T-SQL) dialect for `DataFusion` unparser.
 
-use datafusion::common::plan_err;
+use datafusion::common::{TableReference, plan_err};
 use datafusion::error::Result;
 use datafusion::prelude::Expr;
 use datafusion::sql::sqlparser::ast::{self, ExactNumberInfo, Ident, ObjectName};
@@ -26,8 +26,9 @@ use datafusion::sql::unparser::dialect::Dialect;
 
 /// Microsoft SQL Server dialect for T-SQL compatibility.
 ///
-/// - Uses `FLOAT` for Float64 instead of the default `DOUBLE`.
-/// - Remaps `substr` to T-SQL's `SUBSTRING`.
+/// - Quotes every identifier with `"`.
+/// - For SQL that holds casts or functions: uses `FLOAT` for Float64 instead of the default
+///   `DOUBLE`, and remaps `substr` to T-SQL's `SUBSTRING`.
 #[derive(Debug, Default)]
 pub struct MsSqlDialect {}
 
@@ -39,8 +40,9 @@ impl MsSqlDialect {
 }
 
 impl Dialect for MsSqlDialect {
+    /// Every identifier is quoted: an unquoted `user` or `order` is a T-SQL keyword or function.
     fn identifier_quote_style(&self, _: &str) -> Option<char> {
-        None
+        Some('"')
     }
 
     /// Not measured for SQL Server, so answered conservatively: the trait default
@@ -67,6 +69,31 @@ impl Dialect for MsSqlDialect {
             "substr" => substr_to_substring(unparser, args),
             _ => Ok(None),
         }
+    }
+}
+
+/// Quotes `name` as a T-SQL identifier. The connection sets `QUOTED_IDENTIFIER ON`.
+pub(crate) fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Quotes each part of `table` as a T-SQL identifier.
+pub(crate) fn quote_table_reference(table: &TableReference) -> String {
+    match table {
+        TableReference::Bare { table } => quote_identifier(table),
+        TableReference::Partial { schema, table } => {
+            format!("{}.{}", quote_identifier(schema), quote_identifier(table))
+        }
+        TableReference::Full {
+            catalog,
+            schema,
+            table,
+        } => format!(
+            "{}.{}.{}",
+            quote_identifier(catalog),
+            quote_identifier(schema),
+            quote_identifier(table)
+        ),
     }
 }
 
@@ -134,6 +161,28 @@ mod tests {
         MsSqlDialect::new()
     }
 
+    #[test]
+    fn every_identifier_is_quoted() -> Result<()> {
+        let dialect = create_dialect();
+        let unparser = Unparser::new(&dialect);
+        let sql = unparser
+            .expr_to_sql(&col("user").eq(lit("dbo")).and(col("a\"b").gt(lit(1))))?
+            .to_string();
+        assert_eq!(sql, r#"(("user" = 'dbo') AND ("a""b" > 1))"#);
+        assert_eq!(
+            quote_table_reference(&TableReference::partial("dbo", "order")),
+            r#""dbo"."order""#
+        );
+        assert_eq!(quote_table_reference(&TableReference::bare("t")), r#""t""#);
+        assert_eq!(
+            quote_table_reference(&TableReference::full("db", "dbo", "t")),
+            r#""db"."dbo"."t""#
+        );
+        assert_eq!(quote_identifier("my col"), r#""my col""#);
+        assert_eq!(quote_identifier("a\"b"), r#""a""b""#);
+        Ok(())
+    }
+
     /// Pinned so a trait default cannot quietly re-enable the scope: SQL Server has
     /// not been measured to fix a volatile value inside a derived table, and the
     /// unparser refuses the shape on a dialect that answers `false` here.
@@ -155,7 +204,7 @@ mod tests {
             datafusion::arrow::datatypes::DataType::Float64,
         );
         let sql = unparser.expr_to_sql(&expr)?.to_string();
-        assert_eq!(sql, "CAST(a AS FLOAT)");
+        assert_eq!(sql, r#"CAST("a" AS FLOAT)"#);
         Ok(())
     }
 
@@ -170,7 +219,7 @@ mod tests {
             .expect("should return Some for substr");
 
         let sql = result.to_string();
-        assert_eq!(sql, "SUBSTRING(name, 1, 3)");
+        assert_eq!(sql, r#"SUBSTRING("name", 1, 3)"#);
         Ok(())
     }
 
@@ -185,7 +234,7 @@ mod tests {
             .expect("should return Some for substr");
 
         let sql = result.to_string();
-        assert_eq!(sql, "SUBSTRING(name, 2, 2147483647)");
+        assert_eq!(sql, r#"SUBSTRING("name", 2, 2147483647)"#);
         Ok(())
     }
 
