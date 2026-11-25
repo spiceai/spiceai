@@ -301,7 +301,8 @@ async fn file_shipdate_ranges(
             .await
             .expect("open data file");
         let stats = file.file_stats().expect("data file has footer statistics");
-        let (set, dtype) = stats.get(column);
+        let (aggregates, dtype) = stats.get(column);
+        let set = aggregates.to_stats_set();
         let min = set
             .get_as::<i32>(Stat::Min, dtype)
             .into_inner()

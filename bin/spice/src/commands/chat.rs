@@ -1371,10 +1371,20 @@ mod tests {
         ];
         let server = SlowServer::dribbling_then_holding(chunks, Duration::from_millis(10));
 
-        let response = tokio::time::timeout(Duration::from_secs(5), responses_stream_from(&server))
-            .await
-            .expect("the terminal event ends the read without waiting for the server to hang up")
-            .expect("a completed Responses stream is an answer");
+        // The clock covers the request alone. Building the context's HTTP clients reads the
+        // system proxy settings, which on macOS lists the test binary's directory, and with
+        // many test processes starting at once that takes seconds.
+        let ctx = unhurried_context(server.url());
+        let config = responses_chat_config();
+        let messages = one_shot_prompt();
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_chat_streaming(&ctx, &config, &messages, false, false),
+        )
+        .await
+        .expect("the terminal event ends the read without waiting for the server to hang up")
+        .expect("a completed Responses stream is an answer");
 
         assert_eq!(response.content, "Hello, world");
         let usage = response.usage.expect("the terminal event carries usage");

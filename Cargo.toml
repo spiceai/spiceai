@@ -116,6 +116,7 @@ members = [
     "crates/s3-event-notifications",
     "crates/s3_vectors",
     "crates/s3_vectors_metadata_filter",
+    "crates/range-rescale",
     "crates/search",
     "crates/sharded-cache",
     "crates/tantivy_datafusion_filter",
@@ -182,11 +183,13 @@ version = "2.5.0-unstable"
 # `tokio_unstable` is enabled via `RUSTFLAGS="--cfg tokio_unstable"` to expose the
 # per-worker tokio RuntimeMetrics (busy/park/steal). `cayenne_loom` is enabled the
 # same way (`RUSTFLAGS="--cfg cayenne_loom"`) to swap std atomics for loom's
-# model-checked ones in cayenne's `StructuralVersion` seqlock model tests. Declare
-# both so the otherwise-unknown cfg names don't trip the `unexpected_cfgs` lint on
-# builds without the flag. Declared workspace-wide (via each crate's
+# model-checked ones in cayenne's `StructuralVersion` seqlock model tests. The Verus
+# verifier sets `verus_keep_ghost` when it keeps proof code, so `range-rescale`
+# imports its vstd lemmas only then. Declare all three so the otherwise-unknown cfg
+# names don't trip the `unexpected_cfgs` lint on builds without the flag. Declared
+# workspace-wide (via each crate's
 # `lints.workspace = true`) rather than per-crate.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)', 'cfg(cayenne_loom)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)', 'cfg(cayenne_loom)', 'cfg(verus_keep_ghost)'] }
 
 [workspace.lints.clippy]
 # Deny the pedantic group with a lower priority so the specific opt-outs below win.
@@ -530,14 +533,14 @@ flatbuffers = "25.2.10"
 # Vortex tagged releases publish version 0.1.0 in their Cargo.toml, not the actual release version,
 # so we specify git deps here directly. The [patch.crates-io] entries below exist to override
 # transitive vortex dependencies pulled in by other patched crates.
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "4539a2fa604c9cfe72f6977fdf3cff98323b00c0" } # branch: spiceai-55 (vortex 0.86.1)
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "4539a2fa604c9cfe72f6977fdf3cff98323b00c0" } # branch: spiceai-55 (vortex 0.86.1)
-vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "4539a2fa604c9cfe72f6977fdf3cff98323b00c0" } # branch: spiceai-55 (vortex 0.86.1)
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "e9959de8e0e8c39f04f4dcd9adb68b2438bfc697" } # branch: spiceai-55 (vortex 0.93.0)
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "e9959de8e0e8c39f04f4dcd9adb68b2438bfc697" } # branch: spiceai-55 (vortex 0.93.0)
+vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "e9959de8e0e8c39f04f4dcd9adb68b2438bfc697" } # branch: spiceai-55 (vortex 0.93.0)
 vortex-datafusion = { path = "crates/vortex" }
-vortex-io = { git = "https://github.com/spiceai/vortex.git", rev = "4539a2fa604c9cfe72f6977fdf3cff98323b00c0", features = ["tokio"] } # branch: spiceai-55 (vortex 0.86.1)
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "4539a2fa604c9cfe72f6977fdf3cff98323b00c0" } # branch: spiceai-55 (vortex 0.86.1)
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "4539a2fa604c9cfe72f6977fdf3cff98323b00c0" } # branch: spiceai-55 (vortex 0.86.1)
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "4539a2fa604c9cfe72f6977fdf3cff98323b00c0" } # branch: spiceai-55 (vortex 0.86.1)
+vortex-io = { git = "https://github.com/spiceai/vortex.git", rev = "e9959de8e0e8c39f04f4dcd9adb68b2438bfc697", features = ["tokio"] } # branch: spiceai-55 (vortex 0.93.0)
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "e9959de8e0e8c39f04f4dcd9adb68b2438bfc697" } # branch: spiceai-55 (vortex 0.93.0)
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "e9959de8e0e8c39f04f4dcd9adb68b2438bfc697" } # branch: spiceai-55 (vortex 0.93.0)
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "e9959de8e0e8c39f04f4dcd9adb68b2438bfc697" } # branch: spiceai-55 (vortex 0.93.0)
 
 x509-certificate = "0.25.0"
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "f53c2c1c96791bea14c37cee93cae38626d9cfbc" } # branch: trunk (arrow 59.3)
@@ -659,6 +662,13 @@ tantivy-query-grammar = { path = "vendor/tantivy-query-grammar" }
 # dropping it.
 sqlparser = { path = "vendor/sqlparser" }
 
+# Local vendored fork of `apache-avro` 0.21.0 (path: vendor/apache-avro) that
+# bounds the memory an Avro array or map may claim from its declared item count:
+# upstream reserves the count a block header declares before decoding any item,
+# so a few bytes of input allocated gigabytes. Used by CDC Avro ingest and by
+# Iceberg manifest reads. See vendor/apache-avro/README.md before dropping it.
+apache-avro = { path = "vendor/apache-avro" }
+
 # Dependencies on crates.io `backoff` 0.4 resolve to the workspace crate.
 backoff = { path = "crates/backoff" }
 
@@ -691,12 +701,12 @@ delta_kernel_default_engine = { git = "https://github.com/spiceai/delta-kernel-r
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28" } # branch: spiceai-0.11.0-df-55
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28" } # branch: spiceai-0.11.0-df-55
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28" } # branch: spiceai-0.11.0-df-55
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28" } # branch: spiceai-0.11.0-df-55
-iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28" } # branch: spiceai-0.11.0-df-55
-iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28" } # branch: spiceai-0.11.0-df-55
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "9aaad84db93327729964c647345a91da0d1d5943" } # branch: spiceai-0.11.0-df-55
+iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "9aaad84db93327729964c647345a91da0d1d5943" } # branch: spiceai-0.11.0-df-55
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "9aaad84db93327729964c647345a91da0d1d5943" } # branch: spiceai-0.11.0-df-55
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "9aaad84db93327729964c647345a91da0d1d5943" } # branch: spiceai-0.11.0-df-55
+iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "9aaad84db93327729964c647345a91da0d1d5943" } # branch: spiceai-0.11.0-df-55
+iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "9aaad84db93327729964c647345a91da0d1d5943" } # branch: spiceai-0.11.0-df-55
 
 # candle-* crates are already redirected to the spiceai/candle fork via the
 # [patch.crates-io] block higher up in this file. Keeping those here would be
@@ -720,12 +730,12 @@ arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "510ef23
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "510ef234e1444f2c4aaf748d0c905787738afa7a" } # branch: spiceai-59.3.2 (arrow 59.3.2 + spice patches)
 parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "510ef234e1444f2c4aaf748d0c905787738afa7a" }      # branch: spiceai-59.3.2 (arrow 59.3.2 + spice patches)
 
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "4539a2fa604c9cfe72f6977fdf3cff98323b00c0" } # branch: spiceai-55 (vortex 0.86.1)
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "4539a2fa604c9cfe72f6977fdf3cff98323b00c0" } # branch: spiceai-55 (vortex 0.86.1)
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "e9959de8e0e8c39f04f4dcd9adb68b2438bfc697" } # branch: spiceai-55 (vortex 0.93.0)
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "e9959de8e0e8c39f04f4dcd9adb68b2438bfc697" } # branch: spiceai-55 (vortex 0.93.0)
 vortex-datafusion = { path = "crates/vortex" }
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "4539a2fa604c9cfe72f6977fdf3cff98323b00c0" } # branch: spiceai-55 (vortex 0.86.1)
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "4539a2fa604c9cfe72f6977fdf3cff98323b00c0" } # branch: spiceai-55 (vortex 0.86.1)
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "4539a2fa604c9cfe72f6977fdf3cff98323b00c0" } # branch: spiceai-55 (vortex 0.86.1)
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "e9959de8e0e8c39f04f4dcd9adb68b2438bfc697" } # branch: spiceai-55 (vortex 0.93.0)
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "e9959de8e0e8c39f04f4dcd9adb68b2438bfc697" } # branch: spiceai-55 (vortex 0.93.0)
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "e9959de8e0e8c39f04f4dcd9adb68b2438bfc697" } # branch: spiceai-55 (vortex 0.93.0)
 
 # `ttf-parser` is unmaintained (RUSTSEC-2026-0192). The workspace vendors it under
 # `crates/vendor/ttf-parser` for `lopdf` and `pdf-extract`; this patch routes the

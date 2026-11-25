@@ -69,6 +69,12 @@ impl MetadataCatalog for ObjectNativeCatalog {
         }
     }
 
+    fn data_write_gate(&self, table_id: &str) -> crate::catalog::DataWriteGate {
+        self.for_table(table_id).data_write_gate(table_id)
+    }
+    async fn follow_commits(&self, table_id: &str) -> CatalogResult<u64> {
+        self.for_table(table_id).follow_commits(table_id).await
+    }
     async fn init(&self) -> CatalogResult<()> {
         self.on_every_log(|domain| async move { domain.init().await })
             .await
@@ -513,9 +519,10 @@ impl MetadataCatalog for ObjectNativeCatalog {
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
         delete_files: &[crate::metadata::DeleteFile],
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()> {
         self.for_table(table_id)
-            .commit_overwrite(table_id, new_snapshot_id, inlined, delete_files)
+            .commit_overwrite(table_id, new_snapshot_id, inlined, delete_files, files)
             .await
     }
     async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<String> {

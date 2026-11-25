@@ -1,0 +1,52 @@
+name: cayenne-scan-pushdown
+description: >
+  Filters that Cayenne evaluates inside its Vortex scan answer as PostgreSQL
+  answers them over the same rows: an IN list holding a column, SQL's
+  three-valued IN, a CASE whose unselected branch would divide by zero or
+  overflow, arithmetic over decimals of different types, a cast past a type's
+  range, and signed zeros. Projections that the Vortex scan could evaluate,
+  among them an alias that reuses a column's name, answer the same way; today
+  they run above Cayenne's scan, and the comparison holds if they move into it.
+  Federated, the same queries check that the oracle and Spice agree without the
+  scan. (Cayenne memory mode holds its rows in memory and filters them above any
+  Vortex scan, so it is not a variant here.)
+
+sources:
+  src: { kind: postgres }
+
+# Inline storage is off, so six rows reach a data file rather than being held in
+# the metastore, and every query reads them through the Vortex scan.
+variants:
+  cayenne:
+    datasets:
+      '*': { acceleration: { enabled: true, engine: cayenne, mode: file, params: { cayenne_inline_max_rows: '0' } } }
+  federated: {}
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-scan-pushdown
+  datasets:
+    - { from: 'postgres:public.v', name: v, params: '${sources.src.params}' }
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE v (
+          id int PRIMARY KEY, a int, b int NOT NULL, p numeric(15, 2) NOT NULL,
+          r numeric(10, 0) NOT NULL, n numeric(19, 0), s text, f float8, g float8);
+        INSERT INTO v VALUES
+          (0, 2147483647, 0, 1.50, 0, 9999999999999999999, 'xy', '-0', '0'),
+          (1, -2147483648, 0, 0.00, 0, 1, 'abc', '0', '-0'),
+          (2, 1, 1, 1.00, 1, 2, NULL, 1.5, 1.5),
+          (3, 2, 2, 2.00, 2, NULL, 'q', '-0', '0'),
+          (4, NULL, 0, 0.00, 0, 3, '', NULL, '0'),
+          (5, 4, 2, 2.00, 2, -9223372036854775808, 'xyz', '0', '0');
+  - start: {}
+  - corpus: corpus/cayenne-scan-pushdown.sql

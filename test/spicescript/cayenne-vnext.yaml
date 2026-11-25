@@ -11,7 +11,9 @@ description: >
   into SQLite; and an object-store data path (an `s3://` `cayenne_file_path`,
   S3 Express included) fails to load with a message naming the dataset, the
   path and the fix. Turning the flag on again stops the datasets now on
-  SQLite rather than moving them.
+  SQLite rather than moving them, and a dataset that sets its own
+  `cayenne_file_path` under the flag fails to load with a message naming
+  the setting and both fixes.
   Every answer matches the PostgreSQL source throughout, and a value other than
   `enabled` or `disabled` stops the dataset with a message naming the param.
 
@@ -142,3 +144,19 @@ steps:
   - assert-log:
       contains: ["Failed to load dataset 'after_flag' \\(cayenne\\): `cayenne_file_path` 's3://cayenne-vnext-data/prefix' is an object-store path, which Cayenne does not support for a dataset's own data\\. .*See: https://spiceai\\.org/docs/components/data-accelerators/cayenne"]
   - assert-files: { lacks: ['s3:'] }
+
+  # The flag on: a dataset's own `cayenne_file_path` is not supported yet for
+  # data in the state location, so each dataset fails to load with a message
+  # naming the setting and both fixes, before anything is written there.
+  - restart:
+      ready: false
+      patch:
+        spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+        datasets:
+          after_flag: { acceleration: { params: { cayenne_file_path: './elsewhere' } } }
+          before_flag: { acceleration: { params: { cayenne_file_path: './elsewhere' } } }
+  - assert-status: { dataset: after_flag, status: Error, message-contains: "Failed to load dataset 'after_flag' (cayenne): `acceleration.params.cayenne_file_path` is not supported yet with `runtime.params.cayenne_vnext` enabled. Remove `cayenne_file_path` from the dataset, or set `runtime.params.cayenne_vnext: disabled`. See: https://spiceai.org/docs/components/data-accelerators/cayenne" }
+    eventually: 60s
+  - assert-status: { dataset: before_flag, status: Error, message-contains: "Failed to load dataset 'before_flag' (cayenne): `acceleration.params.cayenne_file_path` is not supported yet with `runtime.params.cayenne_vnext` enabled." }
+    eventually: 60s
+  - assert-files: { lacks: ['elsewhere'] }
