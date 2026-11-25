@@ -291,6 +291,27 @@ class ToolBuildsStoreUnderThePrefixTest(unittest.TestCase):
                     self.assertIn("spice-minio/artifacts/${CI_STORE_PREFIX}", line)
 
 
+class MssqlBenchImageTest(unittest.TestCase):
+    """The spice-mssql-bench image this branch's benchmark legs run as a service."""
+
+    def test_every_job_that_runs_it_pins_its_digest_and_only_trunk_publishes_it(self):
+        pinned = re.compile(r"'ghcr\.io/spiceai/spice-mssql-bench@sha256:[0-9a-f]{64}'")
+        users = 0
+        for workflow in sorted((GITHUB_DIR / "workflows").glob("*.yml")):
+            text = workflow.read_text()
+            if workflow.name == "spice_mssql_tpch_bench_docker.yml" or "spice-mssql-bench" not in text:
+                continue
+            users += 1
+            for line in text.splitlines():
+                if "spice-mssql-bench" in line and "image:" in line:
+                    self.assertRegex(line, pinned)
+        self.assertEqual(users, 2)
+        build = yaml.safe_load((GITHUB_DIR / "workflows" / "spice_mssql_tpch_bench_docker.yml").read_text())
+        first = build["jobs"]["build"]["steps"][0]
+        self.assertEqual(first["name"], "Refuse a run off trunk")
+        self.assertIn('[ "$GITHUB_REF" != refs/heads/trunk ]', first["run"])
+
+
 class SetupSpicedTest(StoreTest):
     def test_trunks_latest_build_is_read_at_trunks_keys(self):
         for github_ref in (PULL_REQUEST, RELEASE, "refs/heads/trunk"):

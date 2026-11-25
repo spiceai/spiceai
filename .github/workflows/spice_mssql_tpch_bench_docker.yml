@@ -9,6 +9,15 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+      # Benchmark jobs run this image as a service, pinned by digest, so only trunk's definition
+      # of it is published; this branch's copy never runs on trunk.
+      - name: Refuse a run off trunk
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/trunk ]; then
+            echo "::error::spice-mssql-bench is published only from trunk, not $GITHUB_REF."
+            exit 1
+          fi
+
       - name: Check disk space
         run: df . -h
 

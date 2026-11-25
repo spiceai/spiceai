@@ -38,7 +38,8 @@ jobs:
     timeout-minutes: 600
     services:
       mssql_tpch:
-        image: ${{ contains(github.event.inputs.spicepod_path, 'mssql') && 'ghcr.io/spiceai/spice-mssql-bench:latest' || '' }}
+        # Pinned by digest: trunk's spice_mssql_tpch_bench_docker.yml publishes it.
+        image: ${{ contains(github.event.inputs.spicepod_path, 'mssql') && 'ghcr.io/spiceai/spice-mssql-bench@sha256:d324b103e29ef6abb62f062ca82457af5db97624c7a1b2cd21b738c8e0afbb22' || '' }}
         ports:
           - 1433:1433
         env:
