@@ -157,35 +157,50 @@ pub(crate) async fn create_physical_plan(
     let Some(lookup) = point_lookup else {
         return session.create_physical_plan(plan).await;
     };
-    let Some(optimized) = optimize_lean(session, plan, lookup)? else {
-        return session.create_physical_plan(plan).await;
-    };
     let planner = Arc::clone(session.query_planner());
-    PLANNING_POINT_LOOKUP
-        .scope(lookup, planner.create_physical_plan(&optimized, session))
-        .await
+    match optimize_lean(session, plan, lookup)? {
+        Optimized::Lookup(optimized) => {
+            PLANNING_POINT_LOOKUP
+                .scope(lookup, planner.create_physical_plan(&optimized, session))
+                .await
+        }
+        Optimized::Full(optimized) => planner.create_physical_plan(&optimized, session).await,
+    }
+}
+
+/// A logical plan [`optimize_lean`] produced, and how it must be planned physically.
+#[derive(Debug)]
+pub(crate) enum Optimized {
+    /// Still a point lookup: planned with the physical rules in [`SKIPPABLE_RULES`] skipped.
+    Lookup(LogicalPlan),
+    /// Taken out of the lookup shape by analysis, and optimized with every rule: planned in full.
+    Full(LogicalPlan),
 }
 
 /// Optimizes a point lookup's logical plan with one pass and its [`SKIPPABLE_RULES`] skipped, then
 /// with full optimization when that pass leaves work another pass would do.
 ///
-/// Returns `None` when analysis takes the plan out of the lookup shape, and the plan must be
-/// planned in full. [`is_point_lookup`] sees the plan before the analyzer runs, and an analyzer
-/// rule may rewrite it into something the skipped rules do act on: on a cluster,
-/// `PartitionedTableScanRewrite` turns the scan into the union of its partitions, which with one
-/// executor is a union of one input that only `optimize_unions` removes.
+/// [`is_point_lookup`] sees the plan before the analyzer runs, and an analyzer rule may rewrite it
+/// into something the skipped rules do act on: on a cluster, `PartitionedTableScanRewrite` turns
+/// the scan into the union of its partitions, which with one executor is a union of one input that
+/// only `optimize_unions` removes. Such a plan is optimized from its analysis with every rule
+/// ([`Optimized::Full`]). The analyzer rules a lookup skips act only on aggregates and DDL, which
+/// neither a lookup nor that rewrite contains, so the plan is the one full planning produces.
 pub(crate) fn optimize_lean(
     session: &mut SessionState,
     plan: &LogicalPlan,
     lookup: PointLookup,
-) -> Result<Option<LogicalPlan>> {
+) -> Result<Optimized> {
     let analyzed = OPTIMIZING_POINT_LOOKUP.sync_scope(lookup, || {
         session
             .analyzer()
             .execute_and_check(plan.clone(), session.config_options(), |_, _| {})
     })?;
     if !is_lookup_shaped(&analyzed) {
-        return Ok(None);
+        return session
+            .optimizer()
+            .optimize(analyzed, &*session, |_, _| {})
+            .map(Optimized::Full);
     }
     let max_passes = session.config().options().optimizer.max_passes;
     session.config_mut().options_mut().optimizer.max_passes = 1;
@@ -195,9 +210,9 @@ pub(crate) fn optimize_lean(
     session.config_mut().options_mut().optimizer.max_passes = max_passes;
     let optimized = optimized?;
     if has_constant_predicate(&optimized) || limit_can_reach_scan(&optimized) {
-        return session.optimize(&optimized).map(Some);
+        return session.optimize(&optimized).map(Optimized::Lookup);
     }
-    Ok(Some(optimized))
+    Ok(Optimized::Lookup(optimized))
 }
 
 /// Whether the analyzed `plan` still has only the nodes a point lookup is made of — limits,
@@ -316,7 +331,13 @@ pub(crate) fn is_point_lookup(plan: &LogicalPlan) -> Option<PointLookup> {
                 node = limit.input.as_ref();
             }
             LogicalPlan::Projection(projection) => {
-                if !projection.expr.iter().all(is_plain_column_or_constant) {
+                // A predicate above the projection pins the scan's column only if the
+                // projection passes that column through under its own name.
+                if !projection.expr.iter().all(is_plain_column_or_constant)
+                    || !predicates
+                        .iter()
+                        .all(|predicate| passes_through(projection, predicate))
+                {
                     return None;
                 }
                 node = projection.input.as_ref();
@@ -846,8 +867,8 @@ mod tests {
     use datafusion::prelude::SessionContext;
 
     use super::{
-        MAX_BOUNDED_LOOKUP_KEYS, create_physical_plan, is_bounded_key_lookup, is_point_lookup,
-        optimize_lean, wrap_skippable_rules,
+        MAX_BOUNDED_LOOKUP_KEYS, Optimized, create_physical_plan, is_bounded_key_lookup,
+        is_point_lookup, optimize_lean, wrap_skippable_rules,
     };
 
     /// A view hidden behind a provider that plans it inside its own scan, as a provider that wraps
@@ -1020,6 +1041,9 @@ mod tests {
             "SELECT 1 AS present FROM split WHERE name = 'n5' LIMIT 1",
             // The limit below the projection, as an optimized plan carries it.
             "SELECT 1 AS present FROM (SELECT * FROM keyed WHERE id = 5 LIMIT 1) q",
+            // A subquery that passes the key through under its own name.
+            "SELECT * FROM (SELECT id, name FROM keyed) q WHERE id = 5",
+            "SELECT * FROM (SELECT k.id AS id, name FROM keyed k) q WHERE id = 5",
         ] {
             assert!(
                 is_point_lookup(&unoptimized(&ctx, sql).await).is_some(),
@@ -1052,6 +1076,11 @@ mod tests {
             "SELECT a.id FROM keyed a JOIN keyed b ON a.id = b.id WHERE a.id = 5",
             "SELECT DISTINCT id FROM keyed WHERE id = 5",
             "SELECT * FROM keyed",
+            // An outer `id` that is another column renamed, or a constant, pins no column of
+            // the table, though the table has a column of that name.
+            "SELECT * FROM (SELECT region AS id, name FROM keyed) q WHERE id = 1",
+            "SELECT * FROM (SELECT 5 AS id, name FROM keyed) q WHERE id = 5",
+            "SELECT * FROM (SELECT region AS id FROM unkeyed) q WHERE id = 1",
         ] {
             assert!(
                 is_point_lookup(&unoptimized(&ctx, sql).await).is_none(),
@@ -1156,6 +1185,7 @@ mod tests {
             "SELECT * FROM split WHERE region = 1",
             "SELECT 1 AS present FROM (SELECT * FROM split WHERE name = 'n5' LIMIT 1) q",
             "SELECT 1 AS present FROM (SELECT * FROM keyed WHERE id = 5 LIMIT 1) q",
+            "SELECT * FROM (SELECT id, name FROM keyed) q WHERE id = 5",
             // A large unkeyed scan, which full planning repartitions for parallelism.
             "SELECT * FROM big WHERE region = 1 LIMIT 100000",
             "SELECT * FROM big WHERE region = 1",
@@ -1279,9 +1309,11 @@ mod tests {
                 let lookup = is_point_lookup(&plan);
                 // Recognised before analysis, and planned in full after it.
                 assert!(
-                    optimize_lean(&mut ctx.state(), &plan, lookup.expect("a point lookup"))
-                        .expect("analyzed")
-                        .is_none(),
+                    matches!(
+                        optimize_lean(&mut ctx.state(), &plan, lookup.expect("a point lookup"))
+                            .expect("analyzed"),
+                        Optimized::Full(_)
+                    ),
                     "{sql} over {regions:?}"
                 );
                 let full = ctx
@@ -1382,9 +1414,11 @@ mod tests {
             let plan = unoptimized(&ctx, sql).await;
             let lookup = is_point_lookup(&plan).expect("a point lookup");
             let full = ctx.state().optimize(&plan).expect("full");
-            let lean = optimize_lean(&mut ctx.state(), &plan, lookup)
-                .expect("lean")
-                .expect("a lookup after analysis");
+            let Optimized::Lookup(lean) =
+                optimize_lean(&mut ctx.state(), &plan, lookup).expect("lean")
+            else {
+                panic!("{sql} is still a lookup after analysis");
+            };
             assert_eq!(
                 full.display_indent().to_string(),
                 lean.display_indent().to_string(),
