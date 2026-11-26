@@ -72,7 +72,8 @@ impl Dialect for MsSqlDialect {
     }
 }
 
-/// Quotes `name` as a T-SQL identifier. The connection sets `QUOTED_IDENTIFIER ON`.
+/// Quotes `name` as a T-SQL identifier. tiberius logs in as an ODBC client, so SQL Server sets
+/// `QUOTED_IDENTIFIER ON`.
 pub(crate) fn quote_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
