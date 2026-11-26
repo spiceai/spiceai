@@ -1759,7 +1759,27 @@
     },
     {
       "run": "postgres-write-back-outage",
+      "who": "object-native",
+      "key": "query: SELECT count(*), sum(balance) FROM accounts #2",
+      "kind": "wrong-answer",
+      "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "pattern": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
       "who": "as-written",
+      "key": "query: SELECT * FROM accounts #2",
+      "kind": "wrong-answer",
+      "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "pattern": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
+      "who": "object-native",
       "key": "query: SELECT * FROM accounts #2",
       "kind": "wrong-answer",
       "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
@@ -1779,7 +1799,27 @@
     },
     {
       "run": "postgres-write-back-outage",
+      "who": "object-native",
+      "key": "query: SELECT * FROM accounts #3",
+      "kind": "wrong-answer",
+      "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "pattern": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
       "who": "as-written",
+      "key": "query: SELECT count(*), sum(balance) FROM accounts #3",
+      "kind": "wrong-answer",
+      "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "pattern": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
+      "who": "object-native",
       "key": "query: SELECT count(*), sum(balance) FROM accounts #3",
       "kind": "wrong-answer",
       "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
@@ -1802,7 +1842,8 @@
       "who": "object-native",
       "key": "query: SELECT * FROM accounts #4",
       "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"owner\", row_number: 47, expected: \"\\\"through spice\\\"\", actual: \"\\\"at the source\\\"\" }",
+      "signature": "((RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)|DataMismatch \\{ column: \"owner\", row_number: 47, expected: .*through spice.*, actual: .*at the source)",
+      "pattern": "((RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)|DataMismatch \\{ column: \"owner\", row_number: 47, expected: .*through spice.*, actual: .*at the source)",
       "group": "write-back",
       "may-pass": true
     },
