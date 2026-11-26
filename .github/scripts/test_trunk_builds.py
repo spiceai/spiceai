@@ -57,7 +57,7 @@ class SpicedDockerDevTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def provenance(self, github_ref, commit):
+    def provenance(self, github_ref, commit, tag="my-feature"):
         checkout = Path(tempfile.mkdtemp(dir=self.root))
         git(checkout, "clone", "-q", str(self.bare), ".")
         git(checkout, "checkout", "-q", commit)
@@ -71,6 +71,7 @@ class SpicedDockerDevTest(unittest.TestCase):
             "GITHUB_REF": github_ref,
             "GITHUB_REF_TYPE": "branch",
             "GITHUB_REF_NAME": github_ref.removeprefix("refs/heads/"),
+            "INPUT_TAG": tag,
         }
         proc = subprocess.run(["bash", "-e", str(checkout / "step.sh")], cwd=checkout, env=env,
                               capture_output=True, text=True, timeout=60)
@@ -83,6 +84,33 @@ class SpicedDockerDevTest(unittest.TestCase):
         proc, output = self.provenance("refs/heads/trunk", self.trunk)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("on_trunk=true", output)
+
+    def test_only_a_trunk_run_publishes_a_trunk_tag_and_only_for_its_commit(self):
+        proc, _ = self.provenance("refs/heads/trunk", self.trunk, tag=f"trunk-{self.trunk[:12]}")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        for github_ref, commit, tag in (
+            ("refs/heads/trunk", self.trunk, "trunk-0123456789ab"),
+            ("refs/heads/feature", self.feature, f"trunk-{self.feature[:12]}"),
+            ("refs/heads/feature", self.feature, f"trunk-{self.trunk[:12]}"),
+        ):
+            with self.subTest(github_ref=github_ref, tag=tag):
+                proc, _ = self.provenance(github_ref, commit, tag=tag)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("Only a run on trunk publishes a trunk- tag", proc.stdout)
+        proc, _ = self.provenance("refs/heads/feature", self.feature, tag="dev-feature")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_a_trunk_runs_image_is_attested_after_it_is_pushed(self):
+        workflow = yaml.safe_load((WORKFLOWS / "spiced_docker_dev.yml").read_text())
+        job = workflow["jobs"]["publish"]
+        self.assertEqual(job["permissions"]["attestations"], "write")
+        names = [s.get("name") for s in job["steps"]]
+        attest = job["steps"][names.index("Attest the image")]
+        self.assertEqual(attest["if"], "github.ref == 'refs/heads/trunk'")
+        self.assertRegex(attest["uses"], r"^actions/attest-build-provenance@[0-9a-f]{40}$")
+        self.assertEqual(attest["with"]["subject-digest"], "${{ steps.push.outputs.digest }}")
+        self.assertIs(attest["with"]["push-to-registry"], True)
+        self.assertLess(names.index("Import images and create manifest"), names.index("Attest the image"))
 
     def test_another_refs_run_builds_its_commit(self):
         proc, output = self.provenance("refs/heads/feature", self.feature)
@@ -113,6 +141,47 @@ class SpicedDockerDevTest(unittest.TestCase):
 
 
 class ClusterImageTest(unittest.TestCase):
+    def test_a_trunk_runs_cluster_app_runs_only_an_attested_trunk_image(self):
+        steps = job_steps("testoperator_run_cluster_bench_aws.yml", "run-cluster-bench")
+        names = [s.get("name") or "" for s in steps]
+        resolve = steps[names.index("Resolve the cluster app image")]
+        verify = steps[names.index("Verify the cluster app image's attestation")]
+        run = next(i for i, n in enumerate(names) if n.startswith("Run the cluster benchmark"))
+        self.assertLess(names.index("Verify the cluster app image's attestation"), run)
+        self.assertIn("github.ref == 'refs/heads/trunk'", resolve["if"])
+        self.assertTrue(verify["if"].startswith("github.ref == 'refs/heads/trunk'"))
+        self.assertEqual(verify["uses"], "$/.github/actions/verify-attestation")
+        self.assertEqual(verify["with"]["image"], "${{ steps.app-image.outputs.image }}")
+        self.assertEqual(verify["with"]["signer-workflow"], ".github/workflows/spiced_docker_dev.yml")
+
+    def test_a_trunk_dispatch_takes_only_a_trunk_commit(self):
+        steps = job_steps("testoperator_dispatch_cluster.yml", "resolve-image")
+        script = next(s for s in steps if s.get("id") == "resolve")["run"]
+        fake_gh = '#!/usr/bin/env bash\necho "$COMPARE_STATUS"\n'
+        fake_docker = "#!/usr/bin/env bash\nexit 1\n"
+        for github_ref, status, ok in (("refs/heads/trunk", "behind", True), ("refs/heads/trunk", "identical", True),
+                                       ("refs/heads/trunk", "diverged", False), ("refs/heads/trunk", "ahead", False),
+                                       ("refs/heads/feature", "ahead", True)):
+            with self.subTest(github_ref=github_ref, status=status), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                git(work, "init", "-q", "-b", "trunk")
+                git(work, "config", "user.email", "ci@example.invalid")
+                git(work, "config", "user.name", "ci")
+                (work / "f").write_text("x")
+                git(work, "add", "f")
+                git(work, "commit", "-qm", "x")
+                (work / "bin").mkdir()
+                for name, text in (("gh", fake_gh), ("docker", fake_docker)):
+                    (work / "bin" / name).write_text(text)
+                    (work / "bin" / name).chmod(0o755)
+                output = work / "out"
+                output.write_text("")
+                proc = subprocess.run(["bash", "-e", "-c", script], cwd=work, capture_output=True, text=True, env={
+                    "PATH": f"{work / 'bin'}{os.pathsep}{os.environ['PATH']}", "GITHUB_REF": github_ref,
+                    "GITHUB_REPOSITORY": "owner/repo", "GITHUB_OUTPUT": str(output), "COMPARE_STATUS": status,
+                    "FORCE_REBUILD": "false", "CUSTOM_IMAGE_TAG": "", "INPUT_SPICED_REF": "trunk"})
+                self.assertEqual(proc.returncode == 0, ok, proc.stdout + proc.stderr)
+
     def test_only_a_trunk_run_names_a_trunk_image(self):
         steps = job_steps("testoperator_dispatch_cluster.yml", "resolve-image")
         run = next(s for s in steps if s.get("id") == "resolve")["run"]

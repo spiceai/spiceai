@@ -608,6 +608,18 @@ class CheckCiRoleJobsTest(unittest.TestCase):
                 f"        uses: {check_workflow_yaml.VERIFY_ACTION}\n"
             )
             self.assertEqual(self.problems(steps + verify), [])
+        with self.subTest(case="verify gated on a trunk run and a step output"):
+            verify = (
+                "      - name: Verify\n        if: github.ref == 'refs/heads/trunk' && steps.x.outputs.image != ''\n"
+                f"        uses: {check_workflow_yaml.VERIFY_ACTION}\n"
+            )
+            self.assertEqual(self.problems(steps + verify), [])
+        with self.subTest(case="verify gated on a trunk run and the environment"):
+            verify = (
+                "      - name: Verify\n        if: github.ref == 'refs/heads/trunk' && env.IMAGE != ''\n"
+                f"        uses: {check_workflow_yaml.VERIFY_ACTION}\n"
+            )
+            self.assertIn("on no `env` value", self.problems(steps + verify)[0])
 
     def test_an_image_input_goes_to_images_not_builds(self):
         document = REUSABLE_CI_ROLE.replace(

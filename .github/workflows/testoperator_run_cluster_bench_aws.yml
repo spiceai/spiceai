@@ -343,6 +343,37 @@ jobs:
           output-env-credentials: false
           output-credentials: true
 
+      # On trunk the app runs only an image spiced_docker_dev built and attested on trunk: the tag
+      # is resolved to its digest here and that digest's attestation checked. A release channel or
+      # EC2 release image is published by the release process, not this check.
+      - name: Resolve the cluster app image
+        id: app-image
+        if: env.CB_CUSTOM_IMAGE_TAG != '' && github.ref == 'refs/heads/trunk'
+        env:
+          IMAGE_TAG: ${{ env.CB_CUSTOM_IMAGE_TAG }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${IMAGE_TAG}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::custom_image_tag '${IMAGE_TAG}' is not an image tag."
+            exit 1
+          fi
+          token="$(curl -fsSL "https://ghcr.io/token?scope=repository:spiceai/spiceai-dev:pull" | jq -r .token)"
+          digest="$(curl -fsSI -H "Authorization: Bearer ${token}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/spiceai/spiceai-dev/manifests/${IMAGE_TAG}" | tr -d '\r' | awk -F': ' 'tolower($1) == "docker-content-digest" { print $2 }')"
+          if ! [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not read the digest of ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}."
+            exit 1
+          fi
+          echo "image=ghcr.io/spiceai/spiceai-dev@${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the cluster app image's attestation
+        if: github.ref == 'refs/heads/trunk' && steps.app-image.outputs.image != ''
+        uses: $/.github/actions/verify-attestation
+        with:
+          image: ${{ steps.app-image.outputs.image }}
+          signer-workflow: .github/workflows/spiced_docker_dev.yml
+
       # spidapter hands the spicepod's store credentials to a Spice Cloud app that runs whatever
       # image the run names, so the app gets only credentials that read the benchmark data: a
       # second exchange whose session policy (.github/store-policies/benchmark-data-read-only.json)

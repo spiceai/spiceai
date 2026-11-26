@@ -47,10 +47,12 @@ class VerifyAttestationTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertTrue(self.calls.read_text().rstrip("\n").endswith("--source-ref refs/heads/trunk --source-digest 0123abc"))
 
-    def verify(self, file=None, gh_exit=0, source_commit="", signer=".github/workflows/build_release.yml", release="false"):
+    def verify(self, file=None, gh_exit=0, source_commit="", signer=".github/workflows/build_release.yml", release="false",
+               image=""):
         env = {
             "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
-            "FILE": str(file or self.file),
+            "FILE": "" if image and file is None else str(file or self.file),
+            "IMAGE": image,
             "SIGNER_WORKFLOW": signer,
             "RELEASE": release,
             "GITHUB_REPOSITORY": "spiceai/spiceai",
@@ -82,6 +84,25 @@ class VerifyAttestationTest(unittest.TestCase):
         proc = self.verify(signer="", release="true", gh_exit=1)
         self.assertEqual(proc.returncode, 1)
         self.assertIn("has no build attestation from build_release.yml on a release branch", proc.stdout)
+
+    def test_an_image_is_verified_by_digest(self):
+        digest = "sha256:" + "a" * 64
+        proc = self.verify(image=f"ghcr.io/spiceai/spiceai-dev@{digest}", signer=".github/workflows/spiced_docker_dev.yml")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(
+            self.calls.read_text(),
+            f"attestation verify oci://ghcr.io/spiceai/spiceai-dev@{digest} --repo spiceai/spiceai --signer-workflow "
+            "spiceai/spiceai/.github/workflows/spiced_docker_dev.yml --source-ref refs/heads/trunk\n",
+        )
+        for image in ("ghcr.io/spiceai/spiceai-dev:trunk-0123456789ab", "ghcr.io/spiceai/spiceai-dev@sha256:abc",
+                      f"ghcr.io/spiceai/spiceai-dev@{digest} --repo x"):
+            with self.subTest(image=image):
+                proc = self.verify(image=image, signer=".github/workflows/spiced_docker_dev.yml")
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("is not a registry/name@sha256:<digest> reference", proc.stdout)
+        proc = self.verify(file=self.file, image=f"ghcr.io/spiceai/spiceai-dev@{digest}")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("give file or image, not both", proc.stdout)
 
     def test_one_signer_rule_is_required(self):
         for signer, release, message in (("", "false", "signer-workflow is required"),

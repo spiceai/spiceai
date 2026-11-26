@@ -366,12 +366,16 @@ def check_ci_role_jobs(document: dict) -> list[str]:
                 )
             condition = str(step.get("if", "")).strip()
             if step.get("uses") == VERIFY_ACTION and step.get("if") is not None and (
-                not re.match(r"(?:\$\{\{\s*)?steps\.ci-role\.outputs\.full\s*==\s*'true'\s*(?:&&|\}\}|$)", condition)
+                not re.match(
+                    r"(?:\$\{\{\s*)?(?:steps\.ci-role\.outputs\.full\s*==\s*'true'|github\.ref\s*==\s*'refs/heads/trunk')\s*(?:&&|\}\}|$)",
+                    condition,
+                )
                 or re.search(r"(?<![\w.-])env\s*[.\[]", condition)
             ):
                 problems.append(
                     f"job `{name}` step `{label}` verifies only `if: {step.get('if')}`; gate it on "
-                    "`steps.ci-role.outputs.full == 'true'` first and on no `env` value, which an earlier step can change"
+                    "`steps.ci-role.outputs.full == 'true'` or `github.ref == 'refs/heads/trunk'` first and on no "
+                    "`env` value, which an earlier step can change"
                 )
             if "aws-actions/configure-aws-credentials" in str(step.get("uses", "")):
                 role = str((step.get("with") or {}).get("role-to-assume", ""))

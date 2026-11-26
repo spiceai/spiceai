@@ -125,6 +125,8 @@ jobs:
 
       - name: Determine build provenance
         id: provenance
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           # Raw commit actually built (HEAD = `inputs.ref || github.sha`).
           revision="$(git rev-parse HEAD)"
@@ -147,6 +149,16 @@ jobs:
             echo "::error::This run is on trunk, so it builds only a commit on trunk, and ${revision} is not one (within trunk's last 100 commits). Dispatch spiced_docker_dev on the branch that has it."
             exit 1
           fi
+          # A `trunk-` tag names trunk's image of one commit: only a trunk run publishes one, as
+          # `trunk-<the first 12 characters of the commit it built>`.
+          case "$INPUT_TAG" in
+            trunk-*)
+              if [ "$GITHUB_REF" != refs/heads/trunk ] || [ "$INPUT_TAG" != "trunk-${revision:0:12}" ]; then
+                echo "::error::Only a run on trunk publishes a trunk- tag, and only as trunk-${revision:0:12} for this commit, not ${INPUT_TAG}."
+                exit 1
+              fi
+              ;;
+          esac
 
       - name: Set target architectures
         id: set_targets
@@ -389,6 +401,7 @@ jobs:
       contents: read
       packages: write
       id-token: write
+      attestations: write  # trunk's images, which the cluster benchmark verifies before running one
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -430,6 +443,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Import images and create manifest
+        id: push
         env:
           IMAGE_TAG: ${{ inputs.tag }}
           REL_VERSION: ${{ needs.setup.outputs.rel_version }}
@@ -468,6 +482,22 @@ jobs:
 
           echo "Verifying image:"
           docker buildx imagetools inspect ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}
+          digest="$(docker buildx imagetools inspect "ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}" --format '{{json .Manifest}}' | jq -r .digest)"
+          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not read the digest of ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}."
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      # A trunk run's image carries this workflow's attestation, which the cluster benchmark
+      # verifies on trunk before the app runs it.
+      - name: Attest the image
+        if: github.ref == 'refs/heads/trunk'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/spiceai/spiceai-dev
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
 
       - name: Summary
         env:

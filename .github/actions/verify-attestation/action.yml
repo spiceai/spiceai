@@ -11,8 +11,13 @@ description: >-
 
 inputs:
   file:
-    description: The downloaded file.
-    required: true
+    description: The downloaded file. Give this or `image`.
+    required: false
+    default: ''
+  image:
+    description: A container image by digest (`registry/name@sha256:<digest>`). Give this or `file`.
+    required: false
+    default: ''
   signer-workflow:
     description: The workflow that builds and attests it on trunk, e.g. `.github/workflows/build_release.yml`. Not used with `release`.
     required: false
@@ -37,13 +42,26 @@ runs:
       shell: bash
       env:
         FILE: ${{ inputs.file }}
+        IMAGE: ${{ inputs.image }}
         SIGNER_WORKFLOW: ${{ inputs.signer-workflow }}
         RELEASE: ${{ inputs.release }}
         SOURCE_COMMIT: ${{ inputs.source-commit }}
         GH_TOKEN: ${{ inputs.token }}
       run: |
         set -euo pipefail
-        if [ ! -f "$FILE" ]; then
+        IMAGE="${IMAGE:-}"
+        if [ -n "$IMAGE" ]; then
+          if [ -n "$FILE" ]; then
+            echo "::error::verify-attestation: give file or image, not both."
+            exit 1
+          fi
+          # By digest only: a tag can move after the check.
+          if ! [[ "$IMAGE" =~ ^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::verify-attestation: image '$IMAGE' is not a registry/name@sha256:<digest> reference."
+            exit 1
+          fi
+          FILE="oci://$IMAGE"
+        elif [ ! -f "$FILE" ]; then
           echo "::error::$FILE does not exist, so its attestation cannot be verified."
           exit 1
         fi
@@ -51,7 +69,7 @@ runs:
           echo "::error::The GitHub CLI (gh) is not installed on this runner, so $FILE's attestation cannot be verified; not running it."
           exit 1
         fi
-        if [ "$RELEASE" = true ]; then
+        if [ "${RELEASE:-false}" = true ]; then
           if [ -n "$SIGNER_WORKFLOW" ]; then
             echo "::error::verify-attestation: give signer-workflow or release, not both."
             exit 1
