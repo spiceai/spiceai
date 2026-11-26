@@ -20,7 +20,7 @@ runs:
         docker run -d --name scylladb \
           -p 9042:9042 \
           -e SCYLLA_DEVELOPER_MODE=1 \
-          scylladb/scylla:2026.1.2 --smp 4 # limit shards to speed up provisioning and to avoid starving spiced/testoperator
+          scylladb/scylla:2026.1.2@sha256:27321d736c5bb3db18612862b6425f4782c09a63ba5ea8b24bbd250835c101c7 --smp 4 # limit shards to speed up provisioning and to avoid starving spiced/testoperator
 
     - name: Wait for ScyllaDB
       shell: bash

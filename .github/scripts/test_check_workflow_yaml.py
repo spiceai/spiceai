@@ -1,8 +1,11 @@
 """Unit tests for check_workflow_yaml.py."""
+import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -1751,6 +1754,141 @@ runs:
         self.assertEqual(
             [f for f in check_workflow_yaml.check_definitions(github_dir) if "download as code" in f], []
         )
+
+
+PINNED = "@sha256:" + "a" * 64
+
+
+def _workflow_with_job(job_body: str, workflow_env: str = "") -> str:
+    return (
+        "on: workflow_dispatch\n" + workflow_env + "jobs:\n  test:\n    runs-on: ubuntu-24.04\n"
+        + textwrap.indent(textwrap.dedent(job_body), "    ")
+    )
+
+
+def _workflow_running(script: str, step_env: str = "") -> str:
+    step = "steps:\n  - name: Start it\n" + textwrap.indent(step_env, "    ") + "    run: |\n"
+    return _workflow_with_job(step + textwrap.indent(textwrap.dedent(script), "      "))
+
+
+def _image_problems(text: str) -> list[str]:
+    return check_workflow_yaml.check_workflow(text)
+
+
+def _workflow_with_service_image(image: str) -> str:
+    job = {"runs-on": "ubuntu-24.04", "services": {"db": {"image": image}}, "steps": [{"run": "true"}]}
+    return yaml.safe_dump({"on": "workflow_dispatch", "jobs": {"test": job}})
+
+
+class CheckContainerImagesTest(unittest.TestCase):
+    def test_a_service_image_by_tag_is_reported(self):
+        problems = _image_problems(_workflow_with_job("services:\n  db:\n    image: postgres:16\nsteps:\n  - run: true\n"))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("service `db` runs `postgres:16`, which is not pinned by digest", problems[0])
+
+    def test_a_service_image_pinned_by_digest_passes(self):
+        for image in (f"postgres:16{PINNED}", f"ghcr.io/spiceai/x{PINNED}", ""):
+            with self.subTest(image=image):
+                self.assertEqual(_image_problems(_workflow_with_service_image(image)), [])
+
+    def test_a_service_image_chosen_by_an_expression_is_read_through_its_literals(self):
+        cases = {
+            "${{ inputs.x && 'postgres:16' || '' }}": "`postgres:16`, which is not pinned",
+            f"${{{{ inputs.x && 'postgres:16{PINNED}' || '' }}}}": None,
+            "${{ inputs.x && format('postgres:{0}', inputs.v) || '' }}": "builds its image name with format()",
+            "${{ matrix.image }}": "names its image only through an expression",
+            f"${{{{ inputs.x && fromJSON('{{\"16\": \"postgres:16{PINNED}\"}}')[inputs.v || '16'] || '' }}}}": None,
+            f"${{{{ fromJSON('{{\"16\": \"postgres:16{PINNED}\", \"17\": \"postgres:17\"}}')[inputs.v] }}}}": "`postgres:17`, which is not pinned",
+        }
+        for image, expected in cases.items():
+            with self.subTest(image=image):
+                problems = _image_problems(_workflow_with_service_image(image))
+                if expected is None:
+                    self.assertEqual(problems, [])
+                else:
+                    self.assertEqual(len(problems), 1, problems)
+                    self.assertIn(expected, problems[0])
+
+    def test_a_job_container_and_a_docker_step_are_read(self):
+        problems = _image_problems(_workflow_with_job("container: node:20\nsteps:\n  - uses: docker://alpine:3.20\n"))
+        self.assertEqual(len(problems), 2, problems)
+        self.assertIn("container runs `node:20`", problems[0])
+        self.assertIn("step `step 1` runs `alpine:3.20`", problems[1])
+        text = _workflow_with_job(f"container:\n  image: node:20{PINNED}\nsteps:\n  - uses: docker://alpine:3.20{PINNED}\n")
+        self.assertEqual(_image_problems(text), [])
+
+    def test_the_image_of_docker_run_create_and_pull_is_read_past_their_options(self):
+        scripts = [
+            "docker run -d --name db -p 5432:5432 -e A=B --user 0:0 --shm-size=4g postgres:16 -c x=1",
+            "docker run -dit --rm -v /a:/b postgres:16",
+            "sudo docker pull --platform linux/amd64 postgres:16",
+            "docker create --name db postgres:16",
+            "docker container run --rm postgres:16",
+            "docker image pull -q postgres:16",
+            "if ! docker run -d \\\n  --name db \\\n  -p 1:2 \\\n  postgres:16 --flag; then\n  exit 1\nfi",
+            "out=$(docker run --rm postgres:16 echo hi)",
+            "true && docker run postgres:16",
+        ]
+        for script in scripts:
+            with self.subTest(script=script):
+                problems = _image_problems(_workflow_running(script))
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn("runs `postgres:16`, which is not pinned by digest", problems[0])
+
+    def test_docker_commands_that_start_no_image_and_text_that_only_names_one_pass(self):
+        scripts = [
+            "docker ps -a\ndocker exec db pg_isready\ndocker logs db\ndocker rm -f db",
+            'echo "docker pull ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}" >> "$GITHUB_STEP_SUMMARY"',
+            "# docker run postgres:16\ntrue",
+            "docker run --rm localhost:5000/spiceai:dev-amd64 --version",
+            f"docker run -d --restart=always --name registry registry:2.8.3{PINNED}",
+        ]
+        for script in scripts:
+            with self.subTest(script=script):
+                self.assertEqual(_image_problems(_workflow_running(script)), [])
+
+    def test_an_image_in_a_variable_is_read_from_its_assignments_and_env(self):
+        pinned_case = f"case \"$STORE\" in\n  a) image=minio{PINNED} ;;\n  b) image=rustfs/rustfs:1.0.1{PINNED} ;;\nesac\ndocker run -d \"$image\" server"
+        self.assertEqual(_image_problems(_workflow_running(pinned_case)), [])
+        one_unpinned = pinned_case.replace(f"rustfs/rustfs:1.0.1{PINNED}", "rustfs/rustfs:1.0.1")
+        problems = _image_problems(_workflow_running(one_unpinned))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("`rustfs/rustfs:1.0.1`, which is not pinned", problems[0])
+        self.assertEqual(_image_problems(_workflow_running('docker run -d "${IMAGE}"', f"env:\n  IMAGE: mysql:8.4{PINNED}\n")), [])
+        problems = _image_problems(_workflow_running('docker run -d "${IMAGE}"', "env:\n  IMAGE: mysql:${{ inputs.version }}\n"))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("builds its image name around an expression", problems[0])
+        problems = _image_problems(_workflow_running('docker run -d "$IMAGE"'))
+        self.assertIn("the image in `$IMAGE`, which this check cannot resolve to a literal", problems[0])
+        problems = _image_problems(_workflow_running('docker pull "${image}:${VERSION}"'))
+        self.assertIn("built from shell variables", problems[0])
+
+    def test_a_composite_action_script_is_read(self):
+        action = "name: x\ndescription: x\nruns:\n  using: composite\n  steps:\n    - name: Start\n      shell: bash\n      run: docker run -d scylladb/scylla:2026.1.2 --smp 4\n"
+        problems = check_workflow_yaml.check_action(action)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("step `Start` runs `scylladb/scylla:2026.1.2`, which is not pinned by digest", problems[0])
+
+    def test_every_listed_source_version_has_a_pinned_image(self):
+        """The PostgreSQL and MySQL lines test/source_versions.json lists are the versions the
+        CH-benCH actions and the bench's postgres service accept, so each needs a pinned image."""
+        root = Path(__file__).resolve().parents[2]
+        listed = json.loads((root / "test/source_versions.json").read_text())
+        places = {
+            "postgres": [
+                root / ".github/actions/setup-chbench-postgres/action.yml",
+                root / ".github/workflows/testoperator_run_bench_aws.yml",
+            ],
+            "mysql": [root / ".github/actions/setup-chbench-mysql/action.yml"],
+        }
+        for source, paths in places.items():
+            for version in (entry["version"] for entry in listed[source]["versions"]):
+                for path in paths:
+                    with self.subTest(source=source, version=version, path=path.name):
+                        self.assertRegex(
+                            path.read_text(),
+                            rf"(?:{re.escape(version)}\) image=|\"{re.escape(version)}\":\"){source}:{re.escape(version)}@sha256:[0-9a-f]{{64}}",
+                        )
 
 
 class RepositoryTest(unittest.TestCase):

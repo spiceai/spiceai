@@ -54,13 +54,20 @@
 # `sh -c "$(curl …)"`, or given to PowerShell's `iex`, nor names the unpinned rustup
 # installers (sh.rustup.rs, win.rustup.rs). A download is kept as a file, checked against
 # a pinned SHA-256, and then run.
+#
+# And every container image a workflow or composite action starts is pinned by digest
+# (`name[:tag]@sha256:<digest>`): a job's `services:` and `container:`, a `uses: docker://`
+# step, and the image of a `docker run`, `docker create` or `docker pull` in a `run:` script
+# (see `check_container_images`).
 """Validate the repository's GitHub Actions workflow and composite action YAML."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -721,6 +728,7 @@ def check_workflow(text: str) -> list[str]:
         problems.extend(check_share_off_trunk(jobs))
         problems.extend(check_app_store_credentials(jobs))
         problems.extend(check_download_execution(jobs))
+        problems.extend(check_container_images(document))
 
     return problems
 
@@ -1311,6 +1319,270 @@ def check_cache_endpoint_isolation(jobs: dict) -> list[str]:
     return problems
 
 
+# Container images. A tag is a name the registry can point at other bytes at any time, so a
+# job that starts `postgres:16` runs whatever the registry serves under it that day, with
+# the job's credentials beside it. A digest names the bytes. The exception is an image the
+# job built itself and pushed to a registry on the runner (`localhost:5000/…`, the local
+# registry the image workflows start): its digest does not exist until the job builds it.
+#
+# What is read: `jobs.<job>.services.<name>.image`, `jobs.<job>.container` (or its `image`),
+# `uses: docker://…` steps, and in every `run:` script of a workflow or composite action, the
+# image argument of `docker run`, `docker create` and `docker pull` (also `docker container
+# run|create` and `docker image pull`, after `sudo`, `!`, `if`, `&&` and the like). An image
+# argument that is a shell variable (`"$image"`) is read from the literal assignments of that
+# variable in the same script (`image=…`, case arms included) and from the step's, job's and
+# workflow's `env:`; every value must be pinned. A `${{ }}` expression (in `image:` or in an
+# assigned value) is read through its string literals: each literal that looks like an image
+# (it has a `/`, `:` or `@`), and each string value of a `fromJSON('{…}')` literal, must be
+# pinned, and an expression that builds the name with `format()`, or names no image literal at
+# all, is reported, since its image cannot be checked.
+#
+# What it does not catch: an image a script under .github/scripts, a Makefile, a compose
+# file, a Helm chart or test code starts (including through .github/scripts/docker_pull.sh,
+# whose arguments are not read); `docker` run through a variable, function or alias; `docker
+# compose`, `docker build` base images and buildx driver images; an image named in an
+# expression without a `/`, `:` or `@` (`'redis'`); and options it does not know to take a
+# value, which can make it read the option's value as the image (and report it).
+DOCKER_IMAGE_COMMANDS = {("run",), ("create",), ("pull",), ("container", "run"), ("container", "create"), ("image", "pull")}
+# Options of `docker run`/`create`/`pull` that take no value; every other option does,
+# unless it is written `--name=value` or as a cluster of these short flags (`-dit`).
+DOCKER_FLAGS = frozenset(
+    "--rm -d --detach -i --interactive -t --tty --init --privileged -P --publish-all --read-only "
+    "--oom-kill-disable --no-healthcheck -q --quiet --disable-content-trust --help -a --all-tags "
+    "--use-api-socket".split()
+)
+DOCKER_SHORT_FLAGS = frozenset("ditPqa")
+# Docker's own options before the subcommand that take a value.
+DOCKER_GLOBAL_OPTIONS = frozenset({"--context", "-c", "--host", "-H", "--config", "--log-level", "-l"})
+COMMAND_SEPARATORS = frozenset({";", "&&", "||", "|", "&", "(", ")", "!", "{", "}", "then", "do", "else", "elif", "if", "while", "until", "time", "exec", "command", "nohup", "$"})
+PINNED_IMAGE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}")
+LOCAL_IMAGE = re.compile(r"(?:localhost|127\.0\.0\.1)(?::\d+)?/\S+")
+EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+EXPRESSION_LITERAL = re.compile(r"'((?:[^']|'')*)'")
+EXPR_PLACEHOLDER = "__GITHUB_EXPRESSION__"
+ASSIGNMENT_VALUE = r"""("[^"\n]*"|'[^'\n]*'|[^\s;&|)]*)"""
+
+
+def _image_problem(image: str) -> str | None:
+    """Why a literal image reference is not acceptable, or None when it is pinned or local."""
+    if not image or PINNED_IMAGE.fullmatch(image) or LOCAL_IMAGE.fullmatch(image):
+        return None
+    return (
+        f"`{image}`, which is not pinned by digest; pin it as `{image.split('@')[0]}@sha256:<digest>`, "
+        "with the digest of its multi-arch index as the registry serves it"
+    )
+
+
+def _looks_like_image(text: str) -> bool:
+    return bool(text) and not re.search(r"\s", text) and any(c in text for c in "/:@")
+
+
+def _json_strings(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for v in value.values() for s in _json_strings(v)]
+    if isinstance(value, list):
+        return [s for v in value for s in _json_strings(v)]
+    return []
+
+
+def _expression_image_problems(value: str) -> list[str]:
+    """The problems with an image named through `${{ }}`, read through its string literals."""
+    shown = f"`{value.strip()}`"
+    if EXPRESSION.sub("", value).strip():
+        return [
+            f"{shown}, which builds its image name around an expression this check cannot read; name each image "
+            "it can be as a digest-pinned literal"
+        ]
+    problems, images = [], 0
+    for expression in EXPRESSION.findall(value):
+        if re.search(r"\bformat\s*\(", expression):
+            problems.append(
+                f"{shown}, which builds its image name with format(), which this check cannot read; map each "
+                "allowed value to a digest-pinned literal (fromJSON('{...}')[...])"
+            )
+            continue
+        for literal in (m.replace("''", "'") for m in EXPRESSION_LITERAL.findall(expression)):
+            candidates = [literal]
+            if literal.lstrip().startswith(("{", "[")):
+                try:
+                    candidates = _json_strings(json.loads(literal))
+                except ValueError:
+                    pass
+            for candidate in candidates:
+                if _looks_like_image(candidate):
+                    images += 1
+                    problem = _image_problem(candidate)
+                    if problem:
+                        problems.append(problem)
+    if images == 0 and not problems:
+        problems.append(
+            f"{shown}, which names its image only through an expression this check cannot read; name each image "
+            "it can be as a digest-pinned literal"
+        )
+    return problems
+
+
+def _value_problems(value: str) -> list[str]:
+    """The problems with an image given as a YAML value or an assigned shell value."""
+    value = value.strip()
+    if "${{" in value:
+        return _expression_image_problems(value)
+    if "$" in value:
+        return [f"`{value}`, which is built from shell variables this check cannot read; assign the image a digest-pinned literal"]
+    problem = _image_problem(value)
+    return [problem] if problem else []
+
+
+def _logical_lines(script: str) -> list[str]:
+    """The script's lines, with comment lines dropped, continuations joined, and each `${{ }}`
+    replaced by one placeholder word so the shell tokenizer keeps it whole."""
+    script = COMMENT_LINE.sub("", script)
+    script = EXPRESSION.sub(EXPR_PLACEHOLDER, script)
+    return script.replace("\\\n", " ").splitlines()
+
+
+def _tokens(line: str) -> list[str]:
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|()")
+    lexer.whitespace_split = True
+    lexer.commenters = "#"
+    try:
+        return list(lexer)
+    except ValueError:
+        # An unbalanced quote, as in prose a heredoc carries: split on whitespace instead.
+        return [t.strip("'\"") for t in line.split()]
+
+
+def docker_images(script: object) -> list[str]:
+    """The image argument of each `docker run|create|pull` in a script, as written (after the
+    shell removes its quotes)."""
+    if not isinstance(script, str):
+        return []
+    images = []
+    for line in _logical_lines(script):
+        if "docker" not in line:
+            continue
+        tokens = _tokens(line)
+        for i, token in enumerate(tokens):
+            if token != "docker":
+                continue
+            # The command position: the line's start, after a separator or keyword, after
+            # `sudo` and its options, or after `NAME=value` prefixes.
+            j = i - 1
+            while j >= 0 and (re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[j]) or (tokens[j].startswith("-") and "sudo" in tokens[:j])):
+                j -= 1
+            if j >= 0 and tokens[j] not in COMMAND_SEPARATORS and tokens[j] != "sudo":
+                continue
+            k = i + 1
+            while k < len(tokens) and tokens[k].startswith("-"):
+                k += 2 if tokens[k] in DOCKER_GLOBAL_OPTIONS else 1
+            command = next(
+                (c for c in sorted(DOCKER_IMAGE_COMMANDS, key=len, reverse=True) if tuple(tokens[k : k + len(c)]) == c),
+                None,
+            )
+            if command is None:
+                continue
+            k += len(command)
+            while k < len(tokens):
+                option = tokens[k]
+                if option == "--":
+                    k += 1
+                    break
+                if not option.startswith("-") or option == "-":
+                    break
+                if "=" in option or option in DOCKER_FLAGS or (
+                    re.fullmatch(r"-[A-Za-z]+", option) and set(option[1:]) <= DOCKER_SHORT_FLAGS
+                ):
+                    k += 1
+                else:
+                    k += 2
+            if k < len(tokens) and tokens[k] not in COMMAND_SEPARATORS:
+                images.append(tokens[k])
+    return images
+
+
+def _assigned_values(script: str, name: str) -> list[str]:
+    """The values a script assigns to shell variable `name` literally: `name=value`, also in a
+    `case` arm, after `export`/`local`/`readonly`, or as a command prefix."""
+    script = COMMENT_LINE.sub("", script)
+    values = []
+    for match in re.finditer(rf"(?:^|[\s;&|(]){re.escape(name)}={ASSIGNMENT_VALUE}", script, re.M):
+        value = match.group(1)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        values.append(value)
+    return values
+
+
+def _script_image_problems(step: dict, envs: list[dict]) -> list[str]:
+    script = step.get("run")
+    problems = []
+    for image in docker_images(script):
+        variable = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", image)
+        if variable is None:
+            if EXPR_PLACEHOLDER in image:
+                problems.append(
+                    f"`{image.replace(EXPR_PLACEHOLDER, '${{ }}')}`, which names the image with an expression in the "
+                    "script; assign the image a digest-pinned literal"
+                )
+            else:
+                problems.extend(_value_problems(image))
+            continue
+        name = variable.group(1)
+        values = _assigned_values(script, name)
+        for env in [step.get("env"), *envs]:
+            if isinstance(env, dict) and name in env:
+                values.append(str(env[name]))
+        if not values:
+            problems.append(
+                f"the image in `${name}`, which this check cannot resolve to a literal; assign it a digest-pinned "
+                "image in the same script or the step's `env:`"
+            )
+        for value in values:
+            problems.extend(_value_problems(value))
+    return problems
+
+
+def _steps_image_problems(steps: object, where: str, envs: list[dict]) -> list[str]:
+    problems = []
+    if not isinstance(steps, list):
+        return problems
+    for position, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            continue
+        label = step.get("name") or f"step {position}"
+        uses = step.get("uses")
+        if isinstance(uses, str) and uses.startswith("docker://"):
+            problems.extend(f"{where}step `{label}` runs {p}" for p in _value_problems(uses[len("docker://") :]))
+        problems.extend(f"{where}step `{label}` runs {p}" for p in _script_image_problems(step, envs))
+    return problems
+
+
+def check_container_images(document: dict) -> list[str]:
+    """Report a container image a workflow starts by tag: in a job's `services:` or
+    `container:`, a `uses: docker://` step, or a `docker run|create|pull` in a script.
+    The module comment above `DOCKER_IMAGE_COMMANDS` says what is read and what is not."""
+    problems = []
+    workflow_env = document.get("env") if isinstance(document.get("env"), dict) else {}
+    jobs = document.get("jobs")
+    for job_name, job in (jobs.items() if isinstance(jobs, dict) else []):
+        if not isinstance(job, dict):
+            continue
+        services = job.get("services")
+        for service, spec in (services.items() if isinstance(services, dict) else []):
+            image = spec.get("image") if isinstance(spec, dict) else spec
+            if isinstance(image, str):
+                problems.extend(f"job `{job_name}` service `{service}` runs {p}" for p in _value_problems(image))
+        container = job.get("container")
+        image = container.get("image") if isinstance(container, dict) else container
+        if isinstance(image, str):
+            problems.extend(f"job `{job_name}` container runs {p}" for p in _value_problems(image))
+        job_env = job.get("env") if isinstance(job.get("env"), dict) else {}
+        problems.extend(_steps_image_problems(job.get("steps"), f"job `{job_name}` ", [job_env, workflow_env]))
+    return problems
+
+
 def check_action_descriptions(document: dict) -> list[str]:
     """Report a `${{` in an action's descriptions.
 
@@ -1351,6 +1623,7 @@ def check_action(text: str) -> list[str]:
         + check_action_expansions(document)
         + _step_download_executions(runs.get("steps") if isinstance(runs, dict) else None, "")
         + check_own_prefix_spiced_reads(runs.get("steps") if isinstance(runs, dict) else None, "")
+        + _steps_image_problems(runs.get("steps") if isinstance(runs, dict) else None, "", [])
     )
 
 

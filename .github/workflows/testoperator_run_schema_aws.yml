@@ -94,7 +94,7 @@ jobs:
       # the seed step below creates the schema only. Excludes the DuckLake
       # spicepods, which provision their own postgres catalog DB on the same port.
       postgres_tpch:
-        image: ${{ (contains(inputs.spicepod_path, 'postgres') && !contains(inputs.spicepod_path, 'ducklake')) && 'postgres:16' || '' }}
+        image: ${{ (contains(inputs.spicepod_path, 'postgres') && !contains(inputs.spicepod_path, 'ducklake')) && 'postgres:16@sha256:07abc3f43c9395b0bdbbab36bc25ddb0e8d83cd4fcafb5fb7d6abe14ff156dd8' || '' }}
         ports:
           - 5432:5432
         env:
@@ -216,7 +216,9 @@ jobs:
           # MinIO no longer publishes images or binaries: quay.io/minio/minio and minio/minio refuse
           # anonymous pulls and dl.min.io answers 410. Chainguard builds the same server from the
           # upstream source; it runs as a non-root user that cannot create /data, hence --user.
-          image=cgr.dev/chainguard/minio:latest
+          # Pinned by digest: Chainguard publishes only `latest` and rebuilds it, so a bump takes the
+          # digest `latest` names then (the multi-arch index from cgr.dev).
+          image=cgr.dev/chainguard/minio:latest@sha256:f6243be11aaaa2fe654d260558e2b3fcef50135e78a3abfd0db802b13444f059
           if ! docker run -d --name minio --user 0:0 \
             -p 9000:9000 \
             -p 9001:9001 \

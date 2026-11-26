@@ -107,7 +107,7 @@ jobs:
       # exist`. Excludes ducklake[postgres+s3], which provisions its own local
       # postgres catalog DB on the same port.
       postgres_tpch:
-        image: ${{ (contains(inputs.spicepod_path, 'postgres') && !contains(inputs.spicepod_path, 'ducklake') && (((startsWith(inputs.query_set, 'tpch') || inputs.query_set == 'tpcds') && (inputs.scale_factor == '1' || inputs.scale_factor == '10')))) && 'postgres:16' || '' }}
+        image: ${{ (contains(inputs.spicepod_path, 'postgres') && !contains(inputs.spicepod_path, 'ducklake') && (((startsWith(inputs.query_set, 'tpch') || inputs.query_set == 'tpcds') && (inputs.scale_factor == '1' || inputs.scale_factor == '10')))) && 'postgres:16@sha256:07abc3f43c9395b0bdbbab36bc25ddb0e8d83cd4fcafb5fb7d6abe14ff156dd8' || '' }}
         ports:
           - 5432:5432
         env:
