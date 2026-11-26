@@ -842,30 +842,33 @@ async fn read_one_row(
 /// the schema its writer committed. A cached plan from before would expand
 /// `SELECT *` to the old columns, or read a widened column at its old type.
 fn plan_matches_scanned_tables(plan: &LogicalPlan) -> bool {
-    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::common::tree_node::TreeNodeRecursion;
     let mut matches = true;
     let _ = plan.apply_with_subqueries(|node| {
         if let LogicalPlan::TableScan(scan) = node {
             let current = scan.source.schema();
             let planned = scan.projected_schema.fields();
-            let same = match &scan.projection {
-                Some(indices) => {
-                    indices.len() == planned.len()
-                        && indices.iter().zip(planned.iter()).all(|(&index, planned)| {
-                            current.fields().get(index).is_some_and(|field| {
-                                field.name() == planned.name()
-                                    && field.data_type() == planned.data_type()
+            let same =
+                match &scan.projection {
+                    Some(indices) => {
+                        indices.len() == planned.len()
+                            && indices.iter().zip(planned.iter()).all(|(&index, planned)| {
+                                current.fields().get(index).is_some_and(|field| {
+                                    field.name() == planned.name()
+                                        && field.data_type() == planned.data_type()
+                                })
                             })
-                        })
-                }
-                None => {
-                    current.fields().len() == planned.len()
-                        && current.fields().iter().zip(planned.iter()).all(|(field, planned)| {
-                            field.name() == planned.name()
-                                && field.data_type() == planned.data_type()
-                        })
-                }
-            };
+                    }
+                    None => {
+                        current.fields().len() == planned.len()
+                            && current.fields().iter().zip(planned.iter()).all(
+                                |(field, planned)| {
+                                    field.name() == planned.name()
+                                        && field.data_type() == planned.data_type()
+                                },
+                            )
+                    }
+                };
             if !same {
                 matches = false;
                 return Ok(TreeNodeRecursion::Stop);
@@ -5585,7 +5588,7 @@ impl DataFusion {
                 &normalized_refresh_schema,
             )
         {
-            refuse_shared_recreate(&diff.to_string())?;
+            refuse_shared_recreate(&diff)?;
             let dataset_name = dataset.name.to_string();
             let trigger = if is_file_update {
                 "file_update mode"
@@ -8556,10 +8559,16 @@ mod tests {
             .expect("scan")
             .build()
             .expect("plan");
-            assert!(plan_matches_scanned_tables(&plan), "{projection:?}: unchanged");
+            assert!(
+                plan_matches_scanned_tables(&plan),
+                "{projection:?}: unchanged"
+            );
 
             *source.0.lock() = Arc::clone(&widened);
-            assert!(!plan_matches_scanned_tables(&plan), "{projection:?}: widened");
+            assert!(
+                !plan_matches_scanned_tables(&plan),
+                "{projection:?}: widened"
+            );
 
             *source.0.lock() = Arc::clone(&added);
             // `SELECT *` expanded to the old columns must be replanned; a

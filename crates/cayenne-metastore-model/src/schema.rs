@@ -73,18 +73,32 @@ pub(crate) struct State {
     changes: u8,
     copy: Option<Copy>,
     instances: [Instance; INSTANCES],
+    /// What the run has seen, as [`Seen`] bits.
+    seen: u8,
+}
+
+/// The events a run records, one bit each in [`State::seen`].
+struct Seen;
+
+impl Seen {
     /// A query read data written under a wider schema than it serves.
-    misaligned: bool,
+    const MISALIGNED: u8 = 1;
     /// A copy an instance was serving was dropped.
-    dropped_served: bool,
+    const DROPPED_SERVED: u8 = 1 << 1;
     /// The previous Spicepod's instance wrote data under the widened schema.
-    previous_wrote_wide: bool,
+    const PREVIOUS_WROTE_WIDE: u8 = 1 << 2;
     /// A writer was killed with a committed schema it had written no data under.
-    killed_after_commit: bool,
+    const KILLED_AFTER_COMMIT: u8 = 1 << 3;
     /// Another instance then took the copy over and wrote under that schema.
-    took_over_after_commit: bool,
+    const TOOK_OVER_AFTER_COMMIT: u8 = 1 << 4;
     /// The recreating writer refused to drop a copy another instance served.
-    refused_recreate: bool,
+    const REFUSED_RECREATE: u8 = 1 << 5;
+}
+
+impl State {
+    fn has_seen(&self, event: u8) -> bool {
+        self.seen & event != 0
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,9 +151,7 @@ impl Protocol {
     /// Whether another instance than `i` serves folder `folder`.
     fn others_serve(s: &State, i: usize, folder: u8) -> bool {
         (0..INSTANCES).any(|j| {
-            j != i
-                && s.instances[j].status == Status::Serving
-                && s.instances[j].folder == folder
+            j != i && s.instances[j].status == Status::Serving && s.instances[j].folder == folder
         })
     }
 }
@@ -273,10 +285,10 @@ impl Model for Protocol {
                 if bound == 1 {
                     copy.unwritten_commit = false;
                     if i == 1 {
-                        n.previous_wrote_wide = true;
+                        n.seen |= Seen::PREVIOUS_WROTE_WIDE;
                     }
-                    if s.killed_after_commit {
-                        n.took_over_after_commit = true;
+                    if s.has_seen(Seen::KILLED_AFTER_COMMIT) {
+                        n.seen |= Seen::TOOK_OVER_AFTER_COMMIT;
                     }
                 }
             }
@@ -301,14 +313,14 @@ impl Model for Protocol {
                     n.instances[i].adopted = true;
                 }
                 if copy.data >> (bound + 1) != 0 {
-                    n.misaligned = true;
+                    n.seen |= Seen::MISALIGNED;
                 }
             }
             Action::Recreate(i) => {
                 let folder = s.copy.as_ref()?.folder;
                 if self.has("recreate-drops") {
                     if Self::others_serve(s, i, folder) {
-                        n.dropped_served = true;
+                        n.seen |= Seen::DROPPED_SERVED;
                     }
                     n.copy = Some(Copy {
                         schema: INCOMPATIBLE,
@@ -322,7 +334,7 @@ impl Model for Protocol {
                 } else {
                     // The writer fails the dataset rather than drop the copy.
                     if Self::others_serve(s, i, folder) {
-                        n.refused_recreate = true;
+                        n.seen |= Seen::REFUSED_RECREATE;
                     }
                     n.instances[i].status = Status::Failed;
                     n.copy.as_mut()?.writer = None;
@@ -334,7 +346,7 @@ impl Model for Protocol {
                     && copy.writer == Some(i)
                 {
                     if copy.unwritten_commit {
-                        n.killed_after_commit = true;
+                        n.seen |= Seen::KILLED_AFTER_COMMIT;
                     }
                     copy.writer = None;
                 }
@@ -346,18 +358,17 @@ impl Model for Protocol {
         vec![
             Property::always(
                 "a replica never serves rows misaligned with its schema",
-                |_, s: &State| !s.misaligned,
+                |_, s: &State| !s.has_seen(Seen::MISALIGNED),
             ),
-            Property::always(
-                "no instance drops a copy another serves",
-                |_, s: &State| !s.dropped_served,
-            ),
+            Property::always("no instance drops a copy another serves", |_, s: &State| {
+                !s.has_seen(Seen::DROPPED_SERVED)
+            }),
             Property::always(
                 "a copy's schema never narrows below its data",
                 |_, s: &State| {
-                    s.copy
-                        .as_ref()
-                        .is_none_or(|copy| copy.schema == INCOMPATIBLE || copy.data >> (copy.schema + 1) == 0)
+                    s.copy.as_ref().is_none_or(|copy| {
+                        copy.schema == INCOMPATIBLE || copy.data >> (copy.schema + 1) == 0
+                    })
                 },
             ),
             Property::always(
@@ -398,15 +409,15 @@ impl Model for Protocol {
             ),
             Property::sometimes(
                 "an instance with the previous Spicepod writes the widened copy",
-                |_, s: &State| s.previous_wrote_wide,
+                |_, s: &State| s.has_seen(Seen::PREVIOUS_WROTE_WIDE),
             ),
             Property::sometimes(
                 "a writer killed after committing a schema change is taken over and the copy serves on",
-                |_, s: &State| s.took_over_after_commit,
+                |_, s: &State| s.has_seen(Seen::TOOK_OVER_AFTER_COMMIT),
             ),
             Property::sometimes(
                 "the recreating writer leaves a copy other instances serve",
-                |_, s: &State| s.refused_recreate,
+                |_, s: &State| s.has_seen(Seen::REFUSED_RECREATE),
             ),
         ]
     }

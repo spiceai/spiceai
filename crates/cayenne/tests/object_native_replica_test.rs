@@ -84,7 +84,7 @@ async fn replica_reopens_with_different_settings_and_wider_schema() {
             .into_iter()
             .filter(|object| object.location.filename() == Some("head"))
             .collect();
-        assert!(!heads.is_empty());
+        assert_ne!(heads.len(), 0, "the writer's commits wrote a log head");
         let mut before = Vec::new();
         for head in &heads {
             before.push(
