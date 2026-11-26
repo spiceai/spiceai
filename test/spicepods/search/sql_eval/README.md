@@ -1,41 +1,59 @@
 # Search Evaluation in SQL
 
-These spicepods do what `testoperator run search` does, but in SQL. `spiced` runs a search for each
-test query, then calculates nDCG, recall, MRR and precision at k = 1..10 in views. You do not need
-`testoperator`.
-
-`testoperator` does not use these files. Do not put them in `mteb/`, `conteb/` or `financebench/`:
-the spicepod validator in `testoperator_dispatch_search.yml` validates every file in those
-directories as a standalone spicepod, and the spicepods in `spicepods/` are not standalone.
+These spicepods calculate the retrieval metrics of `testoperator run search` in SQL. `spiced` runs
+a search for each test query, then calculates nDCG, recall, MRR and precision at k = 1..10 in views.
 
 ## Layout
 
 ```
-sql_eval/
-├── scifact-full_text_search.yaml           <- one root spicepod for each benchmark and search
-└── spicepods/                              <- dependencies (resolved from the root's directory)
-    ├── search/offline-evals/spicepod.yaml  <- the metric views, for every benchmark
-    └── mteb/scifact/spicepod.yaml          <- the benchmark data: corpus, test_queries, relevance_data
+test/spicepods/search/
+├── mteb/scifact/full_text_search-cayenne[file].yaml  <- existing benchmark spicepod: corpus, test_queries, relevance_data
+└── sql_eval/
+    ├── spicepod.yaml                    <- the metric views, for every benchmark
+    └── scifact-full_text_search.yaml    <- root: the search to evaluate, and its dependencies
 ```
 
 | Spicepod | Contains |
 |---|---|
-| Root | `runtime.functions.enabled: true`, `dependencies`, `metadata.benchmark_dataset`, and the search to evaluate: the table function `search_pipeline(query)` |
-| `search/offline-evals` | The views `relevance_judgments`, `search_results`, `query_metrics` and `retrieval_metrics` |
-| `mteb/<dataset>` | The datasets `corpus`, `test_queries` and `relevance_data`, with the [required schema](../README.md#required-tables) |
+| Root (`sql_eval/<benchmark>-<search>.yaml`) | `runtime.functions.enabled: true`, `metadata.benchmark_dataset`, `dependencies`, and the search to evaluate: the table function `search_pipeline(query)` |
+| `sql_eval/spicepod.yaml` | The views `relevance_judgments`, `search_results`, `query_metrics` and `retrieval_metrics` |
+| A benchmark spicepod in `mteb/` | The tables `corpus`, `test_queries` and `relevance_data`, with the [required schema](../README.md#required-tables) |
 
-`spiced` loads a dependency from `<directory of the root spicepod>/spicepods/<dependency>/spicepod.yaml`.
-It does not load the dependencies of a dependency, and it ignores the `runtime` section of a
-dependency. Thus each root spicepod is in this directory, lists all of its dependencies, and sets
-`runtime.functions.enabled: true`.
+The root spicepod lists its dependencies relative to `test/spicepods/search/`:
 
-The root `.gitignore` ignores every `spicepods` directory and every `spicepod.yaml` file. It has an
-exception for `sql_eval/spicepods/**/spicepod.yaml`, so git tracks a new dependency here.
+```yaml
+dependencies:
+  - sql_eval
+  - mteb/scifact/full_text_search-cayenne[file].yaml
+```
+
+A dependency is a directory that contains `spicepod.yaml`, or a spicepod file. The runtime ignores
+the `runtime` section of a dependency, and it does not load the dependencies of a dependency.
+Thus each root spicepod sets `runtime.functions.enabled: true` and lists all of its dependencies.
 
 ## Run
 
+Give `test/spicepods/search` to `testoperator` as the dependency directory:
+
 ```console
-spiced test/spicepods/search/sql_eval/scifact-full_text_search.yaml
+testoperator run search \
+  --spicepod-path test/spicepods/search/sql_eval/scifact-full_text_search.yaml \
+  --spicepod-dependencies test/spicepods/search \
+  --sql-pipeline "SELECT _id, _score FROM search_pipeline(:query)"
+```
+
+`testoperator` loads the dependencies, merges them with the root spicepod, and starts `spiced` with
+the result. It sends each test query to `search_pipeline` and calculates the metrics in Rust. The
+`retrieval_metrics` view calculates the same metrics in SQL.
+
+`spiced` alone cannot load these dependencies, because it looks for them in the `spicepods/`
+directory next to the root spicepod. To run the merged spicepod in `spiced` without a test,
+export it, then start `spiced` in the directory that the command prints:
+
+```console
+testoperator export search \
+  --spicepod-path test/spicepods/search/sql_eval/scifact-full_text_search.yaml \
+  --spicepod-dependencies test/spicepods/search
 ```
 
 ```sql
@@ -50,6 +68,16 @@ searches again.
 
 - **A different search on the same benchmark:** copy the root spicepod and change only the body of
   `search_pipeline`. It must return `_id` and `_score` for the top 10 rows of `corpus`, best first.
-  A search that needs embeddings on `corpus` needs a benchmark spicepod that configures them.
-- **A different benchmark:** add `spicepods/mteb/<dataset>/spicepod.yaml` with the three datasets,
-  and a root spicepod that depends on it.
+  A search that needs embeddings on `corpus` depends on a benchmark spicepod that configures them,
+  for example `mteb/scifact/model2vec[potion-multilingual-128M]-cayenne[file].yaml`.
+- **A different benchmark:** add a root spicepod that depends on `sql_eval` and on a spicepod of
+  that benchmark in `mteb/`, `conteb/` or `financebench/`.
+
+## Notes
+
+- The root `.gitignore` ignores every `spicepod.yaml` file, but an ignore rule does not apply to a
+  file that git already tracks. Changes to `sql_eval/spicepod.yaml` are tracked as usual.
+- `testoperator` does not run these files unless you give the root spicepod with
+  `--spicepod-path`. Do not put a root spicepod in `mteb/`, `conteb/` or `financebench/`: the
+  spicepod validator in `testoperator_dispatch_search.yml` checks every file there as a standalone
+  spicepod.

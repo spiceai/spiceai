@@ -2,7 +2,15 @@ version: v1
 kind: Spicepod
 name: scifact-full_text_search
 
-# Full-text search on SciFact, evaluated in SQL. After the runtime is ready:
+# Full-text search on SciFact, evaluated in SQL. The dependencies are relative
+# to test/spicepods/search/, so give that directory to testoperator:
+#
+#   testoperator run search \
+#     --spicepod-path test/spicepods/search/sql_eval/scifact-full_text_search.yaml \
+#     --spicepod-dependencies test/spicepods/search \
+#     --sql-pipeline "SELECT _id, _score FROM search_pipeline(:query)"
+#
+# In the running spicepod:
 #
 #   SELECT * FROM retrieval_metrics ORDER BY k;   -- mean metrics at k = 1..10
 #   SELECT * FROM query_metrics WHERE k = 10;     -- one row per judged query
@@ -15,8 +23,8 @@ runtime:
     enabled: true
 
 dependencies:
-  - search/offline-evals
-  - mteb/scifact
+  - sql_eval                                             # the metric views
+  - mteb/scifact/full_text_search-cayenne[file].yaml     # corpus, test_queries, relevance_data
 
 functions:
   # The search to evaluate: the top 10 corpus rows for one query, best first.

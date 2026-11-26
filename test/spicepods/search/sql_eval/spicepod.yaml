@@ -1,12 +1,13 @@
 version: v1
 kind: Spicepod
-name: offline-evals
+name: sql_eval
 
-# Retrieval metrics in SQL, for any search and any benchmark. The spicepod that
-# depends on this one must give:
+# Retrieval metrics in SQL, for any search and any benchmark. Use this
+# spicepod as a dependency. The root spicepod must give:
 #
 #   - the tables `corpus`, `test_queries` (`_id`, `text`) and `relevance_data`
-#     (`"query-id"`, `"corpus-id"`, `score`), as in test/spicepods/search/README.md;
+#     (`"query-id"`, `"corpus-id"`, `score`), as in test/spicepods/search/README.md.
+#     A spicepod in test/spicepods/search/mteb/ gives these tables;
 #   - a table function `search_pipeline(query)` that returns `_id` and `_score`,
 #     best first, for the top 10 rows of `corpus`;
 #   - `runtime.functions.enabled: true`, because the runtime ignores the
