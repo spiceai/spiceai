@@ -54,12 +54,12 @@ use std::sync::Arc;
 
 use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
+use cayenne::MetadataCatalog;
 use cayenne::maintained_aggregate::{
     MaintainedAggregateExpr, MaintainedAggregateFunction, MaintainedAggregateSpec,
 };
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
 use cayenne::optimizer_rules::CayenneMaintainedAggregateRewriter;
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use common::TestFixture;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::session_state::SessionStateBuilder;
@@ -173,7 +173,7 @@ async fn maintained_aggregate_pushed_filter_impl(fixture: TestFixture) -> TestRe
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(TABLE),
         partition_column: None,
         vortex_config: VortexConfig {
             inline_max_rows: 0,
@@ -181,7 +181,9 @@ async fn maintained_aggregate_pushed_filter_impl(fixture: TestFixture) -> TestRe
         },
     };
     let table = Arc::new(
-        CayenneTableProvider::create_table(Arc::clone(&catalog), options, ctx.runtime_env())
+        fixture
+            .data_store
+            .create(Arc::clone(&catalog), ctx.runtime_env(), options)
             .await?,
     );
 
@@ -210,9 +212,11 @@ async fn maintained_aggregate_pushed_filter_impl(fixture: TestFixture) -> TestRe
     // 3) Re-open WITH the unfiltered maintained view. The open-time rebuild scans
     //    the committed files and populates the registry Fresh at epoch 0 (the
     //    deterministic way to feed it — plain `insert_into` does not).
-    let reopened = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-        .with_maintained_aggregates(vec![unfiltered_sum_v_by_k()])
-        .open(TABLE)
+    let reopened = fixture
+        .data_store
+        .open_with(catalog, ctx.runtime_env(), TABLE, |builder| {
+            builder.with_maintained_aggregates(vec![unfiltered_sum_v_by_k()])
+        })
         .await?;
     ctx.register_table(TABLE, Arc::new(reopened) as Arc<dyn TableProvider>)?;
 
@@ -258,7 +262,7 @@ async fn maintained_aggregate_pushed_filter_impl(fixture: TestFixture) -> TestRe
     Ok(())
 }
 
-test_with_backends!(maintained_aggregate_pushed_filter_impl);
+test_on_data_store!(maintained_aggregate_pushed_filter_impl);
 
 /// Finding-1 variant: the table carries a pending key-deletion tombstone, so the
 /// scan is wrapped in a deletion-filter exec and the query predicate is pushed onto
@@ -281,7 +285,7 @@ async fn maintained_aggregate_pushed_filter_with_deletes_impl(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(TABLE_DEL),
         partition_column: None,
         vortex_config: VortexConfig {
             inline_max_rows: 0,
@@ -289,7 +293,9 @@ async fn maintained_aggregate_pushed_filter_with_deletes_impl(
         },
     };
     let table = Arc::new(
-        CayenneTableProvider::create_table(Arc::clone(&catalog), options, ctx.runtime_env())
+        fixture
+            .data_store
+            .create(Arc::clone(&catalog), ctx.runtime_env(), options)
             .await?,
     );
 
@@ -316,9 +322,11 @@ async fn maintained_aggregate_pushed_filter_with_deletes_impl(
 
     // Re-open with the unfiltered view; the rebuild reads post-delete visible state
     // and the deletion index carries the tombstone, so scans wrap a deletion filter.
-    let reopened = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-        .with_maintained_aggregates(vec![unfiltered_sum_v_by_k()])
-        .open(TABLE_DEL)
+    let reopened = fixture
+        .data_store
+        .open_with(catalog, ctx.runtime_env(), TABLE_DEL, |builder| {
+            builder.with_maintained_aggregates(vec![unfiltered_sum_v_by_k()])
+        })
         .await?;
     ctx.register_table(TABLE_DEL, Arc::new(reopened) as Arc<dyn TableProvider>)?;
 
@@ -372,7 +380,7 @@ async fn maintained_aggregate_pushed_filter_with_deletes_impl(
     Ok(())
 }
 
-test_with_backends!(maintained_aggregate_pushed_filter_with_deletes_impl);
+test_on_data_store!(maintained_aggregate_pushed_filter_with_deletes_impl);
 
 /// The other half of the pushed-filter contract: a view declared WITH the
 /// query's filter must answer it even though physical `FilterPushdown` moved the
@@ -402,7 +410,7 @@ async fn maintained_aggregate_filtered_view_serves_pushed_filter_impl(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(TABLE_SERVED),
         partition_column: None,
         vortex_config: VortexConfig {
             inline_max_rows: 0,
@@ -410,7 +418,9 @@ async fn maintained_aggregate_filtered_view_serves_pushed_filter_impl(
         },
     };
     let table = Arc::new(
-        CayenneTableProvider::create_table(Arc::clone(&catalog), options, ctx.runtime_env())
+        fixture
+            .data_store
+            .create(Arc::clone(&catalog), ctx.runtime_env(), options)
             .await?,
     );
 
@@ -434,9 +444,11 @@ async fn maintained_aggregate_filtered_view_serves_pushed_filter_impl(
     drop(table);
 
     let reopened = Arc::new(
-        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-            .with_maintained_aggregates(vec![filtered_sum_v_by_k()])
-            .open(TABLE_SERVED)
+        fixture
+            .data_store
+            .open_with(catalog, ctx.runtime_env(), TABLE_SERVED, |builder| {
+                builder.with_maintained_aggregates(vec![filtered_sum_v_by_k()])
+            })
             .await?,
     ) as Arc<dyn TableProvider>;
     ctx.register_table(TABLE_SERVED, Arc::clone(&reopened))?;
@@ -501,7 +513,7 @@ async fn maintained_aggregate_filtered_view_serves_pushed_filter_impl(
     Ok(())
 }
 
-test_with_backends!(maintained_aggregate_filtered_view_serves_pushed_filter_impl);
+test_on_data_store!(maintained_aggregate_filtered_view_serves_pushed_filter_impl);
 
 /// A maintained filter as the Cayenne accelerator builds it from `filter_sql`:
 /// parsed against the table schema, coerced and folded the way the planner
@@ -559,7 +571,7 @@ async fn chbench_q1_and_q6_are_served_by_their_views_impl(fixture: TestFixture) 
             "ol_w_id".to_string(),
             "ol_number".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(TABLE_CHBENCH),
         partition_column: None,
         vortex_config: VortexConfig {
             inline_max_rows: 0,
@@ -567,7 +579,9 @@ async fn chbench_q1_and_q6_are_served_by_their_views_impl(fixture: TestFixture) 
         },
     };
     let table = Arc::new(
-        CayenneTableProvider::create_table(Arc::clone(&catalog), options, ctx.runtime_env())
+        fixture
+            .data_store
+            .create(Arc::clone(&catalog), ctx.runtime_env(), options)
             .await?,
     );
     // 2008-01-01 (delivered) and NULL (undelivered) delivery dates.
@@ -632,9 +646,11 @@ async fn chbench_q1_and_q6_are_served_by_their_views_impl(fixture: TestFixture) 
         )),
     };
     let reopened = Arc::new(
-        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-            .with_maintained_aggregates(vec![q1_view, q6_view])
-            .open(TABLE_CHBENCH)
+        fixture
+            .data_store
+            .open_with(catalog, ctx.runtime_env(), TABLE_CHBENCH, |builder| {
+                builder.with_maintained_aggregates(vec![q1_view, q6_view])
+            })
             .await?,
     ) as Arc<dyn TableProvider>;
     ctx.register_table(TABLE_CHBENCH, Arc::clone(&reopened))?;
@@ -661,4 +677,4 @@ async fn chbench_q1_and_q6_are_served_by_their_views_impl(fixture: TestFixture) 
     Ok(())
 }
 
-test_with_backends!(chbench_q1_and_q6_are_served_by_their_views_impl);
+test_on_data_store!(chbench_q1_and_q6_are_served_by_their_views_impl);

@@ -81,6 +81,20 @@ struct Cli {
     #[arg(long)]
     cluster: bool,
 
+    /// The image a script's `cluster: { containers: true }` runs each
+    /// executor in, with the `spiced` under test mounted in. The default has
+    /// only the base libraries a Linux `spiced` built with the default
+    /// features needs; a build that links more, such as unixODBC with the
+    /// `odbc` feature, needs an image that has them. A local image is used
+    /// as is; another is pulled.
+    #[arg(
+        long = "executor-image",
+        value_name = "IMAGE",
+        env = "SPICESCRIPT_EXECUTOR_IMAGE",
+        default_value = runner::DEFAULT_EXECUTOR_IMAGE
+    )]
+    executor_image: String,
+
     /// Where instances keep their spicepods, data and logs.
     #[arg(long, default_value = "target/spicescript")]
     work_dir: PathBuf,
@@ -394,6 +408,7 @@ async fn run(cli: Cli) -> Result<bool> {
             .as_deref()
             .map(std::path::absolute)
             .transpose()?,
+        executor_image: cli.executor_image,
     };
     let mut ledger = ledger::Ledger::load(&scripts)?;
     let mut passed = 0;

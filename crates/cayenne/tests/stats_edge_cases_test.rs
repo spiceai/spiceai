@@ -43,11 +43,11 @@ test_with_backends!(test_stats_correct_after_overwrite);
 // Data Inlining Edge Cases
 // ============================================================================
 
-test_with_backends!(test_large_insert_bypasses_inline);
-test_with_backends!(test_multiple_small_inserts_accumulate_inline);
-test_with_backends!(test_scan_unions_inlined_and_vortex);
-test_with_backends!(test_overwrite_clears_inlined_data);
-test_with_backends!(test_delete_removes_row_from_pk_table);
+test_on_data_store!(test_large_insert_bypasses_inline);
+test_on_data_store!(test_multiple_small_inserts_accumulate_inline);
+test_on_data_store!(test_scan_unions_inlined_and_vortex);
+test_on_data_store!(test_overwrite_clears_inlined_data);
+test_on_data_store!(test_delete_removes_row_from_pk_table);
 
 // ============================================================================
 // Helpers
@@ -61,21 +61,23 @@ async fn create_table_no_pk(
     let ctx = SessionContext::new();
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = CayenneTableProvider::create_table(
-        catalog,
-        CreateTableOptions {
-            table_name: name.to_string(),
-            schema,
-            primary_key: vec![],
-            on_conflict: None,
-            base_path: fixture.data_path.to_string_lossy().to_string(),
-            partition_column: None,
-            vortex_config: cayenne::metadata::VortexConfig::default(),
-        },
-        ctx.runtime_env(),
-    )
-    .await
-    .expect("create table");
+    let table = fixture
+        .data_store
+        .create(
+            catalog,
+            ctx.runtime_env(),
+            CreateTableOptions {
+                table_name: name.to_string(),
+                schema,
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: fixture.data_store.base_path(name),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            },
+        )
+        .await
+        .expect("create table");
 
     (table, ctx)
 }
@@ -89,21 +91,23 @@ async fn create_table_with_pk(
     let ctx = SessionContext::new();
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = CayenneTableProvider::create_table(
-        catalog,
-        CreateTableOptions {
-            table_name: name.to_string(),
-            schema,
-            primary_key: pk,
-            on_conflict: None,
-            base_path: fixture.data_path.to_string_lossy().to_string(),
-            partition_column: None,
-            vortex_config: cayenne::metadata::VortexConfig::default(),
-        },
-        ctx.runtime_env(),
-    )
-    .await
-    .expect("create table");
+    let table = fixture
+        .data_store
+        .create(
+            catalog,
+            ctx.runtime_env(),
+            CreateTableOptions {
+                table_name: name.to_string(),
+                schema,
+                primary_key: pk,
+                on_conflict: None,
+                base_path: fixture.data_store.base_path(name),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            },
+        )
+        .await
+        .expect("create table");
 
     (table, ctx)
 }

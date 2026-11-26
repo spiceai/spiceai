@@ -41,7 +41,7 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
 
-test_with_backends!(test_live_num_rows_and_ndv_under_upsert);
+test_on_data_store!(test_live_num_rows_and_ndv_under_upsert);
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -107,22 +107,24 @@ async fn test_live_num_rows_and_ndv_under_upsert(
     let ctx = SessionContext::new();
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = CayenneTableProvider::create_table(
-        catalog,
-        CreateTableOptions {
-            table_name: "inc_stats".to_string(),
-            schema: schema(),
-            primary_key: vec!["id".to_string()],
-            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-                "id".to_string(),
-            ]))),
-            base_path: fixture.data_path.to_string_lossy().to_string(),
-            partition_column: None,
-            vortex_config: VortexConfig::default(),
-        },
-        ctx.runtime_env(),
-    )
-    .await?;
+    let table = fixture
+        .data_store
+        .create(
+            catalog,
+            ctx.runtime_env(),
+            CreateTableOptions {
+                table_name: "inc_stats".to_string(),
+                schema: schema(),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                    "id".to_string(),
+                ]))),
+                base_path: fixture.data_store.base_path("inc_stats"),
+                partition_column: None,
+                vortex_config: VortexConfig::default(),
+            },
+        )
+        .await?;
     let table = Arc::new(table);
     ctx.register_table(
         "inc_stats",
@@ -262,8 +264,8 @@ async fn test_live_num_rows_and_ndv_under_upsert(
 // Test B: fresh inline insert (no supersedes) — `live_rows_delta` is N and
 //         `inlined_row_count` also grew by N, so `num_rows` overcounted by N.
 
-test_with_backends!(test_inline_upsert_superseding_file_rows);
-test_with_backends!(test_fresh_inline_after_staged_no_double_count);
+test_on_data_store!(test_inline_upsert_superseding_file_rows);
+test_on_data_store!(test_fresh_inline_after_staged_no_double_count);
 
 /// Regression test A: an inline upsert that supersedes file-backed rows
 /// must not inflate `num_rows` — `live_rows_delta` nets the supersedes.
@@ -273,22 +275,24 @@ async fn test_inline_upsert_superseding_file_rows(
     let ctx = SessionContext::new();
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = CayenneTableProvider::create_table(
-        catalog,
-        CreateTableOptions {
-            table_name: "upsert_file_supersede".to_string(),
-            schema: schema(),
-            primary_key: vec!["id".to_string()],
-            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-                "id".to_string(),
-            ]))),
-            base_path: fixture.data_path.to_string_lossy().to_string(),
-            partition_column: None,
-            vortex_config: VortexConfig::default(),
-        },
-        ctx.runtime_env(),
-    )
-    .await?;
+    let table = fixture
+        .data_store
+        .create(
+            catalog,
+            ctx.runtime_env(),
+            CreateTableOptions {
+                table_name: "upsert_file_supersede".to_string(),
+                schema: schema(),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                    "id".to_string(),
+                ]))),
+                base_path: fixture.data_store.base_path("upsert_file_supersede"),
+                partition_column: None,
+                vortex_config: VortexConfig::default(),
+            },
+        )
+        .await?;
     let table = Arc::new(table);
     ctx.register_table(
         "upsert_file_supersede",
@@ -334,22 +338,24 @@ async fn test_fresh_inline_after_staged_no_double_count(
     let ctx = SessionContext::new();
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = CayenneTableProvider::create_table(
-        catalog,
-        CreateTableOptions {
-            table_name: "fresh_inline_no_dbl".to_string(),
-            schema: schema(),
-            primary_key: vec!["id".to_string()],
-            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-                "id".to_string(),
-            ]))),
-            base_path: fixture.data_path.to_string_lossy().to_string(),
-            partition_column: None,
-            vortex_config: VortexConfig::default(),
-        },
-        ctx.runtime_env(),
-    )
-    .await?;
+    let table = fixture
+        .data_store
+        .create(
+            catalog,
+            ctx.runtime_env(),
+            CreateTableOptions {
+                table_name: "fresh_inline_no_dbl".to_string(),
+                schema: schema(),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                    "id".to_string(),
+                ]))),
+                base_path: fixture.data_store.base_path("fresh_inline_no_dbl"),
+                partition_column: None,
+                vortex_config: VortexConfig::default(),
+            },
+        )
+        .await?;
     let table = Arc::new(table);
     ctx.register_table(
         "fresh_inline_no_dbl",

@@ -4085,6 +4085,7 @@ impl MetadataCatalog for CayenneCatalog {
         old_snapshot_ids: &[String],
         new_snapshot_id: &str,
         new_sequence_number: i64,
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<bool> {
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
         if max_attempts == 0 {
@@ -4100,8 +4101,12 @@ impl MetadataCatalog for CayenneCatalog {
                 }
             })?;
 
-            match self
-                .swap_protected_snapshots_in_txn(
+            let swapped = async {
+                if let Some(files) = files {
+                    self.replace_snapshot_files_in_txn(&mut *tx, table_id, new_snapshot_id, files)
+                        .await?;
+                }
+                self.swap_protected_snapshots_in_txn(
                     &mut *tx,
                     table_id,
                     old_snapshot_ids,
@@ -4109,9 +4114,12 @@ impl MetadataCatalog for CayenneCatalog {
                     new_sequence_number,
                 )
                 .await
-            {
+            }
+            .await;
+            match swapped {
                 // CAS guard failed — an input snapshot is no longer active.
-                // The transaction made no changes; nothing to commit.
+                // Nothing commits: dropping the transaction rolls back any
+                // manifest rows it wrote.
                 Ok(false) => return Ok(false),
                 Ok(true) => match tx.commit().await {
                     Ok(()) => return Ok(true),
@@ -11129,7 +11137,13 @@ mod tests {
         }
 
         let swapped = catalog
-            .swap_protected_snapshots(&table_id, &[input_a.clone(), input_b.clone()], &p_new, 4)
+            .swap_protected_snapshots(
+                &table_id,
+                &[input_a.clone(), input_b.clone()],
+                &p_new,
+                4,
+                None,
+            )
             .await
             .expect("swap protected snapshots");
         assert!(
@@ -11424,7 +11438,13 @@ mod tests {
             .expect("seed roster row");
 
         let swapped = catalog
-            .swap_protected_snapshots(&table_id, &[input_a.clone(), input_b.clone()], &p_new, 4)
+            .swap_protected_snapshots(
+                &table_id,
+                &[input_a.clone(), input_b.clone()],
+                &p_new,
+                4,
+                None,
+            )
             .await
             .expect("swap protected snapshots");
         assert!(
