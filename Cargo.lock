@@ -18100,6 +18100,7 @@ dependencies = [
  "key-index",
  "logos",
  "opentelemetry 0.32.0",
+ "redact",
  "runtime-acceleration",
  "runtime-config",
  "serde",
