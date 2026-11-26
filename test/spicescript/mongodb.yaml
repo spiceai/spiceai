@@ -1,4 +1,6 @@
 name: mongodb
+duration: 28s
+tags: [long]
 description: >
   The MongoDB connector against a replica set: a collection answers the
   corpus as PostgreSQL does over the same rows, federated (filters, ORDER BY

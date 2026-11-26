@@ -120,8 +120,6 @@ pub struct CayenneRuntimeConfig {
 pub enum AcceleratorRuntimeConfig {
     Arrow,
     PartitionedArrow,
-    Sqlite,
-    PostgreSQL,
     Cayenne(CayenneRuntimeConfig),
 }
 
@@ -132,8 +130,6 @@ impl AcceleratorRuntimeConfig {
         match self {
             Self::Arrow => Engine::Arrow,
             Self::PartitionedArrow => Engine::PartitionedArrow,
-            Self::Sqlite => Engine::Sqlite,
-            Self::PostgreSQL => Engine::PostgreSQL,
             Self::Cayenne(_) => Engine::Cayenne,
         }
     }
@@ -148,8 +144,6 @@ impl AcceleratorRuntimeConfig {
         match engine {
             Engine::Arrow => Self::Arrow,
             Engine::PartitionedArrow => Self::PartitionedArrow,
-            Engine::Sqlite => Self::Sqlite,
-            Engine::PostgreSQL => Self::PostgreSQL,
             Engine::Cayenne => Self::Cayenne(CayenneRuntimeConfig::default()),
         }
     }
@@ -224,7 +218,7 @@ pub fn registered_engine_names() -> Vec<String> {
     names
 }
 
-/// [`registered_engine_names`] as a user-facing list — `"arrow, duckdb, and sqlite"`.
+/// [`registered_engine_names`] as a user-facing list — `"arrow and cayenne"`.
 ///
 /// Separate from the message that embeds it so the wording can be asserted directly;
 /// the link order of the registration slice is not stable, hence the sort above.
@@ -351,7 +345,7 @@ pub enum Error {
     InvalidConfiguration { msg: String },
 
     #[snafu(display(
-        "Unknown acceleration engine '{engine}'. Valid engines are: arrow, sqlite, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
+        "Unknown acceleration engine '{engine}'. Valid engines are: arrow, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
     ))]
     UnknownEngine { engine: Arc<str> },
 
@@ -432,24 +426,6 @@ impl AcceleratorEngineRegistry {
         ctx: Arc<SessionContext>,
     ) -> Result<Arc<dyn TableProvider>> {
         let engine = acceleration_settings.engine;
-
-        // Normalize Dictionary-encoded types to their value types only for
-        // accelerator engines that do not natively support Arrow Dictionary
-        // encoding (SQLite).  Other engines (Arrow, Cayenne,
-        // PostgreSQL) handle Dictionary types natively and benefit from the
-        // compact encoding.
-        let needs_dictionary_normalization = matches!(engine.to_unpartitioned(), Engine::Sqlite);
-        let schema = if needs_dictionary_normalization
-            && arrow_tools::schema::has_dictionary_types(&schema)
-        {
-            let normalized = arrow_tools::type_rewrite::normalize_dictionary_types(&schema);
-            tracing::debug!(
-                "Normalized Arrow Dictionary types in schema for {engine} acceleration"
-            );
-            Arc::new(normalized)
-        } else {
-            schema
-        };
 
         let accelerator = self
             .get_accelerator_engine(acceleration_settings.engine)
@@ -1394,7 +1370,7 @@ mod tests {
                 .with_remove_duplicates(true)
                 .with_last_write_wins(true),
         ] {
-            let table = builder(Engine::Sqlite)
+            let table = builder(Engine::Cayenne)
                 .upsert_options(options.clone())
                 .build()
                 .expect("build succeeds");
@@ -1415,7 +1391,7 @@ mod tests {
     /// on the same "no deduplication" answer.
     #[test]
     fn no_upsert_options_means_no_keys_written_and_none_read_back() {
-        let table = builder(Engine::Sqlite).build().expect("build succeeds");
+        let table = builder(Engine::Cayenne).build().expect("build succeeds");
 
         assert!(!table.options.contains_key("upsert_remove_duplicates"));
         assert!(!table.options.contains_key("upsert_last_write_wins"));
@@ -1429,7 +1405,7 @@ mod tests {
     /// upserts on. Dropping them turns every upsert into a blind append.
     #[test]
     fn constraints_reach_the_created_table() {
-        let table = builder(Engine::Sqlite)
+        let table = builder(Engine::Cayenne)
             .constraints(pk(vec![0, 1]))
             .build()
             .expect("build succeeds");
@@ -1439,13 +1415,13 @@ mod tests {
 
     #[test]
     fn a_table_built_without_constraints_has_none_rather_than_a_stale_key() {
-        let table = builder(Engine::Sqlite).build().expect("build succeeds");
+        let table = builder(Engine::Cayenne).build().expect("build succeeds");
         assert!(table.constraints.is_empty());
     }
 
     #[test]
     fn the_on_conflict_behavior_reaches_the_created_table() {
-        let table = builder(Engine::Sqlite)
+        let table = builder(Engine::Cayenne)
             .on_conflict(OnConflict::Upsert(
                 datafusion_table_providers::util::column_reference::ColumnReference::try_from("id")
                     .expect("column reference"),
@@ -1461,7 +1437,7 @@ mod tests {
 
     #[test]
     fn the_write_mode_reaches_the_created_table() {
-        let table = builder(Engine::Sqlite)
+        let table = builder(Engine::Cayenne)
             .mode(Mode::File)
             .build()
             .expect("build succeeds");
@@ -1500,12 +1476,18 @@ mod tests {
     #[test]
     fn unique_constraints_are_not_reported_as_primary_keys() {
         let constraints = Constraints::new_unverified(vec![Constraint::Unique(vec![2])]);
-        assert!(get_primary_keys_from_constraints(&constraints, &schema()).is_empty());
+        assert_eq!(
+            get_primary_keys_from_constraints(&constraints, &schema()),
+            [] as [String; 0]
+        );
     }
 
     #[test]
     fn no_constraints_yields_no_primary_keys() {
-        assert!(get_primary_keys_from_constraints(&Constraints::default(), &schema()).is_empty());
+        assert_eq!(
+            get_primary_keys_from_constraints(&Constraints::default(), &schema()),
+            [] as [String; 0]
+        );
     }
 
     /// Turning primary-key conflict detection off is a Cayenne-only escape
@@ -1528,7 +1510,7 @@ mod tests {
                 );
 
                 let other_engine = Acceleration {
-                    engine: Engine::Sqlite,
+                    engine: Engine::Arrow,
                     params: acceleration.params.clone(),
                     ..Acceleration::default()
                 };
@@ -1637,13 +1619,7 @@ mod tests {
     /// fails to compile in `engine`.
     #[test]
     fn the_default_config_for_an_engine_is_that_engines_own_variant() {
-        for engine in [
-            Engine::Arrow,
-            Engine::PartitionedArrow,
-            Engine::Sqlite,
-            Engine::PostgreSQL,
-            Engine::Cayenne,
-        ] {
+        for engine in [Engine::Arrow, Engine::PartitionedArrow, Engine::Cayenne] {
             assert_eq!(
                 AcceleratorRuntimeConfig::default_for(engine).engine(),
                 engine,

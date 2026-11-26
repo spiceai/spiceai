@@ -926,7 +926,7 @@ mod tests {
             Ok(b) => b,
             Err(e) => panic!("Failed to serialize: {e}"),
         };
-        assert!(!bytes.is_empty());
+        assert_ne!(bytes, [] as [u8; 0]);
 
         // Deserialize
         let decoded: PreparedStatement = match from_bytes(&bytes) {

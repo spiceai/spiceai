@@ -155,7 +155,7 @@ impl CayenneTableProvider {
             &self.table_schema(),
             None,
         )?);
-        self.staging_may_have_files().store(true, Ordering::Release);
+        self.mark_staging_may_have_files(staging_snapshot_id);
         let (rows, _, stats) = self
             .write_to_snapshot_with_schema(
                 data,

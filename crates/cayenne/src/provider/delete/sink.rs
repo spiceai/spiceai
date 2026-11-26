@@ -368,20 +368,22 @@ fn cleanup_uncommitted_delete_paths_blocking(paths: Vec<std::path::PathBuf>) {
 /// not line up two-by-two: the main listing applies re-inserts with no sequence cutoff
 /// (`apply_deletion_filter_with_insert_records`), a protected snapshot ignores them and
 /// has a cutoff (`apply_partial_deletion_filter`), and the COLD tier ignores them with
-/// NO cutoff (`apply_deletion_filter`). Deriving the mode from "is there a cutoff" gets
-/// cold wrong, and cold is the case where it costs a row: its files hold fully
-/// superseded data, so treating a re-inserted key as live there matches the stale value
-/// and tombstones the key — deleting the replacement that never matched the predicate.
+/// its files' sequence as the cutoff (`apply_cold_deletion_filter`). Deriving the mode
+/// from "is there a cutoff" alone is not enough, and cold is the case where it costs a
+/// row: its files hold superseded data, so treating a re-inserted key as live there
+/// matches the stale value and tombstones the key — deleting the replacement that never
+/// matched the predicate.
 #[derive(Clone)]
 pub(crate) struct DeleteScanSource {
     /// Only deletions NEWER than this apply to these rows. `None` — every deletion
-    /// applies — for the main listing and the cold tier.
+    /// applies — for the main listing; a cold-tier source carries the sequence
+    /// its files were written at.
     pub(crate) min_delete_seq: Option<i64>,
     /// Whether a key re-inserted after its delete reads as live again.
     pub(crate) insert_records: InsertRecordHandling,
     pub(crate) table: DeleteScanTable,
     /// The deletion index as it stood when `table` was captured, taken under the same
-    /// `listing_fence` read. `None` for a source captured without one (the cold tier).
+    /// `listing_fence` read. `None` for a source captured without one.
     ///
     /// A row's liveness is only meaningful against the index its source was captured
     /// with. A seq-prefix bake or a current-snapshot compaction folds the rows a
@@ -625,8 +627,14 @@ impl StagedPkDelete {
     }
 
     /// Number of rows this delete removes: one per key. Every key it holds is
-    /// the key of a row its scan found live, so a key written again after an
-    /// earlier delete counts, and a key with no live row is never in it.
+    /// the key of a row its scan found live in the source it was read from,
+    /// against that source's own cutoff (see
+    /// [`CayenneDeletionSink::is_live_int64_pk`]), so a key written again after
+    /// an earlier delete counts, and a key deleted before this delete began, or a
+    /// superseded version, never reaches this set. Judging the keys again against
+    /// the whole-table index cannot be right for every source: a datalake file's
+    /// rows are live by its sequence cutoff, and a composite-key upsert's
+    /// tombstone carries no re-insert record.
     fn new_count(&self) -> usize {
         match self {
             Self::Int64 { new_pks, .. } => new_pks.len(),
@@ -665,8 +673,9 @@ pub struct CayenneDeletionSink {
     /// A protected snapshot carries `max_delete_seq_at_creation`: only deletes NEWER than
     /// that apply to its rows, which is precisely what tells a superseded version from
     /// the row that replaced it. Without it, a key-based delete can match a version an
-    /// upsert already retired and tombstone the KEY, taking the live row with it. `None`
-    /// is the base case — the current snapshot and cold-tier files, where every delete
+    /// upsert already retired and tombstone the KEY, taking the live row with it. A
+    /// cold-tier source carries the sequence its files were written at, for the same
+    /// reason. `None` is the base case — the current snapshot, where every delete
     /// applies.
     additional_scan_tables: Vec<DeleteScanSource>,
     /// How the main listing table treats an upsert's re-insert marker. Carried from the
@@ -720,10 +729,9 @@ pub struct CayenneDeletionSink {
     /// index it is judged by (see [`DeleteScanSource::tombstones_at_capture`]). `None` on
     /// internal persist-only helpers, which capture without them.
     capture_locks: Option<CaptureLocks>,
-    /// The owning table's `file_deletion_fence`, which removing the files of
-    /// superseded position deletion vectors waits for. `None` leaves those files
-    /// on disk.
-    file_deletion_fence: Option<Arc<tokio::sync::RwLock<()>>>,
+    /// The owning table, which reclaims the files of the position deletion
+    /// vectors a delete supersedes. `None` leaves those files in place.
+    owner: Option<Arc<super::super::CayenneTableProvider>>,
     /// The owning table's storage when its data path is an object-store URL;
     /// deletion vectors are written, read and removed through its store.
     dataset_storage: Option<Arc<DatasetStorage>>,
@@ -797,7 +805,7 @@ impl CayenneDeletionSink {
             count_exact: false,
             scan_input_version: None,
             capture_locks: None,
-            file_deletion_fence: None,
+            owner: None,
             dataset_storage,
             committed_snapshot: None,
         }
@@ -815,14 +823,11 @@ impl CayenneDeletionSink {
         self
     }
 
-    /// Wire the owning table's `file_deletion_fence`, so a position delete removes
-    /// the files of the deletion vectors it supersedes.
+    /// Wire the owning table, so a position delete reclaims the deletion vectors
+    /// it supersedes.
     #[must_use]
-    pub(crate) fn with_file_deletion_fence(
-        mut self,
-        file_deletion_fence: Arc<tokio::sync::RwLock<()>>,
-    ) -> Self {
-        self.file_deletion_fence = Some(file_deletion_fence);
+    pub(crate) fn with_owner(mut self, table: super::super::CayenneTableProvider) -> Self {
+        self.owner = Some(Arc::new(table));
         self
     }
 
@@ -864,15 +869,12 @@ impl CayenneDeletionSink {
             .collect())
     }
 
-    /// Remove the files of `replaced` vector rows once the commit that dropped them
-    /// has succeeded. See [`super::vector_io::remove_dropped_deletion_vector_files`].
+    /// Reclaim the files of `replaced` vector rows once the commit that dropped
+    /// them has succeeded. See
+    /// [`super::super::CayenneTableProvider::remove_dropped_deletion_vector_files`].
     pub(crate) fn remove_replaced_deletion_vector_files(&self, replaced: Vec<DeleteFile>) {
-        if let Some(fence) = &self.file_deletion_fence {
-            super::vector_io::remove_dropped_deletion_vector_files(
-                replaced,
-                Arc::clone(fence),
-                self.dataset_storage.clone(),
-            );
+        if let Some(table) = &self.owner {
+            table.remove_dropped_deletion_vector_files(replaced);
         }
     }
 
@@ -1052,8 +1054,8 @@ impl CayenneDeletionSink {
     }
 
     /// Whether an Int64-keyed row from a snapshot whose deletions are visible above
-    /// `min_delete_seq` is still live. `None` is the base case — the current snapshot and
-    /// cold tier, where every delete applies.
+    /// `min_delete_seq` is still live. `None` is the base case — the current snapshot,
+    /// where every delete applies.
     ///
     /// Delegates to the read path's own predicate rather than probing the index directly:
     /// a bare `get_with_min_seq(..).is_none()` is only half the rule, and misses that a

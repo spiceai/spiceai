@@ -20,9 +20,13 @@ mod unnest;
 pub use unnest::*;
 
 pub mod file_format;
+pub mod limits;
 pub mod source;
 
 pub use file_format::*;
 
 #[cfg(test)]
 mod scan_tests;
+
+#[cfg(test)]
+mod probe_tests;

@@ -116,7 +116,8 @@ use datafusion::logical_expr::{LogicalPlanBuilder, LogicalPlanBuilderOptions, Op
 use util::timestamp_filter::TimestampFilterConvert;
 
 use super::caching::{
-    CACHE_NAMESPACE_COLUMN, CACHE_REFRESHED_AT_COLUMN, REQUEST_KEY_COLUMNS, effective_max_age,
+    CACHE_NAMESPACE_COLUMN, CACHE_REFRESHED_AT_COLUMN, CACHE_REQUEST_COLUMN, REQUEST_KEY_COLUMNS,
+    effective_max_age,
 };
 use super::retention::create_timestamp_filter_converter;
 use super::{Retention, RetentionPredicate};
@@ -1070,18 +1071,28 @@ fn entry_predicate(
     Some(identity.and(bound))
 }
 
-/// The subset of [`REQUEST_KEY_COLUMNS`] this accelerator stores, plus the cache
-/// namespace when present.
+/// [`CACHE_REQUEST_COLUMN`] when this accelerator stores it, otherwise the
+/// subset of [`REQUEST_KEY_COLUMNS`] it stores, plus the cache namespace when
+/// present.
 ///
 /// The namespace belongs in the key: two principals can hold entries under the
 /// same request key, and evicting by request alone would take out a row the
 /// budget never charged to that entry.
 fn entry_key_columns(schema: &arrow::datatypes::Schema) -> Vec<String> {
-    let mut columns: Vec<String> = REQUEST_KEY_COLUMNS
-        .iter()
-        .filter(|name| is_utf8_column(schema, name))
-        .map(|name| (*name).to_string())
-        .collect();
+    // A response from a paginated source stores each page under its own path
+    // and query; the request it was fetched for is what every page shares, so
+    // that is the entry. Rows stored without it (written by a runtime that did
+    // not stamp it) group together under NULL, which a sweep never names, so
+    // only the fetch-time range can evict them: all at once, never in part.
+    let mut columns: Vec<String> = if is_utf8_column(schema, CACHE_REQUEST_COLUMN) {
+        vec![CACHE_REQUEST_COLUMN.to_string()]
+    } else {
+        REQUEST_KEY_COLUMNS
+            .iter()
+            .filter(|name| is_utf8_column(schema, name))
+            .map(|name| (*name).to_string())
+            .collect()
+    };
 
     if !columns.is_empty() && is_utf8_column(schema, CACHE_NAMESPACE_COLUMN) {
         columns.push(CACHE_NAMESPACE_COLUMN.to_string());
@@ -1231,7 +1242,7 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new(CACHE_NAMESPACE_COLUMN, DataType::Utf8, false),
         ]);
-        assert!(entry_key_columns(&schema).is_empty());
+        assert_eq!(entry_key_columns(&schema), [] as [String; 0]);
     }
 
     /// An entry for tests that never resolve a key — only `partition_doomed`'s
@@ -2779,7 +2790,7 @@ mod tests {
             ),
         ]);
 
-        assert!(unmeasurable_payload_columns(&schema).is_empty());
+        assert_eq!(unmeasurable_payload_columns(&schema), [] as [String; 0]);
     }
 
     #[test]

@@ -52,9 +52,9 @@ use runtime_acceleration::change_sink::provider::{
     reject_unknown_operations,
 };
 use runtime_acceleration::change_sink::{
-    BackendWrite, ChangeBatch, ChangeCapabilities, ChangePayload, ChangeSinkBackend,
-    ChangeSinkContext, DurabilityObserver, PositionWrite, Recovery, ReplacementSupport,
-    SchemaEvolutionSupport, StorageDurability, WriteOptions, replaced_scope_filters,
+    BackendWrite, ChangeCapabilities, ChangeSinkBackend, ChangeSinkContext, ChangeWrite,
+    DurabilityObserver, PositionWrite, Recovery, ReplacementSupport, SchemaEvolutionSupport,
+    StorageDurability, WriteOptions, replaced_scope_filters,
 };
 use runtime_table_partition::provider::PartitionTableProvider;
 use spice_table::{LayerWalk, find_concrete};
@@ -230,11 +230,12 @@ impl CayenneChangeSinkBackend {
                 .any(|(op, _)| matches!(op, ChangeOperationType::Truncate))
             && (!self.buffers_cdc_in_memory() || !self.is_replayable(&batch, &groups, options));
         if !same_record {
-            return self.apply_cdc_groups(batch, options, ctx).await;
+            return self.apply_cdc_groups(batch, groups, options, ctx).await;
         }
-        let (write, after_commit) =
-            cayenne::catalog::with_same_record_commits(self.apply_cdc_groups(batch, options, ctx))
-                .await;
+        let (write, after_commit) = cayenne::catalog::with_same_record_commits(
+            self.apply_cdc_groups(batch, groups, options, ctx),
+        )
+        .await;
         let mut write = write?;
         let catalog = Arc::clone(self.table.catalog());
         let table_id = self.table.table_id().to_string();
@@ -275,13 +276,15 @@ impl CayenneChangeSinkBackend {
         Ok(write)
     }
 
+    /// The caller groups the batch once, encoding every row's primary key,
+    /// and passes the result in.
     async fn apply_cdc_groups(
         &self,
         batch: CdcBatch,
+        groups: Vec<(ChangeOperationType, Vec<usize>)>,
         options: WriteOptions,
         ctx: &SessionContext,
     ) -> Result<BackendWrite> {
-        let groups = group_into_sub_batches(&batch);
         reject_unknown_operations(&groups)?;
         let replayable = self.is_replayable(&batch, &groups, options);
         self.select_recovery_path(if replayable {
@@ -510,32 +513,25 @@ impl ChangeSinkBackend for CayenneChangeSinkBackend {
 
     async fn apply(
         &self,
-        batch: ChangeBatch,
+        write: ChangeWrite,
         options: WriteOptions,
         ctx: &SessionContext,
         positions: Vec<PositionWrite>,
     ) -> Result<BackendWrite> {
-        let replacement_filters = replaced_scope_filters(batch.replaced_scopes());
-        match batch.into_payload() {
-            ChangePayload::Cdc(rows) => {
+        let replacement_filters = replaced_scope_filters(write.replaced_scopes());
+        match write {
+            ChangeWrite::Cdc(rows) => {
                 let batch = rows.into_built().map_err(before_mutation)?;
                 self.apply_cdc(batch, options, ctx, positions).await
             }
-            ChangePayload::Rows {
-                schema,
-                batches,
-                scoped_inputs,
-            } => {
-                let batches = if self.table.is_memory_resident_mode()
-                    && batches.iter().any(|batch| batch.num_rows() > 0)
-                {
-                    let target = self.context.table.schema();
-                    let batches = batches
-                        .into_iter()
-                        .map(|batch| try_cast_to(batch, Arc::clone(&target)).map_err(Into::into))
-                        .collect::<Result<Vec<_>>>()
+            ChangeWrite::Rows(write) => {
+                let write = if self.table.is_memory_resident_mode() && write.num_rows() > 0 {
+                    let write = write
+                        .cast_to(&self.context.table.schema())
                         .map_err(before_mutation)?;
-                    let incoming_bytes = batches
+                    let incoming_bytes = write
+                        .rows()
+                        .batches()
                         .iter()
                         .map(|batch| {
                             u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX)
@@ -545,9 +541,9 @@ impl ChangeSinkBackend for CayenneChangeSinkBackend {
                         .preflight_memory_append(incoming_bytes, replacement_filters.as_deref())
                         .await
                         .map_err(|error| before_mutation(error.into()))?;
-                    batches
+                    write
                 } else {
-                    batches
+                    write
                 };
                 let rebuildable = options.recovery == Recovery::Rebuildable;
                 self.select_recovery_path(if rebuildable {
@@ -562,7 +558,7 @@ impl ChangeSinkBackend for CayenneChangeSinkBackend {
                 // every burst, which every point lookup then has to read.
                 let changed = self
                     .provider
-                    .apply_rows(schema, batches, scoped_inputs, options, ctx, Some(self))
+                    .apply_rows(write, options, ctx, Some(self))
                     .await?;
                 Ok(BackendWrite::complete(
                     changed,

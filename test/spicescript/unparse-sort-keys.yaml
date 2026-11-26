@@ -1,4 +1,5 @@
 name: unparse-sort-keys
+duration: 5s
 description: >
   A federated ORDER BY orders the rows by the values the SELECT list returns. A
   key reading an output that cannot be repeated reads the one value the list

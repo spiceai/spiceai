@@ -1176,7 +1176,7 @@ mod tests {
             100,
             "a refill after churn + clear must not append new slots"
         );
-        assert!(shard.free.is_empty());
+        assert_eq!(shard.free, [] as [u32; 0]);
         assert_eq!(shard.len(), 100);
     }
 

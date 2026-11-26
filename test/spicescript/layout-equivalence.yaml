@@ -1,4 +1,6 @@
 name: layout-equivalence
+duration: 91s
+tags: [long]
 description: >
   How Cayenne lays data out never changes an answer: sorted, sharded,
   partitioned, indexed, and cold-tiered (to an S3-compatible bucket)

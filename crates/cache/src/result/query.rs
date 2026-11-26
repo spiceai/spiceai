@@ -1549,7 +1549,7 @@ mod tests {
         let stream = CachedRawStream::from_raw(wrap_raw_batches(Vec::new()), Arc::clone(&schema));
         assert_eq!(stream.schema(), schema);
         assert_eq!(stream.size_hint(), (0, Some(0)));
-        assert!(drain_raw_stream(stream).is_empty());
+        assert_eq!(drain_raw_stream(stream), [] as [Arc<RecordBatch>; 0]);
     }
 
     /// Single-batch Raw serve: the yielded handle is the stored `Arc`, so a
@@ -1733,7 +1733,7 @@ mod tests {
         .collect_batches()
         .await
         .expect("empty collect");
-        assert!(empty.is_empty());
+        assert_eq!(empty, [] as [RecordBatch; 0]);
 
         QueryResult::from_cached_raw(
             wrap_raw_batches(Vec::new()),

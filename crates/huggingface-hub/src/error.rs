@@ -31,7 +31,7 @@ use snafu::prelude::*;
 use crate::client;
 use crate::download::FetchError;
 use crate::location::{RepoId, RepoType};
-use crate::settings::{self, Settings, TokenScope, TokenSource, display_path};
+use crate::settings::{self, Offline, Settings, TokenScope, TokenSource, display_path};
 use crate::snapshot::{Requester, Source};
 
 /// What a download was for: every message names it.
@@ -92,16 +92,26 @@ pub(crate) enum Cause {
     Hub(client::Error),
     Fetch(FetchError),
     Settings(settings::Error),
-    /// `HF_HUB_OFFLINE` is set and the cache holds no snapshot of the revision.
-    OfflineNoSnapshot,
+    /// `HF_HUB_OFFLINE` or `TRANSFORMERS_OFFLINE` is set (`by`) and the cache holds no
+    /// snapshot of the revision.
+    OfflineNoSnapshot {
+        by: Offline,
+    },
     /// Files the component needs (`what`) are not where the snapshot's files came from.
     Missing {
         what: String,
         source: Source,
     },
-    /// The repository's files cannot be used: `message` says why.
+    /// The repository's files, as listed from `source`, cannot be used: `message` says why.
     Unusable {
         message: String,
+        source: Source,
+    },
+    /// The content of a file the snapshot holds, read from `source`, cannot be used: `message`
+    /// says why.
+    InvalidFile {
+        message: String,
+        source: Source,
     },
     /// The repository id is not one the Hub allows.
     InvalidRepo,
@@ -173,36 +183,67 @@ impl DownloadError {
         )
     }
 
-    /// The repository's files cannot be used; `message` says why, as the clause after a
-    /// colon.
+    /// The repository's files, as the snapshot lists them, cannot be used; `message` says why,
+    /// as the clause after a colon. When the snapshot lists only the cache, the error says so
+    /// and what clears it (offline, how to fill the cache; in an outage, to check the network;
+    /// when the Hub refused the request, the fix for the token, the access conditions or the
+    /// limit), and `message` reads after "where":
+    /// it says what the cache's listing lacks, since the repository, which was not read, may
+    /// hold it. A file the snapshot holds whose content cannot be used is
+    /// [`Self::invalid_file`].
     #[must_use]
     pub fn unusable(snapshot: &crate::snapshot::Snapshot, message: impl Into<String>) -> Self {
         snapshot.error(
             None,
             Cause::Unusable {
                 message: message.into(),
+                source: snapshot.source().clone(),
+            },
+        )
+    }
+
+    /// The content of a file the snapshot holds cannot be used; `message` says why, as the
+    /// clause after a colon. In a snapshot `Snapshot::open` made with the Hub read, the copy has
+    /// the size the Hub lists, and the error is taken as a mistake in the Spicepod. Read from the
+    /// cache alone, the copy's size is not checked: a copy cut short by a crash is used as it is
+    /// until `Snapshot::open` reads the Hub's listing, and is then downloaded again because its
+    /// size differs. So the error says only the cache was read. Offline, where a retry reads the
+    /// same copy, it says that unsetting the variable lets Spice compare the copy with the Hub;
+    /// in an outage, Spice retries until the Hub is back. A snapshot `Snapshot::open_paths` made
+    /// takes a cached copy's size from the copy, with or without the Hub.
+    #[must_use]
+    pub fn invalid_file(snapshot: &crate::snapshot::Snapshot, message: impl Into<String>) -> Self {
+        snapshot.error(
+            None,
+            Cause::InvalidFile {
+                message: message.into(),
+                source: snapshot.source().clone(),
             },
         )
     }
 
     /// Whether the download cannot succeed until the Spicepod changes: a setting that is not
-    /// valid, or a repository that does not hold what the component loads. A refusal from the
-    /// Hub is not one: a missing or private repository, a rejected token and a gated
-    /// repository can all be fixed on the Hub's side, and a network failure, a full disk or a
-    /// cache `hf download` can fill can clear while Spice runs.
+    /// valid, a repository that does not hold what the component loads, or a file of it whose
+    /// content the component cannot use, read from the Hub or, offline, from the cache, where
+    /// a retry reads the same copy. A refusal from the Hub is not one: a missing or private
+    /// repository, a rejected token and a gated repository can all be fixed on the Hub's side,
+    /// and a network failure, a full disk or a cache `hf download` can fill can clear while
+    /// Spice runs. Nor is what a listing of the cache alone lacks, which the cache, not the
+    /// repository, is missing, nor a file read from the cache in an outage, which the Hub's
+    /// return can replace.
     #[must_use]
     pub fn is_configuration_error(&self) -> bool {
         match self.cause.as_ref() {
-            Cause::Settings(_)
-            | Cause::Unusable { .. }
-            | Cause::InvalidPath
-            | Cause::InvalidRepo => true,
-            Cause::Missing { source, .. } => matches!(source, Source::Hub),
+            Cause::Settings(_) | Cause::InvalidPath | Cause::InvalidRepo => true,
+            Cause::Missing { source, .. } | Cause::Unusable { source, .. } => {
+                matches!(source, Source::Hub)
+            }
+            Cause::InvalidFile { source, .. } => !matches!(source, Source::CacheInOutage { .. }),
             Cause::Hub(error) | Cause::Fetch(FetchError::Hub { source: error }) => matches!(
                 error,
                 client::Error::InvalidEndpoint { .. } | client::Error::InvalidToken { .. }
             ),
-            Cause::Fetch(_) | Cause::OfflineNoSnapshot => false,
+            Cause::Fetch(_) | Cause::OfflineNoSnapshot { .. } => false,
         }
     }
 
@@ -272,13 +313,14 @@ impl DownloadError {
             Cause::Fetch(error @ FetchError::InvalidEntry { .. }) => (error.to_string(), None),
             // Worded as a cause already, with its own fix.
             Cause::Settings(error) => (error.to_string(), None),
-            Cause::OfflineNoSnapshot => (
+            Cause::OfflineNoSnapshot { by } => (
                 format!(
-                    "`HF_HUB_OFFLINE` is set and revision '{}' of the repo is not in the Hugging Face cache at '{}'",
+                    "{} and revision '{}' of the repo is not in the Hugging Face cache at '{}'",
+                    by.is_set(),
                     context.revision,
                     display_path(&context.cache_dir)
                 ),
-                Some(offline_fix(context)),
+                Some(offline_fix(context, *by)),
             ),
             Cause::Missing {
                 what,
@@ -286,24 +328,100 @@ impl DownloadError {
             } => (format!("the repo has no {what}"), None),
             Cause::Missing {
                 what,
-                source: Source::OfflineCache,
+                source: Source::OfflineCache { by },
             } => (
                 format!(
-                    "`HF_HUB_OFFLINE` is set and the Hugging Face cache at '{}' does not hold {what}",
+                    "{} and the Hugging Face cache at '{}' does not hold {what}",
+                    by.is_set(),
                     display_path(&context.cache_dir)
                 ),
-                Some(offline_fix(context)),
+                Some(offline_fix(context, *by)),
             ),
             Cause::Missing {
                 what,
-                source: Source::CacheInOutage { reason },
+                source: Source::CacheInOutage { error },
+            } if refused(error) => {
+                let (cause, fix) =
+                    hub_cause_and_fix(error, token, no_token_fix, &context.revision, retried);
+                (
+                    format!(
+                        "{cause}, so Spice read only the Hugging Face cache, which does not hold {what}"
+                    ),
+                    fix,
+                )
+            }
+            Cause::Missing {
+                what,
+                source: Source::CacheInOutage { error },
             } => (
                 format!(
-                    "the Hugging Face Hub could not be reached ({reason}), and the Hugging Face cache does not hold {what}"
+                    "the Hugging Face Hub could not be reached ({}), and the Hugging Face cache does not hold {what}",
+                    unreachable_reason(error)
                 ),
                 Some(unreachable_fix(retried)),
             ),
-            Cause::Unusable { message } => (message.clone(), None),
+            Cause::Unusable {
+                message,
+                source: Source::Hub,
+            }
+            | Cause::InvalidFile {
+                message,
+                source: Source::Hub,
+            } => (message.clone(), None),
+            Cause::InvalidFile {
+                message,
+                source: Source::OfflineCache { by },
+            } => (
+                format!(
+                    "{}, so Spice read only the Hugging Face cache at '{}', where {message}",
+                    by.is_set(),
+                    display_path(&context.cache_dir)
+                ),
+                Some(format!(
+                    "Unset {} so that Spice compares the cache's copy with the Hugging Face Hub and downloads it again if its size differs",
+                    by.variables()
+                )),
+            ),
+            Cause::Unusable {
+                message,
+                source: Source::OfflineCache { by },
+            } => (
+                format!(
+                    "{}, so Spice read only the Hugging Face cache at '{}', where {message}",
+                    by.is_set(),
+                    display_path(&context.cache_dir)
+                ),
+                Some(offline_fix(context, *by)),
+            ),
+            Cause::Unusable {
+                message,
+                source: Source::CacheInOutage { error },
+            }
+            | Cause::InvalidFile {
+                message,
+                source: Source::CacheInOutage { error },
+            } if refused(error) => {
+                let (cause, fix) =
+                    hub_cause_and_fix(error, token, no_token_fix, &context.revision, retried);
+                (
+                    format!("{cause}, so Spice read only the Hugging Face cache, where {message}"),
+                    fix,
+                )
+            }
+            Cause::Unusable {
+                message,
+                source: Source::CacheInOutage { error },
+            }
+            | Cause::InvalidFile {
+                message,
+                source: Source::CacheInOutage { error },
+            } => (
+                format!(
+                    "the Hugging Face Hub could not be reached ({}), so Spice read only the Hugging Face cache, where {message}",
+                    unreachable_reason(error)
+                ),
+                Some(unreachable_fix(retried)),
+            ),
             Cause::InvalidRepo => (
                 "it is not a Hugging Face repo id: use '<owner>/<name>', each 1 to 96 letters, digits, '-', '_' or '.', starting and ending with a letter or digit, without '--' or '..'"
                     .to_string(),
@@ -318,11 +436,14 @@ impl DownloadError {
     }
 }
 
-/// How to fill the cache `HF_HUB_OFFLINE` reads.
-fn offline_fix(context: &DownloadContext) -> String {
+/// How to fill the cache `HF_HUB_OFFLINE` or `TRANSFORMERS_OFFLINE` (`by`) reads, or stop
+/// reading the cache alone.
+fn offline_fix(context: &DownloadContext, by: Offline) -> String {
     format!(
-        "Run `hf download {} --revision {}` while online, or unset `HF_HUB_OFFLINE`",
-        context.repo, context.revision
+        "Run `hf download {} --revision {}` while online, or unset {}",
+        context.repo,
+        context.revision,
+        by.variables()
     )
 }
 
@@ -421,6 +542,49 @@ fn unreachable_fix(retried: bool) -> String {
         "Spice retries the download; check the network connection".to_string()
     } else {
         "Check the network connection, then restart Spice".to_string()
+    }
+}
+
+/// Whether the Hub answered and refused the request, so that a token, the repository's access
+/// conditions or the end of a rate limit, not the network, decides whether the files load.
+pub(crate) fn refused(error: &client::Error) -> bool {
+    matches!(
+        error,
+        client::Error::TokenRejected { .. }
+            | client::Error::Gated { .. }
+            | client::Error::RateLimited { .. }
+    )
+}
+
+/// Why a load read only the cache, as a clause: "the Hugging Face Hub could not be reached
+/// (HTTP 503)", "the Hugging Face Hub refused the request (token rejected, HTTP 401)".
+pub(crate) fn fallback_clause(error: &client::Error) -> String {
+    let reason = unreachable_reason(error);
+    if refused(error) {
+        format!("the Hugging Face Hub refused the request ({reason})")
+    } else {
+        format!("the Hugging Face Hub could not be reached ({reason})")
+    }
+}
+
+/// The warning a load that falls back to the cache logs: `subject` loads revision `revision` of
+/// `repo` from the cache at `commit`, because the Hub could not be reached or refused it.
+pub(crate) fn fallback_warning(
+    subject: &str,
+    error: &client::Error,
+    revision: &str,
+    repo: &RepoId,
+    commit: &str,
+) -> String {
+    let reason = unreachable_reason(error);
+    if refused(error) {
+        format!(
+            "{subject} was refused by the Hugging Face Hub ({reason}), so it loads revision '{revision}' of '{repo}' from the cache at commit {commit}. Changes to '{revision}' are not seen until the Hub accepts its requests."
+        )
+    } else {
+        format!(
+            "{subject} could not reach the Hugging Face Hub ({reason}), so it loads revision '{revision}' of '{repo}' from the cache at commit {commit}. Changes to '{revision}' are not seen until the Hub is reachable."
+        )
     }
 }
 
@@ -554,8 +718,34 @@ mod tests {
         );
     }
 
-    /// Each piece of advice that depends on whether Spice loads the component again: a model
-    /// is retried, an embedding model or reranker is loaded once.
+    /// A load that falls back to the cache says whether the Hub could not be reached or
+    /// refused it, so a rejected token is not taken for a network failure.
+    #[test]
+    fn the_fallback_warning_says_whether_the_hub_refused_the_request() {
+        let unavailable = client::Error::Status {
+            repo: repo(),
+            status: 503,
+            attempts: 5,
+            message: String::new(),
+        };
+        assert_eq!(
+            fallback_warning("Model 'test'", &unavailable, "main", &repo(), "abc1234"),
+            "Model 'test' could not reach the Hugging Face Hub (HTTP 503), so it loads revision 'main' of 'o/m' from the cache at commit abc1234. Changes to 'main' are not seen until the Hub is reachable."
+        );
+        let rejected = client::Error::TokenRejected {
+            repo: repo(),
+            status: 401,
+            token: Some(TokenSource::Env("HF_TOKEN")),
+            token_scope: TokenScope::Any,
+        };
+        assert_eq!(
+            fallback_warning("Model 'test'", &rejected, "main", &repo(), "abc1234"),
+            "Model 'test' was refused by the Hugging Face Hub (token rejected, HTTP 401), so it loads revision 'main' of 'o/m' from the cache at commit abc1234. Changes to 'main' are not seen until the Hub accepts its requests."
+        );
+    }
+
+    /// Each piece of advice that depends on whether Spice loads the component again after a
+    /// failed download.
     #[test]
     fn advice_says_whether_spice_retries() {
         let unavailable = || {
@@ -583,12 +773,50 @@ mod tests {
         let outage_without_file = || Cause::Missing {
             what: "'tokenizer.json'".to_string(),
             source: Source::CacheInOutage {
-                reason: "HTTP 503".to_string(),
+                error: std::sync::Arc::new(client::Error::Status {
+                    repo: repo(),
+                    status: 503,
+                    attempts: 5,
+                    message: ": The Hub is down.".to_string(),
+                }),
+            },
+        };
+        let env_token = || Some(TokenSource::Env("HF_TOKEN"));
+        let rejected_without_file = || Cause::Missing {
+            what: "'tokenizer.json'".to_string(),
+            source: Source::CacheInOutage {
+                error: std::sync::Arc::new(client::Error::TokenRejected {
+                    repo: repo(),
+                    status: 401,
+                    token: env_token(),
+                    token_scope: TokenScope::Any,
+                }),
+            },
+        };
+        let gated_without_file = || Cause::Missing {
+            what: "'tokenizer.json'".to_string(),
+            source: Source::CacheInOutage {
+                error: std::sync::Arc::new(client::Error::Gated {
+                    repo: repo(),
+                    repo_url: "https://huggingface.co/o/m".to_string(),
+                    token: env_token(),
+                    token_scope: TokenScope::Any,
+                }),
+            },
+        };
+        let rate_limited_without_file = || Cause::Missing {
+            what: "'tokenizer.json'".to_string(),
+            source: Source::CacheInOutage {
+                error: std::sync::Arc::new(client::Error::RateLimited {
+                    repo: repo(),
+                    reset_hint: String::new(),
+                    token: None,
+                    token_scope: TokenScope::Any,
+                }),
             },
         };
         let prefix = "Failed to download embedding model 'e5' from Hugging Face repo 'o/m' (revision 'main'):";
         let docs = "See: https://spiceai.org/docs/components/embeddings/huggingface";
-        let env_token = || Some(TokenSource::Env("HF_TOKEN"));
         let cases = [
             (
                 error(true, None, unavailable()),
@@ -633,6 +861,22 @@ mod tests {
             (
                 error(false, None, outage_without_file()),
                 "the Hugging Face Hub could not be reached (HTTP 503), and the Hugging Face cache does not hold 'tokenizer.json'. Check the network connection, then restart Spice.",
+            ),
+            (
+                error(true, env_token(), rejected_without_file()),
+                "the Hub rejected the token from `HF_TOKEN` (HTTP 401), so Spice read only the Hugging Face cache, which does not hold 'tokenizer.json'. Set `HF_TOKEN` to a token with access to this repo, or set `hf_token`.",
+            ),
+            (
+                error(true, env_token(), gated_without_file()),
+                "the repo is gated, so Spice read only the Hugging Face cache, which does not hold 'tokenizer.json'. Accept its access conditions at https://huggingface.co/o/m with the account the token from `HF_TOKEN` belongs to.",
+            ),
+            (
+                error(true, None, rate_limited_without_file()),
+                "the Hub kept rate-limiting requests, so Spice read only the Hugging Face cache, which does not hold 'tokenizer.json'. Spice retries the download; to raise the limit, set `hf_token`, set `HF_TOKEN`, or run `hf auth login`.",
+            ),
+            (
+                error(false, None, rate_limited_without_file()),
+                "the Hub kept rate-limiting requests, so Spice read only the Hugging Face cache, which does not hold 'tokenizer.json'. Restart Spice once the limit resets; to raise the limit, set `hf_token`, set `HF_TOKEN`, or run `hf auth login`.",
             ),
         ];
         for (actual, expected) in cases {

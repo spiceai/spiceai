@@ -891,10 +891,12 @@ impl PreparedStagedAppend {
     /// 6) uses [`Self::apply_under_held_barrier`] instead so it can hold the
     /// fences on every participating partition for one shared barrier window.
     ///
+    /// Returns the statistics epoch the files were published under.
+    ///
     /// # Errors
     ///
     /// Returns an error if moving the staged files or removing the WAL fails.
-    pub async fn apply_under_barrier(&self) -> Result<()> {
+    pub async fn apply_under_barrier(&self) -> Result<u64> {
         let _write_guard = self.lock_current_snapshot_for_apply().await;
         let _visibility_guard = self.table.visibility_lock_arc().lock_owned().await;
         // Hold the listing fence for the entire move + WAL removal + listing
@@ -919,7 +921,7 @@ impl PreparedStagedAppend {
         // (non-IVM table, or a non-incremental write) marks stale instead.
         self.table
             .feed_staged_ivm_under_fence(self.ivm_feed_batches.as_ref());
-        Ok(())
+        Ok(self.table.statistics_epoch())
     }
 
     /// Apply the staged write ASSUMING the caller already holds this
@@ -1321,7 +1323,7 @@ impl CayenneTableProvider {
         if !self.begin_final_key_write(&staging_snapshot_id, &self.get_current_snapshot_id()) {
             self.clear_new_staging_snapshot_dir(&staging_snapshot_id)
                 .await?;
-            self.staging_may_have_files().store(true, Ordering::Release);
+            self.mark_staging_may_have_files(&staging_snapshot_id);
         }
 
         let (row_count, _writer_ops, _stats_acc) = match self

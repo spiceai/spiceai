@@ -33,7 +33,10 @@ use tokio::sync::broadcast::error::RecvError;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::datafusion::request_context_extension::get_current_datafusion;
-use crate::dataupdate::{DataUpdate, DataUpdateReceiver, UpdateType};
+use crate::dataupdate::{DataUpdateReceiver, UpdateType};
+use runtime_acceleration::dataupdate::SequencedDataUpdate;
+
+use super::append_stream::StreamMetadata;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{Service, metrics};
@@ -45,14 +48,14 @@ const MAX_PENDING_INITIAL_SNAPSHOT_UPDATE_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Default)]
 struct PendingInitialSnapshotUpdates {
-    updates: VecDeque<DataUpdate>,
+    updates: VecDeque<SequencedDataUpdate>,
     batches: usize,
     rows: usize,
     bytes: usize,
 }
 
 impl PendingInitialSnapshotUpdates {
-    fn push_back(&mut self, update: DataUpdate) -> bool {
+    fn push_back(&mut self, update: SequencedDataUpdate) -> bool {
         let (update_batches, update_rows, update_bytes) = update_stats(&update);
         let next_updates = self.updates.len().saturating_add(1);
         let next_batches = self.batches.saturating_add(update_batches);
@@ -75,7 +78,7 @@ impl PendingInitialSnapshotUpdates {
         true
     }
 
-    fn pop_front(&mut self) -> Option<DataUpdate> {
+    fn pop_front(&mut self) -> Option<SequencedDataUpdate> {
         let update = self.updates.pop_front()?;
         let (update_batches, update_rows, update_bytes) = update_stats(&update);
         self.batches = self.batches.saturating_sub(update_batches);
@@ -92,8 +95,8 @@ impl PendingInitialSnapshotUpdates {
     }
 }
 
-fn update_stats(update: &DataUpdate) -> (usize, usize, usize) {
-    update.data.iter().fold(
+fn update_stats(update: &SequencedDataUpdate) -> (usize, usize, usize) {
+    update.update.data.iter().fold(
         (0usize, 0usize, 0usize),
         |(batch_count, row_count, byte_count), batch| {
             (
@@ -126,7 +129,30 @@ impl Default for ChangeFlightEncoder {
 }
 
 impl ChangeFlightEncoder {
+    /// A schema message carrying `metadata`, which a subscriber reads as a
+    /// marker and not as data. It resends the current schema, so dictionaries
+    /// are sent afresh after it.
+    fn marker(&mut self, metadata: &StreamMetadata) -> Option<FlightData> {
+        let schema = self.schema.as_ref()?;
+        let flight = FlightData::from(SchemaAsIpc::new(schema.as_ref(), &self.write_options))
+            .with_app_metadata(metadata.to_bytes());
+        self.tracker = DictionaryTracker::new(false);
+        Some(flight)
+    }
+
+    #[cfg(test)]
     fn encode(&mut self, record_batch: &RecordBatch) -> Result<Vec<FlightData>, Status> {
+        self.encode_with_metadata(record_batch, None)
+    }
+
+    /// Encodes `record_batch`, with `metadata` on each of its record batch
+    /// messages.
+    fn encode_with_metadata(
+        &mut self,
+        record_batch: &RecordBatch,
+        metadata: Option<&StreamMetadata>,
+    ) -> Result<Vec<FlightData>, Status> {
+        let app_metadata = metadata.map(StreamMetadata::to_bytes);
         let mut flights = Vec::new();
         let schema_changed = self
             .schema
@@ -159,7 +185,11 @@ impl ChangeFlightEncoder {
                 .map_err(|source| Status::internal(format!("Unable to encode batch: {source}")))?;
 
             flights.extend(flight_dictionaries.into_iter().map(Into::into));
-            flights.push(flight_batch.into());
+            let flight_batch: FlightData = flight_batch.into();
+            flights.push(match &app_metadata {
+                Some(app_metadata) => flight_batch.with_app_metadata(app_metadata.clone()),
+                None => flight_batch,
+            });
         }
 
         Ok(flights)
@@ -212,42 +242,87 @@ pub(crate) async fn handle(
         )));
     };
 
-    let rx = flight_svc
-        .data_update_broadcaster
-        .subscribe(&data_path)
-        .await;
+    Ok(Response::new(
+        open_subscription(
+            &flight_svc.data_update_broadcaster,
+            &datafusion,
+            table_provider,
+            data_path,
+        )
+        .await?,
+    ))
+}
 
-    Ok(Response::new(do_exchange_response_stream(
+/// Opens an append-stream subscription to `data_path`: its truncate, snapshot,
+/// end marker, and then the updates committed after the snapshot.
+pub(crate) async fn open_subscription(
+    broadcaster: &crate::dataupdate::DataUpdateBroadcaster,
+    datafusion: &Arc<crate::datafusion::DataFusion>,
+    table_provider: Arc<dyn TableProvider>,
+    data_path: TableReference,
+) -> Result<futures::stream::BoxStream<'static, Result<FlightData, Status>>, Status> {
+    // Subscribe and open the snapshot while no fenced commit runs, so the
+    // snapshot holds exactly the commits up to the sequence number read, and
+    // every later commit reaches the subscription.
+    let (rx, snapshot_fence) = broadcaster.subscribe_at_snapshot(&data_path).await;
+    let mut snapshot = initial_snapshot_stream(datafusion, Arc::clone(&table_provider)).await?;
+    // A provider may defer its query to the first poll (DuckDB does), so the
+    // snapshot is pinned only once its first batch is read: read it under the
+    // fence too.
+    let first_batch = snapshot.next().await;
+    let snapshot_schema = snapshot.schema();
+    let snapshot: SendableRecordBatchStream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            snapshot_schema,
+            futures::stream::iter(first_batch).chain(snapshot),
+        ),
+    );
+    let snapshot_position = SnapshotPosition {
+        epoch: broadcaster.epoch().to_string(),
+        sequence: snapshot_fence.sequence,
+    };
+    drop(snapshot_fence);
+
+    Ok(do_exchange_response_stream(
         rx,
+        snapshot,
+        snapshot_position,
         table_provider,
-        datafusion,
         data_path,
-    )))
+    ))
+}
+
+/// Where a subscription's snapshot stands in the producer's commits.
+struct SnapshotPosition {
+    epoch: String,
+    /// The last commit the snapshot holds.
+    sequence: u64,
 }
 
 fn do_exchange_response_stream(
     mut rx: DataUpdateReceiver,
+    mut initial_snapshot_stream: SendableRecordBatchStream,
+    snapshot_position: SnapshotPosition,
     table_provider_stream: Arc<dyn TableProvider>,
-    datafusion_stream: Arc<crate::datafusion::DataFusion>,
     data_path_stream: TableReference,
 ) -> futures::stream::BoxStream<'static, Result<FlightData, Status>> {
     // The stream interleaves a fallible initial snapshot, broadcast updates, and IPC encoding without materializing the response.
     let response_stream = try_stream! {
         let mut encoder = ChangeFlightEncoder::default();
         enum InitialSnapshotEvent {
-            DataUpdate(Result<DataUpdate, RecvError>),
+            DataUpdate(Result<SequencedDataUpdate, RecvError>),
             SnapshotBatch(Option<Result<RecordBatch, DataFusionError>>),
         }
 
-        let mut initial_snapshot_stream = initial_snapshot_stream(
-            &datafusion_stream,
-            Arc::clone(&table_provider_stream),
-        )
-        .await?;
         let snapshot_schema = initial_snapshot_stream.schema();
+        let epoch = snapshot_position.epoch;
 
         let truncate_batch = truncate_change_batch(&snapshot_schema)?;
-        let flights = encode_and_count(&mut encoder, &truncate_batch)?;
+        let flights = encode_and_count(
+            &mut encoder,
+            &truncate_batch,
+            Some(&StreamMetadata::begin(&epoch)),
+        )?;
         for flight in flights {
             yield flight;
         }
@@ -256,7 +331,7 @@ fn do_exchange_response_stream(
 
         loop {
             let event = tokio::select! {
-                update = rx.recv() => InitialSnapshotEvent::DataUpdate(update),
+                update = rx.recv_sequenced() => InitialSnapshotEvent::DataUpdate(update),
                 batch = initial_snapshot_stream.next() => InitialSnapshotEvent::SnapshotBatch(batch),
             };
 
@@ -300,7 +375,7 @@ fn do_exchange_response_stream(
                         &table_provider_stream,
                         &batch,
                     )?;
-                    let flights = encode_and_count(&mut encoder, &change_batch)?;
+                    let flights = encode_and_count(&mut encoder, &change_batch, None)?;
                     for flight in flights {
                         yield flight;
                     }
@@ -309,18 +384,33 @@ fn do_exchange_response_stream(
             }
         }
 
-        while let Some(data_update) = pending_updates.pop_front() {
+        // The snapshot is complete: mark its end with the last commit it holds.
+        if let Some(flight) =
+            encoder.marker(&StreamMetadata::end(&epoch, snapshot_position.sequence))
+        {
+            metrics::DO_EXCHANGE_DATA_UPDATES_SENT.add(1, &[]);
+            yield flight;
+        }
+
+        while let Some(SequencedDataUpdate { sequence, update: data_update }) =
+            pending_updates.pop_front()
+        {
+            if sequence <= snapshot_position.sequence {
+                continue;
+            }
+            let metadata = StreamMetadata::update(&epoch, sequence);
             if data_update.update_type == UpdateType::Overwrite {
                 let truncate_batch = truncate_change_batch(&data_update.schema)?;
-                let flights = encode_and_count(&mut encoder, &truncate_batch)?;
+                let flights = encode_and_count(&mut encoder, &truncate_batch, Some(&metadata))?;
                 for flight in flights {
                     yield flight;
                 }
             }
 
             for batch in &data_update.data {
-                let change_batch = record_batch_to_change_batch(&table_provider_stream, batch)?;
-                let flights = encode_and_count(&mut encoder, &change_batch)?;
+                let batch = align_to_snapshot_schema(batch, &snapshot_schema);
+                let change_batch = record_batch_to_change_batch(&table_provider_stream, &batch)?;
+                let flights = encode_and_count(&mut encoder, &change_batch, Some(&metadata))?;
                 for flight in flights {
                     yield flight;
                 }
@@ -328,8 +418,8 @@ fn do_exchange_response_stream(
         }
 
         loop {
-            let data_update = match rx.recv().await {
-                Ok(data_update) => data_update,
+            let (sequence, data_update) = match rx.recv_sequenced().await {
+                Ok(SequencedDataUpdate { sequence, update }) => (sequence, update),
                 Err(RecvError::Lagged(skipped_messages)) => {
                     Err(Status::data_loss(format!(
                         "DoExchange subscriber fell behind and missed {skipped_messages} update(s) for dataset {data_path_stream}; resubscribe and reconcile state"
@@ -341,18 +431,23 @@ fn do_exchange_response_stream(
                     )))?
                 }
             };
+            if sequence <= snapshot_position.sequence {
+                continue;
+            }
+            let metadata = StreamMetadata::update(&epoch, sequence);
 
             if data_update.update_type == UpdateType::Overwrite {
                 let truncate_batch = truncate_change_batch(&data_update.schema)?;
-                let flights = encode_and_count(&mut encoder, &truncate_batch)?;
+                let flights = encode_and_count(&mut encoder, &truncate_batch, Some(&metadata))?;
                 for flight in flights {
                     yield flight;
                 }
             }
 
             for batch in &data_update.data {
-                let change_batch = record_batch_to_change_batch(&table_provider_stream, batch)?;
-                let flights = encode_and_count(&mut encoder, &change_batch)?;
+                let batch = align_to_snapshot_schema(batch, &snapshot_schema);
+                let change_batch = record_batch_to_change_batch(&table_provider_stream, &batch)?;
+                let flights = encode_and_count(&mut encoder, &change_batch, Some(&metadata))?;
                 for flight in flights {
                     yield flight;
                 }
@@ -366,8 +461,9 @@ fn do_exchange_response_stream(
 fn encode_and_count(
     encoder: &mut ChangeFlightEncoder,
     record_batch: &RecordBatch,
+    metadata: Option<&StreamMetadata>,
 ) -> Result<Vec<FlightData>, Status> {
-    let flights = encoder.encode(record_batch)?;
+    let flights = encoder.encode_with_metadata(record_batch, metadata)?;
     metrics::DO_EXCHANGE_DATA_UPDATES_SENT.add(flights.len() as u64, &[]);
     Ok(flights)
 }
@@ -398,10 +494,10 @@ fn record_batch_to_change_batch(
     let primary_keys = get_primary_keys_from_constraints(&schema, table_provider.constraints())?;
     let primary_keys_array = match primary_keys.as_ref() {
         Some(primary_keys) => get_primary_keys_array(primary_keys, row_count),
-        None => ListArray::new_null(
-            Arc::new(Field::new("item", DataType::Utf8, false)),
-            row_count,
-        ),
+        // An empty key list per row, not a null one. Both mean "no keys", but
+        // an older subscriber reads a batch of null lists as rows with
+        // different keys and writes each row on its own.
+        None => get_primary_keys_array(&[], row_count),
     };
     let data_array = StructArray::from(batch.clone());
     let change_schema = Arc::new(changes_schema(schema.as_ref()));
@@ -419,6 +515,25 @@ fn record_batch_to_change_batch(
             "Unable to convert record batch into change event: {source}"
         ))
     })
+}
+
+/// `batch` in the schema the subscriber's initial snapshot used, when it can be
+/// cast to it. A refresh publishes the rows it read from its source, whose
+/// types the acceleration may store differently; a subscriber resolves its
+/// schema from the first batch it receives, so later batches have to match it.
+fn align_to_snapshot_schema(batch: &RecordBatch, snapshot_schema: &SchemaRef) -> RecordBatch {
+    if batch.schema().fields() == snapshot_schema.fields() {
+        return batch.clone();
+    }
+    match arrow_tools::record_batch::try_cast_to(batch.clone(), Arc::clone(snapshot_schema)) {
+        Ok(aligned) => aligned,
+        Err(error) => {
+            tracing::debug!(
+                "DoExchange data update does not cast to the initial snapshot schema, so it is sent as is: {error}"
+            );
+            batch.clone()
+        }
+    }
 }
 
 fn truncate_change_batch(schema: &SchemaRef) -> Result<RecordBatch, Status> {
@@ -483,6 +598,7 @@ fn get_primary_keys_array(primary_keys: &[&str], row_count: usize) -> ListArray 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataupdate::DataUpdate;
     use arrow::array::{Array, BooleanArray, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
 
@@ -504,6 +620,10 @@ mod tests {
         }
     }
 
+    fn sequenced(update: DataUpdate, sequence: u64) -> SequencedDataUpdate {
+        SequencedDataUpdate { sequence, update }
+    }
+
     #[test]
     fn test_get_primary_keys_array_repeats_keys_for_each_row() {
         let primary_keys = get_primary_keys_array(&["tenant", "id"], 2);
@@ -523,6 +643,53 @@ mod tests {
         }
     }
 
+    /// A table without a primary key sends an empty key list per row, not a
+    /// null one, so a subscriber writes a snapshot batch at once instead of one
+    /// row at a time.
+    #[test]
+    fn test_keyless_change_batch_sends_empty_key_lists() {
+        let table_provider: Arc<dyn TableProvider> = Arc::new(
+            datafusion::datasource::MemTable::try_new(test_schema(), vec![vec![]])
+                .expect("mem table should be created"),
+        );
+        let change_batch =
+            record_batch_to_change_batch(&table_provider, &test_batch(vec![1, 2, 3]))
+                .expect("change batch should be built");
+        let keys = change_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("primary keys should be a list");
+
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys.null_count(), 0, "no row has a null key list");
+        assert!((0..keys.len()).all(|row| keys.value_length(row) == 0));
+    }
+
+    /// Rows a refresh publishes in its source's types go out in the types of
+    /// the subscriber's initial snapshot.
+    #[test]
+    fn test_align_to_snapshot_schema_casts_published_rows() {
+        let wide = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let published = RecordBatch::try_new(
+            Arc::clone(&wide),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![7, 8]))],
+        )
+        .expect("published batch should be valid");
+
+        let aligned = align_to_snapshot_schema(&published, &test_schema());
+        assert_eq!(aligned.schema().fields(), test_schema().fields());
+        let ids = aligned
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("aligned ids should be int32");
+        assert_eq!(ids.values().to_vec(), vec![7, 8]);
+
+        let unchanged = align_to_snapshot_schema(&test_batch(vec![1]), &test_schema());
+        assert_eq!(unchanged.num_rows(), 1);
+    }
+
     #[test]
     fn test_truncate_change_batch_emits_truncate_operation() {
         let batch = truncate_change_batch(&test_schema()).expect("truncate batch should be valid");
@@ -539,8 +706,13 @@ mod tests {
     #[test]
     fn test_pending_initial_snapshot_updates_preserves_order() {
         let mut pending_updates = PendingInitialSnapshotUpdates::default();
-        assert!(pending_updates.push_back(test_data_update(vec![1], UpdateType::Append)));
-        assert!(pending_updates.push_back(test_data_update(vec![2], UpdateType::Overwrite)));
+        assert!(
+            pending_updates.push_back(sequenced(test_data_update(vec![1], UpdateType::Append), 1))
+        );
+        assert!(pending_updates.push_back(sequenced(
+            test_data_update(vec![2], UpdateType::Overwrite),
+            2
+        )));
 
         let first_update = pending_updates
             .pop_front()
@@ -549,8 +721,8 @@ mod tests {
             .pop_front()
             .expect("second pending update should exist");
 
-        assert_eq!(first_update.update_type, UpdateType::Append);
-        assert_eq!(second_update.update_type, UpdateType::Overwrite);
+        assert_eq!(first_update.update.update_type, UpdateType::Append);
+        assert_eq!(second_update.update.update_type, UpdateType::Overwrite);
         assert!(pending_updates.pop_front().is_none());
     }
 
@@ -564,7 +736,7 @@ mod tests {
         };
         let mut pending_updates = PendingInitialSnapshotUpdates::default();
 
-        assert!(!pending_updates.push_back(update));
+        assert!(!pending_updates.push_back(sequenced(update, 1)));
         assert!(pending_updates.pop_front().is_none());
     }
 
@@ -586,7 +758,7 @@ mod tests {
         };
         let mut pending_updates = PendingInitialSnapshotUpdates::default();
 
-        assert!(!pending_updates.push_back(update));
+        assert!(!pending_updates.push_back(sequenced(update, 1)));
         assert!(pending_updates.pop_front().is_none());
     }
 
@@ -641,9 +813,17 @@ mod tests {
         );
         let data_path = TableReference::bare("orders");
         let broadcaster = crate::dataupdate::DataUpdateBroadcaster::new();
-        let rx = broadcaster.subscribe(&data_path).await;
+        let (rx, fence) = broadcaster.subscribe_at_snapshot(&data_path).await;
+        let snapshot = initial_snapshot_stream(&datafusion, Arc::clone(&table_provider) as _)
+            .await
+            .expect("snapshot stream");
+        let position = SnapshotPosition {
+            epoch: broadcaster.epoch().to_string(),
+            sequence: fence.sequence,
+        };
+        drop(fence);
         let response_stream =
-            do_exchange_response_stream(rx, table_provider, datafusion, data_path.clone())
+            do_exchange_response_stream(rx, snapshot, position, table_provider, data_path.clone())
                 .map_err(|status| FlightError::Tonic(Box::new(status)));
 
         broadcaster
@@ -675,6 +855,95 @@ mod tests {
         assert_eq!(change_data_id(&batches[1]), 1);
         assert_eq!(change_op(&batches[2]), "r");
         assert_eq!(change_data_id(&batches[2]), 2);
+    }
+
+    /// The truncate opening the snapshot carries `begin`, a schema message
+    /// carrying `end` and the snapshot's sequence number follows the snapshot,
+    /// and each later update carries its own sequence number.
+    #[tokio::test]
+    async fn test_do_exchange_response_stream_marks_snapshot_and_sequences_updates() {
+        use super::super::append_stream::StreamMarker;
+        use arrow_flight::{
+            decode::{DecodedPayload, FlightDataDecoder},
+            error::FlightError,
+        };
+        use datafusion::datasource::MemTable;
+        use futures::TryStreamExt;
+        use std::time::Duration;
+
+        let runtime = crate::Runtime::builder().build().await;
+        let datafusion = runtime.datafusion();
+        let table_provider = Arc::new(
+            MemTable::try_new(test_schema(), vec![vec![test_batch(vec![1])]])
+                .expect("mem table should be created"),
+        );
+        let data_path = TableReference::bare("orders");
+        let broadcaster = crate::dataupdate::DataUpdateBroadcaster::new();
+        // One commit before the subscription: the snapshot holds it.
+        let _earlier = broadcaster.subscribe(&data_path).await;
+        broadcaster
+            .publish(&data_path, test_data_update(vec![1], UpdateType::Append))
+            .await;
+        let (rx, fence) = broadcaster.subscribe_at_snapshot(&data_path).await;
+        let snapshot = initial_snapshot_stream(&datafusion, Arc::clone(&table_provider) as _)
+            .await
+            .expect("snapshot stream");
+        let position = SnapshotPosition {
+            epoch: broadcaster.epoch().to_string(),
+            sequence: fence.sequence,
+        };
+        drop(fence);
+        let response_stream =
+            do_exchange_response_stream(rx, snapshot, position, table_provider, data_path.clone())
+                .map_err(|status| FlightError::Tonic(Box::new(status)));
+        broadcaster
+            .publish(&data_path, test_data_update(vec![2], UpdateType::Append))
+            .await;
+
+        let messages = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut decoder = FlightDataDecoder::new(response_stream);
+            let mut messages = Vec::new();
+            loop {
+                let message = decoder
+                    .try_next()
+                    .await
+                    .expect("flight data should decode")
+                    .expect("stream should yield enough messages");
+                let metadata = StreamMetadata::parse(&message.inner.app_metadata);
+                let is_batch = matches!(message.payload, DecodedPayload::RecordBatch(_));
+                let id = match &message.payload {
+                    DecodedPayload::RecordBatch(batch) if change_op(batch) == "r" => {
+                        Some(change_data_id(batch))
+                    }
+                    _ => None,
+                };
+                messages.push((is_batch, metadata, id));
+                if id == Some(2) {
+                    return messages;
+                }
+            }
+        })
+        .await
+        .expect("snapshot, end marker and update should be emitted");
+
+        let epoch = broadcaster.epoch().to_string();
+        let marked: Vec<_> = messages
+            .iter()
+            .filter(|(_, metadata, _)| metadata.is_some())
+            .collect();
+        assert_eq!(marked.len(), 3, "{messages:?}");
+        assert_eq!(marked[0].1, Some(StreamMetadata::begin(&epoch)));
+        assert!(marked[0].0, "begin is on the truncate batch");
+        assert_eq!(marked[1].1, Some(StreamMetadata::end(&epoch, 1)));
+        assert!(!marked[1].0, "end is a schema message");
+        let update = marked[2].1.as_ref().expect("update metadata");
+        assert_eq!(update.marker, StreamMarker::Update);
+        assert_eq!(update.sequence, Some(2));
+        let snapshot_rows: Vec<_> = messages
+            .iter()
+            .filter_map(|(_, metadata, id)| metadata.is_none().then_some(*id).flatten())
+            .collect();
+        assert_eq!(snapshot_rows, vec![1], "the snapshot rows are unmarked");
     }
 
     fn change_op(batch: &RecordBatch) -> &str {

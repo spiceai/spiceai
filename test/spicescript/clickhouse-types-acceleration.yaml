@@ -1,4 +1,6 @@
 name: clickhouse-types-acceleration
+duration: 14s
+tags: [long]
 description: >
   A ClickHouse table with the common types the literal matrix does not cover
   (narrow and unsigned integers, Float32, FixedString, Date, DateTime, UUID,

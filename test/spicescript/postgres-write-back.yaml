@@ -1,4 +1,6 @@
 name: postgres-write-back
+duration: 72s
+tags: [long]
 description: >
   PostgreSQL CDC into file-mode Cayenne, with and without
   `write_mode: write_back`. A write-back dataset refuses a write outside a

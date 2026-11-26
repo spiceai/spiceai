@@ -1,4 +1,6 @@
 name: results-cache-swr
+duration: 15s
+tags: [long, macos-smoke]
 description: >
   Past item_ttl and inside stale_while_revalidate_ttl, the SQL results cache
   serves a parameterized query's entry STALE at once and revalidates it in

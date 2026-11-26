@@ -1,4 +1,6 @@
 name: readiness-failures
+duration: 16s
+tags: [long]
 description: >
   A dataset that cannot load is reported in Error with a message naming the
   table; it keeps the runtime from being ready unless the runtime is ready

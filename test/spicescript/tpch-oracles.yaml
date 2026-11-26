@@ -1,4 +1,6 @@
 name: tpch-oracles
+duration: 71s
+tags: [long]
 description: >
   TPC-H (scale 0.01) through Spice over PostgreSQL, federated and in Cayenne,
   answers as MySQL does over the same rows: an oracle that shares neither

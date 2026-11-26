@@ -1,4 +1,6 @@
 name: slow-refresh-warning
+duration: 59s
+tags: [long]
 description: >
   A refresh that runs far longer than the dataset's recent refreshes is
   reported while it is still running, once it passes three times their median

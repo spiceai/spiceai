@@ -25,27 +25,23 @@ limitations under the License.
 //! source instead of the acceleration fails rather than passing on the source's rows.
 
 use std::fmt::Write as _;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::Schema;
-use arrow_flight::sql::client::FlightSqlServiceClient;
-use futures::TryStreamExt;
-use runtime::{Runtime, auth::EndpointAuth, config::Config};
-use tonic::transport::Channel;
+use runtime::Runtime;
 
 use super::{
-    compare, make_dim, make_fact, micro_queries, sqlite_accel, standalone_duckdb, write_parquet,
+    compare, make_dim, make_fact, micro_queries, standalone_duckdb, standalone_sqlite,
+    write_parquet,
 };
 use crate::configure_test_datafusion;
 use crate::utils::{
-    free_ports, register_test_connectors, run_query, runtime_ready_check, test_request_context,
-    wait_until_true,
+    register_test_connectors, run_query, runtime_ready_check,
+    sql_clients::{SURFACES, SqlClients},
+    test_request_context,
 };
 
-const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const FACT_ROWS: usize = 2_048;
 const DIM_ROWS: usize = 256;
 
@@ -95,71 +91,6 @@ fn spicepod(engine: &str, storage: Storage, dir: &std::path::Path) -> String {
     )
 }
 
-/// Decodes `/v1/sql`'s `application/vnd.spiceai.sql.v1+json` answer with the Arrow schema
-/// the response carries, so the comparison sees the types the server reported.
-async fn over_http(
-    client: &reqwest::Client,
-    port: u16,
-    sql: &str,
-) -> Result<Vec<RecordBatch>, String> {
-    let response = client
-        .post(format!("http://{LOCALHOST}:{port}/v1/sql"))
-        .header("Accept", "application/vnd.spiceai.sql.v1+json")
-        .header("Content-Type", "text/plain")
-        .body(sql.to_string())
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let status = response.status();
-    let body = response.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        return Err(format!("HTTP {status}: {body}"));
-    }
-    let body: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    let rows = body["data"]
-        .as_array()
-        .ok_or_else(|| format!("no `data` array in {body}"))?;
-    let row_count = body["row_count"].as_u64();
-    if row_count != Some(rows.len() as u64) {
-        return Err(format!(
-            "`row_count` {row_count:?} disagrees with the {} rows in `data`",
-            rows.len()
-        ));
-    }
-    if rows.is_empty() {
-        return Ok(vec![]);
-    }
-    let schema: Schema =
-        serde_json::from_value(body["schema"].clone()).map_err(|e| e.to_string())?;
-    let mut decoder = arrow_json::ReaderBuilder::new(Arc::new(schema))
-        .build_decoder()
-        .map_err(|e| e.to_string())?;
-    decoder.serialize(rows).map_err(|e| e.to_string())?;
-    Ok(decoder
-        .flush()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .collect())
-}
-
-async fn over_flight_sql(channel: &Channel, sql: &str) -> Result<Vec<RecordBatch>, String> {
-    let mut client = FlightSqlServiceClient::new(channel.clone());
-    let info = client
-        .execute(sql.to_string(), None)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut batches = Vec::new();
-    for endpoint in info.endpoint {
-        let ticket = endpoint
-            .ticket
-            .ok_or_else(|| "a Flight SQL endpoint carried no ticket".to_string())?;
-        let stream = client.do_get(ticket).await.map_err(|e| e.to_string())?;
-        let mut part: Vec<RecordBatch> = stream.try_collect().await.map_err(|e| e.to_string())?;
-        batches.append(&mut part);
-    }
-    Ok(batches)
-}
-
 fn row_count(batches: &[RecordBatch]) -> usize {
     batches.iter().map(RecordBatch::num_rows).sum()
 }
@@ -180,7 +111,7 @@ async fn surfaces_match_standalone_oracles(engine: &str, storage: Storage) {
     )
     .expect("the spicepod must be written");
 
-    let (_sqlite_dir, sqlite) = sqlite_accel::load_standalone_sqlite(&tables);
+    let (_sqlite_dir, sqlite) = standalone_sqlite::load_standalone_sqlite(&tables);
     let (_duckdb_dir, duckdb) = standalone_duckdb::load_standalone_duckdb(&tables);
 
     register_test_connectors().await;
@@ -200,34 +131,9 @@ async fn surfaces_match_standalone_oracles(engine: &str, storage: Storage) {
             .unwrap_or_else(|e| panic!("remove {name}.parquet: {e}"));
     }
 
-    let [http_port, flight_port] = free_ports();
-    let config = Config::new()
-        .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
-        .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port));
-    let server_rt = Arc::clone(&rt);
-    tokio::spawn(async move {
-        Box::pin(server_rt.start_servers(config, None, EndpointAuth::default())).await
-    });
-
-    let http = reqwest::Client::new();
-    let flight_endpoint = Channel::from_shared(format!("http://{LOCALHOST}:{flight_port}"))
-        .expect("a valid Flight URI");
-    // HTTP readiness does not mean the Flight server is listening, so wait for both.
-    assert!(
-        wait_until_true(Duration::from_secs(30), || async {
-            http.get(format!("http://{LOCALHOST}:{http_port}/health"))
-                .send()
-                .await
-                .is_ok()
-                && flight_endpoint.connect().await.is_ok()
-        })
-        .await,
-        "the HTTP server on port {http_port} and the Flight server on port {flight_port} did not both start within 30s"
-    );
-    let flight = flight_endpoint
-        .connect()
+    let clients = SqlClients::start(&rt)
         .await
-        .expect("the Flight server accepted a connection");
+        .unwrap_or_else(|e| panic!("{e}"));
 
     if engine == "cayenne" {
         assert_cayenne_storage(&rt, storage).await;
@@ -243,7 +149,7 @@ async fn surfaces_match_standalone_oracles(engine: &str, storage: Storage) {
             ),
             (
                 "standalone-sqlite",
-                sqlite_accel::standalone_query(&sqlite, &q.sql)
+                standalone_sqlite::standalone_query(&sqlite, &q.sql)
                     .unwrap_or_else(|e| panic!("sqlite sql {}: {e}", q.name)),
             ),
         ];
@@ -256,14 +162,10 @@ async fn surfaces_match_standalone_oracles(engine: &str, storage: Storage) {
                 q.name
             );
         }
-        let surfaces = [
-            (
-                "in-process",
-                run_query(&rt, &q.sql).await.map_err(|e| e.to_string()),
-            ),
-            ("http", over_http(&http, http_port, &q.sql).await),
-            ("flight-sql", over_flight_sql(&flight, &q.sql).await),
-        ];
+        let mut surfaces = Vec::with_capacity(SURFACES.len());
+        for surface in SURFACES {
+            surfaces.push((surface.label(), clients.query(surface, &q.sql).await));
+        }
         for (surface, spice) in &surfaces {
             let spice = match spice {
                 Ok(batches) if row_count(batches) > 0 => batches,
@@ -325,16 +227,6 @@ async fn run(engine: &'static str, storage: Storage) {
     test_request_context()
         .scope(surfaces_match_standalone_oracles(engine, storage))
         .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn arrow_surfaces_vs_standalone_engines() {
-    run("arrow", Storage::Memory).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn sqlite_surfaces_vs_standalone_engines() {
-    run("sqlite", Storage::Memory).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

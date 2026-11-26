@@ -1,4 +1,6 @@
 name: postgres-cdc-kill-under-load
+duration: 255s
+tags: [long]
 description: >
   Repeated SIGKILLs of spiced during PostgreSQL CDC load leave a file-mode
   Cayenne acceleration (refresh_mode: changes) with exactly the source's rows,

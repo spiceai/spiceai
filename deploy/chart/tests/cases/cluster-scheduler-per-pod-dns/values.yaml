@@ -1,0 +1,12 @@
+role: scheduler
+replicaCount: 2
+cluster:
+  tls:
+    secretName: spice-scheduler-tls
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: app
+  runtime:
+    state:
+      location: s3://bucket/spice-state

@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q21"
 ---
-+------------------+------------------+------------+-----------+
-| w_warehouse_name | i_item_id        | inv_before | inv_after |
-+------------------+------------------+------------+-----------+
-| Certainly fede   | AAAAAAAAAACDAAAA | 2062       | 2960      |
-| Certainly fede   | AAAAAAAAAACOAAAA | 1823       | 2365      |
-| Certainly fede   | AAAAAAAAAADHAAAA | 2409       | 2560      |
-| Certainly fede   | AAAAAAAAAADPBAAA | 980        | 1362      |
-| Certainly fede   | AAAAAAAAAAEGAAAA | 1659       | 1945      |
-| Certainly fede   | AAAAAAAAAAEKCAAA | 1055       | 1511      |
-| Certainly fede   | AAAAAAAAAAFADAAA | 1746       | 2368      |
-| Certainly fede   | AAAAAAAAAAHDAAAA | 1772       | 2126      |
-| Certainly fede   | AAAAAAAAAAHMAAAA | 1541       | 2447      |
-| Certainly fede   | AAAAAAAAAAKNCAAA | 1947       | 2610      |
-+------------------+------------------+------------+-----------+
++----------------------+------------------+------------+-----------+
+| w_warehouse_name     | i_item_id        | inv_before | inv_after |
++----------------------+------------------+------------+-----------+
+| Bad cards must make. | AAAAAAAAAAAACAAA | 1700       | 2096      |
+| Bad cards must make. | AAAAAAAAAACDAAAA | 2164       | 2834      |
+| Bad cards must make. | AAAAAAAAAACNCAAA | 1837       | 3499      |
+| Bad cards must make. | AAAAAAAAAACOAAAA | 1951       | 2180      |
+| Bad cards must make. | AAAAAAAAAADHAAAA | 1678       | 2027      |
+| Bad cards must make. | AAAAAAAAAAEGAAAA | 2360       | 2696      |
+| Bad cards must make. | AAAAAAAAAAFGCAAA | 1797       | 1874      |
+| Bad cards must make. | AAAAAAAAAAFPAAAA | 1855       | 2253      |
+| Bad cards must make. | AAAAAAAAAAGNAAAA | 2098       | 2598      |
+| Bad cards must make. | AAAAAAAAAAKNAAAA | 949        | 1001      |
++----------------------+------------------+------------+-----------+

@@ -1,4 +1,6 @@
 name: memory-limit
+duration: 211s
+tags: [long]
 description: >
   Under a `runtime.query.memory_limit` (1 GiB) smaller than what the
   queries hold at once, queries over a Cayenne acceleration of 2 million

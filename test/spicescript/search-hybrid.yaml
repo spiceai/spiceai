@@ -1,4 +1,6 @@
 name: search-hybrid
+duration: 15s
+tags: [long]
 description: >
   Search on Cayenne beyond single queries: rrf fuses text_search and
   vector_search into exactly the documents either finds; a text_search

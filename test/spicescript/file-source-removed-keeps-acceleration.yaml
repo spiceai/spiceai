@@ -1,4 +1,5 @@
 name: file-source-removed-keeps-acceleration
+duration: 7s
 description: >
   When every source file of a file-connector dataset is removed, a federated
   query errors instead of returning zero rows, and a full refresh into Cayenne

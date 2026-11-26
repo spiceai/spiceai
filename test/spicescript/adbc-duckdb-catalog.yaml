@@ -1,4 +1,5 @@
 name: adbc-duckdb-catalog
+duration: 3s
 description: >
   Discover DuckDB schemas and tables through the ADBC catalog, select tables
   with include/exclude patterns, and compare typed rows, aggregates and joins
@@ -17,6 +18,10 @@ spicepod:
       include: ['main.*', 'other.*']
       exclude: ['main.secret']
       params: ${sources.src.adbc_params}
+
+defaults:
+  # The table-discovery skip is logged at debug level.
+  spiced-args: [-v]
 
 steps:
   # Seed before direct ADBC opens the file read-write and takes its lock.
@@ -90,6 +95,23 @@ steps:
         - [main, items]
         - [main, readings]
         - [other, extra]
+  # A schema `include` cannot reach is still registered, with no tables.
+  - query: >
+      SELECT schema_name FROM information_schema.schemata
+      WHERE catalog_name = 'ddb' AND schema_name <> 'information_schema' ORDER BY 1
+    expect:
+      rows:
+        - [ignored]
+        - [main]
+        - [other]
+        - [pg_catalog]
+  # `include` reaches no table in `ignored`, so its tables are never listed;
+  # `main` and `other` are listed.
+  - assert-log:
+      contains: "Schema 'ignored' of ADBC catalog 'ddb' cannot match any include pattern; skipping its table discovery"
+      lacks:
+        - "Schema 'main' of ADBC catalog 'ddb' cannot match"
+        - "Schema 'other' of ADBC catalog 'ddb' cannot match"
   - query: SELECT * FROM ddb.main.readings ORDER BY id
     expect: { rows: *readings }
   - query: SELECT * FROM ddb.main.items ORDER BY id

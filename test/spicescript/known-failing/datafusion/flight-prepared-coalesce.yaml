@@ -3,6 +3,7 @@
 # server-side with "Cannot cast string 'name 1' to value of UInt64 type";
 # federated it answers, and so does the same query with HTTP parameters.
 name: flight-prepared-coalesce
+duration: 6s
 description: >
   A Flight SQL prepared statement with a parameter in a projected COALESCE
   answers as PostgreSQL does with the value written in, over a federated

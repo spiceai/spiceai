@@ -1,4 +1,6 @@
 name: mysql-cdc-shutdown-mid-delivery
+duration: 64s
+tags: [long]
 description: >
   Two datasets share one MySQL binlog reader. One cannot apply changes because
   its embedding model is not answering, so transactions writing both tables

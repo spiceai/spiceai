@@ -1,4 +1,6 @@
 name: federation-differential
+duration: 95s
+tags: [long]
 description: >
   A query corpus answers the same through Spice as on the source itself, for
   PostgreSQL, MySQL, DuckDB and DuckLake, both federated (each query rewritten and pushed

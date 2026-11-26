@@ -1,4 +1,6 @@
 name: metrics-agreement-cdc
+duration: 41s
+tags: [long]
 description: >
   Metrics agree with a known workload: change capture of 100 inserts, 40
   updates and 10 deletes applies exactly 150 rows and absorbs exactly 10

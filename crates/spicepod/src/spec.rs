@@ -361,9 +361,11 @@ pub struct SpicepodDefinition {
     #[serde(default)]
     pub functions: Vec<ComponentOrReference<Function>>,
 
+    /// Spicepods this one depends on, under `spicepods/`. Each entry is the
+    /// reference itself (`acme/support`), or a mapping that also sets `trust`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
-    pub dependencies: Vec<String>,
+    pub dependencies: Vec<crate::dependency::Dependency>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]

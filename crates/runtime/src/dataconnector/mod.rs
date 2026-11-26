@@ -456,13 +456,13 @@ mod tests {
         );
     }
 
-    /// A source that advertises safe durable write-back delivery, so a wrapper
-    /// that silently inherits the trait default is visible as `false`.
+    /// A source that advertises safe durable write-back delivery and a user-token
+    /// client ID, so a wrapper that silently inherits a trait default is visible.
     #[derive(Debug)]
-    struct SafeDeliveryConnector;
+    struct CapableSource;
 
     #[async_trait]
-    impl DataConnector for SafeDeliveryConnector {
+    impl DataConnector for CapableSource {
         fn as_any(&self) -> &dyn Any {
             self
         }
@@ -478,20 +478,23 @@ mod tests {
         fn supports_durable_write_back_delivery(&self) -> bool {
             true
         }
+
+        fn user_token_client_id(&self) -> Option<&str> {
+            Some("client")
+        }
     }
 
-    /// `supports_durable_write_back_delivery` has a `false` default, so any
-    /// wrapper that forgets to forward it silently reports a safe source as
-    /// unsafe and the registration gate rejects a valid dataset. That is the
-    /// defaulted-no-op wrapper bug (#10460) applied to this capability, and it
-    /// compiles cleanly — only a test catches it.
+    /// `supports_durable_write_back_delivery` and `user_token_client_id` have
+    /// defaults, so a wrapper that forgets to forward one compiles cleanly: the
+    /// registration gate rejects a safe source as unsafe, or no request loads a
+    /// deferred dataset. Only a test catches it.
     ///
     /// `ElasticsearchFullTextConnector` forwards the same one-liner but is
     /// behind the `elasticsearch` feature and needs a params-bearing dataset to
     /// construct, so it is not exercised here.
     #[test]
-    fn every_wrapper_forwards_durable_write_back_delivery_support() {
-        let inner: Arc<dyn DataConnector> = Arc::new(SafeDeliveryConnector);
+    fn every_wrapper_forwards_the_source_capabilities() {
+        let inner: Arc<dyn DataConnector> = Arc::new(CapableSource);
         assert!(
             inner.supports_durable_write_back_delivery(),
             "precondition: the wrapped source advertises safe delivery"
@@ -502,6 +505,11 @@ mod tests {
             deferred.supports_durable_write_back_delivery(),
             "DeferredConnector must forward the source's delivery capability"
         );
+        assert_eq!(
+            deferred.user_token_client_id(),
+            Some("client"),
+            "DeferredConnector must forward the source's user-token client ID"
+        );
 
         let full_text =
             crate::search::full_text::connector::FullTextConnector::new(Arc::clone(&inner));
@@ -509,15 +517,26 @@ mod tests {
             full_text.supports_durable_write_back_delivery(),
             "FullTextConnector must forward the source's delivery capability"
         );
+        assert_eq!(
+            full_text.user_token_client_id(),
+            Some("client"),
+            "FullTextConnector must forward the source's user-token client ID"
+        );
 
         let embedding = crate::embeddings::connector::EmbeddingConnector::new(
             Arc::clone(&inner),
             Arc::new(RwLock::new(std::collections::HashMap::new())),
             Arc::new(RwLock::new(Secrets::default())),
+            crate::status::RuntimeStatus::new(),
         );
         assert!(
             embedding.supports_durable_write_back_delivery(),
             "EmbeddingConnector must forward the source's delivery capability"
+        );
+        assert_eq!(
+            embedding.user_token_client_id(),
+            Some("client"),
+            "EmbeddingConnector must forward the source's user-token client ID"
         );
 
         let drasi = crate::drasi::connector::DrasiConnector::new(
@@ -543,6 +562,66 @@ mod tests {
         assert!(
             drasi.supports_durable_write_back_delivery(),
             "DrasiConnector must forward the source's delivery capability"
+        );
+        assert_eq!(
+            drasi.user_token_client_id(),
+            Some("client"),
+            "DrasiConnector must forward the source's user-token client ID"
+        );
+    }
+
+    /// A request finds a deferred dataset by the client ID its source resolved.
+    #[tokio::test]
+    async fn requests_find_a_deferred_dataset_by_the_client_id_its_source_resolved() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let ds = Arc::new(
+            crate::component::dataset::builder::DatasetBuilder::try_new(
+                "databricks:main.sales.orders".into(),
+                "orders",
+            )
+            .expect("valid dataset")
+            .with_app(Arc::new(app::AppBuilder::new("deferred_dataset").build()))
+            .with_runtime(Arc::clone(&runtime))
+            .build()
+            .expect("valid dataset"),
+        );
+        let table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::datasource::MemTable::try_new(
+                Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+                    datafusion::arrow::datatypes::Field::new(
+                        "id",
+                        datafusion::arrow::datatypes::DataType::Int64,
+                        false,
+                    ),
+                ])),
+                vec![vec![]],
+            )
+            .expect("valid table"),
+        );
+        let df = runtime.datafusion();
+        df.register_table(
+            ds,
+            crate::datafusion::Table::Federated {
+                data_connector: Arc::new(crate::dataconnector::deferred::DeferredConnector::new(
+                    Arc::new(CapableSource),
+                )),
+                federated_read_table: runtime_table::federated::FederatedTable::new_unchecked(
+                    table,
+                ),
+                generation: crate::datafusion::FederatedGeneration::Drain,
+            },
+        )
+        .await
+        .expect("a deferred dataset registers");
+
+        assert_eq!(
+            df.deferred_datasets_for(&["client".to_string()]).await,
+            vec![datafusion::common::TableReference::from("orders")]
+        );
+        assert_eq!(
+            df.deferred_datasets_for(&["other-client".to_string()])
+                .await,
+            Vec::<datafusion::common::TableReference>::new()
         );
     }
 

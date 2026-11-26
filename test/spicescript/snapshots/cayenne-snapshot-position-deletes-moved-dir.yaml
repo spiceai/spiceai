@@ -1,0 +1,99 @@
+name: cayenne-snapshot-position-deletes-moved-dir
+duration: 9s
+description: >
+  A DELETE on a Cayenne file acceleration with no primary key writes position
+  deletion vectors against the data files it already wrote. A snapshot taken
+  after the delete, restored on empty local storage, serves exactly the rows the
+  delete kept: both when the restore lands in the directory that wrote the
+  snapshot (`same-dir`) and when `cayenne_file_path` and `cayenne_metadata_dir`
+  point somewhere else (`moved`), as on a second machine.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  same-dir: {}
+  moved: {}
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-snapshot-position-deletes-moved-dir
+  snapshots:
+    enabled: true
+    location: file://${instance.dir}/snapshots/
+  datasets:
+    - from: postgres:public.src
+      name: t
+      params: ${sources.src.params}
+      access: read_write
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        refresh_check_interval: 1h
+        write_mode: acceleration
+        snapshots: enabled
+        snapshots_trigger: time_interval
+        snapshots_trigger_threshold: 2s
+        snapshots_creation_policy: on_change
+        params:
+          cayenne_file_path: ${instance.dir}/accel-1/data
+          cayenne_metadata_dir: ${instance.dir}/accel-1/meta
+          # Every row goes to a data file, so the DELETE writes position
+          # deletion vectors rather than dropping inline rows.
+          cayenne_inline_max_rows: '0'
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE src (id bigint, v text);
+        INSERT INTO src SELECT i, 'v' || i FROM generate_series(1, 20000) i;
+  - start: {}
+  - query: SELECT id, v FROM t
+    oracle-sql: SELECT id, v FROM src
+  - assert-log: { contains: 'Snapshot created dataset=t' }
+    eventually: 30s
+
+  # Every seventh row is deleted from the data files the load wrote.
+  - spice-exec: DELETE FROM t WHERE id % 7 = 0
+  - query: SELECT id, v FROM t
+    oracle-sql: SELECT id, v FROM src WHERE id % 7 <> 0
+  - assert-log: { count: { 'Snapshot created dataset=t': '>=2' } }
+    eventually: 30s
+  - assert-files: { contains: '^accel-1/data/.*' }
+
+  # Empty local storage. The restored acceleration only reads snapshots, so a
+  # refresh cannot reload the deleted rows from the source.
+  - stop: {}
+  - wipe-instance-dir: { keep: [snapshots] }
+  - start:
+      ready: false
+      patch:
+        datasets:
+          t: { acceleration: { refresh_mode: snapshot, snapshots: bootstrap_only } }
+    only: same-dir
+  - start:
+      ready: false
+      patch:
+        datasets:
+          t:
+            acceleration:
+              refresh_mode: snapshot
+              snapshots: bootstrap_only
+              params: { cayenne_file_path: '${instance.dir}/accel-2/data', cayenne_metadata_dir: '${instance.dir}/accel-2/meta' }
+    only: moved
+  - assert-log: { contains: 'Snapshot restored' }
+    eventually: 60s
+  - query: SELECT id, v FROM t
+    oracle-sql: SELECT id, v FROM src WHERE id % 7 <> 0
+    eventually: 60s
+  # None of the deleted rows is served again.
+  - query: SELECT count(*) AS n FROM t WHERE id % 7 = 0
+    expect: { rows: [['0']] }
+  - assert-files: { contains: '^accel-2/' }
+    only: moved

@@ -1,4 +1,6 @@
 name: tlp
+duration: 488s
+tags: [long]
 description: >
   Ternary logic partitioning over random predicates: for each predicate p the
   rows of a table equal those WHERE p, WHERE NOT (p) and WHERE (p) IS NULL

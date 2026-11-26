@@ -1103,6 +1103,7 @@ mod tests {
             depends_on: vec![],
             metrics: None,
             as_tool: true,
+            build: None,
         }
     }
 
@@ -1138,6 +1139,7 @@ mod tests {
             depends_on: vec![],
             metrics: None,
             as_tool: false,
+            build: None,
         }
     }
 
@@ -1190,6 +1192,7 @@ mod tests {
             depends_on: vec![],
             metrics: None,
             as_tool: false,
+            build: None,
         }
     }
 

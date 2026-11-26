@@ -306,6 +306,152 @@ pub struct SnapshotSequenceCommit {
     pub sequence_number: i64,
 }
 
+/// Whether an instance may write a table's data files; shared by the table and
+/// the metastore log that decides it, so the table sees a change of writer at
+/// once. See [`MetadataCatalog::data_write_gate`].
+///
+/// Under a writer lease the gate also closes by itself at the lease's
+/// deadline ([`Self::hold_until`]): an instance that cannot renew its lease
+/// sends no data write once another instance could judge the lease lapsed and
+/// take over, even if it never learns it was replaced.
+///
+/// Each time the instance becomes the writer again the gate's generation
+/// rises. A table binds the generation it opened at ([`Self::for_table`]), so
+/// a table whose state was seeded before another instance wrote the dataset
+/// refuses writes until it is opened again from the committed state: its
+/// sequence numbers and key sets would otherwise be stale.
+#[derive(Clone, Debug)]
+pub struct DataWriteGate {
+    state: std::sync::Arc<GateState>,
+    /// The generation a table's gate was bound at; `None` for the log's own.
+    bound: Option<u64>,
+}
+
+#[derive(Debug)]
+struct GateState {
+    allowed: std::sync::atomic::AtomicBool,
+    generation: std::sync::atomic::AtomicU64,
+    /// Writes are refused from this instant on, as nanoseconds since
+    /// [`gate_clock_epoch`]; `u64::MAX` for no deadline.
+    valid_until_ns: std::sync::atomic::AtomicU64,
+    /// Whether writes are allowed, for whoever waits for a change of writer.
+    changes: tokio::sync::watch::Sender<bool>,
+}
+
+impl DataWriteGate {
+    fn with(allowed: bool) -> Self {
+        Self {
+            state: std::sync::Arc::new(GateState {
+                allowed: std::sync::atomic::AtomicBool::new(allowed),
+                generation: std::sync::atomic::AtomicU64::new(0),
+                valid_until_ns: std::sync::atomic::AtomicU64::new(u64::MAX),
+                changes: tokio::sync::watch::Sender::new(allowed),
+            }),
+            bound: None,
+        }
+    }
+
+    /// A gate that allows writes: the instance writes the table.
+    #[must_use]
+    pub fn open() -> Self {
+        Self::with(true)
+    }
+
+    /// A gate that refuses writes: another instance writes the table.
+    #[must_use]
+    pub fn closed() -> Self {
+        Self::with(false)
+    }
+
+    /// This gate for a table opening now: it allows writes only while the
+    /// instance stays the writer it is at this generation.
+    #[must_use]
+    pub fn for_table(&self) -> Self {
+        Self {
+            state: std::sync::Arc::clone(&self.state),
+            bound: Some(
+                self.state
+                    .generation
+                    .load(std::sync::atomic::Ordering::Acquire),
+            ),
+        }
+    }
+
+    /// Follow whether this instance writes the table: `true` while it does.
+    /// Changes when another instance takes it over, or this one does.
+    #[must_use]
+    pub fn watch(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.state.changes.subscribe()
+    }
+
+    /// Whether a write may be sent now.
+    #[must_use]
+    pub fn allows(&self) -> bool {
+        // The generation is read after `allowed`, which `set` publishes after
+        // raising it, so an allowed read never pairs with an older generation.
+        let allowed = self
+            .state
+            .allowed
+            .load(std::sync::atomic::Ordering::Acquire);
+        allowed
+            && self.bound.is_none_or(|bound| {
+                bound
+                    == self
+                        .state
+                        .generation
+                        .load(std::sync::atomic::Ordering::Acquire)
+            })
+            && gate_clock_ns(std::time::Instant::now())
+                < self
+                    .state
+                    .valid_until_ns
+                    .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Refuse writes from `deadline` on, until a later call moves it: the
+    /// instant a writer lease could lapse unless renewed.
+    pub fn hold_until(&self, deadline: std::time::Instant) {
+        self.state.valid_until_ns.store(
+            gate_clock_ns(deadline),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// Allow or refuse writes from now on. Allowing them again after a refusal
+    /// starts a new generation.
+    pub fn set(&self, allows: bool) {
+        use std::sync::atomic::Ordering;
+        if allows {
+            if !self.state.allowed.load(Ordering::Acquire) {
+                self.state.generation.fetch_add(1, Ordering::AcqRel);
+            }
+            self.state.allowed.store(true, Ordering::Release);
+            self.state
+                .changes
+                .send_if_modified(|allowed| !std::mem::replace(allowed, true));
+        } else {
+            self.state.allowed.store(false, Ordering::Release);
+            self.state
+                .changes
+                .send_if_modified(|allowed| std::mem::replace(allowed, false));
+        }
+    }
+}
+
+/// Process-local origin of [`GateState::valid_until_ns`].
+fn gate_clock_epoch() -> std::time::Instant {
+    static EPOCH: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    *EPOCH
+}
+
+/// `at` as nanoseconds since [`gate_clock_epoch`]; an instant before the epoch
+/// counts as the epoch.
+fn gate_clock_ns(at: std::time::Instant) -> u64 {
+    u64::try_from(at.saturating_duration_since(gate_clock_epoch()).as_nanos())
+        .unwrap_or(u64::MAX - 1)
+}
+
 /// The durable effects of one mem-tier seal or checkpoint.
 #[derive(Debug, Default)]
 pub struct MemTierDurableCommit {
@@ -325,6 +471,18 @@ pub struct MemTierDurableCommit {
     pub inline_data: Vec<InlinedData>,
     /// Clear the superseded inline corpus AND its deletion markers.
     pub clear_inlined: bool,
+    /// Keys re-inserted at `sequence_number` that a delete-only vector from an
+    /// earlier commit may still hide, recorded as per-key insert records.
+    pub insert_records: Vec<Vec<u8>>,
+    /// The table's statistics including this commit's rows.
+    pub table_statistics: Option<TableStatistics>,
+    /// Drop the per-file statistics of every snapshot except this one.
+    pub keep_file_statistics_of: Option<String>,
+    /// Manifest rows of the data files this commit's rows landed in, upserted
+    /// with it: a table whose data is in the object-native location scans only
+    /// its manifest, so its files and the clear of the rows they hold commit
+    /// together.
+    pub manifest_files: Vec<SnapshotFile>,
 }
 
 /// One table's durable append publication. A slice is one atomic transaction.
@@ -678,6 +836,28 @@ pub trait MetadataCatalog: Send + Sync {
     /// Initialize the catalog, creating necessary tables if they don't exist.
     async fn init(&self) -> CatalogResult<()>;
 
+    /// Bring this instance's view of `table_id` up to the commits another
+    /// instance made to it: on a replica of an object-native location, one
+    /// conditional read of the dataset head, and the records after it when it
+    /// moved. Returns the revision of the committed state afterwards, which
+    /// changes whenever that state does: a table reloads what it caches from
+    /// the catalog when the revision differs from the one it last loaded at,
+    /// so a reload that failed, or another table's follow, is caught up by the
+    /// next call. A metastore this instance alone writes is always current and
+    /// returns a constant.
+    ///
+    /// No default: a wrapper must forward it, or its replica never sees new
+    /// commits.
+    async fn follow_commits(&self, table_id: &str) -> CatalogResult<u64>;
+
+    /// Whether this instance may write `table_id`'s data to its location: open
+    /// while it writes the table, closed while another instance does. Every
+    /// data-file write and delete of a table checks it first, so an instance
+    /// that does not write a table leaves no object behind.
+    ///
+    /// No default: a wrapper must forward it, or a replica writes data files.
+    fn data_write_gate(&self, table_id: &str) -> DataWriteGate;
+
     /// List all table names in the catalog.
     async fn list_table_names(&self) -> CatalogResult<Vec<String>>;
 
@@ -1003,11 +1183,17 @@ pub trait MetadataCatalog: Send + Sync {
     /// This records when the snapshot was created relative to deletions.
     /// Used for Iceberg-style sequence ordering: deletions only apply to
     /// snapshots with sequence <= `delete_sequence`.
+    ///
+    /// `files` names the files of a new protected snapshot, which has no
+    /// manifest rows yet, in the same commit that makes it live, so that no
+    /// crash leaves the files of a snapshot that never became live named, where
+    /// no sweep reclaims them. `None` when there is no manifest to record.
     async fn set_snapshot_sequence(
         &self,
         table_id: &str,
         snapshot_id: &str,
         sequence_number: i64,
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()>;
 
     /// Get the sequence number for a snapshot.
@@ -1102,12 +1288,18 @@ pub trait MetadataCatalog: Send + Sync {
     ///
     /// Returns `Ok(false)` if any input snapshot is no longer active (the
     /// caller should discard the rewritten output and retry on a later trigger).
+    ///
+    /// `files` names the files of the merged snapshot, which has no manifest
+    /// rows yet, in the same commit as the swap, so that no crash leaves the
+    /// files of a snapshot that never became live named, where no sweep
+    /// reclaims them. `None` when the caller recorded the manifest already.
     async fn swap_protected_snapshots(
         &self,
         table_id: &str,
         old_snapshot_ids: &[String],
         new_snapshot_id: &str,
         new_sequence_number: i64,
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<bool>;
 
     /// Atomically commit an overwrite: update the snapshot pointer, clear all
@@ -1136,12 +1328,18 @@ pub trait MetadataCatalog: Send + Sync {
     ///
     /// `delete_files` are position deletion vectors on the new snapshot, hiding
     /// the copies of keys its incoming data repeated across record batches.
+    ///
+    /// `files` is the new snapshot's complete manifest, possibly empty, recorded
+    /// in the same commit as the flip so that no crash leaves the files of a
+    /// snapshot that never became current named, where no sweep reclaims them.
+    /// `None` when the caller recorded the manifest already.
     async fn commit_overwrite(
         &self,
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
         delete_files: &[crate::metadata::DeleteFile],
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()>;
 
     /// Add a partition to a table.
@@ -1308,15 +1506,49 @@ pub trait MetadataCatalog: Send + Sync {
     /// records, inline data, snapshot sequences, per-file/table stats, pk index)
     /// + repoint `current_snapshot_id` to `new_snapshot_id` (a fresh empty warm
     /// snapshot). All-or-nothing, so a crash mid-promotion never leaves rows in
-    /// BOTH tiers (double-count) or NEITHER (loss). The deletion state is cleared
-    /// because the cold files were written with all deletes already applied
-    /// (single-version) — exactly the semantics of `commit_overwrite`, whose new
-    /// content here lives on the cold object store instead of a warm snapshot.
+    /// BOTH tiers (double-count) or NEITHER (loss). `cold_files` is the whole
+    /// new manifest: the files this promotion wrote plus every existing cold
+    /// file it carries forward.
+    ///
+    /// `retain_tombstones_above` decides what happens to the deletion state.
+    /// `None` clears all of it, which is correct when no tombstone can hide a
+    /// row of any cold file in `cold_files`. `Some(cutoff)` keeps every
+    /// key-based delete file and every insert record whose sequence is above
+    /// `cutoff` — tombstones that still hide superseded rows of carried-forward
+    /// cold files — and clears the rest, including every position-based delete
+    /// file (those name warm files the overwrite clear retires).
     async fn commit_overwrite_to_cold(
         &self,
         table_id: &str,
         new_snapshot_id: &str,
         cold_files: &[ColdTierFile],
+        retain_tombstones_above: Option<i64>,
+    ) -> CatalogResult<()>;
+
+    /// Atomically replace datalake (cold) files: remove the manifest rows of
+    /// `removed_file_urls` and register `added`, in one transaction.
+    ///
+    /// Conditional, like [`Self::swap_protected_snapshots`]: returns `Ok(false)`
+    /// and changes nothing when any of `removed_file_urls` is no longer in the
+    /// manifest (an overwrite or another swap consumed it), so a merge built from
+    /// a stale manifest can never re-register rows twice or drop rows another
+    /// commit placed. Never touches warm data, delete files, or insert records.
+    async fn swap_cold_tier_files(
+        &self,
+        table_id: &str,
+        removed_file_urls: &[String],
+        added: &[ColdTierFile],
+    ) -> CatalogResult<bool>;
+
+    /// Clear every key-based delete file and insert record at or below
+    /// `cutoff`, in one transaction. Position-based delete files are untouched.
+    ///
+    /// The caller must have established that no tombstone at or below `cutoff`
+    /// can hide a live row anywhere in the table.
+    async fn clear_key_tombstones_at_or_below(
+        &self,
+        table_id: &str,
+        cutoff: i64,
     ) -> CatalogResult<()>;
 
     /// Upsert the persisted primary-key existence index (a bloom checkpoint),

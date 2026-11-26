@@ -62,6 +62,40 @@ use url::Url;
 /// Redirects followed before the request fails; the same limit `object_store`'s client uses.
 const MAX_REDIRECTS: usize = 10;
 
+/// Why a client that sends credentials refuses a redirect for which
+/// [`redirect_continues_off_origin`] is true.
+pub const REDIRECT_CHAIN_REFUSED: &str = "a request that carries credentials does not follow a redirect chain that continues on another host. Configure the endpoint URL as the redirect target directly.";
+
+/// Whether a redirect to `next`, after the URLs in `chain` (the request's own URL first), stays on
+/// the host and port of the previous URL when that URL is not on the request's own host and port.
+/// A client that sends credentials refuses such a redirect, so its credentials stay on the
+/// request's origin across a redirect chain.
+#[must_use]
+pub fn redirect_continues_off_origin(chain: &[Url], next: &Url) -> bool {
+    let same_host_and_port = |a: &Url, b: &Url| {
+        a.host_str() == b.host_str() && a.port_or_known_default() == b.port_or_known_default()
+    };
+    match (chain.first(), chain.last()) {
+        (Some(first), Some(previous)) => {
+            same_host_and_port(previous, next) && !same_host_and_port(first, previous)
+        }
+        _ => false,
+    }
+}
+
+/// Why a client that sends a custom credential header refuses a redirect for which
+/// [`redirect_leaves_origin`] is true.
+pub const OFF_ORIGIN_REDIRECT_REFUSED: &str = "a request that carries a custom credential header follows a redirect only to its own scheme, host, and port. Configure the endpoint URL as the redirect target directly.";
+
+/// Whether a redirect to `next`, after the URLs in `chain` (the request's own URL first), leaves
+/// the request's own scheme, host, or port.
+#[must_use]
+pub fn redirect_leaves_origin(chain: &[Url], next: &Url) -> bool {
+    chain
+        .first()
+        .is_none_or(|own| own.origin() != next.origin())
+}
+
 /// Client options [`build_client`] does not apply; each must keep its default.
 const UNAPPLIED: &[ClientConfigKey] = &[
     ClientConfigKey::AllowInvalidCertificates,
@@ -162,12 +196,36 @@ impl fmt::Debug for DestinationGuard {
     }
 }
 
-/// A request refused by a [`DestinationGuard`].
+/// A request refused by a [`DestinationGuard`] or by a redirect policy.
 #[derive(Debug, Clone, Snafu)]
 #[snafu(display("Refused to connect to {target}: {reason}"))]
 pub struct DestinationRefused {
     target: String,
     reason: Arc<str>,
+}
+
+impl DestinationRefused {
+    /// The refusal of a redirect to `target` that [`redirect_continues_off_origin`] reports for a
+    /// request that carries credentials. It names only the target's origin, because a path or
+    /// query can hold secrets.
+    #[must_use]
+    pub fn redirect_chain(target: &Url) -> Self {
+        Self {
+            target: target.origin().ascii_serialization(),
+            reason: Arc::from(REDIRECT_CHAIN_REFUSED),
+        }
+    }
+
+    /// The refusal of a redirect to `target` that [`redirect_leaves_origin`] reports for a request
+    /// that carries a custom credential header. It names only the target's origin, because a path
+    /// or query can hold secrets.
+    #[must_use]
+    pub fn off_origin(target: &Url) -> Self {
+        Self {
+            target: target.origin().ascii_serialization(),
+            reason: Arc::from(OFF_ORIGIN_REDIRECT_REFUSED),
+        }
+    }
 }
 
 /// Returns the refusal behind `error`, if a guard caused it.
@@ -204,6 +262,9 @@ pub(crate) fn build_client(
     }
 
     let redirect_guard = guard.clone();
+    let sends_credentials = options
+        .get_default_headers()
+        .is_some_and(|headers| !headers.is_empty());
     let redirect_hosts = Arc::new(Mutex::new(HashSet::new()));
     let new_redirect_hosts = Arc::clone(&redirect_hosts);
     let mut builder = reqwest::Client::builder()
@@ -215,6 +276,11 @@ pub(crate) fn build_client(
         .redirect(redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= MAX_REDIRECTS {
                 return attempt.error("too many redirects");
+            }
+            if sends_credentials && redirect_continues_off_origin(attempt.previous(), attempt.url())
+            {
+                let refused = DestinationRefused::redirect_chain(attempt.url());
+                return attempt.error(refused);
             }
             // The chain's first URL names the request's own host.
             let own_host = attempt
@@ -315,5 +381,76 @@ fn flag(value: Option<String>) -> object_store::Result<bool> {
         "1" | "true" | "on" | "yes" | "y" => Ok(true),
         "0" | "false" | "off" | "no" | "n" => Ok(false),
         _ => Err(generic(format!("failed to parse \"{value}\" as a boolean"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redirect_continues_off_origin;
+    use url::Url;
+
+    fn chain(urls: &[&str]) -> Vec<Url> {
+        urls.iter()
+            .map(|url| Url::parse(url).expect("valid URL"))
+            .collect()
+    }
+
+    #[test]
+    fn a_redirect_chain_may_not_continue_on_a_host_it_moved_to() {
+        let endpoint = "https://api.example.com/data";
+        for (previous, next) in [
+            (
+                vec![endpoint, "https://cdn.example.net/a"],
+                "https://cdn.example.net/b",
+            ),
+            (
+                vec![endpoint, "https://cdn.example.net/a"],
+                "http://cdn.example.net:443/b",
+            ),
+            (
+                vec![endpoint, "https://api.example.com:8443/a"],
+                "https://api.example.com:8443/b",
+            ),
+            (
+                vec![
+                    endpoint,
+                    "https://cdn.example.net/a",
+                    "https://edge.example.org/x",
+                ],
+                "https://edge.example.org/y",
+            ),
+        ] {
+            let next = Url::parse(next).expect("valid URL");
+            assert!(
+                redirect_continues_off_origin(&chain(&previous), &next),
+                "{previous:?} -> {next} must be refused"
+            );
+        }
+        for (previous, next) in [
+            (vec![endpoint], "https://cdn.example.net/a"),
+            (vec![endpoint], "https://api.example.com/other"),
+            (
+                vec![endpoint, "https://api.example.com/x"],
+                "https://api.example.com:443/y",
+            ),
+            (
+                vec![endpoint, "https://api.example.com/x"],
+                "https://cdn.example.net/a",
+            ),
+            (
+                vec![endpoint, "https://cdn.example.net/a"],
+                "https://edge.example.org/x",
+            ),
+            (
+                vec![endpoint, "https://cdn.example.net/a"],
+                "https://api.example.com/back",
+            ),
+        ] {
+            let next = Url::parse(next).expect("valid URL");
+            assert!(
+                !redirect_continues_off_origin(&chain(&previous), &next),
+                "{previous:?} -> {next} must be followed"
+            );
+        }
     }
 }

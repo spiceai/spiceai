@@ -412,7 +412,7 @@ testCases:
         assert_eq!(expected.columns.len(), 2);
         assert_eq!(expected.columns[0].name, "flag");
         assert_eq!(expected.columns[1].type_token, "integer");
-        assert!(expected.rows.is_empty());
+        assert_eq!(expected.rows, [] as [Vec<String>; 0]);
         std::fs::remove_dir_all(&dir).expect("cleanup mini suite");
     }
 

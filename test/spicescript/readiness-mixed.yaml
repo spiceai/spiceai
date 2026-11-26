@@ -1,4 +1,6 @@
 name: readiness-mixed
+duration: 65s
+tags: [long]
 description: >
   Datasets with different ready_state settings in one runtime each follow
   their own: while their slow first loads run, the on_registration dataset
