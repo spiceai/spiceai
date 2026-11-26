@@ -1482,26 +1482,6 @@
       "pattern": "^objects under 'state/cayenne/v1/datasets/orders-' in 'lake' (trend upward|went over their bound)",
       "group": "cayenne",
       "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-s3",
-      "key": "assert-objects: {\"contains\":\".arrow\",\"max\":200,\"prefix\":\"state/cayenne/v1/datasets/orders-\",\"source\":\"lake\"}",
-      "kind": "other",
-      "signature": "expected 0 to 200 objects under 'state/cayenne/v1/datasets/orders-' containing '.arrow' in 'lake', found <n>",
-      "pattern": "^expected 0 to 200 objects under 'state/cayenne/v1/datasets/orders-' containing '\\.arrow' in 'lake', found \\d+",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-s3",
-      "key": "assert-objects: {\"contains\":\".vortex\",\"max\":400,\"prefix\":\"state/cayenne/v1/datasets/orders-\",\"source\":\"lake\"}",
-      "kind": "other",
-      "signature": "expected 0 to 400 objects under 'state/cayenne/v1/datasets/orders-' containing '.vortex' in 'lake', found <n>",
-      "pattern": "^expected 0 to 400 objects under 'state/cayenne/v1/datasets/orders-' containing '\\.vortex' in 'lake', found \\d+",
-      "group": "cayenne",
-      "may-pass": true
     }
   ],
   "postgres-literals": [
