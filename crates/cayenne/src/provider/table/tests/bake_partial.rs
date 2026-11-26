@@ -261,14 +261,20 @@ async fn write_checkpoints(t: &Table, model: &mut Model, range: std::ops::Range<
     write_checkpoints_keyed(&[(&t.provider, t.key)], model, range, false).await;
 }
 
-/// Every `(ts, h, v)` the table returns, in key order. A table keyed by `ts`
-/// alone reports `h` as the function of `ts` it is everywhere else.
-async fn rows_of(provider: &CayenneTableProvider, name: &str) -> Vec<(i64, i64, i64)> {
+/// Every `(ts, h, v)` the table returns, in key order. A table keyed by
+/// `(ts, h)` reports the `h` it stores, so a bake that changed a stored `h`
+/// fails the comparison with the model. A table keyed by `ts` alone has no `h`
+/// column and reports it as the function of `ts` it is everywhere else.
+async fn rows_of(provider: &CayenneTableProvider, name: &str, key: Key) -> Vec<(i64, i64, i64)> {
     let ctx = SessionContext::new();
     ctx.register_table(name, Arc::new(provider.clone_for_write()))
         .expect("table registered");
+    let sql = match key {
+        Key::Composite => format!("SELECT ts, h, v FROM {name} ORDER BY ts, h, v"),
+        Key::Int64 => format!("SELECT ts, v FROM {name} ORDER BY ts, v"),
+    };
     let batches = ctx
-        .sql(&format!("SELECT ts, v FROM {name} ORDER BY ts, v"))
+        .sql(&sql)
         .await
         .expect("query planned")
         .collect()
@@ -284,9 +290,17 @@ async fn rows_of(provider: &CayenneTableProvider, name: &str) -> Vec<(i64, i64, 
                 .expect("Int64 column")
                 .clone()
         };
-        let (ts, v) = (column(0), column(1));
+        let ts = column(0);
+        let (h, v) = match key {
+            Key::Composite => (Some(column(1)), column(2)),
+            Key::Int64 => (None, column(1)),
+        };
         for row in 0..batch.num_rows() {
-            rows.push((ts.value(row), hash_of(ts.value(row)), v.value(row)));
+            let ts_value = ts.value(row);
+            let h_value = h
+                .as_ref()
+                .map_or_else(|| hash_of(ts_value), |h| h.value(row));
+            rows.push((ts_value, h_value, v.value(row)));
         }
     }
     rows
@@ -338,8 +352,8 @@ async fn bake(provider: &CayenneTableProvider, what: &str) {
 ///
 /// A scan first, so the provider's cached scan view moves to the live snapshots
 /// and releases its pins on the retired ones, as the next query does.
-async fn sweep_retired(provider: &CayenneTableProvider, name: &str) {
-    let _ = rows_of(provider, name).await;
+async fn sweep_retired(provider: &CayenneTableProvider, name: &str, key: Key) {
+    let _ = rows_of(provider, name, key).await;
     let retired: Vec<String> = provider
         .retired_snapshot_dirs
         .lock()
@@ -432,14 +446,14 @@ async fn partial_bake_matches_full_bake(
             "round {round}: both bakes prune the same tombstones"
         );
 
-        sweep_retired(&partial.provider, partial.name).await;
+        sweep_retired(&partial.provider, partial.name, key).await;
         assert_rows(
-            &rows_of(&full.provider, full.name).await,
+            &rows_of(&full.provider, full.name, key).await,
             &model,
             &format!("round {round}: full bake"),
         );
         assert_rows(
-            &rows_of(&partial.provider, partial.name).await,
+            &rows_of(&partial.provider, partial.name, key).await,
             &model,
             &format!("round {round}: partial bake, retired inputs swept"),
         );
@@ -454,7 +468,7 @@ async fn partial_bake_matches_full_bake(
     }
 
     assert_rows(
-        &rows_of(&partial.provider, partial.name).await,
+        &rows_of(&partial.provider, partial.name, key).await,
         &model,
         "after the last writes",
     );
@@ -468,14 +482,18 @@ async fn partial_bake_matches_full_bake(
     } = partial;
     drop(provider);
     let reopened = reopen(&catalog, &tmp, name, key).await;
-    assert_rows(&rows_of(&reopened, name).await, &model, "after a restart");
+    assert_rows(
+        &rows_of(&reopened, name, key).await,
+        &model,
+        "after a restart",
+    );
 
     // Bake again after the restart, over files earlier bakes kept and linked.
     write_checkpoints_keyed(&[(&reopened, key)], &mut model, 14..17, true).await;
     bake(&reopened, "after the restart").await;
-    sweep_retired(&reopened, name).await;
+    sweep_retired(&reopened, name, key).await;
     assert_rows(
-        &rows_of(&reopened, name).await,
+        &rows_of(&reopened, name, key).await,
         &model,
         "after a bake following the restart",
     );
@@ -697,7 +715,7 @@ async fn a_bake_rewrites_small_files_it_could_keep() {
         "the bake rewrote every input file and linked none"
     );
     assert_rows(
-        &rows_of(&t.provider, t.name).await,
+        &rows_of(&t.provider, t.name, t.key).await,
         &model,
         "after a bake that rewrote every small file",
     );
