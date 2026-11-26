@@ -21,10 +21,17 @@ inputs:
   github_token:
     description: 'Token that can read the release and its attestations'
     required: true
+  destination:
+    description: 'Where to put the spiced binary; empty installs it as /usr/local/bin/spiced'
+    required: false
+    default: ''
 outputs:
   SPICED_COMMIT:
     description: 'Commit the release tag points to'
     value: ${{ steps.find.outputs.SPICED_COMMIT }}
+  path:
+    description: 'Path of the installed spiced'
+    value: ${{ steps.install.outputs.path }}
 runs:
   using: 'composite'
   steps:
@@ -140,10 +147,12 @@ runs:
         token: ${{ inputs.github_token }}
 
     - name: Install the released spiced
+      id: install
       shell: bash
       env:
         ARCHIVE: ${{ steps.find.outputs.archive }}
         SPICED_COMMIT: ${{ steps.find.outputs.SPICED_COMMIT }}
+        DESTINATION: ${{ inputs.destination }}
       run: |
         set -euo pipefail
         dir="$(dirname "${ARCHIVE}")"
@@ -152,6 +161,14 @@ runs:
           echo "::error::${ARCHIVE} holds no spiced"
           exit 1
         fi
-        sudo cp "${dir}/spiced" /usr/local/bin/spiced
-        spiced --version
+        if [ -n "${DESTINATION}" ]; then
+          mkdir -p "$(dirname "${DESTINATION}")"
+          install -m 0755 "${dir}/spiced" "${DESTINATION}"
+          path="${DESTINATION}"
+        else
+          sudo cp "${dir}/spiced" /usr/local/bin/spiced
+          path=/usr/local/bin/spiced
+        fi
+        "${path}" --version
+        echo "path=${path}" >> "${GITHUB_OUTPUT}"
         echo "SPICED_COMMIT=${SPICED_COMMIT}"

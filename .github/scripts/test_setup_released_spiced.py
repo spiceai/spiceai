@@ -145,7 +145,7 @@ class SetupReleasedSpicedTest(unittest.TestCase):
                 self.assertEqual(step["with"]["release"], "true")
                 self.assertEqual(step["with"]["source-commit"], "${{ steps.find.outputs.SPICED_COMMIT }}")
         order = list(self.steps)
-        self.assertLess(order.index("Verify the archive's build attestation"), order.index("Install the released spiced"))
+        self.assertLess(order.index("Verify the archive's build attestation"), order.index("install"))
 
     def test_a_recorded_release_with_sha256sums_needs_both_to_agree(self):
         self.serve("v2.5.0", sums=f"{self.digest}  {ASSET}\n", digests={"v2.5.0": {ASSET: self.digest}})
@@ -164,6 +164,29 @@ class SetupReleasedSpicedTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("does not list", proc.stdout)
 
+    def test_a_destination_installs_spiced_there_without_sudo(self):
+        import io
+        import tarfile
+
+        archive = self.dir / "spiced_linux_x86_64.tar.gz"
+        data = b"#!/bin/sh\necho spiced v2.4.3\n"
+        with tarfile.open(archive, "w:gz") as tar:
+            info = tarfile.TarInfo("spiced")
+            info.size = len(data)
+            info.mode = 0o755
+            tar.addfile(info, io.BytesIO(data))
+        (self.dir / "install.sh").write_text(self.steps["install"]["run"])
+        output = self.dir / "github_output"
+        output.write_text("")
+        destination = self.dir / "baseline" / "spiced"
+        proc = subprocess.run(["bash", "-e", str(self.dir / "install.sh")], cwd=self.dir, capture_output=True, text=True,
+                              env={"PATH": os.environ["PATH"], "ARCHIVE": str(archive), "SPICED_COMMIT": COMMIT,
+                                   "DESTINATION": str(destination), "GITHUB_OUTPUT": str(output)})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(destination.is_file())
+        self.assertIn(f"path={destination}", output.read_text())
+        self.assertIn("spiced v2.4.3", proc.stdout)
+
     def test_a_value_that_is_not_a_release_tag_is_refused(self):
         for tag in ("release/2.4", "v2.4.3/../../x", "v2.4", "trunk"):
             with self.subTest(tag=tag):
@@ -171,6 +194,41 @@ class SetupReleasedSpicedTest(unittest.TestCase):
                 self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
                 self.assertIn("is not a release tag", proc.stdout)
                 self.assertEqual(found, {})
+
+
+class ColdStartBaselineTest(unittest.TestCase):
+    """The cold-start comparison's baseline is a recorded release, verified before it runs."""
+
+    WORKFLOW = GITHUB_DIR / "workflows" / "testoperator_run_cold_start.yml"
+
+    def choose(self, version):
+        steps = yaml.safe_load(self.WORKFLOW.read_text())["jobs"]["cold-start"]["steps"]
+        script = next(s for s in steps if s.get("id") == "baseline")["run"]
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "out"
+            output.write_text("")
+            proc = subprocess.run(["bash", "-e", "-c", script], cwd=GITHUB_DIR.parent, capture_output=True, text=True,
+                                  env={"PATH": os.environ["PATH"], "INPUT_BASELINE_VERSION": version,
+                                       "GITHUB_OUTPUT": str(output)})
+            return proc, output.read_text()
+
+    def test_the_default_is_the_newest_recorded_release_and_an_input_must_be_a_tag(self):
+        recorded = json.loads((GITHUB_DIR / "release-digests.json").read_text())["releases"]
+        newest = max(recorded, key=lambda tag: tuple(int(p) for p in tag[1:].split(".")))
+        proc, output = self.choose("")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(output, f"version={newest}\n")
+        for version, ok in (("v2.3.4", True), ("latest", False), ("v2.3.4/../../x", False), ("2.3.4", False)):
+            with self.subTest(version=version):
+                proc, output = self.choose(version)
+                self.assertEqual(proc.returncode == 0, ok, proc.stdout + proc.stderr)
+
+    def test_the_baseline_runs_only_through_setup_released_spiced(self):
+        job = yaml.safe_load(self.WORKFLOW.read_text())["jobs"]["cold-start"]
+        install = next(s for s in job["steps"] if s.get("id") == "baseline-spiced")
+        self.assertEqual(install["uses"], "$/.github/actions/setup-released-spiced")
+        self.assertEqual(install["with"]["release"], "${{ steps.baseline.outputs.version }}")
+        self.assertNotIn("releases/download", yaml.safe_dump(job))
 
 
 if __name__ == "__main__":

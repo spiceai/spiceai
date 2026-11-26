@@ -136,23 +136,32 @@ jobs:
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
 
-      - name: Download the baseline release
+      # The baseline is a recorded release (.github/release-digests.json): the input, or by
+      # default the newest recorded one. setup-released-spiced verifies it before it runs.
+      - name: Choose the baseline release
         id: baseline
         env:
           INPUT_BASELINE_VERSION: ${{ github.event.inputs.baseline_version }}
         run: |
+          set -euo pipefail
           version="${INPUT_BASELINE_VERSION}"
           if [ -z "$version" ]; then
-            latest=$(curl -sSLI -o /dev/null -w '%{url_effective}' https://github.com/spiceai/spiceai/releases/latest)
-            version="${latest##*/}"
+            version="$(python3 -c 'import json; tags = json.load(open(".github/release-digests.json"))["releases"]; print(max(tags, key=lambda t: tuple(int(p) for p in t[1:].split("."))))')"
           fi
-          mkdir -p "${RUNNER_TEMP}/baseline"
-          curl -sSfL -o "${RUNNER_TEMP}/baseline/spiced.tar.gz" \
-            "https://github.com/spiceai/spiceai/releases/download/${version}/spiced_linux_x86_64.tar.gz"
-          tar -xzf "${RUNNER_TEMP}/baseline/spiced.tar.gz" -C "${RUNNER_TEMP}/baseline"
-          chmod +x "${RUNNER_TEMP}/baseline/spiced"
+          if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::baseline_version '$version' is not a release tag such as v2.3.1."
+            exit 1
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "path=${RUNNER_TEMP}/baseline/spiced" >> "$GITHUB_OUTPUT"
+
+      - name: Install the baseline release
+        id: baseline-spiced
+        uses: $/.github/actions/setup-released-spiced
+        with:
+          release: ${{ steps.baseline.outputs.version }}
+          spicepod_file: test/spicepods/cold_start/${{ matrix.spicepod }}
+          github_token: ${{ github.token }}
+          destination: ${{ runner.temp }}/baseline/spiced
 
       - name: Build Testoperator
         uses: $/.github/actions/build-testoperator
@@ -186,7 +195,7 @@ jobs:
           S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
           S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
           S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
-          BASELINE_PATH: ${{ steps.baseline.outputs.path }}
+          BASELINE_PATH: ${{ steps.baseline-spiced.outputs.path }}
           INPUT_RUNS: ${{ github.event.inputs.runs || '3' }}
           INPUT_MAX_READY_RATIO: ${{ github.event.inputs.max_ready_ratio || '2.0' }}
 
