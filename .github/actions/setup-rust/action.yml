@@ -146,6 +146,16 @@ runs:
         if [ "${RUNNER_OS:-}" = macOS ] && [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]; then
           per_job_home=true
           rust_home="${RUNNER_TEMP:?RUNNER_TEMP is not set}/rust-home"
+          # A rustc wrapper the host's environment names is the host's binary, which any job here
+          # can replace; only one setup-sccache installed into this job's RUNNER_TEMP wraps rustc.
+          for wrapper in RUSTC_WRAPPER CARGO_BUILD_RUSTC_WRAPPER; do
+            value="${!wrapper:-}"
+            if [ -n "$value" ] && [[ "$value" != "$RUNNER_TEMP"/* ]]; then
+              echo "::notice::Not using $wrapper=$value, which this job did not install; building without it."
+              echo "$wrapper=" >> "$GITHUB_ENV"
+              unset "$wrapper"
+            fi
+          done
           if [ "${CARGO_HOME:-}" = "$rust_home/cargo" ] && [ "${RUSTUP_HOME:-}" = "$rust_home/rustup" ] &&
             [ -d "$rust_home" ] && [ ! -L "$rust_home" ]; then
             # An earlier setup-rust in this job made these homes, and its GITHUB_ENV named

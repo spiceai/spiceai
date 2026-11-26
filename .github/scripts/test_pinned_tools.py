@@ -218,6 +218,7 @@ class PinnedToolsTest(unittest.TestCase):
         subprocess.run([str(bin_dir / "sccache"), "--version"], check=True)
         self.assertEqual(self.calls(), ["pinned-sccache --version"])
         self.assertIn("installed=true", (self.tmp / "github_output").read_text())
+        self.assertIn(f"RUSTC_WRAPPER={bin_dir / 'sccache'}", (self.tmp / "github_env").read_text().splitlines())
 
     def test_a_mac_wraps_rustc_only_in_the_pinned_sccache(self):
         archive = tar_gz_of({"sccache-v1/sccache": (recorder(self.log, "pinned-sccache"), 0o755)})
@@ -227,6 +228,7 @@ class PinnedToolsTest(unittest.TestCase):
         (bin_dir,) = self.path_dirs()
         self.assertTrue(bin_dir.is_relative_to(self.runner_temp), bin_dir)
         self.assertIn("installed=true", (self.tmp / "github_output").read_text())
+        self.assertIn(f"RUSTC_WRAPPER={bin_dir / 'sccache'}", (self.tmp / "github_env").read_text().splitlines())
         subprocess.run([str(bin_dir / "sccache"), "--version"], check=True)
         self.assertEqual(self.calls(), ["pinned-sccache --version"])
         # The configuration and the pre-flight, which run sccache, follow only that install.

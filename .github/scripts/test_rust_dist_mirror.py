@@ -556,6 +556,17 @@ class PerJobHomeTest(unittest.TestCase):
         self.assertEqual(self.mirror_log.read_text(), "")
         self.assertIn(f"Toolchain {TOOLCHAIN} already available", proc.stdout)
 
+    def test_a_mac_drops_a_rustc_wrapper_this_job_did_not_install(self):
+        proc, _ = self.run_step(RUSTC_WRAPPER="/usr/local/bin/sccache", CARGO_BUILD_RUSTC_WRAPPER="sccache")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        values = self.github_env_values()
+        self.assertEqual(values.get("RUSTC_WRAPPER"), "")
+        self.assertEqual(values.get("CARGO_BUILD_RUSTC_WRAPPER"), "")
+        own = str(self.runner_temp / "sccache.x" / "bin" / "sccache")
+        proc, _ = self.run_step(RUSTC_WRAPPER=own)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("RUSTC_WRAPPER", self.github_env_values())
+
     def test_a_mac_runner_that_does_not_say_where_it_runs_is_isolated_too(self):
         proc, calls = self.run_step(RUNNER_ENVIRONMENT=None)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)

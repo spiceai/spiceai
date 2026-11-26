@@ -166,6 +166,8 @@ runs:
         install -m 0755 "$dir"/sccache-v*/sccache "$dir/bin/sccache"
         rm -rf "$dir/sccache.tar.gz" "$dir"/sccache-v*
         echo "$dir/bin" >> "$GITHUB_PATH"
+        # By path: the wrapper is the binary this step checked, whatever else is on PATH.
+        echo "RUSTC_WRAPPER=$dir/bin/sccache" >> "$GITHUB_ENV"
         echo "installed=true" >> "$GITHUB_OUTPUT"
         echo "SCCACHE_CACHE_SIZE=4T" >> $GITHUB_ENV
         : "${SCCACHE_CONF:=${RUNNER_TEMP}/sccache/config}"
@@ -202,6 +204,8 @@ runs:
         install -m 0755 "$dir"/sccache-v*/sccache "$dir/bin/sccache"
         rm -rf "$dir/sccache.tar.gz" "$dir"/sccache-v*
         echo "$dir/bin" >> "$GITHUB_PATH"
+        # By path: the wrapper is the binary this step checked, whatever else is on PATH.
+        echo "RUSTC_WRAPPER=$dir/bin/sccache" >> "$GITHUB_ENV"
         echo "installed=true" >> "$GITHUB_OUTPUT"
 
     - name: Set up sccache (macOS)
