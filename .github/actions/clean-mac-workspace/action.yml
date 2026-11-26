@@ -1,0 +1,37 @@
+name: Empty the workspace on a self-hosted Mac
+description: >-
+  Every runner instance on a self-hosted Mac reuses its workspace across jobs of every ref, and
+  actions/checkout keeps an existing repository's local config and hooks, and any file git does
+  not track. Run before actions/checkout, this removes everything in GITHUB_WORKSPACE, so the job
+  starts from nothing an earlier job left. On any other runner it does nothing.
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Empty the workspace
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Any Mac that is not GitHub-hosted, as setup-rust counts them: one that does not say
+        # where it runs is emptied too.
+        if [ "${RUNNER_OS:-}" != macOS ] || [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ]; then
+          exit 0
+        fi
+        workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is not set}"
+        [ -d "$workspace" ] || exit 0
+        if [ -z "$(ls -A "$workspace")" ]; then
+          echo "The workspace is empty."
+          exit 0
+        fi
+        # An earlier job can lock what it leaves (immutable flags, ACLs, modes), so those are
+        # cleared first. With -R and no -L, neither command follows a link out of the workspace.
+        chflags -R nouchg "$workspace" 2>/dev/null || true
+        chmod -R -N "$workspace" 2>/dev/null || true
+        chmod -R u+rwx "$workspace" 2>/dev/null || true
+        find "$workspace" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+        if [ -n "$(ls -A "$workspace")" ]; then
+          echo "::error::$workspace still holds files an earlier job left after emptying it; not checking out over them."
+          ls -la "$workspace"
+          exit 1
+        fi
+        echo "Emptied $workspace."

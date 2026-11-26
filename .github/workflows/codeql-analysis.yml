@@ -74,6 +74,10 @@ jobs:
         # https://docs.github.com/en/free-pro-team@latest/github/finding-security-vulnerabilities-and-errors-in-your-code/configuring-code-scanning#changing-the-languages-that-are-analyzed
 
     steps:
+      # A self-hosted Mac reuses its workspace across jobs of every ref: start from an empty one.
+      - name: Empty the workspace (self-hosted Macs)
+        uses: $/.github/actions/clean-mac-workspace
+
       # push and merge_group scan github.sha. merge_group's github.sha is the
       # queue merge commit, which is the SHA the upload records. Fork heads are
       # not fetched: allow-unsafe-pr-checkout stays unset.

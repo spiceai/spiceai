@@ -704,6 +704,40 @@ def check_store_policies(github_dir: Path) -> list[str]:
     return problems
 
 
+SELF_HOSTED_MAC = re.compile(r"\bspiceai-macos")
+CLEAN_MAC_WORKSPACE = "$/.github/actions/clean-mac-workspace"
+
+
+def check_mac_workspace(jobs: dict) -> list[str]:
+    """Report a job on a self-hosted Mac that checks out over a workspace an earlier job left.
+
+    Each runner instance there reuses its workspace across jobs of every ref, and actions/checkout
+    keeps an existing repository's local config and hooks, which run in the next job. So such a job
+    runs `clean-mac-workspace` before its first checkout. A job is on such a Mac when its `runs-on`,
+    or its matrix, names a `spiceai-macos` runner.
+    """
+    problems = []
+    for name, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        runners = json.dumps(job.get("runs-on", "")) + json.dumps((job.get("strategy") or {}).get("matrix", {}))
+        if not SELF_HOSTED_MAC.search(runners):
+            continue
+        cleaned = False
+        for position, step in enumerate(_steps(job), start=1):
+            uses = str(step.get("uses", ""))
+            if uses == CLEAN_MAC_WORKSPACE:
+                cleaned = True
+            elif uses.startswith("actions/checkout@") and not cleaned:
+                label = step.get("name") or f"step {position}"
+                problems.append(
+                    f"job `{name}` runs on a self-hosted Mac and checks out at step `{label}` over the workspace "
+                    f"an earlier job left; run `{CLEAN_MAC_WORKSPACE}` before it"
+                )
+                break
+    return problems
+
+
 def check_mac_store_credentials(jobs: dict) -> list[str]:
     """Report a job on a self-hosted Mac that takes store credentials from anything but a read-only exchange.
 
@@ -925,6 +959,7 @@ def check_workflow(text: str) -> list[str]:
         problems.extend(check_share_off_trunk(jobs))
         problems.extend(check_app_store_credentials(jobs))
         problems.extend(check_mac_store_credentials(jobs))
+        problems.extend(check_mac_workspace(jobs))
         problems.extend(check_download_execution(jobs))
         problems.extend(check_container_images(document))
         problems.extend(check_hashed_python_installs(jobs, document.get("permissions")))

@@ -861,6 +861,27 @@ class CheckAppStoreCredentialsTest(unittest.TestCase):
         self.assertLessEqual(len(check_workflow_yaml.NAS_READ_ONLY_POLICY_JSON), 2048)
 
 
+class CheckMacWorkspaceTest(unittest.TestCase):
+    def problems(self, runs_on, steps, matrix=""):
+        text = (f"on: push\njobs:\n  j:\n    runs-on: {runs_on}\n{matrix}    steps:\n{steps}")
+        return [p for p in check_workflow_yaml.check_workflow(text) if "self-hosted Mac and checks out" in p]
+
+    CHECKOUT = "      - uses: actions/checkout@v7\n"
+    CLEAN = "      - name: Empty\n        uses: $/.github/actions/clean-mac-workspace\n"
+
+    def test_a_self_hosted_mac_job_empties_its_workspace_before_checking_out(self):
+        self.assertEqual(len(self.problems("spiceai-macos", self.CHECKOUT)), 1)
+        self.assertEqual(len(self.problems("spiceai-macos-large", self.CHECKOUT + self.CLEAN)), 1)
+        self.assertEqual(self.problems("spiceai-macos", self.CLEAN + self.CHECKOUT), [])
+        matrix = "    strategy:\n      matrix:\n        runner: [spiceai-dev-runners, spiceai-macos]\n"
+        self.assertEqual(len(self.problems("${{ matrix.runner }}", self.CHECKOUT, matrix)), 1)
+
+    def test_other_runners_need_nothing(self):
+        for runner in ("ubuntu-24.04", "macos-14", "spiceai-dev-runners"):
+            with self.subTest(runner=runner):
+                self.assertEqual(self.problems(runner, self.CHECKOUT), [])
+
+
 class CheckMacStoreCredentialsTest(unittest.TestCase):
     DOC = (
         "on: workflow_dispatch\njobs:\n  nas:\n    runs-on: {runner}\n    steps:\n"
