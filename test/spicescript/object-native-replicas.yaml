@@ -1,26 +1,37 @@
 name: object-native-replicas
 description: >
-  Two instances run the same Spicepod against one state location and one
-  Postgres source. The first to start writes the dataset; the second serves its
-  rows from the location as a replica, and adding it adds no replication slot.
-  The replica follows the writer's changes. When the writer is killed, the
-  replica takes over once its lease lapses and resumes the same slot from the
-  last commit, with no change missing or applied twice; the killed instance,
-  started again, follows the new writer, and takes the dataset over again
-  while the source is down, ingesting once it is back. A dataset the writer has not loaded
-  yet is not served from the replica's empty acceleration: the replica serves it
-  from the source until the writer records its load. Every answer is checked
-  against the source.
+  Three instances run the same Spicepod against one state location and one
+  Postgres source. The first to start writes every dataset; each that joins
+  serves the rows from the location and asks for its share of the writing,
+  until the nine write units (seven datasets with a slot each, a dataset with
+  no change stream, and two datasets sharing one explicitly named slot) settle
+  at three per instance, with no instance killed and no slot added. The two
+  datasets on one slot are always written by one instance. A graceful shutdown
+  hands its datasets over without a lease's lapse of ingest, and an instance
+  that loses the state location but keeps its source stops consuming at once,
+  so the instances taking over resume within a lease of the takeover. When a
+  writer is killed, the others take over once its lease lapses and resume the
+  same slots from the last commit, with no change missing or applied twice;
+  the killed instance, started again, follows, and takes datasets over again
+  while the source is down, ingesting once it is back. A dataset the writer has
+  not loaded yet is not served from a replica's empty acceleration: the replica
+  serves it from the source until the writer records its load. Every answer is
+  checked against the source.
 
 sources:
-  # One database for both instances: they share its replication slot.
+  # One database for every instance: they share its replication slots.
   src: { kind: postgres, shared: true }
-  # Its shared bucket holds the state location both instances use.
-  lake: { kind: rustfs }
+  # Its shared bucket holds the state location every instance uses. A reaches
+  # it through a proxy, which a step cuts while A keeps its source; B and C
+  # reach the store directly.
+  lake: { kind: rustfs, latency: 1ms }
 
 variants:
-  a: {}
+  a:
+    spicepod:
+      runtime: { state: { params: { s3_endpoint: '${sources.lake.endpoint}' } } }
   b: {}
+  c: {}
 
 spicepod:
   version: v1
@@ -31,7 +42,7 @@ spicepod:
     state:
       location: s3://${sources.lake.shared_bucket}/state/
       params:
-        s3_endpoint: ${sources.lake.endpoint}
+        s3_endpoint: ${sources.lake.direct_endpoint}
         s3_region: us-east-1
         s3_auth: key
         s3_key: ${sources.lake.key}
@@ -63,6 +74,101 @@ spicepod:
         mode: file
         refresh_mode: full
         refresh_sql: SELECT * FROM unloaded WHERE u_id / (u_id - u_id) = 1
+    # Six more datasets, each with a slot of its own named for the location.
+    - from: postgres:public.d1
+      name: d1
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: id
+        params:
+          cayenne_cdc_mem_tier_min_flush_bytes: '0'
+    - from: postgres:public.d2
+      name: d2
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: id
+        params:
+          cayenne_cdc_mem_tier_min_flush_bytes: '0'
+    - from: postgres:public.d3
+      name: d3
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: id
+        params:
+          cayenne_cdc_mem_tier_min_flush_bytes: '0'
+    - from: postgres:public.d4
+      name: d4
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: id
+        params:
+          cayenne_cdc_mem_tier_min_flush_bytes: '0'
+    - from: postgres:public.d5
+      name: d5
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: id
+        params:
+          cayenne_cdc_mem_tier_min_flush_bytes: '0'
+    - from: postgres:public.d6
+      name: d6
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: id
+        params:
+          cayenne_cdc_mem_tier_min_flush_bytes: '0'
+    # Two datasets that name one slot: they share one replication
+    # connection, so one instance writes both, as one write unit.
+    - from: postgres:public.s1
+      name: s1
+      params:
+        $merge: '${sources.src.params}'
+        pg_replication_slot: onr_shared
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: id
+        params:
+          cayenne_cdc_mem_tier_min_flush_bytes: '0'
+    - from: postgres:public.s2
+      name: s2
+      params:
+        $merge: '${sources.src.params}'
+        pg_replication_slot: onr_shared
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: id
+        params:
+          cayenne_cdc_mem_tier_min_flush_bytes: '0'
 
 defaults:
   # The instances work together, so they run side by side; each answers from
@@ -78,6 +184,22 @@ steps:
         INSERT INTO orders SELECT i, 'O', i * 1.25 FROM generate_series(1, 1000) AS i;
         CREATE TABLE unloaded (u_id bigint PRIMARY KEY, u_v bigint);
         INSERT INTO unloaded SELECT i, i * 10 FROM generate_series(1, 300) AS i;
+        CREATE TABLE d1 (id bigint PRIMARY KEY, at timestamptz NOT NULL DEFAULT clock_timestamp());
+        INSERT INTO d1 (id) SELECT generate_series(1, 100);
+        CREATE TABLE d2 (id bigint PRIMARY KEY, at timestamptz NOT NULL DEFAULT clock_timestamp());
+        INSERT INTO d2 (id) SELECT generate_series(1, 100);
+        CREATE TABLE d3 (id bigint PRIMARY KEY, at timestamptz NOT NULL DEFAULT clock_timestamp());
+        INSERT INTO d3 (id) SELECT generate_series(1, 100);
+        CREATE TABLE d4 (id bigint PRIMARY KEY, at timestamptz NOT NULL DEFAULT clock_timestamp());
+        INSERT INTO d4 (id) SELECT generate_series(1, 100);
+        CREATE TABLE d5 (id bigint PRIMARY KEY, at timestamptz NOT NULL DEFAULT clock_timestamp());
+        INSERT INTO d5 (id) SELECT generate_series(1, 100);
+        CREATE TABLE d6 (id bigint PRIMARY KEY, at timestamptz NOT NULL DEFAULT clock_timestamp());
+        INSERT INTO d6 (id) SELECT generate_series(1, 100);
+        CREATE TABLE s1 (id bigint PRIMARY KEY, v bigint);
+        INSERT INTO s1 SELECT i, i * 1 FROM generate_series(1, 200) AS i;
+        CREATE TABLE s2 (id bigint PRIMARY KEY, v bigint);
+        INSERT INTO s2 SELECT i, i * 2 FROM generate_series(1, 200) AS i;
     only: a
 
   # A starts first and writes the dataset.
@@ -87,15 +209,23 @@ steps:
     eventually: 60s
     only: a
 
-  # B serves A's rows from the location, consuming nothing: the source still
-  # has exactly one slot.
+  # B serves A's rows from the location, adding no slot: the source still has
+  # one slot for each consumer, and A's are the only ones.
   - start: {}
     only: b
   - query: SELECT count(*) AS n, sum(o_total) AS total FROM orders
     eventually: 60s
     only: b
   - source-query: { src: "SELECT count(*) AS slots FROM pg_replication_slots WHERE database = current_database()" }
-    expect: { rows: [['1']] }
+    expect: { rows: [['8']] }
+    only: a
+
+  # B writes fewer units than its share, so it asks A for them one at a time,
+  # through the location, until the nine units are split five and four. No
+  # instance is killed.
+  - source-query: { lake: "lease-holders state/cayenne/v1" }
+    expect: { rows: [['5'], ['4']] }
+    eventually: 240s
     only: a
   # A never loaded `unloaded`, so B answers it from the source rather than from
   # its empty acceleration.
@@ -116,8 +246,132 @@ steps:
     eventually: 60s
     only: b
 
-  # A dies. Changes made meanwhile wait in the slot; B takes over once A's
-  # lease lapses and applies them from the last commit.
+  # C joins and takes its share: three units each.
+  - start: {}
+    only: c
+  - source-query: { lake: "lease-holders state/cayenne/v1" }
+    expect: { rows: [['3'], ['3'], ['3']] }
+    eventually: 300s
+    only: a
+  - query: SELECT o_status, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_status ORDER BY o_status
+    eventually: 60s
+    only: c
+
+  # Changes to every unit reach every instance, wherever each unit is
+  # written. The two datasets on slot onr_shared ingest through its one
+  # consumer: they are one unit, written by one instance.
+  - source-exec:
+      src: "INSERT INTO d1 (id) SELECT generate_series(101, 150); INSERT INTO d2 (id) SELECT generate_series(101, 150); INSERT INTO d3 (id) SELECT generate_series(101, 150); INSERT INTO d4 (id) SELECT generate_series(101, 150); INSERT INTO d5 (id) SELECT generate_series(101, 150); INSERT INTO d6 (id) SELECT generate_series(101, 150); UPDATE s1 SET v = v + 7 WHERE id % 3 = 0; UPDATE s2 SET v = v + 7 WHERE id % 3 = 0;"
+    only: a
+  - query: "SELECT t, n, last FROM (SELECT 'd1' AS t, count(*) AS n, max(id) AS last FROM d1 UNION ALL SELECT 'd2' AS t, count(*) AS n, max(id) AS last FROM d2 UNION ALL SELECT 'd3' AS t, count(*) AS n, max(id) AS last FROM d3 UNION ALL SELECT 'd4' AS t, count(*) AS n, max(id) AS last FROM d4 UNION ALL SELECT 'd5' AS t, count(*) AS n, max(id) AS last FROM d5 UNION ALL SELECT 'd6' AS t, count(*) AS n, max(id) AS last FROM d6 UNION ALL SELECT 's1' AS t, count(*) AS n, sum(v) AS last FROM s1 UNION ALL SELECT 's2' AS t, count(*) AS n, sum(v) AS last FROM s2) AS x ORDER BY t"
+    eventually: 60s
+  - source-query: { src: "SELECT count(*) AS consumers FROM pg_stat_replication r JOIN pg_replication_slots s ON s.active_pid = r.pid WHERE s.slot_name = 'onr_shared'" }
+    expect: { rows: [['1']] }
+    only: a
+  - source-query: { src: "SELECT count(*) FILTER (WHERE active) AS consumed, count(*) AS slots FROM pg_replication_slots WHERE database = current_database()" }
+    expect: { rows: [['8', '8']] }
+    eventually: 60s
+    only: a
+
+  # A graceful shutdown hands C's units to A and B before anything else stops:
+  # ingest pauses for less than one lease (30s). B measures how far behind the
+  # source the six tables written every 200 ms are, every 100 ms, across the
+  # shutdown and the takeovers.
+  - background:
+      id: ticks
+      source-exec: { src: "INSERT INTO d1 (id) VALUES (${round} + 1000000); INSERT INTO d2 (id) VALUES (${round} + 1000000); INSERT INTO d3 (id) VALUES (${round} + 1000000); INSERT INTO d4 (id) VALUES (${round} + 1000000); INSERT INTO d5 (id) VALUES (${round} + 1000000); INSERT INTO d6 (id) VALUES (${round} + 1000000);" }
+      every: 200ms
+    only: b
+  - query: "SELECT CASE WHEN (CAST(now() AS BIGINT) - CAST(min(latest) AS BIGINT)) / 1000000 < 10000 THEN 1 ELSE 0 END AS fresh FROM (SELECT max(at) AS latest FROM d1 UNION ALL SELECT max(at) AS latest FROM d2 UNION ALL SELECT max(at) AS latest FROM d3 UNION ALL SELECT max(at) AS latest FROM d4 UNION ALL SELECT max(at) AS latest FROM d5 UNION ALL SELECT max(at) AS latest FROM d6) AS x"
+    expect: { rows: [['1']] }
+    eventually: 60s
+    only: b
+  - background:
+      id: lag
+      query: "SELECT (CAST(now() AS BIGINT) - CAST(min(latest) AS BIGINT)) / 1000000 AS lag_ms FROM (SELECT max(at) AS latest FROM d1 UNION ALL SELECT max(at) AS latest FROM d2 UNION ALL SELECT max(at) AS latest FROM d3 UNION ALL SELECT max(at) AS latest FROM d4 UNION ALL SELECT max(at) AS latest FROM d5 UNION ALL SELECT max(at) AS latest FROM d6) AS x"
+      every: 100ms
+      measure: { column: lag_ms, below: 30000 }
+    only: b
+  - stop: {}
+    only: c
+  - source-query: { lake: "lease-holders state/cayenne/v1" }
+    expect: { rows: [['5'], ['4']] }
+    eventually: 240s
+    only: a
+  # Keep sampling for a whole lease after the handoff: the lag is the thing
+  # under test, so the wait is time itself, not a readiness poll.
+  - sleep: 30s
+    only: b
+  - stop-background: lag
+    only: b
+  - stop-background: ticks
+    only: b
+  - query: "SELECT t, n, last FROM (SELECT 'd1' AS t, count(*) AS n, max(id) AS last FROM d1 UNION ALL SELECT 'd2' AS t, count(*) AS n, max(id) AS last FROM d2 UNION ALL SELECT 'd3' AS t, count(*) AS n, max(id) AS last FROM d3 UNION ALL SELECT 'd4' AS t, count(*) AS n, max(id) AS last FROM d4 UNION ALL SELECT 'd5' AS t, count(*) AS n, max(id) AS last FROM d5 UNION ALL SELECT 'd6' AS t, count(*) AS n, max(id) AS last FROM d6 UNION ALL SELECT 's1' AS t, count(*) AS n, sum(v) AS last FROM s1 UNION ALL SELECT 's2' AS t, count(*) AS n, sum(v) AS last FROM s2) AS x ORDER BY t"
+    eventually: 60s
+    except: c
+
+  # C starts again and takes its share back.
+  - start: {}
+    only: c
+  - source-query: { lake: "lease-holders state/cayenne/v1" }
+    expect: { rows: [['3'], ['3'], ['3']] }
+    eventually: 300s
+    only: a
+
+  # A loses the state location but keeps its source. Its writer leases lapse,
+  # B and C take its units over, and A stops consuming its slots the moment its
+  # leases could lapse, without waiting to reload: the changes reach B and C
+  # within a lease of the takeover.
+  - source-exec: { lake: proxy-disable }
+    only: a
+  - source-exec:
+      src: "INSERT INTO d1 (id) SELECT generate_series(2000001, 2000050); INSERT INTO d2 (id) SELECT generate_series(2000001, 2000050); INSERT INTO d3 (id) SELECT generate_series(2000001, 2000050); INSERT INTO d4 (id) SELECT generate_series(2000001, 2000050); INSERT INTO d5 (id) SELECT generate_series(2000001, 2000050); INSERT INTO d6 (id) SELECT generate_series(2000001, 2000050); UPDATE s1 SET v = v + 11 WHERE id % 3 = 0; UPDATE s2 SET v = v + 11 WHERE id % 3 = 0; UPDATE orders SET o_total = o_total + 3 WHERE o_id % 19 = 0;"
+    only: b
+  - query: "SELECT t, n, last FROM (SELECT 'd1' AS t, count(*) AS n, max(id) AS last FROM d1 UNION ALL SELECT 'd2' AS t, count(*) AS n, max(id) AS last FROM d2 UNION ALL SELECT 'd3' AS t, count(*) AS n, max(id) AS last FROM d3 UNION ALL SELECT 'd4' AS t, count(*) AS n, max(id) AS last FROM d4 UNION ALL SELECT 'd5' AS t, count(*) AS n, max(id) AS last FROM d5 UNION ALL SELECT 'd6' AS t, count(*) AS n, max(id) AS last FROM d6 UNION ALL SELECT 's1' AS t, count(*) AS n, sum(v) AS last FROM s1 UNION ALL SELECT 's2' AS t, count(*) AS n, sum(v) AS last FROM s2) AS x ORDER BY t"
+    eventually: 75s
+    except: a
+  - query: SELECT o_status, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_status ORDER BY o_status
+    eventually: 90s
+    except: a
+  - source-query: { src: "SELECT count(*) FILTER (WHERE active) AS consumed, count(*) AS slots FROM pg_replication_slots WHERE database = current_database()" }
+    expect: { rows: [['8', '8']] }
+    eventually: 90s
+    only: b
+  # A reaches the location again, follows B and C, and asks for its share back.
+  - source-exec: { lake: proxy-enable }
+    only: a
+  - source-query: { lake: "lease-holders state/cayenne/v1" }
+    expect: { rows: [['3'], ['3'], ['3']] }
+    eventually: 300s
+    only: a
+  - query: "SELECT t, n, last FROM (SELECT 'd1' AS t, count(*) AS n, max(id) AS last FROM d1 UNION ALL SELECT 'd2' AS t, count(*) AS n, max(id) AS last FROM d2 UNION ALL SELECT 'd3' AS t, count(*) AS n, max(id) AS last FROM d3 UNION ALL SELECT 'd4' AS t, count(*) AS n, max(id) AS last FROM d4 UNION ALL SELECT 'd5' AS t, count(*) AS n, max(id) AS last FROM d5 UNION ALL SELECT 'd6' AS t, count(*) AS n, max(id) AS last FROM d6 UNION ALL SELECT 's1' AS t, count(*) AS n, sum(v) AS last FROM s1 UNION ALL SELECT 's2' AS t, count(*) AS n, sum(v) AS last FROM s2) AS x ORDER BY t"
+    eventually: 60s
+    only: a
+
+  # Writing moved many times above, by request, by a graceful shutdown and by
+  # a lost location, and never cost a dataset a rebuild from its source (the
+  # slot is never acknowledged past what a writer recorded) or a member stall
+  # (a dataset that stops consuming its slot on purpose leaves it cleanly).
+  - assert-log:
+      lacks:
+        - "will have its acceleration rebuilt from the source"
+        - "shared replication member detached; its last applied LSN"
+  # Moving a dataset reads nothing from its source: the instance taking over
+  # resumes from what the location holds. Only A's first load read the nine
+  # change-stream datasets; `unloaded`, refreshed in full, never loads.
+  - assert-log:
+      count:
+        "initial snapshot bootstrap complete": 9
+        "Loaded [0-9]+ rows": 0
+    only: a
+  - assert-log:
+      count:
+        "initial snapshot bootstrap complete": 0
+        "Loaded [0-9]+ rows": 0
+    except: a
+
+  # A dies. Changes made meanwhile wait in the slot; B and C take over once
+  # A's leases lapse and apply them from the last commit.
   - kill-spiced: {}
     only: a
   - source-exec:
@@ -136,7 +390,7 @@ steps:
   - query: SELECT count(*) AS n, count(DISTINCT o_id) AS ids, sum(o_total) AS total FROM orders
     only: b
   - source-query: { src: "SELECT count(*) AS slots FROM pg_replication_slots WHERE database = current_database()" }
-    expect: { rows: [['1']] }
+    expect: { rows: [['8']] }
     only: b
 
   # A, started again, follows B.
@@ -152,7 +406,7 @@ steps:
     eventually: 60s
     only: a
   - source-query: { src: "SELECT count(*) AS slots FROM pg_replication_slots WHERE database = current_database()" }
-    expect: { rows: [['1']] }
+    expect: { rows: [['8']] }
     only: a
 
   # B dies while the source is down. A takes the dataset over but cannot reach

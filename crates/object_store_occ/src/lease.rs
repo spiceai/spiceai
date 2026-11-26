@@ -116,6 +116,12 @@ pub struct LeaseRecord {
     pub lease_duration_ms: u64,
     pub acquire_time_ms: i64,
     pub renew_time_ms: i64,
+    /// The instance the holder handed the lease to ([`Lease::release_to`]):
+    /// it may take the lease over at once, while every other instance,
+    /// including the holder, treats it as a lease that lapses after its
+    /// duration as usual. Absent from a lease nobody was handed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_to: Option<String>,
 }
 
 impl LeaseRecord {
@@ -277,7 +283,10 @@ pub enum Plan {
 /// A lease held under the holder's identity is renewed whichever process wrote
 /// it: a restarted instance resumes the lease its previous run held. A lease
 /// lapses after the duration its holder wrote into it; an unreadable one is
-/// treated as another instance's, lasting `duration`.
+/// treated as another instance's, lasting `duration`. A lease its holder
+/// handed to another instance ([`LeaseRecord::handoff_to`]) is taken over at
+/// once by that instance, and by any other, the holder included, only once it
+/// lapses.
 #[must_use]
 pub fn plan(
     observed: Option<&ObservedLease>,
@@ -289,8 +298,10 @@ pub fn plan(
         return Plan::Create;
     };
     let record = observed.record.as_ref();
+    let handed_to = record.and_then(|record| record.handoff_to.as_deref());
     if let Some(record) = record
         && record.holder_identity == holder.identity()
+        && handed_to.is_none_or(|to| to == holder.identity())
     {
         return Plan::Renew {
             version: observed.version.clone(),
@@ -299,7 +310,8 @@ pub fn plan(
     }
     let previous_holder = record.map(|record| record.holder_identity.clone());
     let lease_duration = record.map_or(duration, LeaseRecord::lease_duration);
-    if unchanged_for >= lease_duration {
+    // The holder handed the lease to this instance: take it over at once.
+    if unchanged_for >= lease_duration || handed_to == Some(holder.identity()) {
         Plan::TakeOver {
             version: observed.version.clone(),
             holder: previous_holder,
@@ -307,8 +319,9 @@ pub fn plan(
             previous_generation: record.map_or(0, |record| record.generation),
         }
     } else {
+        // A lease handed to another instance is that instance's to take.
         Plan::Standby {
-            holder: previous_holder,
+            holder: handed_to.map(str::to_string).or(previous_holder),
             lease_duration,
         }
     }
@@ -644,13 +657,41 @@ impl Lease {
         io: &I,
         path: &Path,
     ) -> Result<bool, LeaseError<ConditionalWriteError>> {
+        self.release_to(io, path, None).await
+    }
+
+    /// Hands the lease this holder last wrote to the instance `to`, which may
+    /// take it over at once; every other instance, this holder included, then
+    /// waits for it to lapse, so a handoff to an instance that has stopped
+    /// costs one lease duration. With `None`, as [`Self::release`]. Returns
+    /// `false` when this holder has written no lease since it last released
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseError`] when the release could not be written; the lease
+    /// then stays this holder's until it lapses.
+    pub async fn release_to<I: LeaseIo + ?Sized>(
+        &self,
+        io: &I,
+        path: &Path,
+        to: Option<&str>,
+    ) -> Result<bool, LeaseError<ConditionalWriteError>> {
         let Some((version, record)) = self.state.lock().written.take() else {
             return Ok(false);
         };
-        let released = LeaseRecord {
-            lease_duration_ms: 0,
-            renew_time_ms: self.next_renew_time_ms(),
-            ..record
+        let released = match to {
+            None => LeaseRecord {
+                lease_duration_ms: 0,
+                renew_time_ms: self.next_renew_time_ms(),
+                handoff_to: None,
+                ..record
+            },
+            Some(to) => LeaseRecord {
+                renew_time_ms: self.next_renew_time_ms(),
+                handoff_to: Some(to.to_string()),
+                ..record
+            },
         };
         let body =
             serde_json::to_vec_pretty(&released).map_err(|source| LeaseError::Serialize {
@@ -667,6 +708,66 @@ impl Lease {
             .await
             .map_err(LeaseError::Generation)?;
         Ok(true)
+    }
+
+    /// Moves the lease this holder holds to a new generation, so a takeover
+    /// of the state it guards fences every write made under the previous one,
+    /// this holder's own included. `next_generation` gives the generation from
+    /// the current one, as for [`Self::acquire`]. Returns `None` when this
+    /// holder no longer holds the lease as it last wrote it: another write
+    /// changed it, or it was released.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseError`] when the write fails for a reason other than a
+    /// conflict, or when `next_generation` does.
+    pub async fn advance<I, E, F, Fut>(
+        &self,
+        io: &I,
+        path: &Path,
+        next_generation: F,
+    ) -> Result<Option<u64>, LeaseError<E>>
+    where
+        I: LeaseIo + ?Sized,
+        F: FnOnce(u64) -> Fut,
+        Fut: Future<Output = Result<u64, E>>,
+    {
+        let Some((version, record)) = self.state.lock().written.clone() else {
+            return Ok(None);
+        };
+        let generation = next_generation(record.generation)
+            .await
+            .map_err(LeaseError::Generation)?;
+        let advanced = LeaseRecord {
+            generation,
+            renew_time_ms: self.next_renew_time_ms(),
+            ..record
+        };
+        let body =
+            serde_json::to_vec_pretty(&advanced).map_err(|source| LeaseError::Serialize {
+                path: path.to_string(),
+                source,
+            })?;
+        let Some(expected) = Expected::at_version(version) else {
+            return Ok(None);
+        };
+        match io.write(path, PutPayload::from(body), &expected).await {
+            Ok(result) => {
+                self.state.lock().written = Some((UpdateVersion::from(result), advanced));
+                Ok(Some(generation))
+            }
+            Err(ConditionalWriteError::Conflict { .. }) => {
+                self.state.lock().written = None;
+                Ok(None)
+            }
+            Err(
+                ConditionalWriteError::Unsupported { source, .. }
+                | ConditionalWriteError::Store { source, .. },
+            ) => Err(LeaseError::Write {
+                path: path.to_string(),
+                source,
+            }),
+        }
     }
 
     async fn read<I: LeaseIo + ?Sized, E>(
@@ -693,6 +794,7 @@ impl Lease {
             lease_duration_ms: u64::try_from(self.duration.as_millis()).unwrap_or(u64::MAX),
             acquire_time_ms,
             renew_time_ms,
+            handoff_to: None,
         }
     }
 
@@ -880,6 +982,7 @@ mod tests {
             lease_duration_ms: u64::try_from(lease_duration.as_millis()).expect("fits"),
             acquire_time_ms: 1_000,
             renew_time_ms: 2_000,
+            handoff_to: None,
         }
     }
 
@@ -1015,6 +1118,126 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_lease_handed_to_us_is_taken_over_at_once_and_only_by_us() {
+        let handed = LeaseRecord {
+            handoff_to: Some("b".to_string()),
+            ..record("a", 4, Duration::from_secs(30))
+        };
+        // The instance it was handed to takes it over without waiting.
+        assert_eq!(
+            plan(
+                Some(&observed(Some(handed.clone()))),
+                &holder("b"),
+                Duration::from_secs(30),
+                Duration::ZERO
+            ),
+            Plan::TakeOver {
+                version: version("7"),
+                holder: Some("a".to_string()),
+                unrenewed_for: Duration::ZERO,
+                previous_generation: 4,
+            }
+        );
+        // Any other instance, and the holder that handed it over, waits for it
+        // to lapse, and sees the instance it was handed to as its holder.
+        for other in ["a", "c"] {
+            assert_eq!(
+                plan(
+                    Some(&observed(Some(handed.clone()))),
+                    &holder(other),
+                    Duration::from_secs(30),
+                    Duration::from_secs(29)
+                ),
+                Plan::Standby {
+                    holder: Some("b".to_string()),
+                    lease_duration: Duration::from_secs(30),
+                },
+                "{other}"
+            );
+            assert!(matches!(
+                plan(
+                    Some(&observed(Some(handed.clone()))),
+                    &holder(other),
+                    Duration::from_secs(30),
+                    Duration::from_secs(30)
+                ),
+                Plan::TakeOver {
+                    previous_generation: 4,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn advance_moves_the_holders_lease_to_a_new_generation_once_it_holds_it() {
+        let store = memory();
+        let a = Lease::new(holder("a"), Duration::from_secs(30));
+        acquire(&a, &store).await;
+        assert_eq!(
+            a.advance(store.as_ref(), &path(), |g| async move {
+                Ok::<_, Infallible>(g + 5)
+            })
+            .await
+            .expect("advance"),
+            Some(6)
+        );
+        assert_eq!(stored(&store).await.generation, 6);
+        // A renewal keeps the advanced generation.
+        assert_eq!(
+            acquire(&a, &store).await,
+            Role::Holder {
+                generation: 6,
+                acquired: Acquired::Renewed {
+                    by_other_process: false
+                },
+            }
+        );
+        // Another write changed the lease: the holder no longer holds it as it
+        // wrote it, and advances nothing.
+        store
+            .put(
+                &path(),
+                serde_json::to_vec(&record("b", 9, Duration::from_secs(30)))
+                    .expect("json")
+                    .into(),
+            )
+            .await
+            .expect("overwrite");
+        assert_eq!(
+            a.advance(store.as_ref(), &path(), after)
+                .await
+                .expect("advance"),
+            None
+        );
+        assert_eq!(stored(&store).await.generation, 9);
+    }
+
+    #[tokio::test]
+    async fn a_lease_handed_over_is_taken_by_the_instance_it_names() {
+        let store = memory();
+        let a = Lease::new(holder("a"), Duration::from_secs(30));
+        let b = Lease::new(holder("b"), Duration::from_secs(30));
+        acquire(&a, &store).await;
+        assert!(
+            a.release_to(store.as_ref(), &path(), Some("b"))
+                .await
+                .expect("release")
+        );
+        assert_eq!(stored(&store).await.handoff_to.as_deref(), Some("b"));
+        // The holder that handed it over does not renew it.
+        assert!(matches!(acquire(&a, &store).await, Role::Standby { .. }));
+        match acquire(&b, &store).await {
+            Role::Holder {
+                generation: 2,
+                acquired: Acquired::TookOver { .. },
+            } => {}
+            other => panic!("b should take the lease over at once: {other:?}"),
+        }
+        assert_eq!(stored(&store).await.handoff_to, None);
     }
 
     #[test]

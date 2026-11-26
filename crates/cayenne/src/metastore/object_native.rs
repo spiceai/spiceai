@@ -31,7 +31,9 @@ mod publish;
 mod registry;
 mod slot;
 mod transactions;
+mod unit;
 pub use registry::{ObjectNativeCatalog, TableDeletionHolds, dataset_log_at, new_dataset_folder};
+pub use unit::WriteUnits;
 
 /// One head log: a serial writer and its last acknowledged state. The catalog
 /// keeps one for its name registry and one per dataset. No database is used.
@@ -43,18 +45,11 @@ struct Domain {
     /// Open while this instance writes the log, so its tables' stores accept
     /// data writes; closed on a replica.
     data_writes: crate::catalog::DataWriteGate,
-    /// The writer lease that decides whether this instance writes the log,
-    /// under [`Access::Leased`].
-    lease: Option<WriterLease>,
-}
-
-/// A log's writer lease, as this instance holds or watches it.
-struct WriterLease {
-    lease: object_store_occ::lease::Lease,
-    path: object_store::path::Path,
-    store: Arc<dyn object_store::ObjectStore>,
-    /// The dataset the lease is for, named in its errors.
-    dataset: Arc<str>,
+    /// The writer lease of the unit the log belongs to, which decides whether
+    /// this instance writes it, under [`Access::Leased`].
+    unit: Option<Arc<unit::UnitLease>>,
+    /// The dataset this log holds; empty for the name registry.
+    name: Arc<str>,
 }
 
 /// What opening the catalog found, for the startup log.
@@ -107,23 +102,6 @@ impl Default for LeaseSettings {
     }
 }
 
-/// The part of a dataset one writer holds a lease on. Today a whole dataset;
-/// a source partition or a key range gets its own lease object later, beside
-/// it, and its generation in the dataset state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WriteUnit {
-    Dataset,
-}
-
-impl WriteUnit {
-    /// The lease object of this unit in the log at `prefix`.
-    fn lease_path(self, prefix: &object_store::path::Path) -> object_store::path::Path {
-        match self {
-            Self::Dataset => prefix.clone().join("leases").join("writer.json"),
-        }
-    }
-}
-
 struct Inner {
     reader: DatasetStateReader,
     head: Head,
@@ -144,6 +122,8 @@ struct Inner {
     /// A background task is resolving [`Stop::Unresolved`] or reloading after
     /// [`Stop::Fenced`].
     recovering: bool,
+    /// How the log is taken over again after a commit whose outcome is unknown.
+    retake: Retake,
     /// The dataset this log holds, for what it reports; empty for the registry.
     dataset: Arc<str>,
     config: NativeCatalogConfig,
@@ -262,6 +242,17 @@ fn validate_uuid(name: &str, value: &str) -> CatalogResult<()> {
     uuid::Uuid::parse_str(value)
         .map_err(|_| invalid(format!("{name} is not a valid UUID: {value}")))?;
     Ok(())
+}
+
+/// How a writer takes its log over again after a commit whose outcome is
+/// unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Retake {
+    /// It reopens the log itself, at the head's next generation.
+    Reopen,
+    /// Its unit's writer lease takes every member over again, at a new lease
+    /// generation; the log follows what committed until then.
+    ByLease,
 }
 
 /// Why a log accepts no change.

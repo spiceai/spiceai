@@ -66,7 +66,7 @@ pub(super) fn start_background(
     let endpoint = format!("{}/v1/sql", instance.spiced.http_endpoint());
     let mut tasks = Vec::new();
     for _ in 0..spec.concurrency {
-        let (halt, stats, round, sql, target, endpoint, every, expect) = (
+        let (halt, stats, round, sql, target, endpoint, every, expect, measure) = (
             Arc::clone(&halt),
             Arc::clone(&stats),
             Arc::clone(&round),
@@ -75,6 +75,7 @@ pub(super) fn start_background(
             endpoint.clone(),
             spec.every,
             spec.expect.clone(),
+            spec.measure.as_ref().map(|measure| measure.column.clone()),
         );
         tasks.push(tokio::spawn(async move {
             let client = reqwest::Client::new();
@@ -102,6 +103,10 @@ pub(super) fn start_background(
                             if let Some(expect) = &expect {
                                 check_invariant(&body, expect)?;
                             }
+                            if let Some(column) = &measure {
+                                let value = measured_value(&body, column)?;
+                                stats.lock().measured.push(value);
+                            }
                             Ok(())
                         }
                         .await
@@ -127,6 +132,7 @@ pub(super) fn start_background(
             stop: halt,
             tasks,
             stats,
+            measure: spec.measure.clone(),
         },
     );
     Ok(())
@@ -158,6 +164,43 @@ pub(super) fn check_invariant(body: &str, expect: &BTreeMap<String, Option<Strin
     Ok(())
 }
 
+/// The number in `column` of a `/v1/sql` JSON answer of exactly one row.
+fn measured_value(body: &str, column: &str) -> Result<f64> {
+    let rows: Vec<serde_json::Map<String, Value>> = serde_json::from_str(body)
+        .with_context(|| format!("not a JSON row array: {}", one_line(body, 200)))?;
+    let [row] = rows.as_slice() else {
+        bail!(
+            "expected one row, got {}: {}",
+            rows.len(),
+            one_line(body, 200)
+        );
+    };
+    match row.get(column) {
+        Some(Value::Number(n)) => n
+            .as_f64()
+            .with_context(|| format!("'{column}' = {n} is not a finite number")),
+        Some(Value::String(s)) => s
+            .parse()
+            .with_context(|| format!("'{column}' = {s:?} is not a number")),
+        other => bail!("'{column}' is {other:?}, not a number"),
+    }
+}
+
+/// The value at quantile `q` of sorted `samples` (nearest rank).
+fn quantile(samples: &[f64], q: f64) -> f64 {
+    if samples.is_empty() {
+        return f64::NAN;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "a rank within a sample count far below 2^52"
+    )]
+    let rank = ((samples.len() as f64) * q).ceil() as usize;
+    samples[rank.clamp(1, samples.len()) - 1]
+}
+
 /// Stops a background task, waiting for each loop's iteration in flight, and
 /// fails if any iteration failed with an error no `allow` pattern matches.
 pub(super) async fn stop_background(
@@ -169,6 +212,7 @@ pub(super) async fn stop_background(
         .background
         .remove(id)
         .ok_or_else(|| anyhow!("no background '{id}' is running"))?;
+    let measure = background.measure.clone();
     background
         .stop
         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -223,8 +267,29 @@ pub(super) async fn stop_background(
     for (kind, n) in kinds.iter().take(2) {
         let _ = write!(common, "; {n}× {kind}");
     }
+    let mut measured = String::new();
+    if let Some(measure) = &measure {
+        let mut samples = stats.measured.clone();
+        samples.sort_unstable_by(f64::total_cmp);
+        let max = samples.last().copied().unwrap_or(f64::NAN);
+        let _ = write!(
+            measured,
+            "; {}: n={}, p99 {}, p99.9 {}, max {max}",
+            measure.column,
+            samples.len(),
+            quantile(&samples, 0.99),
+            quantile(&samples, 0.999),
+        );
+        if let Some(below) = measure.below {
+            ensure!(
+                !samples.is_empty() && max < below,
+                "{} reached {max}, at or above {below}{measured}",
+                measure.column
+            );
+        }
+    }
     Ok(format!(
-        "{} iterations, {} allowed errors, p99 {:.0}ms{common}",
+        "{} iterations, {} allowed errors, p99 {:.0}ms{measured}{common}",
         stats.iterations,
         stats.errors.len(),
         p99.as_secs_f64() * 1000.0

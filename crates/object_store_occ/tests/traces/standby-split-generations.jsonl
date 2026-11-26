@@ -1,0 +1,1 @@
+{"kind":"witness","run":"standby-retake-split-generations","family":"standby","mode":"standby-retake-split","property":"a head takeover carries its lease's generation","status":"FAIL","valid":true,"initial_index":0,"actions":["Retake(0)","Takeover(0)"]}

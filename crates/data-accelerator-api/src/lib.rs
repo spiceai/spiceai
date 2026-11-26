@@ -950,6 +950,14 @@ pub trait DataAccelerator: Send + Sync {
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Hand every acceleration this instance writes for other instances
+    /// sharing its location back to them, each at a commit boundary, so they
+    /// take over at once rather than once a lease lapses; this instance writes
+    /// none of them afterwards. Called first on a graceful shutdown. A no-op
+    /// for an engine whose accelerations no other instance writes. No default,
+    /// so every engine states which it is.
+    async fn release_writer_leases(&self);
 }
 
 /// Factory that re-runs the `create_accelerator_table` registry flow to

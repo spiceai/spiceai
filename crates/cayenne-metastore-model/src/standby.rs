@@ -5,6 +5,14 @@
 //! expiry on a discrete clock, renewal by the holder, crash, pause and resume,
 //! and takeover by a head commit that raises the writer generation. Only the
 //! generation in the head fences writers; lease timing decides availability.
+//!
+//! The lease grants the generation the head checks: every head takeover is at
+//! the generation of the lease its taker holds. In the `retake` runs a holder
+//! also takes its head over again (after a commit whose outcome it could not
+//! learn, or a takeover that failed): it first moves its own lease to the next
+//! generation, then takes the head over at it. The `split` control keeps two
+//! generations instead, as a takeover at the head's next generation whatever
+//! the lease holds, and the head's generation then drifts from the lease's.
 use stateright::{Model, Property};
 
 /// Ticks a lease lasts after acquisition or renewal.
@@ -95,6 +103,10 @@ pub(crate) struct State {
     /// (change, instance) of each committed data file left on the committing
     /// instance's local disk; only the local-files control records any.
     local_files: Vec<(usize, usize)>,
+    /// The lease generation its taker held when the head was last taken over.
+    head_epoch: usize,
+    /// Retakes so far; at most one, to keep the runs finite.
+    retakes: u8,
     /// A standby read or a takeover needed a file on another instance's disk.
     unreadable_file: bool,
 }
@@ -104,6 +116,10 @@ pub(crate) enum Action {
     Acquire(usize),
     Renew(usize),
     Takeover(usize),
+    /// A holder that writes the head takes it over again: under the next
+    /// generation of its own lease, or, in the `split` control, at the head's
+    /// next generation with the lease left as it is.
+    Retake(usize),
     Read(usize),
     Commit(usize),
     Ack(usize),
@@ -193,6 +209,8 @@ impl Model for Protocol {
             bad_read: false,
             local_files: vec![],
             unreadable_file: false,
+            head_epoch: 1,
+            retakes: 0,
         }]
     }
     fn actions(&self, s: &State, a: &mut Vec<Action>) {
@@ -202,6 +220,7 @@ impl Model for Protocol {
                 Action::Acquire(i),
                 Action::Renew(i),
                 Action::Takeover(i),
+                Action::Retake(i),
                 Action::Read(i),
                 Action::Commit(i),
                 Action::Ack(i),
@@ -274,21 +293,60 @@ impl Model for Protocol {
                 if !running(i) || n.epoch == 0 || n.generation != 0 {
                     return None;
                 }
-                if self.has("no-generation") {
+                let generation = if self.has("no-generation") {
                     // Fencing by the lease object only: the head is read, not written.
+                    n.epoch
+                } else if self.has("split") {
+                    // Two generations: the head's next, whatever the lease holds.
+                    next.head.generation = s.head.generation + 1;
+                    next.head.generation
                 } else if s.head.generation >= n.epoch {
                     // The takeover CAS requires a lower generation in the head.
                     Self::step_down(&mut next.instances[i]);
                     return Some(next);
                 } else {
                     next.head.generation = n.epoch;
+                    n.epoch
+                };
+                if !self.has("no-generation") {
+                    next.head_epoch = n.epoch;
                 }
                 next.crash_takeover |= s.lease.epoch == n.epoch && s.lease.cause == 1;
                 next.unreadable_file |= s.local_files.iter().any(|&(_, o)| o != i);
-                next.fenced = n.epoch;
+                next.fenced = generation;
                 let m = &mut next.instances[i];
-                m.generation = n.epoch;
+                m.generation = generation;
                 m.base = Some(next.head);
+            }
+            Action::Retake(i) => {
+                let n = &s.instances[i];
+                if !self.has("retake")
+                    || !running(i)
+                    || s.retakes >= 1
+                    || n.generation == 0
+                    || n.left == 0
+                    || s.lease.epoch != n.epoch
+                {
+                    return None;
+                }
+                next.retakes += 1;
+                if !self.has("split") {
+                    // The holder moves its own lease to the next generation:
+                    // a conditional write on the version it wrote.
+                    if s.lease.epoch >= EPOCHS {
+                        return None;
+                    }
+                    next.lease.epoch = s.lease.epoch + 1;
+                    next.lease.left = DURATION;
+                    next.lease.lost = 0;
+                    next.instances[i].epoch = next.lease.epoch;
+                    next.instances[i].left = DURATION;
+                }
+                // It takes the head over next; a commit it sent before stays in
+                // flight.
+                let m = &mut next.instances[i];
+                m.generation = 0;
+                m.base = None;
             }
             Action::Read(i) => {
                 let n = &s.instances[i];
@@ -413,8 +471,19 @@ impl Model for Protocol {
                     "instance {i} takes over (lease object only; the head generation is not raised)"
                 )
             }
+            Action::Takeover(i) if self.has("split") => {
+                format!("instance {i} takes over the head at its next generation")
+            }
             Action::Takeover(i) => {
                 format!("instance {i} takes over the head (raises its generation)")
+            }
+            Action::Retake(i) if self.has("split") => {
+                format!("instance {i} takes its head over again (lease unchanged)")
+            }
+            Action::Retake(i) => {
+                format!(
+                    "instance {i} moves its lease to the next generation to take its head over again"
+                )
             }
             Action::Read(i) => format!("instance {i} reads a source change and prepares a commit"),
             Action::Commit(i) => format!("instance {i}'s commit CAS arrives at the head"),
@@ -445,6 +514,10 @@ impl Model for Protocol {
             format!(
                 "ticks with no ingester since the last holder failure: {}",
                 s.waiting
+            ),
+            format!(
+                "lease generation {}; head taken over under lease generation {}",
+                s.lease.epoch, s.head_epoch
             ),
             crate::explorer::flags(&[
                 ("stale commit attempted", s.stale),
@@ -491,6 +564,9 @@ impl Model for Protocol {
                     )
                     .to(head)
                     .tone(if ok { Tone::Live } else { Tone::Gone })
+                }
+                Action::Retake(i) => {
+                    Event::on(i, format!("retake (lease epoch {})", after.lease.epoch)).to(lease)
                 }
                 Action::Read(i) => Event::on(i, "read a change, prepare commit").tone(Tone::Staged),
                 Action::Commit(i) => {
@@ -612,6 +688,11 @@ impl Model for Protocol {
             Property::sometimes("takeover after holder crash", |_, s: &State| {
                 s.crash_takeover
             }),
+            // The lease grants the generation the head checks.
+            Property::always(
+                "a head takeover carries its lease's generation",
+                |_, s: &State| s.head_epoch == 0 || s.head.generation == s.head_epoch,
+            ),
             Property::sometimes("paused writer resumes and is fenced", |_, s: &State| {
                 s.fenced_resume
             }),
@@ -624,6 +705,17 @@ impl Model for Protocol {
                 |_, s: &State| s.acknowledged == CHANGES && s.fenced >= 2,
             ),
         ];
+        if self.has("retake") {
+            p.push(Property::sometimes(
+                "a holder takes its head over again and commits",
+                |_, s: &State| {
+                    s.retakes > 0
+                        && s.committers
+                            .iter()
+                            .any(|&(g, _)| g == s.head.generation && g >= 2)
+                },
+            ));
+        }
         if self.timed() {
             p.extend([
                 Property::always("lease exclusive until expiry", |_, s: &State| {
@@ -656,6 +748,173 @@ impl Model for Protocol {
         }
         p
     }
+}
+
+/// What one action of a standby trace did, as a replay checks it against the
+/// implementation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StepKind {
+    Tick,
+    /// The instance acquired the lease at this generation.
+    Acquire {
+        instance: usize,
+        epoch: usize,
+    },
+    /// The instance renewed its lease, or (`renewed: false`) found another
+    /// instance holds it and stepped down.
+    Renew {
+        instance: usize,
+        renewed: bool,
+    },
+    /// The instance took the head over at `generation`, or was refused.
+    Takeover {
+        instance: usize,
+        accepted: bool,
+        generation: usize,
+    },
+    /// The instance takes its head over again: under lease generation
+    /// `epoch` (`None` in the `split` control, which leaves the lease as is).
+    Retake {
+        instance: usize,
+        epoch: Option<usize>,
+    },
+    /// The instance prepared a commit of source change `change`.
+    Read {
+        instance: usize,
+        change: usize,
+    },
+    /// The instance's prepared commit reached the head.
+    Commit {
+        instance: usize,
+        outcome: CommitOutcome,
+    },
+    Ack {
+        instance: usize,
+    },
+    Crash {
+        instance: usize,
+    },
+    Restart {
+        instance: usize,
+    },
+    Pause {
+        instance: usize,
+    },
+    Resume {
+        instance: usize,
+    },
+    Serve {
+        instance: usize,
+    },
+}
+
+/// How a prepared commit fared at the head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitOutcome {
+    Accepted,
+    /// Refused because the head moved under the same generation; the writer
+    /// reads the head again.
+    Rebase,
+    /// Refused by a newer generation; the writer steps down.
+    Fenced,
+    /// Refused after the instance had already moved on from the generation
+    /// that prepared it.
+    Stale,
+}
+
+/// One step of a standby trace: what the action did and the state after it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Step {
+    pub kind: StepKind,
+    pub lease_epoch: usize,
+    pub head_generation: usize,
+    pub rows: Vec<usize>,
+}
+
+fn parse(text: &str) -> Option<Action> {
+    let (name, arg) = match text.split_once('(') {
+        Some((name, rest)) => (name, Some(rest.strip_suffix(')')?.trim().parse().ok()?)),
+        None => (text, None),
+    };
+    Some(match (name, arg) {
+        ("Tick", None) => Action::Tick,
+        ("Acquire", Some(i)) => Action::Acquire(i),
+        ("Renew", Some(i)) => Action::Renew(i),
+        ("Takeover", Some(i)) => Action::Takeover(i),
+        ("Retake", Some(i)) => Action::Retake(i),
+        ("Read", Some(i)) => Action::Read(i),
+        ("Commit", Some(i)) => Action::Commit(i),
+        ("Ack", Some(i)) => Action::Ack(i),
+        ("Crash", Some(i)) => Action::Crash(i),
+        ("Restart", Some(i)) => Action::Restart(i),
+        ("Pause", Some(i)) => Action::Pause(i),
+        ("Resume", Some(i)) => Action::Resume(i),
+        ("Serve", Some(i)) => Action::Serve(i),
+        _ => return None,
+    })
+}
+
+/// Step the model through `actions` (as a trace prints them) and say what
+/// each did. `None` when an action does not parse or is not enabled.
+#[must_use]
+pub fn steps(mode: &str, actions: &[String]) -> Option<Vec<Step>> {
+    let protocol = Protocol::new(mode);
+    let mut state = protocol.init_states().pop()?;
+    let mut out = Vec::with_capacity(actions.len());
+    for text in actions {
+        let action = parse(text)?;
+        let next = protocol.next_state(&state, action.clone())?;
+        let kind = match action {
+            Action::Tick => StepKind::Tick,
+            Action::Acquire(i) => StepKind::Acquire {
+                instance: i,
+                epoch: next.lease.epoch,
+            },
+            Action::Renew(i) => StepKind::Renew {
+                instance: i,
+                renewed: next.instances[i].epoch != 0,
+            },
+            Action::Takeover(i) => StepKind::Takeover {
+                instance: i,
+                accepted: next.instances[i].generation != 0,
+                generation: next.instances[i].generation,
+            },
+            Action::Retake(i) => StepKind::Retake {
+                instance: i,
+                epoch: (!protocol.has("split")).then_some(next.lease.epoch),
+            },
+            Action::Read(i) => StepKind::Read {
+                instance: i,
+                change: next.instances[i].pending?.change,
+            },
+            Action::Commit(i) => StepKind::Commit {
+                instance: i,
+                outcome: if next.head.pos > state.head.pos {
+                    CommitOutcome::Accepted
+                } else if next.instances[i].generation == 0 && state.instances[i].generation != 0 {
+                    CommitOutcome::Fenced
+                } else if next.instances[i].base != state.instances[i].base {
+                    CommitOutcome::Rebase
+                } else {
+                    CommitOutcome::Stale
+                },
+            },
+            Action::Ack(i) => StepKind::Ack { instance: i },
+            Action::Crash(i) => StepKind::Crash { instance: i },
+            Action::Restart(i) => StepKind::Restart { instance: i },
+            Action::Pause(i) => StepKind::Pause { instance: i },
+            Action::Resume(i) => StepKind::Resume { instance: i },
+            Action::Serve(i) => StepKind::Serve { instance: i },
+        };
+        out.push(Step {
+            kind,
+            lease_epoch: next.lease.epoch,
+            head_generation: next.head.generation,
+            rows: next.rows.clone(),
+        });
+        state = next;
+    }
+    Some(out)
 }
 
 #[cfg(test)]

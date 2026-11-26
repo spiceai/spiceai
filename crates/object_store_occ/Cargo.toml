@@ -28,7 +28,7 @@ uuid = { workspace = true, features = ["v4", "v7"] }
 cayenne-metastore-model = { path = "../cayenne-metastore-model" }
 object_store_sim = { path = "../object_store_sim" }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "fs"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "fs", "test-util"] }
 
 [[test]]
 name = "integration"

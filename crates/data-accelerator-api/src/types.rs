@@ -50,6 +50,20 @@ impl AcceleratorEngineRegistry {
         }
     }
 
+    /// Hand every acceleration this instance writes for others on a shared
+    /// location back to them ([`DataAccelerator::release_writer_leases`]).
+    pub async fn release_writer_leases(&self) {
+        let engines: Vec<Arc<dyn DataAccelerator>> = self
+            .accelerator_engine_registry
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        futures::future::join_all(engines.iter().map(|engine| engine.release_writer_leases()))
+            .await;
+    }
+
     pub async fn register_accelerator_engine(
         &self,
         engine: Engine,

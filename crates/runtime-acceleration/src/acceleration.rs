@@ -159,6 +159,33 @@ pub fn unset_refresh_mode_for_connector(connector: &str) -> RefreshMode {
     }
 }
 
+/// The change-source consumer `dataset` reads through when other datasets may
+/// share it, named so every instance running the same Spicepod computes the
+/// same name: a PostgreSQL replication slot named by `pg_replication_slot`,
+/// which every dataset naming it on one connection reads through one
+/// replication connection. `None` for a dataset that reads through a consumer
+/// of its own, or none.
+///
+/// Datasets on one consumer must be written by one instance. The name is the
+/// slot alone, whatever the connection: two datasets naming one slot on
+/// different databases are then written together too, which is coarser than
+/// needed but never splits a consumer.
+#[must_use]
+pub fn shared_change_consumer(dataset: &spicepod::component::dataset::Dataset) -> Option<String> {
+    let enabled = dataset
+        .acceleration
+        .as_ref()
+        .is_some_and(|acceleration| acceleration.enabled);
+    if !enabled || dataset.from.split_once(':').map(|(connector, _)| connector) != Some("postgres")
+    {
+        return None;
+    }
+    let slot = dataset.params.as_ref()?.data.get("pg_replication_slot")?;
+    let slot = slot.as_string();
+    let slot = slot.trim();
+    (!slot.is_empty()).then(|| format!("postgres slot {slot}"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Mode {
     #[default]

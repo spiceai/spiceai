@@ -2417,6 +2417,13 @@ impl Runtime {
 
         self.status.mark_shutdown();
 
+        let shutdown_timeout: Duration = self.read_app().await.and_then(|app| {
+            app.runtime.shutdown_timeout().unwrap_or_else(|err| {
+                tracing::warn!("Invalid shutdown timeout: {err}. Using default: {RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT:?}");
+                Some(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT)
+            })
+        }).unwrap_or(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT);
+
         // Tell CDC sources to release their upstream resources NOW, before
         // the connection-drain phase below: a Postgres replication connection
         // holds a single-consumer slot, and releasing it at shutdown start
@@ -2424,13 +2431,6 @@ impl Runtime {
         // during a rolling deploy instead of retrying against "slot is
         // active".
         data_components::cdc::begin_shutdown();
-
-        let shutdown_timeout: Duration = self.read_app().await.and_then(|app| {
-            app.runtime.shutdown_timeout().unwrap_or_else(|err| {
-                tracing::warn!("Invalid shutdown timeout: {err}. Using default: {RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT:?}");
-                Some(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT)
-            })
-        }).unwrap_or(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT);
         tracing::info!(
             "Shutdown initiated; waiting up to {shutdown_timeout:?} for connections to drain"
         );
@@ -2484,8 +2484,31 @@ impl Runtime {
         //
         // Snapshot writer leases are resigned alongside, so a replacement instance
         // need not wait for them to lapse.
+        //
+        // Once the sources have recorded how far they got, every acceleration
+        // this instance writes for other instances on a shared location is
+        // handed back to them, each at a commit boundary, before connections
+        // finish draining or anything else stops: they resume ingesting at
+        // their next renewal instead of after a lease lapses.
+        let drain_then_hand_over = async {
+            let unfinished = data_components::cdc::drain_shutdown(shutdown_timeout).await;
+            if tokio::time::timeout(
+                shutdown_timeout,
+                self.df
+                    .accelerator_engine_registry()
+                    .release_writer_leases(),
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!(
+                    "Shutdown waited {shutdown_timeout:?} to hand writing of shared accelerations to other instances and gave up; they take those datasets over once their writer leases lapse"
+                );
+            }
+            unfinished
+        };
         let (unfinished_sources, _, leases_released) = tokio::join!(
-            data_components::cdc::drain_shutdown(shutdown_timeout),
+            drain_then_hand_over,
             join_all(shutdown_futures),
             tokio::time::timeout(shutdown_timeout, self.df.resign_snapshot_writer_leases()),
         );

@@ -787,6 +787,20 @@ const SPILLED: &str = "records";
 fn numbered(prefix: &Path, directory: &str, number: u64) -> Path {
     prefix.clone().join(directory).join(format!("{number:020}"))
 }
+/// The generation of the writer that last took the log at `prefix` over, or
+/// `None` when it has no head yet. A writer lease grants each takeover a
+/// generation above this one.
+/// # Errors
+/// Returns an error when the head cannot be read or decoded.
+pub async fn head_generation(store: &dyn ObjectStore, prefix: &Path) -> Result<Option<u64>> {
+    match read_head(store, prefix).await {
+        Ok(state) => Ok(Some(state.head.lease)),
+        Err(Error::Storage {
+            source: object_store::Error::NotFound { .. },
+        }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
 async fn read_head(store: &dyn ObjectStore, prefix: &Path) -> Result<HeadState> {
     let result = store.get(&prefix.clone().join("head")).await?;
     decode_head(result).await

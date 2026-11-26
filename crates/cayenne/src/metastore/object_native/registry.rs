@@ -58,6 +58,8 @@ pub struct ObjectNativeCatalog {
     routes: RwLock<Routes>,
     /// [`Self::location_id`], once read: it never changes after it is recorded.
     location_id: std::sync::OnceLock<String>,
+    /// The write units and their leases, under [`super::Access::Leased`].
+    units: Option<Arc<super::unit::Units>>,
     /// Serializes creating and dropping datasets, and deleting a dropped
     /// dataset's folder.
     pub(super) ddl: Arc<tokio::sync::Mutex<()>>,
@@ -109,22 +111,23 @@ fn sibling(prefix: &Path, name: &str) -> Path {
     Path::from_iter(parts).join(name)
 }
 
-/// Keep `domain`'s writer lease, under [`super::Access::Leased`], for as long
-/// as the catalog holds the log: renew it, or take over once it lapses.
-fn keep_lease_while_open(domain: &Arc<Domain>) {
-    let Some(every) = domain.lease_interval() else {
-        return;
-    };
-    let domain = Arc::downgrade(domain);
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(every).await;
-            let Some(domain) = domain.upgrade() else {
-                break;
-            };
-            domain.keep_lease().await;
-        }
-    });
+/// The write units of a catalog at `prefix` opened with `config`: `None`
+/// unless a writer lease decides which instance writes each log.
+fn units_for(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &Path,
+    config: NativeCatalogConfig,
+    groups: super::WriteUnits,
+) -> Option<Arc<super::unit::Units>> {
+    match config.access {
+        super::Access::Leased(settings) => Some(super::unit::Units::new(
+            Arc::clone(store),
+            sibling(prefix, "leases"),
+            settings,
+            groups,
+        )),
+        super::Access::Writer | super::Access::Replica => None,
+    }
 }
 
 /// A folder name a person browsing the bucket can match to its dataset.
@@ -200,7 +203,7 @@ impl ObjectNativeCatalog {
         prefix: Path,
         config: NativeCatalogConfig,
     ) -> CatalogResult<Self> {
-        Self::create_at(store, prefix, config, None).await
+        Self::create_at(store, prefix, config, None, super::WriteUnits::default()).await
     }
 
     /// Open the catalog kept in a local directory, creating it on first use. The
@@ -254,7 +257,7 @@ impl ObjectNativeCatalog {
         prefix: Path,
         config: NativeCatalogConfig,
     ) -> CatalogResult<Self> {
-        Self::open_at(store, prefix, config, None).await
+        Self::open_at(store, prefix, config, None, super::WriteUnits::default()).await
     }
 
     /// Open the log of every dataset the registry names, route each table to its
@@ -265,11 +268,12 @@ impl ObjectNativeCatalog {
         config: NativeCatalogConfig,
         registry: Domain,
         anchor: Option<Arc<str>>,
+        units: Option<Arc<super::unit::Units>>,
     ) -> CatalogResult<Self> {
         let datasets = sibling(&prefix, "datasets");
         let transactions = sibling(&prefix, "transactions");
         let registry = Arc::new(registry);
-        keep_lease_while_open(&registry);
+        registry.join_unit().await;
         let mut routes = Routes::default();
         routes.refresh(&registry, registry.tables().await);
         let entries = registry.positions_under(REGISTRY).await;
@@ -277,6 +281,7 @@ impl ObjectNativeCatalog {
             let store = Arc::clone(&store);
             let datasets = datasets.clone();
             let anchor = anchor.clone();
+            let units = units.clone();
             async move {
                 let folder = String::from_utf8(folder).map_err(invalid)?;
                 let prefix = datasets.join(folder.as_str());
@@ -293,6 +298,7 @@ impl ObjectNativeCatalog {
                     config.commit_each_change,
                     anchor,
                     &name,
+                    units.as_ref(),
                 )
                 .await?;
                 domain.folder = folder;
@@ -307,9 +313,12 @@ impl ObjectNativeCatalog {
                 continue;
             };
             let domain = Arc::new(domain);
-            keep_lease_while_open(&domain);
+            domain.join_unit().await;
             routes.refresh(&domain, domain.tables().await);
             routes.datasets.insert(name, domain);
+        }
+        if let Some(units) = &units {
+            units.balance_while_open();
         }
         // Only the instance that writes the registry removes its stale entries.
         if registry.data_writes.allows() {
@@ -325,6 +334,7 @@ impl ObjectNativeCatalog {
             transactions,
             routes: RwLock::new(routes),
             location_id: std::sync::OnceLock::new(),
+            units,
             ddl: Arc::new(tokio::sync::Mutex::new(())),
             dropping: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             deletion_holds: parking_lot::Mutex::new(HashMap::new()),
@@ -445,11 +455,12 @@ impl ObjectNativeCatalog {
             self.config.commit_each_change,
             self.anchor.clone(),
             &name,
+            self.units.as_ref(),
         )
         .await?;
         domain.folder.clone_from(&folder);
         let domain = Arc::new(domain);
-        keep_lease_while_open(&domain);
+        domain.join_unit().await;
         let id = domain.create_table(options).await?;
         // The dataset's bookkeeping kept while it had no log moves to its log,
         // which commits before the registry names it: a crash between leaves a
@@ -655,7 +666,9 @@ impl ObjectNativeCatalog {
         prefix: Path,
         config: NativeCatalogConfig,
         anchor: Option<Arc<str>>,
+        groups: super::WriteUnits,
     ) -> CatalogResult<Self> {
+        let units = units_for(&store, &prefix, config, groups);
         let registry = Domain::create_with_config(
             Arc::clone(&store),
             prefix.clone(),
@@ -663,9 +676,10 @@ impl ObjectNativeCatalog {
             true,
             anchor.clone(),
             "",
+            units.as_ref(),
         )
         .await?;
-        Self::assemble(store, prefix, config, registry, anchor).await
+        Self::assemble(store, prefix, config, registry, anchor, units).await
     }
     /// [`Self::open_or_create_at`] with explicit head-log tuning.
     /// # Errors
@@ -676,14 +690,34 @@ impl ObjectNativeCatalog {
         location: &str,
         config: NativeCatalogConfig,
     ) -> CatalogResult<Self> {
+        Self::open_or_create_at_with_units(
+            store,
+            prefix,
+            location,
+            config,
+            super::WriteUnits::default(),
+        )
+        .await
+    }
+    /// [`Self::open_or_create_at_with_config`], with the datasets that share a
+    /// change source's consumer, so one writer lease holds each group.
+    /// # Errors
+    /// Returns an error when the store cannot be used or the history is invalid.
+    pub async fn open_or_create_at_with_units(
+        store: Arc<dyn ObjectStore>,
+        prefix: Path,
+        location: &str,
+        config: NativeCatalogConfig,
+        groups: super::WriteUnits,
+    ) -> CatalogResult<Self> {
         let anchor = location_anchor(location, &prefix);
         let (catalog, verb) = match store.head(&prefix.clone().join("head")).await {
             Ok(_) => (
-                Self::open_at(store, prefix, config, anchor).await?,
+                Self::open_at(store, prefix, config, anchor, groups).await?,
                 "Opened",
             ),
             Err(object_store::Error::NotFound { .. }) => (
-                Self::create_at(store, prefix, config, anchor).await?,
+                Self::create_at(store, prefix, config, anchor, groups).await?,
                 "Created",
             ),
             Err(error) => return Err(invalid(error)),
@@ -705,7 +739,9 @@ impl ObjectNativeCatalog {
         prefix: Path,
         config: NativeCatalogConfig,
         anchor: Option<Arc<str>>,
+        groups: super::WriteUnits,
     ) -> CatalogResult<Self> {
+        let units = units_for(&store, &prefix, config, groups);
         let registry = Domain::open_with_config(
             Arc::clone(&store),
             prefix.clone(),
@@ -713,9 +749,10 @@ impl ObjectNativeCatalog {
             true,
             anchor.clone(),
             "",
+            units.as_ref(),
         )
         .await?;
-        Self::assemble(store, prefix, config, registry, anchor).await
+        Self::assemble(store, prefix, config, registry, anchor, units).await
     }
     /// The store the catalog's logs are in.
     #[must_use]
@@ -758,11 +795,12 @@ impl ObjectNativeCatalog {
                 self.config.commit_each_change,
                 self.anchor.clone(),
                 &name,
+                self.units.as_ref(),
             )
             .await?;
             domain.folder = folder;
             let domain = Arc::new(domain);
-            keep_lease_while_open(&domain);
+            domain.join_unit().await;
             let tables = domain.tables().await;
             let mut routes = self.routes.write();
             routes.refresh(&domain, tables);
@@ -847,6 +885,16 @@ impl ObjectNativeCatalog {
             .datasets
             .get(name)
             .map(|domain| domain.data_writes.watch())
+    }
+
+    /// Hand back every writer lease this instance holds, at a commit boundary,
+    /// so other instances take its datasets over at once; nothing is acquired
+    /// or renewed afterwards. For a graceful shutdown, before anything else
+    /// stops.
+    pub async fn release_writer_leases(&self) {
+        if let Some(units) = &self.units {
+            units.release_all().await;
+        }
     }
     /// The prefix of the dataset folders (`…/cayenne/v1/datasets`) in [`Self::store`].
     #[must_use]

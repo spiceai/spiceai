@@ -516,7 +516,8 @@ impl CayenneAccelerator {
         metadata_dir: &str,
         source: &dyn AccelerationSource,
     ) -> Result<Arc<cayenne::metastore::object_native::ObjectNativeCatalog>> {
-        let location = effective_state_location(&source.app())?;
+        let app = source.app();
+        let location = effective_state_location(&app)?;
         let location_url = location.location.clone();
         let secrets = source.secrets();
         let catalog = cell
@@ -545,7 +546,17 @@ impl CayenneAccelerator {
                     ),
                     ..cayenne::metastore::object_native::NativeCatalogConfig::default()
                 };
-                let native = cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at_with_config(
+                // Datasets that share a change source's consumer are written
+                // by one instance together, so a consumer is never split.
+                let mut groups = cayenne::metastore::object_native::WriteUnits::default();
+                for dataset in &app.datasets {
+                    if let Some(consumer) =
+                        runtime_acceleration::acceleration::shared_change_consumer(dataset)
+                    {
+                        groups.insert(dataset.name.clone(), consumer);
+                    }
+                }
+                let native = cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at_with_units(
                         runtime_state_location::metrics::metered(
                             store,
                             runtime_state_location::StateFeature::CayenneMetastore,
@@ -555,6 +566,7 @@ impl CayenneAccelerator {
                             .join("catalog"),
                         &format!("{}/cayenne/v1", location.location.trim_end_matches('/')),
                         config,
+                        groups,
                     )
                     .await
                     .map(|native| native.with_data_store(data_store));

@@ -18,8 +18,8 @@ limitations under the License.
 //! ([`data_components::postgres_replication::shared`]): the `old_*` arms mirror
 //! the pre-change mutex-`HashMap` `AckTable` (eager `recompute` on every
 //! commit/credit, one shared mutex taken per op) and the `new_*` arms mirror the
-//! per-member cache-line-isolated `AckSlot` design (a lock-free `advance_monotonic`
-//! on the member's own atomic; the slot-level floor recomputed lazily under a
+//! per-member cache-line-isolated `AckSlot` design (lock-free `advance_monotonic`
+//! calls on the member's own atomics; the slot-level floor recomputed lazily under a
 //! read lock at each boundary). The ack internals are crate-private, so — exactly
 //! like `shared_pump_bench` — both arms are mirrored here; the `new_*` code is a
 //! line-faithful copy of the real `AckSlot`/`advance_monotonic`/sweep so there is
@@ -177,6 +177,7 @@ const STREAMING: u8 = 0b100;
 #[repr(align(64))]
 struct NewSlot {
     committed: AtomicU64,
+    flush: AtomicU64,
     delivered: AtomicU64,
     state: AtomicU8,
 }
@@ -185,6 +186,7 @@ impl NewSlot {
     fn streaming() -> Arc<Self> {
         Arc::new(Self {
             committed: AtomicU64::new(0),
+            flush: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
             state: AtomicU8::new(LIVE | STREAMING),
         })
@@ -192,11 +194,15 @@ impl NewSlot {
     fn committed(&self) -> u64 {
         self.committed.load(Ordering::Acquire)
     }
+    fn flush_lsn(&self) -> u64 {
+        self.committed().min(self.flush.load(Ordering::Acquire))
+    }
     fn delivered(&self) -> u64 {
         self.delivered.load(Ordering::Acquire)
     }
     fn commit(&self, lsn: u64) {
         advance_monotonic(&self.committed, lsn);
+        advance_monotonic(&self.flush, lsn);
     }
     fn deliver(&self, lsn: u64) {
         advance_monotonic(&self.delivered, lsn);
@@ -244,7 +250,7 @@ impl NewAck {
             .read()
             .expect("lock")
             .values()
-            .map(|slot| slot.committed())
+            .map(|slot| slot.flush_lsn())
             .min();
         if let Some(floor) = floor {
             advance_monotonic(&self.shared_flush, floor);

@@ -389,6 +389,9 @@ pub struct AcceleratedTable {
 
     // Async background tasks relevant to the accelerated table (i.e should be stopped when the table is dropped).
     pub handlers: parking_lot::Mutex<Vec<JoinHandle<()>>>,
+    /// For an acceleration shared through one location: `true` while this
+    /// instance may write it, which a table built as a replica never may.
+    shared_writes: Option<tokio::sync::watch::Receiver<bool>>,
     initial_snapshot: parking_lot::Mutex<Option<refresh::InitialSnapshot>>,
     changes_drain: std::sync::OnceLock<runtime_acceleration::change_sink::Publication>,
     zero_results_action: ZeroResultsAction,
@@ -483,6 +486,15 @@ pub enum SharedAcceleration {
     /// initial load in `initial_load` for the replicas.
     Writer {
         initial_load: Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>,
+        /// `true` while this instance may write the acceleration. The moment
+        /// it turns `false` (another instance took writing over, or this one
+        /// handed it over) the refresh stops, releasing its change stream for
+        /// the new writer at once rather than when the dataset reloads.
+        writes: tokio::sync::watch::Receiver<bool>,
+        /// Asks for the dataset to be reloaded once its refresh is stopped, so
+        /// a table whose refresh stopped is replaced even when writing comes
+        /// back to this instance before the change of role is seen.
+        reload: Arc<dyn Fn() + Send + Sync>,
     },
     /// Another instance writes it: this one serves what that instance
     /// committed, starts no refresh, and is ready once `initial_load` holds the
@@ -491,6 +503,38 @@ pub enum SharedAcceleration {
         initial_load: Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>,
     },
 }
+
+/// Abort the refresh of a shared acceleration this instance writes as soon as
+/// it may no longer write it, so its change stream (a `PostgreSQL` replication
+/// slot, say) is released for the new writer at once. The dataset reloads as a
+/// replica afterwards, and that reload would stop the refresh too, but only
+/// once it reaches this dataset. Nothing the refresh had not committed was
+/// acknowledged to its source, so the new writer resumes from the last commit.
+async fn stop_refresh_when_writes_stop(
+    mut writes: tokio::sync::watch::Receiver<bool>,
+    refresh: tokio::task::AbortHandle,
+    reload: Arc<dyn Fn() + Send + Sync>,
+    dataset: TableReference,
+) {
+    if writes.wait_for(|writes| !*writes).await.is_ok() {
+        tracing::debug!(
+            "Dataset '{dataset}' is no longer written by this instance; stopping its refresh"
+        );
+        // The change stream stops on purpose, not because its consumer stalled.
+        data_components::cdc::release_dataset(&dataset.to_string());
+        refresh.abort();
+        // This table no longer refreshes, whatever role the instance has
+        // later: ask until a reload replaces it, which ends this task with the
+        // table's other handlers.
+        loop {
+            reload();
+            tokio::time::sleep(STOPPED_REFRESH_RELOAD_RETRY).await;
+        }
+    }
+}
+
+/// How often a table whose refresh was stopped asks again to be reloaded.
+const STOPPED_REFRESH_RELOAD_RETRY: Duration = Duration::from_secs(5);
 
 /// How often a replica checks whether the instance that writes its
 /// acceleration has loaded it, and the writer whether its initial load has
@@ -1505,6 +1549,14 @@ impl Builder {
         let initial_snapshot = refresher.take_initial_snapshot();
         let refresher = Arc::new(refresher);
         if let Some(refresh_handle) = refresh_handle {
+            if let Some(SharedAcceleration::Writer { writes, reload, .. }) = &self.shared {
+                handlers.push(tokio::spawn(stop_refresh_when_writes_stop(
+                    writes.clone(),
+                    refresh_handle.abort_handle(),
+                    Arc::clone(reload),
+                    self.dataset_name.clone(),
+                )));
+            }
             handlers.push(refresh_handle);
         }
         match &self.shared {
@@ -1516,7 +1568,7 @@ impl Builder {
                     self.dataset_name.clone(),
                 )));
             }
-            Some(SharedAcceleration::Writer { initial_load }) => {
+            Some(SharedAcceleration::Writer { initial_load, .. }) => {
                 handlers.push(tokio::spawn(record_initial_load(
                     Arc::clone(initial_load),
                     Arc::clone(&refresher),
@@ -1697,6 +1749,14 @@ impl Builder {
             partition_scope: self.partition_scope,
             reload_trigger,
             handlers: parking_lot::Mutex::new(handlers),
+            shared_writes: match &self.shared {
+                Some(SharedAcceleration::Writer { writes, .. }) => Some(writes.clone()),
+                // A replica never writes the acceleration.
+                Some(SharedAcceleration::Replica { .. }) => {
+                    Some(tokio::sync::watch::channel(false).1)
+                }
+                None => None,
+            },
             initial_snapshot: parking_lot::Mutex::new(initial_snapshot),
             changes_drain: std::sync::OnceLock::new(),
             zero_results_action: self.zero_results_action,
@@ -1791,6 +1851,7 @@ impl AcceleratedTable {
                     .then(|| self.synchronized_with.clone())
                     .flatten();
                 let claims = Arc::clone(&self.in_flight_revalidations);
+                let shared_writes = self.shared_writes.clone();
                 let accelerator = Arc::clone(&self.accelerator);
                 let (sender, receiver) = tokio::sync::watch::channel(None);
                 self.io_runtime.spawn(async move {
@@ -1824,6 +1885,19 @@ impl AcceleratedTable {
                     let storage_result = match publication {
                         Some(publication) => publication.wait().await,
                         None => Ok(()),
+                    };
+                    // Another instance writes the acceleration now: what this
+                    // table accepted but did not commit was never acknowledged
+                    // to its source, and the new writer resumes from the last
+                    // commit, so a publication the storage refused is expected.
+                    let storage_result = match (storage_result, &shared_writes) {
+                        (Err(error), Some(writes)) if !*writes.borrow() => {
+                            tracing::debug!(
+                                "Dataset '{dataset}' is written by another instance, so the changes it had not saved are left to that instance: {error}"
+                            );
+                            Ok(())
+                        }
+                        (result, _) => result,
                     };
                     // The accelerator's own background maintenance — compaction,
                     // sweeps, checkpoints — is not a change producer, so nothing

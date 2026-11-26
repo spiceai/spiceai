@@ -112,7 +112,7 @@ const CURRENT_DEFECTS: [&str; 1] = ["mem-tier-current-3-exhaust"];
 /// (including the data-file replay),
 /// and the runs `crates/cayenne`'s mem-tier replay names directly. A test keeps
 /// this list equal to the runs those files name.
-const REPLAYED_AGAINST_CODE: [&str; 37] = [
+const REPLAYED_AGAINST_CODE: [&str; 39] = [
     "commits-restart-no-persist-before-send",
     "commits-restart-turnover",
     "data-files",
@@ -139,6 +139,8 @@ const REPLAYED_AGAINST_CODE: [&str; 37] = [
     "source-no-redelivery-skip",
     "source-position-before-data",
     "source-positions",
+    "standby-retake",
+    "standby-retake-split-generations",
     "transactions-txn-1-exhaust",
     "transactions-txn-no-coordinator-wait-0-exhaust",
     "transactions-txn-no-create-once-0-exhaust",
@@ -492,6 +494,22 @@ pub fn runs() -> Vec<Run> {
             bound: 0,
             seed: None,
             failure: "healthy holder keeps its lease",
+        },
+        Run {
+            name: "standby-retake",
+            family: "standby",
+            mode: "standby-retake",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "standby-retake-split-generations",
+            family: "standby",
+            mode: "standby-retake-split",
+            bound: 0,
+            seed: None,
+            failure: "a head takeover carries its lease's generation",
         },
         Run {
             name: "commits-restart-turnover",
@@ -3648,6 +3666,24 @@ pub fn data_file_steps(run: &str, actions: &[String]) -> Option<Vec<DataFileStep
         .into_iter()
         .find(|r| r.name == run && r.family == "data-files")?;
     data_files::steps(run.mode, run.bound, actions)
+}
+
+pub use standby::{
+    CommitOutcome as StandbyCommitOutcome, Step as StandbyStep, StepKind as StandbyStepKind,
+};
+
+/// The steps of the `standby` run `run` through `actions`, as a trace prints
+/// them: what each action did (a lease acquired or advanced, a head taken over
+/// or refused, a commit accepted, rebased or fenced) and the lease generation,
+/// head generation and committed changes after it, for a replay to compare
+/// with the implementation. `None` for an unknown run or an action that is not
+/// enabled.
+#[must_use]
+pub fn standby_steps(run: &str, actions: &[String]) -> Option<Vec<StandbyStep>> {
+    let run = runs()
+        .into_iter()
+        .find(|r| r.name == run && r.family == "standby")?;
+    standby::steps(run.mode, actions)
 }
 
 /// Problems with the model citations in design documents: a cited run that does

@@ -79,6 +79,34 @@ pub fn begin_shutdown() {
     CDC_SHUTDOWN_EPOCH.send_modify(|epoch| *epoch += 1);
 }
 
+/// Datasets that stop consuming their change source on purpose, by name: another
+/// Spice instance writes them now (see [`release_dataset`]).
+static RELEASED_DATASETS: LazyLock<Mutex<std::collections::HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// Dataset `dataset` stops consuming its change source on purpose, because
+/// another Spice instance writes its acceleration now: the stream the runtime is
+/// about to stop is a departure, not a stalled consumer. Called just before the
+/// stream is stopped; the source consumes the mark when it sees the stream go
+/// ([`take_released_dataset`]), and a dataset that joins its source again
+/// clears it ([`clear_released_dataset`]).
+pub fn release_dataset(dataset: &str) {
+    RELEASED_DATASETS.lock().insert(dataset.to_string());
+}
+
+/// Whether `dataset` was released with [`release_dataset`] since it last
+/// joined its source, consuming the mark.
+#[must_use]
+pub fn take_released_dataset(dataset: &str) -> bool {
+    RELEASED_DATASETS.lock().remove(dataset)
+}
+
+/// `dataset` consumes its change source again: a mark left by
+/// [`release_dataset`] no longer describes it.
+pub fn clear_released_dataset(dataset: &str) {
+    RELEASED_DATASETS.lock().remove(dataset);
+}
+
 /// The current shutdown epoch. Long-running CDC sources capture this at
 /// stream start and stop once it changes.
 #[must_use]

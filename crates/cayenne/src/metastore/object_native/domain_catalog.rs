@@ -130,13 +130,8 @@ impl MetadataCatalog for Domain {
         Ok(())
     }
     async fn shutdown(&self) -> CatalogResult<()> {
-        {
-            let mut inner = self.inner.take().await;
-            inner.flush().await?;
-        }
-        // Hand the writer lease back, so another instance takes over at once.
-        self.release_lease().await;
-        Ok(())
+        let mut inner = self.inner.take().await;
+        inner.flush().await
     }
     async fn list_table_names(&self) -> CatalogResult<Vec<String>> {
         Ok(self.read().await?.reader.list_table_names())
