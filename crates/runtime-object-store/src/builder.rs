@@ -37,7 +37,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use datafusion::error::DataFusionError;
 use object_store::{
-    ClientOptions, ObjectStore, RetryConfig, azure::MicrosoftAzureBuilder,
+    ClientOptions, ObjectStore, RetryConfig,
+    azure::{AzureConfigKey, MicrosoftAzureBuilder},
     gcp::GoogleCloudStorageBuilder,
 };
 use object_store_spawn::SpawnedReqwestConnector;
@@ -77,13 +78,11 @@ pub fn build_azure_object_store<S: ::std::hash::BuildHasher>(
     params: &HashMap<String, String, S>,
     io_runtime: Handle,
 ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
-    let mut url = url.clone();
-
     let mut builder = MicrosoftAzureBuilder::from_env()
         .with_http_connector(SpawnedReqwestConnector::new(io_runtime));
 
     if let Some(sas) = params.get("sas_string") {
-        url.set_query(Some(sas));
+        builder = builder.with_config(AzureConfigKey::SasKey, sas);
     }
 
     if let Some(use_emulator) = params.get("use_emulator") {
@@ -406,6 +405,84 @@ mod tests {
         assert_eq!(
             store.to_string(),
             "MicrosoftAzure { account: devstoreaccount1, container: testcontainer }"
+        );
+    }
+
+    /// Serves 404 to every request on a loopback port and records each request's query.
+    async fn query_recording_server() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::{Router, body::Body, extract::State, http::Request, response::Response};
+
+        async fn handler(
+            State(seen): State<Arc<std::sync::Mutex<Vec<String>>>>,
+            request: Request<Body>,
+        ) -> Response<Body> {
+            seen.lock()
+                .expect("the request log is not poisoned")
+                .push(request.uri().query().unwrap_or_default().to_string());
+            Response::builder()
+                .status(404)
+                .body(Body::empty())
+                .expect("a 404 response builds")
+        }
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(axum::routing::any(handler))
+            .with_state(Arc::clone(&seen));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the server binds a loopback port");
+        let address = listener.local_addr().expect("the server has an address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{address}/account"), seen)
+    }
+
+    #[tokio::test]
+    async fn azure_builder_authorizes_requests_with_the_sas() {
+        use object_store::ObjectStoreExt;
+
+        let (endpoint, seen) = query_recording_server().await;
+        let url = Url::parse("abfss://container@account.dfs.core.windows.net/").expect("valid url");
+        let params = HashMap::from([
+            ("account".to_string(), "account".to_string()),
+            ("endpoint".to_string(), endpoint),
+            ("allow_http".to_string(), "true".to_string()),
+            ("max_retries".to_string(), "0".to_string()),
+            (
+                "sas_string".to_string(),
+                "sv=2019-12-12&sp=r&sig=sas-signature".to_string(),
+            ),
+        ]);
+
+        let store = build_azure_object_store(&url, &params, handle())
+            .expect("azure object store should build with a SAS");
+        let _ = store
+            .head(&object_store::path::Path::from("items.csv"))
+            .await
+            .expect_err("the server answers 404");
+        let seen = seen.lock().expect("the request log is not poisoned");
+        assert_eq!(seen.as_slice(), ["sv=2019-12-12&sp=r&sig=sas-signature"]);
+    }
+
+    #[tokio::test]
+    async fn azure_builder_error_leaves_out_the_sas() {
+        let url = Url::parse("abfss://container@account.dfs.core.usgovcloudapi.net/prefix/")
+            .expect("valid url");
+        let params = HashMap::from([(
+            "sas_string".to_string(),
+            "sv=2019-12-12&sig=sas-signature".to_string(),
+        )]);
+
+        let err = build_azure_object_store(&url, &params, handle())
+            .expect_err("object_store has no pattern for this host")
+            .to_string();
+        assert!(
+            err.ends_with(
+                "URL did not match any known pattern for scheme: abfss://container@account.dfs.core.usgovcloudapi.net/prefix/"
+            ),
+            "{err}"
         );
     }
 
