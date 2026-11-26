@@ -34,9 +34,11 @@ mod error;
 pub mod location;
 pub mod settings;
 pub mod snapshot;
+mod text;
 
 pub use client::{Commit, EntryKind, Error, FileRead, Hub, HubConfig, Result, TreeEntry};
 pub use error::DownloadError;
 pub use location::{RepoId, RepoType};
 pub use settings::{ParamToken, Settings};
 pub use snapshot::{Requester, Snapshot};
+pub use text::printable;

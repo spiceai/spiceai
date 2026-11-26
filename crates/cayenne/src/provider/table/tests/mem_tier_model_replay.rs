@@ -994,6 +994,18 @@ async fn mem_tier_model_replay_control_capture_reservation() {
     .await;
 }
 
+/// A bake prunes a key's delete from the in-memory index while its delete vector
+/// stays in the catalog; the key is upserted again with no delete of its own, and
+/// a second bake folds that row. The second bake's tag must stay at or above the
+/// pruned delete, or a restart reloads the vector and hides the row (#16706).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mem_tier_model_replay_control_pruned_floor() {
+    control_witness(include_str!(
+        "../../../../tests/traces/mem-tier-no-pruned-floor.jsonl"
+    ))
+    .await;
+}
+
 /// After two seals and a restart, a bake must leave the key with one visible
 /// row: the second seal's tombstone hides the first seal's inline shadow, and
 /// that tombstone is above every snapshot the bake folds, so the bake must not

@@ -95,10 +95,14 @@ jobs:
 """
             ),
             [
-                "job 'a' selects its environment with an expression ('${{ inputs.environment }}'), which this check "
-                "cannot verify; name the environment literally (see docs/dev/github_actions_environments.md)",
-                "job 'b' selects its environment with an expression ('${{ 'secret-free' }}'), which this check "
-                "cannot verify; name the environment literally (see docs/dev/github_actions_environments.md)",
+                (
+                    "job 'a' selects its environment with an expression ('${{ inputs.environment }}'), which this check "
+                    "cannot verify; name the environment literally (see docs/dev/github_actions_environments.md)"
+                ),
+                (
+                    "job 'b' selects its environment with an expression ('${{ 'secret-free' }}'), which this check "
+                    "cannot verify; name the environment literally (see docs/dev/github_actions_environments.md)"
+                ),
             ],
         )
 

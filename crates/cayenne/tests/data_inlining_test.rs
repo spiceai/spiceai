@@ -37,26 +37,26 @@ use std::sync::Arc;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-test_with_backends!(test_inlined_data_crud);
-test_with_backends!(test_small_insert_inlined);
-test_with_backends!(test_inlined_data_visible_in_scan);
-test_with_backends!(test_limit_on_inlined_scan);
-test_with_backends!(test_roundtrip_preserves_values);
-test_with_backends!(test_roundtrip_preserves_nulls);
-test_with_backends!(test_roundtrip_mixed_types);
-test_with_backends!(test_roundtrip_many_small_batches);
-test_with_backends!(test_inline_write_coalesces_into_one_batch);
-test_with_backends!(test_inline_scan_batches_scale_with_writes_not_rows);
-test_with_backends!(test_wide_rows_still_reach_the_coalesce);
-test_with_backends!(test_roundtrip_mixed_inline_and_vortex);
-test_with_backends!(test_roundtrip_across_reopen);
-test_with_backends!(test_roundtrip_exceeds_byte_threshold);
-test_with_backends!(test_pk_upsert_inline_mutation);
-test_with_backends!(test_pk_delete_inline_mutation);
-test_with_backends!(test_pk_auto_checkpoint_preserves_rows);
-test_with_backends!(test_inline_memtable_segment_pressure_checkpoints);
-test_with_backends!(test_inline_writer_fallback_preserves_buffered_and_remaining_batches);
-test_with_backends!(test_compaction_runs_after_inline_memtable_checkpoint);
+test_on_data_store!(test_inlined_data_crud);
+test_on_data_store!(test_small_insert_inlined);
+test_on_data_store!(test_inlined_data_visible_in_scan);
+test_on_data_store!(test_limit_on_inlined_scan);
+test_on_data_store!(test_roundtrip_preserves_values);
+test_on_data_store!(test_roundtrip_preserves_nulls);
+test_on_data_store!(test_roundtrip_mixed_types);
+test_on_data_store!(test_roundtrip_many_small_batches);
+test_on_data_store!(test_inline_write_coalesces_into_one_batch);
+test_on_data_store!(test_inline_scan_batches_scale_with_writes_not_rows);
+test_on_data_store!(test_wide_rows_still_reach_the_coalesce);
+test_on_data_store!(test_roundtrip_mixed_inline_and_vortex);
+test_on_data_store!(test_roundtrip_across_reopen);
+test_on_data_store!(test_roundtrip_exceeds_byte_threshold);
+test_on_data_store!(test_pk_upsert_inline_mutation);
+test_on_data_store!(test_pk_delete_inline_mutation);
+test_on_data_store!(test_pk_auto_checkpoint_preserves_rows);
+test_on_data_store!(test_inline_memtable_segment_pressure_checkpoints);
+test_on_data_store!(test_inline_writer_fallback_preserves_buffered_and_remaining_batches);
+test_on_data_store!(test_compaction_runs_after_inline_memtable_checkpoint);
 
 #[tokio::test]
 #[ignore = "performance regression coverage; run explicitly with --ignored"]
@@ -126,7 +126,7 @@ async fn test_inlined_data_crud(
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: fixture.data_path.to_string_lossy().to_string(),
+            base_path: fixture.data_store.base_path("inline_crud_test"),
             partition_column: None,
             vortex_config: cayenne::metadata::VortexConfig::default(),
         })
@@ -186,7 +186,6 @@ async fn test_small_insert_inlined(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let catalog = &fixture.catalog;
-    let data_path = &fixture.data_path;
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -194,20 +193,22 @@ async fn test_small_insert_inlined(
     ]));
 
     let ctx = SessionContext::new();
-    let table = CayenneTableProvider::create_table(
-        Arc::clone(catalog) as Arc<dyn MetadataCatalog>,
-        CreateTableOptions {
-            table_name: "small_inline_test".to_string(),
-            schema: Arc::clone(&schema),
-            primary_key: vec![],
-            on_conflict: None,
-            base_path: data_path.to_string_lossy().to_string(),
-            partition_column: None,
-            vortex_config: cayenne::metadata::VortexConfig::default(),
-        },
-        ctx.runtime_env(),
-    )
-    .await?;
+    let table = fixture
+        .data_store
+        .create(
+            Arc::clone(catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+            CreateTableOptions {
+                table_name: "small_inline_test".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: fixture.data_store.base_path("small_inline_test"),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            },
+        )
+        .await?;
 
     let table_id = catalog.get_table("small_inline_test").await?.table_id;
 
@@ -237,7 +238,6 @@ async fn test_inlined_data_visible_in_scan(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let catalog = &fixture.catalog;
-    let data_path = &fixture.data_path;
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -245,20 +245,22 @@ async fn test_inlined_data_visible_in_scan(
     ]));
 
     let ctx = SessionContext::new();
-    let table = CayenneTableProvider::create_table(
-        Arc::clone(catalog) as Arc<dyn MetadataCatalog>,
-        CreateTableOptions {
-            table_name: "scan_inline_test".to_string(),
-            schema: Arc::clone(&schema),
-            primary_key: vec![],
-            on_conflict: None,
-            base_path: data_path.to_string_lossy().to_string(),
-            partition_column: None,
-            vortex_config: cayenne::metadata::VortexConfig::default(),
-        },
-        ctx.runtime_env(),
-    )
-    .await?;
+    let table = fixture
+        .data_store
+        .create(
+            Arc::clone(catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+            CreateTableOptions {
+                table_name: "scan_inline_test".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: fixture.data_store.base_path("scan_inline_test"),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            },
+        )
+        .await?;
 
     // Insert small batch (should be inlined)
     let batch = RecordBatch::try_new(
@@ -351,20 +353,22 @@ async fn create_table(
     schema: Arc<Schema>,
 ) -> Result<(CayenneTableProvider, SessionContext), Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
-    let table = CayenneTableProvider::create_table(
-        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
-        CreateTableOptions {
-            table_name: name.to_string(),
-            schema,
-            primary_key: vec![],
-            on_conflict: None,
-            base_path: fixture.data_path.to_string_lossy().to_string(),
-            partition_column: None,
-            vortex_config: cayenne::metadata::VortexConfig::default(),
-        },
-        ctx.runtime_env(),
-    )
-    .await?;
+    let table = fixture
+        .data_store
+        .create(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+            CreateTableOptions {
+                table_name: name.to_string(),
+                schema,
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: fixture.data_store.base_path(name),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            },
+        )
+        .await?;
     Ok((table, ctx))
 }
 
@@ -379,22 +383,24 @@ async fn create_pk_upsert_table(
 
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
-            CreateTableOptions {
-                table_name: name.to_string(),
-                schema,
-                primary_key: vec!["id".to_string()],
-                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-                    "id".to_string(),
-                ]))),
-                base_path: fixture.data_path.to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config: cayenne::metadata::VortexConfig::default(),
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: name.to_string(),
+                    schema,
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                        "id".to_string(),
+                    ]))),
+                    base_path: fixture.data_store.base_path(name),
+                    partition_column: None,
+                    vortex_config: cayenne::metadata::VortexConfig::default(),
+                },
+            )
+            .await?,
     );
     ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
     let table_id = fixture.catalog.get_table(name).await?.table_id;
@@ -1113,12 +1119,14 @@ async fn test_roundtrip_across_reopen(
     drop(table);
 
     let ctx2 = SessionContext::new();
-    let reopened = cayenne::CayenneTableProviderBuilder::new(
-        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
-        ctx2.runtime_env(),
-    )
-    .open("rt_reopen")
-    .await?;
+    let reopened = fixture
+        .data_store
+        .open(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            ctx2.runtime_env(),
+            "rt_reopen",
+        )
+        .await?;
 
     ctx2.register_table("rt_reopen", Arc::new(reopened))?;
     let got = collect_sorted(&ctx2, "SELECT id, name FROM rt_reopen ORDER BY id").await?;
@@ -1237,20 +1245,22 @@ async fn test_compaction_runs_after_inline_memtable_checkpoint(
 
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
-            CreateTableOptions {
-                table_name: "inline_then_compaction".to_string(),
-                schema: Arc::clone(&schema),
-                primary_key: vec![],
-                on_conflict: None,
-                base_path: fixture.data_path.to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config,
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: "inline_then_compaction".to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path("inline_then_compaction"),
+                    partition_column: None,
+                    vortex_config,
+                },
+            )
+            .await?,
     );
     ctx.register_table(
         "inline_then_compaction",
@@ -1326,7 +1336,7 @@ async fn test_compaction_runs_after_inline_memtable_checkpoint(
 
 // ─── inline-memtable cache invalidation ────────────────────────────────────
 
-test_with_backends!(test_inlined_cache_generation_invariants);
+test_on_data_store!(test_inlined_cache_generation_invariants);
 
 /// Verify that the inline-memtable cache generation counter is bumped correctly.
 ///
@@ -1347,20 +1357,22 @@ async fn test_inlined_cache_generation_invariants(fixture: common::TestFixture) 
 
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
-            cayenne::metadata::CreateTableOptions {
-                table_name: "inlined_cache_gen".to_string(),
-                schema: Arc::clone(&schema),
-                primary_key: vec![],
-                on_conflict: None,
-                base_path: fixture.data_path.to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config: cayenne::metadata::VortexConfig::default(),
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+                cayenne::metadata::CreateTableOptions {
+                    table_name: "inlined_cache_gen".to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path("inlined_cache_gen"),
+                    partition_column: None,
+                    vortex_config: cayenne::metadata::VortexConfig::default(),
+                },
+            )
+            .await?,
     );
     ctx.register_table(
         "inlined_cache_gen",
