@@ -23,10 +23,11 @@ use crate::catalog_filter::TableSelector;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
-use futures::future::try_join_all;
+use futures::future::join_all;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use iceberg_datafusion::IcebergTableProvider;
 use tokio::sync::Semaphore;
+use util::single_line;
 
 use crate::RefreshableCatalogProvider;
 use crate::iceberg::catalog::Error;
@@ -97,6 +98,7 @@ impl IcebergCatalogProvider {
             root_namespace.as_ref(),
             selector,
             table_wrapper.as_ref(),
+            &HashMap::new(),
         )
         .await?;
 
@@ -122,11 +124,17 @@ impl IcebergCatalogProvider {
     }
 
     /// Load all schemas (namespaces) from the Iceberg catalog.
+    ///
+    /// A namespace whose tables cannot be listed keeps its schema in `previous`,
+    /// or is left out when it has none, so one namespace cannot fail the catalog.
+    /// When every namespace, or every table, that the load tried failed, the
+    /// catalog cannot be read at all and the load returns the first error.
     async fn load_schemas(
         client: Arc<dyn Catalog>,
         root_namespace: Option<&NamespaceIdent>,
         selector: &TableSelector,
         table_wrapper: Option<&CatalogTableWrapper>,
+        previous: &HashMap<String, Arc<dyn SchemaProvider>>,
     ) -> Result<HashMap<String, Arc<dyn SchemaProvider>>> {
         // Create the semaphore first, so we can use it in the closures below
         let load_semaphore = Arc::new(Semaphore::new(10));
@@ -159,7 +167,7 @@ impl IcebergCatalogProvider {
                 },
             };
 
-        let providers = try_join_all(child_namespaces.iter().map(|namespace| {
+        let loads = join_all(child_namespaces.iter().map(|namespace| {
             let semaphore_clone = Arc::clone(&load_semaphore);
             IcebergSchemaProvider::try_new(
                 Arc::clone(&client),
@@ -167,21 +175,76 @@ impl IcebergCatalogProvider {
                 semaphore_clone,
                 selector,
                 table_wrapper.cloned(),
+                previous.get(&schema_name_for_namespace(namespace)).cloned(),
             )
         }))
-        .await?;
+        .await;
 
-        let schemas: HashMap<String, Arc<dyn SchemaProvider>> = child_namespaces
-            .iter()
-            .map(schema_name_for_namespace)
-            .zip(providers)
-            .map(|(name, provider)| {
-                let provider = Arc::new(provider) as Arc<dyn SchemaProvider>;
-                (name, provider)
-            })
-            .collect();
+        let mut schemas = HashMap::new();
+        let mut listed = Loads::default();
+        let mut tables = Loads::default();
+        for (namespace, load) in child_namespaces.iter().zip(loads) {
+            let name = schema_name_for_namespace(namespace);
+            match (load, previous.get(&name)) {
+                (Ok((provider, loads)), _) => {
+                    listed.loaded += 1;
+                    tables.merge(loads);
+                    schemas.insert(name, Arc::new(provider) as Arc<dyn SchemaProvider>);
+                }
+                (Err(e), Some(provider)) => {
+                    tracing::warn!(
+                        "Cannot list the tables of Iceberg namespace '{}'; it keeps the tables it had: {}",
+                        namespace.join("."),
+                        single_line(&e.to_string())
+                    );
+                    schemas.insert(name, Arc::clone(provider));
+                    listed.fail(e);
+                }
+                (Err(e), None) => {
+                    tracing::warn!(
+                        "Cannot list the tables of Iceberg namespace '{}', skipping it: {}",
+                        namespace.join("."),
+                        single_line(&e.to_string())
+                    );
+                    listed.fail(e);
+                }
+            }
+        }
+
+        if let Some(e) = listed.total_failure().or_else(|| tables.total_failure()) {
+            return Err(e);
+        }
 
         Ok(schemas)
+    }
+}
+
+/// How many namespaces or tables a load read, and the first that failed.
+#[derive(Default)]
+pub(crate) struct Loads {
+    loaded: usize,
+    first_error: Option<Error>,
+}
+
+impl Loads {
+    fn fail(&mut self, e: Error) {
+        self.first_error.get_or_insert(e);
+    }
+
+    fn merge(&mut self, other: Loads) {
+        self.loaded += other.loaded;
+        if self.first_error.is_none() {
+            self.first_error = other.first_error;
+        }
+    }
+
+    /// The first failure, when there was one and nothing loaded.
+    fn total_failure(self) -> Option<Error> {
+        if self.loaded == 0 {
+            self.first_error
+        } else {
+            None
+        }
     }
 }
 
@@ -209,11 +272,17 @@ impl CatalogProvider for IcebergCatalogProvider {
 #[async_trait]
 impl RefreshableCatalogProvider for IcebergCatalogProvider {
     async fn refresh(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let previous = self
+            .schemas
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let new_schemas = Self::load_schemas(
             Arc::clone(&self.catalog),
             self.root_namespace.as_ref(),
             &self.selector,
             self.table_wrapper.as_ref(),
+            &previous,
         )
         .await?;
 
@@ -258,27 +327,33 @@ impl IcebergSchemaProvider {
     /// * `namespace` - The namespace containing the tables
     /// * `load_semaphore` - Semaphore to limit concurrent table loads
     /// * `selector` - Which discovered tables the catalog registers
+    /// * `previous` - This namespace's schema from the previous load, if any
     pub(crate) async fn try_new(
         client: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         load_semaphore: Arc<Semaphore>,
         selector: &TableSelector,
         table_wrapper: Option<CatalogTableWrapper>,
-    ) -> Result<Self> {
-        let tables = Self::load_tables(
+        previous: Option<Arc<dyn SchemaProvider>>,
+    ) -> Result<(Self, Loads)> {
+        let (tables, loads) = Self::load_tables(
             Arc::clone(&client),
             &namespace,
             load_semaphore,
             selector,
             table_wrapper.as_ref(),
+            previous.as_deref(),
         )
         .await?;
 
-        Ok(IcebergSchemaProvider {
-            catalog: client,
-            namespace,
-            tables: RwLock::new(tables),
-        })
+        Ok((
+            IcebergSchemaProvider {
+                catalog: client,
+                namespace,
+                tables: RwLock::new(tables),
+            },
+            loads,
+        ))
     }
 
     /// Synchronously look up a cached table provider by name.
@@ -313,13 +388,17 @@ impl IcebergSchemaProvider {
     }
 
     /// Load all tables from the Iceberg catalog for this namespace.
+    ///
+    /// A table that cannot be loaded keeps its provider in `previous`, or is left
+    /// out when it has none, so one table cannot fail the namespace.
     async fn load_tables(
         client: Arc<dyn Catalog>,
         namespace: &NamespaceIdent,
         load_semaphore: Arc<Semaphore>,
         selector: &TableSelector,
         table_wrapper: Option<&CatalogTableWrapper>,
-    ) -> Result<HashMap<String, Arc<dyn TableProvider>>> {
+        previous: Option<&dyn SchemaProvider>,
+    ) -> Result<(HashMap<String, Arc<dyn TableProvider>>, Loads)> {
         let table_names: Vec<_> = client
             .list_tables(namespace)
             .await
@@ -330,40 +409,45 @@ impl IcebergSchemaProvider {
             .filter(|table| selector.selects(&table.to_string()))
             .collect();
 
-        // Transform each load_table call to return Result<(TableIdent, Option<Arc<dyn TableProvider>>)>
-        let table_futures: Vec<_> = table_names
-            .iter()
-            .map(|name| {
-                let client_clone = Arc::clone(&client);
-                let name_clone = Arc::new(name.clone());
-                let semaphore_clone = Arc::clone(&load_semaphore);
-                let wrapper_clone = table_wrapper.cloned();
-                async move {
-                    // Map the inner Result to include the table name
-                    Self::load_table(
-                        client_clone,
-                        Arc::clone(&name_clone),
-                        semaphore_clone,
-                        wrapper_clone,
-                    )
-                    .await
-                    .map(|opt_provider| (name_clone, opt_provider))
-                }
-            })
-            .collect();
+        let loads = join_all(table_names.iter().map(|name| {
+            Self::load_table(
+                Arc::clone(&client),
+                Arc::new(name.clone()),
+                Arc::clone(&load_semaphore),
+                table_wrapper.cloned(),
+            )
+        }))
+        .await;
 
-        // Execute all futures in parallel, short-circuiting on first error
-        let table_results = try_join_all(table_futures).await?;
-
-        // Filter out None values, only keeping successful loads
         let mut tables = HashMap::new();
-        for (name, opt_provider) in table_results {
-            if let Some(provider) = opt_provider {
-                tables.insert(name.name().to_string(), provider);
+        let mut outcome = Loads::default();
+        for (name, load) in table_names.iter().zip(loads) {
+            match load {
+                Ok(Some(provider)) => {
+                    tables.insert(name.name().to_string(), provider);
+                    outcome.loaded += 1;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let kept = match previous {
+                        Some(schema) => schema.table(name.name()).await.ok().flatten(),
+                        None => None,
+                    };
+                    let error = single_line(&e.to_string()).into_owned();
+                    if let Some(provider) = kept {
+                        tracing::warn!(
+                            "Cannot load Iceberg table '{name}'; it keeps its last loaded definition: {error}"
+                        );
+                        tables.insert(name.name().to_string(), provider);
+                    } else {
+                        tracing::warn!("Cannot load Iceberg table '{name}', skipping it: {error}");
+                    }
+                    outcome.fail(e);
+                }
             }
         }
 
-        Ok(tables)
+        Ok((tables, outcome))
     }
 
     async fn load_table(
@@ -591,7 +675,7 @@ mod tests {
             .mount(&server)
             .await;
         // Anything else (e.g. `/v1/namespaces/public/tables`) falls through to
-        // wiremock's default 404, which surfaces as an error.
+        // wiremock's default 404, which leaves the namespace out.
 
         let catalog = RestCatalogBuilder::default()
             .with_storage_factory(Arc::new(LocalFsStorageFactory))
@@ -609,12 +693,238 @@ mod tests {
             Some(&root),
             &TableSelector::new(None, None),
             None,
+            &HashMap::new(),
         )
         .await
         .expect("nested child namespace loads");
 
         let names: Vec<_> = schemas.keys().cloned().collect();
         assert_eq!(names, vec!["public".to_string()]);
+    }
+
+    /// A REST catalog served by wiremock. `tables` maps each namespace to the
+    /// tables it lists, or to `None` when listing them is forbidden; a table in
+    /// `forbidden` is listed but forbidden to load.
+    async fn mount_rest_catalog(
+        server: &wiremock::MockServer,
+        tables: &[(&str, Option<&[&str]>)],
+        forbidden: &[&str],
+    ) {
+        use iceberg::spec::TableMetadataBuilder;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let forbidden_body = serde_json::json!({
+            "error": {"message": "forbidden", "type": "ForbiddenException", "code": 403}
+        });
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"defaults": {}, "overrides": {}})),
+            )
+            .mount(server)
+            .await;
+        let namespaces: Vec<_> = tables.iter().map(|(ns, _)| vec![*ns]).collect();
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"namespaces": namespaces})),
+            )
+            .mount(server)
+            .await;
+        for (ns, names) in tables {
+            let Some(names) = names else {
+                Mock::given(method("GET"))
+                    .and(path(format!("/v1/namespaces/{ns}/tables")))
+                    .respond_with(ResponseTemplate::new(403).set_body_json(&forbidden_body))
+                    .mount(server)
+                    .await;
+                continue;
+            };
+            let identifiers: Vec<_> = names
+                .iter()
+                .map(|name| serde_json::json!({"namespace": [ns], "name": name}))
+                .collect();
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/namespaces/{ns}/tables")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"identifiers": identifiers})),
+                )
+                .mount(server)
+                .await;
+            for name in *names {
+                let table_path = format!("/v1/namespaces/{ns}/tables/{name}");
+                if forbidden.contains(name) {
+                    Mock::given(method("GET"))
+                        .and(path(table_path))
+                        .respond_with(ResponseTemplate::new(403).set_body_json(&forbidden_body))
+                        .mount(server)
+                        .await;
+                    continue;
+                }
+                let location = format!("file:///nonexistent/{ns}/{name}");
+                let schema = iceberg::spec::Schema::builder()
+                    .with_schema_id(0)
+                    .with_fields(vec![
+                        NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    ])
+                    .build()
+                    .expect("schema builds");
+                let metadata = TableMetadataBuilder::from_table_creation(
+                    TableCreation::builder()
+                        .name((*name).to_string())
+                        .location(location.clone())
+                        .schema(schema)
+                        .build(),
+                )
+                .expect("metadata builder")
+                .build()
+                .expect("metadata builds")
+                .metadata;
+                Mock::given(method("GET"))
+                    .and(path(table_path))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "metadata-location": format!("{location}/metadata/00000.metadata.json"),
+                        "metadata": metadata,
+                    })))
+                    .mount(server)
+                    .await;
+            }
+        }
+    }
+
+    async fn rest_catalog(server: &wiremock::MockServer) -> Arc<dyn Catalog> {
+        use iceberg::io::LocalFsStorageFactory;
+        use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
+
+        let catalog = RestCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .load(
+                "rest",
+                HashMap::from([(REST_CATALOG_PROP_URI.to_string(), server.uri())]),
+            )
+            .await
+            .expect("load REST catalog");
+        Arc::new(catalog)
+    }
+
+    fn sorted_table_names(catalog: &IcebergCatalogProvider, schema: &str) -> Vec<String> {
+        let mut names = catalog
+            .schema(schema)
+            .expect("schema is registered")
+            .table_names();
+        names.sort();
+        names
+    }
+
+    async fn table_of(
+        catalog: &IcebergCatalogProvider,
+        schema: &str,
+        table: &str,
+    ) -> Arc<dyn TableProvider> {
+        catalog
+            .schema(schema)
+            .expect("schema is registered")
+            .table(table)
+            .await
+            .expect("table lookup")
+            .expect("table is registered")
+    }
+
+    /// A table the catalog lists but forbids loading, and a namespace whose
+    /// tables it forbids listing, are left out; the rest of the catalog loads.
+    /// When it forbids loading every table, the catalog does not load.
+    #[tokio::test]
+    async fn a_table_that_cannot_be_loaded_does_not_fail_the_catalog() {
+        let server = wiremock::MockServer::start().await;
+        mount_rest_catalog(
+            &server,
+            &[("sales", Some(&["orders", "secret"])), ("hr", None)],
+            &["secret"],
+        )
+        .await;
+
+        let catalog = IcebergCatalogProvider::try_new(
+            rest_catalog(&server).await,
+            None,
+            &TableSelector::new(None, None),
+            None,
+        )
+        .await
+        .expect("the catalog loads without the tables it cannot read");
+
+        assert_eq!(catalog.schema_names(), vec!["sales".to_string()]);
+        assert_eq!(sorted_table_names(&catalog, "sales"), vec!["orders"]);
+
+        mount_rest_catalog(
+            &server,
+            &[("sales", Some(&["orders", "secret"])), ("hr", None)],
+            &["orders", "secret"],
+        )
+        .await;
+        IcebergCatalogProvider::try_new(
+            rest_catalog(&server).await,
+            None,
+            &TableSelector::new(None, None),
+            None,
+        )
+        .await
+        .expect_err("a catalog none of whose tables can be loaded fails to load");
+    }
+
+    /// On refresh, a table or namespace that fails keeps what the previous
+    /// load registered, a table no longer listed is gone, and the tables that
+    /// did load are updated.
+    #[tokio::test]
+    async fn a_refresh_keeps_what_it_cannot_reload() {
+        let server = wiremock::MockServer::start().await;
+        mount_rest_catalog(
+            &server,
+            &[
+                ("sales", Some(&["orders", "returns", "dropped"])),
+                ("hr", Some(&["staff"])),
+            ],
+            &[],
+        )
+        .await;
+        let catalog = IcebergCatalogProvider::try_new(
+            rest_catalog(&server).await,
+            None,
+            &TableSelector::new(None, None),
+            None,
+        )
+        .await
+        .expect("the catalog loads");
+        let returns = table_of(&catalog, "sales", "returns").await;
+        let hr = catalog.schema("hr").expect("hr is registered");
+
+        mount_rest_catalog(
+            &server,
+            &[
+                ("sales", Some(&["orders", "returns", "refunds"])),
+                ("hr", None),
+            ],
+            &["returns"],
+        )
+        .await;
+        catalog.refresh().await.expect("the refresh succeeds");
+
+        assert_eq!(
+            sorted_table_names(&catalog, "sales"),
+            vec!["orders", "refunds", "returns"]
+        );
+        assert!(
+            Arc::ptr_eq(&table_of(&catalog, "sales", "returns").await, &returns),
+            "a table that fails to reload keeps its provider"
+        );
+        assert!(
+            Arc::ptr_eq(&catalog.schema("hr").expect("hr is kept"), &hr),
+            "a namespace whose tables cannot be listed keeps its schema"
+        );
     }
 
     const NAMESPACE: &str = "guard_ns";

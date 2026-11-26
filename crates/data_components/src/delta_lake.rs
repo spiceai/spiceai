@@ -111,10 +111,27 @@ pub enum Error {
         data_type: String,
     },
 
+    #[snafu(display(
+        "The Delta Lake table '{table_url}' changed column '{column}' after Spice loaded it: {change}. The query is refused because Spice planned it with the column as it was loaded. Restart Spice to load the new schema. See: https://spiceai.org/docs/components/data-connectors/delta-lake"
+    ))]
+    SchemaChanged {
+        table_url: String,
+        column: String,
+        change: &'static str,
+    },
+
     #[snafu(display("Failed to create object store for Delta Lake table {table_url}: {source}"))]
     ObjectStore {
         table_url: String,
         source: object_store::Error,
+    },
+
+    #[snafu(display(
+        "Failed to load Delta Lake table '{table_url}' because loading it stopped unexpectedly. This is a bug in Spice; report it at https://github.com/spiceai/spiceai/issues"
+    ))]
+    LoadTaskFailed {
+        table_url: String,
+        source: tokio::task::JoinError,
     },
 }
 
@@ -158,7 +175,8 @@ impl Read for DeltaTableFactory {
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let delta_path = table_reference.table().to_string();
-        let delta: DeltaTable = DeltaTable::from(delta_path, self.params.clone(), &self.io_runtime)
+        let delta: DeltaTable = DeltaTable::open(delta_path, self.params.clone(), &self.io_runtime)
+            .await
             .boxed()?
             .with_table_parquet_options(self.table_parquet_options.clone());
         Ok(Arc::new(delta))
@@ -183,7 +201,48 @@ pub struct DeltaTable {
 }
 
 impl DeltaTable {
-    pub fn from(
+    /// Opens the Delta table at `table_location`.
+    ///
+    /// Reading the Delta log blocks the calling thread until the reads finish
+    /// (delta-kernel waits on its own background runtime), so the load runs on
+    /// the blocking pool. On a Tokio worker it would stall every task queued
+    /// behind it, including the tasks that drive the worker's I/O.
+    pub async fn open(
+        table_location: String,
+        options: HashMap<String, SecretString>,
+        io_runtime: &Handle,
+    ) -> Result<Self> {
+        let table_url = table_location.clone();
+        let io_runtime = io_runtime.clone();
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || {
+            span.in_scope(|| Self::from(table_location, options, &io_runtime))
+        })
+        .await
+        .context(LoadTaskFailedSnafu { table_url })?
+    }
+
+    /// Opens the Delta table at `table_location` through a pre-built object
+    /// store, bypassing the credential resolution in [`DeltaTable::open`].
+    ///
+    /// Used by Unity Catalog credential vending, where the store
+    /// authenticates with vended, refresh-aware credentials. Like
+    /// [`DeltaTable::open`], the blocking Delta log read runs on the blocking pool.
+    pub async fn open_with_object_store(
+        table_location: String,
+        object_store: Arc<dyn object_store::ObjectStore>,
+    ) -> Result<Self> {
+        let table_url = table_location.clone();
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || {
+            span.in_scope(|| Self::from_object_store(table_location, object_store))
+        })
+        .await
+        .context(LoadTaskFailedSnafu { table_url })?
+    }
+
+    /// Blocks until the Delta log is read; async callers use [`DeltaTable::open`].
+    fn from(
         table_location: String,
         options: HashMap<String, SecretString>,
         io_runtime: &Handle,
@@ -283,12 +342,9 @@ impl DeltaTable {
         Ok((parquet_store, engine))
     }
 
-    /// Creates a `DeltaTable` backed by a pre-built object store, bypassing
-    /// the credential resolution in [`DeltaTable::from`].
-    ///
-    /// Used by Unity Catalog credential vending, where the store
-    /// authenticates with vended, refresh-aware credentials.
-    pub fn from_object_store(
+    /// Blocks until the Delta log is read; async callers use
+    /// [`DeltaTable::open_with_object_store`].
+    fn from_object_store(
         table_location: String,
         object_store: Arc<dyn object_store::ObjectStore>,
     ) -> Result<Self> {
@@ -444,12 +500,14 @@ impl DeltaTable {
                     .collect::<Vec<_>>(),
             )
             .build();
-        tracing::trace!(
-            table_parquet_options = ?self.table_parquet_options,
-            "Creating Delta Lake ParquetSource"
-        );
+        // Spark and Databricks write `timestamp` columns as INT96 by default. Read them at the
+        // table's microsecond UTC type: as nanoseconds, a value outside 1677-2262 wraps.
+        let mut table_parquet_options = self.table_parquet_options.clone();
+        table_parquet_options.global.coerce_int96 = Some("us".to_string());
+        table_parquet_options.global.coerce_int96_tz = Some("UTC".to_string());
+        tracing::trace!(?table_parquet_options, "Creating Delta Lake ParquetSource");
         let parquet_source = ParquetSource::new(table_schema)
-            .with_table_parquet_options(self.table_parquet_options.clone())
+            .with_table_parquet_options(table_parquet_options)
             .with_parquet_file_reader_factory(Arc::clone(parquet_file_reader_factory))
             .with_predicate(Arc::clone(physical_expr));
 
@@ -720,6 +778,16 @@ fn as_one_line(text: &str) -> String {
         rendered.push('\u{2026}');
     }
     rendered
+}
+
+/// The refusal for a scan whose loaded `column` reads differently in the latest snapshot. The
+/// name comes out of the table, so it is rendered through [`as_one_line`].
+fn schema_changed(table_url: String, column: &str, change: &'static str) -> DataFusionError {
+    DataFusionError::External(Box::new(Error::SchemaChanged {
+        table_url,
+        column: as_one_line(column),
+        change,
+    }))
 }
 
 /// The refusal [`logical_target_in_source_order`] returns, in the shape this connector's other
@@ -1044,6 +1112,132 @@ impl PhysicalExpr for RelabelFieldsExpr {
         write!(f, "{self}")
     }
 }
+
+/// The first loaded column that the `latest` schema no longer reads the same way, and how it
+/// changed. A scan reads the latest snapshot but plans with the loaded schema, so a column that
+/// was dropped, renamed, dropped and added again (a new physical name) or given another type
+/// would read the wrong values. Columns and nested fields added after loading, and metadata other
+/// than physical names, change nothing for the loaded ones. A dropped top-level NOT NULL is
+/// checked by [`first_dropped_not_null`].
+fn first_changed_column(
+    loaded: &delta_kernel::schema::StructType,
+    loaded_mode: ColumnMappingMode,
+    latest: &delta_kernel::schema::StructType,
+    latest_mode: ColumnMappingMode,
+) -> Option<(String, &'static str)> {
+    loaded.fields().find_map(|field| {
+        let change = match latest.field(field.name()) {
+            None => "it was dropped or renamed",
+            Some(now) if now.physical_name(latest_mode) != field.physical_name(loaded_mode) => {
+                if loaded_mode == latest_mode {
+                    "it was dropped and added again"
+                } else {
+                    "the table's column mapping changed"
+                }
+            }
+            Some(now)
+                if !type_reads_the_same(
+                    field.data_type(),
+                    loaded_mode,
+                    now.data_type(),
+                    latest_mode,
+                ) =>
+            {
+                "its type or a field inside it changed"
+            }
+            Some(_) => return None,
+        };
+        Some((field.name().clone(), change))
+    })
+}
+
+/// The first loaded column, or field reached through NOT NULL structs, that was NOT NULL and is
+/// nullable in the `latest` schema, as a dotted path. The planner turns a NULL test on a
+/// non-nullable value into a constant and drops the column from the scan, so this is checked on
+/// every loaded column, not only the ones a scan reads. A field under a nullable struct reads as
+/// nullable already, so it is not checked.
+fn first_dropped_not_null(
+    loaded: &delta_kernel::schema::StructType,
+    latest: &delta_kernel::schema::StructType,
+) -> Option<String> {
+    loaded.fields().find_map(|field| {
+        latest
+            .field(field.name())
+            .and_then(|now| dropped_not_null_path(field, now))
+    })
+}
+
+fn dropped_not_null_path(
+    loaded: &delta_kernel::schema::StructField,
+    latest: &delta_kernel::schema::StructField,
+) -> Option<String> {
+    use delta_kernel::schema::DataType as D;
+    if loaded.nullable {
+        return None;
+    }
+    if latest.nullable {
+        return Some(loaded.name().clone());
+    }
+    match (loaded.data_type(), latest.data_type()) {
+        (D::Struct(loaded_fields), D::Struct(latest_fields)) => {
+            first_dropped_not_null(loaded_fields, latest_fields)
+                .map(|path| format!("{}.{path}", loaded.name()))
+        }
+        _ => None,
+    }
+}
+
+/// Whether values of the `latest` type read into the `loaded` one: every loaded struct field is
+/// still there under the same physical name, with a type that reads the same and no NOT NULL
+/// dropped, and an array or map that had no NULL elements still has none.
+fn type_reads_the_same(
+    loaded: &delta_kernel::schema::DataType,
+    loaded_mode: ColumnMappingMode,
+    latest: &delta_kernel::schema::DataType,
+    latest_mode: ColumnMappingMode,
+) -> bool {
+    use delta_kernel::schema::DataType as D;
+    match (loaded, latest) {
+        (D::Struct(loaded), D::Struct(latest)) => loaded.fields().all(|field| {
+            latest.field(field.name()).is_some_and(|now| {
+                now.physical_name(latest_mode) == field.physical_name(loaded_mode)
+                    && (field.nullable || !now.nullable)
+                    && type_reads_the_same(
+                        field.data_type(),
+                        loaded_mode,
+                        now.data_type(),
+                        latest_mode,
+                    )
+            })
+        }),
+        (D::Array(loaded), D::Array(latest)) => {
+            (loaded.contains_null() || !latest.contains_null())
+                && type_reads_the_same(
+                    loaded.element_type(),
+                    loaded_mode,
+                    latest.element_type(),
+                    latest_mode,
+                )
+        }
+        (D::Map(loaded), D::Map(latest)) => {
+            (loaded.value_contains_null() || !latest.value_contains_null())
+                && type_reads_the_same(
+                    loaded.key_type(),
+                    loaded_mode,
+                    latest.key_type(),
+                    latest_mode,
+                )
+                && type_reads_the_same(
+                    loaded.value_type(),
+                    loaded_mode,
+                    latest.value_type(),
+                    latest_mode,
+                )
+        }
+        (loaded, latest) => loaded == latest,
+    }
+}
+
 /// Finds the first column (by dotted path) whose Delta type Spice does not map to an
 /// Arrow type yet: `void`, and the year-month and day-time interval types.
 ///
@@ -1178,12 +1372,20 @@ impl TableProvider for DeltaTable {
         let parquet_file_reader_factory = Arc::new(DefaultParquetFileReaderFactory::new(
             Arc::clone(&self.parquet_object_store),
         )) as Arc<dyn ParquetFileReaderFactory>;
-        let projected_delta_schema = project_delta_schema(
+        let loaded_schema = project_delta_schema(
             &self.arrow_schema,
             Arc::clone(&self.delta_schema),
             projection,
         )?;
         let engine = Arc::clone(&self.engine);
+        let loaded_table_schema = Arc::clone(&self.delta_schema);
+        let loaded_mode = self
+            .physical_schema_mapping
+            .as_ref()
+            .map_or(ColumnMappingMode::None, |mapping| {
+                mapping.column_mapping_mode
+            });
+        let table_url = self.table_url.to_string();
 
         // Clone the filters since we need to move them into the spawn_blocking closure
         let filters_clone = filters.to_vec();
@@ -1197,12 +1399,34 @@ impl TableProvider for DeltaTable {
                 else {
                     return exec_err!("Unable to get latest Delta table snapshot");
                 };
+                let latest_schema = snapshot.schema();
+                if let Some((column, change)) = first_changed_column(
+                    &loaded_schema,
+                    loaded_mode,
+                    &latest_schema,
+                    snapshot.table_configuration().column_mapping_mode(),
+                )
+                .or_else(|| {
+                    first_dropped_not_null(&loaded_table_schema, &latest_schema)
+                        .map(|column| (column, "its NOT NULL was dropped"))
+                }) {
+                    return Err(schema_changed(table_url, &column, change));
+                }
 
                 // We'll convert all filters for delta_kernel predicates since
                 // partition pruning is already handled separately later in the code
 
+                // The loaded columns read the same in the latest schema, whose fields carry the
+                // annotations its column mapping needs (a table upgraded to column mapping
+                // annotates every field).
+                let scan_schema = delta_kernel::schema::StructType::try_new(
+                    loaded_schema
+                        .fields()
+                        .filter_map(|field| latest_schema.field(field.name()).cloned()),
+                )
+                .map_err(map_delta_error_to_datafusion_err)?;
                 let mut scan_builder =
-                    ScanBuilder::new(Arc::clone(&snapshot)).with_schema(projected_delta_schema);
+                    ScanBuilder::new(Arc::clone(&snapshot)).with_schema(Arc::new(scan_schema));
 
                 // Convert and apply predicate if possible
                 if let Some(predicate) = filters_to_delta_kernel_predicate(&filters_clone) {
@@ -1363,9 +1587,31 @@ impl TableProvider for DeltaTable {
         if let Some(mapping) = &self.physical_schema_mapping {
             // Rewrite filter references, nested field names included, from logical to physical
             // names so ParquetSource can match them against the physical parquet schema.
-            let physical_df_schema = DFSchema::try_from(Arc::new(mapping.schema.clone()))?;
+            // Partition columns keep their logical names: the scan registers them under those.
+            let is_partition_col = |name: &str| table_partition_col_names.contains(&name);
+            let data_delta_schema = delta_kernel::schema::StructType::try_new(
+                self.delta_schema
+                    .fields()
+                    .filter(|field| !is_partition_col(field.name()))
+                    .cloned(),
+            )
+            .map_err(map_delta_error_to_datafusion_err)?;
+            let filter_fields = mapping
+                .schema
+                .fields()
+                .iter()
+                .map(
+                    |field| match mapping.physical_to_logical.get(field.name()) {
+                        Some(logical) if is_partition_col(logical) => Ok(Arc::new(
+                            self.arrow_schema.field_with_name(logical)?.clone(),
+                        )),
+                        _ => Ok(Arc::clone(field)),
+                    },
+                )
+                .collect::<Result<Vec<_>, arrow::error::ArrowError>>()?;
+            let physical_df_schema = DFSchema::try_from(Arc::new(Schema::new(filter_fields)))?;
             let physical_expr = physical_filter(state, filters, &physical_df_schema, |filter| {
-                rewrite_to_physical_names(filter, &self.delta_schema, mapping.column_mapping_mode)
+                rewrite_to_physical_names(filter, &data_delta_schema, mapping.column_mapping_mode)
             })?;
 
             let physical_non_partition_schema =
@@ -1472,20 +1718,10 @@ fn handle_scan_file(scan_context: &mut ScanContext, scan_file: ScanFile) {
 
     let root_url = &scan_context.table_root;
 
-    let path = if root_url.path().ends_with('/') {
-        format!("{}{}", root_url.path(), path)
-    } else {
-        format!("{}/{}", root_url.path(), path)
-    };
-
-    let partitioned_file_path = match object_store::path::Path::from_url_path(&path) {
+    let partitioned_file_path = match data_file_location(root_url, &path) {
         Ok(path) => path,
         Err(e) => {
-            scan_context
-                .errs
-                .push(datafusion::error::DataFusionError::Execution(format!(
-                    "Error parsing file path: {e}",
-                )));
+            scan_context.errs.push(e);
             return;
         }
     };
@@ -1522,6 +1758,55 @@ fn handle_scan_file(scan_context: &mut ScanContext, scan_file: ScanFile) {
         partition_values,
         _transform: transform,
     });
+}
+
+/// Resolves a data file's `path` from the Delta log to its location in the table's object store.
+///
+/// The path is a URL relative to the table root or, in a shallow clone, an absolute URL. It is
+/// resolved the way the Delta kernel resolves it. A relative path must stay inside the table root.
+/// The scan reads every file through the table's own object store, so a file in another store is
+/// refused. Hadoop's other scheme names for a store (`s3a`, `s3n`, `abfs`) name the same store.
+fn data_file_location(
+    table_root: &Url,
+    path: &str,
+) -> Result<object_store::path::Path, DataFusionError> {
+    fn object_store_of(url: &Url) -> (&str, &str) {
+        let scheme = match url.scheme() {
+            "s3a" | "s3n" => "s3",
+            "abfs" => "abfss",
+            scheme => scheme,
+        };
+        (
+            scheme,
+            &url[url::Position::BeforeUsername..url::Position::AfterPort],
+        )
+    }
+    fn shown(url: &Url) -> String {
+        format!(
+            "{}://{}{}",
+            url.scheme(),
+            url.host_str().unwrap_or_default(),
+            url.path()
+        )
+    }
+
+    let file_url = table_root
+        .join(path)
+        .map_err(|e| DataFusionError::Execution(format!("Error parsing file path: {e}")))?;
+
+    let is_absolute = Url::parse(path).is_ok();
+    if object_store_of(&file_url) != object_store_of(table_root)
+        || (!is_absolute && !file_url.path().starts_with(table_root.path()))
+    {
+        return Err(DataFusionError::Execution(format!(
+            "Delta Lake data file '{}' is outside the table's storage location '{}'.",
+            shown(&file_url),
+            shown(table_root),
+        )));
+    }
+
+    object_store::path::Path::from_url_path(file_url.path())
+        .map_err(|e| DataFusionError::Execution(format!("Error parsing file path: {e}")))
 }
 
 fn map_delta_error_to_datafusion_err(e: delta_kernel::Error) -> datafusion::error::DataFusionError {
@@ -2331,6 +2616,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_changed_column_name_cannot_split_the_refusal() {
+        let message = schema_changed(
+            "file:///t/".to_string(),
+            "two\nlines",
+            "it was dropped or renamed",
+        )
+        .to_string();
+        assert!(!message.contains('\n'), "{message:?}");
+        assert!(message.contains("changed column 'two"), "{message}");
+    }
+
     /// The names in a refusal come out of the table, so the one-line guarantee above has to hold
     /// for a schema that names a column with a newline in it rather than only for the names a
     /// test picks.
@@ -2980,6 +3277,232 @@ mod column_mapping_filter_tests {
         StructType::try_new(fields).expect("a valid test struct")
     }
 
+    #[test]
+    fn a_loaded_column_the_latest_snapshot_reads_differently_refuses_the_scan() {
+        let id = || mapped("id", "col-id", 1, DeltaType::INTEGER);
+        let amount = || mapped("amount", "col-amount", 2, DeltaType::INTEGER);
+        let status = || mapped("status", "col-status", 3, DeltaType::STRING);
+        let a = || mapped("a", "col-st-a", 5, DeltaType::INTEGER);
+        let st = |fields: Vec<StructField>| mapped("st", "col-st", 4, struct_of(fields));
+        let loaded = struct_of(vec![id(), amount(), status(), st(vec![a()])]);
+        let mode = ColumnMappingMode::Name;
+        let changed = |latest: Vec<StructField>| {
+            first_changed_column(&loaded, mode, &struct_of(latest), mode)
+        };
+        let changed_column =
+            |column: &str, change: &'static str| Some((column.to_string(), change));
+
+        let note = mapped("note", "col-note", 6, DeltaType::STRING);
+        let nested_note = mapped("note", "col-st-note", 7, DeltaType::STRING);
+        assert_eq!(
+            changed(vec![
+                id(),
+                amount(),
+                status(),
+                st(vec![a(), nested_note]),
+                note
+            ]),
+            None
+        );
+        let commented = a().add_metadata([("comment", MetadataValue::String("x".to_string()))]);
+        assert_eq!(
+            changed(vec![id(), amount(), status(), st(vec![commented])]),
+            None
+        );
+
+        let renamed = mapped("total", "col-amount", 2, DeltaType::INTEGER);
+        assert_eq!(
+            changed(vec![id(), renamed, status(), st(vec![a()])]),
+            changed_column("amount", "it was dropped or renamed")
+        );
+        let added_again = mapped("status", "col-status-2", 8, DeltaType::STRING);
+        assert_eq!(
+            changed(vec![id(), amount(), added_again, st(vec![a()])]),
+            changed_column("status", "it was dropped and added again")
+        );
+        let widened = mapped("amount", "col-amount", 2, DeltaType::LONG);
+        assert_eq!(
+            changed(vec![id(), widened, status(), st(vec![a()])]),
+            changed_column("amount", "its type or a field inside it changed")
+        );
+        let nested_renamed = mapped("b", "col-st-a", 5, DeltaType::INTEGER);
+        let nested_added_again = mapped("a", "col-st-a-2", 9, DeltaType::INTEGER);
+        let not_null = |field: StructField| StructField {
+            nullable: false,
+            ..field
+        };
+        let loaded_not_null = struct_of(vec![mapped(
+            "st",
+            "col-st",
+            4,
+            struct_of(vec![not_null(a())]),
+        )]);
+        for latest in [vec![nested_renamed], vec![nested_added_again]] {
+            assert_eq!(
+                changed(vec![id(), amount(), status(), st(latest)]),
+                changed_column("st", "its type or a field inside it changed")
+            );
+        }
+        assert_eq!(
+            first_changed_column(
+                &loaded_not_null,
+                mode,
+                &struct_of(vec![st(vec![a()])]),
+                mode
+            ),
+            changed_column("st", "its type or a field inside it changed")
+        );
+        let loaded_required = struct_of(vec![id(), not_null(amount())]);
+        let relaxed = struct_of(vec![id(), amount()]);
+        assert_eq!(
+            first_dropped_not_null(&loaded_required, &relaxed),
+            Some("amount".to_string())
+        );
+        assert_eq!(first_dropped_not_null(&relaxed, &loaded_required), None);
+        assert_eq!(
+            first_dropped_not_null(&loaded_required, &struct_of(vec![id()])),
+            None
+        );
+        let required_st = |a: StructField| not_null(st(vec![a]));
+        assert_eq!(
+            first_dropped_not_null(
+                &struct_of(vec![id(), required_st(not_null(a()))]),
+                &struct_of(vec![id(), required_st(a())])
+            ),
+            Some("st.a".to_string())
+        );
+        assert_eq!(
+            first_dropped_not_null(
+                &struct_of(vec![id(), st(vec![not_null(a())])]),
+                &struct_of(vec![id(), st(vec![a()])])
+            ),
+            None
+        );
+
+        let element = |fields: Vec<StructField>, contains_null: bool| {
+            mapped(
+                "l",
+                "col-l",
+                10,
+                ArrayType::new(struct_of(fields), contains_null),
+            )
+        };
+        let value = |fields: Vec<StructField>, value_contains_null: bool| {
+            let map = MapType::new(DeltaType::STRING, struct_of(fields), value_contains_null);
+            mapped("m", "col-m", 11, map)
+        };
+        let loaded_nested = struct_of(vec![element(vec![a()], false), value(vec![a()], false)]);
+        let changed_nested = |latest: Vec<StructField>| {
+            first_changed_column(&loaded_nested, mode, &struct_of(latest), mode)
+        };
+        let b = || mapped("b", "col-b", 12, DeltaType::INTEGER);
+        assert_eq!(
+            changed_nested(vec![
+                element(vec![a(), b()], false),
+                value(vec![a(), b()], false)
+            ]),
+            None
+        );
+        let in_element = changed_column("l", "its type or a field inside it changed");
+        let in_value = changed_column("m", "its type or a field inside it changed");
+        let renamed_a = || mapped("b", "col-st-a", 5, DeltaType::INTEGER);
+        assert_eq!(
+            changed_nested(vec![
+                element(vec![renamed_a()], false),
+                value(vec![a()], false)
+            ]),
+            in_element
+        );
+        assert_eq!(
+            changed_nested(vec![
+                element(vec![a()], false),
+                value(vec![renamed_a()], false)
+            ]),
+            in_value
+        );
+        assert_eq!(
+            changed_nested(vec![element(vec![a()], true), value(vec![a()], false)]),
+            in_element
+        );
+        assert_eq!(
+            changed_nested(vec![element(vec![a()], false), value(vec![a()], true)]),
+            in_value
+        );
+        // A nested field that became NOT NULL still reads into the loaded, nullable one.
+        assert_eq!(
+            changed(vec![id(), amount(), status(), st(vec![not_null(a())])]),
+            None
+        );
+
+        // Upgrading a table to column mapping keeps each name, nested ones too, as its physical name.
+        let plain = struct_of(vec![
+            StructField::new("id", DeltaType::INTEGER, true),
+            StructField::new(
+                "st",
+                struct_of(vec![StructField::new("a", DeltaType::INTEGER, true)]),
+                true,
+            ),
+        ]);
+        let upgraded = struct_of(vec![
+            mapped("id", "id", 1, DeltaType::INTEGER),
+            mapped(
+                "st",
+                "st",
+                2,
+                struct_of(vec![mapped("a", "a", 3, DeltaType::INTEGER)]),
+            ),
+        ]);
+        assert_eq!(
+            first_changed_column(&plain, ColumnMappingMode::None, &upgraded, mode),
+            None
+        );
+        assert_eq!(
+            first_changed_column(&loaded, mode, &plain, ColumnMappingMode::None),
+            changed_column("id", "the table's column mapping changed")
+        );
+        // Upgraded, then dropped and added again: a new physical name under the new mode.
+        let added_after_upgrade = struct_of(vec![mapped("id", "col-id-2", 1, DeltaType::INTEGER)]);
+        assert_eq!(
+            first_changed_column(&plain, ColumnMappingMode::None, &added_after_upgrade, mode),
+            changed_column("id", "the table's column mapping changed")
+        );
+        let nested_added_after_upgrade = struct_of(vec![
+            mapped("id", "id", 1, DeltaType::INTEGER),
+            mapped(
+                "st",
+                "st",
+                2,
+                struct_of(vec![mapped("a", "col-st-a-2", 3, DeltaType::INTEGER)]),
+            ),
+        ]);
+        assert_eq!(
+            first_changed_column(
+                &plain,
+                ColumnMappingMode::None,
+                &nested_added_after_upgrade,
+                mode
+            ),
+            changed_column("st", "its type or a field inside it changed")
+        );
+        let keyed = |key: DeltaType| {
+            struct_of(vec![mapped(
+                "k",
+                "col-k",
+                13,
+                MapType::new(key, DeltaType::STRING, true),
+            )])
+        };
+        assert_eq!(
+            first_changed_column(
+                &keyed(DeltaType::INTEGER),
+                mode,
+                &keyed(DeltaType::LONG),
+                mode
+            ),
+            changed_column("k", "its type or a field inside it changed")
+        );
+    }
+
     /// `id INT`, `st STRUCT<a INT, label STRING>` where `label` was renamed from `b`,
     /// `outer STRUCT<inner STRUCT<x INT>>`, `l ARRAY<STRUCT<a INT>>`, and
     /// `m MAP<STRING, STRUCT<a INT>>`. Every field carries a physical name, as Spark writes them.
@@ -3185,5 +3708,640 @@ mod column_mapping_filter_tests {
         })
         .expect("an unplannable filter must not fail the scan");
         assert_eq!(planned.to_string(), "true");
+    }
+}
+
+#[cfg(test)]
+mod table_read_tests {
+    //! Reads small Delta tables written to a temporary directory in the shapes Spark writes.
+    use super::*;
+    use chrono::NaiveDate;
+    use datafusion::assert_batches_eq;
+    use datafusion::execution::context::SessionContext;
+    use parquet::data_type::{Int32Type, Int96, Int96Type};
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::parser::parse_message_type;
+    use std::path::Path;
+
+    const ID_TS_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"integer","nullable":true,"metadata":{}},{"name":"ts","type":"timestamp","nullable":true,"metadata":{}}]}"#;
+
+    /// Writes `rows` to `file` with `ts` stored as INT96, Spark's default for `timestamp` columns.
+    fn write_int96_file(file: &Path, rows: &[(i32, &str)]) -> u64 {
+        let schema =
+            parse_message_type("message spark_schema { optional int32 id; optional int96 ts; }")
+                .expect("schema");
+        let out = std::fs::File::create(file).expect("create parquet file");
+        let mut writer = SerializedFileWriter::new(
+            out,
+            Arc::new(schema),
+            Arc::new(WriterProperties::builder().build()),
+        )
+        .expect("parquet writer");
+        let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        let timestamps: Vec<Int96> = rows
+            .iter()
+            .map(|(_, ts)| {
+                let ts = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
+                    .expect("timestamp");
+                let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
+                let julian_day = (ts.date() - epoch).num_days() + 2_440_588;
+                let nanos_of_day = (ts.time() - chrono::NaiveTime::MIN)
+                    .num_nanoseconds()
+                    .expect("nanoseconds of the day");
+                let mut value = Int96::new();
+                value.set_data(
+                    u32::try_from(nanos_of_day & 0xFFFF_FFFF).expect("low bits"),
+                    u32::try_from(nanos_of_day >> 32).expect("high bits"),
+                    u32::try_from(julian_day).expect("julian day"),
+                );
+                value
+            })
+            .collect();
+        let definition_levels = vec![1; rows.len()];
+        let mut row_group = writer.next_row_group().expect("row group");
+        let mut column = row_group.next_column().expect("id").expect("id column");
+        column
+            .typed::<Int32Type>()
+            .write_batch(&ids, Some(&definition_levels), None)
+            .expect("write id");
+        column.close().expect("close id");
+        let mut column = row_group.next_column().expect("ts").expect("ts column");
+        column
+            .typed::<Int96Type>()
+            .write_batch(&timestamps, Some(&definition_levels), None)
+            .expect("write ts");
+        column.close().expect("close ts");
+        row_group.close().expect("close row group");
+        writer.close().expect("close parquet file");
+        std::fs::metadata(file).expect("parquet file").len()
+    }
+
+    /// Writes version 0 of a Delta log that adds `files` (`add.path`, size).
+    fn write_delta_log(table: &Path, schema: &str, files: &[(String, u64)]) {
+        let log = table.join("_delta_log");
+        std::fs::create_dir_all(&log).expect("create _delta_log");
+        let mut actions = vec![
+            serde_json::json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+            serde_json::json!({"metaData": {
+                "id": "00000000-0000-0000-0000-000000000000",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": schema,
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 0
+            }}),
+        ];
+        for (path, size) in files {
+            actions.push(serde_json::json!({"add": {
+                "path": path,
+                "partitionValues": {},
+                "size": size,
+                "modificationTime": 0,
+                "dataChange": true
+            }}));
+        }
+        let commit = actions
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(log.join("00000000000000000000.json"), commit).expect("write commit");
+    }
+
+    /// An object store whose reads run on the runtime that opened the table, the way a
+    /// store served from inside the same process does.
+    #[derive(Debug)]
+    struct CallerRuntimeStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+        caller: Handle,
+    }
+
+    impl std::fmt::Display for CallerRuntimeStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CallerRuntimeStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl object_store::ObjectStore for CallerRuntimeStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            let inner = Arc::clone(&self.inner);
+            let location = location.clone();
+            self.caller
+                .spawn(async move { inner.get_opts(&location, options).await })
+                .await
+                .map_err(|e| object_store::Error::Generic {
+                    store: "CallerRuntimeStore",
+                    source: Box::new(e),
+                })?
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Opening a table through a pre-built object store must not read the Delta log on the
+    /// calling Tokio worker. With a single worker, a worker blocked on the log read leaves the
+    /// store's reads, which run on that same runtime, unable to make progress.
+    #[test]
+    fn open_with_object_store_does_not_block_the_calling_worker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_delta_log(dir.path(), ID_TS_SCHEMA, &[]);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(CallerRuntimeStore {
+            inner: Arc::new(
+                object_store::local::LocalFileSystem::new_with_prefix(dir.path())
+                    .expect("local store"),
+            ),
+            caller: runtime.handle().clone(),
+        });
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        runtime.spawn(async move {
+            let opened =
+                DeltaTable::open_with_object_store("s3://bucket/".to_string(), store).await;
+            sender
+                .send(opened.map(|table| {
+                    table
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|field| field.name().clone())
+                        .collect::<Vec<_>>()
+                }))
+                .expect("the test is waiting for the result");
+        });
+        let opened = receiver.recv_timeout(std::time::Duration::from_secs(30));
+        // A worker blocked on the log read never finishes, so don't wait for it on drop.
+        runtime.shutdown_background();
+
+        let columns = opened
+            .expect("the table must open without blocking the only Tokio worker")
+            .expect("the table opens");
+        assert_eq!(columns, vec!["id".to_string(), "ts".to_string()]);
+    }
+
+    /// Writes an `INT32` Parquet file whose columns carry the given (physical) names.
+    fn write_i32_file(file: &Path, columns: &[(&str, Vec<Option<i32>>)]) -> u64 {
+        use datafusion::arrow::array::{ArrayRef, Int32Array};
+        use parquet::arrow::ArrowWriter;
+        let schema = Arc::new(Schema::new(
+            columns
+                .iter()
+                .map(|(name, _)| Field::new(*name, DataType::Int32, true))
+                .collect::<Vec<_>>(),
+        ));
+        let arrays = columns
+            .iter()
+            .map(|(_, values)| Arc::new(Int32Array::from(values.clone())) as ArrayRef)
+            .collect();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).expect("batch");
+        let out = std::fs::File::create(file).expect("create parquet file");
+        let mut writer = ArrowWriter::try_new(out, schema, None).expect("parquet writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close parquet file");
+        std::fs::metadata(file).expect("parquet file").len()
+    }
+
+    /// An `integer` column, with a physical name and id when the table uses column mapping.
+    fn int_column(name: &str, mapping: Option<(&str, i64)>, nullable: bool) -> serde_json::Value {
+        let metadata = mapping.map_or_else(
+            || serde_json::json!({}),
+            |(physical, id)| {
+                serde_json::json!({
+                    "delta.columnMapping.id": id,
+                    "delta.columnMapping.physicalName": physical
+                })
+            },
+        );
+        serde_json::json!({"name": name, "type": "integer", "nullable": nullable, "metadata": metadata})
+    }
+
+    fn table_metadata(columns: &[serde_json::Value], column_mapping: bool) -> serde_json::Value {
+        let schema = serde_json::json!({"type": "struct", "fields": columns}).to_string();
+        let configuration = if column_mapping {
+            serde_json::json!({"delta.columnMapping.mode": "name", "delta.columnMapping.maxColumnId": "9"})
+        } else {
+            serde_json::json!({})
+        };
+        serde_json::json!({"metaData": {
+            "id": "00000000-0000-0000-0000-000000000000",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": schema,
+            "partitionColumns": [],
+            "configuration": configuration,
+            "createdTime": 0
+        }})
+    }
+
+    fn protocol(reader: u32, writer: u32) -> serde_json::Value {
+        serde_json::json!({"protocol": {"minReaderVersion": reader, "minWriterVersion": writer}})
+    }
+
+    fn add_file(path: &str, size: u64) -> serde_json::Value {
+        serde_json::json!({"add": {
+            "path": path,
+            "partitionValues": {},
+            "size": size,
+            "modificationTime": 0,
+            "dataChange": true
+        }})
+    }
+
+    /// Writes commit `version` of the table's Delta log.
+    fn write_commit(table: &Path, version: u64, actions: &[serde_json::Value]) {
+        let log = table.join("_delta_log");
+        std::fs::create_dir_all(&log).expect("create _delta_log");
+        let commit = actions
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(log.join(format!("{version:020}.json")), commit).expect("write commit");
+    }
+
+    /// Registers the table once, the way a dataset keeps its provider while the table changes.
+    fn registered(table: &Path) -> SessionContext {
+        let provider = DeltaTable::from(
+            table.to_str().expect("utf-8 path").to_string(),
+            HashMap::new(),
+            &Handle::current(),
+        )
+        .expect("open Delta table");
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider))
+            .expect("register table");
+        ctx
+    }
+
+    async fn rows(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
+        ctx.sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("execute")
+    }
+
+    async fn refusal(ctx: &SessionContext, sql: &str) -> String {
+        ctx.sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("the scan is refused")
+            .to_string()
+    }
+
+    async fn query(table: &Path, sql: &str) -> Vec<RecordBatch> {
+        let provider = DeltaTable::from(
+            table.to_str().expect("utf-8 path").to_string(),
+            HashMap::new(),
+            &Handle::current(),
+        )
+        .expect("open Delta table");
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider))
+            .expect("register table");
+        ctx.sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("execute")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn int96_timestamps_keep_their_value_outside_the_nanosecond_range() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let size = write_int96_file(
+            &dir.path().join("part-0.parquet"),
+            &[
+                (1, "9999-12-31 00:00:00"),
+                (2, "2024-01-01 12:00:00"),
+                (3, "0001-01-01 00:00:00"),
+            ],
+        );
+        write_delta_log(
+            dir.path(),
+            ID_TS_SCHEMA,
+            &[("part-0.parquet".to_string(), size)],
+        );
+
+        let rows = query(dir.path(), "SELECT id, ts FROM t ORDER BY id").await;
+        assert_batches_eq!(
+            [
+                "+----+----------------------+",
+                "| id | ts                   |",
+                "+----+----------------------+",
+                "| 1  | 9999-12-31T00:00:00Z |",
+                "| 2  | 2024-01-01T12:00:00Z |",
+                "| 3  | 0001-01-01T00:00:00Z |",
+                "+----+----------------------+",
+            ],
+            &rows
+        );
+
+        let rows = query(
+            dir.path(),
+            "SELECT id FROM t WHERE ts > TIMESTAMP '2100-01-01T00:00:00Z' ORDER BY id",
+        )
+        .await;
+        assert_batches_eq!(["+----+", "| id |", "+----+", "| 1  |", "+----+"], &rows);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shallow_clone_reads_files_by_their_absolute_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let clone = dir.path().join("clone");
+        std::fs::create_dir_all(&source).expect("source dir");
+        std::fs::create_dir_all(&clone).expect("clone dir");
+        let file = source.join("part-0.parquet");
+        let size = write_int96_file(
+            &file,
+            &[(1, "2024-01-01 00:00:00"), (2, "2024-01-02 00:00:00")],
+        );
+        let absolute = Url::from_file_path(&file).expect("file URL").to_string();
+        write_delta_log(&clone, ID_TS_SCHEMA, &[(absolute, size)]);
+
+        let rows = query(&clone, "SELECT id FROM t ORDER BY id").await;
+        assert_batches_eq!(
+            ["+----+", "| id |", "+----+", "| 1  |", "| 2  |", "+----+"],
+            &rows
+        );
+    }
+
+    #[test]
+    fn data_file_paths_resolve_against_the_table_root() {
+        let root = Url::parse("s3://bucket/tables/t/").expect("root");
+        let location = |path: &str| data_file_location(&root, path).map(|p| p.to_string());
+
+        assert_eq!(
+            location("part-0.parquet").expect("relative"),
+            "tables/t/part-0.parquet"
+        );
+        assert_eq!(
+            location("day=2024-01-01%2012%3A00%3A00/part-0.parquet").expect("encoded"),
+            "tables/t/day=2024-01-01 12:00:00/part-0.parquet"
+        );
+        assert_eq!(
+            location("s3://bucket/tables/source/part-0.parquet").expect("absolute"),
+            "tables/source/part-0.parquet"
+        );
+        assert_eq!(
+            location("s3a://bucket/tables/source/part-0.parquet").expect("Hadoop scheme name"),
+            "tables/source/part-0.parquet"
+        );
+        location("../source/part-0.parquet").expect_err("relative path above the root");
+        location("/tables/source/part-0.parquet").expect_err("path from the bucket root");
+        location("s3://other-bucket/tables/source/part-0.parquet").expect_err("other bucket");
+        location("gs://bucket/tables/source/part-0.parquet").expect_err("other store");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scan_after_a_schema_change_refuses_the_changed_columns_and_reads_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = dir.path();
+        let size = write_i32_file(
+            &table.join("part-0.parquet"),
+            &[
+                ("col-id", vec![Some(1), Some(2)]),
+                ("col-status", vec![Some(10), Some(20)]),
+                ("col-c", vec![Some(5), Some(6)]),
+            ],
+        );
+        let loaded = [
+            int_column("id", Some(("col-id", 1)), true),
+            int_column("status", Some(("col-status", 2)), true),
+            int_column("c", Some(("col-c", 3)), false),
+        ];
+        write_commit(
+            table,
+            0,
+            &[
+                protocol(2, 5),
+                table_metadata(&loaded, true),
+                add_file("part-0.parquet", size),
+            ],
+        );
+        let ctx = registered(table);
+        assert_batches_eq!(
+            [
+                "+----+--------+---+",
+                "| id | status | c |",
+                "+----+--------+---+",
+                "| 1  | 10     | 5 |",
+                "| 2  | 20     | 6 |",
+                "+----+--------+---+",
+            ],
+            &rows(&ctx, "SELECT id, status, c FROM t ORDER BY id").await
+        );
+
+        // `status` is dropped and added again, and a row is written under the new schema while the
+        // table stays registered.
+        let size = write_i32_file(
+            &table.join("part-1.parquet"),
+            &[
+                ("col-id", vec![Some(3)]),
+                ("col-c", vec![Some(7)]),
+                ("col-status-2", vec![Some(30)]),
+            ],
+        );
+        let latest = [
+            int_column("id", Some(("col-id", 1)), true),
+            int_column("c", Some(("col-c", 3)), false),
+            int_column("status", Some(("col-status-2", 4)), true),
+        ];
+        write_commit(
+            table,
+            1,
+            &[
+                table_metadata(&latest, true),
+                add_file("part-1.parquet", size),
+            ],
+        );
+
+        let error = refusal(&ctx, "SELECT id, status FROM t").await;
+        assert!(
+            error.contains(
+                "changed column 'status' after Spice loaded it: it was dropped and added again"
+            ),
+            "{error}"
+        );
+        assert_batches_eq!(
+            [
+                "+----+", "| id |", "+----+", "| 1  |", "| 2  |", "| 3  |", "+----+"
+            ],
+            &rows(&ctx, "SELECT id FROM t ORDER BY id").await
+        );
+
+        // `c` loses its NOT NULL. The planner reads `c IS NOT NULL` as `true` and leaves `c` out of
+        // the scan, so even a query that does not read `c` is refused.
+        let size = write_i32_file(
+            &table.join("part-2.parquet"),
+            &[
+                ("col-id", vec![Some(4)]),
+                ("col-c", vec![None]),
+                ("col-status-2", vec![Some(40)]),
+            ],
+        );
+        let relaxed = [
+            int_column("id", Some(("col-id", 1)), true),
+            int_column("c", Some(("col-c", 3)), true),
+            int_column("status", Some(("col-status-2", 4)), true),
+        ];
+        write_commit(
+            table,
+            2,
+            &[
+                table_metadata(&relaxed, true),
+                add_file("part-2.parquet", size),
+            ],
+        );
+        for sql in [
+            "SELECT id FROM t",
+            "SELECT count(*) FROM t WHERE c IS NOT NULL",
+        ] {
+            let error = refusal(&ctx, sql).await;
+            assert!(
+                error
+                    .contains("changed column 'c' after Spice loaded it: its NOT NULL was dropped"),
+                "{sql}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_table_upgraded_to_column_mapping_keeps_reading() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = dir.path();
+        let size = write_i32_file(
+            &table.join("part-0.parquet"),
+            &[("id", vec![Some(1)]), ("v", vec![Some(10)])],
+        );
+        let plain = [int_column("id", None, true), int_column("v", None, true)];
+        write_commit(
+            table,
+            0,
+            &[
+                protocol(1, 2),
+                table_metadata(&plain, false),
+                add_file("part-0.parquet", size),
+            ],
+        );
+        let ctx = registered(table);
+
+        // The upgrade keeps each name as its physical name, so the old files still read.
+        let size = write_i32_file(
+            &table.join("part-1.parquet"),
+            &[("id", vec![Some(2)]), ("v", vec![Some(20)])],
+        );
+        let upgraded = [
+            int_column("id", Some(("id", 1)), true),
+            int_column("v", Some(("v", 2)), true),
+        ];
+        write_commit(
+            table,
+            1,
+            &[
+                protocol(2, 5),
+                table_metadata(&upgraded, true),
+                add_file("part-1.parquet", size),
+            ],
+        );
+        assert_batches_eq!(
+            [
+                "+----+----+",
+                "| id | v  |",
+                "+----+----+",
+                "| 1  | 10 |",
+                "| 2  | 20 |",
+                "+----+----+",
+            ],
+            &rows(&ctx, "SELECT id, v FROM t ORDER BY id").await
+        );
+
+        // `v` is then dropped and added again under the new mode, with a new physical name.
+        let size = write_i32_file(
+            &table.join("part-2.parquet"),
+            &[("id", vec![Some(3)]), ("col-v-2", vec![Some(30)])],
+        );
+        let added_again = [
+            int_column("id", Some(("id", 1)), true),
+            int_column("v", Some(("col-v-2", 3)), true),
+        ];
+        write_commit(
+            table,
+            2,
+            &[
+                table_metadata(&added_again, true),
+                add_file("part-2.parquet", size),
+            ],
+        );
+        let error = refusal(&ctx, "SELECT id, v FROM t").await;
+        assert!(
+            error.contains(
+                "changed column 'v' after Spice loaded it: the table's column mapping changed"
+            ),
+            "{error}"
+        );
     }
 }

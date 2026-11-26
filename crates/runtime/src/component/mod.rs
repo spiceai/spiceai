@@ -439,6 +439,8 @@ mod tests {
     #[test]
     fn the_deprecated_engine_warning_is_one_line_grouped_by_engine() {
         let arrow = acceleration(Some("arrow"));
+        // A removed engine fails to load with its own error, so the deprecation
+        // warning leaves it out.
         let sqlite = acceleration(Some("sqlite"));
         let postgres = acceleration(Some("postgresql"));
         let cayenne = acceleration(Some("cayenne"));

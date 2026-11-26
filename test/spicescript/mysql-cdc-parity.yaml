@@ -30,7 +30,7 @@ variants:
     datasets: { '*': { acceleration: { mode: memory } } }
   # Object-native data (#16131): data files in the state location, which an
   # instance that loses its directory serves again without the source.
-  object-native-local: object-native-local
+  object-native: object-native
   object-native-s3: object-native-s3
   object-native-s3-latency: object-native-s3-latency
 
@@ -192,12 +192,12 @@ steps:
   # and none at a local `s3:` path.
   - source-exec:
       src: "INSERT INTO orders (o_id, o_custkey, o_status, o_total) VALUES (1, 7, 'N', 10.50), (2, 7, 'F', NULL), (3, 9, NULL, 0.01)"
-    only: &object-native-data [object-native-local, object-native-s3, object-native-s3-latency]
+    only: &object-native-data [object-native, object-native-s3, object-native-s3-latency]
   - query: SELECT * FROM orders
     eventually: 30s
     only: *object-native-data
   - assert-files: { contains: ['^state/cayenne/v1/datasets/orders-[^/]+/data/', '^state/cayenne/v1/datasets/customers-[^/]+/data/'] }
-    only: object-native-local
+    only: object-native
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/customers-, contains: /data/, min: 1 }
     only: object-native-s3
   - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/customers-, contains: /data/, min: 1 }
@@ -210,10 +210,7 @@ steps:
   # Expected failures (ledger): a `refresh_mode: changes` dataset is not
   # registered while its source cannot be reached, so its copy in the location
   # is not served until the source is back ("table … not found" on every
-  # object-native-data variant). On object-native-local the data files are
-  # under `.spice/data`, which the wipe removes, so `orders` then refuses to
-  # load with "Deletion vector file is missing…" even with the source back
-  # (local data is not in the location yet).
+  # object-native-data variant).
   - query: SELECT * FROM orders
     id: orders-before-wipe
     only: *object-native-data
@@ -255,8 +252,7 @@ steps:
 
   # Readers while the change stream writes (#16132): with the data in an
   # object-store location, with or without 20 ms of latency, no query fails,
-  # and the table still matches the source afterwards. (A local location does
-  # not hold data files yet, so it is not run there.)
+  # and the table still matches the source afterwards.
   - background:
       id: cdc-writes
       source-exec: { src: "UPDATE orders SET o_total = o_total + 1 WHERE o_id % 13 = ${round} % 13" }

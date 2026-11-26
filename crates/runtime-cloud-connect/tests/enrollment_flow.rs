@@ -652,9 +652,9 @@ async fn pre_runtime_enroll_persists_identity_and_connects() {
     );
     let instance = &body["instance"];
     assert_eq!(instance["fingerprint"].as_str().unwrap().len(), 64);
-    assert!(!instance["hostname"].as_str().unwrap().is_empty());
-    assert!(!instance["os"].as_str().unwrap().is_empty());
-    assert!(!instance["arch"].as_str().unwrap().is_empty());
+    assert_ne!(instance["hostname"].as_str().unwrap(), "");
+    assert_ne!(instance["os"].as_str().unwrap(), "");
+    assert_ne!(instance["arch"].as_str().unwrap(), "");
     assert_eq!(instance["runtime_version"], "v0.0.0-test");
 
     // Server should have received the Hello, AdoptAck, and a successful

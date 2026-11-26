@@ -1,0 +1,1 @@
+--show-only templates/deployment.yaml --show-only templates/service.yaml

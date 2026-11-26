@@ -41,7 +41,7 @@ The default distribution includes the standard data and AI/ML feature set. This 
 **Included Features:**
 
 - All standard data connectors (PostgreSQL, MySQL, DuckDB, SQLite, ClickHouse, etc.)
-- Embedded data accelerators (Spice Cayenne, SQLite)
+- Embedded data accelerator (Spice Cayenne)
 - AI/ML model inference (LLMs, embeddings)
 - Search capabilities (Vector and BM-25 Full-Text-Search)
 - Inline SQL user-defined scalar and table functions
@@ -52,9 +52,7 @@ The default distribution includes the standard data and AI/ML feature set. This 
 - ODBC (`odbc`), Elasticsearch (`elasticsearch`), NFS (`nfs`), and ScyllaDB (`scylladb`) data connectors
 - Acceleration snapshots (`snapshots` feature)
 - HTTP-backed function servers (`http-functions` feature)
-- WebAssembly user-defined functions (`wasm-functions` feature; Rust source compilation additionally requires `wasm-functions-compile`)
-
-> **Note:** The PostgreSQL data accelerator is only available in nightly builds. The PostgreSQL data connector is included in all distributions.
+- WebAssembly user-defined functions (`wasm-functions` feature)
 
 **Installation:**
 
@@ -277,7 +275,7 @@ The following features are available with the [Spice Cloud Platform](https://spi
 - **Acceleration Snapshots** - Bootstrap accelerated datasets from durable snapshot storage for fast cold starts, recovery after ephemeral storage loss, and controlled rollback to a previous acceleration state. Local open source builds can enable this with `snapshots`.
 - **Globally Persisted HTTP Rate-Control State** - Persist request-rate state and expiring active instance heartbeats per origin from a background worker so multiple Spice instances or clusters coordinate a shared request budget. Local open source builds can enable this with `rate-control`.
 - **Function Servers** - Run HTTP-backed user-defined scalar and table functions from `functions:` declarations. The default open source distribution supports inline SQL functions only; local builds can enable HTTP-backed function servers with `http-functions`.
-- **WASM Functions** - Run sandboxed WebAssembly table functions from `functions:` declarations using Arrow IPC batches as the data ABI. Local open source builds can enable precompiled modules with `wasm-functions`; compiling Rust sources to WASM at startup additionally requires `wasm-functions-compile`.
+- **WASM Functions** - Run sandboxed WebAssembly table functions from `functions:` declarations using Arrow IPC batches as the data ABI. Local open source builds can enable them with `wasm-functions`. The runtime only loads prebuilt modules (`params.module`) and never runs a compiler: build a function's module on the developer's machine with `spice build` (or `spice run`, which builds first) from its `build:` block.
 - **OIDC Token Verification** - Validate identity tokens from enterprise providers (Okta, Azure AD, Auth0, Google, etc.) for secure access to Spice runtime endpoints.
 
 ### Linux arm64 Notes
@@ -296,16 +294,13 @@ You can build custom distributions with specific feature combinations:
 
 ```bash
 # Build with specific features
-SPICED_CUSTOM_FEATURES="adbc,postgres,sqlite,models" make build-runtime
+SPICED_CUSTOM_FEATURES="adbc,postgres,models" make build-runtime
 
 # Build with HTTP-backed function servers
 SPICED_NON_DEFAULT_FEATURES="http-functions" make install
 
-# Build with precompiled WASM user functions
+# Build with WASM user functions (prebuilt modules)
 SPICED_NON_DEFAULT_FEATURES="wasm-functions" make install
-
-# Build with Rust source-to-WASM compilation for user functions
-SPICED_NON_DEFAULT_FEATURES="wasm-functions-compile" make install
 
 # Build with acceleration snapshots
 SPICED_NON_DEFAULT_FEATURES="snapshots" make install

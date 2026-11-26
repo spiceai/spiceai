@@ -104,20 +104,22 @@ async fn seeded_table(fixture: &TestFixture) -> TestResult<Arc<CayenneTableProvi
     ]));
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
-            CreateTableOptions {
-                table_name: "t".to_string(),
-                schema: Arc::clone(&schema),
-                primary_key: vec!["id".to_string()],
-                on_conflict: None,
-                base_path: fixture.data_path.to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config: cayenne::metadata::VortexConfig::default(),
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: "t".to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path("t"),
+                    partition_column: None,
+                    vortex_config: cayenne::metadata::VortexConfig::default(),
+                },
+            )
+            .await?,
     );
     let batch = RecordBatch::try_new(
         schema,
@@ -204,7 +206,7 @@ async fn cayenne_table_auto_materializes_and_disabled_stays_inlined_impl(
     Ok(())
 }
 
-test_with_backends!(cayenne_table_auto_materializes_and_disabled_stays_inlined_impl);
+test_on_data_store!(cayenne_table_auto_materializes_and_disabled_stays_inlined_impl);
 
 const Q47_SHAPED_SQL: &str = "WITH v1 AS ( \
              SELECT cat, yr, moy, sum(sales) AS sum_sales, \
@@ -235,20 +237,22 @@ async fn seeded_monthly_table(fixture: &TestFixture) -> TestResult<Arc<CayenneTa
     ]));
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
-            CreateTableOptions {
-                table_name: "t".to_string(),
-                schema: Arc::clone(&schema),
-                primary_key: vec!["cat".to_string(), "yr".to_string(), "moy".to_string()],
-                on_conflict: None,
-                base_path: fixture.data_path.to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config: cayenne::metadata::VortexConfig::default(),
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: "t".to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec!["cat".to_string(), "yr".to_string(), "moy".to_string()],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path("t"),
+                    partition_column: None,
+                    vortex_config: cayenne::metadata::VortexConfig::default(),
+                },
+            )
+            .await?,
     );
     let mut cat = vec!["A".to_string()];
     let mut yr = vec![2000_i64];
@@ -314,4 +318,4 @@ async fn cayenne_lag_lead_year_filter_matches_inlined_impl(fixture: TestFixture)
     Ok(())
 }
 
-test_with_backends!(cayenne_lag_lead_year_filter_matches_inlined_impl);
+test_on_data_store!(cayenne_lag_lead_year_filter_matches_inlined_impl);

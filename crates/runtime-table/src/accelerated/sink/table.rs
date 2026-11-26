@@ -702,7 +702,7 @@ mod tests {
         let changes = narrowing_schema_cast_changes(&input, &target, &[]);
         assert_eq!(changes.dropped, ["c".to_string()]);
         assert_eq!(changes.narrowed, ["a: Int64 -> Int32".to_string()]);
-        assert!(changes.engine_normalized.is_empty());
+        assert_eq!(changes.engine_normalized, [] as [String; 0]);
     }
 
     #[test]
@@ -791,7 +791,7 @@ mod tests {
             without_rules.narrowed,
             [r#"created_at: Timestamp(ns, "UTC") -> Timestamp(µs, "UTC")"#.to_string()]
         );
-        assert!(without_rules.engine_normalized.is_empty());
+        assert_eq!(without_rules.engine_normalized, [] as [String; 0]);
     }
 
     /// The rewrite rules must not swallow a real narrowing that happens to sit beside
@@ -878,7 +878,7 @@ mod tests {
             changes.narrowed,
             ["naive: Timestamp(ns) -> Timestamp(µs)".to_string()]
         );
-        assert!(changes.engine_normalized.is_empty());
+        assert_eq!(changes.engine_normalized, [] as [String; 0]);
     }
 
     /// A Cayenne table created before the engine preserved timestamp units still

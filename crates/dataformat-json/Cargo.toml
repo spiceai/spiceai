@@ -13,15 +13,20 @@ arrow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
+# The compression ratio check and memory accounting every remote read shares.
+http-body-limit = { path = "../http-body-limit" }
 serde_json = { workspace = true, features = ["raw_value"] }
 datafusion.workspace = true
 datafusion-datasource.workspace = true
 datafusion-physical-expr.workspace = true
 object_store.workspace = true
 snafu.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+tokio-util = { workspace = true, features = ["io", "io-util"] }
 tracing.workspace = true
 
 [dev-dependencies]
+flate2 = "1.1"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

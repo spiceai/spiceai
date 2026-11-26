@@ -124,18 +124,18 @@ pub fn policy_recreates_on_incompatible(policy: OnSchemaChange) -> bool {
 /// Engines with a v1 [`data_accelerator_api::DataAccelerator::evolve_table_schema`]
 /// implementation. Partitioned engines are excluded: each partition table would
 /// need the DDL and the partition provider pins its schema. Arrow (memory-only)
-/// and Postgres rely on the trait default and degrade to block-equivalent.
+/// relies on the trait default and degrades to block-equivalent.
 #[must_use]
 pub fn engine_supports_in_place_evolution(engine: Engine) -> bool {
-    matches!(engine, Engine::Sqlite | Engine::Cayenne)
+    matches!(engine, Engine::Cayenne)
 }
 
 /// Engines whose [`data_accelerator_api::DataAccelerator::drop_table`] actually drops the
 /// stored table, so the accelerated table can be dropped and recreated with a new schema (the
 /// `on_schema_change: drop_and_recreate` path). Today this is exactly the in-place-evolution
-/// set: the two engines with a real `drop_table` (SQLite/Cayenne) are the same
-/// two with `evolve_table_schema`; Arrow is memory-only (a full refresh rebuilds it) and
-/// Postgres / partitioned engines have a no-op `drop_table`. Delegate to keep the two in sync;
+/// set: Cayenne, the one engine with a real `drop_table`, is also the one with
+/// `evolve_table_schema`; Arrow is memory-only (a full refresh rebuilds it) and
+/// partitioned engines have a no-op `drop_table`. Delegate to keep the two in sync;
 /// if a future engine gains one capability but not the other, split this back into its own match.
 #[must_use]
 pub fn engine_supports_recreate(engine: Engine) -> bool {
@@ -378,23 +378,19 @@ mod tests {
 
     #[test]
     fn engine_support_matrix() {
-        assert!(engine_supports_in_place_evolution(Engine::Sqlite));
         assert!(engine_supports_in_place_evolution(Engine::Cayenne));
         assert!(!engine_supports_in_place_evolution(Engine::Arrow));
         assert!(!engine_supports_in_place_evolution(
             Engine::PartitionedArrow
         ));
-        assert!(!engine_supports_in_place_evolution(Engine::PostgreSQL));
     }
 
     #[test]
     fn recreate_engine_matrix() {
         // Recreate requires a real `drop_table`: same engine set as in-place evolution.
-        assert!(engine_supports_recreate(Engine::Sqlite));
         assert!(engine_supports_recreate(Engine::Cayenne));
         assert!(!engine_supports_recreate(Engine::Arrow));
         assert!(!engine_supports_recreate(Engine::PartitionedArrow));
-        assert!(!engine_supports_recreate(Engine::PostgreSQL));
     }
 
     #[test]

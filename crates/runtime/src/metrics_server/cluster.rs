@@ -434,7 +434,10 @@ mod tests {
         let mut request = ExportMetricsServiceRequest::default();
         add_node_labels(&mut request, "node-1", ROLE_SCHEDULER);
         // Should not panic with empty request
-        assert!(request.resource_metrics.is_empty());
+        assert_eq!(
+            request.resource_metrics,
+            [] as [opentelemetry_proto::tonic::metrics::v1::ResourceMetrics; 0]
+        );
     }
 
     #[test]

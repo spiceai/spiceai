@@ -176,14 +176,6 @@ endif
 # silently never built it — selection looked complete while three lanes never
 # ran. See `crates/cayenne/tests/correctness/README.md`.
 #
-# Scoped to `cayenne` deliberately. `runtime/sqlite` would also unlock runtime's
-# accelerator-parity binary, but the feature flows through the
-# whole `--all` build: every runtime test binary the gate builds relinks with
-# them, and those link at hundreds of megabytes each. That is a
-# large, permanent cost on every sign-off and merge-queue run to gain two
-# micro-shape comparisons — the thinnest of the five lanes. It belongs in the
-# integration workflow, which already builds with `adbc,sqlite`.
-#
 # The chDB lane is deliberately not here. `chdb-rust` needs libchdb, which its
 # build script fetches over the network, so folding it into the gate would make
 # every sign-off depend on that fetch and on a machine that can link it. CI runs
@@ -241,18 +233,44 @@ print-rust-gate-features:
 # `runtime-datafusion`'s `is_distinct_from_precedence` binary is self-contained
 # (in-memory SessionContext, no credentials) and gates the vendored sqlparser
 # fix that binds `IS [NOT] DISTINCT FROM` tighter than `AND` / `OR`.
+# `data_components`' `avro_decode_allocation` binary measures, with a counting
+# allocator, the heap a CDC Avro body with oversized array and map counts claims.
 # `accelerator-cayenne`'s `integration` binary opens Cayenne accelerations through
 # the accelerator registry on temp dirs: stored data files, partitioning, lookup
 # indexes, snapshot restore and source acknowledgement. It needs no service.
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache|safetensors_hf_cache|gguf_hf_cache)::/)) + (binary_id(=llms-llamacpp::integration) & test(/^load_errors::/)) + binary_id(=llama-cpp::integration) + binary_id(=duckdb-oracle::integration) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use)) + (package(=runtime-datafusion) & binary(=is_distinct_from_precedence)) + binary_id(=accelerator-cayenne::integration)
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache|safetensors_hf_cache|gguf_hf_cache)::/)) + (binary_id(=llms-llamacpp::integration) & test(/^load_errors::/)) + binary_id(=llama-cpp::integration) + binary_id(=duckdb-oracle::integration) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use)) + (package(=runtime-datafusion) & binary(=is_distinct_from_precedence)) + binary_id(=accelerator-cayenne::integration) + (package(=data_components) & binary(=avro_decode_allocation))
+# Tests that run after merge, in `trunk_tests.yml` (`make nextest-post-merge`),
+# and not in the gate that sign-off and the merge queue run. Each is slow, and
+# none has caught a defect in the gate:
+#
+# - The SF1 result-correctness lanes: Cayenne against standalone DuckDB and
+#   SQLite over TPC-H, TPC-DS, ClickBench, CH-benCHmark and SpiceBench. They run
+#   a few at a time (the `result-correctness` group in `.config/nextest.toml`),
+#   so in the merge queue they finished last: from 2026-11-20 to 11-22 they ran a
+#   median 589s after every other test had finished, 62% of the run. In the
+#   merge queue from 2026-09-23 and the failed sign-offs from 2026-10-06, their
+#   only failures were time-limit kills on one runner. The micro, SQLancer and
+#   SSB lanes take seconds and stay in the gate.
+# - `sim_regret_report`, which prints a report of the tuning simulation and
+#   asserts nothing.
+#
+# Only `test(=…)` terms: nextest rejects a `binary_id(=…)` that matches no built
+# binary, which a narrowed run (NEXTEST_FILTER_EXTRA) that does not build
+# `cayenne` would hit. The names are module-qualified and unique in the
+# workspace. They are exact, so a renamed test leaves this filter and runs in the
+# gate again; `nextest-post-merge` fails when the filter selects fewer tests
+# than it names. `nextest-packages`, sign-off's targeted pre-check, leaves them
+# out too: `sim_regret_report` is a `cayenne` unit test, which it would
+# otherwise run whenever a branch touches `cayenne`.
+NEXTEST_POST_MERGE_FILTER := test(=result_correctness_vs_duckdb_test::chbench_sf1_load_mode_matrix_vs_duckdb) | test(=result_correctness_vs_duckdb_test::tpcds_and_clickbench_parity_vs_duckdb) | test(=result_correctness_vs_duckdb_test::spicebench_sf1_tpch_scenario_parity_vs_duckdb) | test(=result_correctness_vs_duckdb_test::tpch_full_result_parity_vs_duckdb) | test(=result_correctness_vs_sqlite_test::tpcds_full_result_parity_vs_sqlite) | test(=result_correctness_vs_sqlite_test::tpch_full_result_parity_vs_sqlite) | test(=result_correctness_vs_sqlite_test::chbench_full_result_parity_vs_sqlite) | test(=provider::tuning_sim::sim_regret_report)
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
 # match everything the first one excluded and widen the run instead.
 ifneq ($(strip $(NEXTEST_FILTER_EXTRA)),)
-_NEXTEST_FILTER := ($(NEXTEST_FILTER)) & ($(NEXTEST_FILTER_EXTRA))
+_NEXTEST_FILTER := (($(NEXTEST_FILTER)) - ($(NEXTEST_POST_MERGE_FILTER))) & ($(NEXTEST_FILTER_EXTRA))
 else
-_NEXTEST_FILTER := $(NEXTEST_FILTER)
+_NEXTEST_FILTER := ($(NEXTEST_FILTER)) - ($(NEXTEST_POST_MERGE_FILTER))
 endif
 # A filterset smuggled in through NEXTEST_FLAG would silently widen the run for
 # the reason above, and a gate that runs more than it was asked to reads as green.
@@ -281,6 +299,27 @@ nextest:
 	@$(_WITH_LIBDUCKDB) \
 	targets="$$($(_NEXTEST_TARGETS_CMD))" || exit $$?; \
 	cargo nextest run $(NEXTEST_SELECTION) $$targets $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E '$(_NEXTEST_FILTER)'
+
+# The tests the gate leaves to after merge (NEXTEST_POST_MERGE_FILTER above), run
+# by `trunk_tests.yml`. Only `cayenne` holds them, so this builds that package
+# alone, with the gate's DuckDB result-correctness feature. It lists the
+# selection first and fails unless every test the filter names is in it, so a
+# renamed test cannot quietly drop out of both runs.
+# The listing is JSON because CI's cargo-nextest (.github/actions/setup-nextest)
+# predates `--message-format oneline`; this counts the tests the filter matched.
+_COUNT_LISTED_MATCHES = import json, sys; d = json.load(sys.stdin); print(sum(t['filter-match']['status'] == 'matches' for s in d['rust-suites'].values() for t in s['testcases'].values()))
+_POST_MERGE_SELECTION = -p cayenne --features cayenne/result-correctness-duckdb --lib --test integration $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
+.PHONY: nextest-post-merge
+nextest-post-merge:
+	@$(_WITH_LIBDUCKDB) \
+	named=$$(printf '%s' '$(NEXTEST_POST_MERGE_FILTER)' | grep -o 'test(=' | wc -l | tr -d ' '); \
+	listed=$$(cargo nextest list $(_POST_MERGE_SELECTION) --message-format json -E '$(NEXTEST_POST_MERGE_FILTER)') || exit $$?; \
+	count=$$(printf '%s' "$$listed" | $(PYTHON) -c "$(_COUNT_LISTED_MATCHES)") || exit $$?; \
+	if [ "$$count" != "$$named" ]; then \
+	  echo "nextest-post-merge: NEXTEST_POST_MERGE_FILTER names $$named tests but selects $$count, so a named test was renamed or removed. Update the filter in the Makefile." >&2; \
+	  exit 1; \
+	fi; \
+	cargo nextest run $(_POST_MERGE_SELECTION) -E '$(NEXTEST_POST_MERGE_FILTER)'
 
 # Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
 # the crates a branch touched, before the full workspace gate. Same lib-only
@@ -317,7 +356,7 @@ verify-cli:
 nextest-packages:
 	@test -n "$(strip $(PACKAGES))" || { echo 'nextest-packages requires PACKAGES="crate1 crate2"' >&2; exit 1; }
 	@$(_WITH_LIBDUCKDB) \
-	cargo nextest run --no-tests=pass $(_LINT_PKG_FLAGS) --lib $(_FEATURES_FLAGS) $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
+	cargo nextest run --no-tests=pass $(_LINT_PKG_FLAGS) --lib $(_FEATURES_FLAGS) $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E 'not ($(NEXTEST_POST_MERGE_FILTER))'
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
@@ -325,11 +364,11 @@ test-integration:
 	# Test if .env file exists, and login to Spice if not
 	@test -f .env || (`spice login`)
 	# The `adbc::` tests need the SQLite ADBC driver; run them with `dbc install sqlite` and `-E 'test(/^adbc::/)'`, as integration_adbc.yml does.
-	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc,sqlite --no-capture -E 'not test(/^adbc::/)'
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc --no-capture -E 'not test(/^adbc::/)'
 
 .PHONY: test-integration-without-spiceai-dataset
 test-integration-without-spiceai-dataset:
-	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc,sqlite --no-capture -E 'not test(spiceai_integration_test) and not test(/^adbc::/)'
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc --no-capture -E 'not test(spiceai_integration_test) and not test(/^adbc::/)'
 
 .PHONY: test-integration-models
 test-integration-models:
@@ -358,7 +397,9 @@ FEATURES ?=
 ifneq ($(strip $(PACKAGES)),)
 _LINT_PKG_FLAGS := $(foreach p,$(PACKAGES),-p $(p))
 _LINT_WORKSPACE_FLAGS := $(_LINT_PKG_FLAGS)
-_FMT_FLAGS := $(_LINT_PKG_FLAGS)
+# `cargo fmt -p` takes a bare member name, not the `name@version` spec that
+# scripts/signoff passes when a dependency shares a member's name.
+_FMT_FLAGS := $(foreach p,$(PACKAGES),-p $(firstword $(subst @, ,$(p))))
 # Scoped runs pass --lib only when a selected package has a library: it is a
 # fatal `no library targets found` when every selected package is bin-only
 # (e.g. testoperator alone), which would break the targeted pre-lint that
@@ -366,7 +407,7 @@ _FMT_FLAGS := $(_LINT_PKG_FLAGS)
 # runs only for the lint recipes, not for every target that reads PACKAGES. If
 # the metadata cannot be read, --lib is left out: --tests still lints each
 # library through its unit-test build, and the full workspace lint follows.
-_LINT_LIB_FLAG = $(shell cargo metadata --no-deps --format-version 1 2>/dev/null | $(PYTHON) -c 'import json, sys; wanted = set(sys.argv[1:]); packages = json.load(sys.stdin)["packages"]; lib_kinds = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}; print("--lib" if any(p["name"] in wanted and lib_kinds & set(t["kind"]) for p in packages for t in p["targets"]) else "")' $(PACKAGES) 2>/dev/null)
+_LINT_LIB_FLAG = $(shell cargo metadata --no-deps --format-version 1 2>/dev/null | $(PYTHON) -c 'import json, sys; wanted = {spec.split("@")[0] for spec in sys.argv[1:]}; packages = json.load(sys.stdin)["packages"]; lib_kinds = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}; print("--lib" if any(p["name"] in wanted and lib_kinds & set(t["kind"]) for p in packages for t in p["targets"]) else "")' $(PACKAGES) 2>/dev/null)
 _LINT_TARGET_FLAGS = $(_LINT_LIB_FLAG) --bins --tests
 else
 _LINT_WORKSPACE_FLAGS := --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract
@@ -465,13 +506,11 @@ check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features
 	cargo check $(CARGO_PROFILE) --no-default-features --features adbc
 	cargo check $(CARGO_PROFILE) --no-default-features --features postgres
-	cargo check $(CARGO_PROFILE) --no-default-features --features sqlite
 	cargo check $(CARGO_PROFILE) --no-default-features --features mysql
 	cargo check $(CARGO_PROFILE) --no-default-features --features keyring-secret-store
 	cargo check $(CARGO_PROFILE) --no-default-features --features flightsql
 	cargo check $(CARGO_PROFILE) --no-default-features --features http-functions
 	cargo check $(CARGO_PROFILE) --no-default-features --features wasm-functions
-	cargo check $(CARGO_PROFILE) --no-default-features --features wasm-functions-compile
 	cargo check $(CARGO_PROFILE) --no-default-features --features aws-secrets-manager
 	cargo check $(CARGO_PROFILE) --no-default-features --features databricks
 	cargo check $(CARGO_PROFILE) --no-default-features --features delta_lake
@@ -539,9 +578,7 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # accelerator and acceleration snapshots, which `default` does not. Recompute the difference
 # before relying on it rather than trusting a comment, from this list and the
 # `default = [...]` array in bin/spiced/Cargo.toml.
-#
-# Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
-SPICED_DATA_FEATURES := adbc,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb
+SPICED_DATA_FEATURES := adbc,postgres,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb
 
 .PHONY: install
 install: build

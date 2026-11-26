@@ -45,10 +45,6 @@ snowflake = [
   "dep:pkcs8",
   "dep:serde_json",
 ]
-sqlite = [
-  "datafusion-table-providers/sqlite",
-  "datafusion-table-providers/sqlite-federation",
-]
 
 [lints]
 workspace = true

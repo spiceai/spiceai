@@ -1197,7 +1197,7 @@ fn test_many_entries_same_h2() {
 fn test_batch_lookup_empty() {
     let index = HashIndex::new(vec!["id".to_string()]);
     let results = index.get_batch(&[]);
-    assert!(results.is_empty());
+    assert_eq!(results, [] as [Option<RowLocation>; 0]);
 }
 
 #[test]

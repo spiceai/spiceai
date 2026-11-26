@@ -49,6 +49,7 @@ use util::{RetryError, retry};
 
 use url::Url;
 
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchReceiverStream};
 use futures::future::try_join_all;
@@ -108,6 +109,17 @@ pub(crate) type UnnestHandler = Box<dyn Fn(&Value) -> Result<Vec<Value>> + Send 
 /// (prior pages already counted) from a truncated first page that claimed
 /// `hasNextPage: false`. GitHub never sends this key.
 pub const NESTED_DELIVERED_BEFORE_KEY: &str = "__spice_delivered_before";
+
+/// The error a scan reports for a failed page: a response refused as a compression bomb
+/// keeps its type, so callers classify it as a refusal of the data (see
+/// `data_components::refusal`); any other failure keeps its message.
+fn scan_error(error: Error) -> DataFusionError {
+    if data_components::refusal::is_compression_refusal(&error) {
+        DataFusionError::External(Box::new(error))
+    } else {
+        DataFusionError::Execution(error.to_string())
+    }
+}
 
 pub enum UnnestBehavior {
     Depth(usize),
@@ -815,6 +827,12 @@ fn unnest_json_objects(
 
 pub struct GraphQLClient {
     client: reqwest::Client,
+    /// The query memory pool every response body is charged to while it is held.
+    memory_pool: Arc<dyn MemoryPool>,
+    /// The dataset this client reads for, which a refused response names.
+    dataset: Option<Arc<str>>,
+    /// The connector whose documentation page a refused response links.
+    connector: &'static str,
     endpoint: Url,
     pub(crate) json_pointer: Option<Arc<str>>,
     unnest_parameters: UnnestParameters,
@@ -965,6 +983,7 @@ impl GraphQLClient {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         client: reqwest::Client,
+        memory_pool: Arc<dyn MemoryPool>,
         endpoint: Url,
         json_pointer: Option<&str>,
         token: Option<Arc<dyn TokenProvider>>,
@@ -1026,6 +1045,9 @@ impl GraphQLClient {
 
         Ok(Self {
             client,
+            memory_pool,
+            dataset: None,
+            connector: "graphql",
             endpoint,
             json_pointer,
             unnest_parameters,
@@ -1036,6 +1058,34 @@ impl GraphQLClient {
             semaphore,
             nested_pager: None,
         })
+    }
+
+    /// The error for a response body that could not be read: a failed read is reported as
+    /// before, and a refused or undecodable body names the endpoint's origin.
+    fn response_body_error(&self, source: http_body_limit::Error) -> Error {
+        match source {
+            http_body_limit::Error::Read { source } => Error::ReqwestInternal { source },
+            source => Error::ResponseBody {
+                endpoint: self.endpoint.origin().ascii_serialization(),
+                dataset: self.dataset.as_deref().map_or_else(
+                    || "this dataset".to_string(),
+                    |name| format!("dataset '{name}'"),
+                ),
+                connector: self.connector,
+                source,
+            },
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn with_source(
+        mut self,
+        dataset: Option<Arc<str>>,
+        connector: &'static str,
+    ) -> Self {
+        self.dataset = dataset;
+        self.connector = connector;
+        self
     }
 
     #[must_use]
@@ -1288,10 +1338,34 @@ impl GraphQLClient {
             self.record_adaptive_outcome(RequestOutcome::Success);
         }
 
-        // Read the raw body first so we can classify it before JSON decoding.
-        let response_bytes = response.bytes().await.context(ReqwestInternalSnafu)?;
+        // Read the raw body first so we can classify it before JSON decoding. The client
+        // decodes compressed bodies itself, so one that expands past what real data
+        // compresses to is refused as a compression bomb as it decodes; and the body is
+        // charged, as decompressed, to the query memory pool as it is read and while it is
+        // held below, so a response the pool cannot hold is refused instead of exhausting
+        // the process.
+        let reservation = MemoryConsumer::new(format!(
+            "GraphQL response from {}",
+            self.endpoint.origin().ascii_serialization()
+        ))
+        .register(&self.memory_pool);
+        let decoded_here = http_body_limit::Encoding::of(&response_headers).is_some();
+        let response_bytes =
+            http_body_limit::read_bytes(response, http_body_limit::Limit::Reserve(&reservation))
+                .await
+                .map_err(|source| self.response_body_error(source))?;
         let http_elapsed = http_started.elapsed();
-        let response_text = String::from_utf8_lossy(&response_bytes).into_owned();
+        // The text is a second copy of the body, and longer than it where a byte is not
+        // valid UTF-8, so it is charged at its exact length before it is made.
+        let response_text = http_body_limit::utf8_lossy(&response_bytes, &reservation)
+            .map_err(|source| self.response_body_error(source))?;
+        // A body decoded here, as one `reqwest` decoded transparently would, carries no
+        // length or encoding the classification below should compare it against.
+        let (content_length, content_encoding) = if decoded_here {
+            (None, None)
+        } else {
+            (content_length, content_encoding)
+        };
 
         let header = |name: &str| response_headers.get(name).and_then(|v| v.to_str().ok());
         tracing::debug!(
@@ -1780,7 +1854,7 @@ impl GraphQLClient {
                 query_cost,
             )
             .await
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            .map_err(scan_error)?;
 
             let first_page_rows: usize = result.records.iter().map(RecordBatch::num_rows).sum();
             total_rows += first_page_rows;
@@ -1864,7 +1938,7 @@ impl GraphQLClient {
                     query_cost,
                 )
                 .await
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                .map_err(scan_error)?;
 
                 let page_rows: usize = result.records.iter().map(RecordBatch::num_rows).sum();
                 total_rows += page_rows;
@@ -2220,6 +2294,91 @@ fn handle_http_error(
     Ok(())
 }
 
+/// Whether a GraphQL `errors` entry says the query itself is wrong, as opposed
+/// to the server failing to run it.
+///
+/// A validation-style `extensions.code` always means the query is wrong. An
+/// error with a source location points into the query, so it is too, unless
+/// the code names a transient server failure. Anything else (a bare message,
+/// an execution-time failure) is treated as transient.
+fn is_query_error(has_location: bool, code: Option<&str>) -> bool {
+    const QUERY_CODES: &[&str] = &[
+        "GRAPHQL_VALIDATION_FAILED",
+        "GRAPHQL_PARSE_FAILED",
+        "BAD_USER_INPUT",
+        "BAD_REQUEST",
+        "PERSISTED_QUERY_NOT_FOUND",
+        "PERSISTED_QUERY_NOT_SUPPORTED",
+    ];
+    const TRANSIENT_CODES: &[&str] = &[
+        "INTERNAL_SERVER_ERROR",
+        "SERVICE_UNAVAILABLE",
+        "TIMEOUT",
+        "GATEWAY_TIMEOUT",
+        "UPSTREAM_ERROR",
+    ];
+    match code {
+        Some(code) if QUERY_CODES.iter().any(|c| c.eq_ignore_ascii_case(code)) => true,
+        Some(code) if TRANSIENT_CODES.iter().any(|c| c.eq_ignore_ascii_case(code)) => false,
+        _ => has_location,
+    }
+}
+
+/// An explicit credential or permission refusal named by the API.
+fn is_refusal_code(code: Option<&str>) -> bool {
+    code.is_some_and(|c| {
+        ["UNAUTHENTICATED", "FORBIDDEN", "UNAUTHORIZED"]
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(c))
+    })
+}
+
+/// The identifier that classified the entry as a refusal, for the operator
+/// message. Prefer `extensions.code` when it is a refusal; otherwise `type`.
+fn refusal_label<'a>(error_code: Option<&'a str>, error_type: Option<&'a str>) -> Option<&'a str> {
+    if is_refusal_code(error_code) {
+        error_code
+    } else if is_refusal_code(error_type) {
+        error_type
+    } else {
+        None
+    }
+}
+
+fn error_code_and_type(entry: &Value) -> (Option<&str>, Option<&str>) {
+    let code = entry
+        .get("extensions")
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_str());
+    let error_type = entry.get("type").and_then(|t| t.as_str());
+    (code, error_type)
+}
+
+/// A failure the API named: a validation-style `extensions.code`, a refusal
+/// named by `code` or `type`, or a `NOT_FOUND` type. Locations alone do not
+/// count — GitHub's ambiguous internal-error message can carry a location and
+/// still be a timeout.
+fn is_named_permanent_entry(entry: &Value) -> bool {
+    let (code, error_type) = error_code_and_type(entry);
+    is_query_error(false, code)
+        || is_refusal_code(code)
+        || is_refusal_code(error_type)
+        || error_type.is_some_and(|t| t.eq_ignore_ascii_case("not_found"))
+}
+
+/// Whether a GraphQL `errors` entry is a failure no retry clears, as
+/// `handle_graphql_query_error` classifies it: a problem with the query, an
+/// explicit credential refusal named by `extensions.code` or by the top-level
+/// `type`, or a `NOT_FOUND` type.
+fn is_permanent_entry(entry: &Value) -> bool {
+    let has_location = entry
+        .get("locations")
+        .and_then(|l| l.as_array())
+        .is_some_and(|l| !l.is_empty());
+    let (code, _) = error_code_and_type(entry);
+    is_named_permanent_entry(entry) || is_query_error(has_location, code)
+}
+
 fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
     // Check if there are any errors in the response
     if let Some(errors) = response.get("errors") {
@@ -2234,19 +2393,23 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
             // defect where missing Projects v2 access gives an internal error
             // instead of an authorization error. The timeout is the common case,
             // so the error is not an explicit deny: the caller retries it with a
-            // smaller page. Check for this before processing other GraphQL errors.
-            for error in errors_array {
-                if let Some(message) = error.get("message").and_then(|m| m.as_str())
-                    && message.contains("Something went wrong while executing your query")
-                {
-                    tracing::debug!(
-                        "Detected GitHub 'Something went wrong' error, treating it as a transient backend failure: {}",
-                        message
-                    );
-                    return Err(Error::InvalidCredentialsOrPermissions {
-                        message: "GitHub returned an internal error. The query is usually too expensive for the GitHub backend to complete in time; the request will be retried with a smaller page. If the error persists, verify the GitHub App has permission to access the requested resource.".to_string(),
-                        kind: RefusalKind::Inferred,
-                    });
+            // smaller page. A named permanent diagnostic on the same body still
+            // wins — the message must not hide a FORBIDDEN, NOT_FOUND, or
+            // validation code, even when it appears on an earlier entry.
+            if !errors_array.iter().any(is_named_permanent_entry) {
+                for error in errors_array {
+                    if let Some(message) = error.get("message").and_then(|m| m.as_str())
+                        && message.contains("Something went wrong while executing your query")
+                    {
+                        tracing::debug!(
+                            "Detected GitHub 'Something went wrong' error, treating it as a transient backend failure: {}",
+                            message
+                        );
+                        return Err(Error::InvalidCredentialsOrPermissions {
+                            message: "GitHub returned an internal error. The query is usually too expensive for the GitHub backend to complete in time; the request will be retried with a smaller page. If the error persists, verify the GitHub App has permission to access the requested resource.".to_string(),
+                            kind: RefusalKind::Inferred,
+                        });
+                    }
                 }
             }
         } else if errors.is_null() {
@@ -2257,10 +2420,20 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
     }
 
     // Safely access the first error with bounds checking
+    // Prefer a named permanent diagnostic (refusal, validation code, NOT_FOUND)
+    // over a location-only query error, and either over an earlier bare
+    // message, so one transient-looking entry cannot hide a failure no retry
+    // clears. GitHub's internal-error message can carry a location and still
+    // be a timeout.
     let graphql_error = response
         .get("errors")
         .and_then(|e| e.as_array())
-        .and_then(|arr| arr.first())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|entry| is_named_permanent_entry(entry))
+                .or_else(|| arr.iter().find(|entry| is_permanent_entry(entry)))
+                .or_else(|| arr.first())
+        })
         .unwrap_or(&Value::Null);
 
     if !graphql_error.is_null() {
@@ -2296,6 +2469,20 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
             .unwrap_or_default()
             .to_string();
 
+        let error_code = graphql_error
+            .get("extensions")
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_str());
+
+        if let Some(label) = refusal_label(error_code, error_type) {
+            return Err(Error::InvalidCredentialsOrPermissions {
+                message: format!(
+                    "The API refused the request ({label}). Verify the credentials have the necessary permissions. {message}"
+                ),
+                kind: RefusalKind::Explicit,
+            });
+        }
+
         if let Some(error_type) = error_type {
             if error_type.to_lowercase() == "forbidden" {
                 return Err(Error::InvalidCredentialsOrPermissions {
@@ -2312,6 +2499,11 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
                     ),
                 });
             }
+        }
+
+        if !is_query_error(location.is_some(), error_code) {
+            tracing::debug!("GraphQL error without a query location: {message}");
+            return Err(Error::ServerReportedError { message });
         }
 
         return if let Some((line, column)) = location {
@@ -2537,6 +2729,104 @@ mod tests {
         }
     }
 
+    /// A byte that is not valid UTF-8 becomes U+FFFD, three bytes of text. The body and
+    /// its text are held together while the response is parsed, so a response needs
+    /// room in the query memory pool for both.
+    mod response_text_memory {
+        use std::sync::Arc;
+
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        use url::Url;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use crate::graphql::builder::GraphQLClientBuilder;
+        use crate::graphql::client::{GraphQLQuery, UnnestBehavior};
+
+        const INVALID: usize = 1024 * 1024;
+
+        async fn fetch(server: &MockServer, limit: usize) -> (Result<String, String>, usize) {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+            let client = GraphQLClientBuilder::new(
+                Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
+                UnnestBehavior::Depth(0),
+            )
+            .with_json_pointer(Some("/data/items"))
+            .with_schema(Some(Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Utf8,
+                true,
+            )]))))
+            .build(reqwest::Client::builder(), Arc::clone(&pool))
+            .expect("client to build");
+            let query = GraphQLQuery::try_from(Arc::<str>::from("query { items { id } }"))
+                .expect("query to parse")
+                .with_json_pointer(Arc::from("/data/items"));
+            let result = client
+                .execute(&query, None, None, None, None, None)
+                .await
+                .map_err(|error| error.to_string())
+                .map(|result| {
+                    let batch = result.records.first().expect("one batch");
+                    batch
+                        .column_by_name("id")
+                        .expect("the id column")
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("a string column")
+                        .value(0)
+                        .to_string()
+                });
+            (result, pool.reserved())
+        }
+
+        #[tokio::test]
+        async fn a_body_whose_text_outgrows_it_is_held_to_the_pool() {
+            let mut body = br#"{"data":{"items":[{"id":""#.to_vec();
+            body.extend(std::iter::repeat_n(0xff_u8, INVALID));
+            body.extend_from_slice(br#""}]}}"#);
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/json")
+                        .set_body_bytes(body.clone()),
+                )
+                .mount(&server)
+                .await;
+            // The text is the body with each invalid byte three bytes long.
+            let text = body.len() + 2 * INVALID;
+
+            for limit in [3 * INVALID, body.len() + text - 1] {
+                match fetch(&server, limit).await {
+                    (Ok(id), _) => panic!(
+                        "a {}-byte body whose text is {text} bytes was parsed under a \
+                         {limit}-byte limit (its id alone is {} bytes)",
+                        body.len(),
+                        id.len()
+                    ),
+                    (Err(message), reserved) => {
+                        assert!(
+                            message.contains(
+                                "holding the decoded data would pass the query memory limit"
+                            ),
+                            "{message}"
+                        );
+                        assert_eq!(reserved, 0, "a refused response holds nothing");
+                    }
+                }
+            }
+
+            let (id, _) = fetch(&server, body.len() + text).await;
+            assert_eq!(
+                id.expect("a pool with room for the body and its text parses it"),
+                "\u{FFFD}".repeat(INVALID)
+            );
+        }
+    }
+
     /// The nested-pagination path end to end over a mock server: an outer page
     /// whose child connection is truncated, the `node(id:)` follow-ups, and the
     /// terminal page. The live full-history tests are `#[ignore]`, so without
@@ -2629,7 +2919,12 @@ mod tests {
                 node_selection: "id",
                 page_size: 2,
             }))
-            .build(reqwest::Client::new())
+            .build(
+                reqwest::Client::builder(),
+                std::sync::Arc::new(
+                    datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                ),
+            )
             .expect("client to build");
 
             // The provider normally stamps the client's pointer onto the query;
@@ -2757,7 +3052,12 @@ mod tests {
                 node_selection: "id",
                 page_size: 2,
             }))
-            .build(reqwest::Client::new())
+            .build(
+                reqwest::Client::builder(),
+                std::sync::Arc::new(
+                    datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                ),
+            )
             .expect("client to build");
 
             let query = GraphQLQuery::try_from(Arc::<str>::from(OUTER_QUERY))
@@ -2863,7 +3163,12 @@ mod tests {
                 node_selection: "id",
                 page_size: 2,
             }))
-            .build(reqwest::Client::new())
+            .build(
+                reqwest::Client::builder(),
+                std::sync::Arc::new(
+                    datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                ),
+            )
             .expect("client to build");
 
             let query = GraphQLQuery::try_from(Arc::<str>::from(OUTER_QUERY))
@@ -2973,7 +3278,12 @@ mod tests {
                 node_selection: "id",
                 page_size: 2,
             }))
-            .build(reqwest::Client::new())
+            .build(
+                reqwest::Client::builder(),
+                std::sync::Arc::new(
+                    datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                ),
+            )
             .expect("client to build");
 
             let query = GraphQLQuery::try_from(Arc::<str>::from(OUTER_QUERY))
@@ -3067,7 +3377,12 @@ mod tests {
                 node_selection: "id",
                 page_size: 2,
             }))
-            .build(reqwest::Client::new())
+            .build(
+                reqwest::Client::builder(),
+                std::sync::Arc::new(
+                    datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                ),
+            )
             .expect("client to build");
 
             let query = GraphQLQuery::try_from(Arc::<str>::from(OUTER_QUERY))
@@ -3136,7 +3451,12 @@ mod tests {
             )
             .with_json_pointer(Some("/data/view/nodes"))
             .with_schema(schema)
-            .build(reqwest::Client::new())
+            .build(
+                reqwest::Client::builder(),
+                std::sync::Arc::new(
+                    datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                ),
+            )
             .expect("client to build")
         }
 
@@ -3197,7 +3517,7 @@ mod tests {
                 &json!({"data": {"view": {"nodes": null}}}),
             );
 
-            assert!(result.records.is_empty());
+            assert_eq!(result.records, [] as [RecordBatch; 0]);
             assert_eq!(result.schema, schema);
         }
 
@@ -4028,6 +4348,7 @@ mod tests {
 
         let client = super::GraphQLClient::new(
             reqwest::Client::new(),
+            std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
             Url::parse("https://example.com/graphql").expect("valid url"),
             Some("/data"),
             Some(token),
@@ -4061,6 +4382,7 @@ mod tests {
 
         let client = super::GraphQLClient::new(
             reqwest::Client::new(),
+            std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
             Url::parse("https://example.com/graphql").expect("valid url"),
             None,
             Some(token),
@@ -4085,6 +4407,7 @@ mod tests {
     fn test_auth_basic_when_no_token() {
         let client = super::GraphQLClient::new(
             reqwest::Client::new(),
+            std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
             Url::parse("https://example.com/graphql").expect("valid url"),
             None,
             None,
@@ -4111,6 +4434,7 @@ mod tests {
 
         let client = super::GraphQLClient::new(
             reqwest::Client::new(),
+            std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
             Url::parse("https://example.com/graphql").expect("valid url"),
             None,
             None,
@@ -4137,6 +4461,7 @@ mod tests {
 
         let client = super::GraphQLClient::new(
             reqwest::Client::new(),
+            std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
             Url::parse("https://example.com/graphql").expect("valid url"),
             None,
             None,
@@ -4161,6 +4486,7 @@ mod tests {
     fn test_auth_none_when_nothing_set() {
         let client = super::GraphQLClient::new(
             reqwest::Client::new(),
+            std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
             Url::parse("https://example.com/graphql").expect("valid url"),
             None,
             None,
@@ -4433,7 +4759,12 @@ mod tests {
                 DataType::Utf8,
                 true,
             )]))))
-            .build(reqwest::Client::new())
+            .build(
+                reqwest::Client::builder(),
+                std::sync::Arc::new(
+                    datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                ),
+            )
             .expect("client to build");
 
             let provider = GraphQLTableProviderBuilder::new(client)
@@ -4560,7 +4891,12 @@ mod tests {
                 DataType::Utf8,
                 true,
             )]))))
-            .build(reqwest::Client::new())
+            .build(
+                reqwest::Client::builder(),
+                std::sync::Arc::new(
+                    datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                ),
+            )
             .expect("client to build")
         }
 
@@ -4924,7 +5260,7 @@ mod tests {
             fn respond(&self, _request: &Request) -> ResponseTemplate {
                 if self
                     .remaining_failures
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                         left.checked_sub(1)
                     })
                     .is_ok()
@@ -4934,5 +5270,271 @@ mod tests {
                 self.success.clone()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod graphql_errors_classification_tests {
+    use super::{handle_graphql_query_error, is_query_error};
+    use crate::graphql::{Error, is_retriable_error};
+    use serde_json::json;
+
+    fn classify(body: &serde_json::Value) -> Error {
+        handle_graphql_query_error(body, "{ items { id } }").expect_err("errors[] must fail")
+    }
+
+    #[test]
+    fn errors_without_location_are_retriable() {
+        let err = classify(&json!({
+            "data": null,
+            "errors": [{"message": "upstream timeout, please retry"}]
+        }));
+        assert!(matches!(err, Error::ServerReportedError { .. }), "{err:?}");
+        assert!(is_retriable_error(&err));
+        assert!(err.to_string().contains("upstream timeout, please retry"));
+    }
+
+    #[test]
+    fn transient_code_with_location_is_retriable() {
+        let err = classify(&json!({
+            "errors": [{
+                "message": "backend unavailable",
+                "locations": [{"line": 1, "column": 3}],
+                "extensions": {"code": "SERVICE_UNAVAILABLE"}
+            }]
+        }));
+        assert!(is_retriable_error(&err), "{err:?}");
+    }
+
+    #[test]
+    fn errors_with_location_fail_clearly() {
+        let err = classify(&json!({
+            "errors": [{
+                "message": "Cannot query field \"bogus\" on type \"Query\".",
+                "locations": [{"line": 1, "column": 3}]
+            }]
+        }));
+        assert!(matches!(err, Error::InvalidGraphQLQuery { .. }), "{err:?}");
+        assert!(!is_retriable_error(&err));
+        assert!(err.to_string().contains("Cannot query field"));
+    }
+
+    #[test]
+    fn validation_codes_fail_clearly_even_without_location() {
+        for code in [
+            "GRAPHQL_VALIDATION_FAILED",
+            "GRAPHQL_PARSE_FAILED",
+            "BAD_USER_INPUT",
+        ] {
+            let err = classify(&json!({
+                "errors": [{"message": "bad query", "extensions": {"code": code}}]
+            }));
+            assert!(
+                matches!(err, Error::InvalidGraphQLQuery { .. }),
+                "{code}: {err:?}"
+            );
+            assert!(!is_retriable_error(&err));
+        }
+    }
+
+    #[test]
+    fn refusal_codes_are_permanent_without_location() {
+        for code in ["UNAUTHENTICATED", "FORBIDDEN"] {
+            let err = classify(&json!({
+                "errors": [{"message": "nope", "extensions": {"code": code}}]
+            }));
+            assert!(
+                matches!(err, Error::InvalidCredentialsOrPermissions { .. }),
+                "{code}: {err:?}"
+            );
+            assert!(!is_retriable_error(&err));
+        }
+    }
+
+    #[test]
+    fn later_validation_error_is_not_hidden_by_a_bare_first_entry() {
+        let err = classify(&json!({
+            "errors": [
+                {"message": "upstream timeout"},
+                {"message": "bad field", "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}}
+            ]
+        }));
+        assert!(matches!(err, Error::InvalidGraphQLQuery { .. }), "{err:?}");
+        assert!(err.to_string().contains("bad field"));
+    }
+
+    #[test]
+    fn later_type_refusal_is_not_hidden_by_a_bare_first_entry() {
+        let err = classify(&json!({
+            "errors": [
+                {"message": "upstream timeout"},
+                {"message": "access denied", "type": "FORBIDDEN"}
+            ]
+        }));
+        assert!(
+            matches!(err, Error::InvalidCredentialsOrPermissions { .. }),
+            "{err:?}"
+        );
+        assert!(!is_retriable_error(&err));
+        assert!(err.to_string().contains("access denied"));
+    }
+
+    #[test]
+    fn later_not_found_type_is_not_hidden_by_a_bare_first_entry() {
+        let err = classify(&json!({
+            "errors": [
+                {"message": "upstream timeout"},
+                {"message": "no such repository", "type": "NOT_FOUND"}
+            ]
+        }));
+        assert!(matches!(err, Error::ResourceNotFound { .. }), "{err:?}");
+        assert!(!is_retriable_error(&err));
+        assert!(err.to_string().contains("no such repository"));
+    }
+
+    #[test]
+    fn classification_table() {
+        assert!(!is_query_error(false, None));
+        assert!(is_query_error(true, None));
+        assert!(!is_query_error(true, Some("INTERNAL_SERVER_ERROR")));
+        assert!(is_query_error(false, Some("graphql_validation_failed")));
+    }
+
+    /// An ambiguous GitHub backend message is retriable even when it carries a
+    /// source location, because the same wording is used for a timeout.
+    #[test]
+    fn github_internal_error_message_with_locations_stays_retriable() {
+        let err = classify(&json!({
+            "errors": [{
+                "message": "Something went wrong while executing your query.",
+                "locations": [{"line": 1, "column": 1}]
+            }]
+        }));
+        assert!(
+            matches!(
+                err,
+                Error::InvalidCredentialsOrPermissions {
+                    kind: crate::graphql::RefusalKind::Inferred,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(is_retriable_error(&err), "{err:?}");
+    }
+
+    /// A later named refusal is not hidden by GitHub's ambiguous internal-error
+    /// message, including when that message carries a source location.
+    #[test]
+    fn github_internal_error_message_with_locations_does_not_hide_a_later_type_refusal() {
+        let err = classify(&json!({
+            "errors": [
+                {
+                    "message": "Something went wrong while executing your query.",
+                    "locations": [{"line": 1, "column": 1}]
+                },
+                {"message": "access denied", "type": "FORBIDDEN"}
+            ]
+        }));
+        assert!(
+            matches!(
+                err,
+                Error::InvalidCredentialsOrPermissions {
+                    kind: crate::graphql::RefusalKind::Explicit,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(!is_retriable_error(&err), "{err:?}");
+        assert!(err.to_string().contains("access denied"), "{err}");
+    }
+
+    /// A later named refusal is not hidden by GitHub's ambiguous internal-error
+    /// message.
+    #[test]
+    fn github_internal_error_message_does_not_hide_a_later_type_refusal() {
+        let err = classify(&json!({
+            "errors": [
+                {"message": "Something went wrong while executing your query."},
+                {"message": "access denied", "type": "FORBIDDEN"}
+            ]
+        }));
+        assert!(
+            matches!(
+                err,
+                Error::InvalidCredentialsOrPermissions {
+                    kind: crate::graphql::RefusalKind::Explicit,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(!is_retriable_error(&err), "{err:?}");
+        assert!(err.to_string().contains("access denied"), "{err}");
+    }
+
+    /// A later validation code is not hidden by the same GitHub message.
+    #[test]
+    fn github_internal_error_message_does_not_hide_a_later_validation_code() {
+        let err = classify(&json!({
+            "errors": [
+                {"message": "Something went wrong while executing your query."},
+                {"message": "bad field", "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}}
+            ]
+        }));
+        assert!(matches!(err, Error::InvalidGraphQLQuery { .. }), "{err:?}");
+        assert!(!is_retriable_error(&err), "{err:?}");
+        assert!(err.to_string().contains("bad field"), "{err}");
+    }
+
+    /// A refusal code on the same entry as the GitHub message is still an
+    /// explicit refusal, not an inferred timeout.
+    #[test]
+    fn github_internal_error_message_with_a_refusal_code_on_the_same_entry_is_permanent() {
+        let err = classify(&json!({
+            "errors": [{
+                "message": "Something went wrong while executing your query.",
+                "extensions": {"code": "FORBIDDEN"}
+            }]
+        }));
+        assert!(
+            matches!(
+                err,
+                Error::InvalidCredentialsOrPermissions {
+                    kind: crate::graphql::RefusalKind::Explicit,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(!is_retriable_error(&err), "{err:?}");
+    }
+
+    /// A refusal named by `type` is the label the operator sees, even when
+    /// `extensions.code` names a transient failure on the same entry.
+    #[test]
+    fn refusal_message_uses_the_type_when_the_code_is_not_a_refusal() {
+        let err = classify(&json!({
+            "errors": [{
+                "message": "access denied",
+                "type": "FORBIDDEN",
+                "extensions": {"code": "INTERNAL_SERVER_ERROR"}
+            }]
+        }));
+        assert!(
+            matches!(
+                err,
+                Error::InvalidCredentialsOrPermissions {
+                    kind: crate::graphql::RefusalKind::Explicit,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(!is_retriable_error(&err), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("FORBIDDEN"), "{text}");
+        assert!(!text.contains("INTERNAL_SERVER_ERROR"), "{text}");
     }
 }
