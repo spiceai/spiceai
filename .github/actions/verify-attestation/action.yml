@@ -38,9 +38,15 @@ inputs:
 runs:
   using: composite
   steps:
+    # The check runs the gh this action installs, from its pin, never a gh the runner already has.
+    - name: Install the GitHub CLI
+      id: gh
+      uses: $/.github/actions/install-gh-cli
+
     - name: Verify the build attestation
       shell: bash
       env:
+        GH_BIN: ${{ steps.gh.outputs.path }}
         FILE: ${{ inputs.file }}
         IMAGE: ${{ inputs.image }}
         SIGNER_WORKFLOW: ${{ inputs.signer-workflow }}
@@ -65,8 +71,9 @@ runs:
           echo "::error::$FILE does not exist, so its attestation cannot be verified."
           exit 1
         fi
-        if ! command -v gh >/dev/null 2>&1; then
-          echo "::error::The GitHub CLI (gh) is not installed on this runner, so $FILE's attestation cannot be verified; not running it."
+        GH_BIN="${GH_BIN:-}"
+        if [ -z "$GH_BIN" ] || [ ! -x "$GH_BIN" ]; then
+          echo "::error::The pinned GitHub CLI (gh) is not installed, so $FILE's attestation cannot be verified; not running it."
           exit 1
         fi
         if [ "${RELEASE:-false}" = true ]; then
@@ -77,7 +84,7 @@ runs:
           # Every published release file is attested by build_release.yml on a release branch.
           repository_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY}"
           identity="^${repository_url//./\\.}/\\.github/workflows/build_release\\.yml@refs/heads/release/"
-          if ! out="$(gh attestation verify "$FILE" --repo "$GITHUB_REPOSITORY" \
+          if ! out="$("$GH_BIN" attestation verify "$FILE" --repo "$GITHUB_REPOSITORY" \
             --cert-identity-regex "$identity" --deny-self-hosted-runners ${SOURCE_COMMIT:+--source-digest "$SOURCE_COMMIT"} 2>&1)"; then
             printf '%s\n' "$out"
             echo "::error::$FILE has no build attestation from build_release.yml on a release branch; not running it."
@@ -91,7 +98,7 @@ runs:
           exit 1
         fi
         signer="${GITHUB_REPOSITORY}/${SIGNER_WORKFLOW#./}"
-        if ! out="$(gh attestation verify "$FILE" --repo "$GITHUB_REPOSITORY" \
+        if ! out="$("$GH_BIN" attestation verify "$FILE" --repo "$GITHUB_REPOSITORY" \
           --signer-workflow "$signer" --source-ref refs/heads/trunk ${SOURCE_COMMIT:+--source-digest "$SOURCE_COMMIT"} 2>&1)"; then
           printf '%s\n' "$out"
           echo "::error::$FILE has no build attestation from $signer on trunk; not running it."

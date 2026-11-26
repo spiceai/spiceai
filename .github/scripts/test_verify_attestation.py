@@ -24,7 +24,9 @@ class VerifyAttestationTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmp.name)
         self.script = self.dir / "verify.sh"
-        self.script.write_text(yaml.safe_load(ACTION.read_text())["runs"]["steps"][0]["run"])
+        steps = yaml.safe_load(ACTION.read_text())["runs"]["steps"]
+        self.assertEqual(steps[0]["uses"], "$/.github/actions/install-gh-cli")
+        self.script.write_text(next(s for s in steps if s.get("name") == "Verify the build attestation")["run"])
         self.bin = self.dir / "bin"
         self.bin.mkdir()
         self.calls = self.dir / "calls"
@@ -50,7 +52,8 @@ class VerifyAttestationTest(unittest.TestCase):
     def verify(self, file=None, gh_exit=0, source_commit="", signer=".github/workflows/build_release.yml", release="false",
                image=""):
         env = {
-            "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
+            "PATH": os.environ["PATH"],
+            "GH_BIN": str(self.bin / "gh"),
             "FILE": "" if image and file is None else str(file or self.file),
             "IMAGE": image,
             "SIGNER_WORKFLOW": signer,
@@ -123,15 +126,20 @@ class VerifyAttestationTest(unittest.TestCase):
             proc.stdout,
         )
 
-    def test_a_runner_without_gh_fails_closed_and_says_why(self):
+    def test_a_runner_without_the_pinned_gh_fails_closed_and_says_why(self):
         empty = self.dir / "empty"
         empty.mkdir()
-        env = {"PATH": str(empty), "FILE": str(self.file), "SIGNER_WORKFLOW": ".github/workflows/build_release.yml",
-               "GITHUB_REPOSITORY": "spiceai/spiceai", "GH_TOKEN": "a-token", "SOURCE_COMMIT": ""}
-        proc = subprocess.run(["/bin/bash", str(self.script)], env=env, capture_output=True, text=True, timeout=30)
-        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        self.assertIn("The GitHub CLI (gh) is not installed on this runner", proc.stdout)
-        self.assertNotIn("a-token", proc.stdout + proc.stderr)
+        for gh_bin in ("", str(empty / "gh")):
+            with self.subTest(gh_bin=gh_bin):
+                env = {"PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}", "GH_BIN": gh_bin, "FILE": str(self.file),
+                       "SIGNER_WORKFLOW": ".github/workflows/build_release.yml", "GITHUB_REPOSITORY": "spiceai/spiceai",
+                       "GH_TOKEN": "a-token", "SOURCE_COMMIT": ""}
+                proc = subprocess.run(["/bin/bash", str(self.script)], env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("The pinned GitHub CLI (gh) is not installed", proc.stdout)
+                self.assertNotIn("a-token", proc.stdout + proc.stderr)
+                # The gh on PATH is never asked.
+                self.assertFalse(self.calls.exists())
 
     def test_a_missing_file_fails_without_asking(self):
         proc = self.verify(file=self.dir / "absent.tar.gz")

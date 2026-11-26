@@ -131,13 +131,14 @@ entry itself as `(Get-Content … | ConvertFrom-Json).'<name>'`, names its targe
   digest GitHub records for the release asset, checked against a download.
   `test/tpc-bench/Makefile` pins the v2.0.0 CLI archives its TPC-H generator downloads in
   its own `case` arms the same way, and `check_ci_cache_pins.py` requires a SHA-256 in each.
-- **`github-cli-keyring`**: the apt keyring of GitHub CLI's package repository, which
-  `install-gh-cli` (for `push-snap-changes` and the bench, schema and cluster bench
-  workflows) installs before `apt install gh`, from the action's own copy of the pin. The SHA-256 is the one GitHub publishes for the binary keyring in
-  `docs/install_linux.md` of `cli/cli`; the file holds the keys `2C61 0620 1985 B60E 6C7A C873
-  23F3 D4EA 7571 6059` and `7F38 BBB5 9D06 4DBC B3D8 4D72 5612 B364 6231 3325`, the
-  fingerprints that page lists, and the repository is signed by the second. When GitHub
-  changes the file, the install fails until the pin is updated from that page.
+- **`gh`**: the GitHub CLI 2.103.3 for Linux x86_64 and arm64 and macOS x86_64 and arm64, the
+  SHA-256s `gh_<version>_checksums.txt` publishes beside the release, each checked against a
+  download. `install-gh-cli` installs it into a new directory of the job's own, first on PATH,
+  whatever gh the runner has (the self-hosted Macs' gh is one any job there can replace), for
+  `push-snap-changes`, the bench, schema and cluster bench workflows, and `verify-attestation`,
+  which runs the binary it installed by its path. The target names the asset, extension
+  included. To bump it, pick the newest release at least two weeks old and take the four
+  lines of its checksums file.
 - **`docker-apt-key`**: Docker's apt key (`download.docker.com/linux/ubuntu/gpg`), which the
   arm64 jobs of `spiced_docker_dev.yml`, `build_nightly.yml` and `spiced_docker.yml` install.
   It holds one key, `9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88`, the fingerprint

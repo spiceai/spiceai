@@ -105,12 +105,12 @@ class PinnedToolsTest(unittest.TestCase):
         # The runner's own bin, first on PATH, with a planted copy of each tool.
         self.planted = self.tmp / "planted-bin"
         self.planted.mkdir()
-        for tool in ("mc", "sccache", "aws"):
+        for tool in ("mc", "sccache", "aws", "gh"):
             (self.planted / tool).write_text(recorder(self.log, f"planted-{tool}"))
             (self.planted / tool).chmod(0o755)
         # `uname -m` answers what the test says, so a test can be any architecture.
         (self.planted / "uname").write_text(
-            '#!/bin/sh\ncase "$1" in -m) echo "${FAKE_UNAME_M:-x86_64}" ;; -s) echo Linux ;; *) echo Linux ;; esac\n'
+            '#!/bin/sh\ncase "$1" in -m) echo "${FAKE_UNAME_M:-x86_64}" ;; *) echo "${FAKE_UNAME_S:-Linux}" ;; esac\n'
         )
         (self.planted / "uname").chmod(0o755)
         for name in ("github_path", "github_env", "github_output"):
@@ -263,6 +263,26 @@ class PinnedToolsTest(unittest.TestCase):
             text = (ROOT / path).read_text()
             self.assertIn("uses: $/.github/actions/install-aws-cli", text, path)
             self.assertNotIn("aws/install", text, path)
+
+    def test_gh_is_the_pinned_one_on_linux_and_macos(self):
+        for system, machine, target in (("Linux", "x86_64", "linux_amd64.tar.gz"), ("Darwin", "arm64", "macOS_arm64.zip")):
+            with self.subTest(target=target):
+                (self.tmp / "github_path").write_text("")
+                (self.tmp / "github_output").write_text("")
+                self.log.write_text("")
+                inner = {f"gh_9.9.9_{target.split('.')[0]}/bin/gh": (recorder(self.log, "pinned-gh"), 0o755)}
+                archive = tar_gz_of(inner) if target.endswith(".tar.gz") else zip_of(inner)
+                self.serve("gh", archive, target)
+                r = self.run_step("install-gh-cli", "Install the GitHub CLI", {"FAKE_UNAME_S": system, "FAKE_UNAME_M": machine})
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                (bin_dir,) = self.path_dirs()
+                self.assertTrue(bin_dir.is_relative_to(self.runner_temp), bin_dir)
+                self.assertIn(f"path={bin_dir / 'gh'}", (self.tmp / "github_output").read_text())
+                self.assertEqual(self.calls(), ["pinned-gh --version"])
+        self.assertNotIn("command -v gh", step("install-gh-cli", "Install the GitHub CLI")["run"])
+        r = self.run_step("install-gh-cli", "Install the GitHub CLI", {"FAKE_UNAME_S": "Windows_NT"})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("pins no gh", r.stdout + r.stderr)
 
 
 if __name__ == "__main__":

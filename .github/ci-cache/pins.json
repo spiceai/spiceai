@@ -92,12 +92,18 @@
     "url": "https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip",
     "sha256": "08c0ca117111fcede14239d0093792352befdc174218c344d232c13279643d05"
   },
-  "github-cli-keyring": {
-    "url": "https://cli.github.com/packages/githubcli-archive-keyring.gpg",
-    "sha256": "6084d5d7bd8e288441e0e94fc6275570895da18e6751f70f057485dc2d1a811b"
-  },
   "docker-apt-key": {
     "url": "https://download.docker.com/linux/ubuntu/gpg",
     "sha256": "1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570"
+  },
+  "gh": {
+    "version": "2.103.3",
+    "url": "https://github.com/cli/cli/releases/download/v{version}/gh_{version}_{target}",
+    "sha256": {
+      "linux_amd64.tar.gz": "4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d",
+      "linux_arm64.tar.gz": "ee32df2323c8847f5fac6cb6b4b69ca75828e9329a8f22f677021f7b3306ce63",
+      "macOS_amd64.zip": "a2f86418f4350ae6e9ec60d5000bdf7665728436946a97fc27fe50e6ae752682",
+      "macOS_arm64.zip": "d700207eae9ae98fe2b89535c2c087c07823d4628c56364695a5a07ef311c062"
+    }
   }
 }

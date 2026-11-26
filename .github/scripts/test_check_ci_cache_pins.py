@@ -302,15 +302,21 @@ class CheckCiCachePinsTest(unittest.TestCase):
         self.assertIn("no longer compares the DuckDB CLI it downloads", result.stdout)
 
 
-    def test_the_gh_keyring_is_fetched_through_its_pin(self):
+    def test_gh_is_fetched_through_its_pin_for_every_target_the_action_asks_for(self):
         result = self.run_check()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("github-cli-keyring", result.stdout)
+        self.assertIn("gh 2.103.3", result.stdout)
         path = self.tmp / ".github/actions/install-gh-cli/action.yml"
-        path.write_text(path.read_text().replace('fetch_pinned.sh" github-cli-keyring "$out"', 'wget" -O"$out" x'))
+        text = path.read_text()
+        path.write_text(text.replace('fetch_pinned.sh" gh "$dir/archive" "$target"', 'curl" -o "$dir/archive" x'))
         result = self.run_check()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("install-gh-cli/action.yml does not download github-cli-keyring", result.stdout)
+        self.assertIn("install-gh-cli/action.yml does not download gh", result.stdout)
+        path.write_text(text)
+        self.edit_pins(lambda pins: pins["gh"]["sha256"].pop("macOS_arm64.zip"))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("macOS_arm64.zip", result.stdout)
 
     def test_the_docker_apt_key_is_checked_inline_against_its_pin(self):
         result = self.run_check()

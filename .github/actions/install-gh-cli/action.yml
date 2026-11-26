@@ -1,27 +1,48 @@
 name: Install the GitHub CLI
 description: >-
-  Install gh from GitHub's apt repository, trusted through the keyring whose SHA-256
-  .github/ci-cache/pins.json pins as GitHub publishes it, unless the runner already has gh.
+  Install the gh release pinned in .github/ci-cache/pins.json, checked against its SHA-256, into
+  a new directory of the job's own, first on PATH for the rest of the job. A gh already on the
+  runner is never what the job runs: on the self-hosted Macs every job can write the host's.
   The pin and the helper come from this action's own copy of the repository, so a workflow
-  called at @trunk uses trunk's pin whatever commit it checked out.
+  called at @trunk installs trunk's pin whatever commit it checked out.
+
+outputs:
+  path:
+    description: The installed gh binary.
+    value: ${{ steps.install.outputs.path }}
 
 runs:
   using: 'composite'
   steps:
     - name: Install the GitHub CLI
+      id: install
       shell: bash
       run: |
         set -euo pipefail
-        if command -v gh >/dev/null 2>&1; then
-          echo "gh is already installed: $(gh --version | head -1)"
-          exit 0
+        case "$(uname -s)-$(uname -m)" in
+          Linux-x86_64) target=linux_amd64.tar.gz ;;
+          Linux-aarch64) target=linux_arm64.tar.gz ;;
+          Darwin-x86_64) target=macOS_amd64.zip ;;
+          Darwin-arm64) target=macOS_arm64.zip ;;
+          *)
+            echo "::error::.github/ci-cache/pins.json pins no gh for $(uname -s) $(uname -m)."
+            exit 1
+            ;;
+        esac
+        dir="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/gh.XXXXXX")"
+        bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" gh "$dir/archive" "$target"
+        mkdir "$dir/src" "$dir/bin"
+        case "$target" in
+          *.tar.gz) tar -xzf "$dir/archive" -C "$dir/src" ;;
+          *.zip) unzip -q "$dir/archive" -d "$dir/src" ;;
+        esac
+        found=("$dir"/src/gh_*/bin/gh)
+        if [ "${#found[@]}" -ne 1 ] || [ ! -f "${found[0]}" ] || [ -L "${found[0]}" ]; then
+          echo "::error::The pinned gh archive holds no single bin/gh."
+          exit 1
         fi
-        out="$(mktemp "${RUNNER_TEMP:?RUNNER_TEMP is not set}/githubcli-keyring.XXXXXX")"
-        bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" github-cli-keyring "$out"
-        sudo mkdir -p -m 755 /etc/apt/keyrings /etc/apt/sources.list.d
-        sudo install -m 0644 "$out" /etc/apt/keyrings/githubcli-archive-keyring.gpg
-        rm -f "$out"
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-          | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-        sudo apt-get update
-        sudo apt-get install -y gh
+        install -m 0755 "${found[0]}" "$dir/bin/gh"
+        rm -rf "$dir/archive" "$dir/src"
+        echo "$dir/bin" >> "$GITHUB_PATH"
+        echo "path=$dir/bin/gh" >> "$GITHUB_OUTPUT"
+        "$dir/bin/gh" --version | head -1
