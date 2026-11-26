@@ -3910,7 +3910,7 @@ mod explorer_tests {
             .filter(|f| !TEXT_ONLY.contains(f))
             .collect();
         assert_eq!(render.drawn, expected);
-        assert_eq!(render.families.len(), 25, "{:?}", render.families);
+        assert_eq!(render.families.len(), 26, "{:?}", render.families);
         assert!(
             render.steps > 10_000,
             "only {} steps rendered",

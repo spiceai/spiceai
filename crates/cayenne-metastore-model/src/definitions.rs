@@ -245,6 +245,84 @@ impl Model for Protocol {
             ),
         ]
     }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{Event, Timeline, Tone, state_and_trace, steps};
+        let state = path.last_state().clone();
+        let app = |app: u8| match app {
+            0 => "shop",
+            1 => "store",
+            _ => "shop (renamed)",
+        };
+        let mut boxes = vec![];
+        boxes.push(match &state.copy {
+            None => ("COPY".to_string(), vec!["not created".to_string()], Tone::Gone),
+            Some(copy) => (
+                "COPY".to_string(),
+                vec![
+                    format!("built from host {}", copy.definition),
+                    format!("app recorded: {}", app(copy.app)),
+                    format!(
+                        "rows from hosts: {}",
+                        (0..INSTANCES)
+                            .filter(|i| copy.rows & (1 << Self::host(*i)) != 0)
+                            .map(|i| i.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    format!(
+                        "writer: {}",
+                        copy.writer
+                            .map_or_else(|| "none".to_string(), |w| format!("instance {w}"))
+                    ),
+                ],
+                Tone::Live,
+            ),
+        });
+        for i in 0..INSTANCES {
+            let reads_other = state.status[i] == Status::Serving
+                && state
+                    .copy
+                    .as_ref()
+                    .is_some_and(|copy| copy.rows & !(1 << Self::host(i)) != 0);
+            boxes.push((
+                format!("INSTANCE {i}"),
+                vec![
+                    format!("app {}, host {}", app(state.app[i]), Self::host(i)),
+                    format!("{:?}", state.status[i]),
+                ],
+                if reads_other {
+                    Tone::Bad
+                } else {
+                    Tone::Actor
+                },
+            ));
+        }
+        let lanes = vec![
+            "instance 0".to_string(),
+            "instance 1".to_string(),
+            "copy".to_string(),
+        ];
+        let copy_lane = INSTANCES;
+        let mut events = vec![];
+        for (before, action, after) in steps(path) {
+            let label = self.format_action(&action);
+            let event = match action {
+                Action::Open(i) => {
+                    let tone = match after.status[i] {
+                        Status::Failed => Tone::Gone,
+                        _ => Tone::Live,
+                    };
+                    Event::on(i, label).to(copy_lane).tone(tone)
+                }
+                Action::Write(i) => Event::on(i, label).to(copy_lane).tone(Tone::Live),
+                Action::TakeLease(i) => Event::on(i, label).to(copy_lane).tone(Tone::Staged),
+                Action::Stop(i) => Event::on(i, label).tone(Tone::Gone),
+                Action::Rename => Event::on(0, label).tone(Tone::Actor),
+            };
+            events.push(event.breaking(&crate::explorer::broken(self, &before, &after)));
+        }
+        Some(state_and_trace(&boxes, &Timeline { lanes, events }))
+    }
     fn format_action(&self, action: &Action) -> String {
         match action {
             Action::Open(i) => format!("instance {i} loads the dataset"),
