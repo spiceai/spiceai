@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -21,12 +22,14 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicI64;
 use std::time::{Duration, SystemTime};
 
-use arrow::array::StringArray;
 use arrow::array::{Array, ArrayRef, RecordBatch, TimestampNanosecondArray};
-use arrow::compute::cast;
+use arrow::array::{BooleanArray, StringArray};
+use arrow::compute::{cast, filter_record_batch};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_tools::format::SchemaDisplay;
-use data_components::http::provider::HttpTableProvider;
+use data_components::http::provider::{
+    DEFAULT_MAX_REQUEST_PARTITIONS, HttpTableProvider, RequestPages,
+};
 use datafusion::common::{DataFusionError, Result as DataFusionResult, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::TaskContext;
@@ -537,6 +540,362 @@ pub const CACHE_NAMESPACE_COLUMN: &str = "__spice_cache_namespace";
 #[must_use]
 pub fn is_reserved_caching_column(name: &str) -> bool {
     name.eq_ignore_ascii_case(CACHE_NAMESPACE_COLUMN)
+        || name.eq_ignore_ascii_case(CACHE_REQUEST_COLUMN)
+}
+
+/// Storage-only column naming the request a cached row was fetched for, so
+/// every row of one response shares a value even when pagination stored each
+/// page under its own path and query. Eviction, retention and the scheduled
+/// refresh treat the rows that share it as one entry, so none of them can
+/// leave part of a response to be served as though it were whole.
+///
+/// It holds the request's key as [`encode_request_key`] writes it. Nullable:
+/// a row written by a runtime that does not stamp it reads as NULL, and is
+/// kept and evicted as before. Hidden from the user-facing schema, like
+/// [`CACHE_NAMESPACE_COLUMN`].
+pub const CACHE_REQUEST_COLUMN: &str = "__spice_cache_request";
+
+/// The request-key predicates in `filters`, `column = 'value'` or
+/// `column IS NULL` over [`REQUEST_KEY_COLUMNS`], encoded as a JSON object
+/// with the columns in a fixed order and `null` for `IS NULL`. `None` when a
+/// filter is anything else, so such a write stores no key.
+#[must_use]
+pub fn encode_request_key(filters: &[Expr]) -> Option<String> {
+    let mut key = BTreeMap::<&str, Option<String>>::new();
+    for filter in filters {
+        let (column, value) = match filter {
+            Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Eq => {
+                match (binary.left.as_ref(), binary.right.as_ref()) {
+                    (
+                        Expr::Column(column),
+                        Expr::Literal(
+                            ScalarValue::Utf8(Some(value))
+                            | ScalarValue::LargeUtf8(Some(value))
+                            | ScalarValue::Utf8View(Some(value)),
+                            _,
+                        ),
+                    ) => (column, Some(value.clone())),
+                    _ => return None,
+                }
+            }
+            Expr::IsNull(inner) => match inner.as_ref() {
+                Expr::Column(column) => (column, None),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let name = REQUEST_KEY_COLUMNS
+            .into_iter()
+            .find(|name| *name == column.name)?;
+        if let Some(previous) = key.insert(name, value.clone())
+            && previous != value
+        {
+            return None;
+        }
+    }
+    if key.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&key).ok()
+}
+
+/// The entry identity shared by cache admission and lookup. Omitted path and
+/// query dimensions remain omitted; an omitted body identifies a GET.
+fn request_entry_key(filters: &[Expr]) -> Option<String> {
+    let mut canonical = writer::canonical_request_filters(filters)?;
+    if !canonical
+        .iter()
+        .flat_map(Expr::column_refs)
+        .any(|c| c.name == REQUEST_BODY_COLUMN)
+    {
+        canonical.push(col(REQUEST_BODY_COLUMN).eq(lit("")));
+    }
+    encode_request_key(&canonical)
+}
+
+// OR branches must enumerate actual connector values: a NULL or reversed
+// equality branch is not represented by request_filter_values.
+fn enumerable_request_predicate(expr: &Expr, under_or: bool) -> bool {
+    match expr {
+        Expr::BinaryExpr(binary)
+            if matches!(
+                binary.op,
+                datafusion::logical_expr::Operator::And | datafusion::logical_expr::Operator::Or
+            ) =>
+        {
+            let under_or = under_or || binary.op == datafusion::logical_expr::Operator::Or;
+            enumerable_request_predicate(&binary.left, under_or)
+                && enumerable_request_predicate(&binary.right, under_or)
+        }
+        Expr::InList(list) if !list.negated => list.list.iter().all(|value| {
+            matches!(value, Expr::Literal(ScalarValue::Utf8(Some(_)), _))
+                && writer::canonical_request_filters(&[list
+                    .expr
+                    .as_ref()
+                    .clone()
+                    .eq(value.clone())])
+                .is_some()
+        }),
+        _ => {
+            writer::canonical_request_filters(std::slice::from_ref(expr)).is_some()
+                && (!under_or
+                    || REQUEST_KEY_COLUMNS.iter().any(|name| {
+                        !HttpTableProvider::request_filter_values(std::slice::from_ref(expr), name)
+                            .is_empty()
+                    }))
+        }
+    }
+}
+
+/// Canonical requests represented by a lookup, excluding response predicates.
+#[cfg(test)]
+fn lookup_entry_keys(filters: &[Expr]) -> Option<Vec<String>> {
+    lookup_entry_keys_bounded(filters, DEFAULT_MAX_REQUEST_PARTITIONS).0
+}
+
+fn lookup_entry_keys_bounded(filters: &[Expr], bound: usize) -> (Option<Vec<String>>, bool, bool) {
+    let request: Vec<_> = filters
+        .iter()
+        .flat_map(flatten_and_conjuncts)
+        .filter(expr_names_request_key)
+        .collect();
+    if bound == 0 {
+        return (None, true, false);
+    }
+    if request.is_empty() {
+        return (None, false, false);
+    }
+    if let Some(key) = request_entry_key(&request) {
+        return (Some(vec![key]), false, true);
+    }
+    // Expansion must not discard a noncanonical predicate on a request key.
+    if !request
+        .iter()
+        .all(|expr| enumerable_request_predicate(expr, false))
+    {
+        return (None, false, false);
+    }
+    // Enumerate at most bound + 1 combinations, and encode none until the
+    // entire set fits. The extra combination distinguishes overflow from a
+    // request exactly at the connector's limit.
+    let Some(keys) = requested_cache_keys_bounded(&request, bound.saturating_add(1)) else {
+        return (None, false, false);
+    };
+    if keys.len() > bound {
+        return (None, true, false);
+    }
+    (
+        keys.iter()
+            .map(|key| key.entry_key_with_predicates(&request))
+            .collect(),
+        false,
+        false,
+    )
+}
+
+/// Restrict candidate rows to the responses fetched for this lookup's requests.
+/// Noncanonical request scans accept any tagged entry; scans without request
+/// predicates and legacy tables without entry tags retain every row.
+pub(super) struct RequestEntryRestriction {
+    keys: Option<HashSet<String>>,
+    requires_tag: bool,
+    over_bound: bool,
+    claim_filters: Vec<Expr>,
+    claim_entry: Option<String>,
+    canonical: bool,
+}
+
+impl RequestEntryRestriction {
+    #[cfg(test)]
+    pub(super) fn new(filters: &[Expr]) -> Self {
+        Self::with_bound(filters, DEFAULT_MAX_REQUEST_PARTITIONS)
+    }
+
+    pub(super) fn for_lookup(filters: &[Expr], source: &dyn TableProvider) -> Self {
+        let bound = (source as &dyn std::any::Any)
+            .downcast_ref::<HttpTableProvider>()
+            .map_or(
+                DEFAULT_MAX_REQUEST_PARTITIONS,
+                HttpTableProvider::max_request_partitions,
+            );
+        Self::with_bound(filters, bound)
+    }
+
+    fn with_bound(filters: &[Expr], bound: usize) -> Self {
+        let headers = HttpTableProvider::request_filter_values(filters, "request_headers")
+            .len()
+            .max(1);
+        let (keys, over_bound, canonical) = lookup_entry_keys_bounded(filters, bound / headers);
+        // Only an entirely canonical request may reuse the entry as its claim.
+        let claim_entry = keys
+            .as_ref()
+            .filter(|keys| keys.len() == 1)
+            .and_then(|keys| keys.first())
+            .cloned();
+        Self {
+            keys: keys.map(|keys| keys.into_iter().collect()),
+            over_bound,
+            claim_filters: filters.to_vec(),
+            claim_entry,
+            canonical,
+            requires_tag: filters.iter().flat_map(Expr::column_refs).any(|column| {
+                REQUEST_KEY_COLUMNS.contains(&column.name.as_str())
+                    || column.name == "request_headers"
+            }),
+        }
+    }
+
+    fn claim_key(&self, filters: &[Expr], namespace: &str) -> String {
+        if self.canonical
+            && filters == self.claim_filters
+            && self
+                .claim_filters
+                .iter()
+                .flat_map(Expr::column_refs)
+                .all(|column| REQUEST_KEY_COLUMNS.contains(&column.name.as_str()))
+            && let Some(entry) = &self.claim_entry
+        {
+            return format!("{entry}|__ns={namespace}");
+        }
+        compute_cache_key_from_filters_and_namespace(filters, namespace)
+    }
+
+    // Nonempty batches have already passed this restriction, so one matching
+    // entry proves that no request in a single-entry lookup is missing.
+    fn single_tagged_entry(&self, batches: &[RecordBatch]) -> bool {
+        self.keys.as_ref().is_some_and(|keys| keys.len() == 1)
+            && batches.iter().all(|batch| {
+                batch
+                    .schema()
+                    .column_with_name(CACHE_REQUEST_COLUMN)
+                    .is_some()
+            })
+    }
+
+    pub(super) fn is_active(&self, schema: &arrow::datatypes::Schema) -> bool {
+        (self.keys.is_some() || self.requires_tag)
+            && schema.column_with_name(CACHE_REQUEST_COLUMN).is_some()
+    }
+
+    /// Narrow the storage scan while retaining the post-scan restriction.
+    pub(super) fn scan_filter(&self, schema: &arrow::datatypes::Schema) -> Option<Expr> {
+        if !self.is_active(schema) {
+            return None;
+        }
+        let keys = self.keys.as_ref().filter(|keys| !keys.is_empty())?;
+        let mut keys: Vec<_> = keys.iter().collect();
+        keys.sort_unstable();
+        Some(if keys.len() == 1 {
+            col(CACHE_REQUEST_COLUMN).eq(lit(keys[0].as_str()))
+        } else {
+            col(CACHE_REQUEST_COLUMN).in_list(
+                keys.into_iter().map(|key| lit(key.as_str())).collect(),
+                false,
+            )
+        })
+    }
+
+    fn apply(&self, batch: RecordBatch) -> DataFusionResult<RecordBatch> {
+        if !self.is_active(&batch.schema()) {
+            return Ok(batch);
+        }
+        let Some(column) = batch.column_by_name(CACHE_REQUEST_COLUMN) else {
+            return Ok(batch);
+        };
+        let keys = column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!("{CACHE_REQUEST_COLUMN} must be Utf8"))
+            })?;
+        let mask = BooleanArray::from_iter(keys.iter().map(|key| {
+            Some(
+                !self.over_bound
+                    && key.is_some_and(|key| {
+                        self.keys.as_ref().is_none_or(|keys| keys.contains(key))
+                    }),
+            )
+        }));
+        if mask.true_count() == batch.num_rows() {
+            return Ok(batch);
+        }
+        Ok(filter_record_batch(&batch, &mask)?)
+    }
+
+    fn restrict_stream(
+        self: &Arc<Self>,
+        stream: SendableRecordBatchStream,
+    ) -> SendableRecordBatchStream {
+        let restriction = Arc::clone(self);
+        let schema = stream.schema();
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream.map(move |batch| restriction.apply(batch?)),
+        ))
+    }
+}
+
+/// The predicates [`encode_request_key`] encoded, or `None` for a value it
+/// did not write.
+#[must_use]
+pub fn decode_request_key(encoded: &str) -> Option<Vec<Expr>> {
+    let key: BTreeMap<String, Option<String>> = serde_json::from_str(encoded).ok()?;
+    if key.is_empty() {
+        return None;
+    }
+    key.into_iter()
+        .map(|(name, value)| {
+            let name = REQUEST_KEY_COLUMNS
+                .into_iter()
+                .find(|known| *known == name)?;
+            Some(match value {
+                Some(value) => col(name).eq(lit(value)),
+                None => col(name).is_null(),
+            })
+        })
+        .collect()
+}
+
+/// Appends [`CACHE_REQUEST_COLUMN`] to a caching accelerator's storage schema,
+/// after any [`CACHE_NAMESPACE_COLUMN`].
+///
+/// # Errors
+///
+/// Returns a `DataFusionError` if `schema` already defines a column whose name
+/// matches [`CACHE_REQUEST_COLUMN`] ignoring case.
+pub fn extend_schema_with_cache_request(
+    dataset_name: &str,
+    schema: &arrow::datatypes::Schema,
+) -> DataFusionResult<arrow::datatypes::Schema> {
+    use arrow::datatypes::Field;
+    if schema
+        .fields()
+        .iter()
+        .any(|f| f.name().eq_ignore_ascii_case(CACHE_REQUEST_COLUMN))
+    {
+        return Err(DataFusionError::Plan(format!(
+            "dataset `{dataset_name}` declares a column named `{CACHE_REQUEST_COLUMN}` (case-insensitive match), which is reserved by the caching accelerator. Rename the source column to avoid this name.",
+        )));
+    }
+    let mut fields: Vec<Field> = schema.fields().iter().map(|f| (**f).clone()).collect();
+    fields.push(
+        Field::new(CACHE_REQUEST_COLUMN, arrow::datatypes::DataType::Utf8, true).with_metadata(
+            HashMap::from([
+                (
+                    arrow_tools::metadata_keys::OPTIONAL_TRAILING_COLUMN_METADATA_KEY.to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    arrow_tools::metadata_keys::AUTOMATIC_INDEX_METADATA_KEY.to_string(),
+                    "true".to_string(),
+                ),
+            ]),
+        ),
+    );
+    Ok(arrow::datatypes::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
 }
 
 /// Returns a copy of `batch` with [`CACHE_NAMESPACE_COLUMN`] appended,
@@ -734,7 +1093,24 @@ struct RequestedCacheKey {
     body: Option<String>,
 }
 
+fn canonical_request_conjuncts(filters: &[Expr]) -> Vec<Expr> {
+    filters
+        .iter()
+        .flat_map(flatten_and_conjuncts)
+        .filter_map(|expr| writer::canonical_request_filters(&[expr]))
+        .flatten()
+        .collect()
+}
+
 impl RequestedCacheKey {
+    fn entry_key_with_predicates(&self, filters: &[Expr]) -> Option<String> {
+        let mut request: Vec<_> = self.to_filter_expr().into_iter().collect();
+        // Enumeration extracts connector values. Retain canonical conjuncts
+        // too, including explicit NULLs and literal-on-the-left equalities.
+        request.extend(canonical_request_conjuncts(filters));
+        request_entry_key(&request)
+    }
+
     fn matches(&self, cached: &Self) -> bool {
         dim_matches(self.path.as_deref(), cached.path.as_deref())
             && dim_matches(self.query.as_deref(), cached.query.as_deref())
@@ -797,6 +1173,10 @@ fn owned_request_filter_values(filters: &[Expr], column: &str) -> Vec<String> {
 /// query = 'q')` is skipped: expanding each column independently would invent
 /// the cross product `('/a','q')` and `('/b','p')`.
 fn requested_cache_keys(filters: &[Expr]) -> Option<Vec<RequestedCacheKey>> {
+    requested_cache_keys_bounded(filters, usize::MAX)
+}
+
+fn requested_cache_keys_bounded(filters: &[Expr], bound: usize) -> Option<Vec<RequestedCacheKey>> {
     if filters.iter().any(|filter| {
         rejects_http_cross_column_or(filter) || has_negated_request_key_in_list(filter)
     }) {
@@ -838,6 +1218,9 @@ fn requested_cache_keys(filters: &[Expr]) -> Option<Vec<RequestedCacheKey>> {
                 };
                 if seen.insert(key.clone()) {
                     keys.push(key);
+                    if keys.len() >= bound {
+                        return Some(keys);
+                    }
                 }
             }
         }
@@ -851,7 +1234,20 @@ fn requested_cache_keys(filters: &[Expr]) -> Option<Vec<RequestedCacheKey>> {
 /// is the product of each request-key column's distinct values, and each
 /// cached row matches at most one of them. `false` when the filters do not name
 /// a discrete request-key set, the same cases [`requested_cache_keys`] skips.
-fn names_uncached_request_key(filters: &[Expr], cached_batches: &[RecordBatch]) -> bool {
+fn names_uncached_request_key(
+    filters: &[Expr],
+    cached_batches: &[RecordBatch],
+    restriction: &RequestEntryRestriction,
+) -> bool {
+    if cached_batches.iter().any(|batch| {
+        batch
+            .schema()
+            .column_with_name(CACHE_REQUEST_COLUMN)
+            .is_some()
+    }) && restriction.keys.is_some()
+    {
+        return missing_requested_cache_keys(filters, cached_batches, restriction).is_some();
+    }
     if filters.iter().any(|filter| {
         rejects_http_cross_column_or(filter) || has_negated_request_key_in_list(filter)
     }) {
@@ -937,19 +1333,53 @@ fn cached_request_keys(batches: &[RecordBatch]) -> Vec<RequestedCacheKey> {
     keys
 }
 
+enum CachedLookupKeys {
+    Entries(HashSet<String>),
+    Dimensions(Vec<RequestedCacheKey>),
+}
+
+impl CachedLookupKeys {
+    fn of(restriction: &RequestEntryRestriction, batches: &[RecordBatch]) -> Self {
+        if batches.iter().any(|batch| {
+            batch
+                .schema()
+                .column_with_name(CACHE_REQUEST_COLUMN)
+                .is_some()
+        }) && restriction.keys.is_some()
+        {
+            let keys = batches
+                .iter()
+                .flat_map(|batch| {
+                    (0..batch.num_rows())
+                        .filter_map(|row| utf8_cell(batch, CACHE_REQUEST_COLUMN, row))
+                })
+                .collect();
+            Self::Entries(keys)
+        } else {
+            Self::Dimensions(cached_request_keys(batches))
+        }
+    }
+
+    fn contains(&self, requested: &RequestedCacheKey, filters: &[Expr]) -> bool {
+        match self {
+            Self::Entries(keys) => requested
+                .entry_key_with_predicates(filters)
+                .is_some_and(|key| keys.contains(&key)),
+            Self::Dimensions(keys) => keys.iter().any(|cached| requested.matches(cached)),
+        }
+    }
+}
+
 fn missing_requested_cache_keys(
     filters: &[Expr],
     cached_batches: &[RecordBatch],
+    restriction: &RequestEntryRestriction,
 ) -> Option<Vec<RequestedCacheKey>> {
     let requested = requested_cache_keys(filters)?;
-    let cached = cached_request_keys(cached_batches);
+    let cached = CachedLookupKeys::of(restriction, cached_batches);
     let missing: Vec<RequestedCacheKey> = requested
         .into_iter()
-        .filter(|requested_key| {
-            !cached
-                .iter()
-                .any(|cached_key| requested_key.matches(cached_key))
-        })
+        .filter(|requested_key| !cached.contains(requested_key, filters))
         .collect();
     (!missing.is_empty()).then_some(missing)
 }
@@ -1157,9 +1587,10 @@ fn missing_request_key_filter_groups(
     filters: &[Expr],
     cached_batches: &[RecordBatch],
     complete_fetch: bool,
+    restriction: &RequestEntryRestriction,
 ) -> Option<Vec<Vec<Expr>>> {
-    let missing = missing_requested_cache_keys(filters, cached_batches)?;
-    let groups = request_key_filter_groups(filters, &missing, complete_fetch);
+    let missing = missing_requested_cache_keys(filters, cached_batches, restriction)?;
+    let groups = request_key_filter_groups(filters, &missing, complete_fetch, restriction);
     (!groups.is_empty()).then_some(groups)
 }
 
@@ -1173,20 +1604,17 @@ fn present_request_key_filter_groups(
     filters: &[Expr],
     cached_batches: &[RecordBatch],
     complete_fetch: bool,
+    restriction: &RequestEntryRestriction,
 ) -> Vec<Vec<Expr>> {
     let Some(requested) = requested_cache_keys(filters) else {
         return Vec::new();
     };
-    let cached = cached_request_keys(cached_batches);
+    let cached = CachedLookupKeys::of(restriction, cached_batches);
     let present: Vec<RequestedCacheKey> = requested
         .into_iter()
-        .filter(|requested_key| {
-            cached
-                .iter()
-                .any(|cached_key| requested_key.matches(cached_key))
-        })
+        .filter(|requested_key| cached.contains(requested_key, filters))
         .collect();
-    request_key_filter_groups(filters, &present, complete_fetch)
+    request_key_filter_groups(filters, &present, complete_fetch, restriction)
 }
 
 /// One filter set per origin scan for `keys`: the non-key conjuncts of
@@ -1196,11 +1624,16 @@ fn request_key_filter_groups(
     filters: &[Expr],
     keys: &[RequestedCacheKey],
     complete_fetch: bool,
+    restriction: &RequestEntryRestriction,
 ) -> Vec<Vec<Expr>> {
     if keys.is_empty() {
         return Vec::new();
     }
-    let non_key = non_request_key_filters(filters);
+    let mut non_key = non_request_key_filters(filters);
+    if complete_fetch && restriction.keys.is_some() {
+        // Keep canonical dimensions the connector's value enumeration omits.
+        non_key.extend(canonical_request_conjuncts(filters));
+    }
     let key_exprs = if complete_fetch {
         per_key_equality_exprs(keys)
     } else {
@@ -1213,7 +1646,11 @@ fn request_key_filter_groups(
             // so a generated scan and that lookup compute the same claim key and
             // coalesce.
             let mut group = non_key.clone();
-            group.extend(flatten_and_conjuncts(&key_expr));
+            for predicate in flatten_and_conjuncts(&key_expr) {
+                if !group.contains(&predicate) {
+                    group.push(predicate);
+                }
+            }
             group
         })
         .collect()
@@ -1253,9 +1690,28 @@ pub struct CacheWriteRequest {
     /// [`runtime_request_context::CacheNamespace::storage_id`]). Stamped into
     /// `__spice_cache_namespace` on every row before storage and added to the
     /// upsert filter set so concurrent writers in different namespaces never
-    /// overwrite each other's rows for the same `(request_path, query, body)`
-    /// key.
+    /// overwrite each other's rows for the same request entry.
     pub namespace_id: Arc<str>,
+    /// Whether the source paginates and whether this fetch followed another page.
+    /// With request grouping, paginated writes select pages matching the request
+    /// predicates and stamp every selected row with the request's entry key.
+    /// Without it, only a single-page response can use its row dimensions as scope.
+    pub pages: RequestPages,
+}
+
+/// Selects request scoping supported by the destination. Without request grouping,
+/// only responses that stayed on one page can use the row's dimensions as scope.
+fn cache_write_pages(pages: RequestPages, stores_request_groups: bool) -> Option<RequestPages> {
+    match (pages, stores_request_groups) {
+        (
+            RequestPages::Paginated {
+                followed_pages: true,
+            },
+            false,
+        ) => None,
+        (_, false) => Some(RequestPages::Single),
+        (_, true) => Some(pages),
+    }
 }
 
 /// Receiver half of the cache write channel
@@ -1837,7 +2293,13 @@ fn compute_cache_key_from_filters(filters: &[Expr]) -> String {
 /// trigger SWR for the same SQL, both must actually fetch and write
 /// independently into their own namespaces.
 fn compute_cache_key_from_filters_and_namespace(filters: &[Expr], namespace_id: &str) -> String {
-    let mut key = compute_cache_key_from_filters(filters);
+    // A decoded GET key includes the empty body that the original lookup
+    // omits. Both must own the same claim through delete and publication.
+    let mut key = if filters.is_empty() {
+        compute_cache_key_from_filters(filters)
+    } else {
+        request_entry_key(filters).unwrap_or_else(|| compute_cache_key_from_filters(filters))
+    };
     key.push_str("|__ns=");
     key.push_str(namespace_id);
     key
@@ -1861,6 +2323,11 @@ fn as_timestamp_nanosecond_array(array: &ArrayRef) -> DataFusionResult<ArrayRef>
 struct StaleCacheEntry {
     filters: Vec<Expr>,
     namespace: Option<String>,
+    /// The stored [`CACHE_REQUEST_COLUMN`] value the filters were decoded
+    /// from: the entry is every row carrying it, possibly several pages. `None`
+    /// for rows stored without it, whose entry is their own path, query and
+    /// body.
+    request_key: Option<String>,
 }
 
 /// What a revalidation learned about the source.
@@ -1902,6 +2369,7 @@ enum CacheFallback {
     Loaded(Vec<RecordBatch>),
     Deferred {
         input: CachingScanInput,
+        restriction: Arc<RequestEntryRestriction>,
         partition: usize,
         context: Arc<TaskContext>,
     },
@@ -1910,25 +2378,37 @@ enum CacheFallback {
 impl CacheFallback {
     async fn read(self) -> Option<Vec<RecordBatch>> {
         let batches = match self {
-            Self::Loaded(batches) => batches,
+            Self::Loaded(batches) => return (!batches.is_empty()).then_some(batches),
             Self::Deferred {
                 input,
+                restriction,
                 partition,
                 context,
-            } => input
-                .into_plan()
-                .await
-                .inspect_err(|error| tracing::debug!(%error, "Cache fallback planning failed"))
-                .ok()?
-                .execute(partition, context)
-                .inspect_err(|error| tracing::debug!(%error, "Cache fallback execution failed"))
-                .ok()?
-                .try_collect()
-                .await
-                .inspect_err(|error| tracing::debug!(%error, "Cache fallback collection failed"))
-                .ok()?,
+            } => (
+                restriction,
+                input
+                    .into_plan()
+                    .await
+                    .inspect_err(|error| tracing::debug!(%error, "Cache fallback planning failed"))
+                    .ok()?
+                    .execute(partition, context)
+                    .inspect_err(|error| tracing::debug!(%error, "Cache fallback execution failed"))
+                    .ok()?
+                    .try_collect::<Vec<RecordBatch>>()
+                    .await
+                    .inspect_err(
+                        |error| tracing::debug!(%error, "Cache fallback collection failed"),
+                    )
+                    .ok()?,
+            ),
         };
+        let (restriction, batches) = batches;
         let batches: Vec<RecordBatch> = batches
+            .into_iter()
+            .map(|batch| restriction.apply(batch))
+            .collect::<DataFusionResult<Vec<_>>>()
+            .inspect_err(|error| tracing::debug!(%error, "Cache fallback restriction failed"))
+            .ok()?
             .into_iter()
             .filter(|batch| batch.num_rows() > 0)
             .collect();
@@ -1948,9 +2428,29 @@ fn charged_response_stream(
     Box::pin(RecordBatchStreamAdapter::new(schema, stream))
 }
 
+/// Where a fetch's response may be stored: the memory pool its batches are
+/// charged to, and whether the table can group the pages of a paginated
+/// response. The default stores nothing.
+#[derive(Clone, Copy, Default)]
+struct PopulationTarget<'a> {
+    memory_pool: Option<&'a Arc<dyn MemoryPool>>,
+    stores_paginated_responses: bool,
+}
+
+impl<'a> PopulationTarget<'a> {
+    fn of(writer: &'a CacheWriteSender) -> Self {
+        Self {
+            memory_pool: writer.memory_pool(),
+            stores_paginated_responses: writer.stores_paginated_responses(),
+        }
+    }
+}
+
 struct CacheFetch {
     batches: Vec<RecordBatch>,
-    complete: bool,
+    /// The pages of a complete fetch, or `None` when the fetch may have
+    /// stopped short of the whole response (or its memory was not charged).
+    complete: Option<RequestPages>,
     charge: Option<Arc<RetainedBufferCharge>>,
 }
 
@@ -1990,6 +2490,7 @@ impl NativeCacheWrite {
         let batches = self.request.batches.clone();
         let filters = self.request.filters.clone();
         let namespace_id = Arc::clone(&self.request.namespace_id);
+        let pages = self.request.pages;
 
         // Admission follows registry acquisition. Initialization can therefore
         // flush every write that observed its old list, while a job waiting for
@@ -2063,6 +2564,7 @@ impl NativeCacheWrite {
                 cache_key: claim.key().to_string(),
                 replaces_existing: true,
                 namespace_id: Arc::clone(&namespace_id),
+                pages,
             };
             let result = if child.writer.requires_complete_fetch() {
                 child.writer.send_claimed_and_wait(request, claim).await
@@ -2163,6 +2665,7 @@ impl CacheRefreshHelper {
             let StaleCacheEntry {
                 filters: row_filters,
                 namespace,
+                request_key: _,
             } = entry;
 
             async move {
@@ -2199,7 +2702,7 @@ impl CacheRefreshHelper {
                     &source_replay_filters(&row_filters),
                     None,
                     cache_write_tx.task_context(&session_state),
-                    cache_write_tx.memory_pool(),
+                    PopulationTarget::of(&cache_write_tx),
                 )
                 .await?;
 
@@ -2234,15 +2737,16 @@ impl CacheRefreshHelper {
                     return Ok(0);
                 }
                 if cache_write_tx.requires_complete_fetch() {
-                    if !complete {
+                    let Some(pages) = complete else {
                         return Ok(0);
-                    }
+                    };
                     let request = CacheWriteRequest {
                         batches,
                         filters: row_filters,
                         cache_key: claim.key().to_string(),
                         namespace_id: namespace_id.into(),
                         replaces_existing: true,
+                        pages,
                     };
                     cache_write_tx.send_claimed_and_wait(request, claim).await?;
                     return Ok(refreshed_rows);
@@ -2340,7 +2844,7 @@ impl CacheRefreshHelper {
             filters,
             None,
             batch_write_tx.task_context(session_state),
-            batch_write_tx.memory_pool(),
+            PopulationTarget::of(&batch_write_tx),
         )
         .await?;
 
@@ -2366,7 +2870,7 @@ impl CacheRefreshHelper {
             tracing::debug!("No cacheable data for dataset={dataset_name} (source returned empty)");
             return Ok(RevalidationOutcome::Empty);
         }
-        if batch_write_tx.requires_complete_fetch() && !complete {
+        if batch_write_tx.requires_complete_fetch() && complete.is_none() {
             return Ok(RevalidationOutcome::NotPopulated);
         }
 
@@ -2380,6 +2884,8 @@ impl CacheRefreshHelper {
             cache_key: claim.key().to_string(),
             namespace_id: namespace.storage_id().into(),
             replaces_existing: true,
+            // Native admission requires proof that every page was fetched.
+            pages: complete.unwrap_or(RequestPages::Single),
         };
 
         batch_write_tx.send_claimed(request, claim).await?;
@@ -2442,9 +2948,27 @@ impl CacheRefreshHelper {
 
         for batch in batches {
             let namespaces = batch.column_by_name(CACHE_NAMESPACE_COLUMN);
+            let request_keys = batch.column_by_name(CACHE_REQUEST_COLUMN);
 
             for row_idx in 0..batch.num_rows() {
-                let filters = Self::extract_filters_from_row(batch, row_idx)?;
+                // A response's rows share the request they were fetched for,
+                // which may span pages stored under their own path and query;
+                // replay that request once rather than each page's.
+                let stored_key = match request_keys {
+                    Some(array) => match ScalarValue::try_from_array(array, row_idx)? {
+                        ScalarValue::Utf8(Some(value))
+                        | ScalarValue::LargeUtf8(Some(value))
+                        | ScalarValue::Utf8View(Some(value)) => {
+                            decode_request_key(&value).map(|filters| (value, filters))
+                        }
+                        _ => None,
+                    },
+                    None => None,
+                };
+                let (request_key, filters) = match stored_key {
+                    Some((key, filters)) => (Some(key), filters),
+                    None => (None, Self::extract_filters_from_row(batch, row_idx)?),
+                };
                 let namespace = match namespaces {
                     Some(array) => match ScalarValue::try_from_array(array, row_idx)? {
                         ScalarValue::Utf8(Some(value))
@@ -2465,7 +2989,11 @@ impl CacheRefreshHelper {
                     None => compute_cache_key_from_filters(&filters),
                 };
                 if seen_filter_keys.insert(cache_key) {
-                    entries.push(StaleCacheEntry { filters, namespace });
+                    entries.push(StaleCacheEntry {
+                        filters,
+                        namespace,
+                        request_key,
+                    });
                 }
             }
         }
@@ -2884,7 +3412,7 @@ impl CacheRefreshHelper {
         dataset_name: &str,
         filters: &[Expr],
         batches: &[RecordBatch],
-        complete: bool,
+        complete: Option<RequestPages>,
         input_charge: Option<Arc<RetainedBufferCharge>>,
         namespace_id: &str,
     ) {
@@ -2902,7 +3430,7 @@ impl CacheRefreshHelper {
         );
 
         for (idx, child) in children.iter().enumerate() {
-            if (child.writer.requires_complete_fetch() && !complete)
+            if (child.writer.requires_complete_fetch() && complete.is_none())
                 || (!child.writer.requires_complete_fetch()
                     && batches.iter().all(|batch| batch.num_rows() == 0))
             {
@@ -2932,6 +3460,7 @@ impl CacheRefreshHelper {
                 namespace_id: namespace_id.into(),
                 // The parent's cache miss does not establish that the child is empty.
                 replaces_existing: true,
+                pages: complete.unwrap_or(RequestPages::Single),
             };
             if let Err(e) = child.writer.send_claimed(request, claim).await {
                 tracing::warn!(
@@ -3060,6 +3589,16 @@ impl CacheRefreshHelper {
                 {
                     filters.push(namespace_filter_expr(namespace_id));
                 }
+                // The group is the rows stored for one request, which other
+                // entries' predicates may also select.
+                if let Some(key) = &entry.request_key
+                    && batches[0]
+                        .schema()
+                        .column_with_name(CACHE_REQUEST_COLUMN)
+                        .is_some()
+                {
+                    filters.push(col(CACHE_REQUEST_COLUMN).eq(lit(key.as_str())));
+                }
                 let predicate = combine_exprs_balanced(filters, Expr::and).ok_or_else(|| {
                     DataFusionError::Plan("A cached group requires a replacement predicate".into())
                 })?;
@@ -3075,6 +3614,15 @@ impl CacheRefreshHelper {
                 cache_key: claim.key().to_string(),
                 namespace_id: namespace_id.into(),
                 replaces_existing: true,
+                // A group stored under a request key may span pages; one
+                // stored without it is one path, query and body.
+                pages: if entry.request_key.is_some() {
+                    RequestPages::Paginated {
+                        followed_pages: true,
+                    }
+                } else {
+                    RequestPages::Single
+                },
             };
             child.writer.send_claimed_and_wait(request, claim).await?;
         }
@@ -3088,8 +3636,10 @@ impl CacheRefreshHelper {
         request: &[Expr],
         namespace_id: &str,
         context: Arc<TaskContext>,
+        restriction: &Arc<RequestEntryRestriction>,
     ) -> DataFusionResult<bool> {
         let mut filters = request.to_vec();
+        filters.extend(request_identity_filters(request, &accelerator.schema()));
         if accelerator
             .schema()
             .column_with_name(CACHE_NAMESPACE_COLUMN)
@@ -3097,10 +3647,12 @@ impl CacheRefreshHelper {
         {
             filters.push(namespace_filter_expr(namespace_id));
         }
-        let plan = TableScanParams::new(session_state, None, &filters, Some(1))
+        // A candidate from another entry must not consume a scan limit before
+        // the entry restriction can see the remaining rows.
+        let plan = TableScanParams::new(session_state, None, &filters, None)
             .scan_and_optimize(accelerator.as_ref(), &filters)
             .await?;
-        let mut stream = plan.execute(0, context)?;
+        let mut stream = restriction.restrict_stream(plan.execute(0, context)?);
         while let Some(batch) = stream.try_next().await? {
             if batch.num_rows() > 0 {
                 return Ok(false);
@@ -3125,7 +3677,7 @@ impl CacheRefreshHelper {
             filters,
             limit,
             task_context,
-            None,
+            PopulationTarget::default(),
         )
         .await
         .map(|fetch| fetch.batches)
@@ -3138,8 +3690,12 @@ impl CacheRefreshHelper {
         filters: &[Expr],
         limit: Option<usize>,
         task_context: Arc<TaskContext>,
-        memory_pool: Option<&Arc<dyn MemoryPool>>,
+        target: PopulationTarget<'_>,
     ) -> DataFusionResult<CacheFetch> {
+        let PopulationTarget {
+            memory_pool,
+            stores_paginated_responses,
+        } = target;
         tracing::debug!(
             "Fetching from source for dataset {dataset_name} with {} filters, limit={limit:?}",
             filters.len()
@@ -3182,9 +3738,17 @@ impl CacheRefreshHelper {
                     })
                     .ok()
             });
-        let complete = completion.as_ref().is_some_and(
-            data_components::http::provider::HttpFetchCompletion::is_complete_single_request,
-        ) && (memory_pool.is_none() || charge.is_some());
+        // A table that cannot group a response's pages (one created before
+        // `__spice_cache_request`) keeps caching what it always has: a response
+        // that read one page, stored under that page's path, query and body.
+        let complete = completion
+            .as_ref()
+            .and_then(|completion| {
+                completion
+                    .complete_request()
+                    .and_then(|pages| cache_write_pages(pages, stores_paginated_responses))
+            })
+            .filter(|_| memory_pool.is_none() || charge.is_some());
 
         tracing::debug!(
             "Federated source returned {} batches for dataset={}",
@@ -3292,6 +3856,7 @@ impl CacheRefreshHelper {
         namespace: CacheNamespace,
         in_flight_revalidations: InFlightRevalidations,
         lookup_started_at: tokio::time::Instant,
+        restriction: Option<&RequestEntryRestriction>,
     ) -> SendableRecordBatchStream {
         // Claimed before the origin is asked, not after: see [`CacheKeyClaim`]
         // for why the window this covers has to include the fetch. A caller that
@@ -3300,7 +3865,10 @@ impl CacheRefreshHelper {
         // unless that fetch asked the origin for fewer rows than this caller
         // needs, in which case it fetches for itself and, holding no claim,
         // does not write.
-        let key = compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id());
+        let key = restriction.map_or_else(
+            || compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id()),
+            |restriction| restriction.claim_key(filters, namespace.storage_id()),
+        );
         let mut claim = match CacheKeyClaim::acquire(&in_flight_revalidations, key.clone(), limit) {
             ClaimOutcome::Leader(claim) => claim,
             ClaimOutcome::Follower(in_flight) => {
@@ -3372,7 +3940,7 @@ impl CacheRefreshHelper {
             filters,
             limit,
             batch_write_tx.task_context(session_state),
-            batch_write_tx.memory_pool(),
+            PopulationTarget::of(&batch_write_tx),
         )
         .await
         {
@@ -3447,7 +4015,12 @@ impl CacheRefreshHelper {
                     }
 
                     let native = batch_write_tx.requires_complete_fetch();
-                    if (native && complete && (total_rows > 0 || !response_filtered))
+                    if native && complete.is_none() {
+                        tracing::debug!(
+                            "Not caching the response for dataset '{dataset_name}': the fetch is not proven to hold the whole response of one request (a row limit, several requests, a page cap, an uncharged response, or a paginated response the table cannot group)"
+                        );
+                    }
+                    if (native && complete.is_some() && (total_rows > 0 || !response_filtered))
                         || (!native && total_rows > 0)
                     {
                         let write_request = CacheWriteRequest {
@@ -3456,6 +4029,7 @@ impl CacheRefreshHelper {
                             cache_key: claim.key().to_string(),
                             namespace_id: namespace.storage_id().into(),
                             replaces_existing: is_expired,
+                            pages: complete.unwrap_or(RequestPages::Single),
                         };
                         if native {
                             if let Some(input_charge) = &charge {
@@ -3685,6 +4259,7 @@ impl CacheRefreshHelper {
         in_flight_revalidations: &InFlightRevalidations,
         batch_write_tx: &CacheWriteSender,
         namespace: &CacheNamespace,
+        restriction: Option<&RequestEntryRestriction>,
     ) -> SendableRecordBatchStream {
         let total_cached_rows: usize = cached_batches.iter().map(RecordBatch::num_rows).sum();
 
@@ -3716,9 +4291,16 @@ impl CacheRefreshHelper {
                     for filters in revalidation_filters {
                         match CacheKeyClaim::acquire(
                             in_flight_revalidations,
-                            compute_cache_key_from_filters_and_namespace(
-                                filters,
-                                namespace.storage_id(),
+                            restriction.map_or_else(
+                                || {
+                                    compute_cache_key_from_filters_and_namespace(
+                                        filters,
+                                        namespace.storage_id(),
+                                    )
+                                },
+                                |restriction| {
+                                    restriction.claim_key(filters, namespace.storage_id())
+                                },
                             ),
                             None,
                         ) {
@@ -3934,6 +4516,7 @@ pub struct CachingAccelerationScanExec {
     dataset_name: String,
     io_runtime: Handle,
     filters: Vec<Expr>,
+    restriction: Arc<RequestEntryRestriction>,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
     /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations
@@ -3959,6 +4542,7 @@ impl CachingAccelerationScanExec {
         accelerator: Arc<dyn TableProvider>,
         dataset_name: String,
         io_runtime: Handle,
+        restriction: Arc<RequestEntryRestriction>,
         filters: Vec<Expr>,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
@@ -4008,6 +4592,7 @@ impl CachingAccelerationScanExec {
             dataset_name,
             io_runtime,
             filters,
+            restriction,
             projection,
             limit,
             accelerator_write_mutex,
@@ -4094,6 +4679,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             Arc::clone(&self.accelerator),
             self.dataset_name.clone(),
             self.io_runtime.clone(),
+            Arc::clone(&self.restriction),
             self.filters.clone(),
             self.projection.clone(),
             self.limit,
@@ -4139,10 +4725,17 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         // A native read that also filters response columns fetches, claims and
         // stores the whole response of its request. The filter above this scan
         // applies the response predicates to the result.
-        let response_filtered = batch_write_tx
-            .requires_complete_fetch()
-            .then(|| writer::response_filtered_request(&self.filters))
-            .flatten();
+        let response_filtered = (batch_write_tx.requires_complete_fetch()
+            && self
+                .filters
+                .iter()
+                .flat_map(Expr::column_refs)
+                .any(|column| {
+                    !REQUEST_KEY_COLUMNS.contains(&column.name.as_str())
+                        && column.name != "request_headers"
+                }))
+        .then(|| writer::response_filtered_request(&self.filters))
+        .flatten();
         let (fill_filters, response_filtered) = match response_filtered {
             Some(request) => (request, true),
             None => (self.filters.clone(), false),
@@ -4194,6 +4787,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             let schema = self.input.schema();
             let stream_schema = Arc::clone(&schema);
             let input = self.input.clone();
+            let restriction = Arc::clone(&self.restriction);
             let federated = Arc::clone(&self.federated);
             let session_state = Arc::clone(&self.session_state);
             let dataset_name = self.dataset_name.clone();
@@ -4220,6 +4814,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     Duration::ZERO,
                     Some(CacheFallback::Deferred {
                         input,
+                        restriction: Arc::clone(&restriction),
                         partition,
                         context,
                     }),
@@ -4229,6 +4824,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     namespace,
                     in_flight_revalidations,
                     lookup_started_at,
+                    Some(&restriction),
                 )
                 .await
             })
@@ -4241,7 +4837,11 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 "A cache-first read requires a planned accelerator input".to_string(),
             ));
         };
-        let accelerator_stream = input.execute(partition, Arc::clone(&context))?;
+        // Restrict each batch before collection, cache decisions, or a direct
+        // streamed hit can observe rows belonging to another entry.
+        let accelerator_stream = self
+            .restriction
+            .restrict_stream(input.execute(partition, Arc::clone(&context))?);
 
         // When no filters are provided (e.g., SELECT *), return cached data directly
         // without triggering HTTP requests to the federated source or staleness checks.
@@ -4275,6 +4875,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         );
 
         // Use stream::once pattern to handle cache miss like FallbackOnZeroResultsScanExec
+        let restriction = Arc::clone(&self.restriction);
         let cache_miss_or_stale_stream = futures::stream::once(async move {
             // Capture the originating request's cache namespace once. Every
             // subsequent cache lookup, write, and SWR refresh inherits this
@@ -4356,6 +4957,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                             namespace,
                             Arc::clone(&in_flight_revalidations),
                             lookup_started_at,
+                            Some(&restriction),
                         )
                         .await;
                     }
@@ -4368,7 +4970,8 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 // scans that each pass it on their own. Plan the full set first,
                 // before the keys are expanded, so a partial hit is refused
                 // where a miss is. Planning sends no request.
-                if names_uncached_request_key(&fill_filters, &cached_batches)
+                if !restriction.single_tagged_entry(&cached_batches)
+                    && names_uncached_request_key(&fill_filters, &cached_batches, &restriction)
                     && let Err(e) = federated
                         .scan(session_state.as_ref(), None, &fill_filters, limit)
                         .await
@@ -4383,11 +4986,17 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 // Data is fresh or stale. A hit that returned some rows is not
                 // enough when the query named several request keys: missing
                 // keys must still be fetched from the origin.
-                if let Some(missing_groups) = missing_request_key_filter_groups(
-                    &fill_filters,
-                    &cached_batches,
-                    batch_write_tx.requires_complete_fetch(),
-                ) {
+                let missing_groups = if restriction.single_tagged_entry(&cached_batches) {
+                    None
+                } else {
+                    missing_request_key_filter_groups(
+                        &fill_filters,
+                        &cached_batches,
+                        batch_write_tx.requires_complete_fetch(),
+                        &restriction,
+                    )
+                };
+                if let Some(missing_groups) = missing_groups {
                     tracing::debug!(
                         dataset = %dataset_name,
                         "Partial cache hit: fetching request keys absent from the accelerator"
@@ -4398,6 +5007,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                         &fill_filters,
                         &cached_batches,
                         batch_write_tx.requires_complete_fetch(),
+                        &restriction,
                     );
                     let hit_stream = CacheRefreshHelper::handle_cache_hit(
                         cached_batches,
@@ -4412,6 +5022,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                         &in_flight_revalidations,
                         &batch_write_tx,
                         &namespace,
+                        Some(&restriction),
                     );
                     let mut combined: SendableRecordBatchStream =
                         Box::pin(RecordBatchStreamAdapter::new(
@@ -4437,6 +5048,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                             namespace.clone(),
                             Arc::clone(&in_flight_revalidations),
                             lookup_started_at,
+                            Some(&restriction),
                         )
                         .await;
                         combined = Box::pin(RecordBatchStreamAdapter::new(
@@ -4460,6 +5072,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     &in_flight_revalidations,
                     &batch_write_tx,
                     &namespace,
+                    Some(&restriction),
                 )
             } else {
                 // Cache miss - no data in accelerator - retrieve from source and store in accelerator
@@ -4477,6 +5090,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                         &fill_filters,
                         namespace.storage_id(),
                         context,
+                        &restriction,
                     )
                     .await
                     {
@@ -4512,6 +5126,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     namespace,
                     Arc::clone(&in_flight_revalidations),
                     lookup_started_at,
+                    Some(&restriction),
                 )
                 .await
             }
@@ -4527,6 +5142,165 @@ impl ExecutionPlan for CachingAccelerationScanExec {
 mod cache_namespace_column_tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn caching_entry_keys_round_trip_and_preserve_omitted_dimensions() {
+        for filters in [
+            vec![col("request_path").eq(lit("/items"))],
+            vec![col("request_query").eq(lit("x=1"))],
+            vec![col("request_path").is_null(), col("request_body").is_null()],
+            vec![
+                col("request_path").eq(lit("/雪")),
+                col("request_body").eq(lit("a\0b")),
+            ],
+        ] {
+            let key = request_entry_key(&filters).expect("entry key");
+            let decoded = decode_request_key(&key).expect("decode");
+            assert_eq!(request_entry_key(&decoded), Some(key.clone()));
+            assert_eq!(
+                compute_cache_key_from_filters_and_namespace(&filters, "public"),
+                compute_cache_key_from_filters_and_namespace(&decoded, "public"),
+            );
+        }
+        let broad = vec![col("request_path").eq(lit("/items"))];
+        assert_eq!(
+            request_entry_key(&broad).as_deref(),
+            Some(r#"{"request_body":"","request_path":"/items"}"#)
+        );
+        assert_ne!(
+            request_entry_key(&broad),
+            request_entry_key(&[broad[0].clone(), col("request_query").eq(lit(""))])
+        );
+        assert_eq!(
+            lookup_entry_keys(&[
+                col("request_path").is_null(),
+                col("request_query").in_list(vec![lit("x"), lit("y")], false)
+            ]),
+            Some(vec![
+                r#"{"request_body":"","request_path":null,"request_query":"x"}"#.into(),
+                r#"{"request_body":"","request_path":null,"request_query":"y"}"#.into(),
+            ])
+        );
+    }
+
+    #[test]
+    fn caching_entry_lookup_selects_only_its_tagged_rows() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let broad = vec![col("request_path").eq(lit("/pages"))];
+        let narrow = vec![broad[0].clone(), col("request_query").eq(lit("cursor=2"))];
+        let broad_key = request_entry_key(&broad).expect("broad key");
+        let narrow_key = request_entry_key(&narrow).expect("narrow key");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("content", DataType::Utf8, false),
+            Field::new(CACHE_REQUEST_COLUMN, DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["A", "B", "C", "B", "untagged"])),
+                Arc::new(StringArray::from(vec![
+                    Some(broad_key.as_str()),
+                    Some(broad_key.as_str()),
+                    Some(broad_key.as_str()),
+                    Some(narrow_key.as_str()),
+                    None,
+                ])),
+            ],
+        )
+        .expect("stored entries");
+        for (filters, expected) in [(&broad, vec!["A", "B", "C"]), (&narrow, vec!["B"])] {
+            let batches = [RequestEntryRestriction::new(filters)
+                .apply(batch.clone())
+                .expect("restricted rows")];
+            let actual: Vec<_> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("content")
+                        .iter()
+                        .map(|value| value.expect("content value").to_string())
+                })
+                .collect();
+            assert_eq!(actual, expected);
+        }
+        let filters = vec![
+            broad[0].clone(),
+            col("request_query").in_list(vec![lit("cursor=2"), lit("cursor=3")], false),
+        ];
+        assert_eq!(
+            missing_requested_cache_keys(
+                &filters,
+                std::slice::from_ref(&batch),
+                &RequestEntryRestriction::new(&filters),
+            ),
+            Some(vec![RequestedCacheKey {
+                path: Some("/pages".into()),
+                query: Some("cursor=3".into()),
+                body: None,
+            }])
+        );
+        let legacy = batch.project(&[0]).expect("legacy projection");
+        assert_eq!(
+            RequestEntryRestriction::new(&broad)
+                .apply(legacy.clone())
+                .expect("legacy rows"),
+            legacy,
+        );
+        assert_eq!(
+            RequestEntryRestriction::new(&[])
+                .apply(batch.clone())
+                .expect("all rows"),
+            batch,
+        );
+    }
+
+    #[test]
+    fn entry_restriction_bounds_combinations_before_encoding() {
+        let filters = vec![
+            col("request_path").in_list(vec![lit("/a"), lit("/b")], false),
+            col("request_query").in_list(vec![lit("p"), lit("q")], false),
+        ];
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            CACHE_REQUEST_COLUMN,
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![
+                Some(r#"{"request_body":"","request_path":"/a","request_query":"p"}"#),
+                Some(r#"{"request_body":"","request_path":"/b","request_query":"q"}"#),
+                None,
+            ]))],
+        )
+        .expect("tagged cache rows");
+        let at_bound = RequestEntryRestriction::with_bound(&filters, 4);
+        assert_eq!(
+            at_bound.apply(batch.clone()).expect("at bound").num_rows(),
+            2
+        );
+        let over_bound = RequestEntryRestriction::with_bound(&filters, 3);
+        assert_eq!(
+            over_bound
+                .apply(batch.clone())
+                .expect("over bound")
+                .num_rows(),
+            0
+        );
+        let mut with_headers = filters;
+        with_headers
+            .push(col("request_headers").in_list(vec![lit("{}"), lit(r#"{"x":"1"}"#)], false));
+        assert_eq!(
+            RequestEntryRestriction::with_bound(&with_headers, 7)
+                .apply(batch)
+                .expect("header combinations exceed bound")
+                .num_rows(),
+            0
+        );
+    }
 
     #[test]
     fn reserved_column_name_is_case_insensitive() {
@@ -4810,6 +5584,7 @@ mod pool_tests {
                     cache_key: key,
                     namespace_id: "public".into(),
                     replaces_existing: true,
+                    pages: RequestPages::Single,
                 },
                 claim,
                 Arc::new(tokio::sync::RwLock::new(Vec::new())),
@@ -5257,11 +6032,14 @@ mod pool_tests {
                 &filters,
                 None,
                 state.task_ctx(),
-                Some(&pool),
+                PopulationTarget {
+                    memory_pool: Some(&pool),
+                    stores_paginated_responses: true,
+                },
             )
             .await
             .expect("initial HTTP fetch");
-            assert!(initial.complete);
+            assert_eq!(initial.complete, Some(RequestPages::Single));
             let expected_scope =
                 CacheRefreshHelper::extract_filters_from_row(&initial.batches[0], 0)
                     .expect("initial stored scope");
@@ -5355,6 +6133,66 @@ mod pool_tests {
     }
 
     #[tokio::test]
+    async fn caching_legacy_sink_admits_only_single_page_responses() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+        let (child, sink, _) = target(&pool, vec![row("old")]);
+        let filters = vec![col("request_path").eq(lit("/items"))];
+        for wait in [false, true] {
+            for followed_pages in [true, false] {
+                let key = compute_cache_key_from_filters_and_namespace(&filters, "public");
+                let ClaimOutcome::Leader(claim) =
+                    CacheKeyClaim::acquire(&child.in_flight, key.clone(), None)
+                else {
+                    panic!("exclusive claim");
+                };
+                let request = CacheWriteRequest {
+                    batches: vec![row(if followed_pages {
+                        "declined"
+                    } else if wait {
+                        "newer"
+                    } else {
+                        "new"
+                    })],
+                    filters: filters.clone(),
+                    cache_key: key,
+                    namespace_id: "public".into(),
+                    replaces_existing: true,
+                    pages: RequestPages::Paginated { followed_pages },
+                };
+                if wait {
+                    child
+                        .writer
+                        .send_claimed_and_wait(request, claim)
+                        .await
+                        .expect("declined publication");
+                } else {
+                    child
+                        .writer
+                        .send_claimed(request, claim)
+                        .await
+                        .expect("declined admission");
+                }
+                sink.flush().await.expect("flush");
+                assert_eq!(
+                    contents(&child.accelerator).await,
+                    vec![if followed_pages && !wait {
+                        "old"
+                    } else if wait && !followed_pages {
+                        "newer"
+                    } else {
+                        "new"
+                    }]
+                );
+                assert!(child.in_flight.lock().is_empty());
+                assert_eq!(pool.reserved(), 0);
+            }
+        }
+        sink.close(Duration::from_secs(5))
+            .await
+            .expect("close sink");
+    }
+
+    #[tokio::test]
     async fn child_admission_and_pending_publication_retain_both_pools() {
         let parent_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
         let child_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
@@ -5371,7 +6209,7 @@ mod pool_tests {
             "pool_test",
             &[col("request_path").eq(lit("/items"))],
             &[batch],
-            true,
+            Some(RequestPages::Single),
             Some(charge),
             "public",
         )
@@ -5443,6 +6281,7 @@ mod pool_tests {
                 cache_key: key,
                 namespace_id: "public".into(),
                 replaces_existing: true,
+                pages: RequestPages::Single,
             },
             claim,
             Arc::new(tokio::sync::RwLock::new(vec![child.clone()])),
@@ -5515,6 +6354,7 @@ mod pool_tests {
                     cache_key: key,
                     namespace_id: "public".into(),
                     replaces_existing: true,
+                    pages: RequestPages::Single,
                 },
                 claim,
             )
@@ -5757,8 +6597,13 @@ mod tests {
             col("request_path").eq(lit("/v1/items")),
             col("request_query").in_list(vec![lit("cat=p"), lit("cat=q")], false),
         ];
-        let groups =
-            missing_request_key_filter_groups(&filters, &[cached], false).expect("q is absent");
+        let groups = missing_request_key_filter_groups(
+            &filters,
+            &[cached],
+            false,
+            &RequestEntryRestriction::new(&filters),
+        )
+        .expect("q is absent");
         missing_filters_are_connector_safe(&groups);
         assert_eq!(
             groups.len(),
@@ -5787,7 +6632,13 @@ mod tests {
         )
         .expect("both keys");
         assert!(
-            missing_request_key_filter_groups(&filters, &[both], false).is_none(),
+            missing_request_key_filter_groups(
+                &filters,
+                &[both],
+                false,
+                &RequestEntryRestriction::new(&filters),
+            )
+            .is_none(),
             "complete hit should not produce a fetch"
         );
     }
@@ -5810,8 +6661,13 @@ mod tests {
             col("request_path").eq(lit("/v1/items")),
             col("request_query").in_list(vec![lit("cat=p"), lit("cat=q"), lit("cat=r")], false),
         ];
-        let groups = missing_request_key_filter_groups(&filters, &[cached], false)
-            .expect("q and r are absent");
+        let groups = missing_request_key_filter_groups(
+            &filters,
+            &[cached],
+            false,
+            &RequestEntryRestriction::new(&filters),
+        )
+        .expect("q and r are absent");
         missing_filters_are_connector_safe(&groups);
         assert_eq!(
             groups.len(),
@@ -5850,8 +6706,13 @@ mod tests {
             col("request_path").in_list(vec![lit("/v1/items"), lit("/v1/other")], false),
             col("request_query").in_list(vec![lit("cat=p"), lit("cat=q")], false),
         ];
-        let groups = missing_request_key_filter_groups(&filters, &[cached], false)
-            .expect("three combinations are absent");
+        let groups = missing_request_key_filter_groups(
+            &filters,
+            &[cached],
+            false,
+            &RequestEntryRestriction::new(&filters),
+        )
+        .expect("three combinations are absent");
         missing_filters_are_connector_safe(&groups);
         assert!(
             groups.len() >= 2,
@@ -5888,8 +6749,13 @@ mod tests {
                 .in_list(vec![lit("cat=p"), lit("cat=q")], false)
                 .and(col("request_headers").eq(lit(header))),
         ];
-        let groups =
-            missing_request_key_filter_groups(&filters, &[cached], false).expect("q is absent");
+        let groups = missing_request_key_filter_groups(
+            &filters,
+            &[cached],
+            false,
+            &RequestEntryRestriction::new(&filters),
+        )
+        .expect("q is absent");
         missing_filters_are_connector_safe(&groups);
         let rendered: Vec<String> = groups.iter().flatten().map(ToString::to_string).collect();
         assert!(
@@ -5931,9 +6797,13 @@ mod tests {
             col("request_path").eq(lit("/v1/items")),
             col("request_query").eq(lit("cat=q")),
         ];
-        let missing =
-            missing_request_key_filter_groups(&filters, std::slice::from_ref(&cached), true)
-                .expect("q is absent");
+        let missing = missing_request_key_filter_groups(
+            &filters,
+            std::slice::from_ref(&cached),
+            true,
+            &RequestEntryRestriction::new(&filters),
+        )
+        .expect("q is absent");
         assert_eq!(missing.len(), 1, "{missing:?}");
         assert_eq!(
             compute_cache_key_from_filters_and_namespace(&missing[0], "ns"),
@@ -5941,7 +6811,12 @@ mod tests {
             "{missing:?}"
         );
 
-        let present = present_request_key_filter_groups(&filters, &[cached], true);
+        let present = present_request_key_filter_groups(
+            &filters,
+            &[cached],
+            true,
+            &RequestEntryRestriction::new(&filters),
+        );
         let point_lookup_p = vec![
             col("request_path").eq(lit("/v1/items")),
             col("request_query").eq(lit("cat=p")),
@@ -5972,8 +6847,13 @@ mod tests {
             col("request_path").eq(lit("/v1/items")),
             col("request_query").in_list(vec![lit("cat=p"), lit("cat=q"), lit("cat=r")], false),
         ];
-        let groups = missing_request_key_filter_groups(&filters, &[cached], true)
-            .expect("q and r are absent");
+        let groups = missing_request_key_filter_groups(
+            &filters,
+            &[cached],
+            true,
+            &RequestEntryRestriction::new(&filters),
+        )
+        .expect("q and r are absent");
         missing_filters_are_connector_safe(&groups);
         assert_eq!(
             groups.len(),
@@ -6385,6 +7265,10 @@ mod tests {
             accelerator,
             "items".to_string(),
             Handle::current(),
+            Arc::new(RequestEntryRestriction::for_lookup(
+                &filters,
+                source.as_ref(),
+            )),
             filters,
             None,
             None,
@@ -7791,6 +8675,7 @@ mod tests {
             &in_flight_revalidations,
             &batch_write_tx,
             &CacheNamespace::Public,
+            None,
         );
         // `handle_cache_hit` clones the sender it is lent, so dropping this one
         // leaves the background refresh holding the only sender: once it has queued
@@ -7910,6 +8795,7 @@ mod tests {
                 cache_key: format!("key_{i}"),
                 namespace_id: "public".into(),
                 replaces_existing: false,
+                pages: RequestPages::Single,
             })
             .await
             .expect("to send write request");
@@ -7988,6 +8874,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -8031,6 +8918,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -8126,6 +9014,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -8176,6 +9065,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -8280,6 +9170,7 @@ mod tests {
             stale_if_error,
             max_age,
             Some(CacheFallback::Deferred {
+                restriction: Arc::new(RequestEntryRestriction::new(&[])),
                 input,
                 partition: 0,
                 context: Arc::new(TaskContext::default()),
@@ -8290,6 +9181,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -8452,6 +9344,7 @@ mod tests {
             stale_if_error,
             max_age,
             Some(CacheFallback::Deferred {
+                restriction: Arc::new(RequestEntryRestriction::new(&[])),
                 input,
                 partition: 0,
                 context: Arc::new(TaskContext::default()),
@@ -8462,6 +9355,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -8692,6 +9586,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -8789,6 +9684,7 @@ mod tests {
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
                 tokio::time::Instant::now(),
+                None,
             ),
         )
         .await
@@ -8888,6 +9784,7 @@ mod tests {
                     cache_key: key.clone(),
                     namespace_id: CacheNamespace::Public.storage_id().into(),
                     replaces_existing: false,
+                    pages: RequestPages::Single,
                 },
                 leader,
             )
@@ -8918,6 +9815,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
         let served: Vec<RecordBatch> = stream.map(|batch| batch.expect("stream")).collect().await;
@@ -8998,6 +9896,7 @@ mod tests {
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
                 tokio::time::Instant::now(),
+                None,
             )
         };
 
@@ -9084,6 +9983,7 @@ mod tests {
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
                 tokio::time::Instant::now(),
+                None,
             )
         };
 
@@ -9159,6 +10059,7 @@ mod tests {
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
                 tokio::time::Instant::now(),
+                None,
             )
         };
 
@@ -9260,6 +10161,7 @@ mod tests {
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
                 tokio::time::Instant::now(),
+                None,
             )
             .await,
         )
@@ -9384,6 +10286,7 @@ mod tests {
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
                 tokio::time::Instant::now(),
+                None,
             )
             .await,
         )
@@ -9625,6 +10528,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -9763,6 +10667,7 @@ mod tests {
             CacheNamespace::Public,
             Arc::clone(&in_flight),
             tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -9967,6 +10872,7 @@ mod tests {
             accelerator,
             "items".to_string(),
             Handle::current(),
+            Arc::new(RequestEntryRestriction::new(&filters)),
             filters,
             None,
             None,
@@ -10438,6 +11344,7 @@ mod tests {
                 accelerator,
                 "http_data".to_string(),
                 Handle::current(),
+                Arc::new(RequestEntryRestriction::new(&filters)),
                 filters.clone(),
                 None,
                 None,
@@ -10508,6 +11415,7 @@ mod tests {
                 stale_if_error: StaleIfError::Enabled,
                 max_age: Duration::ZERO,
                 expired_batches: Some(CacheFallback::Deferred {
+                    restriction: Arc::new(RequestEntryRestriction::new(&filters)),
                     input: input.into(),
                     partition: 0,
                     context: Arc::new(TaskContext::default()),
@@ -10570,6 +11478,7 @@ mod tests {
                 stale_if_error: StaleIfError::Enabled,
                 max_age: Duration::ZERO,
                 expired_batches: Some(CacheFallback::Deferred {
+                    restriction: Arc::new(RequestEntryRestriction::new(&filters)),
                     input: input.into(),
                     partition: 0,
                     context: Arc::new(TaskContext::default()),
@@ -10642,6 +11551,7 @@ mod tests {
                 Arc::clone(&accelerator) as Arc<dyn TableProvider>,
                 "test_dataset".to_string(),
                 Handle::current(),
+                Arc::new(RequestEntryRestriction::new(&filters)),
                 filters,
                 None,
                 None,
@@ -11172,6 +12082,7 @@ mod write_path_tests {
             cache_key: "key".to_string(),
             namespace_id: "public".into(),
             replaces_existing: false,
+            pages: RequestPages::Single,
         })
         .await
         .expect("send");
@@ -11205,6 +12116,7 @@ mod write_path_tests {
                 cache_key: "same-key".to_string(),
                 namespace_id: "public".into(),
                 replaces_existing: false,
+                pages: RequestPages::Single,
             })
             .await
             .expect("send");
@@ -11231,6 +12143,7 @@ mod write_path_tests {
             cache_key: "key".to_string(),
             namespace_id: "public".into(),
             replaces_existing: true,
+            pages: RequestPages::Single,
         })
         .await
         .expect("send");

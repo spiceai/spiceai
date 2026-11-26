@@ -102,7 +102,7 @@ Full workspace and release builds take 20–35 minutes. Minimize large builds:
 
 ```bash
 make install-dev        # Dev build (faster); release: make install
-SPICED_CUSTOM_FEATURES="postgres sqlite" make build-runtime
+SPICED_CUSTOM_FEATURES="postgres mysql" make build-runtime
 make test               # Unit tests
 make test-integration   # Needs credentials (.env or `spice login`)
 make lint-rust-fix      # Auto-fix lint issues

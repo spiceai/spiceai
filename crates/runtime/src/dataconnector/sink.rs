@@ -460,7 +460,7 @@ mod tests {
     fn only_cayenne_registers_a_sink_from_its_acceleration() {
         let source = SinkConnector::with_known_schema(stored_schema());
 
-        for engine in [Engine::Arrow, Engine::PartitionedArrow, Engine::Sqlite] {
+        for engine in [Engine::Arrow, Engine::PartitionedArrow] {
             assert!(
                 !registers_from_acceleration(Some(&acceleration(engine)), &source),
                 "{engine} keeps the wait-for-first-write behavior"

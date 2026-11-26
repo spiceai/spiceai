@@ -31,7 +31,7 @@ use arrow::datatypes::SchemaRef;
 use cayenne::lookup_index::{IndexPersistence, LookupIndexCounters, LookupIndexVerification};
 use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
 use cayenne::provider::CayenneContext;
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::{CayenneTableProvider, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
@@ -135,26 +135,28 @@ pub async fn open_table(
         on_conflict: spec
             .upsert_key
             .map(|key| OnConflict::Upsert(ColumnReference::new(vec![key.to_string()]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(spec.name),
         partition_column: None,
         vortex_config: spec.config,
     };
     let catalog = Arc::clone(&fixture.catalog);
     let catalog: Arc<dyn MetadataCatalog> = catalog;
-    let builder = CayenneTableProviderBuilder::new(catalog, runtime_env).with_context(context);
-    let builder = match spec.persistence {
-        Some(persistence) => builder.with_index_persistence(persistence),
-        None => builder,
-    };
+    let secondary_indexes = spec
+        .indexes
+        .iter()
+        .map(|columns| columns.iter().map(|c| (*c).to_string()).collect())
+        .collect();
     Arc::new(
-        builder
-            .with_secondary_indexes(
-                spec.indexes
-                    .iter()
-                    .map(|columns| columns.iter().map(|c| (*c).to_string()).collect())
-                    .collect(),
-            )
-            .create(options)
+        fixture
+            .data_store
+            .create_with(catalog, runtime_env, options, |builder| {
+                let builder = builder.with_context(context);
+                let builder = match spec.persistence {
+                    Some(persistence) => builder.with_index_persistence(persistence),
+                    None => builder,
+                };
+                builder.with_secondary_indexes(secondary_indexes)
+            })
             .await
             .expect("create or reopen table"),
     )

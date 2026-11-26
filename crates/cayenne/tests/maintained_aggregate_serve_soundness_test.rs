@@ -51,7 +51,7 @@ use cayenne::maintained_aggregate::{
 };
 use cayenne::metadata::{CdcDurability, CreateTableOptions, VortexConfig};
 use cayenne::optimizer_rules::CayenneMaintainedAggregateRewriter;
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, SlotAdvancer};
+use cayenne::{CayenneTableProvider, MetadataCatalog, SlotAdvancer};
 use common::TestFixture;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::session_state::SessionStateBuilder;
@@ -183,7 +183,7 @@ async fn table_in_shape(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.join(name).to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(name),
         partition_column: None,
         vortex_config: VortexConfig {
             cdc_durability: CdcDurability::Memory,
@@ -196,9 +196,11 @@ async fn table_in_shape(
     };
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-            .with_maintained_aggregates(vec![unfiltered_sum_v_by_k()])
-            .create(options)
+        fixture
+            .data_store
+            .create_with(catalog, ctx.runtime_env(), options, |builder| {
+                builder.with_maintained_aggregates(vec![unfiltered_sum_v_by_k()])
+            })
             .await?,
     );
     table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
@@ -351,6 +353,6 @@ async fn file_only_impl(fixture: TestFixture) -> TestResult<()> {
     unfiltered_view_answers_only_whole_table_queries(fixture, Shape::FileOnly).await
 }
 
-test_with_backends!(ram_only_impl);
-test_with_backends!(file_and_ram_impl);
-test_with_backends!(file_only_impl);
+test_on_data_store!(ram_only_impl);
+test_on_data_store!(file_and_ram_impl);
+test_on_data_store!(file_only_impl);

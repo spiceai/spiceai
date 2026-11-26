@@ -3174,7 +3174,8 @@ impl CayenneAccelerator {
             .with_maintained_aggregates(maintained_aggregate_specs)
             .with_durable_write_back(durable_write_back)
             .with_scan_view_reuse(scan_view_reuse)
-            .with_secondary_indexes(secondary_index_columns(source));
+            .with_secondary_indexes(secondary_index_columns(source))
+            .with_schema_indexes(&schema);
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
         }
@@ -5350,13 +5351,14 @@ impl CayenneAccelerator {
         else {
             return Ok(0);
         };
-        let prefix = object_store::path::Path::from(config.url.path().trim_matches('/'));
         let table_name = source.name().to_string();
         let removal_failed = |error: object_store::Error| Error::AccelerationDataDirRemovalFailed {
             table_name: table_name.clone(),
             data_dir: data_dir.to_string(),
             source: std::io::Error::other(error),
         };
+        let prefix = cayenne::dataset_storage::object_key_of_url(&config.url)
+            .map_err(|error| removal_failed(error.into()))?;
         let locations = config
             .store
             .list(Some(&prefix))
@@ -6515,6 +6517,34 @@ mod tests {
             assert_eq!(
                 location_datasets_url(&url, &prefix).as_deref(),
                 expected,
+                "{location}"
+            );
+        }
+    }
+
+    /// The dataset folders' URL percent-encodes each key part exactly once, so
+    /// decoding its path once (`Path::from_url_path`) gives the store's keys back.
+    #[test]
+    fn the_dataset_folders_url_encodes_each_key_once() {
+        let prefix = object_store::path::Path::parse("var/state dir/100%/cayenne/v1/datasets")
+            .expect("key prefix");
+        for (location, expected) in [
+            (
+                "s3://bucket/state/",
+                "s3://bucket/var/state%20dir/100%25/cayenne/v1/datasets",
+            ),
+            (
+                "file:///var/state/",
+                "file:///var/state%20dir/100%25/cayenne/v1/datasets",
+            ),
+        ] {
+            let url = url::Url::parse(location).expect("location URL");
+            let datasets = location_datasets_url(&url, &prefix).expect("dataset folders URL");
+            assert_eq!(datasets, expected, "{location}");
+            let parsed = url::Url::parse(&datasets).expect("dataset folders URL parses");
+            assert_eq!(
+                object_store::path::Path::from_url_path(parsed.path()).expect("object path"),
+                prefix,
                 "{location}"
             );
         }

@@ -92,7 +92,7 @@ async fn in_list_follows_sql_null_semantics_impl(fixture: TestFixture) -> TestRe
         schema: table_schema(),
         primary_key: vec!["id".to_string()],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(CAYENNE_TABLE),
         partition_column: None,
         // Every insert becomes a Vortex file, so the scan evaluates pushed predicates.
         vortex_config: VortexConfig {
@@ -101,7 +101,9 @@ async fn in_list_follows_sql_null_semantics_impl(fixture: TestFixture) -> TestRe
         },
     };
     let table = Arc::new(
-        CayenneTableProvider::create_table(Arc::clone(&catalog), options, ctx.runtime_env())
+        fixture
+            .data_store
+            .create(Arc::clone(&catalog), ctx.runtime_env(), options)
             .await?,
     );
     let inserted = common::insert_batch(table.as_ref(), rows()?).await?;
@@ -148,7 +150,7 @@ async fn in_list_follows_sql_null_semantics_impl(fixture: TestFixture) -> TestRe
     Ok(())
 }
 
-test_with_backends!(in_list_follows_sql_null_semantics_impl);
+test_on_data_store!(in_list_follows_sql_null_semantics_impl);
 
 /// Creates a file-backed table holding [`rows`], with or without a primary key.
 /// Without one the table deletes by row position, which evaluates the `DELETE`
@@ -170,15 +172,19 @@ async fn file_backed_table(
             vec![]
         },
         on_conflict: None,
-        base_path: fixture.data_path.join(name).to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(name),
         partition_column: None,
         vortex_config: VortexConfig {
             inline_max_rows: 0,
             ..VortexConfig::default()
         },
     };
-    let table =
-        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
+    let table = Arc::new(
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), options)
+            .await?,
+    );
     let inserted = common::insert_batch(table.as_ref(), rows()?).await?;
     assert_eq!(inserted, 3, "all three rows must be written");
     Ok(table)
@@ -241,4 +247,4 @@ async fn delete_with_in_list_follows_sql_null_semantics_impl(
     Ok(())
 }
 
-test_with_backends!(delete_with_in_list_follows_sql_null_semantics_impl);
+test_on_data_store!(delete_with_in_list_follows_sql_null_semantics_impl);
