@@ -397,8 +397,7 @@ pub(crate) fn replica_schema_adopted_message(dataset: &str, change: &str) -> Str
 /// replica's live schema cannot widen to.
 pub(crate) fn replica_schema_unservable_message(dataset: &str, reason: &str) -> String {
     format!(
-        "{} cannot serve the schema its writer stored ({reason}), so this instance answers no query of it until it loads the dataset again. Restart this instance to load it with the stored schema. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
-        subject(dataset)
+        "Failed to query dataset '{dataset}' (cayenne): its writer stored a schema this instance cannot widen to ({reason}), so the query fails rather than return columns that do not match it. Restart this instance to load the dataset with the stored schema. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     )
 }
 
@@ -419,7 +418,7 @@ mod replica_schema_message_tests {
                 "orders",
                 "The type of `v` changed from `Int64` to `Int32`, which is not a lossless widening"
             ),
-            "Dataset 'orders' (cayenne) cannot serve the schema its writer stored (The type of `v` changed from `Int64` to `Int32`, which is not a lossless widening), so this instance answers no query of it until it loads the dataset again. Restart this instance to load it with the stored schema. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+            "Failed to query dataset 'orders' (cayenne): its writer stored a schema this instance cannot widen to (The type of `v` changed from `Int64` to `Int32`, which is not a lossless widening), so the query fails rather than return columns that do not match it. Restart this instance to load the dataset with the stored schema. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
         );
     }
 }

@@ -835,17 +835,58 @@ async fn read_one_row(
     Ok(())
 }
 
+/// Whether every table `plan` scans still has the columns the plan was built
+/// against: the same names and types, in the same positions. A table's schema
+/// can change after a plan of it is cached, without the table being registered
+/// again: a live schema evolution from a change stream, or a replica taking up
+/// the schema its writer committed. A cached plan from before would expand
+/// `SELECT *` to the old columns, or read a widened column at its old type.
+fn plan_matches_scanned_tables(plan: &LogicalPlan) -> bool {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut matches = true;
+    let _ = plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::TableScan(scan) = node {
+            let current = scan.source.schema();
+            let planned = scan.projected_schema.fields();
+            let same = match &scan.projection {
+                Some(indices) => {
+                    indices.len() == planned.len()
+                        && indices.iter().zip(planned.iter()).all(|(&index, planned)| {
+                            current.fields().get(index).is_some_and(|field| {
+                                field.name() == planned.name()
+                                    && field.data_type() == planned.data_type()
+                            })
+                        })
+                }
+                None => {
+                    current.fields().len() == planned.len()
+                        && current.fields().iter().zip(planned.iter()).all(|(field, planned)| {
+                            field.name() == planned.name()
+                                && field.data_type() == planned.data_type()
+                        })
+                }
+            };
+            if !same {
+                matches = false;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    matches
+}
+
 fn shared_settings_recreate_message(dataset: &str, reason: &str) -> String {
     let reason = util::single_line(reason);
     format!(
-        "Failed to load dataset {dataset} (cayenne): rebuilding the acceleration ({reason}) would drop its copy in the state location, which other Spice instances may be serving. This instance does not load the dataset; the other instances keep serving its existing rows. Revert the settings change to load it again. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        "Failed to load dataset '{dataset}' (cayenne): rebuilding the acceleration ({reason}) would drop its copy in the state location, which other Spice instances may be serving. This instance does not load the dataset; the other instances keep serving its existing rows. Revert the settings change to load it again. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     )
 }
 
 fn shared_schema_recreate_message(dataset: &str, reason: &str) -> String {
     let reason = util::single_line(reason);
     format!(
-        "Failed to load dataset {dataset} (cayenne): the source schema changed in a way the acceleration cannot apply in place ({reason}), and rebuilding it would drop its copy in the state location, which other Spice instances may be serving. This instance does not load the dataset; the other instances keep serving its existing rows. Revert the source schema change to load it again. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        "Failed to load dataset '{dataset}' (cayenne): the source schema changed in a way the acceleration cannot apply in place ({reason}), and rebuilding it would drop its copy in the state location, which other Spice instances may be serving. This instance does not load the dataset; the other instances keep serving its existing rows. Revert the source schema change to load it again. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     )
 }
 
@@ -7444,8 +7485,11 @@ impl DataFusion {
             if let Some(cache) = plans_cache.as_ref()
                 && let Some(plan) = cache.get_raw_key(&cache_key.as_u64()).await
             {
-                tracing::trace!("using cached plan for {sql}");
-                return Ok(std::sync::Arc::unwrap_or_clone(plan));
+                if plan_matches_scanned_tables(&plan) {
+                    tracing::trace!("using cached plan for {sql}");
+                    return Ok(std::sync::Arc::unwrap_or_clone(plan));
+                }
+                tracing::trace!("replanning {sql}: a table it scans changed its schema");
             }
             plans_cache
         } else {
@@ -8474,9 +8518,63 @@ mod tests {
         assert!(checkpoint.is_retriable());
     }
 
+    /// A table source whose schema a test changes after a plan of it is built.
+    #[derive(Debug)]
+    struct ChangingSource(parking_lot::Mutex<SchemaRef>);
+
+    impl datafusion::logical_expr::TableSource for ChangingSource {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.0.lock())
+        }
+    }
+
+    #[test]
+    fn a_cached_plan_is_replanned_once_a_table_it_scans_changes_schema() {
+        use arrow::datatypes::{DataType, Field};
+        use datafusion::logical_expr::LogicalPlanBuilder;
+
+        let narrow = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, true),
+        ]));
+        let added = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, true),
+            Field::new("extra", DataType::Utf8, true),
+        ]));
+        let widened = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        for projection in [None, Some(vec![0, 1])] {
+            let source = Arc::new(ChangingSource(parking_lot::Mutex::new(Arc::clone(&narrow))));
+            let plan = LogicalPlanBuilder::scan(
+                "t",
+                Arc::clone(&source) as Arc<dyn datafusion::logical_expr::TableSource>,
+                projection.clone(),
+            )
+            .expect("scan")
+            .build()
+            .expect("plan");
+            assert!(plan_matches_scanned_tables(&plan), "{projection:?}: unchanged");
+
+            *source.0.lock() = Arc::clone(&widened);
+            assert!(!plan_matches_scanned_tables(&plan), "{projection:?}: widened");
+
+            *source.0.lock() = Arc::clone(&added);
+            // `SELECT *` expanded to the old columns must be replanned; a
+            // projection of the columns that kept their positions still holds.
+            assert_eq!(
+                plan_matches_scanned_tables(&plan),
+                projection.is_some(),
+                "{projection:?}: added"
+            );
+        }
+    }
+
     #[test]
     fn shared_settings_recreate_message_names_the_copy_and_recovery() {
-        let expected = "Failed to load dataset orders (cayenne): rebuilding the acceleration (on_conflict changed) would drop its copy in the state location, which other Spice instances may be serving. This instance does not load the dataset; the other instances keep serving its existing rows. Revert the settings change to load it again. See: https://spiceai.org/docs/components/data-accelerators/cayenne";
+        let expected = "Failed to load dataset 'orders' (cayenne): rebuilding the acceleration (on_conflict changed) would drop its copy in the state location, which other Spice instances may be serving. This instance does not load the dataset; the other instances keep serving its existing rows. Revert the settings change to load it again. See: https://spiceai.org/docs/components/data-accelerators/cayenne";
         assert_eq!(
             shared_settings_recreate_message("orders", "on_conflict changed"),
             expected
@@ -8493,7 +8591,7 @@ mod tests {
 
     #[test]
     fn shared_schema_recreate_message_names_the_copy_and_recovery() {
-        let expected = "Failed to load dataset orders (cayenne): the source schema changed in a way the acceleration cannot apply in place (v changed from Int32 to Utf8), and rebuilding it would drop its copy in the state location, which other Spice instances may be serving. This instance does not load the dataset; the other instances keep serving its existing rows. Revert the source schema change to load it again. See: https://spiceai.org/docs/components/data-accelerators/cayenne";
+        let expected = "Failed to load dataset 'orders' (cayenne): the source schema changed in a way the acceleration cannot apply in place (v changed from Int32 to Utf8), and rebuilding it would drop its copy in the state location, which other Spice instances may be serving. This instance does not load the dataset; the other instances keep serving its existing rows. Revert the source schema change to load it again. See: https://spiceai.org/docs/components/data-accelerators/cayenne";
         assert_eq!(
             shared_schema_recreate_message("orders", "v changed from Int32 to Utf8"),
             expected
