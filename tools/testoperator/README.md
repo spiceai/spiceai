@@ -25,6 +25,7 @@ Phases are `starting`, `preparing_source`, `waiting_for_spiced`, `running` (the 
 ## Common Options
 
 - `-p, --spicepod-path <SPICEPOD_PATH>`: Path to the `spicepod.yaml` file.
+- `-z, --spicepod-dependencies <DIR>`: The directory that holds the spicepods in the `dependencies:` list of the spicepod. Each entry loads from `<DIR>/<entry>/spicepod.yaml`. testoperator merges the dependencies into the spicepod that it gives to `spiced`. If the spicepod has a `dependencies:` list and this option is not set, the test stops with an error.
 - `-s, --spiced-path <SPICED_PATH>`: Path to the `spiced` binary, or URL to an already-running spiced instance's Flight endpoint (e.g., `http://localhost:50051` to connect to an external instance).
 - `-d, --data-dir <DATA_DIR>`: An optional data directory to symlink into the `spiced` instance.
 - `--ready-wait <WAIT TIME>`: How long to wait before spiced is ready.
@@ -320,6 +321,7 @@ The spicepod loads its own data (for example, parquet files on Hugging Face) and
 Where options are:
 
 - `--sql-pipeline <FILE_OR_SQL>`: A parameterized SQL search pipeline. When set, each query goes to `POST /v1/sql` with this SQL, not to `POST /v1/search`. The value is a path to a file that exists, or the SQL text. A value that ends with `.sql` or has no whitespace must be a file. Thus, a mistyped path fails with `SQL pipeline file not found`, and does not run as SQL.
+- `-z, --spicepod-dependencies <DIR>`: The directory that holds the spicepods in the `dependencies:` list of the spicepod (refer to [Common Options](#common-options)). The required tables can come from a dependency.
 
 A SQL pipeline can use these named parameters:
 
@@ -348,6 +350,22 @@ testoperator run search -p spicepod.yaml \
 
 > [!NOTE]
 > Search table functions (`text_search`, `vector_search`, `rrf`) do not accept parameters as arguments yet (#15046). Until that is fixed, a pipeline can use parameters only in other positions, for example in `WHERE` and `LIMIT`.
+
+A spicepod that gets its tables from other spicepods lists them in `dependencies:`. Give the directory that holds them:
+
+```bash
+testoperator run search -p search/root.yaml --spicepod-dependencies search/spicepods
+```
+
+A `search` entry in a dispatch config (`dispatch/search/`) sets the same values with these fields. `testoperator dispatch` sends each field as an input of `.github/workflows/testoperator_run_search.yml`. Paths are relative to the repository root.
+
+| Field | Option |
+|---|---|
+| `spicepod_path` | `--spicepod-path` |
+| `sql_pipeline` | `--sql-pipeline` |
+| `spicepod_dependencies` | `--spicepod-dependencies` |
+
+The workflow also validates each `spicepod.yaml` under `spicepod_dependencies`, and downloads the Hugging Face files that they read, as it does for the spicepod.
 
 ### Running Text-to-SQL tests
 

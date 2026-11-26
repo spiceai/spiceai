@@ -249,3 +249,161 @@ fn print_retrieval_metrics_table(metrics_by_k: &BTreeMap<usize, RetrievalMetrics
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    use clap::Parser;
+    use test_framework::{gh_utils::map_numbers_to_strings, utils::scan_directory_for_yamls};
+
+    use super::{load_search_method, spicepod::validate_required_tables};
+    use crate::{
+        args::{
+            SearchTestArgs,
+            dispatch::{DispatchTestFile, SearchArgs},
+        },
+        commands::load_app,
+    };
+
+    /// The `testoperator run search` arguments that `testoperator_run_search.yml` builds from a
+    /// dispatch entry. Paths resolve against `repo_root`, as the workflow resolves them against
+    /// its checkout.
+    fn run_search_args(entry: &SearchArgs, repo_root: &Path) -> SearchTestArgs {
+        // The workflow inputs, exactly as `testoperator dispatch` sends them.
+        let inputs = map_numbers_to_strings(
+            serde_json::to_value(entry).expect("should serialize the search inputs"),
+        );
+        let input = |name: &str| inputs.get(name).and_then(serde_json::Value::as_str);
+
+        let spicepod_path = input("spicepod_path").expect("spicepod_path is a required input");
+        let mut command_line: Vec<OsString> = vec![
+            "testoperator".into(),
+            "--spicepod-path".into(),
+            repo_root.join(spicepod_path).into(),
+        ];
+        if let Some(dependencies) = input("spicepod_dependencies") {
+            command_line.push("--spicepod-dependencies".into());
+            command_line.push(repo_root.join(dependencies).into());
+        }
+        if let Some(sql_pipeline) = input("sql_pipeline") {
+            // A file path is relative to the checkout; SQL text passes as is.
+            let file = repo_root.join(sql_pipeline);
+            command_line.push("--sql-pipeline".into());
+            command_line.push(if file.is_file() {
+                file.into()
+            } else {
+                sql_pipeline.into()
+            });
+        }
+
+        SearchTestArgs::try_parse_from(command_line)
+            .unwrap_or_else(|e| panic!("should translate to testoperator arguments: {e}"))
+    }
+
+    /// Each search dispatch entry translates to `testoperator run search` arguments, and its
+    /// spicepod (dependencies included) loads with the tables the harness queries. A broken
+    /// entry fails here instead of in the scheduled run.
+    #[tokio::test]
+    async fn search_dispatches_translate_and_load() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let dispatch_directory = repo_root.join("tools/testoperator/dispatch/search");
+        let mut checked = 0;
+        for dispatch_path in scan_directory_for_yamls(&dispatch_directory)
+            .expect("should scan the search dispatch directory")
+        {
+            let dispatch_name = dispatch_path.display();
+            let dispatch_file =
+                std::fs::File::open(&dispatch_path).expect("should open the dispatch file");
+            let dispatch: DispatchTestFile =
+                yaml::from_reader(dispatch_file).expect("should parse the dispatch file");
+            for entry in &dispatch.tests.search {
+                let args = run_search_args(entry, &repo_root);
+                load_search_method(args.sql_pipeline.as_ref())
+                    .unwrap_or_else(|e| panic!("{dispatch_name}: {e}"));
+                let app = load_app(&args.common).await.unwrap_or_else(|e| {
+                    panic!(
+                        "{dispatch_name} should load {}: {e:#}",
+                        entry.spicepod_path.display()
+                    )
+                });
+                validate_required_tables(&app).unwrap_or_else(|e| panic!("{dispatch_name}: {e}"));
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "should find search dispatch entries");
+    }
+
+    /// A temporary repository with a root spicepod that gets its search tables from one
+    /// dependency under `spicepods/`.
+    fn write_spicepod_with_dependency() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "testoperator-search-dependencies-{}",
+            std::process::id()
+        ));
+        let dependency = root.join("spicepods/data/search");
+        std::fs::create_dir_all(&dependency).expect("create temp dirs");
+        std::fs::write(
+            root.join("root.yaml"),
+            "version: v1\nkind: Spicepod\nname: root\ndependencies:\n  - data/search\n",
+        )
+        .expect("write root spicepod");
+        std::fs::write(
+            dependency.join("spicepod.yaml"),
+            "version: v1
+kind: Spicepod
+name: search-data
+datasets:
+  - from: file:corpus.parquet
+    name: corpus
+  - from: file:test_queries.parquet
+    name: test_queries
+  - from: file:relevance_data.parquet
+    name: relevance_data
+",
+        )
+        .expect("write dependency spicepod");
+        root
+    }
+
+    #[tokio::test]
+    async fn search_dispatch_entry_loads_spicepod_dependencies() {
+        let repo_root = write_spicepod_with_dependency();
+        let dispatch: DispatchTestFile = yaml::from_str(
+            "
+tests:
+  search:
+    spicepod_path: root.yaml
+    runner_type: spiceai-dev-runners
+    spicepod_dependencies: spicepods
+",
+        )
+        .expect("should parse the dispatch file");
+        let mut entry = dispatch.tests.search[0].clone();
+
+        let args = run_search_args(&entry, &repo_root);
+        let app = load_app(&args.common)
+            .await
+            .unwrap_or_else(|e| panic!("should load the dependency: {e:#}"));
+        validate_required_tables(&app).expect("the dependency defines the search tables");
+
+        // Without the directory, the dependency cannot load: fail and say how to fix it.
+        entry.spicepod_dependencies = None;
+        let args = run_search_args(&entry, &repo_root);
+        let err = load_app(&args.common)
+            .await
+            .expect_err("a spicepod with dependencies needs --spicepod-dependencies");
+        let message = err.to_string();
+        assert!(
+            message.contains("data/search"),
+            "error must name the dependency: {message}"
+        );
+        assert!(
+            message.contains("--spicepod-dependencies"),
+            "error must name the flag: {message}"
+        );
+
+        let _ = std::fs::remove_dir_all(repo_root);
+    }
+}

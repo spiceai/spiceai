@@ -28,8 +28,8 @@ use test_framework::{
     opentelemetry_sdk::Resource,
     queries::{Query, QuerySet},
     spiced::{SpicedInstance, StartRequest},
-    spicepod::Spicepod,
     spicepod::component::dataset::CheckAvailability,
+    spicepod::{Spicepod, dependency::Dependency},
     spicepod_utils::from_app,
     spicetest::datasets::NotStarted,
     telemetry::{OtlpExporterConfig, Telemetry},
@@ -431,13 +431,33 @@ pub(crate) async fn load_app(args: &CommonArgs) -> anyhow::Result<App> {
     // Resolve dependencies up-front from the original list, then strip them
     // before handing the spicepod to the builder — otherwise the App carries a
     // dangling `dependencies:` list that no longer matches what got loaded.
-    let mut dependencies = Vec::new();
-    if let Some(dependencies_root) = &args.spicepod_dependencies {
-        for dependency in &spicepod.dependencies {
-            dependencies.push(Spicepod::load(&dependencies_root.join(dependency.from())).await?);
+    // spiced gets only the merged spicepod, so a dependency testoperator does
+    // not load is lost: fail rather than run without its components.
+    let declared = std::mem::take(&mut spicepod.dependencies);
+    let mut dependencies = Vec::with_capacity(declared.len());
+    if !declared.is_empty() {
+        let Some(dependencies_root) = &args.spicepod_dependencies else {
+            let names: Vec<&str> = declared.iter().map(Dependency::from).collect();
+            anyhow::bail!(
+                "{} lists dependencies ({}), but --spicepod-dependencies is not set. \
+                Set --spicepod-dependencies <DIR> to the directory that holds them.",
+                args.spicepod_path.display(),
+                names.join(", ")
+            );
+        };
+        for dependency in &declared {
+            let path = dependencies_root.join(dependency.from());
+            let dependent_spicepod = Spicepod::load(&path).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to load dependency {} of {} from {}: {e}",
+                    dependency.from(),
+                    args.spicepod_path.display(),
+                    path.display()
+                )
+            })?;
+            dependencies.push(dependent_spicepod);
         }
     }
-    spicepod.dependencies = vec![];
 
     let mut app_builder = AppBuilder::new(spicepod.name.clone()).with_spicepod(spicepod);
     for dependent_spicepod in dependencies {

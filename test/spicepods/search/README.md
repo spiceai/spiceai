@@ -115,3 +115,9 @@ a view.
 
 Id columns may be `Utf8`, `LargeUtf8`, or an integer type. Use `views:` to map real column names
 onto these names. See [`custom/example.yaml`](./custom/example.yaml) for a template.
+
+The tables can come from other spicepods that the spicepod lists in `dependencies:`. Then give the
+directory that holds them with `--spicepod-dependencies <DIR>`, or with the `spicepod_dependencies`
+field of a dispatch entry. Each entry loads from `<DIR>/<entry>/spicepod.yaml`. If the spicepod has
+a `dependencies:` list and the directory is not set, the test stops with an error. Refer to
+[the testoperator README](../../../tools/testoperator/README.md#running-search-tests).

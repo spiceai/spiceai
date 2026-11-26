@@ -432,6 +432,10 @@ pub struct SearchArgs {
     /// it. Omitted to search through `POST /v1/search`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sql_pipeline: Option<String>,
+    /// Directory that holds the spicepods named in the spicepod's `dependencies:` list, as
+    /// `--spicepod-dependencies` takes it. Relative to the repository root, like `spicepod_path`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spicepod_dependencies: Option<PathBuf>,
 }
 
 /// Schema test workflow arguments, defined in the test files
@@ -1300,6 +1304,50 @@ tests:
         let serialized =
             serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
         assert_eq!(serialized["sql_pipeline"], sql);
+    }
+
+    #[test]
+    fn test_search_section_spicepod_dependencies_round_trip() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/example/root.yaml
+    runner_type: spiceai-dev-runners
+    spicepod_dependencies: test/spicepods/search/example/spicepods
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+        assert_eq!(
+            test_file.tests.search[0].spicepod_dependencies.as_deref(),
+            Some(std::path::Path::new(
+                "test/spicepods/search/example/spicepods"
+            ))
+        );
+
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(
+            serialized["spicepod_dependencies"],
+            "test/spicepods/search/example/spicepods"
+        );
+    }
+
+    #[test]
+    fn test_search_section_omits_unset_spicepod_dependencies() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-cayenne[file].yaml
+    runner_type: spiceai-dev-runners
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+        assert_eq!(test_file.tests.search[0].spicepod_dependencies, None);
+
+        // An unset field must not become a workflow input.
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert!(serialized.get("spicepod_dependencies").is_none());
     }
 
     #[test]

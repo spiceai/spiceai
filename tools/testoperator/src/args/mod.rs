@@ -98,7 +98,9 @@ pub struct CommonArgs {
     #[arg(short('p'), long, default_value = "spicepod.yaml")]
     pub(crate) spicepod_path: PathBuf,
 
-    #[arg(short('z'), long)]
+    /// Directory that holds the spicepods named in the spicepod's `dependencies:` list. Each
+    /// entry loads from `<DIR>/<entry>`. Required when the spicepod lists dependencies.
+    #[arg(short('z'), long, value_name = "DIR")]
     pub(crate) spicepod_dependencies: Option<PathBuf>,
 
     /// The number of clients to run simultaneously. Each client will send a query, wait for a response, then send another query.
