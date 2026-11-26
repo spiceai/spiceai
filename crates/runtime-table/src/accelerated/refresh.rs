@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -55,7 +56,7 @@ use tokio::select;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{RwLock, Semaphore};
-use tokio::time::sleep;
+use tokio::time::{Instant, Sleep, sleep};
 use tokio_util::sync::CancellationToken;
 
 // The refresh-SQL types travel with their parser in `runtime-datafusion`: the
@@ -1689,18 +1690,26 @@ impl Refresher {
             }
         };
         Ok(Some(tokio::spawn(async move {
-            let mut next_scheduled_refresh_timer = initial_refresh_delay.map(&schedule_refresh);
+            let mut next_scheduled_refresh_timer: Option<Pin<Box<Sleep>>> =
+                initial_refresh_delay.map(|delay| Box::pin(schedule_refresh(delay)));
+            // An external trigger waiting out its jitter, with its overrides. The loop keeps
+            // serving timers, triggers and completions while it waits.
+            let mut delayed_trigger: Option<(Pin<Box<Sleep>>, Option<RefreshOverrides>)> = None;
 
             loop {
                 let scheduled_refresh_future: BoxFuture<()> =
-                    if let Some(timer) = next_scheduled_refresh_timer.take() {
-                        Box::pin(timer)
-                    } else {
-                        Box::pin(std::future::pending())
+                    match next_scheduled_refresh_timer.as_mut() {
+                        Some(timer) => Box::pin(timer.as_mut()),
+                        None => Box::pin(std::future::pending()),
                     };
+                let delayed_trigger_due: BoxFuture<()> = match delayed_trigger.as_mut() {
+                    Some((due, _)) => Box::pin(due.as_mut()),
+                    None => Box::pin(std::future::pending()),
+                };
 
                 select! {
                     () = scheduled_refresh_future => {
+                        next_scheduled_refresh_timer = None;
                         tracing::debug!("Starting scheduled refresh");
                         let request_id = issue_refresh_request(refresh_completion.as_ref());
                         if let Err(err) = start_refresh.send((request_id, None)).await {
@@ -1714,13 +1723,24 @@ impl Refresher {
                         // is added to the timer, `next_scheduled_refresh_timer`.
                         let override_jitter = overrides_opt.as_ref().and_then(|o| o.max_jitter);
                         let delay = Self::compute_delay(Duration::ZERO, override_jitter.or(max_jitter));
-                        // An external trigger replaces the interval timer. Retain its
-                        // due time until completion, including when it has no jitter.
-                        refresh_status.record_dataset_next_refresh(&dataset_name, SystemTime::now() + delay);
-                        if !delay.is_zero() {
-                            sleep(delay).await;
+                        let mut due = Box::pin(sleep(delay));
+                        // A trigger replaces one still waiting out its jitter, overrides included,
+                        // and starts no later than it, so a caller waiting on either is answered
+                        // by its refresh.
+                        if let Some((earlier, _)) = delayed_trigger.take()
+                            && earlier.deadline() < due.deadline()
+                        {
+                            due = earlier;
                         }
-
+                        let next_due = earliest_due(&due, next_scheduled_refresh_timer.as_deref());
+                        refresh_status.record_dataset_next_refresh(&dataset_name, system_time_at(next_due));
+                        delayed_trigger = Some((due, overrides_opt));
+                    },
+                    () = delayed_trigger_due => {
+                        // An external trigger's refresh replaces the interval timer, which
+                        // restarts when the refresh completes.
+                        next_scheduled_refresh_timer = None;
+                        let overrides_opt = delayed_trigger.take().and_then(|(_, overrides)| overrides);
                         // Numbered here rather than at the trigger: a caller
                         // takes its waiter before triggering, so an id issued
                         // now is one the waiter has not seen and a refresh
@@ -1811,16 +1831,21 @@ impl Refresher {
                         // Restart periodic refresh timer (after either cron or manual dataset refresh).
                         // For datasets with no periodic refresh, this will be a no-op. The next
                         // refresh is due an interval after the last successful one, so a failed
-                        // refresh retries on the timer but leaves the recorded due time, now past.
-                        if refresh_check_interval.is_none() && refresh_succeeded {
+                        // refresh retries on the timer but leaves the recorded due time, now past,
+                        // unless a trigger waits out its jitter.
+                        if refresh_check_interval.is_none() && refresh_succeeded && delayed_trigger.is_none() {
                             refresh_status.clear_dataset_next_refresh(&dataset_name);
                         }
                         if let Some(refresh_check_interval) = refresh_check_interval {
-                            next_scheduled_refresh_timer = Some(if refresh_succeeded {
+                            next_scheduled_refresh_timer = Some(Box::pin(if refresh_succeeded {
                                 schedule_refresh(refresh_check_interval)
                             } else {
                                 sleep(Self::compute_delay(refresh_check_interval, max_jitter))
-                            });
+                            }));
+                        }
+                        if let Some((due, _)) = &delayed_trigger {
+                            let next_due = earliest_due(due, next_scheduled_refresh_timer.as_deref());
+                            refresh_status.record_dataset_next_refresh(&dataset_name, system_time_at(next_due));
                         }
                     }
                 }
@@ -2041,6 +2066,19 @@ fn retry_is_scheduled(
 /// unused and any value will do.
 fn issue_refresh_request(refresh_completion: Option<&RefreshCompletion>) -> RefreshRequestId {
     refresh_completion.map_or(0, RefreshCompletion::issue)
+}
+
+/// The due time recorded while a trigger waits out its jitter: the earlier of the
+/// trigger's and the interval timer's.
+fn earliest_due(trigger: &Sleep, timer: Option<&Sleep>) -> Instant {
+    timer.map_or(trigger.deadline(), |timer| {
+        timer.deadline().min(trigger.deadline())
+    })
+}
+
+/// The wall-clock time of a timer's `deadline`.
+fn system_time_at(deadline: Instant) -> SystemTime {
+    SystemTime::now() + deadline.saturating_duration_since(Instant::now())
 }
 
 /// Publishes `at` as `dataset_name`'s last refresh time, with the labels a completed
@@ -2709,6 +2747,19 @@ mod tests {
         mpsc::Sender<Option<RefreshOverrides>>,
         Option<tokio::task::JoinHandle<()>>,
     ) {
+        started_refresher(status, Refresh::new(RefreshMode::Full)).await
+    }
+
+    /// [`started_full_refresher`] with the given refresh settings.
+    async fn started_refresher(
+        status: Arc<status::RuntimeStatus>,
+        refresh: Refresh,
+    ) -> (
+        Arc<Refresher>,
+        RefreshCompletion,
+        mpsc::Sender<Option<RefreshOverrides>>,
+        Option<tokio::task::JoinHandle<()>>,
+    ) {
         let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
             "time_in_string",
             DataType::Utf8,
@@ -2732,7 +2783,7 @@ mod tests {
             TableReference::bare("test"),
             federated,
             Some("mem_table".to_string()),
-            Arc::new(RwLock::new(Refresh::new(RefreshMode::Full))),
+            Arc::new(RwLock::new(refresh)),
             accelerator,
             None,
             None,
@@ -2753,6 +2804,73 @@ mod tests {
             trigger,
             refresh_handle,
         )
+    }
+
+    #[tokio::test]
+    async fn a_trigger_waiting_out_its_jitter_does_not_hold_back_later_triggers() {
+        let (_refresher, completion, trigger, handle) =
+            started_full_refresher(status::RuntimeStatus::new()).await;
+        let jittered = Some(RefreshOverrides {
+            sql: None,
+            mode: None,
+            max_jitter: Some(Duration::from_secs(3600)),
+        });
+        timeout(Duration::from_secs(10), async {
+            // A trigger waits out its jitter half the time, so some of these wait.
+            for _ in 0..20 {
+                trigger
+                    .send(jittered.clone())
+                    .await
+                    .expect("refresher takes the trigger");
+            }
+            let refreshed = completion.next();
+            trigger
+                .send(None)
+                .await
+                .expect("refresher takes the trigger");
+            assert_eq!(
+                refreshed.wait().await,
+                crate::accelerated::refresh_completion::RefreshCompletionOutcome::Answered
+            );
+        })
+        .await
+        .expect("a trigger without jitter refreshes while earlier ones wait out theirs");
+        if let Some(handle) = handle {
+            handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn interval_refreshes_continue_while_a_trigger_waits_out_its_jitter() {
+        let (_refresher, completion, trigger, handle) = started_refresher(
+            status::RuntimeStatus::new(),
+            Refresh::new(RefreshMode::Full).check_interval(Duration::from_millis(100)),
+        )
+        .await;
+        let jittered = Some(RefreshOverrides {
+            sql: None,
+            mode: None,
+            max_jitter: Some(Duration::from_secs(3600)),
+        });
+        timeout(Duration::from_secs(10), async {
+            // A trigger waits out its jitter half the time; a refresh must still land after
+            // each one.
+            for _ in 0..10 {
+                trigger
+                    .send(jittered.clone())
+                    .await
+                    .expect("refresher takes the trigger");
+                assert_eq!(
+                    completion.next().wait().await,
+                    crate::accelerated::refresh_completion::RefreshCompletionOutcome::Answered
+                );
+            }
+        })
+        .await
+        .expect("interval refreshes land while a trigger waits out its jitter");
+        if let Some(handle) = handle {
+            handle.abort();
+        }
     }
 
     #[tokio::test]

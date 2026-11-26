@@ -514,6 +514,8 @@ pub(crate) async fn refresh(
     }
 
     let table_ref = TableReference::parse_str(name);
+    // Not held while the refresh is queued: a spicepod reload waits for the write lock.
+    drop(app_lock);
 
     match df.refresh_table(&table_ref, overrides).await {
         Ok(_) => (
