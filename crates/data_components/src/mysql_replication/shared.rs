@@ -1957,38 +1957,44 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                     item
                 }
                 Err(_idle) => {
+                    let mut source_reachable = true;
                     if silent_since.elapsed() >= silence_limit {
                         let gone = tokio::select! {
                             gone = dump_gone(&source, &mut side_conn, &params, &dump_identity) => gone,
                             () = crate::cdc::shutdown_signalled(shutdown_epoch) => continue 'recv,
                         };
-                        if gone == Some(true) {
-                            note_connection_lost(
-                                &source,
-                                &mut reconnect_attempts,
-                                &connection,
-                                &format!(
-                                    "nothing arrived for {}s and the source no longer runs this binlog dump",
-                                    silent_since.elapsed().as_secs()
-                                ),
-                                &mut backoff,
-                            );
-                            break 'recv;
-                        }
-                        // If the source could not be asked, retry next tick.
-                        if gone == Some(false) {
-                            silent_since = Instant::now();
+                        match gone {
+                            Some(true) => {
+                                note_connection_lost(
+                                    &source,
+                                    &mut reconnect_attempts,
+                                    &connection,
+                                    &format!(
+                                        "nothing arrived for {}s and the source no longer runs this binlog dump",
+                                        silent_since.elapsed().as_secs()
+                                    ),
+                                    &mut backoff,
+                                );
+                                break 'recv;
+                            }
+                            Some(false) => silent_since = Instant::now(),
+                            // Ask again next tick; skip the head poll, which
+                            // could not reach the source either.
+                            None => source_reachable = false,
                         }
                     }
                     if last_persist_at.elapsed() >= params.checkpoint_interval {
                         persist_all(&source, &mut last_persisted).await;
                         last_persist_at = Instant::now();
                     }
-                    tokio::select! {
-                        () = poll_head_and_heartbeat(&source, &mut side_conn, &params) => {}
-                        () = crate::cdc::shutdown_signalled(shutdown_epoch) => continue 'recv,
+                    if source_reachable {
+                        crate::cdc::until_shutdown(
+                            shutdown_epoch,
+                            poll_head_and_heartbeat(&source, &mut side_conn, &params),
+                        )
+                        .await;
+                        last_heartbeat_at = Instant::now();
                     }
-                    last_heartbeat_at = Instant::now();
                     continue 'recv;
                 }
             };
@@ -2357,10 +2363,11 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
             // publish head/lag metrics and fan a readiness heartbeat here too,
             // throttled to the idle-tick cadence.
             if last_heartbeat_at.elapsed() >= idle_tick {
-                tokio::select! {
-                    () = poll_head_and_heartbeat(&source, &mut side_conn, &params) => {}
-                    () = crate::cdc::shutdown_signalled(shutdown_epoch) => continue 'recv,
-                }
+                crate::cdc::until_shutdown(
+                    shutdown_epoch,
+                    poll_head_and_heartbeat(&source, &mut side_conn, &params),
+                )
+                .await;
                 last_heartbeat_at = Instant::now();
             }
         } // 'recv
@@ -3025,23 +3032,10 @@ async fn dump_gone(
         params,
         "dump liveness query",
         DUMP_LIVENESS_TIMEOUT,
-        async |conn| -> std::result::Result<bool, mysql_async::Error> {
-            // Users see their own threads without a `PROCESS` grant. The
-            // command filter ignores the id if a non-dump connection reuses it.
-            let (server_id, dumps_with_id) = conn
-                .exec_first::<(u64, u64), _, _>(
-                    "SELECT @@server_id, (SELECT COUNT(*) FROM information_schema.PROCESSLIST \
-                     WHERE ID = ? AND COMMAND LIKE 'Binlog Dump%')",
-                    (dump.thread_id,),
-                )
-                .await?
-                .ok_or_else(|| mysql_async::Error::Other("the source answered no row".into()))?;
-            let uptime_secs = conn
-                .query_first::<(String, u64), _>("SHOW GLOBAL STATUS LIKE 'Uptime'")
-                .await?
-                .map(|(_, secs)| secs)
-                .ok_or_else(|| mysql_async::Error::Other("the source answered no uptime".into()))?;
-            Ok(dump.is_gone(server_id, Duration::from_secs(uptime_secs), dumps_with_id))
+        async |conn| {
+            super::setup::fetch_dump_status(conn, dump.thread_id)
+                .await
+                .map(|status| dump.is_gone(status.server_id, status.uptime, status.dumps_with_id))
         },
     )
     .await

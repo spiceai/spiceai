@@ -243,7 +243,7 @@ pub(super) struct OpenedDump {
 }
 
 /// Identifies a dump on its source.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) struct DumpIdentity {
     /// Connection id of the dump, as shown in the source's process list.
     pub thread_id: u64,

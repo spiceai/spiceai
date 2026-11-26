@@ -14,23 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! A TCP proxy that simulates a source closing a connection while the network
-//! drops its packets, so the client never learns of the close. Toxiproxy cannot
-//! model this: its timeout toxic delivers the close once the toxic is removed.
-//!
-//! It does not model TCP retransmission or `net_write_timeout`: during a
-//! partition it holds what each side sends, up to [`HOLD_LIMIT`] per direction,
-//! and then stops reading that side.
+//! A TCP proxy that holds traffic during a partition and hides upstream closes
+//! from the client. It holds up to [`HOLD_LIMIT`] per direction before it stops
+//! reading, and does not model TCP retransmission or backpressure.
 
 use std::future::pending;
 use std::io;
 use std::net::SocketAddr;
-#[cfg(test)]
 use std::sync::Arc;
-#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -38,13 +31,14 @@ use tokio::task::{JoinHandle, JoinSet};
 
 /// Bytes held per direction during a partition before the proxy stops reading.
 const HOLD_LIMIT: usize = 1 << 20;
+const BUFFER_CAPACITY: usize = 64 << 10;
 
 /// A loopback listener that can black-hole the path to `upstream`.
 pub struct PartitionProxy {
     address: SocketAddr,
     partitioned: watch::Sender<bool>,
-    task: Mutex<Option<JoinHandle<()>>>,
-    #[cfg(test)]
+    task: JoinHandle<()>,
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by proxy tests"))]
     severed: Arc<AtomicUsize>,
 }
 
@@ -53,22 +47,17 @@ impl PartitionProxy {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
         let address = listener.local_addr()?;
         let (partitioned, partition_rx) = watch::channel(false);
-        #[cfg(test)]
         let severed = Arc::new(AtomicUsize::new(0));
-        #[cfg(test)]
         let task = tokio::spawn(accept_connections(
             listener,
             upstream,
             partition_rx,
             Arc::clone(&severed),
         ));
-        #[cfg(not(test))]
-        let task = tokio::spawn(accept_connections(listener, upstream, partition_rx));
         Ok(Self {
             address,
             partitioned,
-            task: Mutex::new(Some(task)),
-            #[cfg(test)]
+            task,
             severed,
         })
     }
@@ -81,12 +70,8 @@ impl PartitionProxy {
         self.partitioned.send_replace(partitioned);
     }
 
-    pub async fn stop(&self) {
-        let task = self.task.lock().take();
-        if let Some(task) = task {
-            task.abort();
-            let _ = task.await;
-        }
+    pub fn stop(&self) {
+        self.task.abort();
     }
 
     #[cfg(test)]
@@ -97,9 +82,7 @@ impl PartitionProxy {
 
 impl Drop for PartitionProxy {
     fn drop(&mut self) {
-        if let Some(task) = self.task.get_mut().take() {
-            task.abort();
-        }
+        self.task.abort();
     }
 }
 
@@ -107,7 +90,7 @@ async fn accept_connections(
     listener: TcpListener,
     upstream: SocketAddr,
     partitioned: watch::Receiver<bool>,
-    #[cfg(test)] severed: Arc<AtomicUsize>,
+    severed: Arc<AtomicUsize>,
 ) {
     let mut connections = JoinSet::new();
     loop {
@@ -119,21 +102,12 @@ async fn accept_connections(
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     continue;
                 };
-                connections.spawn(Connection {
+                connections.spawn(Connection::new(
                     client,
-                    upstream_address: upstream,
-                    upstream: None,
-                    partitioned: partitioned.clone(),
-                    from_client: Vec::new(),
-                    from_client_offset: 0,
-                    from_upstream: Vec::new(),
-                    from_upstream_offset: 0,
-                    client_state: SideState::Open,
-                    upstream_state: SideState::Open,
-                    severed: false,
-                    #[cfg(test)]
-                    severed_count: Arc::clone(&severed),
-                }.run());
+                    upstream,
+                    partitioned.clone(),
+                    Arc::clone(&severed),
+                ).run());
             }
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
@@ -152,7 +126,6 @@ struct Connection {
     client_state: SideState,
     upstream_state: SideState,
     severed: bool,
-    #[cfg(test)]
     severed_count: Arc<AtomicUsize>,
 }
 
@@ -164,6 +137,28 @@ enum SideState {
 }
 
 impl Connection {
+    fn new(
+        client: TcpStream,
+        upstream_address: SocketAddr,
+        partitioned: watch::Receiver<bool>,
+        severed_count: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            client,
+            upstream_address,
+            upstream: None,
+            partitioned,
+            from_client: Vec::with_capacity(BUFFER_CAPACITY),
+            from_client_offset: 0,
+            from_upstream: Vec::with_capacity(BUFFER_CAPACITY),
+            from_upstream_offset: 0,
+            client_state: SideState::Open,
+            upstream_state: SideState::Open,
+            severed: false,
+            severed_count,
+        }
+    }
+
     async fn run(mut self) {
         loop {
             if *self.partitioned.borrow() {
@@ -228,10 +223,6 @@ impl Connection {
                     }
                 }
             }
-            if self.severed {
-                self.from_upstream.clear();
-                self.from_upstream_offset = 0;
-            }
         }
     }
 
@@ -242,7 +233,11 @@ impl Connection {
         let Some(upstream) = &self.upstream else {
             return;
         };
+        // A close behind more than `HOLD_LIMIT` of data reaches the client.
         let severed = loop {
+            if self.from_upstream.len() >= HOLD_LIMIT {
+                break false;
+            }
             match upstream.try_read_buf(&mut self.from_upstream) {
                 Ok(0) => break true,
                 Ok(_) => {}
@@ -257,7 +252,8 @@ impl Connection {
 
     fn mark_severed(&mut self) {
         self.severed = true;
-        #[cfg(test)]
+        self.from_upstream.clear();
+        self.from_upstream_offset = 0;
         self.severed_count.fetch_add(1, Ordering::Release);
     }
 
@@ -308,56 +304,30 @@ impl Connection {
             biased;
             changed = self.partitioned.changed() => changed.is_ok(),
             ready = upstream.writable(), if !self.from_client.is_empty() => {
-                if ready.is_err() {
-                    reset(&self.client);
-                    return false;
-                }
-                if flush(upstream, &mut self.from_client, &mut self.from_client_offset).is_closed() {
+                if flush_ready(&ready, upstream, &mut self.from_client, &mut self.from_client_offset) {
                     reset(&self.client);
                     return false;
                 }
                 true
             }
             ready = self.client.writable(), if !self.from_upstream.is_empty() => {
-                if ready.is_err() {
-                    reset(upstream);
-                    return false;
-                }
-                if flush(&self.client, &mut self.from_upstream, &mut self.from_upstream_offset).is_closed() {
+                if flush_ready(&ready, &self.client, &mut self.from_upstream, &mut self.from_upstream_offset) {
                     reset(upstream);
                     return false;
                 }
                 true
             }
             ready = self.client.readable(), if self.client_state == SideState::Open && self.from_client.is_empty() => {
-                if ready.is_err() {
+                if read_ready(ready, &self.client, &mut self.from_client, &mut self.client_state).is_err() {
                     reset(upstream);
                     return false;
-                }
-                match self.client.try_read_buf(&mut self.from_client) {
-                    Ok(0) => self.client_state = SideState::Eof,
-                    Ok(_) => {}
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(_) => {
-                        reset(upstream);
-                        return false;
-                    }
                 }
                 true
             }
             ready = upstream.readable(), if self.upstream_state == SideState::Open && self.from_upstream.is_empty() => {
-                if ready.is_err() {
+                if read_ready(ready, upstream, &mut self.from_upstream, &mut self.upstream_state).is_err() {
                     reset(&self.client);
                     return false;
-                }
-                match upstream.try_read_buf(&mut self.from_upstream) {
-                    Ok(0) => self.upstream_state = SideState::Eof,
-                    Ok(_) => {}
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(_) => {
-                        reset(&self.client);
-                        return false;
-                    }
                 }
                 true
             }
@@ -372,31 +342,45 @@ async fn read_connected(stream: Option<&mut TcpStream>, held: &mut Vec<u8>) -> i
     }
 }
 
-enum Flush {
-    Progress,
-    Closed,
+fn flush_ready(
+    ready: &io::Result<()>,
+    stream: &TcpStream,
+    held: &mut Vec<u8>,
+    offset: &mut usize,
+) -> bool {
+    ready.is_err() || flush(stream, held, offset)
 }
 
-impl Flush {
-    fn is_closed(&self) -> bool {
-        matches!(self, Self::Closed)
-    }
-}
-
-fn flush(stream: &TcpStream, held: &mut Vec<u8>, offset: &mut usize) -> Flush {
+fn flush(stream: &TcpStream, held: &mut Vec<u8>, offset: &mut usize) -> bool {
     match stream.try_write(&held[*offset..]) {
-        Ok(0) => Flush::Closed,
+        Ok(0) => true,
         Ok(written) => {
             *offset += written;
             if *offset == held.len() {
                 held.clear();
                 *offset = 0;
             }
-            Flush::Progress
+            false
         }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Flush::Progress,
-        Err(_) => Flush::Closed,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => false,
+        Err(_) => true,
     }
+}
+
+fn read_ready(
+    ready: io::Result<()>,
+    stream: &TcpStream,
+    held: &mut Vec<u8>,
+    state: &mut SideState,
+) -> io::Result<()> {
+    ready?;
+    match stream.try_read_buf(held) {
+        Ok(0) => *state = SideState::Eof,
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
 }
 
 fn reset(stream: &TcpStream) {
@@ -462,7 +446,7 @@ mod tests {
             .expect("read through proxy");
         assert_eq!(&response, b"world");
         within(server).await.expect("server task");
-        proxy.stop().await;
+        proxy.stop();
     }
 
     #[tokio::test]
@@ -520,7 +504,7 @@ mod tests {
             .expect("response after heal");
         assert_eq!(&response, b"next");
         within(server).await.expect("server task");
-        proxy.stop().await;
+        proxy.stop();
     }
 
     #[tokio::test]
@@ -569,7 +553,7 @@ mod tests {
             .await
             .expect_err("severed connection must reset after a client write");
         assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
-        proxy.stop().await;
+        proxy.stop();
     }
 
     #[tokio::test]
@@ -596,6 +580,6 @@ mod tests {
         proxy.set_partitioned(false);
         assert_eq!(within(accepted_rx.recv()).await, Some(()));
         within(server).await.expect("server task");
-        proxy.stop().await;
+        proxy.stop();
     }
 }

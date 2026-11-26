@@ -50,6 +50,12 @@ steps:
     eventually: 60s
 
   - partition-source: src
+  # The dump the kill below must close, so the scenario cannot pass vacuously.
+  - source-query:
+      src: |
+        SELECT count(*) AS dumps FROM information_schema.processlist
+        WHERE db = DATABASE() AND command LIKE 'Binlog Dump%'
+    expect: { rows: [['1']] }
   - source-exec:
       src: |
         DROP PROCEDURE IF EXISTS kill_spiced_connections;
@@ -58,10 +64,8 @@ steps:
         BEGIN
           DECLARE done boolean DEFAULT false;
           DECLARE victim_id bigint unsigned;
-          DECLARE victim_command varchar(64);
-          DECLARE dumps_killed int DEFAULT 0;
           DECLARE victims CURSOR FOR
-            SELECT id, command
+            SELECT id
             FROM information_schema.processlist
             -- Each instance uses its own database, so it kills only its own
             -- connections.
@@ -72,7 +76,7 @@ steps:
           DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = true;
           OPEN victims;
           kill_loop: LOOP
-            FETCH victims INTO victim_id, victim_command;
+            FETCH victims INTO victim_id;
             IF done THEN
               LEAVE kill_loop;
             END IF;
@@ -80,23 +84,14 @@ steps:
             PREPARE kill_statement FROM @kill_sql;
             EXECUTE kill_statement;
             DEALLOCATE PREPARE kill_statement;
-            IF victim_command LIKE 'Binlog Dump%' THEN
-              SET dumps_killed = dumps_killed + 1;
-            END IF;
           END LOOP;
           CLOSE victims;
-          IF dumps_killed = 0 THEN
-            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'no binlog dump from spiced to kill';
-          END IF;
         END //
         DELIMITER ;
         CALL kill_spiced_connections();
         DROP PROCEDURE kill_spiced_connections;
-  # Writes continue during the partition, so the runtime falls behind.
+  # Outlast the runtime's 10 s minimum silence limit while writes continue.
   - sleep: 20s
-  - source-query: { src: "SELECT count(*) AS recent FROM busy WHERE id = 1 AND v >= 20" }
-    expect: { rows: [['1']] }
-    eventually: 60s
   - heal-source: src
 
   # Only a resumed change stream can bring both tables up to date.

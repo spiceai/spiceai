@@ -124,7 +124,7 @@ impl Source for Mysql {
 
     async fn remove(&self) -> Result<()> {
         if let Some(proxy) = &self.proxy {
-            proxy.stop().await;
+            proxy.stop();
         }
         self.container.remove().await?;
         // The run's other MySQL sources may still be on the network; the

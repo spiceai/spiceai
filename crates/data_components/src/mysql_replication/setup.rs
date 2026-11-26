@@ -620,6 +620,47 @@ pub async fn fetch_executed_gtid_set(conn: &mut Conn) -> Result<GtidSet> {
 /// source-attested time: a binlog HEARTBEAT event carries no usable clock, so
 /// lag-based readiness on a quiet source reads the source's own clock here
 /// rather than a local `now()`.
+/// What the source reports about a binlog dump it may still be running.
+pub struct DumpStatus {
+    pub server_id: u64,
+    /// Binlog dump threads with the dump's connection id: 0 or 1.
+    pub dumps_with_id: u64,
+    pub uptime: std::time::Duration,
+}
+
+/// Ask the source about the binlog dump on connection `thread_id`.
+pub async fn fetch_dump_status(conn: &mut Conn, thread_id: u64) -> Result<DumpStatus> {
+    // Users see their own threads without a `PROCESS` grant. The command
+    // filter ignores the id if a non-dump connection reuses it.
+    let (server_id, dumps_with_id): (u64, u64) = conn
+        .exec_first(
+            "SELECT @@server_id, (SELECT COUNT(*) FROM information_schema.PROCESSLIST \
+             WHERE ID = ? AND COMMAND LIKE 'Binlog Dump%')",
+            (thread_id,),
+        )
+        .await
+        .context(SetupQuerySnafu {
+            context: "information_schema.PROCESSLIST",
+        })?
+        .ok_or_else(|| Error::Decode {
+            message: "binlog dump status query returned no row".to_string(),
+        })?;
+    let (_, uptime_secs): (String, u64) = conn
+        .query_first("SHOW GLOBAL STATUS LIKE 'Uptime'")
+        .await
+        .context(SetupQuerySnafu {
+            context: "SHOW GLOBAL STATUS LIKE 'Uptime'",
+        })?
+        .ok_or_else(|| Error::Decode {
+            message: "SHOW GLOBAL STATUS LIKE 'Uptime' returned no row".to_string(),
+        })?;
+    Ok(DumpStatus {
+        server_id,
+        dumps_with_id,
+        uptime: std::time::Duration::from_secs(uptime_secs),
+    })
+}
+
 pub async fn fetch_source_now_ms(conn: &mut Conn) -> Result<i64> {
     let ms: Option<i64> = conn
         .query_first("SELECT CAST(ROUND(UNIX_TIMESTAMP(NOW(3)) * 1000) AS SIGNED)")
