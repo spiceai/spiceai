@@ -638,16 +638,24 @@ mod tests {
             let (mut stalled, _) = listener.accept().await.expect("accept first connection");
             accepted_tx.send(()).await.expect("report first connection");
             push_rx.await.expect("push requested");
-            stalled.write_all(b"lost").await.expect("write on the stalled connection");
+            stalled
+                .write_all(b"lost")
+                .await
+                .expect("write on the stalled connection");
             let (mut relayed, _) = listener.accept().await.expect("accept second connection");
-            relayed.write_all(b"live").await.expect("write on the new connection");
+            relayed
+                .write_all(b"live")
+                .await
+                .expect("write on the new connection");
             stalled
         });
         let proxy = PartitionProxy::start(upstream).await.expect("start proxy");
         let mut stalled = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, proxy.port()))
             .await
             .expect("connect first client");
-        within(accepted_rx.recv()).await.expect("upstream accepted proxy");
+        within(accepted_rx.recv())
+            .await
+            .expect("upstream accepted proxy");
 
         proxy.inject(ProxyFault::Stall);
         push_tx.send(()).expect("request push");
@@ -674,11 +682,16 @@ mod tests {
         let (listener, upstream) = listener().await;
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept proxy");
-            stream.write_all(&[7_u8; 300]).await.expect("write response");
+            stream
+                .write_all(&[7_u8; 300])
+                .await
+                .expect("write response");
             stream
         });
         let proxy = PartitionProxy::start(upstream).await.expect("start proxy");
-        proxy.inject(ProxyFault::Throttle(NonZeroU64::new(1000).expect("positive rate")));
+        proxy.inject(ProxyFault::Throttle(
+            NonZeroU64::new(1000).expect("positive rate"),
+        ));
         let mut client = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, proxy.port()))
             .await
             .expect("connect client");

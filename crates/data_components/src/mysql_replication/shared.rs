@@ -112,10 +112,10 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::binlog::{
-    AdoptedLayout, DumpSilence, MIN_VALID_EVENT_POS, QueryKind, StatementKind, adopt_current_layout,
-    classify_query, classify_statement, compute_pk_source_indexes, immediate_commit_ts_ms,
-    layout_event_mismatch, log_transient_reconnect, open_binlog_stream, purged_position_error,
-    readiness_heartbeat, record_watermark, transaction_commit_ts_ms,
+    AdoptedLayout, DumpSilence, MIN_VALID_EVENT_POS, QueryKind, StatementKind,
+    adopt_current_layout, classify_query, classify_statement, compute_pk_source_indexes,
+    immediate_commit_ts_ms, layout_event_mismatch, log_transient_reconnect, open_binlog_stream,
+    purged_position_error, readiness_heartbeat, record_watermark, transaction_commit_ts_ms,
 };
 use super::changes::{MemberLayout, MysqlChangeRows};
 use super::config::{BinlogPosition, ReplicationParams};
@@ -150,7 +150,6 @@ const MEMBER_SEND_STALL_WARN: Duration = Duration::from_secs(5);
 /// Bounds the head poll, which runs on the pump, so an unreachable source
 /// cannot stall it.
 const HEAD_POLL_TIMEOUT: Duration = Duration::from_secs(30);
-
 
 /// `(database, table)` of a member's source table — the routing key.
 type MemberKey = (String, String);
@@ -1849,7 +1848,15 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
             GtidSet::new()
         };
 
-        let mut stream = match open_binlog_stream(&params, &resume, &connection, use_gtid, &resume_gtid).await {
+        let mut stream = match open_binlog_stream(
+            &params,
+            &resume,
+            &connection,
+            use_gtid,
+            &resume_gtid,
+        )
+        .await
+        {
             Ok(stream) => {
                 backoff.reset();
                 if reconnect_attempts > 0 {
@@ -3011,13 +3018,9 @@ async fn poll_head_and_heartbeat(
     let Some(resume) = source.ack.flush_position() else {
         return;
     };
-    let Some(head) = side_query(
-        source,
-        side_conn,
-        params,
-        "head poll",
-        async |conn| super::setup::fetch_head_position(conn).await,
-    )
+    let Some(head) = side_query(source, side_conn, params, "head poll", async |conn| {
+        super::setup::fetch_head_position(conn).await
+    })
     .await
     else {
         return;

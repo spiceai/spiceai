@@ -1705,7 +1705,11 @@ mod tests {
         assert_eq!(silence.limit, Duration::from_secs(15));
         silence.on_event();
         assert_eq!(silence.expired(ago(16)).map(|s| s.as_secs()), Some(16));
-        assert_eq!(silence.limit, Duration::from_secs(15), "a dump that committed keeps its limit");
+        assert_eq!(
+            silence.limit,
+            Duration::from_secs(15),
+            "a dump that committed keeps its limit"
+        );
     }
 
     #[test]
