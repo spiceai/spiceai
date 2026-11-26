@@ -1,0 +1,73 @@
+name: cluster-checked-sum
+description: >
+  On a scheduler with two executors, each owning one partition of a Cayenne
+  file acceleration, SUM over a BIGINT is checked against the true total, not
+  each executor's partial: [MAX, MAX] on one executor and [-MAX] on the other
+  sum to MAX, [MAX, MAX] on both overflows, and SUM(w + k) over an INT column
+  is exact across both executors. Each executor is sent SUM(CAST(v AS
+  DECIMAL(38,0))), which cannot narrow to BIGINT before the scheduler merges.
+
+sources:
+  duck: { kind: duckdb }
+
+matrix:
+  case: [cancel, overflow, plus]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-checked-sum
+  runtime:
+    scheduler:
+      # One partition per executor, so the two partitions land on different
+      # executors and the scheduler has to merge their partial sums.
+      max_partitions_per_executor: 1
+  datasets:
+    - from: duckdb:t
+      name: t
+      params: ${sources.duck.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, partition_by: [part] }
+
+defaults:
+  cluster: { executors: 2 }
+  cluster-partition-by: { t: part }
+
+steps:
+  - source-exec:
+      duck: CREATE TABLE t (part BIGINT, v BIGINT); INSERT INTO t VALUES (0, 9223372036854775807), (0, 9223372036854775807), (1, -9223372036854775807);
+    when: { case: cancel }
+  - source-exec:
+      duck: CREATE TABLE t (part BIGINT, v BIGINT); INSERT INTO t VALUES (0, 9223372036854775807), (0, 9223372036854775807), (1, 9223372036854775807), (1, 9223372036854775807);
+    when: { case: overflow }
+  - source-exec:
+      duck: CREATE TABLE t (part BIGINT, w INTEGER); INSERT INTO t VALUES (0, 2147483647), (0, 1), (1, 2), (1, NULL);
+    when: { case: plus }
+  - start: {}
+
+  # Both partitions loaded, each on its own executor.
+  - query: SELECT part, count(*) AS n FROM t GROUP BY part ORDER BY part
+    expect: { rows: [['0', '2'], ['1', '1']] }
+    eventually: 60s
+    when: { case: cancel }
+  - query: SELECT part, count(*) AS n FROM t GROUP BY part ORDER BY part
+    expect: { rows: [['0', '2'], ['1', '2']] }
+    eventually: 60s
+    when: { case: [overflow, plus] }
+
+  - explain: SELECT SUM(v) FROM t
+    contains: ['PartialAggregationFlightSqlExec', 'SUM(CAST("v" AS DECIMAL(38,0)))']
+    omits: ['SELECT SUM("v")']
+    when: { case: [cancel, overflow] }
+  - query: SELECT SUM(v) AS s FROM t
+    expect: { rows: [['9223372036854775807']] }
+    when: { case: cancel }
+  - query: SELECT SUM(v) AS s FROM t
+    expect-error: Overflow in SUM of BIGINT
+    when: { case: overflow }
+
+  - explain: SELECT SUM(w + 1), SUM(w + 2), SUM(w + 3) FROM t
+    contains: ['__spice_checked_sum_plus_count']
+    when: { case: plus }
+  - query: SELECT SUM(w + 1) AS a, SUM(w + 2) AS b, SUM(w + 3) AS c FROM t
+    expect: { rows: [['2147483653', '2147483656', '2147483659']] }
+    when: { case: plus }

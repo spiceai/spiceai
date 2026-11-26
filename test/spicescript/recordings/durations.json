@@ -32,6 +32,7 @@
   "cluster-aggregate-over-limit": 50,
   "cluster-cdc-duplicates": 26,
   "cluster-chaos": 417,
+  "cluster-checked-sum": 138,
   "cluster-executors": 92,
   "cluster-literals": 49,
   "cluster-nan-literal": 48,
