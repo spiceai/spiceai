@@ -164,7 +164,7 @@ runs:
         CARGO_NET_GIT_FETCH_WITH_CLI: true
 
     - name: Save to cache
-      if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true' && env.CI_STORE_READ_ONLY != 'true'
+      if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true' && env.CI_CACHE_READ_ONLY != 'true' && env.CI_STORE_READ_ONLY != 'true'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |

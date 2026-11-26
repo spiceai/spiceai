@@ -353,6 +353,16 @@ class NasReadOnlyTest(unittest.TestCase):
                 upload = next(s for s in steps if s.get("name") == name)
                 self.assertTrue(upload["if"].endswith(" && env.CI_STORE_READ_ONLY != 'true'"), upload["if"])
 
+    def test_a_read_only_role_still_saves_no_actions_cache(self):
+        actions = Path(__file__).resolve().parents[1] / "actions"
+        for action in ("build-testoperator", "build-spicepod-validator", "build-spidapter"):
+            with self.subTest(action=action):
+                steps = yaml.safe_load((actions / action / "action.yml").read_text())["runs"]["steps"]
+                saves = [s for s in steps if str(s.get("uses", "")).startswith("actions/cache/save@")]
+                self.assertTrue(saves)
+                for save in saves:
+                    self.assertIn("env.CI_CACHE_READ_ONLY != 'true'", save["if"])
+
     def test_the_nas_job_reads_with_its_policy_and_points_mc_at_those_credentials(self):
         steps = job_steps("testoperator_run_nas.yml", "run-nas-bench")
         exchange = next(s for s in steps if s.get("id") == "rustfs")
