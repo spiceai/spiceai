@@ -753,7 +753,9 @@ pub trait DataAccelerator: Send + Sync {
     ///
     /// `unset_refresh_mode` is what an absent `refresh_mode` resolves to for the source's
     /// connector, which the caller resolves because only it knows the `from:` value (see
-    /// `runtime_acceleration::acceleration::unset_refresh_mode_for_connector`).
+    /// `runtime_acceleration::acceleration::unset_refresh_mode_for_connector`), and
+    /// `connector` is that connector's name (`sink`, `postgres`, …), or `None` for an
+    /// acceleration with no `from:` of its own (a catalog's).
     ///
     /// Asked of the engine rather than recomputed by the runtime so the budget cannot
     /// disagree with the tables it is budgeting for: the same classification configures
@@ -762,6 +764,7 @@ pub trait DataAccelerator: Send + Sync {
         &self,
         _acceleration: &spicepod::acceleration::Acceleration,
         _unset_refresh_mode: runtime_acceleration::acceleration::RefreshMode,
+        _connector: Option<&str>,
     ) -> Option<SpicepodWriteProfile> {
         None
     }
@@ -1344,6 +1347,12 @@ pub struct SpicepodWriteProfile {
     /// Small writes are inlined rather than written straight through, which needs a write
     /// buffer sized per table.
     pub inlines_small_writes: bool,
+    /// The largest inline entry, in serialized bytes, the engine admits when no param
+    /// sets it; 0 when it inlines nothing.
+    pub inline_max_bytes: usize,
+    /// The most bytes the engine buffers while deciding whether to inline a write, when no
+    /// param sets it; 0 when it inlines nothing.
+    pub inline_max_buffer_bytes: usize,
 }
 
 #[cfg(test)]

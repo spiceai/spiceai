@@ -814,6 +814,15 @@ const SMALL_WRITE_INLINE_MAX_ROWS: usize = cayenne::metadata::DEFAULT_INLINE_MAX
 const SMALL_WRITE_INLINE_MAX_BYTES: usize = cayenne::metadata::DEFAULT_INLINE_MAX_BYTES;
 const SMALL_WRITE_INLINE_MAX_BUFFER_BYTES: usize =
     cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES;
+/// The connector whose datasets have no source: rows arrive only through writes.
+const SINK_CONNECTOR: &str = "sink";
+/// Per-write inline admission caps of a [`RefreshWriteProfile::StreamAppend`] table:
+/// the most rows and bytes the runtime writes to one dataset as a single group of
+/// concurrent appends (`GROUP_MAX_ROWS` and `GROUP_MAX_BYTES` in the runtime's append
+/// coalescer), so a group is inlined whole. What a scan reads from the inline tier is
+/// bounded by the flush caps, not these.
+const STREAM_APPEND_INLINE_MAX_ROWS: usize = 32_768;
+const STREAM_APPEND_INLINE_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Longest `refresh_check_interval` at which a scheduled `append` still counts as
 /// a small-write (CDC-shaped) stream rather than a bulk load. Shared by both
 /// classification entry points ([`refresh_write_profile`] and
@@ -1083,6 +1092,15 @@ pub(crate) enum RefreshWriteProfile {
     /// `snapshot`, or refresh `disabled` with writes arriving another way). Files
     /// build up across writes, so compaction stays on at the conservative cadence.
     BulkAppend,
+    /// Rows arrive only through writes to a `sink` dataset (OpenTelemetry exports,
+    /// `INSERT INTO`), many small appends at a time. No source refreshes the table,
+    /// so the appends are the whole load: each one that fits the admission caps is
+    /// inlined into the metastore and the inline tier is flushed to Vortex in large
+    /// files, instead of every append writing a Vortex file of its own. The caps admit
+    /// a whole group of appends the runtime writes together. Durability stays `file`:
+    /// there is no source to replay an acknowledged write from, so the in-memory CDC
+    /// tier does not apply.
+    StreamAppend,
 }
 
 impl RefreshWriteProfile {
@@ -1091,7 +1109,15 @@ impl RefreshWriteProfile {
     pub(crate) fn classify(
         refresh_mode: RefreshMode,
         refresh_check_interval: Option<Duration>,
+        connector: Option<&str>,
     ) -> Self {
+        // A sink has no source, so its refresh mode only says how its writes are
+        // applied: `append` and `disabled` both mean rows arrive as appends.
+        if connector == Some(SINK_CONNECTOR)
+            && matches!(refresh_mode, RefreshMode::Append | RefreshMode::Disabled)
+        {
+            return Self::StreamAppend;
+        }
         match refresh_mode {
             RefreshMode::Caching | RefreshMode::Changes => Self::SmallWrite,
             RefreshMode::Append => {
@@ -1132,6 +1158,7 @@ impl RefreshWriteProfile {
     pub(crate) fn from_spicepod(
         accel: &spicepod::acceleration::Acceleration,
         unset_refresh_mode: RefreshMode,
+        connector: Option<&str>,
     ) -> Self {
         let refresh_mode = accel
             .refresh_mode
@@ -1141,7 +1168,7 @@ impl RefreshWriteProfile {
             .refresh_check_interval
             .as_deref()
             .and_then(|raw| fundu::parse_duration(raw).ok());
-        Self::classify(refresh_mode, interval)
+        Self::classify(refresh_mode, interval, connector)
     }
 
     /// Whether a table on this profile ever accumulates files for compaction to
@@ -1169,8 +1196,28 @@ impl RefreshWriteProfile {
     pub(crate) const fn inlines_small_writes(self) -> bool {
         matches!(
             self,
-            RefreshWriteProfile::SmallWrite | RefreshWriteProfile::BulkOverwrite
+            RefreshWriteProfile::SmallWrite
+                | RefreshWriteProfile::BulkOverwrite
+                | RefreshWriteProfile::StreamAppend
         )
+    }
+
+    /// The per-write inline admission caps `(rows, entry bytes, buffer bytes)` this
+    /// profile applies when no param sets them; all zero when it inlines nothing.
+    pub(crate) const fn inline_admission_caps(self) -> (usize, usize, usize) {
+        match self {
+            RefreshWriteProfile::SmallWrite | RefreshWriteProfile::BulkOverwrite => (
+                SMALL_WRITE_INLINE_MAX_ROWS,
+                SMALL_WRITE_INLINE_MAX_BYTES,
+                SMALL_WRITE_INLINE_MAX_BUFFER_BYTES,
+            ),
+            RefreshWriteProfile::StreamAppend => (
+                STREAM_APPEND_INLINE_MAX_ROWS,
+                STREAM_APPEND_INLINE_MAX_BYTES,
+                STREAM_APPEND_INLINE_MAX_BYTES,
+            ),
+            RefreshWriteProfile::BulkAppend => (0, 0, 0),
+        }
     }
 }
 
@@ -1180,8 +1227,9 @@ fn apply_refresh_mode_defaults(
     acceleration: &Acceleration,
     inline_flush_caps: autotune::InlineFlushCaps,
 ) {
-    match refresh_write_profile(source, acceleration) {
-        RefreshWriteProfile::SmallWrite => {
+    let profile = refresh_write_profile(source, acceleration);
+    match profile {
+        RefreshWriteProfile::SmallWrite | RefreshWriteProfile::StreamAppend => {
             config.compaction_trigger_files = SMALL_WRITE_COMPACTION_TRIGGER_FILES;
             config.compaction_trigger_protected_snapshots =
                 SMALL_WRITE_COMPACTION_TRIGGER_PROTECTED_SNAPSHOTS;
@@ -1192,9 +1240,11 @@ fn apply_refresh_mode_defaults(
             // Per-entry inline-admission caps stay static by design: inlined entries
             // are re-read on every scan with no zone-map pruning, so raising them is
             // pure read-amp (see `provider::table` inlining-caps comment).
-            config.inline_max_rows = SMALL_WRITE_INLINE_MAX_ROWS;
-            config.inline_max_bytes = SMALL_WRITE_INLINE_MAX_BYTES;
-            config.inline_max_buffer_bytes = SMALL_WRITE_INLINE_MAX_BUFFER_BYTES;
+            (
+                config.inline_max_rows,
+                config.inline_max_bytes,
+                config.inline_max_buffer_bytes,
+            ) = profile.inline_admission_caps();
             // Memtable flush caps scale with machine memory + metastore storage class
             // (see `autotune::HardwareProfile::inline_flush_caps`). Explicit operator
             // params still override these in the param-resolution pass below.
@@ -1219,14 +1269,18 @@ fn apply_refresh_mode_defaults(
             // `inline_flush_*` memtable caps are deliberately left at their
             // defaults: a whole-table replace leaves exactly one inline entry, so
             // the flush caps never bind.
-            config.inline_max_rows = SMALL_WRITE_INLINE_MAX_ROWS;
-            config.inline_max_bytes = SMALL_WRITE_INLINE_MAX_BYTES;
-            config.inline_max_buffer_bytes = SMALL_WRITE_INLINE_MAX_BUFFER_BYTES;
+            (
+                config.inline_max_rows,
+                config.inline_max_bytes,
+                config.inline_max_buffer_bytes,
+            ) = profile.inline_admission_caps();
         }
         RefreshWriteProfile::BulkAppend => {
-            config.inline_max_rows = 0;
-            config.inline_max_bytes = 0;
-            config.inline_max_buffer_bytes = 0;
+            (
+                config.inline_max_rows,
+                config.inline_max_bytes,
+                config.inline_max_buffer_bytes,
+            ) = profile.inline_admission_caps();
         }
     }
 }
@@ -1243,15 +1297,24 @@ fn apply_refresh_mode_defaults(
 fn refresh_write_profile_for(
     acceleration: &Acceleration,
     resolved_refresh_mode: RefreshMode,
+    connector: Option<&str>,
 ) -> RefreshWriteProfile {
-    RefreshWriteProfile::classify(resolved_refresh_mode, acceleration.refresh_check_interval)
+    RefreshWriteProfile::classify(
+        resolved_refresh_mode,
+        acceleration.refresh_check_interval,
+        connector,
+    )
 }
 
 fn refresh_write_profile(
     source: &dyn AccelerationSource,
     acceleration: &Acceleration,
 ) -> RefreshWriteProfile {
-    refresh_write_profile_for(acceleration, resolved_refresh_mode(source, acceleration))
+    refresh_write_profile_for(
+        acceleration,
+        resolved_refresh_mode(source, acceleration),
+        source.connector_name(),
+    )
 }
 
 /// Whether the dataset writes small batches continuously, which is what the
@@ -3817,6 +3880,7 @@ impl DataAccelerator for CayenneAccelerator {
         &self,
         acceleration: &spicepod::acceleration::Acceleration,
         unset_refresh_mode: runtime_acceleration::acceleration::RefreshMode,
+        connector: Option<&str>,
     ) -> Option<data_accelerator_api::SpicepodWriteProfile> {
         // The contract is `None` unless the acceleration uses this engine. The runtime
         // enumerates Cayenne accelerations before asking, so this is the implementation
@@ -3826,11 +3890,15 @@ impl DataAccelerator for CayenneAccelerator {
             return None;
         }
 
-        let profile = RefreshWriteProfile::from_spicepod(acceleration, unset_refresh_mode);
+        let profile =
+            RefreshWriteProfile::from_spicepod(acceleration, unset_refresh_mode, connector);
+        let (_, inline_max_bytes, inline_max_buffer_bytes) = profile.inline_admission_caps();
         Some(data_accelerator_api::SpicepodWriteProfile {
             uses_cdc_tier: profile.uses_cdc_tier(),
             needs_compaction: profile.needs_compaction(),
             inlines_small_writes: profile.inlines_small_writes(),
+            inline_max_bytes,
+            inline_max_buffer_bytes,
         })
     }
 
@@ -6370,19 +6438,19 @@ mod tests {
 
         assert!(
             accelerator
-                .spicepod_write_profile(&named(Some("cayenne")), RefreshMode::Full)
+                .spicepod_write_profile(&named(Some("cayenne")), RefreshMode::Full, None)
                 .is_some(),
             "the engine must classify its own acceleration"
         );
         assert!(
             accelerator
-                .spicepod_write_profile(&named(Some("CAYENNE")), RefreshMode::Full)
+                .spicepod_write_profile(&named(Some("CAYENNE")), RefreshMode::Full, None)
                 .is_some(),
             "the engine name is matched the way the runtime matches it: case-insensitively"
         );
         assert!(
             accelerator
-                .spicepod_write_profile(&named(None), RefreshMode::Full)
+                .spicepod_write_profile(&named(None), RefreshMode::Full, None)
                 .is_some(),
             "an acceleration that names no engine uses Cayenne, the default engine"
         );
@@ -6390,7 +6458,7 @@ mod tests {
         for other in [Some("duckdb"), Some("arrow"), Some("sqlite")] {
             assert!(
                 accelerator
-                    .spicepod_write_profile(&named(other), RefreshMode::Full)
+                    .spicepod_write_profile(&named(other), RefreshMode::Full, None)
                     .is_none(),
                 "engine {other:?} is not Cayenne, so this engine must not classify it"
             );
@@ -9786,6 +9854,68 @@ mod tests {
         assert!((2 * 1_048_576..=256 * 1_048_576).contains(&config.inline_flush_max_bytes));
         assert!((2_048..=262_144).contains(&config.inline_flush_max_rows));
         assert!((16..=256).contains(&config.inline_flush_max_segments));
+    }
+
+    /// A sink's rows arrive only as appends, so each whole group of appends is
+    /// inlined and flushed in large files, and every acknowledged write stays durable:
+    /// there is no source to replay it from, so the in-memory CDC tier never applies,
+    /// not even with a refresh interval that would make another append stream
+    /// small-write.
+    #[tokio::test]
+    async fn test_vortex_config_defaults_inline_a_sinks_appends_durably() {
+        for (table_name, refresh_mode, interval) in [
+            ("sink_append", Some(RefreshMode::Append), None),
+            ("sink_disabled", Some(RefreshMode::Disabled), None),
+            (
+                "sink_append_fast",
+                Some(RefreshMode::Append),
+                Some(APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD),
+            ),
+        ] {
+            let mut dataset = TestAccelerationSource::new(table_name).with_connector_name("sink");
+            dataset.set_acceleration(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                refresh_mode,
+                refresh_check_interval: interval,
+                ..Default::default()
+            });
+
+            let config = CayenneAccelerator::get_vortex_config(table_name, &dataset)
+                .await
+                .expect("config should be valid");
+
+            assert_eq!(config.inline_max_rows, STREAM_APPEND_INLINE_MAX_ROWS, "{table_name}");
+            assert_eq!(config.inline_max_bytes, STREAM_APPEND_INLINE_MAX_BYTES, "{table_name}");
+            assert_eq!(
+                config.inline_max_buffer_bytes, STREAM_APPEND_INLINE_MAX_BYTES,
+                "{table_name}"
+            );
+            assert_eq!(
+                config.cdc_durability,
+                cayenne::metadata::CdcDurability::File,
+                "{table_name}"
+            );
+            assert_eq!(
+                config.compaction_trigger_files, SMALL_WRITE_COMPACTION_TRIGGER_FILES,
+                "{table_name}"
+            );
+            assert!((2 * 1_048_576..=256 * 1_048_576).contains(&config.inline_flush_max_bytes));
+        }
+
+        // The same append from a source with a refresh keeps the bulk-append profile.
+        let mut dataset = TestAccelerationSource::new("s3_append").with_connector_name("s3");
+        dataset.set_acceleration(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Append),
+            ..Default::default()
+        });
+        let config = CayenneAccelerator::get_vortex_config("s3_append", &dataset)
+            .await
+            .expect("config should be valid");
+        assert_eq!(config.inline_max_rows, 0);
+        assert_eq!(config.inline_max_bytes, 0);
     }
 
     #[tokio::test]
