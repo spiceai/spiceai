@@ -52,7 +52,13 @@ runs:
       env:
         INPUT_PREFIX: ${{ steps.fixture.outputs.table }}
       run: |
-        python -m pip install 'pyspark==3.5.5' 'delta-spark==3.3.2'
+        # Every package at the version and hashes the requirements files pin. pyspark is an sdist,
+        # built with the pinned setuptools rather than in an isolated build environment, whose
+        # build dependencies pip would install without checking a hash.
+        requirements="$GITHUB_ACTION_PATH/../../requirements"
+        python -m pip install --require-hashes --only-binary=:all: -r "$requirements/cold_start_fixture_build.txt"
+        python -m pip install --require-hashes --no-build-isolation --only-binary=:all: --no-binary=pyspark \
+          -r "$requirements/cold_start_fixture.txt"
         python test/scripts/cold_start_delta_fixture.py --out "${RUNNER_TEMP}/cold_start_fixture" \
           --rows 3000000 --commits 24 --post-optimize-commits 8
         mc rm --recursive --force "spice-minio/${INPUT_PREFIX}/" || true

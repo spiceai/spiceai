@@ -194,7 +194,7 @@ jobs:
           done
           : "${python:?The independent oracles need Python 3.10 or newer on PATH}"
           "$python" -m venv "$RUNNER_TEMP/wal-oracle"
-          "$RUNNER_TEMP/wal-oracle/bin/python" -m pip install --only-binary=:all: -r test/object_store_occ/requirements.txt
+          "$RUNNER_TEMP/wal-oracle/bin/python" -m pip install --require-hashes --only-binary=:all: -r test/object_store_occ/requirements.txt
           echo "$RUNNER_TEMP/wal-oracle/bin" >> "$GITHUB_PATH"
       # Every store-independent test binary; s3_integration runs on the service legs.
       - name: Test state protocol, cancellation, faults and model replays

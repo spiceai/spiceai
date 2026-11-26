@@ -44,7 +44,8 @@ runs:
         INPUT_KEYSPACE: ${{ inputs.keyspace }}
         INPUT_DATA_DIR: ${{ inputs.data-dir }}
       run: |
-        python -m pip install 'duckdb==1.4.4'
+        # duckdb at the version and hashes the requirements file pins.
+        python -m pip install --require-hashes --only-binary=:all: -r "$GITHUB_ACTION_PATH/../../requirements/scylladb_bootstrap.txt"
         python <<'PY'
         import duckdb
         import os

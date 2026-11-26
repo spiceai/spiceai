@@ -29,9 +29,12 @@ FILES = [
 sys.path.insert(0, str(ROOT / ".github" / "scripts"))
 from check_ci_cache_pins import FETCHED_PINS  # noqa: E402
 
-from check_ci_cache_pins import INLINE_PINS  # noqa: E402
+from check_ci_cache_pins import INLINE_PINS, REQUIREMENTS  # noqa: E402
 
-FILES += sorted({user for users in [*FETCHED_PINS.values(), *INLINE_PINS.values()] for user in users})
+FILES += ["test/duckdb_versions.json", *REQUIREMENTS]
+FILES += sorted(
+    {user for users in [*FETCHED_PINS.values(), *INLINE_PINS.values(), *REQUIREMENTS.values()] for user in users}
+)
 
 
 class CheckCiCachePinsTest(unittest.TestCase):
@@ -318,6 +321,37 @@ class CheckCiCachePinsTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         for user in INLINE_PINS["docker-apt-key"]:
             self.assertIn(f"{user} downloads https://download.docker.com/linux/ubuntu/gpg 1 time(s) but checks 0", result.stdout)
+
+
+    def test_every_requirement_is_pinned_and_hashed_and_installed_with_require_hashes(self):
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("installed with --require-hashes", result.stdout)
+
+    def test_a_requirement_without_a_hash_or_an_exact_version_fails(self):
+        path = self.tmp / ".github/requirements/hf_cli.txt"
+        path.write_text(path.read_text() + "requests>=2\nidna==3.20\n")
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("hf_cli.txt has `requests>=2`, which is not one exact version", result.stdout)
+        self.assertIn("hf_cli.txt has `idna==3.20`, which is not one exact version", result.stdout)
+
+    def test_a_pip_install_without_require_hashes_fails(self):
+        path = self.tmp / ".github/workflows/hf_cache_differential.yml"
+        path.write_text(path.read_text().replace("pip install --require-hashes ", "pip install "))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("hf_cache_differential.yml does not install .github/requirements/hf_cli.txt", result.stdout)
+        self.assertIn("without --require-hashes", result.stdout)
+
+    def test_the_ducklake_bootstrap_pins_the_newest_listed_duckdb(self):
+        path = self.tmp / "test/duckdb_versions.json"
+        versions = json.loads(path.read_text())
+        versions["versions"].append({"version": "9.9.9", "sha256": {}})
+        path.write_text(json.dumps(versions))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("ducklake_bootstrap.txt pins duckdb 2.0.0, but test/duckdb_versions.json lists 9.9.9 last", result.stdout)
 
 
 if __name__ == "__main__":

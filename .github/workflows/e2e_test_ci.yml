@@ -532,7 +532,8 @@ jobs:
         run: |
           set -euo pipefail
           python -m venv "$BIGQUERY_GATE_VENV"
-          "$BIGQUERY_GATE_VENV/bin/python" -m pip install google-cloud-bigquery==3.38.0
+          # Every package at the version and hashes .github/requirements/bigquery_gate.txt pins.
+          "$BIGQUERY_GATE_VENV/bin/python" -m pip install --require-hashes --only-binary=:all: -r .github/requirements/bigquery_gate.txt
 
       - name: Validate the BigQuery corpus harness
         run: '"$BIGQUERY_GATE_VENV/bin/python" test/scripts/bigquery_corpus.py --self-test'

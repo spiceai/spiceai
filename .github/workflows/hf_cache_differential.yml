@@ -50,7 +50,8 @@ jobs:
         run: |
           set -euo pipefail
           python -m venv "$RUNNER_TEMP/hf-cli"
-          "$RUNNER_TEMP/hf-cli/bin/python" -m pip install 'huggingface_hub==2.2.0'
+          # Every package at the version and hashes .github/requirements/hf_cli.txt pins.
+          "$RUNNER_TEMP/hf-cli/bin/python" -m pip install --require-hashes --only-binary=:all: -r .github/requirements/hf_cli.txt
           echo "$RUNNER_TEMP/hf-cli/bin" >> "$GITHUB_PATH"
       - name: Compare Spice's cache with the hf CLI's
         # The Hub rate-limits anonymous requests per IP, and the jobs on the self-hosted pool share

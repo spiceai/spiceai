@@ -264,7 +264,13 @@ jobs:
           # that same release.
           duckdb_version=$(jq -r '.versions[-1].version' test/duckdb_versions.json)
           [ -n "$duckdb_version" ] || { echo 'could not read the duckdb version from test/duckdb_versions.json'; exit 1; }
-          python3 -m pip install --upgrade "duckdb==$duckdb_version" minio
+          # Every package at the version and hashes .github/requirements/ducklake_bootstrap.txt pins.
+          python3 -m pip install --upgrade --require-hashes --only-binary=:all: -r .github/requirements/ducklake_bootstrap.txt
+          installed=$(python3 -c 'import duckdb; print(duckdb.__version__)')
+          if [ "$installed" != "$duckdb_version" ]; then
+            echo "::error::.github/requirements/ducklake_bootstrap.txt installs duckdb $installed, but test/duckdb_versions.json lists $duckdb_version last; pin that release there."
+            exit 1
+          fi
 
           python3 <<'PY'
           import duckdb

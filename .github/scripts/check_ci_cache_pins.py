@@ -10,7 +10,10 @@ a self-hosted Mac, whose jobs always install their own, every time.
 
 And for every entry the actions and workflows download through fetch_pinned.sh
 (FETCHED_PINS), it requires each file that downloads it to do so through that script, and
-a pin for every target the file can ask for, read from its `case` arms.
+a pin for every target the file can ask for, read from its `case` arms. It keeps the
+SHA-256s some workflows check inline (INLINE_PINS) and test/tpc-bench/Makefile's DuckDB CLI
+archives pinned too, and requires every pip requirements file CI installs (REQUIREMENTS) to
+pin each package to one version with its hashes, installed with --require-hashes.
 """
 
 import json
@@ -87,6 +90,28 @@ PWSH_TARGET = re.compile(r"\$target\s*=\s*'([^'\n]+)'")
 # release asset in the `case` arm that picks it: `ASSET=<file>; SHA256=<sha256> ;;`.
 TPC_BENCH_MAKEFILE = ROOT / "test" / "tpc-bench" / "Makefile"
 MAKEFILE_ASSET = re.compile(r"ASSET=([A-Za-z0-9_.-]+)(?:;\s*SHA256=([0-9a-f]{64}))?")
+# The pip requirements CI installs with --require-hashes, and the files that install each.
+# Every requirement must name one version (`==`) and the SHA-256 of its files, and every
+# `pip install` in those files must pass --require-hashes, so pip installs nothing unhashed.
+REQUIREMENTS = {
+    ".github/requirements/ducklake_bootstrap.txt": (
+        ".github/workflows/testoperator_run_bench_aws.yml",
+        ".github/workflows/testoperator_run_schema_aws.yml",
+    ),
+    ".github/requirements/scylladb_bootstrap.txt": (".github/actions/setup-scylladb/action.yml",),
+    ".github/requirements/cold_start_fixture_build.txt": (".github/actions/seed-cold-start-fixture/action.yml",),
+    ".github/requirements/cold_start_fixture.txt": (".github/actions/seed-cold-start-fixture/action.yml",),
+    ".github/requirements/hf_cli.txt": (".github/workflows/hf_cache_differential.yml",),
+    ".github/requirements/bigquery_gate.txt": (".github/workflows/e2e_test_ci.yml",),
+    "test/object_store_occ/requirements.txt": (".github/workflows/object_store_wal.yml",),
+}
+# The DuckLake bootstrap writes a catalog spiced reads with the DuckDB release
+# test/duckdb_versions.json lists last, so it must pin that duckdb.
+DUCKLAKE_REQUIREMENTS = ".github/requirements/ducklake_bootstrap.txt"
+DUCKDB_VERSIONS = ROOT / "test" / "duckdb_versions.json"
+REQUIREMENT = re.compile(
+    r"([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9][A-Za-z0-9._+!-]*)\s*(?:;(?:(?!--hash=).)*)?((?:\s*--hash=sha256:[0-9a-f]{64})+)\s*"
+)
 SHELL_VARIABLE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
 
 
@@ -157,6 +182,7 @@ def main() -> int:
     for name, users in INLINE_PINS.items():
         errors.extend(inline_pin_errors(pins, name, users))
     errors.extend(tpc_bench_duckdb_errors())
+    errors.extend(requirements_errors())
 
     for error in errors:
         print(f"::error file={PINS_PATH.relative_to(ROOT)}::{error}")
@@ -168,6 +194,7 @@ def main() -> int:
         fetched = [f"{name} {pins[name]['version']}" if "version" in pins[name] else name for name in FETCHED_PINS]
         print(f"OK: fetched through fetch_pinned.sh, and pinned for every target asked for: {', '.join(fetched)}.")
         print(f"OK: checked inline against pins.json: {', '.join(INLINE_PINS)}.")
+        print(f"OK: installed with --require-hashes, every requirement pinned and hashed: {', '.join(REQUIREMENTS)}.")
     return 1 if errors else 0
 
 
@@ -254,6 +281,52 @@ def inline_pin_errors(pins: dict, name: str, users: tuple) -> list:
                 f"{user} downloads {url} {downloads} time(s) but checks {checks} against {name}'s SHA-256 in "
                 f'{PINS_PATH.relative_to(ROOT)} (`echo "<sha256>  <file>" | sha256sum -c -`).'
             )
+    return errors
+
+
+def _logical_lines(text: str) -> list:
+    """Lines with backslash continuations joined and whole-line comments dropped."""
+    text = re.sub(r"^[ \t]*#[^\n]*\n", "", text, flags=re.M)
+    return text.replace("\\\n", " ").splitlines()
+
+
+def requirements_errors() -> list:
+    """Each requirements file pins and hashes every requirement; each installer passes --require-hashes."""
+    errors = []
+    pinned = {}
+    for name, users in REQUIREMENTS.items():
+        path = ROOT / name
+        if not path.is_file():
+            errors.append(f"{name} is missing, but {', '.join(users)} install it.")
+            continue
+        for line in _logical_lines(path.read_text()):
+            if not line.strip():
+                continue
+            match = REQUIREMENT.fullmatch(line.strip())
+            if match is None:
+                errors.append(
+                    f"{name} has `{line.strip()[:80]}`, which is not one exact version (`name==version`) with the "
+                    "SHA-256 of its files (`--hash=sha256:<sha256>`); regenerate the file as its header says."
+                )
+            else:
+                pinned.setdefault(name, {})[match.group(1).lower().replace("_", "-")] = match.group(2)
+        for user in users:
+            installs = [line for line in _logical_lines((ROOT / user).read_text()) if re.search(r"\bpip3?\s+install\b", line)]
+            if not any(path.name in line and "--require-hashes" in line for line in installs):
+                errors.append(f"{user} does not install {name} with `pip install --require-hashes -r`.")
+            for line in installs:
+                if "--require-hashes" not in line:
+                    errors.append(
+                        f"{user} runs `{line.strip()[:100]}` without --require-hashes; install from a hashed "
+                        "requirements file listed in REQUIREMENTS instead."
+                    )
+    duckdb = pinned.get(DUCKLAKE_REQUIREMENTS, {}).get("duckdb")
+    newest = json.loads(DUCKDB_VERSIONS.read_text())["versions"][-1]["version"]
+    if duckdb != newest:
+        errors.append(
+            f"{DUCKLAKE_REQUIREMENTS} pins duckdb {duckdb}, but {DUCKDB_VERSIONS.relative_to(ROOT)} lists {newest} last, "
+            "the release spiced reads the DuckLake catalog with; pin that one."
+        )
     return errors
 
 
