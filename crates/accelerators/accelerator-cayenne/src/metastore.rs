@@ -36,8 +36,8 @@ use tokio::sync::OnceCell;
 
 use super::{
     AccelerationInitializationFailedSnafu, CAYENNE_MIGRATION_DOCS, CayenneAccelerator, Error,
-    InvalidConfigurationSnafu, Result, TursoMetastoreOnDiskSnafu, native_sidecar,
-    overlapping_metastore_dir, path_exists,
+    InvalidConfigurationSnafu, Result, TursoMetastoreOnDiskSnafu, UnsupportedSetting,
+    ensure_setting_supported, native_sidecar, overlapping_metastore_dir, path_exists,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -311,6 +311,7 @@ impl CayenneAccelerator {
             .acceleration()
             .is_some_and(|acceleration| !acceleration.partition_by.is_empty());
         if vnext {
+            ensure_setting_supported(&table_name, object_native_data_unsupported(source))?;
             let location_supported = url::Url::parse(
                 &effective_state_location(&source.app())?.location,
             )
@@ -318,7 +319,7 @@ impl CayenneAccelerator {
                 location_datasets_url(&location, &object_store::path::Path::default()).is_some()
             });
             ensure!(
-                location_supported && object_native_data_unsupported(source).is_none(),
+                location_supported,
                 InvalidConfigurationSnafu {
                     detail: Arc::from(cayenne::metastore_layout::object_native_data_path_refusal(
                         &table_name
@@ -524,6 +525,9 @@ impl CayenneAccelerator {
                 .await
                 .boxed()
                 .context(AccelerationInitializationFailedSnafu)?;
+                let prefix = object_store::path::Path::parse(&prefix)
+                    .boxed()
+                    .context(AccelerationInitializationFailedSnafu)?;
                 let data_store = runtime_state_location::metrics::metered(
                     Arc::clone(&store),
                     runtime_state_location::StateFeature::CayenneData,
@@ -534,9 +538,7 @@ impl CayenneAccelerator {
                             store,
                             runtime_state_location::StateFeature::CayenneMetastore,
                         ),
-                        object_store::path::Path::from(prefix)
-                            .join("v1")
-                            .join("catalog"),
+                        prefix.join("v1").join("catalog"),
                         &format!("{}/cayenne/v1", location.location.trim_end_matches('/')),
                     )
                     .await
@@ -831,7 +833,9 @@ impl CayenneAccelerator {
             .await
             .boxed()
             .context(AccelerationInitializationFailedSnafu)?;
-            let head = object_store::path::Path::from(prefix)
+            let head = object_store::path::Path::parse(&prefix)
+                .boxed()
+                .context(AccelerationInitializationFailedSnafu)?
                 .join("v1")
                 .join("catalog")
                 .join("head");
@@ -887,47 +891,43 @@ pub(super) fn location_datasets_url(
     location: &url::Url,
     datasets_prefix: &object_store::path::Path,
 ) -> Option<String> {
-    match (location.scheme(), location.host_str()) {
-        ("s3", Some(bucket)) => Some(format!("s3://{bucket}/{datasets_prefix}")),
-        ("file", None | Some("" | "localhost")) => Some(format!("file:///{datasets_prefix}")),
-        _ => None,
-    }
+    let root = match (location.scheme(), location.host_str()) {
+        ("s3", Some(bucket)) => url::Url::parse(&format!("s3://{bucket}/")).ok()?,
+        ("file", None | Some("" | "localhost")) => url::Url::parse("file:///").ok()?,
+        _ => return None,
+    };
+    cayenne::dataset_storage::url_of_object_key(&root, datasets_prefix).map(Into::into)
 }
 
-/// What `source` needs that data in the object-native location does not support yet,
-/// as the setting to name in a message; `None` when its data can go there. Covered:
+/// What `source` needs that data in the object-native location does not support yet;
+/// `None` when its data can go there. Covered:
 /// `refresh_mode: full`, `append` and `changes`, with or without a primary key.
 /// Upserts and deletes write deletion vectors through the dataset's store, and a
 /// change stream's acknowledged position commits with the data it covers, so a
 /// dataset reopened from the location alone resumes from it.
 pub(super) fn object_native_data_unsupported(
     source: &dyn AccelerationSource,
-) -> Option<&'static str> {
+) -> Option<UnsupportedSetting> {
     let acceleration = source.acceleration()?;
     match resolved_refresh_mode(source, acceleration) {
         RefreshMode::Full | RefreshMode::Append | RefreshMode::Changes => {}
-        RefreshMode::Caching => return Some("`refresh_mode: caching`"),
-        RefreshMode::Snapshot => return Some("`refresh_mode: snapshot`"),
-        RefreshMode::Disabled => return Some("`refresh_mode: disabled`"),
+        RefreshMode::Caching => return Some(UnsupportedSetting::RefreshMode("caching")),
+        RefreshMode::Snapshot => return Some(UnsupportedSetting::RefreshMode("snapshot")),
+        RefreshMode::Disabled => return Some(UnsupportedSetting::RefreshMode("disabled")),
     }
-    for param in [
+    [
         "cayenne_file_path",
         "cayenne_s3_zone_ids",
         "cayenne_datalake_location",
-    ] {
-        if acceleration
+    ]
+    .into_iter()
+    .find(|param| {
+        acceleration
             .params
-            .get(param)
+            .get(*param)
             .is_some_and(|value| !value.trim().is_empty())
-        {
-            return Some(match param {
-                "cayenne_file_path" => "`cayenne_file_path`",
-                "cayenne_s3_zone_ids" => "`cayenne_s3_zone_ids`",
-                _ => "`cayenne_datalake_location`",
-            });
-        }
-    }
-    None
+    })
+    .map(UnsupportedSetting::Param)
 }
 
 #[cfg(test)]

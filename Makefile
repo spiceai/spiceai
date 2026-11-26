@@ -176,14 +176,6 @@ endif
 # silently never built it — selection looked complete while three lanes never
 # ran. See `crates/cayenne/tests/correctness/README.md`.
 #
-# Scoped to `cayenne` deliberately. `runtime/sqlite` would also unlock runtime's
-# accelerator-parity binary, but the feature flows through the
-# whole `--all` build: every runtime test binary the gate builds relinks with
-# them, and those link at hundreds of megabytes each. That is a
-# large, permanent cost on every sign-off and merge-queue run to gain two
-# micro-shape comparisons — the thinnest of the five lanes. It belongs in the
-# integration workflow, which already builds with `adbc,sqlite`.
-#
 # The chDB lane is deliberately not here. `chdb-rust` needs libchdb, which its
 # build script fetches over the network, so folding it into the gate would make
 # every sign-off depend on that fetch and on a machine that can link it. CI runs
@@ -241,10 +233,12 @@ print-rust-gate-features:
 # `runtime-datafusion`'s `is_distinct_from_precedence` binary is self-contained
 # (in-memory SessionContext, no credentials) and gates the vendored sqlparser
 # fix that binds `IS [NOT] DISTINCT FROM` tighter than `AND` / `OR`.
+# `data_components`' `avro_decode_allocation` binary measures, with a counting
+# allocator, the heap a CDC Avro body with oversized array and map counts claims.
 # `accelerator-cayenne`'s `integration` binary opens Cayenne accelerations through
 # the accelerator registry on temp dirs: stored data files, partitioning, lookup
 # indexes, snapshot restore and source acknowledgement. It needs no service.
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache|safetensors_hf_cache|gguf_hf_cache)::/)) + (binary_id(=llms-llamacpp::integration) & test(/^load_errors::/)) + binary_id(=llama-cpp::integration) + binary_id(=duckdb-oracle::integration) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use)) + (package(=runtime-datafusion) & binary(=is_distinct_from_precedence)) + binary_id(=accelerator-cayenne::integration)
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache|safetensors_hf_cache|gguf_hf_cache)::/)) + (binary_id(=llms-llamacpp::integration) & test(/^load_errors::/)) + binary_id(=llama-cpp::integration) + binary_id(=duckdb-oracle::integration) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use)) + (package(=runtime-datafusion) & binary(=is_distinct_from_precedence)) + binary_id(=accelerator-cayenne::integration) + (package(=data_components) & binary(=avro_decode_allocation))
 # Tests that run after merge, in `trunk_tests.yml` (`make nextest-post-merge`),
 # and not in the gate that sign-off and the merge queue run. Each is slow, and
 # none has caught a defect in the gate:
@@ -311,13 +305,16 @@ nextest:
 # alone, with the gate's DuckDB result-correctness feature. It lists the
 # selection first and fails unless every test the filter names is in it, so a
 # renamed test cannot quietly drop out of both runs.
+# The listing is JSON because CI's cargo-nextest (.github/actions/setup-nextest)
+# predates `--message-format oneline`; this counts the tests the filter matched.
+_COUNT_LISTED_MATCHES = import json, sys; d = json.load(sys.stdin); print(sum(t['filter-match']['status'] == 'matches' for s in d['rust-suites'].values() for t in s['testcases'].values()))
 _POST_MERGE_SELECTION = -p cayenne --features cayenne/result-correctness-duckdb --lib --test integration $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 .PHONY: nextest-post-merge
 nextest-post-merge:
 	@$(_WITH_LIBDUCKDB) \
 	named=$$(printf '%s' '$(NEXTEST_POST_MERGE_FILTER)' | grep -o 'test(=' | wc -l | tr -d ' '); \
-	listed=$$(cargo nextest list $(_POST_MERGE_SELECTION) --message-format oneline -E '$(NEXTEST_POST_MERGE_FILTER)') || exit $$?; \
-	count=$$(printf '%s\n' "$$listed" | grep -c .); \
+	listed=$$(cargo nextest list $(_POST_MERGE_SELECTION) --message-format json -E '$(NEXTEST_POST_MERGE_FILTER)') || exit $$?; \
+	count=$$(printf '%s' "$$listed" | $(PYTHON) -c "$(_COUNT_LISTED_MATCHES)") || exit $$?; \
 	if [ "$$count" != "$$named" ]; then \
 	  echo "nextest-post-merge: NEXTEST_POST_MERGE_FILTER names $$named tests but selects $$count, so a named test was renamed or removed. Update the filter in the Makefile." >&2; \
 	  exit 1; \
@@ -367,11 +364,11 @@ test-integration:
 	# Test if .env file exists, and login to Spice if not
 	@test -f .env || (`spice login`)
 	# The `adbc::` tests need the SQLite ADBC driver; run them with `dbc install sqlite` and `-E 'test(/^adbc::/)'`, as integration_adbc.yml does.
-	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc,sqlite --no-capture -E 'not test(/^adbc::/)'
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc --no-capture -E 'not test(/^adbc::/)'
 
 .PHONY: test-integration-without-spiceai-dataset
 test-integration-without-spiceai-dataset:
-	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc,sqlite --no-capture -E 'not test(spiceai_integration_test) and not test(/^adbc::/)'
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc --no-capture -E 'not test(spiceai_integration_test) and not test(/^adbc::/)'
 
 .PHONY: test-integration-models
 test-integration-models:
@@ -509,7 +506,6 @@ check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features
 	cargo check $(CARGO_PROFILE) --no-default-features --features adbc
 	cargo check $(CARGO_PROFILE) --no-default-features --features postgres
-	cargo check $(CARGO_PROFILE) --no-default-features --features sqlite
 	cargo check $(CARGO_PROFILE) --no-default-features --features mysql
 	cargo check $(CARGO_PROFILE) --no-default-features --features keyring-secret-store
 	cargo check $(CARGO_PROFILE) --no-default-features --features flightsql
@@ -582,7 +578,7 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # accelerator and acceleration snapshots, which `default` does not. Recompute the difference
 # before relying on it rather than trusting a comment, from this list and the
 # `default = [...]` array in bin/spiced/Cargo.toml.
-SPICED_DATA_FEATURES := adbc,postgres,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb
+SPICED_DATA_FEATURES := adbc,postgres,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb
 
 .PHONY: install
 install: build

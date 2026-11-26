@@ -274,8 +274,8 @@ fn apply_inferred_sort(
     let key = match engine {
         Engine::Arrow => "arrow_sort_columns",
         Engine::Cayenne => "cayenne_sort_columns",
-        // Sqlite / PostgreSQL accelerators have no sort param.
-        _ => return false,
+        // `to_unpartitioned` folds `PartitionedArrow` into `Arrow`.
+        Engine::PartitionedArrow => return false,
     };
 
     // For `refresh_mode: changes`, skip engines whose sort param drives the
@@ -789,7 +789,7 @@ mod tests {
             "a dictionary column is keyed by its values"
         );
 
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Arrow);
         apply_inferred_schema(&mut acc, &inferred, &schema, "t", RefreshMode::Full);
         assert_eq!(acc.indexes.len(), 4, "other engines index any column type");
     }
@@ -912,23 +912,6 @@ mod tests {
             acc.params.get("arrow_sort_columns").map(String::as_str),
             Some("custom")
         );
-    }
-
-    #[test]
-    fn sqlite_has_no_sort_param() {
-        let mut acc = accel(Engine::Sqlite);
-        let inferred = InferredSchema {
-            sort_columns: vec![sort("created_at", true)],
-            ..InferredSchema::default()
-        };
-        apply_inferred_schema(
-            &mut acc,
-            &inferred,
-            &schema(&["created_at"]),
-            "ds",
-            RefreshMode::Full,
-        );
-        assert!(acc.params.is_empty());
     }
 
     #[test]

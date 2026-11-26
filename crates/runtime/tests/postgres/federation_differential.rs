@@ -23,11 +23,8 @@ limitations under the License.
 //! `refresh_mode: full` after the connector converts the rows: Cayenne
 //! `mode: memory`, Cayenne `mode: file` with its defaults, which keeps a load
 //! this small as rows inlined in its metastore, Cayenne `mode: file` with
-//! inlining turned off, which writes and reads Vortex files, Cayenne
-//! `mode: file` partitioned by `grp`, and, with the `sqlite` feature, `SQLite`
-//! `mode: memory` and `mode: file`. Spice sends each query over a `SQLite`
-//! acceleration to `SQLite` as SQL in `SQLite`'s dialect, so those sides check
-//! that translation, and must read nothing but `SQLite`. The Cayenne sides
+//! inlining turned off, which writes and reads Vortex files, and Cayenne
+//! `mode: file` partitioned by `grp`. The Cayenne sides
 //! read the rows back through Cayenne's own scan, with filters and projections
 //! pushed into it, so a value Cayenne stores, encodes, or prunes wrongly shows
 //! up as a row that differs from `PostgreSQL`'s. Every side answers each query three
@@ -69,8 +66,8 @@ use crate::{
     acceleration::has_vortex_file,
     configure_test_datafusion,
     federation_differential::{
-        Case, PlanCheck, Row, agreement, check_cayenne_sources, check_federated, check_sources,
-        empty, operators, ordered, physical_plan, render, rows, spice_rows,
+        Case, PlanCheck, Row, agreement, check_cayenne_sources, check_federated, empty, operators,
+        ordered, physical_plan, render, rows, spice_rows,
     },
     init_tracing,
     postgres::common::{self, get_pg_params},
@@ -113,7 +110,7 @@ const SEED: &[&str] = &[
        (NULL, 'nowhere'), (7, 'unused')",
 ];
 
-/// The scans that send SQL to `PostgreSQL`, or to a `SQLite` acceleration.
+/// The scans that send SQL to `PostgreSQL`.
 const REMOTE_SCANS: [&str; 2] = ["VirtualExecutionPlan", "SqlExec"];
 
 fn cases() -> Vec<Case> {
@@ -265,13 +262,6 @@ enum Kind {
     /// [`Kind::CayenneFile`] with `partition_by: grp`: one Cayenne table per
     /// `grp` value, NULL included. Cayenne refuses `partition_by` in memory mode.
     CayennePartitioned,
-    /// A `SQLite` acceleration held in memory, loaded once with
-    /// `refresh_mode: full`. Spice sends each query over it to `SQLite` as SQL.
-    #[cfg(feature = "sqlite")]
-    SqliteMemory,
-    /// [`Kind::SqliteMemory`] in a database file on disk.
-    #[cfg(feature = "sqlite")]
-    SqliteFile,
 }
 
 /// Where a `mode: file` acceleration of dataset `name` keeps its data.
@@ -333,22 +323,6 @@ fn dataset(port: usize, table: &str, name: &str, kind: Kind, dir: &Path) -> Data
                 ..full
             })
         }
-        #[cfg(feature = "sqlite")]
-        Kind::SqliteMemory => Some(Acceleration {
-            engine: Some("sqlite".to_string()),
-            mode: Mode::Memory,
-            ..full
-        }),
-        #[cfg(feature = "sqlite")]
-        Kind::SqliteFile => Some(Acceleration {
-            engine: Some("sqlite".to_string()),
-            mode: Mode::File,
-            params: Some(Params::from_string_map(HashMap::from([(
-                "sqlite_file".to_string(),
-                dir.join(format!("{name}.db")).display().to_string(),
-            )]))),
-            ..full
-        }),
     };
     ds
 }
@@ -410,20 +384,6 @@ const SUBJECTS: &[Subject] = &[
         regions: "cpart_regions",
         kind: Kind::CayennePartitioned,
     },
-    #[cfg(feature = "sqlite")]
-    Subject {
-        name: "sqlite memory",
-        items: "smem_items",
-        regions: "smem_regions",
-        kind: Kind::SqliteMemory,
-    },
-    #[cfg(feature = "sqlite")]
-    Subject {
-        name: "sqlite file",
-        items: "sfile_items",
-        regions: "sfile_regions",
-        kind: Kind::SqliteFile,
-    },
 ];
 
 /// Spice's answer to `sql` sent the `surface` way, rendered cell by cell.
@@ -441,17 +401,6 @@ async fn surface_rows(
 struct Compared {
     cells: usize,
     all_remote: bool,
-}
-
-/// Checks that every source of the physical plan in `plan` is SQL sent to the
-/// `SQLite` acceleration, so a `SQLite` side answers from `SQLite`.
-#[cfg(feature = "sqlite")]
-fn check_sqlite_sources(plan: &[Row]) -> Result<(), String> {
-    check_sources(
-        plan,
-        |leaf, _| REMOTE_SCANS.contains(&leaf.name) && leaf.line.contains("name=sqlite"),
-        "the SQLite acceleration",
-    )
 }
 
 async fn compare_case(
@@ -490,8 +439,6 @@ async fn compare_case(
             | Kind::CayenneFile
             | Kind::CayenneVortex
             | Kind::CayennePartitioned => Some(&check_cayenne_sources),
-            #[cfg(feature = "sqlite")]
-            Kind::SqliteMemory | Kind::SqliteFile => Some(&check_sqlite_sources),
         };
         for surface in SURFACES {
             let name = format!("{} over {}", subject.name, surface.label());

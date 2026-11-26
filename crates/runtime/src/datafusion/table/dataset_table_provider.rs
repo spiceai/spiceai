@@ -49,18 +49,36 @@ use datafusion::common::TableReference;
 use datafusion::datasource::TableType;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use futures::future::BoxFuture;
-use parking_lot::Mutex;
 use snafu::Snafu;
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex;
+use tokio::time::{Duration, Instant};
 
-use crate::init::dataset_initialization::{DatasetInitialization, DatasetReady};
+use crate::init::dataset_initialization::{DatasetInitialization, DatasetReady, InitializeFailure};
+
+/// The wait before the first retry of a failed initialization; it doubles with each
+/// further failure, up to [`MAX_RETRY_BACKOFF`].
+const MIN_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Where a placeholder's initialization stands.
+enum Slot {
+    /// Not yet attempted, or attempted and failed because the source was unavailable.
+    /// The plan runs on the next [`DatasetTableProvider::ensure_ready`], unless
+    /// `not_before` has not yet passed, in which case that call fails with `last_error`.
+    Pending {
+        init: Box<DatasetInitialization>,
+        failures: u32,
+        not_before: Instant,
+        last_error: Option<Arc<InitError>>,
+    },
+    /// Initialized, or failed in a way no retry clears (a configuration error).
+    Settled(Result<Arc<DatasetReady>, Arc<InitError>>),
+}
 
 /// Errors surfaced from `DatasetTableProvider::ensure_ready`.
 ///
-/// Wrapped in `Arc` because they are stored in a `OnceCell` and any
-/// number of concurrent callers may observe the same failed
-/// initialization.
+/// Wrapped in `Arc` because any number of concurrent callers may
+/// observe the same failed initialization.
 #[derive(Debug, Snafu)]
 pub enum InitError {
     #[snafu(display(
@@ -101,8 +119,10 @@ pub enum InitError {
 pub struct DatasetTableProvider {
     name: TableReference,
     schema: SchemaRef,
-    init: Mutex<Option<DatasetInitialization>>,
-    ready: OnceCell<Result<Arc<DatasetReady>, Arc<InitError>>>,
+    /// Held across an initialization attempt, so concurrent callers wait for it and
+    /// observe its result.
+    slot: Mutex<Slot>,
+    settled: std::sync::atomic::AtomicBool,
 }
 
 impl DatasetTableProvider {
@@ -114,8 +134,13 @@ impl DatasetTableProvider {
         Self {
             name,
             schema,
-            init: Mutex::new(Some(init)),
-            ready: OnceCell::new(),
+            slot: Mutex::new(Slot::Pending {
+                init: Box::new(init),
+                failures: 0,
+                not_before: Instant::now(),
+                last_error: None,
+            }),
+            settled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -125,47 +150,87 @@ impl DatasetTableProvider {
         &self.name
     }
 
-    /// At-most-once initialization. Concurrent callers wait for the
-    /// in-flight call and observe its result.
+    /// Initializes the dataset on the first call, and returns the result to every caller
+    /// after it. Concurrent callers wait for the in-flight attempt and observe its result.
+    ///
+    /// A failure that a later attempt can clear (the source is unavailable) is not kept:
+    /// the next call after a backoff (1s, doubling to 30s) builds the connector again. A
+    /// call inside the backoff returns the last error. A configuration error is kept, as
+    /// no retry clears it.
     pub async fn ensure_ready(&self) -> Result<Arc<DatasetReady>, Arc<InitError>> {
-        let result = self.ready.get_or_init(|| self.initialize_ready()).await;
-        result.clone()
-    }
-
-    fn initialize_ready(&self) -> BoxFuture<'_, Result<Arc<DatasetReady>, Arc<InitError>>> {
-        Box::pin(async move {
-            let init = {
-                self.init.lock().take().ok_or_else(|| {
-                    Arc::new(InitError::AlreadyConsumed {
+        let mut slot = self.slot.lock().await;
+        let (init, failures) = match &*slot {
+            Slot::Settled(result) => return result.clone(),
+            Slot::Pending {
+                last_error: Some(error),
+                not_before,
+                ..
+            } if Instant::now() < *not_before => return Err(Arc::clone(error)),
+            Slot::Pending { .. } => {
+                let Slot::Pending { init, failures, .. } = std::mem::replace(
+                    &mut *slot,
+                    Slot::Settled(Err(Arc::new(InitError::AlreadyConsumed {
                         name: self.name.clone(),
-                    })
-                })?
-            };
+                    }))),
+                ) else {
+                    unreachable!("matched as pending above");
+                };
+                (*init, failures)
+            }
+        };
 
-            let ready = Box::pin(init.initialize()).await.map_err(|err| {
-                Arc::new(InitError::InitializationFailed {
+        match Box::pin(init.initialize_retriable()).await {
+            Ok(ready) => {
+                let result = Ok(Arc::new(ready));
+                *slot = Slot::Settled(result.clone());
+                self.settled
+                    .store(true, std::sync::atomic::Ordering::Release);
+                result
+            }
+            Err(failure) => {
+                let InitializeFailure { error, retry } = *failure;
+                let error = Arc::new(InitError::InitializationFailed {
                     name: self.name.clone(),
-                    source: Box::new(err),
-                })
-            })?;
-
-            Ok(Arc::new(ready))
-        })
+                    source: Box::new(error),
+                });
+                if let Some(init) = retry {
+                    let failures = failures.saturating_add(1);
+                    *slot = Slot::Pending {
+                        init,
+                        failures,
+                        not_before: Instant::now() + retry_backoff(failures),
+                        last_error: Some(Arc::clone(&error)),
+                    };
+                } else {
+                    *slot = Slot::Settled(Err(Arc::clone(&error)));
+                    self.settled
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                Err(error)
+            }
+        }
     }
 
-    /// True iff `ensure_ready` has been called and produced a result
-    /// (success or failure).
+    /// True iff `ensure_ready` has produced a result that will not change: success, or a
+    /// failure no retry clears.
     #[must_use]
     pub fn is_initialized(&self) -> bool {
-        self.ready.initialized()
+        self.settled.load(std::sync::atomic::Ordering::Acquire)
     }
+}
+
+/// The wait after `failures` consecutive failed attempts.
+fn retry_backoff(failures: u32) -> Duration {
+    MIN_RETRY_BACKOFF
+        .saturating_mul(2u32.saturating_pow(failures.saturating_sub(1)))
+        .min(MAX_RETRY_BACKOFF)
 }
 
 impl std::fmt::Debug for DatasetTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DatasetTableProvider")
             .field("name", &self.name)
-            .field("initialized", &self.ready.initialized())
+            .field("initialized", &self.is_initialized())
             .finish_non_exhaustive()
     }
 }

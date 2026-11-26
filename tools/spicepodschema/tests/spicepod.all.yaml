@@ -475,26 +475,6 @@ datasets:
       duckdb_open: data/test.db
 
   # ---------------------------------------------------------------------------
-  # SQLite accelerator test
-  # ---------------------------------------------------------------------------
-  - name: sqlite_accel
-    from: postgres:public.data
-    params:
-      pg_host: localhost
-      pg_port: '5432'
-      pg_db: db
-      pg_user: user
-      pg_pass: pass
-    acceleration:
-      enabled: true
-      engine: sqlite
-      mode: file
-      params:
-        sqlite_file: ./data/accel.sqlite
-        busy_timeout: '5000'
-        file_watcher: 'true'
-
-  # ---------------------------------------------------------------------------
   # Arrow accelerator test
   # ---------------------------------------------------------------------------
   - name: arrow_accel

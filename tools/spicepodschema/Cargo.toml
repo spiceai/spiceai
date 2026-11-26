@@ -10,7 +10,6 @@ version.workspace = true
 
 [dependencies]
 accelerator-cayenne = { path = "../../crates/accelerators/accelerator-cayenne" }
-accelerator-sqlite = { path = "../../crates/accelerators/accelerator-sqlite" }
 data-connector-api = { path = "../../crates/data-connector-api" }
 schemars.workspace = true
 serde.workspace = true
@@ -43,7 +42,6 @@ runtime = { path = "../../crates/runtime", features = [
     "sharepoint",
     "snowflake",
     "spark",
-    "sqlite",
     # Models for model source parameters
     "models",
 ] }

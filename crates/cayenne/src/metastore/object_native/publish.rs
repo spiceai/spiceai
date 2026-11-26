@@ -23,11 +23,31 @@ use super::{
 };
 use crate::{
     catalog::{CatalogError, CatalogResult, SnapshotSequenceCommit},
-    metadata::{DeleteFile, InlinedData},
+    metadata::{DeleteFile, InlinedData, SnapshotFile},
 };
 use cayenne_metastore_actions::{Action, Kind, Record, proto};
 use object_store_occ::headlog::Outcome;
 use prost::Message;
+
+/// The action that records `files` as manifest rows of `snapshot_id`, refusing a
+/// row of another table or snapshot. `upsert` replaces rows the snapshot already
+/// names instead of refusing them.
+pub(super) fn snapshot_manifest_action(
+    table_id: &str,
+    snapshot_id: &str,
+    files: &[SnapshotFile],
+    upsert: bool,
+) -> CatalogResult<Action> {
+    if files
+        .iter()
+        .any(|f| f.table_id != table_id || f.snapshot_id != snapshot_id)
+    {
+        return Err(invalid(format!(
+            "snapshot file identity does not match snapshot '{snapshot_id}' of table '{table_id}'"
+        )));
+    }
+    Ok(actions::add_files(table_id, snapshot_id, files, upsert))
+}
 
 impl Inner {
     /// Buffer an applied record with the buffers it shares a table with, or
@@ -113,6 +133,10 @@ impl Inner {
     /// Commit every buffered change as one record. Nothing that depends on a
     /// buffered change may be acknowledged before this returns `Ok`.
     pub(super) async fn flush(&mut self) -> CatalogResult<()> {
+        // A replica buffers nothing, so it has nothing to commit.
+        if self.stop == Some(Stop::Replica) && self.pending.is_empty() {
+            return Ok(());
+        }
         self.ensure_accepting()?;
         let buffers = std::mem::take(&mut self.pending);
         self.publish_buffers(buffers).await
@@ -134,12 +158,14 @@ impl Inner {
         // not commit, they must never be acknowledged: the log refuses all
         // further work until it is reopened from what did commit. Set before the
         // first await, so a cancelled caller leaves the log to be resolved too.
+        // A replica has no writer and refuses here, before anything changes.
+        self.writer()?;
         self.stop = Some(Stop::Unresolved);
-        let attempt = match self
-            .writer
+        let prepared = self
+            .writer_mut()?
             .prepare_group(vec![record.encode_to_vec().into()])
-            .await
-        {
+            .await;
+        let attempt = match prepared {
             Ok(attempt) => attempt,
             Err(error) => return Err(self.unresolved(&error.to_string())),
         };
@@ -167,7 +193,7 @@ impl Inner {
             // working once the committed state is reloaded.
             Outcome::Fenced { .. } | Outcome::Rejected => {
                 tracing::info!("{}", fenced_message(&self.dataset));
-                self.stop = Some(Stop::Fenced { reloaded: false });
+                self.stop = Some(Stop::Fenced);
                 if let Err(error) = self.reload_committed().await {
                     tracing::debug!(
                         "{} could not reload its committed state yet, so its queries wait for a background retry: {error}",
@@ -193,6 +219,7 @@ impl Inner {
         let record = Record {
             actions: vec![action],
         };
+        self.revision += 1;
         self.reader.state.apply(&record).map_err(invalid)?;
         self.publish_buffers(vec![Pending {
             tables: std::collections::BTreeSet::new(),
@@ -209,20 +236,12 @@ impl Inner {
         let mut batch = Vec::new();
         for publication in publications {
             if !publication.files.is_empty() {
-                if publication.files.iter().any(|file| {
-                    file.table_id != publication.table_id
-                        || file.snapshot_id != publication.snapshot_id
-                }) {
-                    return Err(invalid(
-                        "a published file does not belong to the published snapshot",
-                    ));
-                }
-                batch.push(actions::add_files(
+                batch.push(snapshot_manifest_action(
                     publication.table_id,
                     publication.snapshot_id,
                     publication.files,
                     true,
-                ));
+                )?);
             }
             batch.extend(self.conflict_batch(
                 publication.delete_files.to_vec(),
@@ -276,7 +295,7 @@ impl Inner {
     ) -> CatalogResult<Outcome> {
         let attempts = self.config.publish_attempts;
         let base = self.config.retry_delay;
-        let mut outcome = self.writer.commit(attempt).await;
+        let mut outcome = self.writer_mut()?.commit(attempt).await;
         for retry in 1..=attempts {
             let error = match outcome {
                 Ok(Outcome::Unresolved) => "the outcome was unresolved".to_string(),
@@ -290,7 +309,7 @@ impl Inner {
                 delay.as_millis()
             );
             tokio::time::sleep(delay).await;
-            outcome = self.writer.resolve(attempt).await;
+            outcome = self.writer_mut()?.resolve(attempt).await;
         }
         outcome.map_err(invalid)
     }

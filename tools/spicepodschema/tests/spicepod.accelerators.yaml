@@ -32,28 +32,6 @@ datasets:
         file_watcher: "true"
 
   # ===========================================================================
-  # SQLite Accelerator
-  # Runtime params: busy_timeout, file_watcher
-  # ===========================================================================
-  - name: accel_sqlite
-    from: postgres:public.another_table
-    params:
-      pg_host: localhost
-      pg_port: "5432"
-      pg_db: testdb
-      pg_user: postgres
-      pg_pass: secret
-    acceleration:
-      enabled: true
-      engine: sqlite
-      mode: file
-      refresh_mode: full
-      params:
-        sqlite_file: ./data/accel.sqlite
-        busy_timeout: "5000"
-        file_watcher: "true"
-
-  # ===========================================================================
   # Cayenne Accelerator (if enabled)
   # Runtime params: file_watcher
   # ===========================================================================

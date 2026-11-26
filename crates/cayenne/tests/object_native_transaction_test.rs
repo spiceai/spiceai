@@ -423,7 +423,7 @@ async fn a_sweep_waits_for_a_transaction_that_reserves_the_dataset() {
         .expect("publish a protected snapshot");
     assert!(
         catalog
-            .swap_protected_snapshots(&orders, std::slice::from_ref(&first), &merged, 4)
+            .swap_protected_snapshots(&orders, std::slice::from_ref(&first), &merged, 4, None)
             .await
             .expect("merge")
     );
