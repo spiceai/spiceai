@@ -33,13 +33,18 @@ limitations under the License.
 //! * Apply optional configuration from a `params` map (auth overrides,
 //!   retry/backoff tuning, proxy settings, etc.).
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
+use bytes::Bytes;
 use datafusion::error::DataFusionError;
+use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use object_store::{
-    ClientOptions, ObjectStore, RetryConfig,
+    ClientOptions, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+    RetryConfig,
     azure::{AzureConfigKey, MicrosoftAzureBuilder},
     gcp::GoogleCloudStorageBuilder,
+    path::Path,
 };
 use object_store_spawn::SpawnedReqwestConnector;
 use tokio::runtime::Handle;
@@ -55,18 +60,20 @@ use url::Url;
 ///
 /// Any `#key=value` URL fragment is **not** read by this function; callers
 /// that encode params in the URL fragment must parse it themselves and pass
-/// the result via `params`. The URL's query string is left untouched except
-/// when a `sas_string` param is present, in which case it replaces the query.
+/// the result via `params`.
 ///
-/// Credentials are sourced from:
-/// 1. `params` (explicit overrides such as `access_key`, `bearer_token`,
-///    `client_id`/`client_secret`/`tenant_id`, `federated_token_file`, ...)
-/// 2. Environment variables via [`MicrosoftAzureBuilder::from_env`]
-///    (`AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_ACCOUNT_KEY`,
-///    `AZURE_STORAGE_ACCESS_KEY`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
-///    `AZURE_FEDERATED_TOKEN_FILE`, ...).
-/// 3. Azure Managed Identity / IMDS (fallback, only reached if the above
-///    are absent).
+/// Credentials come from `params` (`access_key`, `bearer_token`, `sas_string`,
+/// `client_id`/`client_secret`/`tenant_id`, `federated_token_file`, ...) and from
+/// environment variables via [`MicrosoftAzureBuilder::from_env`]
+/// (`AZURE_STORAGE_ACCOUNT_KEY`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
+/// `AZURE_FEDERATED_TOKEN_FILE`, ...). When several are set, from either source,
+/// `object_store` uses the first of: a bearer token, an access key, workload identity,
+/// a client secret, a SAS, the Azure CLI. Azure Managed Identity (IMDS) answers when
+/// none is set. With `use_emulator`, the order is an access key, a bearer token, a SAS,
+/// then the emulator's key.
+///
+/// The store's errors pass through credential redaction: `object_store` prints the
+/// URL of a delete request, SAS included.
 ///
 /// # Errors
 ///
@@ -185,13 +192,178 @@ pub fn build_azure_object_store<S: ::std::hash::BuildHasher>(
         builder = builder.with_disable_tagging(as_bool);
     }
 
-    let azure_store = Arc::new(
-        builder
-            .build()
-            .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?,
-    );
+    let azure_store = builder
+        .build()
+        .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?;
 
-    Ok(azure_store as Arc<dyn ObjectStore>)
+    Ok(Arc::new(RedactedErrors(azure_store)) as Arc<dyn ObjectStore>)
+}
+
+/// A store whose errors pass through credential redaction.
+#[derive(Debug)]
+struct RedactedErrors<T>(T);
+
+/// The error with its source replaced by masked text when that text holds a credential.
+/// The kind and path stay; the original source goes, since it would print the credential again.
+fn redact_error(error: object_store::Error) -> object_store::Error {
+    use object_store::Error;
+
+    type Source = Box<dyn std::error::Error + Send + Sync + 'static>;
+    fn masked(source: Source) -> Source {
+        let text = source.to_string();
+        let redacted = redact::redact_message_credentials(&text);
+        if redacted == text {
+            source
+        } else {
+            redacted.into()
+        }
+    }
+
+    match error {
+        Error::Generic { store, source } => Error::Generic {
+            store,
+            source: masked(source),
+        },
+        Error::NotFound { path, source } => Error::NotFound {
+            path,
+            source: masked(source),
+        },
+        Error::NotSupported { source } => Error::NotSupported {
+            source: masked(source),
+        },
+        Error::AlreadyExists { path, source } => Error::AlreadyExists {
+            path,
+            source: masked(source),
+        },
+        Error::Precondition { path, source } => Error::Precondition {
+            path,
+            source: masked(source),
+        },
+        Error::NotModified { path, source } => Error::NotModified {
+            path,
+            source: masked(source),
+        },
+        Error::PermissionDenied { path, source } => Error::PermissionDenied {
+            path,
+            source: masked(source),
+        },
+        Error::Unauthenticated { path, source } => Error::Unauthenticated {
+            path,
+            source: masked(source),
+        },
+        other => other,
+    }
+}
+
+impl<T: ObjectStore> std::fmt::Display for RedactedErrors<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+#[deny(clippy::missing_trait_methods)]
+#[async_trait::async_trait]
+impl<T: ObjectStore> ObjectStore for RedactedErrors<T> {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.0
+            .put_opts(location, payload, opts)
+            .await
+            .map_err(redact_error)
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.0
+            .put_multipart_opts(location, opts)
+            .await
+            .map_err(redact_error)
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.0
+            .get_opts(location, options)
+            .await
+            .map_err(redact_error)
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
+        self.0
+            .get_ranges(location, ranges)
+            .await
+            .map_err(redact_error)
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.0
+            .delete_stream(locations)
+            .map_err(redact_error)
+            .boxed()
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.0.list(prefix).map_err(redact_error).boxed()
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.0
+            .list_with_offset(prefix, offset)
+            .map_err(redact_error)
+            .boxed()
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.0
+            .list_with_delimiter(prefix)
+            .await
+            .map_err(redact_error)
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.0
+            .copy_opts(from, to, options)
+            .await
+            .map_err(redact_error)
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: RenameOptions,
+    ) -> object_store::Result<()> {
+        self.0
+            .rename_opts(from, to, options)
+            .await
+            .map_err(redact_error)
+    }
 }
 
 /// Build a Google Cloud Storage object store.
@@ -439,13 +611,9 @@ mod tests {
         (format!("http://{address}/account"), seen)
     }
 
-    #[tokio::test]
-    async fn azure_builder_authorizes_requests_with_the_sas() {
-        use object_store::ObjectStoreExt;
-
-        let (endpoint, seen) = query_recording_server().await;
-        let url = Url::parse("abfss://container@account.dfs.core.windows.net/").expect("valid url");
-        let params = HashMap::from([
+    /// Params for an Azure store at `endpoint` that signs its requests with a SAS.
+    fn sas_params(endpoint: String) -> HashMap<String, String> {
+        HashMap::from([
             ("account".to_string(), "account".to_string()),
             ("endpoint".to_string(), endpoint),
             ("allow_http".to_string(), "true".to_string()),
@@ -454,16 +622,56 @@ mod tests {
                 "sas_string".to_string(),
                 "sv=2019-12-12&sp=r&sig=sas-signature".to_string(),
             ),
-        ]);
+        ])
+    }
 
-        let store = build_azure_object_store(&url, &params, handle())
+    #[tokio::test]
+    async fn azure_builder_authorizes_requests_with_the_sas() {
+        use object_store::ObjectStoreExt;
+
+        let (endpoint, seen) = query_recording_server().await;
+        let url = Url::parse("abfss://container@account.dfs.core.windows.net/").expect("valid url");
+
+        let store = build_azure_object_store(&url, &sas_params(endpoint), handle())
             .expect("azure object store should build with a SAS");
-        let _ = store
+        let err = store
             .head(&object_store::path::Path::from("items.csv"))
             .await
             .expect_err("the server answers 404");
+        assert!(
+            matches!(err, object_store::Error::NotFound { .. }),
+            "an error with nothing to mask keeps its kind: {err}"
+        );
         let seen = seen.lock().expect("the request log is not poisoned");
         assert_eq!(seen.as_slice(), ["sv=2019-12-12&sp=r&sig=sas-signature"]);
+    }
+
+    #[tokio::test]
+    async fn azure_delete_error_leaves_out_the_sas() {
+        use object_store::ObjectStoreExt;
+
+        let (endpoint, seen) = query_recording_server().await;
+        let url = Url::parse("abfss://container@account.dfs.core.windows.net/").expect("valid url");
+
+        let store = build_azure_object_store(&url, &sas_params(endpoint), handle())
+            .expect("azure object store should build with a SAS");
+        let err = store
+            .delete(&object_store::path::Path::from("items.csv"))
+            .await
+            .expect_err("the server answers 404")
+            .to_string();
+        assert_eq!(
+            seen.lock()
+                .expect("the request log is not poisoned")
+                .as_slice(),
+            ["restype=container&comp=batch&sv=2019-12-12&sp=r&sig=sas-signature"],
+            "the delete is sent as a batch request signed with the SAS"
+        );
+        assert!(
+            err.starts_with("Generic MicrosoftAzure error: Error performing bulk delete request: ")
+                && !err.contains("sas-signature"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
