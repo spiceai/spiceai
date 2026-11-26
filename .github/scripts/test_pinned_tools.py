@@ -237,6 +237,7 @@ class PinnedToolsTest(unittest.TestCase):
         self.assertIn("steps.linux.outputs.installed == 'true'", preflight["if"])
         self.assertEqual(self.calls(), [])
 
+    @unittest.skipUnless(shutil.which("unzip"), "the step unpacks the zip with unzip, which every runner has")
     def test_the_aws_cli_is_the_pinned_one(self):
         install = (
             "#!/bin/sh\nset -e\n"
