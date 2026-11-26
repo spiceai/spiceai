@@ -2059,7 +2059,7 @@ async fn clear_changes_loaded(
     };
     if let Err(error) = written {
         tracing::warn!(
-            "Dataset '{dataset_name}' could not clear the loaded mark from its acceleration checkpoint, so a later start may serve the acceleration before its source answers. Cause: {error}"
+            "Dataset '{dataset_name}' could not update its acceleration record, so a later start may serve its existing acceleration while its source is unavailable, although its configuration now waits for the source. Cause: {error}. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
         );
     }
 }

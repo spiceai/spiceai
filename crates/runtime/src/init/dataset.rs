@@ -3997,15 +3997,10 @@ fn not_served_status(reason: &str, cause: &str) -> String {
 /// after a restart from a recorded position, so it is served from its existing
 /// acceleration at startup and starts its stream once the source answers.
 pub(crate) fn resumes_changes_after_restart(ds: &Dataset) -> bool {
-    ds.acceleration.as_ref().is_some_and(|acceleration| {
-        acceleration.enabled
-            && acceleration.refresh_mode == Some(RefreshMode::Changes)
-            && changes_wait_reason(
-                crate::dataconnector::connector_resumes_changes_after_restart(ds.source()),
-                acceleration,
-            )
-            .is_none()
-    })
+    ds.acceleration
+        .as_ref()
+        .is_some_and(|acceleration| acceleration.refresh_mode == Some(RefreshMode::Changes))
+        && Runtime::may_serve_existing_acceleration(ds)
 }
 
 /// Why a `refresh_mode: changes` dataset waits for its source instead of being

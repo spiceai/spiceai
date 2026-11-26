@@ -4414,7 +4414,7 @@ impl DataFusion {
         // Executor-scoped datasets arrive with `partition_by` cleared, so check the
         // partition filters too.
         let resumes_changes = initial_partition_filters.is_none()
-            && crate::Runtime::may_serve_existing_acceleration(dataset);
+            && crate::init::dataset::resumes_changes_after_restart(dataset);
         let mut initial_load_complete = matches!(refresh_mode, RefreshMode::Caching)
             || (source.as_any().is::<SinkConnector>()
                 && !matches!(refresh_mode, RefreshMode::Snapshot));

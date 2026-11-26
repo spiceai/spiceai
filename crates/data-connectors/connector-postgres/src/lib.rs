@@ -266,9 +266,10 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description(
             "For `refresh_mode: changes`, the dataset is marked Ready once its \
              replication lag (now minus the newest applied commit's source time) \
-             falls below this. It stays not-ready while it loads the table for the \
-             first time. A file acceleration already loaded by an earlier run is served \
-             at startup and catches up in the background; monitor \
+             falls below this. It stays not-ready while snapshotting or draining a \
+             backlog, except that a file acceleration already loaded by an earlier run \
+             is served at startup (without `partition_by`, snapshots or \
+             `on_zero_results: use_source`) and catches up in the background; monitor \
              `dataset_acceleration_cdc_applied_commit_unix_time_ms` for freshness. \
              Default: 2s.",
         )

@@ -1229,7 +1229,7 @@ async fn attach_member(
             tracing::warn!(
                 dataset = %dataset_name,
                 connection = %source.key.label(),
-                "the persisted binlog position for this dataset is unusable and its acceleration survives restarts, so it will be rebuilt from the source before changes are applied"
+                "this dataset has no binlog position it can resume from and its acceleration may already hold rows, so it will be rebuilt from the source before changes are applied"
             );
             // No snapshot runs on this path — the consumer's rebuild replaces it
             // — so the gauge's "finished, or skipped" state is reached here.
@@ -1342,13 +1342,13 @@ fn file_checkpoint_verdict(persisted_file_present: bool) -> CheckpointVerdict {
 enum MemberStart {
     /// Resume from the persisted position; nothing to load.
     Stream,
-    /// Snapshot into an acceleration with no completed load behind it: no
-    /// position was ever persisted for this member.
+    /// Snapshot into an acceleration observed empty, with no position persisted
+    /// for this member.
     Snapshot,
-    /// A position was persisted but cannot be resumed from, so the acceleration
-    /// holds rows whose explanation is gone from the source's binary log. Only
-    /// re-reading the table can correct them, and the consumer owns the
-    /// accelerator so it can do that as one atomic replacement — see
+    /// No position can be resumed from and the acceleration may hold rows: the
+    /// persisted position is unusable, or none was recorded. Only re-reading the
+    /// table can correct those rows, and the consumer owns the accelerator so it
+    /// can do that as one atomic replacement — see
     /// [`crate::cdc::ChangeEnvelope::history_unavailable`].
     Rebuild,
 }
