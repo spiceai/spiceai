@@ -38,16 +38,22 @@ pub(super) struct StateSlot {
     /// lease's state, which is published only when the lease is returned.
     pub(super) published: ArcSwapOption<DatasetStateReader>,
     /// Whether [`Self::published`] is a replica's state, which may lack the
-    /// writer's latest commits until the replica follows them. Stored before
-    /// the state it describes.
+    /// writer's latest commits until the replica follows them. Set before
+    /// publishing replica state and cleared after publishing writer state.
     pub(super) replica: std::sync::atomic::AtomicBool,
     /// Runs in [`Self::published`] between its reservation check and its load,
     /// so a test can take a reservation there.
     #[cfg(test)]
-    pub(super) before_load: Mutex<Option<BeforeLoad>>,
+    pub(super) before_load: Mutex<Option<SlotHook>>,
+    /// Runs in [`Self::publish`] between publishing the role and state.
+    #[cfg(test)]
+    pub(super) between_role_and_state: Mutex<Option<SlotHook>>,
+    /// Runs after a takeover opens the data-write gate.
+    #[cfg(test)]
+    pub(super) after_writer_gate_open: Mutex<Option<SlotHook>>,
 }
 #[cfg(test)]
-pub(super) type BeforeLoad = Box<dyn FnOnce(&StateSlot) + Send>;
+pub(super) type SlotHook = Box<dyn FnOnce(&StateSlot) + Send>;
 pub(super) struct StateLease<'a> {
     slot: &'a Arc<StateSlot>,
     inner: Option<Inner>,
@@ -107,13 +113,19 @@ impl StateSlot {
     }
 
     /// [`Self::published`], when it is the state of the instance that writes
-    /// the log. A load that races a change of role returns the state either
-    /// role published, each as of a commit already made.
+    /// the log. The role is checked again after the state load, so a change to
+    /// replica cannot make its state appear to be the writer's. A change to
+    /// writer publishes its state before exposing that role.
     pub(super) fn published_by_writer(&self) -> Option<Arc<DatasetStateReader>> {
-        if self.replica.load(std::sync::atomic::Ordering::Acquire) {
+        use std::sync::atomic::Ordering;
+        if self.replica.load(Ordering::Acquire) {
             return None;
         }
-        self.published()
+        let published = self.published();
+        if self.replica.load(Ordering::Acquire) {
+            return None;
+        }
+        published
     }
 
     /// Publish `inner`'s state for reads, or withdraw it while the log serves
@@ -126,19 +138,32 @@ impl StateSlot {
             self.published.store(None);
             return;
         }
-        self.replica.store(
-            matches!(inner.head, Head::Replica(_)),
-            std::sync::atomic::Ordering::Release,
-        );
-        if self
+        let state_changed = !self
             .published
             .load()
             .as_ref()
-            .is_some_and(|published| Arc::ptr_eq(published, &inner.reader))
-        {
-            return;
+            .is_some_and(|published| Arc::ptr_eq(published, &inner.reader));
+        if matches!(inner.head, Head::Replica(_)) {
+            self.replica
+                .store(true, std::sync::atomic::Ordering::Release);
+            #[cfg(test)]
+            if let Some(hook) = self.between_role_and_state.lock().take() {
+                hook(self);
+            }
+            if state_changed {
+                self.published.store(Some(Arc::clone(&inner.reader)));
+            }
+        } else {
+            if state_changed {
+                self.published.store(Some(Arc::clone(&inner.reader)));
+            }
+            #[cfg(test)]
+            if let Some(hook) = self.between_role_and_state.lock().take() {
+                hook(self);
+            }
+            self.replica
+                .store(false, std::sync::atomic::Ordering::Release);
         }
-        self.published.store(Some(Arc::clone(&inner.reader)));
     }
 
     /// Wait for the reservation and hold it until the returned guard drops.
@@ -291,6 +316,8 @@ mod tests {
             published: ArcSwapOption::from(Some(Arc::clone(&before))),
             replica: AtomicBool::new(false),
             before_load: Mutex::new(None),
+            between_role_and_state: Mutex::new(None),
+            after_writer_gate_open: Mutex::new(None),
         };
         let published = Arc::clone(&resolved);
         *slot.before_load.lock() = Some(Box::new(move |slot: &StateSlot| {

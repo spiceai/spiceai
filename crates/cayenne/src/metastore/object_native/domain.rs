@@ -179,15 +179,29 @@ impl Domain {
                 if matches!(inner.head, Head::Writer(_)) {
                     self.data_writes.set(false);
                 }
-                match inner.become_writer().await {
+                let became_writer = match inner.become_writer().await {
                     Ok(()) if took_over => {
                         tracing::info!("{}", super::took_over_message(dataset, &inner.location()));
+                        true
                     }
-                    Ok(()) => {}
-                    Err(error) => tracing::warn!(
-                        "{} holds its writer lease but could not take the dataset over, so it keeps serving queries as a replica and retries. Cause: {error}",
-                        subject(dataset)
-                    ),
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(
+                            "{} holds its writer lease but could not take the dataset over, so it keeps serving queries as a replica and retries. Cause: {error}",
+                            subject(dataset)
+                        );
+                        false
+                    }
+                };
+                // Publish the writer state before tables may send writes based on it.
+                drop(inner);
+                if became_writer {
+                    self.data_writes.set(true);
+                }
+                #[cfg(test)]
+                if became_writer && let Some(hook) = self.inner.after_writer_gate_open.lock().take()
+                {
+                    hook(&self.inner);
                 }
             }
             LeaseRole::Standby { holder } => {
@@ -470,6 +484,10 @@ impl Domain {
                 replica: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
                 before_load: Mutex::new(None),
+                #[cfg(test)]
+                between_role_and_state: Mutex::new(None),
+                #[cfg(test)]
+                after_writer_gate_open: Mutex::new(None),
             }),
         })
     }
@@ -1316,8 +1334,6 @@ impl Inner {
         writer.revision = self.revision + 1;
         *self = writer;
         self.resolve_decided_transactions().await?;
-        // Data writes are allowed only once the head is this instance's.
-        self.data_writes.set(true);
         Ok(())
     }
     /// The error a caller gets from a log stopped for `stop`.
@@ -1498,5 +1514,120 @@ impl Inner {
 fn replica_error(dataset: &str) -> CatalogError {
     CatalogError::InvalidOperationNoSource {
         message: replica_change_message(dataset),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::LeaseSettings;
+    use super::{Access, Arc, DatasetStateReader, Domain, NativeCatalogConfig};
+    use object_store::{ObjectStore, memory::InMemory, path::Path};
+    use parking_lot::Mutex;
+
+    const KEY: &str = "cdc-checkpoint";
+    const REPLICA_VALUE: &[u8] = b"replica-state";
+    const LATEST_VALUE: &[u8] = b"log-latest";
+
+    fn leased_config(identity: &'static str) -> NativeCatalogConfig {
+        NativeCatalogConfig {
+            access: Access::Leased(LeaseSettings {
+                duration: std::time::Duration::from_secs(60),
+                identity: Some(identity),
+            }),
+            ..NativeCatalogConfig::default()
+        }
+    }
+
+    fn value(reader: &DatasetStateReader) -> Option<Vec<u8>> {
+        reader
+            .state
+            .positions
+            .get(&(KEY.to_string(), String::new()))
+            .cloned()
+    }
+
+    async fn replica_ready_to_take_over() -> Domain {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let prefix = Path::from("catalog");
+        let writer = Domain::create_with_config(
+            Arc::clone(&store),
+            prefix.clone(),
+            leased_config("writer"),
+            true,
+            None,
+            "orders",
+        )
+        .await
+        .expect("create writer");
+        writer
+            .set_sidecar_value(KEY, Some(REPLICA_VALUE.to_vec()))
+            .await
+            .expect("record the state the replica opens");
+
+        let replica = Domain::open_with_config(
+            store,
+            prefix,
+            leased_config("replica"),
+            true,
+            None,
+            "orders",
+        )
+        .await
+        .expect("open replica");
+        assert_eq!(
+            value(&replica.read().await.expect("publish replica state")),
+            Some(REPLICA_VALUE.to_vec())
+        );
+
+        writer
+            .set_sidecar_value(KEY, Some(LATEST_VALUE.to_vec()))
+            .await
+            .expect("advance the writer state");
+        writer.release_lease().await;
+        replica
+    }
+
+    #[tokio::test]
+    async fn writer_publication_never_exposes_replica_state_as_writer_state() {
+        let replica = replica_ready_to_take_over().await;
+        let observed = Arc::new(Mutex::new(None));
+        let observed_in_hook = Arc::clone(&observed);
+        *replica.inner.between_role_and_state.lock() = Some(Box::new(move |slot| {
+            *observed_in_hook.lock() = Some(slot.published_by_writer().as_deref().and_then(value));
+        }));
+
+        assert!(replica.keep_lease().await);
+        assert_eq!(
+            observed.lock().clone(),
+            Some(None),
+            "the role transition exposed the replica's published state as writer state"
+        );
+        assert_eq!(
+            replica.sidecar_value(KEY).await.expect("read writer state"),
+            Some(LATEST_VALUE.to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn takeover_opens_data_writes_after_publishing_writer_state() {
+        let replica = replica_ready_to_take_over().await;
+        let observed = Arc::new(Mutex::new(None));
+        let observed_in_hook = Arc::clone(&observed);
+        let gate = replica.data_writes.clone();
+        *replica.inner.after_writer_gate_open.lock() = Some(Box::new(move |slot| {
+            *observed_in_hook.lock() =
+                Some((gate.allows(), slot.published().as_deref().and_then(value)));
+        }));
+
+        assert!(replica.keep_lease().await);
+        assert_eq!(
+            observed.lock().clone(),
+            Some((true, Some(LATEST_VALUE.to_vec()))),
+            "the data-write gate opened before the writer state was published"
+        );
+        assert_eq!(
+            value(&replica.read().await.expect("read published writer state")),
+            Some(LATEST_VALUE.to_vec())
+        );
     }
 }
