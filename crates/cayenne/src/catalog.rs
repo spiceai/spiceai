@@ -1183,11 +1183,17 @@ pub trait MetadataCatalog: Send + Sync {
     /// This records when the snapshot was created relative to deletions.
     /// Used for Iceberg-style sequence ordering: deletions only apply to
     /// snapshots with sequence <= `delete_sequence`.
+    ///
+    /// `files` names the files of a new protected snapshot, which has no
+    /// manifest rows yet, in the same commit that makes it live, so that no
+    /// crash leaves the files of a snapshot that never became live named, where
+    /// no sweep reclaims them. `None` when there is no manifest to record.
     async fn set_snapshot_sequence(
         &self,
         table_id: &str,
         snapshot_id: &str,
         sequence_number: i64,
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()>;
 
     /// Get the sequence number for a snapshot.
