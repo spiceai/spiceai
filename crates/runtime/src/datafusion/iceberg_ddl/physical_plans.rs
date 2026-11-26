@@ -1226,23 +1226,33 @@ fn build_forwarded_create_sql(
         columns_sql.join(", ")
     );
 
+    let option = |key: &str, value: String| {
+        format!(
+            "\"{key}\" = {}",
+            datafusion::sql::sqlparser::ast::Value::SingleQuotedString(value)
+        )
+    };
     let mut options = Vec::new();
-    options.push(format!(
-        "\"acceleration.engine\" = '{}'",
-        acceleration.engine.as_deref().unwrap_or("cayenne")
+    options.push(option(
+        "acceleration.engine",
+        acceleration
+            .engine
+            .as_deref()
+            .unwrap_or("cayenne")
+            .to_string(),
     ));
-    options.push(format!("\"acceleration.mode\" = '{}'", acceleration.mode));
+    options.push(option("acceleration.mode", acceleration.mode.to_string()));
     if let Some(refresh_mode) = &acceleration.refresh_mode {
-        options.push(format!(
-            "\"acceleration.refresh_mode\" = '{}'",
-            render_refresh_mode(refresh_mode)
+        options.push(option(
+            "acceleration.refresh_mode",
+            render_refresh_mode(refresh_mode).to_string(),
         ));
     }
     if let Some(time_column) = &dataset_options.time_column {
-        options.push(format!("\"dataset.time_column\" = '{time_column}'"));
+        options.push(option("dataset.time_column", time_column.clone()));
     }
     if let Some(time_format) = &dataset_options.time_format {
-        options.push(format!("\"dataset.time_format\" = '{time_format}'"));
+        options.push(option("dataset.time_format", time_format.to_string()));
     }
 
     if !options.is_empty() {
@@ -1487,6 +1497,31 @@ impl ExecutionPlan for IcebergDropTableExec {
 mod tests {
     use super::*;
     use crate::component::dataset::acceleration::RefreshMode;
+
+    /// A forwarded `CREATE TABLE` writes each option value as a string literal, so a quote in
+    /// the value reaches the executors doubled.
+    #[test]
+    fn a_forwarded_option_value_keeps_its_quote() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, true)]);
+        let dataset_options = DatasetOptions {
+            time_column: Some("o'clock".to_string()),
+            time_format: None,
+        };
+        let sql = build_forwarded_create_sql(
+            "spice",
+            "public",
+            "t",
+            &schema,
+            &Acceleration::default(),
+            &dataset_options,
+            None,
+        )
+        .expect("forwarded SQL");
+        assert!(
+            sql.contains(r#""dataset.time_column" = 'o''clock'"#),
+            "{sql}"
+        );
+    }
 
     /// A table `CREATE TABLE` accelerates is never rebuilt for changed settings, though
     /// its acceleration reads as a rebuildable one (`file` mode, `full` refresh,

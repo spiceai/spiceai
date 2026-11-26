@@ -43,10 +43,6 @@ pub enum Error {
     #[snafu(display("Forbidden: {message}"))]
     Forbidden { message: String },
 
-    /// The user explicitly denied the browser-based device authorization flow.
-    #[snafu(display("Device authorization was denied"))]
-    AuthorizationDenied,
-
     /// The server returned a successful response whose body was invalid for the
     /// requested operation.
     #[snafu(display("Invalid response: {message}"))]

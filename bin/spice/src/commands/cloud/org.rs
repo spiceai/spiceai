@@ -46,6 +46,13 @@ pub const DEFAULT_TOKEN_VAR: &str = "SPICE_SPICEAI_TOKEN";
 /// Environment variable holding the default app (data-plane) API key.
 pub const DEFAULT_API_KEY_VAR: &str = "SPICE_SPICEAI_API_KEY";
 
+/// Environment variable holding the refresh token for [`DEFAULT_TOKEN_VAR`]
+/// after a browser sign-in.
+pub const DEFAULT_REFRESH_TOKEN_VAR: &str = "SPICE_SPICEAI_REFRESH_TOKEN";
+
+/// Environment variable holding the OAuth client ID browser sign-ins use.
+pub const CLIENT_ID_VAR: &str = "SPICE_SPICEAI_CLIENT_ID";
+
 /// Environment variable that overrides the persisted active org for one process.
 pub const ACTIVE_ORG_VAR: &str = "SPICE_CLOUD_ORG";
 
@@ -138,6 +145,16 @@ fn context_path() -> Result<PathBuf> {
             dirs::home_dir().ok_or_else(|| crate::error::HomeDirectoryNotFoundSnafu.build())?;
         Ok(home.join(DOT_SPICE).join(CONTEXT_FILE))
     }
+}
+
+/// Lock file that serializes Spice Cloud credential changes on this machine:
+/// login, logout and sign-in renewal.
+///
+/// # Errors
+///
+/// Returns an error if the home directory cannot be determined.
+pub(super) fn credentials_lock_path() -> Result<PathBuf> {
+    Ok(context_path()?.with_file_name("cloud-credentials.lock"))
 }
 
 /// Redirects cloud-context helpers to a temporary file in tests.
@@ -367,6 +384,12 @@ pub(super) fn org_from_credential_key(key: &str) -> Option<String> {
 #[must_use]
 pub fn org_token_var(org: &str) -> String {
     format!("{DEFAULT_TOKEN_VAR}_{}", encode_org(org))
+}
+
+/// Environment variable holding the refresh token for [`org_token_var`]`(org)`.
+#[must_use]
+pub fn org_refresh_token_var(org: &str) -> String {
+    format!("{DEFAULT_REFRESH_TOKEN_VAR}_{}", encode_org(org))
 }
 
 /// Environment variable holding the app (data-plane) API key for `org`.

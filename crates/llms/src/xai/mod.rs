@@ -73,7 +73,7 @@ impl Xai {
             .with_api_base(endpoint)
             .with_api_key(api_key);
 
-        // No retries and the same bounds, as `crate::provider::client_without_retry`. The service
+        // The same retry policy and bounds as `crate::provider::client_without_retry`. The service
         // also reads xAI's error bodies, which `async-openai` cannot.
         let service = BoundedService::new(Limits::default());
         let client = Client::build(service.http_client().clone(), cfg)

@@ -766,7 +766,7 @@ impl ColumnStatsAccumulator {
             return None;
         };
 
-        match crate::stats::build_file_statistics(state.columns.clone(), &self.schema)
+        match crate::stats::build_file_statistics(&state.columns, &self.schema)
             .and_then(|file_stats| crate::stats::serialize_file_statistics(&file_stats))
         {
             Ok(bytes) => Some((bytes, row_count)),

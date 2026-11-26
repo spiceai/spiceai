@@ -30,10 +30,10 @@ use crate::error::{CloudErrorCode, Error, InvalidResponseSnafu, Result};
 
 pub use spice_cloud_client::CloudClient as InnerCloudClient;
 use spice_cloud_client::types::{
-    ApiKeysResponse, AuthContext, AuthExchangeResponse, ContainerImagesResponse,
-    CreateDeploymentRequest, CreateProjectRequest, Deployment, LogsResponse, MetricsResponse, Org,
-    Project, ProjectExecutor, ProjectKind, ProjectResourceLimits, ProjectResources,
-    RegenerateApiKeyResponse, RegionsResponse, Secret, UpdateChannel, UpdateProjectRequest,
+    ApiKeysResponse, AuthContext, ContainerImagesResponse, CreateDeploymentRequest,
+    CreateProjectRequest, Deployment, LogsResponse, MetricsResponse, Org, Project, ProjectExecutor,
+    ProjectKind, ProjectResourceLimits, ProjectResources, RegenerateApiKeyResponse,
+    RegionsResponse, Secret, UpdateChannel, UpdateProjectRequest,
 };
 
 use super::org;
@@ -182,6 +182,13 @@ impl CloudClient {
         let mut inner = InnerCloudClient::new(base_url)
             .map_err(map_cloud_error(None))?
             .with_token(token);
+        // The configured headers belong to the configured Cloud deployment, so
+        // a client for any other endpoint never carries them.
+        if base_url.trim_end_matches('/') == get_base_url().trim_end_matches('/') {
+            inner = inner
+                .with_api_headers(api_headers()?)
+                .with_portal_headers(portal_headers()?);
+        }
         if let Some(org) = org {
             org::validate_org_name(org)?;
             inner = inner.with_org(org);
@@ -196,7 +203,10 @@ impl CloudClient {
     /// Create a new unauthenticated cloud client (for the login flow).
     pub fn new_unauthenticated() -> Result<Self> {
         Ok(Self {
-            inner: InnerCloudClient::new(&get_base_url()).map_err(map_cloud_error(None))?,
+            inner: InnerCloudClient::new(&get_base_url())
+                .map_err(map_cloud_error(None))?
+                .with_api_headers(api_headers()?)
+                .with_portal_headers(portal_headers()?),
             org: None,
         })
     }
@@ -205,19 +215,6 @@ impl CloudClient {
     /// client requested.
     fn err(&self, error: spice_cloud_client::error::Error) -> Error {
         map_cloud_error(self.org.as_deref())(error)
-    }
-
-    /// Get the auth URL for the login flow.
-    pub fn get_auth_url(&self, auth_code: &str) -> String {
-        self.inner.get_auth_url(auth_code)
-    }
-
-    /// Exchange an auth code for an access token.
-    pub async fn exchange_code(&self, auth_code: &str) -> Result<Option<AuthExchangeResponse>> {
-        self.inner
-            .exchange_code(auth_code)
-            .await
-            .map_err(|error| self.err(error))
     }
 
     /// Exchange `OAuth2` client credentials for an access token.
@@ -435,8 +432,10 @@ impl CloudClient {
             ),
             spice_cloud_client::error::Error::Forbidden { .. } => Error::cloud_with_hint(
                 CloudErrorCode::OrgForbidden,
-                format!("You are not a member of organization '{org}'."),
-                "Ask an owner of that organization to add you, then run 'spice cloud orgs'.",
+                format!("This credential cannot act on organization '{org}'."),
+                format!(
+                    "A browser sign-in is granted for one organization: run 'spice login --org {org}' to sign in for it. If you are not a member, ask an owner of that organization to add you."
+                ),
             ),
             error => self.err(error),
         }
@@ -738,6 +737,63 @@ fn api_base_url_from_legacy_portal(base_url: &str) -> String {
     }
 }
 
+/// Extra headers for every request to the Cloud API host, for example a
+/// protection bypass on a test deployment.
+const API_HEADERS_VAR: &str = "SPICE_CLOUD_API_HEADERS";
+
+/// Extra headers for every request to the portal host.
+const PORTAL_HEADERS_VAR: &str = "SPICE_CLOUD_PORTAL_HEADERS";
+
+/// The headers `SPICE_CLOUD_API_HEADERS` configures.
+///
+/// # Errors
+///
+/// Returns an error when the variable is not a list of `name=value` pairs.
+pub(crate) fn api_headers() -> Result<reqwest::header::HeaderMap> {
+    configured_headers(API_HEADERS_VAR)
+}
+
+/// The headers `SPICE_CLOUD_PORTAL_HEADERS` configures.
+///
+/// # Errors
+///
+/// Returns an error when the variable is not a list of `name=value` pairs.
+pub(crate) fn portal_headers() -> Result<reqwest::header::HeaderMap> {
+    configured_headers(PORTAL_HEADERS_VAR)
+}
+
+fn configured_headers(var: &str) -> Result<reqwest::header::HeaderMap> {
+    match std::env::var(var) {
+        Ok(value) => parse_headers(var, &value),
+        Err(_) => Ok(reqwest::header::HeaderMap::new()),
+    }
+}
+
+/// Parse comma-separated `name=value` pairs with percent-encoded values, the
+/// format of `OTEL_EXPORTER_OTLP_HEADERS`. Values are marked sensitive, and an
+/// error names the variable but never repeats its value.
+fn parse_headers(var: &str, value: &str) -> Result<reqwest::header::HeaderMap> {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    let invalid = || Error::InvalidArgument {
+        message: format!("`{var}` must be comma-separated name=value pairs."),
+    };
+    let mut headers = HeaderMap::new();
+    for pair in value
+        .split(',')
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+    {
+        let (name, value) = pair.split_once('=').ok_or_else(invalid)?;
+        let name = HeaderName::from_bytes(name.trim().as_bytes()).map_err(|_| invalid())?;
+        let value = urlencoding::decode(value.trim()).map_err(|_| invalid())?;
+        let mut value = HeaderValue::from_str(&value).map_err(|_| invalid())?;
+        value.set_sensitive(true);
+        headers.append(name, value);
+    }
+    Ok(headers)
+}
+
 /// Portal origin paired with the authoritative Cloud API origin.
 #[must_use]
 pub(crate) fn portal_base_url() -> String {
@@ -979,7 +1035,6 @@ fn map_cloud_error(org: Option<&str>) -> impl Fn(spice_cloud_client::error::Erro
                 },
                 "Check the credential's role and scopes for this action, or contact your organization admin.",
             ),
-            CloudError::AuthorizationDenied => Error::DeviceAuthorizationDenied,
             CloudError::InvalidResponse { message } => Error::InvalidResponse { message },
             CloudError::NotFound { message } => {
                 Error::cloud(CloudErrorCode::NotFound, format!("Not found: {message}"))
@@ -1369,6 +1424,34 @@ pub fn is_device_authorization_denied_error(error: &crate::error::Error) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_headers_parse_as_name_value_pairs() {
+        let headers = parse_headers("VAR", " x-one = a%2Cb , x-two=c ").expect("valid headers");
+        assert_eq!(
+            headers
+                .get("x-one")
+                .map(reqwest::header::HeaderValue::as_bytes),
+            Some(&b"a,b"[..])
+        );
+        assert_eq!(
+            headers
+                .get("x-two")
+                .map(reqwest::header::HeaderValue::as_bytes),
+            Some(&b"c"[..])
+        );
+        assert!(
+            headers
+                .get("x-one")
+                .is_some_and(reqwest::header::HeaderValue::is_sensitive)
+        );
+        assert!(parse_headers("VAR", "").expect("empty is valid").is_empty());
+
+        let err = parse_headers("VAR", "x-secret").expect_err("a pair needs a value");
+        assert!(err.to_string().contains("`VAR`"), "{err}");
+        let err = parse_headers("VAR", "bad name=hunter2").expect_err("invalid header name");
+        assert!(!err.to_string().contains("hunter2"), "{err}");
+    }
 
     #[test]
     fn build_resources_does_not_default_memory() {

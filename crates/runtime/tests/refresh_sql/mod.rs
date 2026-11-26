@@ -31,8 +31,6 @@ use crate::{
     utils::{register_test_connectors, runtime_ready_check, test_request_context, wait_until_true},
 };
 
-mod refresh_max_timestamp_df;
-
 fn make_spiceai_dataset(path: &str, name: &str, refresh_sql: String) -> Dataset {
     let mut ds = Dataset::new(format!("spice.ai/{path}"), name.to_string());
     ds.acceleration = Some(Acceleration {
@@ -57,12 +55,20 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
 
     test_request_context()
         .scope(async {
+            let mut nation = make_spiceai_dataset(
+                "spiceai/tpch/datasets/tpch.nation",
+                "nation",
+                "SELECT * FROM nation WHERE n_regionkey != 0".to_string(),
+            );
+            // An append override on a dataset not refreshed in append mode needs a
+            // `time_column` or a primary key, so that it can tell new rows from loaded ones.
+            nation
+                .acceleration
+                .as_mut()
+                .expect("the dataset is accelerated")
+                .primary_key = Some("n_nationkey".to_string());
             let app = AppBuilder::new("refresh_sql_override_append")
-                .with_dataset(make_spiceai_dataset(
-                    "spiceai/tpch/datasets/tpch.nation",
-                    "nation",
-                    "SELECT * FROM nation WHERE n_regionkey != 0".to_string(),
-                ))
+                .with_dataset(nation)
                 .build();
 
             configure_test_datafusion();

@@ -2,7 +2,7 @@ name: Check a run is a trusted build
 description: >-
   Fails unless a workflow run of this repository is one whose artifacts a privileged job may
   download and run or publish. A fork's pull request run uploads whatever its author built, so
-  spicescript_dispatch, spicescript_long and release_from_run check the run they are given here
+  spicescript_dispatch, trunk_tests and release_from_run check the run they are given here
   before they touch its artifacts. One list for every caller, identical in spiceai/spiceai and
   spicehq/spiceai so the OSS merge stays clean; a workflow name a repository lacks matches nothing.
   The run must be all of:

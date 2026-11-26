@@ -434,7 +434,7 @@ pub(crate) async fn load_app(args: &CommonArgs) -> anyhow::Result<App> {
     let mut dependencies = Vec::new();
     if let Some(dependencies_root) = &args.spicepod_dependencies {
         for dependency in &spicepod.dependencies {
-            dependencies.push(Spicepod::load(&dependencies_root.join(dependency)).await?);
+            dependencies.push(Spicepod::load(&dependencies_root.join(dependency.from())).await?);
         }
     }
     spicepod.dependencies = vec![];
@@ -1033,7 +1033,7 @@ mod tests {
     ///   different free-text columns than `dbgen`, so Q2, Q10, Q13 and Q20 cannot
     ///   match the answer files.
     ///
-    /// - The three `ClickBench` arms whose acceleration holds only part of the
+    /// - The two `ClickBench` arms whose acceleration holds only part of the
     ///   source, because a runner cannot hold all of it: their `refresh_sql` keeps
     ///   a subset, while the `__test_reference.*` clone drops acceleration and
     ///   reads every row, so it answers a different question. A `LIMIT` subset
@@ -1042,8 +1042,7 @@ mod tests {
     /// Every other scale factor 1 TPC-H, TPC-DS and `ClickBench` dispatch must
     /// validate against an oracle.
     const BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION: &[&str] = &[
-        "clickbench/sf1/accelerated/s3[parquet]-arrow.yaml",
-        "clickbench/sf1/accelerated/s3[parquet]-arrow-partitioned.yaml",
+        "clickbench/sf1/accelerated/s3[parquet]-cayenne[file]-partitioned.yaml",
         "clickbench/sf1/accelerated/s3[parquet]-cayenne[memory].yaml",
         "tpch/sf1/federated/adbc[bigquery].yaml",
         "tpch/sf1/federated/glue[catalog].yaml",

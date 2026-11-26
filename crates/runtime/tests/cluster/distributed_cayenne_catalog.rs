@@ -51,7 +51,11 @@ use super::harness::ClusterHarness;
 
 /// Creates a Cayenne `Catalog` component with `read_write_create` access, pointing
 /// at the given temp directories.
-fn make_cayenne_catalog(catalog_name: &str, data_dir: &str, metadata_dir: &str) -> Catalog {
+pub(super) fn make_cayenne_catalog(
+    catalog_name: &str,
+    data_dir: &str,
+    metadata_dir: &str,
+) -> Catalog {
     let mut catalog = Catalog::new("cayenne".to_string(), catalog_name.to_string())
         .with_access(AccessMode::ReadWriteCreate);
     catalog.params = Some(Params::from_string_map(

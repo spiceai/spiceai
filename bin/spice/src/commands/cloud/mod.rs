@@ -19,6 +19,7 @@ limitations under the License.
 pub mod bytes;
 pub(crate) mod client;
 pub mod org;
+pub(crate) mod refresh;
 
 use crate::commands::login::LoginOutput;
 use crate::context::RuntimeContext;
@@ -486,8 +487,9 @@ impl fmt::Debug for LoginMethod {
 
 #[derive(Args, Debug)]
 pub struct SubscriptionLoginArgs {
-    /// Don't open a browser; print the URL and a one-time code to enter on
-    /// another device. Useful over SSH or in headless shells.
+    /// Don't open a browser; print the sign-in URL. A browser on another
+    /// machine shows an error page after you approve: paste that page's
+    /// address at the prompt. Useful over SSH or in headless shells.
     #[arg(long)]
     pub device: bool,
 }
@@ -1055,6 +1057,13 @@ pub async fn execute(ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
     }
     let org = args.org.as_deref();
 
+    if !matches!(
+        args.command,
+        CloudCommands::Login(_) | CloudCommands::Logout(_)
+    ) {
+        refresh::renew_expiring_sign_ins().await;
+    }
+
     match &args.command {
         CloudCommands::Login(login_args) => execute_login(login_args, org).await,
         CloudCommands::Logout(logout_args) => execute_logout(logout_args, org),
@@ -1544,8 +1553,10 @@ async fn resolve_project_target_with_source(
         (None, OrgSource::Credential)
     };
 
-    let config_dir = CloudConnectConfig::resolve_config_dir(None);
-    let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
+    let state_dir =
+        crate::commands::connect::local_state_dir(&CloudConnectConfig::resolve_config_dir(None))
+            .await?;
+    let identity_path = state_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
     let identity = IdentityStore::load_optional_async(identity_path.clone())
         .await
         .map_err(|source| Error::CloudConnectIo {
@@ -1768,7 +1779,7 @@ async fn execute_login_token(args: &TokenLoginArgs, target: &LoginTarget<'_>) ->
         true,
     )?;
 
-    save_token_and_print_login_result(&token, target).await
+    save_token_and_print_login_result(&token, None, target).await
 }
 
 async fn execute_login_api(args: &ApiLoginArgs, target: &LoginTarget<'_>) -> Result<()> {
@@ -1896,6 +1907,18 @@ fn credential_key(org: Option<&str>) -> String {
     }
 }
 
+/// The `merge_auth_config` key the refresh token for [`credential_key`] is
+/// filed under; the inverse of [`org::org_refresh_token_var`].
+fn refresh_credential_key(org: Option<&str>) -> String {
+    let var = match org {
+        Some(org) if !org.is_empty() => org::org_refresh_token_var(org),
+        _ => org::DEFAULT_REFRESH_TOKEN_VAR.to_string(),
+    };
+    var.strip_prefix("SPICE_SPICEAI_")
+        .unwrap_or("REFRESH_TOKEN")
+        .to_string()
+}
+
 /// The `merge_auth_config` key the app API key is filed under.
 ///
 /// Inverse of [`org::org_api_key_var`], for the same reason as
@@ -1919,6 +1942,7 @@ fn api_key_credential_key(org: Option<&str>) -> String {
 /// or replace the default data-plane key.
 fn user_login_values<'a>(
     token: &'a str,
+    refresh_token: Option<&'a str>,
     api_key: Option<&'a str>,
     token_org: Option<&str>,
     store_org: Option<&str>,
@@ -1941,6 +1965,14 @@ fn user_login_values<'a>(
             .iter()
             .map(|org| (credential_key(Some(org)), token)),
     );
+    if let Some(refresh_token) = refresh_token {
+        values.push((refresh_credential_key(None), refresh_token));
+        values.extend(
+            credential_orgs
+                .iter()
+                .map(|org| (refresh_credential_key(Some(org)), refresh_token)),
+        );
+    }
 
     if let Some(api_key) = api_key {
         if store_org.is_none() {
@@ -2022,6 +2054,7 @@ fn persist_login_values(
         return write_json(&serde_json::Value::Object(result));
     }
 
+    let _lock = refresh::lock_credentials()?;
     if output == LoginOutput::Keychain {
         org::remember_keychain_orgs(&keychain_login_orgs(spiceai))?;
     }
@@ -2032,10 +2065,26 @@ fn persist_login_values(
     if !cloud.is_empty() {
         save_credentials(output, "CLOUD", cloud)?;
     }
+    remove_env_keys(&unpaired_refresh_vars(spiceai))?;
 
     clear_login_shadows(output, spiceai, cloud)?;
     select_login_org(login_org, spiceai)?;
     Ok(())
+}
+
+/// Refresh-token variables beside access tokens this login wrote without one.
+///
+/// A token or API login replaces the access token but not a refresh token
+/// left by an earlier browser sign-in, and renewal must never pair the two.
+fn unpaired_refresh_vars(spiceai: &[(&str, &str)]) -> Vec<String> {
+    let written: BTreeSet<&str> = spiceai.iter().map(|(key, _)| *key).collect();
+    written
+        .iter()
+        .filter(|key| **key == "TOKEN" || key.starts_with("TOKEN_"))
+        .map(|key| format!("REFRESH_{key}"))
+        .filter(|refresh| !written.contains(refresh.as_str()))
+        .map(|refresh| format!("SPICE_SPICEAI_{refresh}"))
+        .collect()
 }
 
 /// Make later commands select the organization authenticated by this login.
@@ -2238,7 +2287,11 @@ fn ensure_login_values_active(spiceai: &[(&str, &str)], cloud: &[(&str, &str)]) 
     Ok(())
 }
 
-async fn save_token_and_print_login_result(token: &str, target: &LoginTarget<'_>) -> Result<()> {
+async fn save_token_and_print_login_result(
+    token: &str,
+    signed_in: Option<&crate::commands::login::session::SignedIn>,
+    target: &LoginTarget<'_>,
+) -> Result<()> {
     let authed_client = CloudClient::with_token_for_org(token, target.requested_org)?;
     let auth_context_result = authed_client.get_auth_context().await;
 
@@ -2262,13 +2315,23 @@ async fn save_token_and_print_login_result(token: &str, target: &LoginTarget<'_>
     } else {
         user_login_org(&authed_client, store_org.as_deref(), token_org.as_deref()).await?
     };
-    let values = user_login_values(
+    let mut values = user_login_values(
         token,
+        signed_in.map(|signed_in| signed_in.grant.refresh_token.as_str()),
         api_key,
         token_org.as_deref(),
         store_org.as_deref(),
         selected_org.as_deref(),
     );
+    if let Some(signed_in) = signed_in {
+        values.push((
+            org::CLIENT_ID_VAR
+                .strip_prefix("SPICE_SPICEAI_")
+                .unwrap_or("CLIENT_ID")
+                .to_string(),
+            signed_in.client_id.as_str(),
+        ));
+    }
     let value_refs: Vec<(&str, &str)> = values
         .iter()
         .map(|(key, value)| (key.as_str(), *value))
@@ -2388,19 +2451,14 @@ async fn print_post_login_org_context(
 }
 
 async fn execute_login_device_flow(open_browser: bool, target: &LoginTarget<'_>) -> Result<()> {
-    use crate::commands::login::session::{BrowserLogin, BrowserLoginOutcome};
-
-    let flow = BrowserLogin::at(client::portal_base_url());
-    if target.output != LoginOutput::Json {
-        flow.announce();
-    }
-    if open_browser {
-        flow.open_browser();
-    }
-    let BrowserLoginOutcome::Granted { access_token, .. } = flow.authenticate().await? else {
-        return Err(Error::DeviceAuthorizationDenied);
-    };
-    save_token_and_print_login_result(&access_token, target).await
+    let signed_in = crate::commands::login::session::sign_in(
+        &client::portal_base_url(),
+        org::read_credential(org::CLIENT_ID_VAR),
+        open_browser,
+        target.requested_org,
+    )
+    .await?;
+    save_token_and_print_login_result(&signed_in.grant.access_token, Some(&signed_in), target).await
 }
 
 fn print_post_login_help() {
@@ -2416,13 +2474,14 @@ fn print_post_login_help() {
 }
 
 fn execute_logout(args: &LogoutArgs, flag_org: Option<&str>) -> Result<()> {
+    let _lock = refresh::lock_credentials()?;
     let mut cleared = Vec::new();
     let mut already_logged_out: Option<String> = None;
 
     match args.scope {
         LogoutScope::All => {
             for org in org::orgs_with_stored_tokens()? {
-                if remove_env_keys(&[org::org_token_var(&org), org::org_api_key_var(&org)])? {
+                if remove_env_keys(&org_credential_keys(&org))? {
                     cleared.push(org);
                 }
             }
@@ -2434,7 +2493,7 @@ fn execute_logout(args: &LogoutArgs, flag_org: Option<&str>) -> Result<()> {
             if let Some(org) = resolve_org(flag_org)? {
                 ensure_active_org_logout_is_isolated(&org, org::default_token().is_some())?;
                 if org::has_org_token(&org) {
-                    if remove_env_keys(&[org::org_token_var(&org), org::org_api_key_var(&org)])? {
+                    if remove_env_keys(&org_credential_keys(&org))? {
                         cleared.push(org.clone());
                     }
                     org::forget_keychain_org(&org)?;
@@ -2477,11 +2536,22 @@ fn execute_logout(args: &LogoutArgs, flag_org: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Credential variables stored for `org`.
+fn org_credential_keys(org: &str) -> [String; 3] {
+    [
+        org::org_token_var(org),
+        org::org_refresh_token_var(org),
+        org::org_api_key_var(org),
+    ]
+}
+
 /// Credential variables that belong to no particular org.
 fn default_credential_keys() -> Vec<String> {
     vec![
         org::DEFAULT_TOKEN_VAR.to_string(),
+        org::DEFAULT_REFRESH_TOKEN_VAR.to_string(),
         org::DEFAULT_API_KEY_VAR.to_string(),
+        org::CLIENT_ID_VAR.to_string(),
         "SPICE_CLOUD_CLIENT_ID".to_string(),
         "SPICE_CLOUD_CLIENT_SECRET".to_string(),
     ]
@@ -2541,24 +2611,32 @@ fn remove_keychain_keys(keys: &[String]) -> (bool, Vec<String>) {
 
 /// Drop `keys` from the env file. Returns whether anything was removed.
 fn remove_env_file_keys(keys: &[String]) -> Result<bool> {
-    use crate::commands::login::env_file_path;
+    use crate::commands::login::{
+        env_file_path, read_env_file_for_update, replace_env_file, unsafe_credential_file,
+    };
 
     let mut removed = false;
 
     let env_file = env_file_path();
     let path = env_file.as_path();
-    if !path.exists() {
-        return Ok(removed);
+
+    // A link or other non-regular entry is never rewritten, so no credential
+    // edit can land in whatever it points to. It only stands in the way when it
+    // still sets one of `keys`; otherwise there is nothing here to remove.
+    if let Some(what) = unsafe_credential_file(path).map_err(|source| Error::ConfigIo {
+        operation: "update",
+        path: path.to_path_buf(),
+        source,
+    })? {
+        return linked_env_file_keys(path, what, keys);
     }
 
     // Never rewrite or delete the file on a failed read. Treating an unreadable
     // or non-UTF-8 file as empty would delete it wholesale, taking every
     // unrelated setting with it.
-    let content = std::fs::read_to_string(path).map_err(|e| crate::error::Error::ConfigIo {
-        operation: "read",
-        path: path.to_path_buf(),
-        source: e,
-    })?;
+    let Some(content) = read_env_file_for_update(path)? else {
+        return Ok(removed);
+    };
 
     // Keep every line that does not assign a removed key, byte-for-byte.
     // Rebuilding the file from a parsed map instead would drop comments and
@@ -2571,6 +2649,11 @@ fn remove_env_file_keys(keys: &[String]) -> Result<bool> {
         } else {
             kept.push(line);
         }
+    }
+
+    // Leave the file exactly as it is when it sets none of `keys`.
+    if !removed {
+        return Ok(false);
     }
 
     // Only discard the file once nothing but comments and blank lines remain.
@@ -2590,13 +2673,95 @@ fn remove_env_file_keys(keys: &[String]) -> Result<bool> {
     if content.ends_with('\n') {
         updated.push('\n');
     }
-    std::fs::write(path, updated).map_err(|e| crate::error::Error::ConfigIo {
-        operation: "write",
-        path: path.to_path_buf(),
-        source: e,
-    })?;
+    replace_env_file(path, updated.as_bytes())?;
 
     Ok(removed)
+}
+
+/// Whether removing `keys` is blocked by an env file that is a link (or not a
+/// regular file), which is never rewritten.
+///
+/// Nothing is removed either way. A link to a regular file is read only to
+/// tell whether it still sets any of `keys`: if it does, keeping quiet would let
+/// a logout or a keychain login report success while the old credential stays
+/// readable, so that is an error naming the keys and the fix.
+fn linked_env_file_keys(path: &std::path::Path, what: &str, keys: &[String]) -> Result<bool> {
+    // A dangling link, or a target that is not a regular file, sets nothing.
+    // Any other failure to inspect or read the target is an error: taking it
+    // as empty would let the command report success while the credential stays
+    // in the file.
+    let read_failed = |source: std::io::Error| Error::ConfigIo {
+        operation: "read",
+        path: path.to_path_buf(),
+        source,
+    };
+    let linked = match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => {
+            read_linked_regular_file(path).map_err(read_failed)?
+        }
+        Ok(_) => String::new(),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(source) => return Err(read_failed(source)),
+    };
+    let still_set: Vec<&str> = keys
+        .iter()
+        .filter(|key| {
+            linked
+                .lines()
+                .any(|line| assigns_any(line, std::slice::from_ref(*key)))
+        })
+        .map(String::as_str)
+        .collect();
+    if still_set.is_empty() {
+        return Ok(false);
+    }
+    // The file the user has to edit is the one the link resolves to.
+    let target = std::fs::canonicalize(path)
+        .or_else(|_| std::fs::read_link(path))
+        .unwrap_or_else(|_| path.to_path_buf());
+    Err(crate::error::Error::ConfigIo {
+        operation: "update",
+        path: path.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "it is {what}, and the file it points to ('{}') still sets {}. Credentials are never written through a link, so they were not removed from it. Delete those lines from that file, or replace '{}' with a regular file and run this command again. See: https://spiceai.org/docs/cli/reference/login",
+                target.display(),
+                still_set.join(", "),
+                path.display()
+            ),
+        ),
+    })
+}
+
+/// The contents of the regular file a linked env file points to, or nothing
+/// when the target is gone or is no longer a regular file.
+///
+/// The link is followed on purpose. The target was a regular file when it was
+/// checked by name, but the link or the target can be replaced since. So the
+/// target is opened without waiting for a writer, its type is checked on the
+/// opened descriptor, and that same descriptor is read: a FIFO swapped in after
+/// the check cannot block the read.
+fn read_linked_regular_file(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(source) => return Err(source),
+    };
+    let mut contents = String::new();
+    if file.metadata()?.is_file() {
+        file.read_to_string(&mut contents)?;
+    }
+    Ok(contents)
 }
 
 fn ensure_keychain_credentials_removed(failures: &[String]) -> Result<()> {
@@ -2619,11 +2784,98 @@ fn ensure_keychain_credentials_removed(failures: &[String]) -> Result<()> {
 /// form the reader accepts, leaving such a credential readable but not
 /// removable — so logout reported success while it stayed live.
 fn assigns_any(line: &str, keys: &[String]) -> bool {
-    let Some((lhs, _)) = line.split_once('=') else {
-        return false;
-    };
-    let name = lhs.trim().trim_start_matches("export ").trim();
-    keys.iter().any(|key| key == name)
+    assigned_name(line).is_some_and(|name| keys.iter().any(|key| key == name))
+}
+
+/// The variable an env-file line assigns, if any.
+fn assigned_name(line: &str) -> Option<&str> {
+    let (lhs, _) = line.split_once('=')?;
+    Some(lhs.trim().trim_start_matches("export ").trim())
+}
+
+/// A replacement for the env file, created before its contents are known.
+///
+/// [`Self::prepare`] refuses a link or any other non-regular file and creates
+/// an owner-only file beside the env file, so the caller learns that the env
+/// file can be replaced before it spends anything it cannot get back.
+/// [`Self::replace_values`] writes the new contents there and renames the file
+/// over the env file, so a concurrent reader sees the old file or the new one,
+/// never a partial one.
+pub(crate) struct EnvFileReplacement {
+    path: std::path::PathBuf,
+    file: tempfile::NamedTempFile,
+}
+
+impl EnvFileReplacement {
+    pub(crate) fn prepare() -> Result<Self> {
+        let path = crate::commands::login::env_file_path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|source| Error::ConfigIo {
+            operation: "read",
+            path: path.clone(),
+            source,
+        })?;
+        if !metadata.is_file() {
+            return Err(Error::ConfigIo {
+                operation: "write",
+                path,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "credentials are written only to a regular file",
+                ),
+            });
+        }
+        let directory = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => std::path::PathBuf::from("."),
+        };
+        let file =
+            tempfile::NamedTempFile::new_in(&directory).map_err(|source| Error::ConfigIo {
+                operation: "create",
+                path: directory,
+                source,
+            })?;
+        Ok(Self { path, file })
+    }
+
+    /// Replace the values of variables the env file already assigns, keeping
+    /// every other line byte-for-byte for the same reasons as
+    /// [`remove_env_file_keys`].
+    pub(crate) fn replace_values(mut self, values: &[(&str, &str)]) -> Result<()> {
+        let path = self.path;
+        let io_error = |operation: &'static str| {
+            let path = path.clone();
+            move |source| Error::ConfigIo {
+                operation,
+                path,
+                source,
+            }
+        };
+        let content = std::fs::read_to_string(&path).map_err(io_error("read"))?;
+
+        let mut updated = content
+            .lines()
+            .map(|line| {
+                let replacement = assigned_name(line)
+                    .and_then(|name| values.iter().find(|(var, _)| *var == name))
+                    .zip(line.split_once('='));
+                match replacement {
+                    Some(((_, value), (lhs, _))) => format!("{lhs}={value}"),
+                    None => line.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if content.ends_with('\n') {
+            updated.push('\n');
+        }
+
+        std::io::Write::write_all(&mut self.file, updated.as_bytes()).map_err(io_error("write"))?;
+        self.file.as_file().sync_all().map_err(io_error("write"))?;
+        self.file
+            .persist(&path)
+            .map_err(|e| io_error("replace")(e.error))?;
+        Ok(())
+    }
 }
 
 async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()> {
@@ -2939,6 +3191,7 @@ async fn execute_service(
                 ),
             })?;
     let config_dir = CloudConnectConfig::resolve_config_dir(Some(&instance_dir));
+    crate::commands::connect::local_state_dir(&config_dir).await?;
     crate::commands::connect::service::cli::execute(
         ctx,
         crate::commands::connect::service::cli::ServiceArgs {
@@ -2964,8 +3217,11 @@ async fn execute_link(ctx: &RuntimeContext, args: &LinkArgs, flag_org: Option<&s
                     current.display()
                 ),
             })?;
-    let config_dir = CloudConnectConfig::resolve_config_dir(Some(&instance_dir));
-    let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
+    let state_dir = crate::commands::connect::local_state_dir(
+        &CloudConnectConfig::resolve_config_dir(Some(&instance_dir)),
+    )
+    .await?;
+    let identity_path = state_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
     let identity = IdentityStore::load_optional_async(identity_path)
         .await
         .map_err(|source| Error::CloudConnectIo {
@@ -3311,8 +3567,10 @@ async fn execute_unlink() -> Result<()> {
                 ),
             })?;
     let requested_config_dir = CloudConnectConfig::resolve_config_dir(Some(&instance_dir));
+    let requested_state_dir =
+        crate::commands::connect::local_state_dir(&requested_config_dir).await?;
     let mutation_lock =
-        runtime_cloud_connect::MutationLock::acquire(&requested_config_dir, "unlink")
+        runtime_cloud_connect::MutationLock::acquire(&requested_state_dir, "unlink")
             .await
             .map_err(|source| Error::CloudConnectIo {
                 message: format!("acquire Cloud Connect state for unlink: {source}"),
@@ -3337,11 +3595,11 @@ async fn execute_unlink() -> Result<()> {
         })?;
     let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
     let pinned_config = crate::commands::connect::service::PinnedConfigDir::for_lock(
-        display_config_dir.clone(),
+        runtime_cloud_connect::state_dir::state_dir(&display_config_dir),
         &mutation_lock,
     )?;
     let _runtime_lock =
-        runtime_cloud_connect::RuntimeLock::acquire(&config_dir).map_err(|source| {
+        runtime_cloud_connect::RuntimeLock::acquire(&display_config_dir).map_err(|source| {
             Error::CloudConnectIo {
                 message: format!(
                     "{source} Stop the running instance before using `spice cloud unlink`."
@@ -3750,7 +4008,9 @@ async fn execute_logs(ctx: &RuntimeContext, args: &LogsArgs, flag_org: Option<&s
                 ),
             })?;
     let config_dir = CloudConnectConfig::resolve_config_dir(Some(&instance_dir));
-    let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
+    let identity_path = crate::commands::connect::local_state_dir(&config_dir)
+        .await?
+        .join(runtime_cloud_connect::config::IDENTITY_FILE);
     let local_identity = IdentityStore::load_optional_async(identity_path.clone())
         .await
         .map_err(|source| Error::CloudConnectIo {
@@ -5965,6 +6225,7 @@ mod tests {
     fn keychain_login_indexes_every_per_org_token_and_no_other_credential() {
         let values = user_login_values(
             "user-token",
+            None,
             Some("personal-api-key"),
             Some("personal"),
             Some("acme"),
@@ -5982,9 +6243,50 @@ mod tests {
     }
 
     #[test]
+    fn a_login_without_a_refresh_token_removes_the_old_one_beside_its_tokens() {
+        let stale =
+            unpaired_refresh_vars(&[("TOKEN", "pat"), ("TOKEN_ACME", "pat"), ("API_KEY", "key")]);
+        assert_eq!(
+            stale,
+            [
+                org::DEFAULT_REFRESH_TOKEN_VAR.to_string(),
+                org::org_refresh_token_var("acme"),
+            ]
+        );
+
+        let browser = unpaired_refresh_vars(&[("TOKEN", "access"), ("REFRESH_TOKEN", "refresh")]);
+        assert!(browser.is_empty(), "{browser:?}");
+    }
+
+    #[test]
+    fn a_browser_sign_in_stores_its_refresh_token_beside_every_token_copy() {
+        let values = user_login_values(
+            "access",
+            Some("refresh"),
+            None,
+            Some("personal"),
+            Some("acme"),
+            Some("acme"),
+        );
+
+        for org in [None, Some("personal"), Some("acme")] {
+            assert!(values.contains(&(credential_key(org), "access")), "{org:?}");
+            assert!(
+                values.contains(&(refresh_credential_key(org), "refresh")),
+                "{org:?}"
+            );
+        }
+        assert_eq!(
+            format!("SPICE_SPICEAI_{}", refresh_credential_key(Some("acme"))),
+            org::org_refresh_token_var("acme")
+        );
+    }
+
+    #[test]
     fn a_user_login_without_an_app_key_does_not_clear_data_plane_credentials() {
         let values = user_login_values(
             "user-token",
+            None,
             None,
             Some("personal"),
             Some("acme"),
@@ -6001,6 +6303,7 @@ mod tests {
     fn a_cross_org_user_login_does_not_relabel_or_replace_the_data_plane_key() {
         let values = user_login_values(
             "user-token",
+            None,
             Some("personal-api-key"),
             Some("personal"),
             Some("acme"),
@@ -6106,6 +6409,13 @@ mod tests {
         let keys = default_credential_keys();
         assert!(keys.contains(&org::DEFAULT_TOKEN_VAR.to_string()));
         assert!(keys.contains(&org::DEFAULT_API_KEY_VAR.to_string()));
+        assert!(keys.contains(&org::DEFAULT_REFRESH_TOKEN_VAR.to_string()));
+        assert!(keys.contains(&org::CLIENT_ID_VAR.to_string()));
+
+        let org_keys = org_credential_keys("acme");
+        assert!(org_keys.contains(&org::org_token_var("acme")));
+        assert!(org_keys.contains(&org::org_refresh_token_var("acme")));
+        assert!(org_keys.contains(&org::org_api_key_var("acme")));
     }
 
     fn instance(phase: &str, spiced: Option<SpicedStatus>) -> InstanceStatus {
@@ -6460,6 +6770,233 @@ mod tests {
         assert_eq!(short_commit(Some("")), "-");
     }
 
+    /// Point the test env file at `target` through a symbolic link.
+    #[cfg(unix)]
+    fn link_env_file_to(target: &std::path::Path) -> std::path::PathBuf {
+        let env_file = crate::commands::login::env_file_path();
+        std::os::unix::fs::symlink(target, &env_file).expect("link the env file");
+        env_file
+    }
+
+    /// A keychain login clears stale env-file copies of the credentials it
+    /// saved. A linked `.env` that sets none of them is left alone, and the
+    /// login succeeds: there is nothing there to clear.
+    #[cfg(unix)]
+    #[test]
+    fn a_keychain_login_leaves_a_linked_env_file_without_its_keys_alone() {
+        let org = "linked-env-keychain-login";
+        let _stores = CredentialStores::user_login(org);
+        let elsewhere = tempfile::tempdir().expect("create the link target directory");
+        let target = elsewhere.path().join("shared.env");
+        std::fs::write(&target, "OTHER_SETTING=kept\n").expect("write the link target");
+        let env_file = link_env_file_to(&target);
+
+        persist_user_login(LoginOutput::Keychain, "fresh-token", org)
+            .expect("a keychain login must not be blocked by a link it has nothing to clear in");
+
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read the link target"),
+            "OTHER_SETTING=kept\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(&env_file)
+                .expect("stat the env file")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(org::default_token().as_deref(), Some("fresh-token"));
+    }
+
+    /// Logout never writes through a linked `.env`. When the linked file still
+    /// sets the credential, logout says so, naming the key and the fix, rather
+    /// than reporting a logout that left the credential readable.
+    #[cfg(unix)]
+    #[test]
+    fn logout_refuses_to_rewrite_a_linked_env_file_that_sets_the_credential() {
+        let _stores = CredentialStores::empty();
+        let elsewhere = tempfile::tempdir().expect("create the link target directory");
+        let target = elsewhere.path().join("shared.env");
+        std::fs::write(&target, "OTHER_SETTING=kept\nSPICE_SPICEAI_TOKEN=live\n")
+            .expect("write the link target");
+        let env_file = link_env_file_to(&target);
+
+        let err = remove_env_keys(&["SPICE_SPICEAI_TOKEN".to_string()])
+            .expect_err("a credential behind a link cannot be removed");
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Failed to update configuration at '{path}': it is a symbolic link, and the file it points to ('{target}') still sets SPICE_SPICEAI_TOKEN. Credentials are never written through a link, so they were not removed from it. Delete those lines from that file, or replace '{path}' with a regular file and run this command again. See: https://spiceai.org/docs/cli/reference/login",
+                path = env_file.display(),
+                target = std::fs::canonicalize(&target)
+                    .expect("resolve the link target")
+                    .display()
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read the link target"),
+            "OTHER_SETTING=kept\nSPICE_SPICEAI_TOKEN=live\n",
+            "the linked file must not be rewritten"
+        );
+    }
+
+    /// A linked `.env` that cannot be read does not count as setting none of
+    /// the keys: logout cannot tell whether the credential is still there, so
+    /// it fails with the read error instead of reporting success.
+    #[cfg(unix)]
+    #[test]
+    fn logout_refuses_a_linked_env_file_it_cannot_read() {
+        const NOT_UTF8: &[u8] = b"SPICE_SPICEAI_TOKEN=live\n#\xff\n";
+
+        let _stores = CredentialStores::empty();
+        let elsewhere = tempfile::tempdir().expect("create the link target directory");
+        let target = elsewhere.path().join("shared.env");
+        std::fs::write(&target, NOT_UTF8).expect("write the link target");
+        let env_file = link_env_file_to(&target);
+
+        let err = remove_env_keys(&["SPICE_SPICEAI_TOKEN".to_string()])
+            .expect_err("an unreadable linked file must not count as setting nothing");
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Failed to read configuration at '{}': stream did not contain valid UTF-8",
+                env_file.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read the link target"),
+            NOT_UTF8,
+            "the linked file must not be rewritten"
+        );
+    }
+
+    /// A linked `.env` retargeted from a regular file to a FIFO between the
+    /// type check and the read never blocks logout: the target is opened
+    /// without waiting for a writer, and only a regular file is read, through
+    /// that same descriptor.
+    #[cfg(unix)]
+    #[test]
+    fn logout_never_blocks_on_a_linked_env_file_retargeted_to_a_fifo() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
+
+        const READS: usize = 5_000;
+        let keys = ["SPICE_SPICEAI_TOKEN".to_string()];
+        let dir = tempfile::tempdir().expect("create the directory");
+        let regular = dir.path().join("shared.env");
+        std::fs::write(&regular, "SPICE_SPICEAI_TOKEN=live\n").expect("write the regular target");
+        let fifo = dir.path().join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo exited {made}");
+        let link = dir.path().join(".env");
+        std::os::unix::fs::symlink(&regular, &link).expect("link the env file");
+
+        // Retarget the link back and forth, each time by renaming a new link
+        // over it, so the name always resolves to one of the two targets.
+        let stop = Arc::new(AtomicBool::new(false));
+        let swapper = {
+            let stop = Arc::clone(&stop);
+            let (link, regular, fifo) = (link.clone(), regular.clone(), fifo.clone());
+            let staged = dir.path().join(".env.next");
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    for target in [&fifo, &regular] {
+                        let _ = std::fs::remove_file(&staged);
+                        std::os::unix::fs::symlink(target, &staged).expect("stage a link");
+                        std::fs::rename(&staged, &link).expect("retarget the link");
+                    }
+                }
+            })
+        };
+
+        let (done, finished) = mpsc::channel();
+        {
+            let link = link.clone();
+            std::thread::spawn(move || {
+                let outcomes: Vec<Result<bool>> = (0..READS)
+                    .map(|_| linked_env_file_keys(&link, "a symbolic link", &keys))
+                    .collect();
+                let _ = done.send(outcomes);
+            });
+        }
+        let outcome = finished.recv_timeout(std::time::Duration::from_secs(60));
+        stop.store(true, Ordering::Relaxed);
+        if outcome.is_err() {
+            // Release a read stuck opening the FIFO, so the thread can exit.
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo);
+        }
+        swapper.join().expect("the swapper thread panicked");
+        let outcomes = outcome.expect("a linked env file retargeted to a FIFO blocked logout");
+
+        let still_sets = |target: &std::path::Path| {
+            format!(
+                "Failed to update configuration at '{path}': it is a symbolic link, and the file it points to ('{target}') still sets SPICE_SPICEAI_TOKEN. Credentials are never written through a link, so they were not removed from it. Delete those lines from that file, or replace '{path}' with a regular file and run this command again. See: https://spiceai.org/docs/cli/reference/login",
+                path = link.display(),
+                target = std::fs::canonicalize(target)
+                    .expect("resolve the link target")
+                    .display()
+            )
+        };
+        let expected_errors = [still_sets(&regular), still_sets(&fifo)];
+        // While a link is renamed over, macOS 26 can fail `stat` or `open` of its
+        // name with EINVAL. That read reports an error, as any failure to read the
+        // target does: it neither blocks nor reports the key as removed.
+        let failed_mid_rename = format!(
+            "Failed to read configuration at '{}': Invalid argument (os error 22)",
+            link.display()
+        );
+        let (mut from_fifo, mut from_file) = (0_usize, 0_usize);
+        for outcome in outcomes {
+            match outcome {
+                // A FIFO sets nothing, so there is nothing to remove from it.
+                Ok(removed) => {
+                    assert!(!removed, "nothing is ever removed through a link");
+                    from_fifo += 1;
+                }
+                Err(err) if err.to_string() == failed_mid_rename => {}
+                // The regular file still sets the key; the error names the
+                // file the link resolved to when the error was built.
+                Err(err) => {
+                    assert!(
+                        expected_errors.contains(&err.to_string()),
+                        "unexpected error: {err}"
+                    );
+                    from_file += 1;
+                }
+            }
+        }
+        assert!(
+            from_fifo > 0 && from_file > 0,
+            "the reads must see both targets ({from_fifo} FIFO, {from_file} regular file)"
+        );
+    }
+
+    /// Removing keys a regular `.env` does not set leaves it byte-for-byte as
+    /// it was, rather than replacing it with an identical new file.
+    #[test]
+    fn logout_leaves_an_env_file_without_the_keys_untouched() {
+        let _stores = CredentialStores::empty();
+        let env_file = crate::commands::login::env_file_path();
+        std::fs::write(&env_file, "# only comments\r\n").expect("write the env file");
+
+        assert!(
+            !remove_env_keys(&["SPICE_SPICEAI_TOKEN".to_string()]).expect("remove nothing"),
+            "nothing was set, so nothing was removed"
+        );
+        assert_eq!(
+            std::fs::read(&env_file).expect("the env file is kept"),
+            b"# only comments\r\n"
+        );
+    }
+
     #[test]
     fn logout_matches_every_assignment_form_the_reader_accepts() {
         // The reader trims around `=`, so all of these are readable
@@ -6603,7 +7140,7 @@ mod tests {
     }
 
     fn persist_user_login(output: LoginOutput, token: &str, org: &str) -> Result<()> {
-        let values = user_login_values(token, None, Some(org), None, Some(org));
+        let values = user_login_values(token, None, None, Some(org), None, Some(org));
         let refs: Vec<(&str, &str)> = values
             .iter()
             .map(|(key, value)| (key.as_str(), *value))
@@ -6702,6 +7239,7 @@ mod tests {
 
         let values = user_login_values(
             "fresh-token",
+            None,
             None,
             Some("personal-org"),
             None,

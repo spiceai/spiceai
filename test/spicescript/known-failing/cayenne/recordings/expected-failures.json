@@ -1,39 +1,4 @@
 {
-  "cayenne-decimal-int-filter": [
-    {
-      "run": "cayenne-decimal-int-filter",
-      "who": "partitioned",
-      "key": "query: SELECT count(*) AS n FROM t WHERE d * 2 > 10",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to bind the Vortex filter to the file's type: Other error: incompatible types for arithmetic operation: decimal(10,2)? decimal(20,0)?\": code: 'Client specified an invalid argument', message: \"Failed",
-      "group": "cayenne",
-      "labels": [
-        "decimal-int"
-      ]
-    },
-    {
-      "run": "cayenne-decimal-int-filter",
-      "who": "partitioned",
-      "key": "query: SELECT count(*) AS n FROM t WHERE d + 1 > 10",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to bind the Vortex filter to the file's type: Other error: incompatible types for arithmetic operation: decimal(10,2)? decimal(20,0)?\": code: 'Client specified an invalid argument', message: \"Failed",
-      "group": "cayenne",
-      "labels": [
-        "decimal-int"
-      ]
-    },
-    {
-      "run": "cayenne-decimal-int-filter",
-      "who": "partitioned",
-      "key": "query: SELECT count(*) AS n FROM t WHERE d * big > 10",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to bind the Vortex filter to the file's type: Other error: incompatible types for arithmetic operation: decimal(10,2)? decimal(20,0)?\": code: 'Client specified an invalid argument', message: \"Failed",
-      "group": "cayenne",
-      "labels": [
-        "decimal-int"
-      ]
-    }
-  ],
   "cayenne-file-durability-date-key": [
     {
       "run": "cayenne-file-durability-date-key",
@@ -579,6 +544,42 @@
       "key": "start: {}",
       "kind": "error",
       "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ev (postgres). Unable to create dataset acceleration: Acceleration creation failed: Invalid Cayenne accel",
+      "group": "cayenne"
+    }
+  ],
+  "location-special-characters": [
+    {
+      "run": "location-special-characters",
+      "who": "s3-percent",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.connection\",\"type\":\"connection\"},\"error_message\":\"Failed to refresh dataset from the data connector: Execution error: Failed to create ObjectStoreWrite for 'state%2520dir/cayenne/v1/d",
+      "group": "cayenne"
+    },
+    {
+      "run": "location-special-characters",
+      "who": "local-percent",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "Failed to create ObjectStoreWrite for '",
+      "pattern": "Failed to create ObjectStoreWrite for '",
+      "group": "cayenne"
+    },
+    {
+      "run": "location-special-characters",
+      "who": "s3-tilde",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.connection\",\"type\":\"connection\"},\"error_message\":\"Failed to refresh dataset from the data connector: Execution error: Failed to create ObjectStoreWrite for 'state%7Edir/cayenne/v1/dat",
+      "group": "cayenne"
+    },
+    {
+      "run": "location-special-characters",
+      "who": "local-tilde",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "Failed to create ObjectStoreWrite for '",
+      "pattern": "Failed to create ObjectStoreWrite for '",
       "group": "cayenne"
     }
   ],
@@ -1136,188 +1137,6 @@
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
-      "group": "cayenne",
-      "may-pass": true
-    }
-  ],
-  "postgres-cdc-kill-under-load": [
-    {
-      "run": "postgres-cdc-kill-under-load[run=1]",
-      "who": "defaults",
-      "key": "query: SELECT id, k, v, seq FROM cdc_t",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-kill-under-load[run=1]",
-      "who": "defaults",
-      "key": "query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS sv, sum(seq) AS ss FROM cdc_t",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-kill-under-load[run=1]",
-      "who": "defaults",
-      "key": "query: SELECT id, k, v, seq FROM cdc_t #2",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-kill-under-load[run=1]",
-      "who": "file-durability",
-      "key": "query: SELECT id, k, v, seq FROM cdc_t",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-kill-under-load[run=1]",
-      "who": "file-durability",
-      "key": "query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS sv, sum(seq) AS ss FROM cdc_t",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-kill-under-load[run=1]",
-      "who": "file-durability",
-      "key": "query: SELECT id, k, v, seq FROM cdc_t #2",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-kill-under-load[run=2]",
-      "who": "defaults",
-      "key": "query: SELECT id, k, v, seq FROM cdc_t",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-kill-under-load[run=2]",
-      "who": "defaults",
-      "key": "query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS sv, sum(seq) AS ss FROM cdc_t",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-kill-under-load[run=2]",
-      "who": "defaults",
-      "key": "query: SELECT id, k, v, seq FROM cdc_t #2",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-kill-under-load[run=2]",
-      "who": "file-durability",
-      "key": "query: SELECT id, k, v, seq FROM cdc_t",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-kill-under-load[run=2]",
-      "who": "file-durability",
-      "key": "query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS sv, sum(seq) AS ss FROM cdc_t",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-kill-under-load[run=2]",
-      "who": "file-durability",
-      "key": "query: SELECT id, k, v, seq FROM cdc_t #2",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-kill-under-load[run=3]",
-      "who": "defaults",
-      "key": "query: SELECT id, k, v, seq FROM cdc_t",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-kill-under-load[run=3]",
-      "who": "defaults",
-      "key": "query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS sv, sum(seq) AS ss FROM cdc_t",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-kill-under-load[run=3]",
-      "who": "defaults",
-      "key": "query: SELECT id, k, v, seq FROM cdc_t #2",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-kill-under-load[run=3]",
-      "who": "file-durability",
-      "key": "query: SELECT id, k, v, seq FROM cdc_t",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-kill-under-load[run=3]",
-      "who": "file-durability",
-      "key": "query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS sv, sum(seq) AS ss FROM cdc_t",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-kill-under-load[run=3]",
-      "who": "file-durability",
-      "key": "query: SELECT id, k, v, seq FROM cdc_t #2",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
       "group": "cayenne",
       "may-pass": true
     }

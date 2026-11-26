@@ -290,17 +290,26 @@ async fn test_tls_hot_reload_all_endpoints() -> Result<(), anyhow::Error> {
                 .await
             });
 
-            // 3. Wait for the servers to come up by handshaking against HTTP.
+            // 3. Wait for every endpoint to come up by handshaking against it.
+            //    `start_servers` binds the HTTP, metrics and Flight listeners
+            //    independently, so HTTP answering does not mean the other two
+            //    are listening yet.
             tracing::info!("waiting for servers...");
-            assert!(
-                wait_for(Duration::from_secs(10), || async {
-                    fetch_server_leaf_fingerprint("127.0.0.1", http_port, &pki_v1.ca_pem)
-                        .await
-                        .is_ok()
-                })
-                .await,
-                "HTTP server did not become reachable"
-            );
+            for (name, port) in [
+                ("http", http_port),
+                ("metrics", metrics_port),
+                ("flight", flight_port),
+            ] {
+                assert!(
+                    wait_for(Duration::from_secs(10), || async {
+                        fetch_server_leaf_fingerprint("127.0.0.1", port, &pki_v1.ca_pem)
+                            .await
+                            .is_ok()
+                    })
+                    .await,
+                    "{name} server did not become reachable"
+                );
+            }
 
             // 4. Verify each endpoint serves the v1 leaf.
             for (name, port) in [

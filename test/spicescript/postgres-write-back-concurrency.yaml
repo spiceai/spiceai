@@ -1,4 +1,5 @@
 name: postgres-write-back-concurrency
+tags: [long]
 description: >
   Writes through Spice to a CDC Cayenne dataset backed by PostgreSQL,
   running while the source itself is written, end in the same rows in Spice

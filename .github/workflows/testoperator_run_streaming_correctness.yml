@@ -70,8 +70,16 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Load secrets from AWS
-        uses: $/.github/actions/load-aws-secrets
+      - name: Assume the streaming benchmark role
+        id: aws-streaming
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.CI_AWS_STREAMING_BENCH_ROLE_ARN }}
+          role-session-name: gha-streaming-${{ github.run_id }}
+          role-duration-seconds: 10800
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
 
       - name: Set spicepod path
         id: set_spicepod_path
@@ -145,8 +153,9 @@ jobs:
         env:
           # DynamoDB credentials
           DYNAMODB_AWS_REGION: us-east-1
-          DYNAMODB_AWS_ACCESS_KEY_ID: ${{ env.AWS_DYNAMODB_ACCESS_KEY_ID }}
-          DYNAMODB_AWS_SECRET_ACCESS_KEY: ${{ env.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
+          DYNAMODB_AWS_ACCESS_KEY_ID: ${{ steps.aws-streaming.outputs.aws-access-key-id }}
+          DYNAMODB_AWS_SECRET_ACCESS_KEY: ${{ steps.aws-streaming.outputs.aws-secret-access-key }}
+          DYNAMODB_AWS_SESSION_TOKEN: ${{ steps.aws-streaming.outputs.aws-session-token }}
           # Metrics
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
