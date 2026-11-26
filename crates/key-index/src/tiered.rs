@@ -377,6 +377,10 @@ impl RunDescriptor {
     }
 }
 
+/// The longest data-file name a run can cover: an object key is at most 1,024
+/// bytes on S3, and a file name is part of one.
+const MAX_FILE_NAME_BYTES: usize = 1024;
+
 /// A persisted run's file name: a digest of the names of the files it covers
 /// and its row count, so the same run always has the same name.
 fn run_file_name<'a>(files: impl Iterator<Item = &'a str>, rows: u64) -> String {
@@ -418,6 +422,11 @@ impl IndexRun {
             let mut files = Vec::with_capacity(count.min(1 << 16));
             for _ in 0..count {
                 let len = reader.u32()? as usize;
+                // Longer than any object key: a corrupt length, refused before
+                // a reader is asked for the bytes it claims.
+                if len > MAX_FILE_NAME_BYTES {
+                    return Err(Error::Corrupt);
+                }
                 let name = std::str::from_utf8(reader.bytes(len)?).map_err(|_| Error::Corrupt)?;
                 files.push(name.to_string());
             }

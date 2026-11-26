@@ -1222,3 +1222,22 @@ fn a_run_files_first_bytes_name_its_files_and_rows() {
     };
     assert_ne!(renamed.file_name(), run.file_name());
 }
+
+/// A run file whose file list claims a name longer than any object key is
+/// refused from its first bytes, rather than asking for more of the file: a
+/// corrupt length could otherwise have a reader fetch the whole object.
+#[test]
+fn a_run_files_start_with_an_impossible_name_length_is_refused() {
+    let mut builder = RunBuilder::new(encoder());
+    builder
+        .add_batch("0193aaaa_00000.vortex", 0, &column(&[1]))
+        .expect("add");
+    let mut bytes = builder.finish().expect("finish").to_bytes();
+    // header 12 | encoding 8 | count 4 | then the first name's length.
+    bytes[24..28].copy_from_slice(&(1_u32 << 30).to_le_bytes());
+    assert_eq!(
+        IndexRun::describe(&bytes[..64]),
+        Err(crate::persist::Error::Corrupt),
+        "a name longer than any object key is corrupt"
+    );
+}

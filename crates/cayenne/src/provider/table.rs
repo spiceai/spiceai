@@ -3637,12 +3637,12 @@ pub struct CayenneTableProvider {
     orphan_age_floor_ms: Arc<AtomicU64>,
     /// When the orphan sweep last ran, or the table opened.
     last_orphan_sweep: Arc<ParkingMutex<Instant>>,
-    /// The data files each unregistered lookup-index run file the orphan sweep
-    /// has read covers, by its key relative to the table's directory, or
-    /// `None` for one that could not be read as a run. A run file's name is
-    /// derived from those files, so an entry never changes while its file is
-    /// listed.
-    index_run_covers: Arc<ParkingMutex<HashMap<String, Option<Vec<String>>>>>,
+    /// What the orphan sweep read of each unregistered lookup-index run file,
+    /// by its key relative to the table's directory: the object's size and
+    /// modification time when read, and the data files it covers, or `None`
+    /// for one that could not be read as a run. An entry is used only while
+    /// the object is unchanged: a rebuilt run rewrites its file.
+    index_run_covers: Arc<ParkingMutex<HashMap<String, IndexRunCovers>>>,
     /// Held by the orphan sweep while it runs, from when it is scheduled: one
     /// runs at a time, and [`Self::sweep_orphan_files_now`] and
     /// [`Self::drain_in_flight_maintenance`] wait for a scheduled one.
@@ -4152,6 +4152,14 @@ struct CayenneTableProviderOpenOptions {
     /// Whether the table existed before this open, so the orphan sweep runs as it
     /// opens: a table created now has nothing to sweep.
     existed: bool,
+}
+
+/// What the orphan sweep read of an unregistered lookup-index run file.
+#[derive(Clone, Debug)]
+struct IndexRunCovers {
+    size: u64,
+    modified: chrono::DateTime<chrono::Utc>,
+    files: Option<Vec<String>>,
 }
 
 /// What a sweep consults before deleting a snapshot directory: in-flight scan
@@ -25551,7 +25559,12 @@ impl CayenneTableProvider {
             if registered.contains(&(key.to_string(), name.to_string())) {
                 continue;
             }
-            let known = self.index_run_covers.lock().get(relative).cloned();
+            let known = self
+                .index_run_covers
+                .lock()
+                .get(relative)
+                .filter(|known| known.size == meta.size && known.modified == meta.last_modified)
+                .map(|known| known.files.clone());
             let described = if let Some(described) = known {
                 described
             } else {
@@ -25565,9 +25578,14 @@ impl CayenneTableProvider {
                 else {
                     continue;
                 };
-                self.index_run_covers
-                    .lock()
-                    .insert(relative.to_string(), described.clone());
+                self.index_run_covers.lock().insert(
+                    relative.to_string(),
+                    IndexRunCovers {
+                        size: meta.size,
+                        modified: meta.last_modified,
+                        files: described.clone(),
+                    },
+                );
                 described
             };
             // A file that cannot be read as a run is left, and not read again.
@@ -25586,6 +25604,25 @@ impl CayenneTableProvider {
         self.index_run_covers
             .lock()
             .retain(|key, _| listed.contains(key));
+        // Every retired run file's retention runs from now if it is not
+        // running already, and the retirement sweep is scheduled to delete
+        // them: the index's own retirements included, on a table no later
+        // write reconsiders.
+        if let Some(keys) = self.catalog.retired_files(table_id).await? {
+            let pending: Vec<String> = keys
+                .into_iter()
+                .filter(|key| key.starts_with(super::constants::LOOKUP_INDEX_DIR_NAME))
+                .collect();
+            if !pending.is_empty() {
+                let now = Instant::now();
+                let mut timers = self.retired_file_timers.lock();
+                for key in pending {
+                    timers.entry(key).or_insert(now);
+                }
+                drop(timers);
+                self.follow_up_retired_snapshot_dirs(crate::metastore_layout::DATA_FILE_RETENTION);
+            }
+        }
         retired.sort();
         Ok(retired)
     }

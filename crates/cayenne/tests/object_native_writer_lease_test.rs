@@ -1488,3 +1488,78 @@ async fn an_unregistered_run_with_a_long_file_list_is_reclaimed() {
         "the retirement sweep deletes it"
     );
 }
+
+/// A run file the orphan sweep retires, with no data-file orphan beside it,
+/// still starts its retention and is deleted by the retirement sweep once the
+/// retention passes, as on an idle table no later write reconsiders.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_file_only_the_orphan_sweep_retires_is_deleted_after_the_retention() {
+    let (a, objects, table, table_id) = indexed_instance().await;
+    a.insert(1, 100).await.expect("A writes");
+    let (registered, stored) =
+        wait_for_runs(&a, &objects, &table_id, "A persists a run", |r, f| {
+            !r.is_empty() && f.len() == r.len()
+        })
+        .await;
+    let (run_name, run_bytes) = run_file(&["01b0000000000000000000000000000e_00000.vortex"]);
+    let run_path = stored[0].replace(registered[0].split_once('/').expect("key/run").1, &run_name);
+    objects
+        .put(&Path::from(run_path.as_str()), PutPayload::from(run_bytes))
+        .await
+        .expect("plant the run file");
+    let swept = table.sweep_orphan_files_now().await.expect("sweep");
+    assert_eq!(
+        (swept.retired.clone(), swept.retired_index_runs.len()),
+        (Vec::<String>::new(), 1),
+        "only the run file is retired: {swept:?}"
+    );
+    // The retention passes on the timers already running, and the retirement
+    // sweep runs; nothing observes the retired set afresh first.
+    table.elapse_data_file_retention();
+    table.sweep_retired_snapshot_dirs_now().await;
+    assert!(
+        !stored_run_files(&objects).await.contains(&run_path),
+        "the retirement sweep deletes the run file"
+    );
+}
+
+/// A file the orphan sweep could not read as a run, later rewritten under the
+/// same name with a valid run over data files that are gone, is read again
+/// and retired: what the sweep remembers of a file holds only while the file
+/// is unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rewritten_run_file_is_read_again() {
+    let (a, objects, table, table_id) = indexed_instance().await;
+    a.insert(1, 100).await.expect("A writes");
+    let (registered, stored) =
+        wait_for_runs(&a, &objects, &table_id, "A persists a run", |r, f| {
+            !r.is_empty() && f.len() == r.len()
+        })
+        .await;
+    let (run_name, run_bytes) = run_file(&["01b0000000000000000000000000000f_00000.vortex"]);
+    let run_path = Path::from(
+        stored[0]
+            .replace(registered[0].split_once('/').expect("key/run").1, &run_name)
+            .as_str(),
+    );
+    objects
+        .put(&run_path, PutPayload::from_static(b"not a run file"))
+        .await
+        .expect("plant a damaged run file");
+    let swept = table.sweep_orphan_files_now().await.expect("sweep");
+    assert_eq!(
+        swept.retired_index_runs,
+        Vec::<String>::new(),
+        "a file that cannot be read as a run is left"
+    );
+    objects
+        .put(&run_path, PutPayload::from(run_bytes))
+        .await
+        .expect("rewrite it as a valid run");
+    let swept = table.sweep_orphan_files_now().await.expect("sweep");
+    assert_eq!(
+        swept.retired_index_runs.len(),
+        1,
+        "the rewritten file is read again and retired: {swept:?}"
+    );
+}
