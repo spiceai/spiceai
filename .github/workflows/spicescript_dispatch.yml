@@ -208,6 +208,10 @@ jobs:
       - name: Install DuckDB CLI
         run: |
           set -euo pipefail
+          if [ "$(uname -s)-$(uname -m)" != Linux-x86_64 ]; then
+            echo "::error::.github/ci-cache/pins.json pins the DuckDB CLI for Linux x86_64 only; run this job on Linux x86_64."
+            exit 1
+          fi
           # DuckDB CLI v1.5.5, pinned in .github/ci-cache/pins.json and checked against its
           # SHA-256, unpacked into a new directory of the job's own.
           dir="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/duckdb.XXXXXX")"

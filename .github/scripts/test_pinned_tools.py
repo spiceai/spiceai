@@ -250,6 +250,10 @@ class PinnedToolsTest(unittest.TestCase):
         (bin_dir,) = self.path_dirs()
         self.assertTrue(bin_dir.is_relative_to(self.runner_temp), bin_dir)
         self.assertEqual(self.calls(), ["pinned-aws --version"])
+        # The pin is the x86_64 build: anywhere else the action refuses before downloading.
+        r = self.run_step("install-aws-cli", "Install the AWS CLI", {"FAKE_UNAME_M": "aarch64"})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("Linux x86_64 build", r.stdout + r.stderr)
         # Every caller installs it through the action.
         for path in (
             ".github/actions/setup-spicescript/action.yml",

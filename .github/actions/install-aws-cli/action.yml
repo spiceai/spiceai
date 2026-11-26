@@ -13,8 +13,8 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        if [ "$(uname -s)" != Linux ]; then
-          echo "::error::install-aws-cli installs the Linux build pinned in .github/ci-cache/pins.json; run this job on Linux."
+        if [ "$(uname -s)-$(uname -m)" != Linux-x86_64 ]; then
+          echo "::error::install-aws-cli installs the Linux x86_64 build pinned in .github/ci-cache/pins.json; run this job on Linux x86_64."
           exit 1
         fi
         command -v unzip >/dev/null || { sudo apt-get update && sudo apt-get install -y unzip; }

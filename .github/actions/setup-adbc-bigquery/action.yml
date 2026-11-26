@@ -56,10 +56,12 @@ runs:
           exit 1
         fi
 
-        # Only the pinned commit is fetched, by its SHA; nothing reads the default branch, and
-        # git checks every object it fetches against the SHA that names it.
-        git init -q /tmp/adbc-bigquery
-        cd /tmp/adbc-bigquery
+        # Only the pinned commit is fetched, by its SHA, into a new directory of the job's own;
+        # nothing reads the default branch, and git checks every object it fetches against the
+        # SHA that names it.
+        work="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/adbc-bigquery.XXXXXX")"
+        git init -q "$work/src"
+        cd "$work/src"
         git remote add origin https://github.com/spiceai/bigquery.git
         git fetch --depth=1 origin "$ADBC_BIGQUERY_COMMIT"
         git checkout -q --detach FETCH_HEAD
@@ -105,12 +107,11 @@ runs:
         fi
 
         CGO_ENABLED=1 go build -tags driverlib -buildmode=c-shared \
-          -o /tmp/libadbc_driver_bigquery.so ./pkg/
-        rm -f /tmp/libadbc_driver_bigquery.h
+          -o "$work/libadbc_driver_bigquery.so" ./pkg/
 
         sudo mkdir -p "${DRIVER_DIR}"
-        sudo cp /tmp/libadbc_driver_bigquery.so "${DRIVER_DIR}/"
+        sudo cp "$work/libadbc_driver_bigquery.so" "${DRIVER_DIR}/"
         printf '[Driver]\nshared = "%s/libadbc_driver_bigquery.so"\n' "${DRIVER_DIR}" | sudo tee "${DRIVER_DIR}/bigquery.toml"
 
         echo "ADBC BigQuery driver installed to ${DRIVER_DIR}/libadbc_driver_bigquery.so"
-        rm -rf /tmp/adbc-bigquery /tmp/libadbc_driver_bigquery.so
+        rm -rf "$work"

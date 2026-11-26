@@ -78,14 +78,21 @@ class PinnedCheckoutTest(unittest.TestCase):
 
     def adbc_bigquery(self, commit):
         script = step_script(ADBC_BIGQUERY, "Build ADBC BigQuery driver")
-        # Only the checkout, into this test's directory rather than the action's /tmp path: the
-        # rest checks the driver's patches and builds it with Go.
-        self.assertIn("/tmp/adbc-bigquery", script)
-        script = script.split("\ncd go\n")[0].replace("/tmp/adbc-bigquery", str(self.dir / "adbc-bigquery"))
+        # Only the checkout: the rest checks the driver's patches and builds it with Go. It runs in
+        # a new directory under RUNNER_TEMP, never a fixed /tmp path a planted repository could hold.
+        self.assertNotIn("/tmp/", script)
+        script = script.split("\ncd go\n")[0]
         script += "\ngit rev-parse HEAD > \"$OUT\"\n"
         out = self.dir / "adbc-head"
+        runner_temp = self.dir / "runner-temp"
+        runner_temp.mkdir(exist_ok=True)
         proc = self.run_script(
-            script, "https://github.com/spiceai/bigquery.git", self.dir, ADBC_BIGQUERY_COMMIT=commit, OUT=str(out)
+            script,
+            "https://github.com/spiceai/bigquery.git",
+            self.dir,
+            ADBC_BIGQUERY_COMMIT=commit,
+            OUT=str(out),
+            RUNNER_TEMP=str(runner_temp),
         )
         return proc, out
 
