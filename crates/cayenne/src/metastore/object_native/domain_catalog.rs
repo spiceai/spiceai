@@ -1498,11 +1498,13 @@ impl MetadataCatalog for Domain {
 }
 
 impl Domain {
-    /// The names of the data files `table` names, live or retired, and of the
+    /// The names of the data files `table` names, live or retired or in any
+    /// snapshot's manifest (a compaction records its new snapshot's manifest,
+    /// and stops holding its files, before the snapshot goes live), and of the
     /// files this process's writes hold in flight (`in_flight`, read before
     /// the state, since a write records its files in the state before it
     /// stops holding them): the files a scan can read, or may once their
-    /// commit lands. A file not among them is gone (deleted, or never to be
+    /// snapshot goes live. A file not among them is gone (deleted, or never to be
     /// committed: another instance's writes are fenced), and no run over it
     /// is built again.
     fn readable_file_names(
@@ -1513,6 +1515,7 @@ impl Domain {
             .live_keys()
             .iter()
             .chain(&table.retired)
+            .chain(table.files.keys().map(|(_, path)| path))
             .map(|key| key.rsplit('/').next().unwrap_or(key).to_string())
             .chain(in_flight.iter().cloned())
             .collect()

@@ -11,30 +11,39 @@
 //! run file costs time, never rows. The property checked here is the stronger
 //! one, that a registered run's file exists.
 //!
-//! Data files go from absent to live (a commit names them), to retired (a
-//! commit removes them; old snapshots still read them), to gone (deleted and
-//! forgotten). A run is built over files that can still be read (live or
-//! retired), possibly slowly: it can finish after one of its files is gone.
+//! Data files go from absent to manifested (written, and named by the
+//! manifest of a snapshot that is not live yet: a compaction records it, and
+//! stops holding its files as uncommitted uploads, before the snapshot goes
+//! live), then live (the snapshot goes live) or gone (the snapshot is
+//! abandoned), then retired (a commit removes them; old snapshots still read
+//! them), then gone (deleted and forgotten). A run is built over files that can
+//! be read (manifested, live or retired), possibly slowly: it can finish after
+//! one of its files is gone.
 //! The writer holding the dataset's lease commits; a writer another's
 //! takeover has fenced keeps running unaware, and its uploads and deletes
 //! still land, but its commits are refused (and tell it it was fenced).
 //!
-//! The protocol: a run file is written, then registered by a commit that
-//! accepts it only while none of its data files is gone and its name is not
-//! retired. A run no longer wanted is unregistered and its file kept, since
+//! The protocol: a file is gone once no manifest, live set or retired set
+//! names it. A run file is written, then registered by a commit that accepts
+//! it only while none of its data files is gone and its name is not retired. A run no longer wanted is unregistered and its file kept, since
 //! the same run may be built again. A run file is retired, by a commit that
 //! also unregisters it, only once one of its data files is gone: no run over
 //! that set can be built again, so the name is never registered again. The
 //! retirement sweep then deletes it, and forgets it once the delete returned.
 //! A delete can be in flight for long, or sent twice (a retry, or the sweep of
-//! a process that was fenced meanwhile), and land after the forget.
+//! a process that was fenced meanwhile), and land after the forget. A run file
+//! can be retired at any time its rule allows, including between another
+//! step's writing and registering it: the orphan sweep retires unregistered
+//! run files concurrently with the index's syncs.
 //!
 //! Controls: `delete-while-live` retires a run file while its data files are
 //! live, as a cleanup that deletes runs merged into a larger one or left
 //! unregistered by a crash would, and registers without checking; `skip-retired`
 //! retires while the files are live but refuses to register a name while it is
 //! retired; `persist-forgotten` keeps the protocol's retirement rule but
-//! registers a run whose build finished after one of its files was gone.
+//! registers a run whose build finished after one of its files was gone;
+//! `manifest-not-readable` counts a file named only by a not-yet-live
+//! snapshot's manifest as gone.
 use stateright::{Model, Property};
 
 /// Data files.
@@ -53,13 +62,15 @@ const CRASHES: u8 = 1;
 enum Data {
     #[default]
     Absent,
+    Manifested,
     Live,
     Retired,
     Gone,
 }
 impl Data {
+    /// Whether the file exists to be read, so a run can be built over it.
     fn readable(self) -> bool {
-        matches!(self, Data::Live | Data::Retired)
+        matches!(self, Data::Manifested | Data::Live | Data::Retired)
     }
 }
 
@@ -69,6 +80,7 @@ enum Rule {
     DeleteWhileLive,
     SkipRetired,
     PersistForgotten,
+    ManifestNotReadable,
 }
 
 #[derive(Clone, Debug)]
@@ -132,11 +144,15 @@ pub(crate) struct State {
     late_delete: bool,
     /// A build finished after one of its files was gone.
     late_build: bool,
+    /// A run was built over a file named only by a not-yet-live manifest.
+    built_over_manifested: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
     DataWrite(usize),
+    DataPublish(usize),
+    DataAbandon(usize),
     DataRetire(usize),
     DataForget(usize),
     BuildStart(usize, Name),
@@ -159,6 +175,8 @@ impl Protocol {
             Rule::SkipRetired
         } else if mode.contains("persist-forgotten") {
             Rule::PersistForgotten
+        } else if mode.contains("manifest-not-readable") {
+            Rule::ManifestNotReadable
         } else {
             Rule::Protocol
         };
@@ -170,8 +188,17 @@ impl Protocol {
     fn holder(s: &State) -> Option<usize> {
         (0..WRITERS).find(|&w| Self::holds_lease(s, w))
     }
-    fn any_gone(s: &State, name: Name) -> bool {
-        (0..DATA).any(|f| covers(name, f) && s.data[f] == Data::Gone)
+    /// Whether one of `name`'s files is gone, as the rule judges it from the
+    /// manifests, live set and retired set.
+    fn any_gone(&self, s: &State, name: Name) -> bool {
+        (0..DATA).any(|f| {
+            covers(name, f)
+                && match s.data[f] {
+                    Data::Gone => true,
+                    Data::Manifested => self.rule == Rule::ManifestNotReadable,
+                    Data::Absent | Data::Live | Data::Retired => false,
+                }
+        })
     }
     fn all_readable(s: &State, name: Name) -> bool {
         (0..DATA).all(|f| !covers(name, f) || s.data[f].readable())
@@ -180,7 +207,7 @@ impl Protocol {
     fn may_register(&self, s: &State, name: Name) -> bool {
         let retired = s.retired & bit(name) != 0;
         match self.rule {
-            Rule::Protocol => !retired && !Self::any_gone(s, name),
+            Rule::Protocol | Rule::ManifestNotReadable => !retired && !self.any_gone(s, name),
             Rule::SkipRetired | Rule::PersistForgotten => !retired,
             Rule::DeleteWhileLive => true,
         }
@@ -188,7 +215,9 @@ impl Protocol {
     /// Whether a retirement commit of `name` is accepted under the lease.
     fn may_retire(&self, s: &State, name: Name) -> bool {
         match self.rule {
-            Rule::Protocol | Rule::PersistForgotten => Self::any_gone(s, name),
+            Rule::Protocol | Rule::PersistForgotten | Rule::ManifestNotReadable => {
+                self.any_gone(s, name)
+            }
             Rule::DeleteWhileLive | Rule::SkipRetired => true,
         }
     }
@@ -223,12 +252,15 @@ impl Model for Protocol {
             fenced_refused: false,
             late_delete: false,
             late_build: false,
+            built_over_manifested: false,
         }]
     }
     fn actions(&self, s: &State, a: &mut Vec<Action>) {
         for f in 0..DATA {
             a.extend([
                 Action::DataWrite(f),
+                Action::DataPublish(f),
+                Action::DataAbandon(f),
                 Action::DataRetire(f),
                 Action::DataForget(f),
             ]);
@@ -261,16 +293,19 @@ impl Model for Protocol {
         }
         let mut next = s.clone();
         match action {
-            Action::DataWrite(f) => next.data[f] = Data::Live,
+            Action::DataWrite(f) => next.data[f] = Data::Manifested,
+            Action::DataPublish(f) => next.data[f] = Data::Live,
             Action::DataRetire(f) => next.data[f] = Data::Retired,
-            Action::DataForget(f) => next.data[f] = Data::Gone,
+            Action::DataAbandon(f) | Action::DataForget(f) => next.data[f] = Data::Gone,
             Action::BuildStart(w, name) => {
                 next.writers[w].build = Some(name);
                 next.builds += 1;
+                next.built_over_manifested |=
+                    (0..DATA).any(|f| covers(name, f) && s.data[f] == Data::Manifested);
             }
             Action::Put(w) => {
                 let name = s.writers[w].build?;
-                next.late_build |= Self::any_gone(s, name);
+                next.late_build |= (0..DATA).any(|f| covers(name, f) && s.data[f] == Data::Gone);
                 next.store |= bit(name);
                 next.writers[w].build = None;
                 next.writers[w].put = Some(name);
@@ -345,7 +380,11 @@ impl Model for Protocol {
                 .join("+")
         };
         match *action {
-            Action::DataWrite(f) => format!("a commit makes data file d{f} live"),
+            Action::DataWrite(f) => {
+                format!("data file d{f} is written and named by a manifest not yet live")
+            }
+            Action::DataPublish(f) => format!("the snapshot naming d{f} goes live"),
+            Action::DataAbandon(f) => format!("the snapshot naming d{f} is abandoned"),
             Action::DataRetire(f) => format!("a commit retires data file d{f}"),
             Action::DataForget(f) => format!("data file d{f} is deleted and forgotten"),
             Action::BuildStart(w, n) => {
@@ -395,6 +434,10 @@ impl Model for Protocol {
                     "build finishes after one of its files is gone",
                     |_, s: &State| s.late_build,
                 ),
+                Property::sometimes(
+                    "run built over a file of a snapshot not yet live",
+                    |_, s: &State| s.built_over_manifested,
+                ),
             ]);
         }
         properties
@@ -407,6 +450,9 @@ impl Protocol {
         let holder = Self::holder(s).is_some();
         match *action {
             Action::DataWrite(f) => holder && s.data[f] == Data::Absent,
+            Action::DataPublish(f) | Action::DataAbandon(f) => {
+                holder && s.data[f] == Data::Manifested
+            }
             Action::DataRetire(f) => holder && s.data[f] == Data::Live,
             Action::DataForget(f) => holder && s.data[f] == Data::Retired,
             Action::BuildStart(w, name) => {
@@ -419,13 +465,8 @@ impl Protocol {
             Action::Put(w) => writer(w).build.is_some(),
             Action::Register(w) => writer(w).put.is_some(),
             Action::Unwant(name) => holder && s.registered & bit(name) != 0,
-            // A process never retires a run between writing its file and
-            // registering it: a sync registers what it wrote before it
-            // removes anything, and a load's cleanup runs before any sync. A
-            // build of the run may be in progress, in this process or another.
             Action::RetireRun(w, name) => {
                 writer(w).generation.is_some()
-                    && writer(w).put != Some(name)
                     && (s.store | s.registered) & bit(name) != 0
                     && s.retired & bit(name) == 0
                     && (!Self::holds_lease(s, w) || self.may_retire(s, name))

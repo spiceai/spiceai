@@ -20,7 +20,11 @@ limitations under the License.
 //! The table's data is flat: its data files sit directly under the table's
 //! directory (`<write_id>_<n>.vortex`), its deletion vectors under
 //! `deletions/`, a staged write in `_staging/<id>/`, and the lookup index in
-//! `_lookup_index/`, which this sweep never touches.
+//! `_lookup_index/`, whose run files follow their own rule: the sweep retires
+//! a run file no run is registered for only once a data file it covers is
+//! gone, since a run's name is derived from the files it covers and the same
+//! run built again reuses it. That reclaims the run files no index sync
+//! reconsiders (a removed index's, an idle table's).
 //!
 //! The sweep deletes nothing itself. It retires what it finds, in one commit
 //! of a `RetireFiles` record through the dataset's log, and the retirement
@@ -85,6 +89,10 @@ pub struct OrphanSweep {
     /// relative to the data path (`<table>/deletions/<file>`). The retirement
     /// sweep deletes them after the retention.
     pub retired: Vec<String>,
+    /// Lookup-index run files no run is registered for that were retired,
+    /// because a data file they cover is gone, by their keys relative to the
+    /// table's directory.
+    pub retired_index_runs: Vec<String>,
     /// Unnamed objects kept because they are younger than the floor.
     pub kept_young: usize,
     /// Unnamed objects kept because a write in this process holds them.

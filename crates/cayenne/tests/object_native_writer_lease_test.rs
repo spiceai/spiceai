@@ -1004,6 +1004,12 @@ async fn a_paused_index_load_deletes_no_run_its_successor_registers() {
         .expect("A's reopen finishes")
         .expect("join");
     eprintln!("A's reopen: {reopened:?}");
+    // A's load tried to retire B's run, which it judged over a gone file from
+    // its stale view: the commit was refused, and A learned it was fenced.
+    assert!(
+        !a.catalog.data_write_gate(&table_id).allows(),
+        "A's retire commit was refused, so A no longer writes the dataset"
+    );
 
     let stored: Vec<String> = objects
         .list(None)
@@ -1310,4 +1316,132 @@ async fn a_run_file_is_deleted_only_once_a_data_file_it_covers_is_gone() {
         );
     }
     assert_eq!(a.count_and_sum().await, expected(1..=400));
+}
+
+/// A compaction records its new snapshot's manifest, and stops holding the
+/// snapshot's files as uncommitted uploads, before the snapshot goes live.
+/// A file named only by that manifest is not gone: the snapshot may still go
+/// live, and a run over it built again. A run over it is neither retired nor
+/// refused registration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_over_a_file_of_a_snapshot_not_yet_live_is_not_retired() {
+    let (a, _objects, _table, table_id) = indexed_instance().await;
+    a.insert(1, 100).await.expect("A writes");
+    let file = "01b0000000000000000000000000000c_00000.vortex";
+    a.catalog
+        .replace_snapshot_files(
+            &table_id,
+            "01b00000-0000-7000-8000-00000000000c",
+            &[cayenne::metadata::SnapshotFile {
+                table_id: table_id.clone(),
+                snapshot_id: "01b00000-0000-7000-8000-00000000000c".to_string(),
+                file_path: file.to_string(),
+                row_count: 1,
+                file_size_bytes: 1,
+                min_sequence: 1,
+                max_sequence: 1,
+                digest: None,
+            }],
+        )
+        .await
+        .expect("record the manifest of a snapshot not yet live");
+    let native = a
+        .catalog
+        .as_any()
+        .downcast_ref::<ObjectNativeCatalog>()
+        .expect("the object-native catalog");
+    let (name, bytes) = run_file(&[file]);
+    let key = "50c8036caa9bfa1774ae2bf50241a307";
+    let run_key = format!("_lookup_index/{key}/{name}");
+    let none = std::collections::HashSet::new();
+    let retired = native
+        .retire_index_run(&table_id, key, &name, &[file.to_string()], &run_key, &none)
+        .await
+        .expect("retire");
+    let registered = native
+        .register_index_run_covering(
+            &cayenne::metadata::IndexRunRecord {
+                table_id: table_id.clone(),
+                index_key: key.to_string(),
+                run_name: name.clone(),
+                row_count: 1,
+                size_bytes: bytes.len() as u64,
+            },
+            &[file.to_string()],
+            &run_key,
+            &none,
+        )
+        .await
+        .expect("register");
+    assert_eq!(
+        (retired, registered),
+        (false, true),
+        "a run over a file only a not-yet-live snapshot's manifest names is kept and may register"
+    );
+}
+
+/// Removing a table's last index unregisters its runs; while the data files
+/// they cover can still be read, their files are kept, since the same index
+/// added back would build the same runs under the same names. No index sync
+/// runs any more to reconsider them, so the orphan sweep retires each once a
+/// data file it covers is gone, and the retirement sweep deletes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_indexs_run_files_are_reclaimed_once_their_data_files_are_gone() {
+    let (a, objects, _table, table_id) = indexed_instance().await;
+    a.insert(1, 100).await.expect("A writes");
+    let (_, stored) = wait_for_runs(&a, &objects, &table_id, "A persists a run", |r, f| {
+        !r.is_empty() && f.len() == r.len()
+    })
+    .await;
+
+    // The index is removed: the table opens with none.
+    let plain = Arc::new(a.builder(&a.data_url).open(TABLE).await.expect("reopen"));
+    let _ = a.ctx.deregister_table(TABLE);
+    a.ctx
+        .register_table(
+            TABLE,
+            Arc::clone(&plain) as Arc<dyn datafusion::datasource::TableProvider>,
+        )
+        .expect("register");
+    let (registered, kept) = wait_for_runs(
+        &a,
+        &objects,
+        &table_id,
+        "the runs are unregistered",
+        |r, _| r.is_empty(),
+    )
+    .await;
+    assert_eq!(
+        (registered, kept.clone()),
+        (Vec::<String>::new(), stored.clone()),
+        "unregistered, and their files kept while their data files are live"
+    );
+    let swept = plain.sweep_orphan_files_now().await.expect("sweep");
+    assert_eq!(
+        swept.retired_index_runs,
+        Vec::<String>::new(),
+        "nothing retired while the data files are live"
+    );
+
+    // The data file is rewritten, and the old one deleted and forgotten.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !plain.force_full_compaction().await.expect("compaction") {
+        assert!(Instant::now() < deadline, "the compaction never ran");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    plain.drain_in_flight_maintenance().await.expect("drain");
+    plain.reclaim_retired_snapshots_now().await;
+    let swept = plain.sweep_orphan_files_now().await.expect("sweep");
+    assert_eq!(
+        swept.retired_index_runs.len(),
+        kept.len(),
+        "the orphan sweep retires the kept run files: {swept:?}"
+    );
+    plain.reclaim_retired_snapshots_now().await;
+    assert_eq!(
+        stored_run_files(&objects).await,
+        Vec::<String>::new(),
+        "and the retirement sweep deletes them"
+    );
+    assert_eq!(a.count_and_sum().await, expected(1..=100));
 }

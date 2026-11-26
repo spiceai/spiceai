@@ -2708,6 +2708,10 @@ fn additional_runs() -> Vec<Run> {
             "index-runs-persist-forgotten",
             "registered run's file exists",
         ),
+        (
+            "index-runs-manifest-not-readable",
+            "registered run's file exists",
+        ),
     ] {
         runs.push(Run {
             name,

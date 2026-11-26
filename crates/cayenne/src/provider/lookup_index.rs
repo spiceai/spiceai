@@ -3012,26 +3012,9 @@ impl PersistedRuns {
         Ok(())
     }
 
-    /// The data files the run file at `path` covers, read from its first
-    /// bytes, when they name it: they are what its name `name` is derived
-    /// from. `None` when the file cannot be read, is not a run file, or its
-    /// name does not match.
+    /// The data files the run file at `path` covers ([`describe_run_file`]).
     async fn describe(&self, path: &object_store::path::Path, name: &str) -> Option<Vec<String>> {
-        // Enough for the file list of a run over a few hundred files; a
-        // longer list reads the whole file.
-        const PREFIX: u64 = 64 * 1024;
-        let size = self.store.head(path).await.ok()?.size;
-        let mut end = PREFIX.min(size);
-        loop {
-            let bytes = self.store.get_range(path, 0..end).await.ok()?;
-            match IndexRun::describe(&bytes) {
-                Ok(Some(described)) => {
-                    return (described.file_name() == name).then_some(described.files);
-                }
-                Ok(None) if end < size => end = size,
-                _ => return None,
-            }
-        }
+        describe_run_file(self.store.as_ref(), path, name).await
     }
 
     /// Every key's persisted runs. A registered run whose file cannot be read
@@ -3353,6 +3336,39 @@ fn distinct_dirs<'a>(mut dirs: impl Iterator<Item = &'a str>) -> bool {
     let mut unique = HashSet::new();
     dirs.all(|dir| unique.insert(dir))
 }
+
+/// The data files the run file at `path` covers, read from its first bytes,
+/// when they name it: they are what its name `name` is derived from. `None`
+/// when the file cannot be read, is not a run file, its name does not match,
+/// or its file list runs past [`DESCRIBE_LIMIT`]. Reads a growing prefix, never
+/// the run's index itself.
+pub(crate) async fn describe_run_file(
+    store: &dyn ObjectStore,
+    path: &object_store::path::Path,
+    name: &str,
+) -> Option<Vec<String>> {
+    let size = store.head(path).await.ok()?.size;
+    let mut end = DESCRIBE_FIRST_READ.min(size);
+    loop {
+        let bytes = store.get_range(path, 0..end).await.ok()?;
+        match IndexRun::describe(&bytes) {
+            Ok(Some(described)) => {
+                return (described.file_name() == name).then_some(described.files);
+            }
+            Ok(None) if end < size.min(DESCRIBE_LIMIT) => {
+                end = end.saturating_mul(4).min(size).min(DESCRIBE_LIMIT);
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The first read of a run file's start: the file list of a run over a few
+/// hundred files.
+const DESCRIBE_FIRST_READ: u64 = 64 * 1024;
+/// The most of a run file's start read to find its file list: a run over
+/// tens of thousands of files. A longer list is not read, and its file left.
+const DESCRIBE_LIMIT: u64 = 4 * 1024 * 1024;
 
 /// A persisted run's name: a digest of the run's files and size, so the same run
 /// always has the same name ([`IndexRun::file_name`]).

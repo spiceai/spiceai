@@ -3637,6 +3637,10 @@ pub struct CayenneTableProvider {
     orphan_age_floor_ms: Arc<AtomicU64>,
     /// When the orphan sweep last ran, or the table opened.
     last_orphan_sweep: Arc<ParkingMutex<Instant>>,
+    /// The data files each unregistered lookup-index run file the orphan sweep
+    /// has read covers, by its key relative to the table's directory. A run
+    /// file's name is derived from those files, so the entry never changes.
+    index_run_covers: Arc<ParkingMutex<HashMap<String, Vec<String>>>>,
     /// Held by the orphan sweep while it runs, from when it is scheduled: one
     /// runs at a time, and [`Self::sweep_orphan_files_now`] and
     /// [`Self::drain_in_flight_maintenance`] wait for a scheduled one.
@@ -12652,6 +12656,7 @@ impl CayenneTableProvider {
                     .unwrap_or(u64::MAX),
             )),
             last_orphan_sweep: Arc::new(ParkingMutex::new(Instant::now())),
+            index_run_covers: Arc::new(ParkingMutex::new(HashMap::new())),
             orphan_sweep_running: Arc::new(tokio::sync::Mutex::new(())),
             inflight_staging_appends: Arc::new(ParkingMutex::new(HashMap::new())),
             staging_deletes_after_commit: Arc::new(ParkingMutex::new(HashSet::new())),
@@ -15159,6 +15164,7 @@ impl CayenneTableProvider {
             uncommitted_files: Arc::clone(&self.uncommitted_files),
             orphan_age_floor_ms: Arc::clone(&self.orphan_age_floor_ms),
             last_orphan_sweep: Arc::clone(&self.last_orphan_sweep),
+            index_run_covers: Arc::clone(&self.index_run_covers),
             orphan_sweep_running: Arc::clone(&self.orphan_sweep_running),
             inflight_staging_appends: Arc::clone(&self.inflight_staging_appends),
             staging_deletes_after_commit: Arc::clone(&self.staging_deletes_after_commit),
@@ -25440,6 +25446,9 @@ impl CayenneTableProvider {
             }
             doomed
         };
+        report.retired_index_runs = self
+            .retire_unregistered_index_runs(native, &table_id, &table_prefix, &objects)
+            .await?;
         if doomed.is_empty() {
             return Ok(report);
         }
@@ -25485,6 +25494,84 @@ impl CayenneTableProvider {
         }
         report.retired = retired;
         Ok(report)
+    }
+
+    /// Retire the lookup-index run files under the table's directory that no
+    /// run is registered for and that cover a data file that is gone, as the
+    /// lookup index itself does ([`super::lookup_index`]): a run's name is
+    /// derived from the files it covers, so only once one is gone can the name
+    /// never be registered again and its file be deleted. Covers the run files
+    /// no index sync reconsiders: those of a removed index, and of a table no
+    /// longer written. Returns the keys retired.
+    async fn retire_unregistered_index_runs(
+        &self,
+        native: &crate::metastore::object_native::ObjectNativeCatalog,
+        table_id: &str,
+        table_prefix: &ObjectStorePath,
+        objects: &[ObjectMeta],
+    ) -> Result<Vec<String>> {
+        let registered: HashSet<(String, String)> = self
+            .catalog
+            .list_index_runs(table_id)
+            .await?
+            .into_iter()
+            .map(|run| (run.index_key, run.run_name))
+            .collect();
+        let config = self.require_object_store()?;
+        let mut listed: HashSet<String> = HashSet::new();
+        let mut retired = Vec::new();
+        for meta in objects {
+            let Some(relative) = crate::object_relative(table_prefix, &meta.location) else {
+                continue;
+            };
+            let mut parts = relative.split('/');
+            let (Some(dir), Some(key), Some(name), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let is_run = std::path::Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension == "run");
+            if dir != super::constants::LOOKUP_INDEX_DIR_NAME || !is_run {
+                continue;
+            }
+            listed.insert(relative.to_string());
+            if registered.contains(&(key.to_string(), name.to_string())) {
+                continue;
+            }
+            let known = self.index_run_covers.lock().get(relative).cloned();
+            let files = if let Some(files) = known {
+                files
+            } else {
+                let Some(files) = super::lookup_index::describe_run_file(
+                    config.store.as_ref(),
+                    &meta.location,
+                    name,
+                )
+                .await
+                else {
+                    continue;
+                };
+                self.index_run_covers
+                    .lock()
+                    .insert(relative.to_string(), files.clone());
+                files
+            };
+            let held = self.uncommitted_files.held_keys();
+            if native
+                .retire_index_run(table_id, key, name, &files, relative, &held)
+                .await
+                .map_err(|source| Error::Catalog { source })?
+            {
+                retired.push(relative.to_string());
+            }
+        }
+        self.index_run_covers
+            .lock()
+            .retain(|key, _| listed.contains(key));
+        retired.sort();
+        Ok(retired)
     }
 
     /// Run the orphan sweep in the background when it is due: after a commit or
