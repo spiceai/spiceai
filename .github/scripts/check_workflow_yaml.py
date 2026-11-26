@@ -435,9 +435,9 @@ def _split_top_level(condition: str, operator: str) -> list[str]:
             in_string = c != "'"
         elif c == "'":
             in_string = True
-        elif c == "(":
+        elif c in "([":
             depth += 1
-        elif c == ")":
+        elif c in ")]":
             depth -= 1
         elif depth == 0 and condition.startswith(operator, i):
             parts.append(condition[start:i].strip())
@@ -1526,14 +1526,15 @@ def check_cache_endpoint_isolation(jobs: dict) -> list[str]:
 # What is read: `jobs.<job>.services.<name>.image`, `jobs.<job>.container` (or its `image`),
 # `uses: docker://…` steps, and in every `run:` script of a workflow or composite action, the
 # image argument of `docker run`, `docker create` and `docker pull` (also `docker container
-# run|create` and `docker image pull`, after `sudo`, `!`, `if`, `&&` and the like). An image
+# run|create` and `docker image pull`, after `sudo`, `env`, `timeout`, `!`, `if`, `&&` and the like). An image
 # argument that is a shell variable (`"$image"`) is read from the literal assignments of that
 # variable in the same script (`image=…`, case arms included) and from the step's, job's and
 # workflow's `env:`; every value must be pinned. A `${{ }}` expression (in `image:` or in an
 # assigned value) is read through its string literals: each literal that looks like an image
 # (it has a `/`, `:` or `@`), and each string value of a `fromJSON('{…}')` literal, must be
-# pinned, and an expression that builds the name with `format()`, or names no image literal at
-# all, is reported, since its image cannot be checked.
+# pinned, and an expression that builds the name with `format()`, names no image literal at all,
+# or can yield a context's value instead of a literal (`inputs.image || 'x@sha256:…'`), is
+# reported, since its image cannot be checked.
 #
 # What it does not catch: an image a script under .github/scripts, a Makefile, a compose
 # file, a Helm chart or test code starts (including through .github/scripts/docker_pull.sh,
@@ -1554,6 +1555,8 @@ DOCKER_SHORT_FLAGS = frozenset("ditPqa")
 # Docker's own options before the subcommand that take a value.
 DOCKER_GLOBAL_OPTIONS = frozenset({"--context", "-c", "--host", "-H", "--config", "--log-level", "-l"})
 COMMAND_SEPARATORS = frozenset({";", "&&", "||", "|", "&", "(", ")", "!", "{", "}", "then", "do", "else", "elif", "if", "while", "until", "time", "exec", "command", "nohup", "$"})
+# Commands that run the rest of their line as a command of its own.
+COMMAND_WRAPPERS = frozenset({"sudo", "env", "timeout", "nice", "stdbuf", "nohup", "command", "exec", "time"})
 PINNED_IMAGE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}")
 LOCAL_IMAGE = re.compile(r"(?:localhost|127\.0\.0\.1)(?::\d+)?/\S+")
 EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
@@ -1615,6 +1618,23 @@ def _expression_image_problems(value: str) -> list[str]:
                     problem = _image_problem(candidate)
                     if problem:
                         problems.append(problem)
+    if images and not problems:
+        # Each `||` operand's value, the last of its `&&` chain, must be a literal or a
+        # fromJSON(...)[...] lookup; a context there (`inputs.image || 'x@sha256:…'`) can be any image.
+        for expression in EXPRESSION.findall(value):
+            for operand in _split_top_level(expression.strip(), "||"):
+                chosen = _split_top_level(operand, "&&")[-1].strip()
+                # `(cond && 'image')` is the same choice in parentheses.
+                while chosen.startswith("(") and chosen.endswith(")") and len(_split_top_level(chosen[1:-1], "||")) == 1:
+                    chosen = _split_top_level(chosen[1:-1].strip(), "&&")[-1].strip()
+                if not (
+                    re.fullmatch(r"'(?:[^']|'')*'", chosen)
+                    or re.fullmatch(r"fromJSON\(\s*'(?:[^']|'')*'\s*\)\s*\[.*\]", chosen, re.S)
+                ):
+                    problems.append(
+                        f"{shown}, which can take its image from `{chosen}`, which this check cannot read; name "
+                        "each image it can be as a digest-pinned literal"
+                    )
     if images == 0 and not problems:
         problems.append(
             f"{shown}, which names its image only through an expression this check cannot read; name each image "
@@ -1671,12 +1691,19 @@ def docker_images(script: object) -> list[str]:
         for i, token in enumerate(tokens):
             if token != "docker":
                 continue
-            # The command position: the line's start, after a separator or keyword, after
-            # `sudo` and its options, or after `NAME=value` prefixes.
+            # The command position: the line's start, after a separator or keyword, after a
+            # command that runs the rest of its line (`sudo`, `env`, `timeout 60`, ...) with its
+            # options and arguments, or after `NAME=value` prefixes.
             j = i - 1
-            while j >= 0 and (re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[j]) or (tokens[j].startswith("-") and "sudo" in tokens[:j])):
+            while j >= 0 and (
+                re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[j])
+                or tokens[j] in COMMAND_WRAPPERS
+                or (tokens[j].startswith("-") and any(w in tokens[:j] for w in COMMAND_WRAPPERS))
+                # A wrapper's numeric argument: `timeout 60`, `timeout -k 5 60`, `nice -n 5`.
+                or (re.fullmatch(r"\d+(?:\.\d+)?[smhd]?", tokens[j]) and any(w in tokens[:j] for w in COMMAND_WRAPPERS))
+            ):
                 j -= 1
-            if j >= 0 and tokens[j] not in COMMAND_SEPARATORS and tokens[j] != "sudo":
+            if j >= 0 and tokens[j] not in COMMAND_SEPARATORS:
                 continue
             k = i + 1
             while k < len(tokens) and tokens[k].startswith("-"):

@@ -1893,6 +1893,26 @@ class CheckContainerImagesTest(unittest.TestCase):
                     self.assertEqual(len(problems), 1, problems)
                     self.assertIn(expected, problems[0])
 
+    def test_an_image_a_context_can_choose_is_reported_even_beside_a_pinned_literal(self):
+        pinned = "postgres:16@sha256:" + "a" * 64
+        for image, ok in ((f"${{{{ inputs.image || '{pinned}' }}}}", False),
+                          (f"${{{{ inputs.on && '{pinned}' || inputs.image }}}}", False),
+                          (f"${{{{ inputs.on && '{pinned}' || '' }}}}", True),
+                          (f"${{{{ (inputs.on && '{pinned}') || '' }}}}", True)):
+            with self.subTest(image=image):
+                problems = _image_problems(_workflow_with_service_image(image))
+                self.assertEqual(problems == [], ok, problems)
+                if not ok:
+                    self.assertIn("can take its image from `inputs.image`", problems[0])
+
+    def test_docker_after_a_command_wrapper_is_read(self):
+        for run in ("timeout 60 docker run --rm postgres:16 true", "env FOO=1 docker run postgres:16",
+                    "sudo -E env A=b timeout -k 5 60 docker pull postgres:16", "nice -n 5 docker run postgres:16"):
+            with self.subTest(run=run):
+                problems = _image_problems(_workflow_with_job(f"steps:\n  - run: {run}\n"))
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn("`postgres:16`, which is not pinned by digest", problems[0])
+
     def test_a_job_container_and_a_docker_step_are_read(self):
         problems = _image_problems(_workflow_with_job("container: node:20\nsteps:\n  - uses: docker://alpine:3.20\n"))
         self.assertEqual(len(problems), 2, problems)
