@@ -127,6 +127,7 @@ pub(crate) mod staging_wal;
 pub(crate) mod streaming;
 pub(crate) mod structural_version;
 pub(crate) mod table;
+pub(crate) mod time_slice;
 pub(crate) mod transaction;
 pub(crate) mod tuning;
 #[cfg(test)]

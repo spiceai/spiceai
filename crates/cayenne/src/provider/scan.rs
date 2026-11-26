@@ -1328,9 +1328,18 @@ impl ExecutionPlan for CayenneAccelerationExec {
                 &context,
                 fan_out,
             );
-            return Ok(Box::pin(accounted));
+            return Ok(Box::pin(super::time_slice::TimeSliced::new(Box::pin(
+                accounted,
+            ))));
         }
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, mapped)))
+        let stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, mapped));
+        // The outermost wrapper gives the query runtime's worker back to other
+        // queries every time slice; the inner per-snapshot wrappers feed it.
+        if self.scan_guard.is_some() {
+            return Ok(Box::pin(super::time_slice::TimeSliced::new(stream)));
+        }
+        Ok(stream)
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
