@@ -172,17 +172,45 @@ runs:
         mkdir -p "$(dirname "${SCCACHE_CONF}")"
         printf '[cache.s3]\nbucket = "sccache"\nkey_prefix = "%s"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = false\nregion = "us-east-1"\n' "${CI_STORE_PREFIX%/}" "${INPUT_MINIO_ENDPOINT}" > "${SCCACHE_CONF}"
 
-    - name: Set up sccache (macOS)
+    # The release pinned in .github/ci-cache/pins.json, as on Linux, into a new directory of the
+    # job's own: a self-hosted Mac's own sccache is one any job on that host can replace, so it never
+    # wraps rustc.
+    - name: Install sccache (macOS)
+      id: macos
       if: runner.os == 'macOS' && (inputs.minio_endpoint != '' || inputs.spiceio_endpoint != '')
+      shell: bash
+      run: |
+        set -eo pipefail
+        case "$(uname -m)" in
+          arm64) target=aarch64-apple-darwin.tar.gz ;;
+          x86_64) target=x86_64-apple-darwin.tar.gz ;;
+          *) target='' ;;
+        esac
+        if [ -z "$target" ]; then
+          echo "::warning::.github/ci-cache/pins.json pins no sccache for macOS $(uname -m); building without the compiler cache."
+          {
+            echo "RUSTC_WRAPPER="
+            echo "SCCACHE_SETUP=false"
+          } >> "$GITHUB_ENV"
+          echo "installed=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        dir="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/sccache.XXXXXX")"
+        bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" sccache "$dir/sccache.tar.gz" "$target"
+        mkdir "$dir/bin"
+        tar -xzf "$dir/sccache.tar.gz" -C "$dir"
+        install -m 0755 "$dir"/sccache-v*/sccache "$dir/bin/sccache"
+        rm -rf "$dir/sccache.tar.gz" "$dir"/sccache-v*
+        echo "$dir/bin" >> "$GITHUB_PATH"
+        echo "installed=true" >> "$GITHUB_OUTPUT"
+
+    - name: Set up sccache (macOS)
+      if: runner.os == 'macOS' && steps.macos.outputs.installed == 'true'
       shell: bash
       env:
         INPUT_SPICEIO_ENDPOINT: ${{ inputs.spiceio_endpoint }}
         INPUT_MINIO_ENDPOINT: ${{ inputs.minio_endpoint }}
       run: |
-        if ! command -v sccache &> /dev/null; then
-          echo "::warning::sccache is not installed on this macOS runner; building without the compiler cache."
-          exit 0
-        fi
         sccache --version
 
         SCCACHE_ENDPOINT="http://localhost:9000"
@@ -259,7 +287,7 @@ runs:
         $config | Out-File -FilePath $configPath -Encoding utf8
 
     - name: Confirm the compiler cache answers before wrapping rustc
-      if: (runner.os == 'Linux' && inputs.minio_endpoint != '' && steps.linux.outputs.installed == 'true') || (runner.os == 'macOS' && (inputs.minio_endpoint != '' || inputs.spiceio_endpoint != ''))
+      if: (runner.os == 'Linux' && inputs.minio_endpoint != '' && steps.linux.outputs.installed == 'true') || (runner.os == 'macOS' && steps.macos.outputs.installed == 'true')
       shell: bash
       # Invoked through `bash` rather than as `./…` so the step does not depend on
       # the script's executable bit surviving a checkout on every platform. The probe

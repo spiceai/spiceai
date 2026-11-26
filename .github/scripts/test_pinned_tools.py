@@ -219,6 +219,38 @@ class PinnedToolsTest(unittest.TestCase):
         self.assertEqual(self.calls(), ["pinned-sccache --version"])
         self.assertIn("installed=true", (self.tmp / "github_output").read_text())
 
+    def test_a_mac_wraps_rustc_only_in_the_pinned_sccache(self):
+        archive = tar_gz_of({"sccache-v1/sccache": (recorder(self.log, "pinned-sccache"), 0o755)})
+        self.serve("sccache", archive, "aarch64-apple-darwin.tar.gz")
+        r = self.run_step("setup-sccache", "Install sccache (macOS)", {"FAKE_UNAME_S": "Darwin", "FAKE_UNAME_M": "arm64"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        (bin_dir,) = self.path_dirs()
+        self.assertTrue(bin_dir.is_relative_to(self.runner_temp), bin_dir)
+        self.assertIn("installed=true", (self.tmp / "github_output").read_text())
+        subprocess.run([str(bin_dir / "sccache"), "--version"], check=True)
+        self.assertEqual(self.calls(), ["pinned-sccache --version"])
+        # The configuration and the pre-flight, which run sccache, follow only that install.
+        self.assertEqual(step("setup-sccache", "Set up sccache (macOS)")["if"],
+                         "runner.os == 'macOS' && steps.macos.outputs.installed == 'true'")
+        preflight = step("setup-sccache", "Confirm the compiler cache answers before wrapping rustc")
+        self.assertIn("(runner.os == 'macOS' && steps.macos.outputs.installed == 'true')", preflight["if"])
+
+    def test_a_mac_without_a_pin_wraps_nothing(self):
+        self.serve("sccache", b"unused", "aarch64-apple-darwin.tar.gz")
+        r = self.run_step("setup-sccache", "Install sccache (macOS)", {"FAKE_UNAME_S": "Darwin", "FAKE_UNAME_M": "ppc"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.path_dirs(), [])
+        self.assertIn("RUSTC_WRAPPER=", (self.tmp / "github_env").read_text().splitlines())
+        self.assertIn("installed=false", (self.tmp / "github_output").read_text())
+        self.assertEqual(self.calls(), [])
+
+    def test_only_setup_sccache_makes_sccache_the_rustc_wrapper(self):
+        for path in sorted((ROOT / ".github").rglob("*.y*ml")):
+            if path.parent.name == "setup-sccache":
+                continue
+            with self.subTest(path=str(path.relative_to(ROOT))):
+                self.assertNotRegex(path.read_text(), r"RUSTC_WRAPPER=sccache|RUSTC_WRAPPER:\s*'?sccache")
+
     def test_setup_sccache_wraps_nothing_where_no_sccache_is_pinned(self):
         self.serve("sccache", b"unused", "x86_64-unknown-linux-musl.tar.gz")
         r = self.run_step(

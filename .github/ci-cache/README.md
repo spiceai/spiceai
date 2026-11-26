@@ -89,12 +89,12 @@ entry itself as `(Get-Content … | ConvertFrom-Json).'<name>'`, names its targe
   mc the runner already has. No source serves a pinnable macOS or Windows build any more,
   so `setup-minio` refuses to run there, and no job runs it there.
 - **`sccache`**: the compiler cache `setup-sccache` installs on Linux x86_64 (the musl
-  archive) and Windows (the MSVC zip), with the SHA-256s the release publishes beside each
-  asset (`<asset>.sha256`). The target names the asset, extension included. On Linux each job
-  installs it into a new directory of its own, first on PATH, so `RUSTC_WRAPPER=sccache` is
-  always the pinned binary. On another Linux architecture the job compiles uncached and
-  nothing runs sccache, whatever the runner has. The self-hosted Macs use the sccache their
-  hosts carry.
+  archive), macOS arm64 and x86_64, and Windows (the MSVC zip), with the SHA-256s the release
+  publishes beside each asset (`<asset>.sha256`). The target names the asset, extension
+  included. On Linux and macOS each job installs it into a new directory of its own, first on
+  PATH, so `RUSTC_WRAPPER=sccache` is always the pinned binary, never the sccache a
+  self-hosted Mac carries. Where nothing is pinned the job compiles uncached and nothing runs
+  sccache, whatever the runner has.
 - **`protoc`**: one protobuf release for every platform `install-protoc` supports (Linux
   x86_64, aarch64, s390x and ppc64le, macOS x86_64 and arm64, Windows 64- and 32-bit). The
   action used to install whatever `releases/latest` named and to take the expected SHA-256

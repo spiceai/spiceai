@@ -90,12 +90,13 @@ jobs:
 
       - name: Check if sccache can be set up
         run: |
+          # setup-sccache sets RUSTC_WRAPPER itself, to the sccache it installs and checks; until
+          # then nothing wraps rustc, least of all this Mac's own sccache.
+          echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
           if [ -z "${{ vars.TEST_MINIO_ENDPOINT }}" ]; then
             echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
           else
             echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
           fi
 
       - name: Set up sccache

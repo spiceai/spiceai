@@ -55,7 +55,9 @@
     "url": "https://github.com/mozilla/sccache/releases/download/v{version}/sccache-v{version}-{target}",
     "sha256": {
       "x86_64-unknown-linux-musl.tar.gz": "911f611db54e48dc50c32232462a99848824be5ba0f6f52cc33903712cd78715",
-      "x86_64-pc-windows-msvc.zip": "9c862bcaef62804f2124dfc2605a0204f4fe0c5fa337ba4264e9bcae9d2ba487"
+      "x86_64-pc-windows-msvc.zip": "9c862bcaef62804f2124dfc2605a0204f4fe0c5fa337ba4264e9bcae9d2ba487",
+      "aarch64-apple-darwin.tar.gz": "a2725e27c12961301834fe4c56ab982af6e8eb86fd51b82179369f1682776800",
+      "x86_64-apple-darwin.tar.gz": "14495d2db913d4d0e1ab4b44a3e1d2c3d44693a5a405deb5a1b5c05e8f34af37"
     }
   },
   "protoc": {
