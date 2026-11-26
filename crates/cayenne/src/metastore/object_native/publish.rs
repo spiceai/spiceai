@@ -129,6 +129,11 @@ impl Inner {
             return Ok(());
         }
         let record = Record {
+            committed_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| {
+                    u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+                }),
             actions: buffers
                 .into_iter()
                 .flat_map(|buffer| buffer.actions)
@@ -197,6 +202,7 @@ impl Inner {
         self.ensure_accepting()?;
         self.flush().await?;
         let record = Record {
+            committed_unix_ms: 0,
             actions: vec![action],
         };
         self.revision += 1;

@@ -1035,6 +1035,7 @@ mod tests {
                 footprint.sort();
                 footprint.dedup();
                 let inner = Record {
+                    committed_unix_ms: 0,
                     actions: vec![
                         Action::new(Kind::AdvanceSeq(AdvanceSeq {
                             table_id,
@@ -1093,7 +1094,11 @@ mod tests {
         Action::new(Kind::Prepare(Prepare {
             txn: txn.into(),
             footprint: footprint.iter().map(ToString::to_string).collect(),
-            actions: Record { actions }.encode_to_vec(),
+            actions: Record {
+                committed_unix_ms: 0,
+                actions,
+            }
+            .encode_to_vec(),
         }))
     }
 
@@ -1107,6 +1112,7 @@ mod tests {
 
     fn one(action: Action) -> Record {
         Record {
+            committed_unix_ms: 0,
             actions: vec![action],
         }
     }
@@ -1227,6 +1233,7 @@ mod tests {
         state.apply(&one(create_at("t"))).expect("create");
         state
             .apply(&Record {
+                committed_unix_ms: 0,
                 actions: vec![
                     files("t", "s", &["a"]),
                     files("t", "g1", &["x"]),
@@ -1241,6 +1248,7 @@ mod tests {
         // A protected merge: g1 and g2 out, g3 in.
         state
             .apply(&Record {
+                committed_unix_ms: 0,
                 actions: vec![
                     remove_groups("t", &["g1", "g2"]),
                     files("t", "g3", &["z"]),
@@ -1269,6 +1277,7 @@ mod tests {
         // A full rewrite: every protected snapshot and the current one retire.
         state
             .apply(&Record {
+                committed_unix_ms: 0,
                 actions: vec![
                     Action::new(Kind::RemoveGroups(crate::proto::RemoveGroups {
                         table_id: "t".into(),
@@ -1316,6 +1325,7 @@ mod tests {
             .expect("append");
         state
             .apply(&Record {
+                committed_unix_ms: 0,
                 actions: vec![
                     files("t", "s2", &["a.vortex", "c.vortex"]),
                     set_current("t", "s2"),
@@ -1334,6 +1344,7 @@ mod tests {
         // Carried again by a protected merge, and still never retired.
         state
             .apply(&Record {
+                committed_unix_ms: 0,
                 actions: vec![
                     files("t", "g1", &["a.vortex"]),
                     set_group("t", "g1"),
@@ -1356,6 +1367,7 @@ mod tests {
         state.apply(&one(files("t", "s", &["a"]))).expect("append");
         state
             .apply(&Record {
+                committed_unix_ms: 0,
                 actions: vec![files("t", "s2", &["b"]), set_current("t", "s2")],
             })
             .expect("replace s");
@@ -1378,6 +1390,7 @@ mod tests {
         );
         state
             .apply(&Record {
+                committed_unix_ms: 0,
                 actions: vec![files("t", "s3", &["a"])],
             })
             .expect("a snapshot that is not live may name any file");
@@ -1418,6 +1431,7 @@ mod tests {
         state.apply(&one(create_at("t"))).expect("create");
         state
             .apply(&Record {
+                committed_unix_ms: 0,
                 actions: vec![
                     files("t", "s", &["a", "b"]),
                     stat("t", "s", "a"),
@@ -1427,6 +1441,7 @@ mod tests {
             .expect("append");
         state
             .apply(&Record {
+                committed_unix_ms: 0,
                 actions: vec![
                     files("t", "s2", &["c"]),
                     stat("t", "s2", "c"),
@@ -1471,6 +1486,7 @@ mod tests {
         let mut state = DatasetState::default();
         state
             .apply(&Record {
+                committed_unix_ms: 0,
                 actions: vec![create("a"), create("b")],
             })
             .expect("create");
@@ -1570,6 +1586,7 @@ mod tests {
             let (mut state, mut expected) = (DatasetState::default(), DatasetState::default());
             for step in 0..200 {
                 let record = Record {
+                    committed_unix_ms: 0,
                     actions: (0..=rng.below(4))
                         .map(|_| random_action(&mut rng))
                         .collect(),

@@ -656,6 +656,10 @@ pub mod action {
 pub struct Record {
     #[prost(message, repeated, tag = "1")]
     pub actions: Vec<Action>,
+    /// When the writer built this record to commit it, as Unix milliseconds on
+    /// its clock; 0 for a record from a writer that did not record it.
+    #[prost(uint64, tag = "2")]
+    pub committed_unix_ms: u64,
 }
 
 impl Action {

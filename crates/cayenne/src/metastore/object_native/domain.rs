@@ -266,7 +266,11 @@ impl Domain {
             .commit_now(Action::new(Kind::Prepare(proto::Prepare {
                 txn: txn.to_string(),
                 footprint: footprint.clone(),
-                actions: Record { actions: batch }.encode_to_vec(),
+                actions: Record {
+                    committed_unix_ms: 0,
+                    actions: batch,
+                }
+                .encode_to_vec(),
             })))
             .await?;
         Ok(footprint)
@@ -627,7 +631,10 @@ impl Inner {
         self.ensure_accepting()?;
         let mut actions = actions;
         self.stamp(&mut actions);
-        let record = Record { actions };
+        let record = Record {
+            committed_unix_ms: 0,
+            actions,
+        };
         // Applied without a copy of the state. A refused record is a guard this
         // catalog's own checks should have caught, and leaves the state partly
         // changed, so the log stops until the process restarts.
@@ -1387,8 +1394,8 @@ impl Inner {
 
     /// On a replica, apply the commits the writer made since this log last
     /// read its head: one conditional GET when nothing changed. Returns the
-    /// log's revision afterwards, and when the writer prepared the oldest
-    /// commit after revision `served`. The writer's own state is always
+    /// log's revision afterwards, and when the writer built the oldest record
+    /// after revision `served` to commit it. The writer's own state is always
     /// current.
     pub(super) async fn follow(
         &mut self,
@@ -1412,7 +1419,7 @@ impl Inner {
                     return Ok(self.followed(served));
                 }
                 let oldest =
-                    Self::oldest_prepared(&entries).unwrap_or_else(|| reader.published_ms());
+                    Self::oldest_committed(&entries).unwrap_or_else(|| reader.published_ms());
                 self.revision += 1;
                 self.note_followed_revision(oldest);
                 if let Err(error) = Self::apply_followed(&mut self.reader.state, entries) {
@@ -1431,17 +1438,25 @@ impl Inner {
         Ok(self.followed(served))
     }
 
-    /// When the writer prepared the oldest of `entries` that records it.
-    fn oldest_prepared(entries: &[object_store_occ::headlog::RecordWithCommit]) -> Option<u64> {
-        entries
-            .iter()
-            .map(|entry| entry.record.prepared_unix_ms)
-            .filter(|ms| *ms > 0)
-            .min()
+    /// When the writer built the oldest of `entries` to commit it, among records
+    /// whose writers recorded that time.
+    fn oldest_committed(entries: &[object_store_occ::headlog::RecordWithCommit]) -> Option<u64> {
+        let mut oldest = None;
+        for entry in entries {
+            for payload in Group::decode(entry.record.payload.clone()).ok()?.payloads {
+                let record = Record::decode(payload).ok()?;
+                if record.committed_unix_ms > 0 {
+                    oldest = Some(oldest.map_or(record.committed_unix_ms, |ms: u64| {
+                        ms.min(record.committed_unix_ms)
+                    }));
+                }
+            }
+        }
+        oldest
     }
 
-    /// Remember that the current revision's oldest commit was prepared at
-    /// `oldest_ms`.
+    /// Remember when the writer built the current revision's oldest record to
+    /// commit it, at `oldest_ms`.
     fn note_followed_revision(&mut self, oldest_ms: u64) {
         if self.followed_revisions.len() >= super::FOLLOWED_REVISIONS_KEPT {
             self.followed_revisions.pop_front();
@@ -1450,8 +1465,8 @@ impl Inner {
             .push_back((self.revision, oldest_ms));
     }
 
-    /// The revision, and when the writer prepared the oldest commit a table
-    /// that serves revision `served` does not serve yet.
+    /// The revision, and when the writer built the oldest unserved record to
+    /// commit it, for a table serving revision `served`.
     fn followed(&self, served: u64) -> crate::catalog::FollowedCommits {
         let oldest_unserved_ms = if served == self.revision {
             None
@@ -1479,7 +1494,7 @@ impl Inner {
         // into the checkpoint are older, so a lag measured from these is a
         // lower bound.
         let oldest =
-            Self::oldest_prepared(&opened.records).unwrap_or_else(|| reader.published_ms());
+            Self::oldest_committed(&opened.records).unwrap_or_else(|| reader.published_ms());
         let replayed = replay_state(opened)?;
         self.reader.state = replayed.state;
         self.revision += 1;
