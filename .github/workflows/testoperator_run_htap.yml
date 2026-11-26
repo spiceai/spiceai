@@ -649,5 +649,14 @@ jobs:
             target="spice-minio/benchmarks/${prefix%/}/"
             summary=$(mc du "${target}" 2>/dev/null || true)
             echo "Cleaning ${target} — ${summary:-empty (no promotion ran)}"
-            mc rm --recursive --force "${target}" >/dev/null 2>&1 || true
+            case "${prefix}" in
+              # On trunk, its cold tier is the whole fixed prefix less the `untrusted/` copies other
+              # refs keep under it, which are theirs and may still be in use.
+              cayenne-cold-sf1000/ | cayenne-cold-sf10/)
+                mc ls "${target}" 2>/dev/null | awk '{ print $NF }' | grep -vx 'untrusted/' | while read -r child; do
+                  mc rm --recursive --force "${target}${child}" >/dev/null 2>&1 || true
+                done
+                ;;
+              *) mc rm --recursive --force "${target}" >/dev/null 2>&1 || true ;;
+            esac
           done
