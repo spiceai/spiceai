@@ -146,7 +146,6 @@
   "postgres-catalog": 64,
   "postgres-catalog-cdc": 24,
   "postgres-cdc-atomicity": 73,
-  "postgres-cdc-bootstrap": 379,
   "postgres-cdc-edge-values": 71,
   "postgres-cdc-kill-under-load": 255,
   "postgres-cdc-limit-after-delete": 10,
