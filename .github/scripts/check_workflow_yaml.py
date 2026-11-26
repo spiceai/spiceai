@@ -628,6 +628,21 @@ READ_ONLY_POLICY_JSON = (
     '"arn:aws:s3:::benchmarks/clickbench/*","arn:aws:s3:::benchmarks/delta/*",'
     '"arn:aws:s3:::benchmarks/hadoop/*","arn:aws:s3:::iceberg/*"]}]}'
 )
+# The macOS NAS benchmark job runs on a self-hosted Mac, whose own mc and other tools every job on
+# that host can replace, so its store credentials read its builds, the compiler cache and the
+# benchmark data, and nothing else.
+NAS_READ_ONLY_POLICY = "nas-bench-read-only"
+NAS_READ_ONLY_POLICY_JSON = (
+    "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"Buckets\",\"Effect\":\"Allow\",\"Action\":[\"s3:GetBucketLo"
+    "cation\",\"s3:ListBucket\"],\"Resource\":[\"arn:aws:s3:::artifacts\",\"arn:aws:s3:::benchmarks\",\"arn:aws"
+    ":s3:::sccache\"]},{\"Sid\":\"BuildsRead\",\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn"
+    ":aws:s3:::artifacts/spiced/*\",\"arn:aws:s3:::artifacts/testoperator/*\",\"arn:aws:s3:::artifacts/sp"
+    "icepod-validator/*\",\"arn:aws:s3:::artifacts/untrusted/*\",\"arn:aws:s3:::sccache/*\"]},{\"Sid\":\"Benc"
+    "hmarkDataRead\",\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::benchmarks/t"
+    "pch_sf*\",\"arn:aws:s3:::benchmarks/tpcds_sf*\",\"arn:aws:s3:::benchmarks/clickbench/*\"]}]}"
+)
+READ_ONLY_POLICIES = {READ_ONLY_POLICY: READ_ONLY_POLICY_JSON, NAS_READ_ONLY_POLICY: NAS_READ_ONLY_POLICY_JSON}
+STORE_CREDENTIAL_OUTPUTS = ("access-key-id", "secret-access-key", "session-token")
 APP_STORE_CREDENTIALS = {"S3_KEY": "access-key-id", "S3_SECRET": "secret-access-key", "S3_SESSION_TOKEN": "session-token"}
 STEP_OUTPUT = re.compile(r"\$\{\{\s*steps\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)\s*\}\}")
 # spidapter as the system adapter testoperator deploys the app through, or run as one directly.
@@ -668,19 +683,51 @@ def check_app_store_credentials(jobs: dict) -> list[str]:
 def check_store_policies(github_dir: Path) -> list[str]:
     """Report a read-only session policy file whose content is not the one the store side expects,
     or that is missing while a workflow names it."""
-    path = github_dir / "store-policies" / f"{READ_ONLY_POLICY}.json"
-    if not path.is_file():
-        named = any(
-            re.search(rf"session-policy:\s*['\"]?{READ_ONLY_POLICY}\b", workflow.read_text(encoding="utf-8"))
-            for workflow in workflow_files(github_dir)
-        )
-        return [f"{path}: missing, and a workflow names it as a session policy"] if named else []
-    if path.read_bytes() != READ_ONLY_POLICY_JSON.encode() + b"\n":
-        return [
-            f"{path}: is not the benchmark data read-only session policy, compact on one line; the "
-            "store side keeps the same policy, so change both together"
-        ]
-    return []
+    problems = []
+    for name, expected in READ_ONLY_POLICIES.items():
+        path = github_dir / "store-policies" / f"{name}.json"
+        if not path.is_file():
+            named = any(
+                re.search(rf"session-policy:\s*['\"]?{name}\b", workflow.read_text(encoding="utf-8"))
+                for workflow in workflow_files(github_dir)
+            )
+            if named:
+                problems.append(f"{path}: missing, and a workflow names it as a session policy")
+        elif path.read_bytes() != expected.encode() + b"\n":
+            problems.append(
+                f"{path}: is not the {name} session policy, compact on one line; the store side keeps "
+                "the same policy, so change both together"
+            )
+    return problems
+
+
+def check_mac_store_credentials(jobs: dict) -> list[str]:
+    """Report a job on a self-hosted Mac that takes store credentials from anything but a read-only exchange.
+
+    Every job on such a host can replace its tools, mc included, so a Mac job's exchanges each carry
+    a read-only session policy, and every store credential it passes on comes from one of them.
+    """
+    problems = []
+    for name, job in jobs.items():
+        if not isinstance(job, dict) or "macos" not in str(job.get("runs-on", "")).lower():
+            continue
+        steps = _steps(job)
+        exchanges = {s.get("id"): s for s in steps if s.get("uses") == RUSTFS_ACTION}
+        for position, step in enumerate(steps, start=1):
+            label = step.get("name") or f"step {position}"
+            if step.get("uses") == RUSTFS_ACTION and (step.get("with") or {}).get("session-policy") not in READ_ONLY_POLICIES:
+                problems.append(
+                    f"job `{name}` runs on a self-hosted Mac, and step `{label}` exchanges store credentials "
+                    f"without a read-only `session-policy` ({', '.join(sorted(READ_ONLY_POLICIES))})"
+                )
+            text = json.dumps({k: step.get(k) for k in ("env", "with", "run")}, default=str)
+            for source, output in re.findall(r"steps\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)", text):
+                if output in STORE_CREDENTIAL_OUTPUTS and source not in exchanges:
+                    problems.append(
+                        f"job `{name}` runs on a self-hosted Mac, and step `{label}` passes `steps.{source}.outputs.{output}`, "
+                        "which is not a read-only exchange's credential"
+                    )
+    return problems
 
 
 def check_ci_role_calls(workflows: dict[str, dict]) -> list[str]:
@@ -874,6 +921,7 @@ def check_workflow(text: str) -> list[str]:
         problems.extend(check_attested_builds(jobs))
         problems.extend(check_share_off_trunk(jobs))
         problems.extend(check_app_store_credentials(jobs))
+        problems.extend(check_mac_store_credentials(jobs))
         problems.extend(check_download_execution(jobs))
         problems.extend(check_container_images(document))
         problems.extend(check_hashed_python_installs(jobs, document.get("permissions")))

@@ -22,8 +22,9 @@ inputs:
   session-policy:
     description: >-
       The name of a session policy in .github/store-policies/ (`benchmark-data-read-only` for
-      `benchmark-data-read-only.json`), for credentials handed to code this job does not
-      control: they may do only what both it and the store's policy allow. It is read from this
+      `benchmark-data-read-only.json`, or `nas-bench-read-only`), for credentials handed to code
+      this job does not control, or used on a host whose tools it does not control: they may do
+      only what both it and the store's policy allow. It is read from this
       action's own copy of the repository, never the job's checkout. Empty for the store's policy
       alone.
     required: false

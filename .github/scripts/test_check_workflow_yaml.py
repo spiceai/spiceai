@@ -840,8 +840,46 @@ class CheckAppStoreCredentialsTest(unittest.TestCase):
             policy.write_text(check_workflow_yaml.READ_ONLY_POLICY_JSON + "\n")
             self.assertEqual(check_workflow_yaml.check_store_policies(github_dir), [])
             policy.write_text(check_workflow_yaml.READ_ONLY_POLICY_JSON.replace('"s3:GetObject"', '"s3:*"') + "\n")
-            self.assertIn("is not the benchmark data read-only session policy",
+            self.assertIn("is not the benchmark-data-read-only session policy",
                           check_workflow_yaml.check_store_policies(github_dir)[0])
+            nas = github_dir / "store-policies" / "nas-bench-read-only.json"
+            nas.write_text(check_workflow_yaml.NAS_READ_ONLY_POLICY_JSON.replace('"s3:GetObject"', '"s3:PutObject"') + "\n")
+            self.assertIn("is not the nas-bench-read-only session policy",
+                          check_workflow_yaml.check_store_policies(github_dir)[-1])
+
+    def test_the_nas_policy_only_reads(self):
+        import json as _json
+
+        policy = _json.loads(check_workflow_yaml.NAS_READ_ONLY_POLICY_JSON)
+        actions = {a for s in policy["Statement"] for a in s["Action"]}
+        self.assertEqual(actions, {"s3:GetBucketLocation", "s3:ListBucket", "s3:GetObject"})
+        self.assertTrue(all(s["Effect"] == "Allow" for s in policy["Statement"]))
+        self.assertLessEqual(len(check_workflow_yaml.NAS_READ_ONLY_POLICY_JSON), 2048)
+
+
+class CheckMacStoreCredentialsTest(unittest.TestCase):
+    DOC = (
+        "on: workflow_dispatch\njobs:\n  nas:\n    runs-on: {runner}\n    steps:\n"
+        "      - id: rustfs\n        uses: $/.github/actions/rustfs-credentials\n"
+        "        with:\n          endpoint: e\n{policy}"
+        "      - name: Build\n        uses: $/.github/actions/build-testoperator\n"
+        "        with:\n          minio_access_key: ${{{{ steps.{key}.outputs.access-key-id }}}}\n"
+    )
+
+    def problems(self, runner="spiceai-macos", policy="          session-policy: nas-bench-read-only\n", key="rustfs"):
+        text = self.DOC.format(runner=runner, policy=policy, key=key)
+        return [p for p in check_workflow_yaml.check_workflow(text) if "self-hosted Mac" in p]
+
+    def test_a_mac_job_takes_only_read_only_store_credentials(self):
+        self.assertEqual(self.problems(), [])
+        self.assertEqual(len(self.problems(policy="")), 1)
+        self.assertEqual(len(self.problems(policy="          session-policy: something-else\n")), 1)
+        self.assertIn("is not a read-only exchange's credential", self.problems(key="other")[0])
+        self.assertEqual(self.problems(runner="spiceai-dev-runners", policy=""), [])
+
+    def test_the_nas_workflow_passes(self):
+        workflow = Path(__file__).resolve().parents[1] / "workflows" / "testoperator_run_nas.yml"
+        self.assertEqual([p for p in check_workflow_yaml.check_workflow(workflow.read_text()) if "self-hosted Mac" in p], [])
 
     def test_the_cluster_bench_passes(self):
         workflow = Path(__file__).resolve().parents[1] / "workflows" / "testoperator_run_cluster_bench_aws.yml"

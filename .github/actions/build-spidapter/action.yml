@@ -163,7 +163,7 @@ runs:
         key: spidapter-${{ steps.detect-os.outputs.os }}-${{ steps.commit-sha.outputs.sha }}
 
     - name: Upload spidapter to MinIO
-      if: inputs.download_from_minio == 'true' && steps.minio-download.outputs.found != 'true' && (inputs.force_rebuild == 'true' || steps.cache-spidapter.outputs.cache-hit != 'true')
+      if: inputs.download_from_minio == 'true' && steps.minio-download.outputs.found != 'true' && (inputs.force_rebuild == 'true' || steps.cache-spidapter.outputs.cache-hit != 'true') && env.CI_STORE_READ_ONLY != 'true'
       shell: bash
       env:
         DETECT_OS_EXT: ${{ steps.detect-os.outputs.ext }}

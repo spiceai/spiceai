@@ -89,7 +89,7 @@ runs:
         cargo build -p "${INPUT_PACKAGE}" --profile "${INPUT_PROFILE}" ${features:+--features "$features"}
 
     - name: Upload to MinIO
-      if: steps.download.outputs.found != 'true'
+      if: steps.download.outputs.found != 'true' && env.CI_STORE_READ_ONLY != 'true'
       shell: bash
       env:
         PATHS_PATH: ${{ steps.paths.outputs.path }}

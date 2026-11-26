@@ -339,6 +339,32 @@ class ShareOffTrunkTest(unittest.TestCase):
         self.assertGreater(checked, 0)
 
 
+class NasReadOnlyTest(unittest.TestCase):
+    """The macOS NAS job's store credentials only read, and its build actions upload nothing."""
+
+    def test_the_build_actions_upload_nothing_with_read_only_store_credentials(self):
+        actions = Path(__file__).resolve().parents[1] / "actions"
+        for action, name in (("build-testoperator", "Upload testoperator to MinIO"),
+                             ("build-spicepod-validator", "Upload spicepod-validator to MinIO"),
+                             ("build-spidapter", "Upload spidapter to MinIO"),
+                             ("build-tool", "Upload to MinIO")):
+            with self.subTest(action=action):
+                steps = yaml.safe_load((actions / action / "action.yml").read_text())["runs"]["steps"]
+                upload = next(s for s in steps if s.get("name") == name)
+                self.assertTrue(upload["if"].endswith(" && env.CI_STORE_READ_ONLY != 'true'"), upload["if"])
+
+    def test_the_nas_job_reads_with_its_policy_and_points_mc_at_those_credentials(self):
+        steps = job_steps("testoperator_run_nas.yml", "run-nas-bench")
+        exchange = next(s for s in steps if s.get("id") == "rustfs")
+        self.assertEqual(exchange["with"]["session-policy"], "nas-bench-read-only")
+        point = next(s for s in steps if s.get("name") == "Point mc at the store with the read-only credentials")
+        self.assertIn("MC_HOST_spice-minio=", point["run"])
+        self.assertIn("CI_STORE_READ_ONLY=true", point["run"])
+        names = [s.get("name") for s in steps]
+        first_store_use = min(names.index(n) for n in ("Build spicepod validator", "Setup spiced", "Build Testoperator"))
+        self.assertLess(names.index(point["name"]), first_store_use)
+
+
 class MssqlBenchImageTest(unittest.TestCase):
     PINNED = re.compile(r"'ghcr\.io/spiceai/spice-mssql-bench@sha256:[0-9a-f]{64}'")
 

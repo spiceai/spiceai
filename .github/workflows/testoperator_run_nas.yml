@@ -58,13 +58,39 @@ jobs:
           fi
           echo "Spicepod file found at ${SPICEPOD_PATH}"
 
-      - name: Get RustFS credentials
+      # This job runs on a self-hosted Mac, whose own mc and other tools any job on that host can
+      # replace, so its store credentials only read: its builds, the compiler cache and the
+      # benchmark data (.github/store-policies/nas-bench-read-only.json). Nothing here writes the store.
+      - name: Get read-only RustFS credentials
         id: rustfs
         uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '36000'
           export-env: 'false'
+          session-policy: nas-bench-read-only
+
+      # No pinned mc is published for macOS, so the host's runs here; it gets only these
+      # credentials, whatever alias the host has, and the build actions upload nothing.
+      - name: Point mc at the store with the read-only credentials
+        env:
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY: ${{ steps.rustfs.outputs.access-key-id }}
+          MINIO_SECRET_KEY: ${{ steps.rustfs.outputs.secret-access-key }}
+          MINIO_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
+        run: |
+          set -euo pipefail
+          for value in "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" "${MINIO_SESSION_TOKEN}"; do
+            if [[ -z "$value" || "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+              echo "::error::The read-only store credentials or endpoint are empty or hold a line break."
+              exit 1
+            fi
+          done
+          {
+            echo "MC_HOST_spice-minio=${MINIO_ENDPOINT%%://*}://${MINIO_ACCESS_KEY}:${MINIO_SECRET_KEY}:${MINIO_SESSION_TOKEN}@${MINIO_ENDPOINT#*://}"
+            # The build actions then upload no build; the credentials could not write one.
+            echo "CI_STORE_READ_ONLY=true"
+          } >> "$GITHUB_ENV"
 
       - name: Build spicepod validator
         uses: $/.github/actions/build-spicepod-validator
