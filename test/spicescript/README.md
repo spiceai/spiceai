@@ -34,4 +34,4 @@ have no Docker.
 | `corpus/` | SQL corpora that `corpus` steps run, and the Python scripts that generate the literal matrices. |
 | `seed/` | Source fixtures loaded by `source-exec: { file }`. |
 | `slt/`, `slt-sqlite/` | sqllogictest files. |
-| `recordings/` | Run times per script (`durations.json`), in every directory with scripts, and the expected failures (`expected-failures.json`). `update_durations.py` rewrites the run times from recent CI runs, which `--partition` balances the CI shards by. |
+| `recordings/` | The expected failures (`expected-failures.json`). Each script records its own run time in its `duration:` line; `update_durations.py` rewrites those from recent CI runs, which `--partition` balances the CI shards by. |

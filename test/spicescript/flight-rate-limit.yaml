@@ -1,4 +1,5 @@
 name: flight-rate-limit
+duration: 8s
 description: >
   Flight DoPut is limited to 100 requests a minute by default: a burst of
   100, refilled at that rate, so a quick run of 150 is refused partway

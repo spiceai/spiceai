@@ -1,4 +1,5 @@
 name: refresh-api-overrides
+duration: 13s
 description: >
   One-off refresh overrides the refresh can't honor are refused with 400
   before anything is queued, on Cayenne, full and append. A `refresh_sql`

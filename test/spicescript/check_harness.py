@@ -104,8 +104,9 @@ def main():
             fixture = Path(directory) / f"{name}.yaml"
             cli = extra.pop("spice-cli", args.spice_cli)
             spicepod = {"version": "v1", "kind": "Spicepod", "name": name, **extra.pop("spicepod", {})}
+            # Indented, so `--record-durations` can add the `duration` line after `name`.
             fixture.write_text(json.dumps({"name": name, "spicepod": spicepod,
-                "steps": [{"start": {}}] + steps, **extra}))
+                "steps": [{"start": {}}] + steps, **extra}, indent=2) + "\n")
             cli_flags = ["--spice-cli", str(Path(cli).resolve())] if cli else []
             result = subprocess.run([str(args.runner.resolve()), "--record-durations", *cli_flags, "--spiced",
                 str(args.spiced.resolve()), "--work-dir", str(args.work_dir.resolve() / name), str(fixture)],

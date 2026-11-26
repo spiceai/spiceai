@@ -1,4 +1,5 @@
 name: snapshots-reader
+duration: 20s
 description: >
   A reader with refresh_mode: snapshot follows a writer through the snapshot
   store: it bootstraps from the writer's first snapshot and then serves each

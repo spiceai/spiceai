@@ -1,4 +1,5 @@
 name: retention-sql-after-append-refresh
+duration: 5s
 description: >
   An append refresh applies retention_sql before it completes: a source row
   soft-deleted after the first load is gone from the acceleration as soon as

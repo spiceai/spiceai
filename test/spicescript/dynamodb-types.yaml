@@ -1,4 +1,5 @@
 name: dynamodb-types
+duration: 16s
 tags: [long]
 description: >
   Every DynamoDB attribute type through the connector against LocalStack:

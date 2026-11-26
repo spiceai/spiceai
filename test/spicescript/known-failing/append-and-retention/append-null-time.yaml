@@ -1,4 +1,5 @@
 name: append-null-time
+duration: 5s
 description: >
   Known failing (#15542): silent row loss. Append refresh reads rows newer than the
   stored maximum of the time column, which a NULL never is: a row with a

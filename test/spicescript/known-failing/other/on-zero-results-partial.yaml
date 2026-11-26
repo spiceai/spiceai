@@ -2,6 +2,7 @@
 # subquery can evaluate does not fall back to the source, so the row the
 # acceleration lacks is missing from the answer.
 name: on-zero-results-partial
+duration: 22s
 description: >
   Subqueries over accelerations with on_zero_results answer as the source
   does: populated, empty (with use_source the source answers, with

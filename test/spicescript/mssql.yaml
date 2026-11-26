@@ -1,4 +1,5 @@
 name: mssql
+duration: 14s
 description: >
   A Microsoft SQL Server table with the common types, and a row of NULLs,
   answers through the `mssql` connector with the values inserted: federated,

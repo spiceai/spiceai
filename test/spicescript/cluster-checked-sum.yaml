@@ -1,4 +1,5 @@
 name: cluster-checked-sum
+duration: 138s
 description: >
   On a scheduler with two executors, each owning one partition of a Cayenne
   file acceleration, SUM over a BIGINT is checked against the true total, not

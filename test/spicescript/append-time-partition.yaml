@@ -1,4 +1,5 @@
 name: append-time-partition
+duration: 15s
 description: >
   Append refresh into Cayenne with a time column paired with a day
   partition column (`time_partition_column`), with a date as the time

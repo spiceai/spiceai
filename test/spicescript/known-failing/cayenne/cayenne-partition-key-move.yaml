@@ -2,6 +2,7 @@
 # moves to another partition keeps its old row too: through an INSERT, and
 # through change capture of a source UPDATE to the partition column.
 name: cayenne-partition-key-move
+duration: 67s
 description: >
   A row whose partition column changes (written directly, or updated at the
   source and replicated) is in its new partition only, once per key.

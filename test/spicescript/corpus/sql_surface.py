@@ -15,8 +15,12 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+import update_durations  # noqa: E402
+
 SCALARS = {}
 
 
@@ -585,7 +589,24 @@ def explain_fixture():
                        "steps": steps}, indent=2) + "\n"
 
 
+def keep_duration(path, text):
+    """`text` with the `duration` line of the script at `path`, which CI records."""
+    if not path.name.endswith(".yaml"):
+        return text
+    json_script = text.lstrip().startswith("{")
+    pattern = update_durations.JSON_LINE if json_script else update_durations.YAML_LINE
+    # A script built from another one's text does not take its duration.
+    lines = [line for line in text.split("\n") if not pattern.fullmatch(line)]
+    recorded = update_durations.get_duration_line(path.read_text()) if path.exists() else None
+    if recorded:
+        name = '  "name":' if json_script else "name:"
+        lines.insert(next(i for i, line in enumerate(lines) if line.startswith(name)) + 1, recorded)
+    return "\n".join(lines)
+
+
 def write_or_check(path, text, check):
+    if text is not None:
+        text = keep_duration(path, text)
     if text is None:
         if path.exists():
             if check:

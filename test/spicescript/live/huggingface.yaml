@@ -1,4 +1,5 @@
 name: huggingface
+duration: 26s
 description: >
   Public Hugging Face Hub datasets read through `hf://` answer as DuckDB's own
   `hf://` reader answered them, federated and accelerated into Cayenne:

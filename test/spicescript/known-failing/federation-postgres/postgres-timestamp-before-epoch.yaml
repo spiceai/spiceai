@@ -1,5 +1,6 @@
 # Known failing (#15545).
 name: postgres-timestamp-before-epoch
+duration: 132s
 description: >
   A PostgreSQL `timestamp` (without time zone) before 1970-01-01 reads as
   itself, as the same instant does in a `timestamptz` column. It fails today:

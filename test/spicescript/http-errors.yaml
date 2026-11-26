@@ -1,4 +1,5 @@
 name: http-errors
+duration: 13s
 description: >
   Client mistakes over HTTP are answered 4xx with a message naming the
   mistake: SQL that does not parse, an unknown table or column, an error

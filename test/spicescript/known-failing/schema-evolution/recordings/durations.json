@@ -1,7 +1,0 @@
-{
-  "acceleration-source-change": 194,
-  "schema-add-column-full-refresh": 50,
-  "schema-frozen-status": 86,
-  "schema-widen": 79,
-  "view-redefined-after-restart": 68
-}
