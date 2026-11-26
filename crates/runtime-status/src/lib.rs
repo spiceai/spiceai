@@ -505,8 +505,9 @@ impl RuntimeStatus {
 
     /// Whether scheduled work, such as a SQL worker, may run: every component has been
     /// `Ready` at least once ([`Self::is_ready`], which stays true after a component fails),
-    /// or every component not in `Error` has ([`Self::is_ready_allowing_unhealthy`]), since a
-    /// component that failed before it loaded may never load.
+    /// or every component not in `Error` has, unless every dataset is in `Error`
+    /// ([`Self::is_ready_allowing_unhealthy`]), since a component that failed before it loaded
+    /// may never load.
     #[must_use]
     pub fn is_ready_for_scheduled_work(&self) -> bool {
         self.is_ready() || self.is_ready_allowing_unhealthy()
@@ -1221,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_work_waits_only_for_components_on_their_first_load() {
+    fn scheduled_work_is_not_held_back_by_a_component_that_failed() {
         let status = RuntimeStatus::new();
         status.set_ready_state(RuntimeReadyState::OnLoad);
         let loaded = TableReference::bare("loaded");
