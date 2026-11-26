@@ -93,6 +93,15 @@ entry itself as `(Get-Content … | ConvertFrom-Json).'<name>'`, names its targe
   architecture sccache stays uninstalled and the pre-flight turns the cache off, as it did
   when the x86_64 binary failed to run there. The self-hosted Macs use the sccache their
   hosts carry.
+- **`protoc`**: one protobuf release for every platform `install-protoc` supports (Linux
+  x86_64, aarch64, s390x and ppc64le, macOS x86_64 and arm64, Windows 64- and 32-bit). The
+  action used to install whatever `releases/latest` named and to take the expected SHA-256
+  from that same API answer, so nothing but GitHub's API vouched for the file. protobuf
+  publishes no checksum files; the pins are the SHA-256 digests GitHub records for each
+  release asset, each checked against a download. To bump it, pick the newest release that
+  is not a pre-release and is at least two weeks old, take each zip's `digest` from
+  `gh api repos/protocolbuffers/protobuf/releases/tags/v<version>`, and check it against a
+  download.
 
 ## How the cache is filled
 

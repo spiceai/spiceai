@@ -1,115 +1,41 @@
 name: Install protoc
-description: 'Install the protoc compiler from GitHub releases for consistent versions across platforms'
-
-inputs:
-  version:
-    description: 'Version of protoc to install (e.g. "v29.3"). If empty, installs the latest release.'
-    required: false
-    default: ''
-  token:
-    description: 'GitHub token for release API requests (avoids unauthenticated api.github.com rate limits). Defaults to the workflow github.token.'
-    required: false
-    default: ''
+description: >-
+  Install the protoc release pinned in .github/ci-cache/pins.json, the same version on
+  every platform, checked against its pinned SHA-256 before it is extracted.
 
 runs:
   using: 'composite'
   steps:
-    - name: Determine version and download protoc (Linux/macOS)
+    - name: Download protoc (Linux/macOS)
       if: runner.os != 'Windows'
       shell: bash
-      env:
-        INPUT_VERSION: ${{ inputs.version }}
-        GITHUB_TOKEN: ${{ inputs.token || github.token }}
       run: |
         set -euo pipefail
 
-        github_api_curl() {
-          local url="$1"
-          if [ -n "${GITHUB_TOKEN:-}" ]; then
-            curl -fsSL \
-              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "${url}"
-          else
-            curl -fsSL "${url}"
-          fi
-        }
-
-        # Ensure jq is available
-        if ! command -v jq &>/dev/null; then
-          echo "jq not found, installing..."
-          if [ "$(uname -s)" = "Darwin" ]; then
-            brew install jq
-          else
-            sudo apt-get update -qq && sudo apt-get install -y -qq jq
-          fi
-        fi
-
-        # Fetch release metadata (authenticated to avoid shared-runner IP rate limits)
-        if [ -z "${INPUT_VERSION}" ]; then
-          RELEASE_JSON=$(github_api_curl "https://api.github.com/repos/protocolbuffers/protobuf/releases/latest")
-        else
-          QUERY_VERSION="${INPUT_VERSION}"
-          if [[ ! "${QUERY_VERSION}" =~ ^v ]]; then
-            QUERY_VERSION="v${QUERY_VERSION}"
-          fi
-          RELEASE_JSON=$(github_api_curl "https://api.github.com/repos/protocolbuffers/protobuf/releases/tags/${QUERY_VERSION}")
-        fi
-
-        VERSION=$(echo "${RELEASE_JSON}" | jq -r '.tag_name')
-        if [ -z "${VERSION}" ] || [ "${VERSION}" = "null" ]; then
-          echo "Failed to determine protoc version from release metadata" >&2
-          exit 1
-        fi
-
-        # Ensure version starts with 'v'
-        if [[ ! "${VERSION}" =~ ^v ]]; then
-          VERSION="v${VERSION}"
-        fi
-
-        # Tag without leading 'v' is what `protoc --version` prints (libprotoc 28.0-rc1).
-        # The zip filename uses a different RC spelling (28.0-rc-1). Keep them apart:
-        # FILE_VERSION is for assets and the cache path only.
-        REPORTED_VERSION="${VERSION#v}"
-        FILE_VERSION="${REPORTED_VERSION}"
-
-        # Handle rc releases (e.g. 28.0rc1 or 28.0-rc1 -> 28.0-rc-1)
-        if [[ "${FILE_VERSION}" == *rc* ]]; then
-          FILE_VERSION=$(echo "${FILE_VERSION}" | sed -E 's/-?rc([0-9]+)$/-rc-\1/')
-        fi
-
-        # Determine OS
-        OS="$(uname -s)"
-        case "${OS}" in
-          Linux)  OS_NAME="linux" ;;
-          Darwin) OS_NAME="osx" ;;
-          *)      echo "Unsupported OS: ${OS}" && exit 1 ;;
-        esac
-
-        # Determine architecture
-        ARCH="$(uname -m)"
-        case "${ARCH}" in
-          x86_64)  ARCH_SUFFIX="x86_64" ;;
-          aarch64) ARCH_SUFFIX="aarch_64" ;;
-          arm64)   ARCH_SUFFIX="aarch_64" ;;
-          s390x)   ARCH_SUFFIX="s390_64" ;;
-          ppc64le) ARCH_SUFFIX="ppcle_64" ;;
+        # The release and the SHA-256 of each platform's zip come from pins.json, never
+        # from the releases API: an answer that names the file to download cannot also be
+        # what vouches for it. To move to another release, update the pin (see
+        # .github/ci-cache/README.md).
+        case "$(uname -s)-$(uname -m)" in
+          Linux-x86_64) target=linux-x86_64 ;;
+          Linux-aarch64) target=linux-aarch_64 ;;
+          Linux-s390x) target=linux-s390_64 ;;
+          Linux-ppc64le) target=linux-ppcle_64 ;;
+          Darwin-x86_64) target=osx-x86_64 ;;
+          Darwin-arm64) target=osx-aarch_64 ;;
           *)
-            echo "Unsupported architecture for protoc release asset selection: ${ARCH}" >&2
+            echo "::error::.github/ci-cache/pins.json pins no protoc for $(uname -s) $(uname -m)." >&2
             exit 1
             ;;
         esac
+        PINS="$GITHUB_ACTION_PATH/../../ci-cache/pins.json"
+        VERSION="$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["protoc"]["version"])' "$PINS")"
+        ARCH_SUFFIX="${target#*-}"
+        FILENAME="protoc-${VERSION}-${target}.zip"
 
-        FILENAME="protoc-${FILE_VERSION}-${OS_NAME}-${ARCH_SUFFIX}.zip"
-        DOWNLOAD_URL="https://github.com/protocolbuffers/protobuf/releases/download/${VERSION}/${FILENAME}"
-
-        # Extract expected SHA256 from release metadata
-        EXPECTED_SHA256=$(echo "${RELEASE_JSON}" | jq -r --arg name "${FILENAME}" '.assets[] | select(.name == $name) | .digest' | sed 's/^sha256://')
-        if [ -z "${EXPECTED_SHA256}" ] || [ "${EXPECTED_SHA256}" = "null" ]; then
-          echo "Failed to find SHA256 digest for asset '${FILENAME}' in release metadata" >&2
-          exit 1
-        fi
+        # What `protoc --version` prints (libprotoc 36.2), and the version in the cache path.
+        REPORTED_VERSION="${VERSION}"
+        FILE_VERSION="${VERSION}"
 
         # Install into the per-agent tool cache, never into a shared $HOME path.
         # Two self-hosted agents on one Mac both run as `runner`, so they share
@@ -138,36 +64,21 @@ runs:
 
         publish_protoc() {
           echo "${INSTALL_DIR}/bin" >> "${GITHUB_PATH}"
-          echo "protoc installed: ${PROTOC_BIN} (${VERSION})"
+          echo "protoc installed: ${PROTOC_BIN} (v${VERSION})"
           "${PROTOC_BIN}" --version
         }
 
         if protoc_version_ok "${PROTOC_BIN}"; then
-          echo "protoc ${VERSION} already present at ${PROTOC_BIN}; skipping download."
+          echo "protoc v${VERSION} already present at ${PROTOC_BIN}; skipping download."
           publish_protoc
           exit 0
         fi
 
-        echo "Downloading protoc ${VERSION}: ${DOWNLOAD_URL}"
-        echo "Expected SHA256: ${EXPECTED_SHA256}"
-        echo "Install dir: ${INSTALL_DIR}"
+        echo "Installing protoc v${VERSION} (${FILENAME}) into ${INSTALL_DIR}"
 
+        # fetch_pinned.sh moves the zip to its destination only once it matches the pin.
         download_and_verify() {
-          local zip="$1"
-          curl -fsSL --retry 5 --retry-delay 2 -o "${zip}" "${DOWNLOAD_URL}"
-          local actual
-          if command -v sha256sum &>/dev/null; then
-            actual=$(sha256sum "${zip}" | awk '{print $1}')
-          else
-            actual=$(shasum -a 256 "${zip}" | awk '{print $1}')
-          fi
-          if [ "${actual}" != "${EXPECTED_SHA256}" ]; then
-            echo "SHA256 mismatch for ${FILENAME}" >&2
-            echo "  Expected: ${EXPECTED_SHA256}" >&2
-            echo "  Actual:   ${actual}" >&2
-            return 1
-          fi
-          echo "SHA256 verified: ${actual}"
+          bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" protoc "$1" "$target"
         }
 
         extract_to() {
@@ -257,68 +168,36 @@ runs:
         done
 
         if [ "${success}" -ne 1 ]; then
-          echo "::error::Failed to install protoc ${VERSION} after 3 attempts"
+          echo "::error::Failed to install protoc v${VERSION} after 3 attempts"
           df -h "${STAGING_ROOT}" "${HOME}" / 2>/dev/null || df -h
           exit 1
         fi
 
         publish_protoc
 
-    - name: Determine version and download protoc (Windows)
+    - name: Download protoc (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
-      env:
-        INPUT_VERSION: ${{ inputs.version }}
-        GITHUB_TOKEN: ${{ inputs.token || github.token }}
       run: |
         $ErrorActionPreference = "Stop"
 
-        $ApiHeaders = @{
-          Accept = "application/vnd.github+json"
-          "X-GitHub-Api-Version" = "2022-11-28"
-        }
-        if (-not [string]::IsNullOrEmpty($env:GITHUB_TOKEN)) {
-          $ApiHeaders.Authorization = "Bearer $($env:GITHUB_TOKEN)"
-        }
-
-        # Fetch release metadata (authenticated to avoid shared-runner IP rate limits)
-        if ([string]::IsNullOrEmpty($env:INPUT_VERSION)) {
-          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/protocolbuffers/protobuf/releases/latest" -Headers $ApiHeaders
-        } else {
-          $QueryVersion = $env:INPUT_VERSION
-          if (-not $QueryVersion.StartsWith("v")) {
-            $QueryVersion = "v$QueryVersion"
-          }
-          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/protocolbuffers/protobuf/releases/tags/$QueryVersion" -Headers $ApiHeaders
-        }
-
-        $Version = $release.tag_name
-        if ([string]::IsNullOrEmpty($Version)) {
-          throw "Failed to determine protoc version from release metadata"
-        }
-
-        # Ensure version starts with 'v'
-        if (-not $Version.StartsWith("v")) {
-          $Version = "v$Version"
-        }
-
-        # Tag without leading 'v' is what `protoc --version` prints (libprotoc 28.0-rc1).
-        # The zip filename uses a different RC spelling (28.0-rc-1). Keep them apart:
-        # $FileVersion is for assets and the cache path only.
-        $ReportedVersion = $Version.TrimStart("v")
-        $FileVersion = $ReportedVersion
-
-        # Handle rc releases
-        $FileVersion = $FileVersion -replace "-?rc(\d+)$", "-rc-`$1"
+        # The release and the SHA-256 of each zip come from pins.json, as on Linux and macOS.
+        $pin = (Get-Content -Raw (Join-Path $env:GITHUB_ACTION_PATH '..\..\ci-cache\pins.json') | ConvertFrom-Json).'protoc'
+        $Version = "v$($pin.version)"
+        # What `protoc --version` prints, and the version in the cache path.
+        $ReportedVersion = $pin.version
+        $FileVersion = $pin.version
 
         # Determine architecture
         $Arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLower()
         switch ($Arch) {
           "x64" {
             $ArchSuffix = "64"
+            $target = 'win64'
           }
           "x86" {
             $ArchSuffix = "32"
+            $target = 'win32'
           }
           "arm64" {
             throw "Failed to install protoc for Windows architecture '${Arch}': No supported protoc release asset is configured for this architecture. Use an x64 Windows runner or update this action to map arm64 to a verified upstream asset."
@@ -328,15 +207,12 @@ runs:
           }
         }
 
-        $Filename = "protoc-${FileVersion}-win${ArchSuffix}.zip"
-        $DownloadUrl = "https://github.com/protocolbuffers/protobuf/releases/download/${Version}/${Filename}"
-
-        # Extract expected SHA256 from release metadata
-        $asset = $release.assets | Where-Object { $_.name -eq $Filename }
-        if (-not $asset -or [string]::IsNullOrEmpty($asset.digest)) {
-          throw "Failed to find SHA256 digest for asset '${Filename}' in release metadata"
+        $Filename = "protoc-${FileVersion}-${target}.zip"
+        $DownloadUrl = $pin.url.Replace('{version}', $pin.version).Replace('{target}', $target)
+        $ExpectedSha256 = $pin.sha256.$target
+        if ([string]::IsNullOrEmpty($ExpectedSha256)) {
+          throw ".github/ci-cache/pins.json pins no protoc for ${target}"
         }
-        $ExpectedSha256 = $asset.digest -replace '^sha256:', ''
 
         if (-not [string]::IsNullOrEmpty($env:RUNNER_TOOL_CACHE)) {
           $InstallDir = Join-Path $env:RUNNER_TOOL_CACHE "protoc\$FileVersion\$ArchSuffix"

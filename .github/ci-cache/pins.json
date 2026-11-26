@@ -57,5 +57,19 @@
       "x86_64-unknown-linux-musl.tar.gz": "911f611db54e48dc50c32232462a99848824be5ba0f6f52cc33903712cd78715",
       "x86_64-pc-windows-msvc.zip": "9c862bcaef62804f2124dfc2605a0204f4fe0c5fa337ba4264e9bcae9d2ba487"
     }
+  },
+  "protoc": {
+    "version": "36.2",
+    "url": "https://github.com/protocolbuffers/protobuf/releases/download/v{version}/protoc-{version}-{target}.zip",
+    "sha256": {
+      "linux-x86_64": "121f6c7afe1d4d0e3ea6aab9432038599250134cbf4474cb1167d2c7decd4278",
+      "linux-aarch_64": "8b8f18bd2b30346efbc698dd5a73dd7c805f3ef8380f6dfc95c768f3f1852f6a",
+      "linux-s390_64": "6ef625085cc7eb42521192f52185c4a9211d5b4721cd104f923494dffbe1c836",
+      "linux-ppcle_64": "0eb8eff1b90b1f06e5dc9aa29aa9e313daba51dd33a3166636d53ea1142228bc",
+      "osx-x86_64": "228cc7add4616cc14ca5e80dee83209d44449a7aee95a914ae748fa374efb078",
+      "osx-aarch_64": "9cd98a532c5c5e0c4161314de0225de27e4c8a323917b6ea7b1b714d3ae23466",
+      "win64": "f0c128dc0d8492eceece83bb459a4c0e316764b929ffbf1aa416357fd644edd3",
+      "win32": "031777688173e6414cfaead74da4c16d7cf2da490bca4e0d0c2458008587f105"
+    }
   }
 }

@@ -227,5 +227,25 @@ class CheckCiCachePinsTest(unittest.TestCase):
                 )
 
 
+    def test_every_platform_install_protoc_supports_must_be_pinned(self):
+        result = self.run_check()
+        self.assertIn("protoc 36.2", result.stdout)
+        for target in ("linux-aarch_64", "osx-aarch_64", "win64", "win32"):
+            with self.subTest(target=target):
+                self.setUp()
+                self.edit_pins(lambda pins: pins["protoc"]["sha256"].pop(target))
+                result = self.run_check()
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(
+                    f"protoc.sha256 has no pin for {target}, which .github/actions/install-protoc/action.yml asks for",
+                    result.stdout,
+                )
+
+    def test_install_protoc_takes_no_release_from_the_releases_api(self):
+        action = self.tmp / ".github/actions/install-protoc/action.yml"
+        self.assertNotIn("api.github.com", action.read_text())
+        self.assertNotIn("releases/latest", action.read_text())
+
+
 if __name__ == "__main__":
     unittest.main()
