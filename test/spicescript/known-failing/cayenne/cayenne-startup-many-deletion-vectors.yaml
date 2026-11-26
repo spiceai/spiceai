@@ -1,0 +1,58 @@
+# Known failing (#16780).
+name: cayenne-startup-many-deletion-vectors
+description: >
+  A keyed Cayenne table with object-native data in an S3 state location 20 ms
+  away is ready within 15 s of a restart after 20,000 single-key deletes, and
+  serves exactly the rows the deletes left. Each delete commits its own
+  deletion vector, and opening the table reads every one of them.
+tags: [long]
+
+sources:
+  src: { kind: postgres }
+  slow-lake: { kind: rustfs, latency: 20ms }
+
+variants:
+  object-native-s3-latency: object-native-s3-latency
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-startup-many-deletion-vectors
+  datasets:
+    - from: postgres:public.orders
+      name: orders
+      access: read_write
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        write_mode: acceleration
+        primary_key: id
+
+# The deletes go to the acceleration only, so the source keeps every row and
+# each check states its answer.
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE orders (id bigint PRIMARY KEY, v text NOT NULL);
+        INSERT INTO orders SELECT i, 'v' || i FROM generate_series(1, 30000) i;
+  - start: {}
+  - query: SELECT count(*) FROM orders
+    expect: { rows: [["30000"]] }
+    eventually: 60s
+
+  # One key per delete, each its own commit, until ids 1 to 20,000 are gone;
+  # later rounds match no row.
+  - background:
+      id: deletes
+      query: DELETE FROM orders WHERE id = ${round} AND id <= 20000
+  - query: SELECT count(*) FROM orders
+    expect: { rows: [["10000"]] }
+    eventually: 30m
+  - stop-background: { id: deletes }
+
+  - restart: { ready-timeout: 15s }
+  - query: SELECT count(*), sum(id), min(id), max(id) FROM orders
+    expect: { rows: [["10000", "250005000", "20001", "30000"]] }

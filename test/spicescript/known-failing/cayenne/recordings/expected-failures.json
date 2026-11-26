@@ -45,6 +45,16 @@
       "group": "cayenne"
     }
   ],
+  "cayenne-startup-many-deletion-vectors": [
+    {
+      "run": "cayenne-startup-many-deletion-vectors",
+      "who": "object-native-s3-latency",
+      "key": "restart: {\"ready-timeout\":\"15s\"}",
+      "kind": "status",
+      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:public.orders\",\"name\":\"orders\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see /Volumes/envoy_ssd/git/spiceai/on-scripts/targ",
+      "group": "cayenne"
+    }
+  ],
   "cayenne-torn-reads": [
     {
       "run": "cayenne-torn-reads",
