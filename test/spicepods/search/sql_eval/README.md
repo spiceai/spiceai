@@ -29,6 +29,9 @@ It does not load the dependencies of a dependency, and it ignores the `runtime` 
 dependency. Thus each root spicepod is in this directory, lists all of its dependencies, and sets
 `runtime.functions.enabled: true`.
 
+The root `.gitignore` ignores every `spicepods` directory and every `spicepod.yaml` file. It has an
+exception for `sql_eval/spicepods/**/spicepod.yaml`, so git tracks a new dependency here.
+
 ## Run
 
 ```console

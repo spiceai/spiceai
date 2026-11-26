@@ -20,6 +20,9 @@ spicepod.yaml
 !examples/cdc-debezium-ingest/spicepod.yaml
 !test/spicepods/chbench/local-writeback/spicepod.yaml
 !.cursor/skills/verify-integer-overflow/spicepod.yaml
+# Dependencies of the SQL search evaluation spicepods; spiced loads them from `spicepods/`.
+!test/spicepods/search/sql_eval/spicepods/
+!test/spicepods/search/sql_eval/spicepods/**/spicepod.yaml
 
 target/
 
