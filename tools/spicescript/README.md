@@ -403,24 +403,23 @@ steps:
 ```
 
 `from:` names the release a script's instances start on, as `X.Y.Z` or `X.Y.x`,
-the newest published X.Y release on GitHub with a `spiced` build for this host
-that can be verified (below). Before running, spicescript lists the releases once
-(with `GITHUB_TOKEN` or `GH_TOKEN` if set, for the API's rate limit) and caches
-the list for an hour in `~/.cache/spicescript/releases.json`, which records what
-each `X.Y.x` resolved to and when; if GitHub can't be reached, an older cached
-list is used with a warning. It then downloads each release the selected runs
+the newest X.Y release with a `spiced` build for this host that
+[`.github/release-digests.json`](../../.github/release-digests.json) records.
+That file holds the digest of each recorded release's `spiced` archives; only a
+reviewed trunk change edits it, and `publish_release.yml` opens that change when
+it publishes a release. spicescript downloads each release the selected runs
 need (`spiced_<os>_<arch>.tar.gz` from the GitHub release) once into
 `~/.cache/spicescript/verified/v<version>/`, and runs it only once the archive
 is verified:
 
-- a release published before SHA256SUMS must match the digest
-  [`.github/release-digests.json`](../../.github/release-digests.json) records
-  for it; add a release there, with the digest GitHub recorded for the asset the
-  release workflow uploaded, before a script can start on it;
-- any other release must be listed in its `SHA256SUMS`, and `SHA256SUMS` and the
-  archive must each carry a build attestation from `build_release.yml` on a
-  release branch, for the commit the tag names (`gh attestation verify`, so the
-  GitHub CLI must be installed).
+- the archive must match the digest the file records;
+- a release that publishes `SHA256SUMS` must also be listed in it with the same
+  digest, and `SHA256SUMS` and the archive must each carry a build attestation
+  from `build_release.yml` on a release branch, for the commit the tag names
+  (`gh attestation verify`, so the GitHub CLI must be installed);
+- off trunk, outside a job with the full CI roles, an exact release the file
+  does not record may run on its `SHA256SUMS` and those attestations alone. A
+  GitHub Actions run on trunk, or with `CI_ROLE_FULL=true`, refuses it.
 
 A cached archive is verified again each time, and `spiced` is unpacked from it
 into a directory of the run's own under `RUNNER_TEMP` (or the system temporary
@@ -429,15 +428,15 @@ used. The binary's `--version` is checked too. The output names the release
 behind each `from:`, and each run the release it starts on:
 
 ```
-from 2.3.x: v2.3.3 (newest published), $RUNNER_TEMP/spicescript-<pid>/spiced-2.3.3/spiced
-from 2.4.x: v2.4.0 (newest published), $RUNNER_TEMP/spicescript-<pid>/spiced-2.4.0/spiced
+from 2.3.x: v2.3.4 (newest recorded), $RUNNER_TEMP/spicescript-<pid>/spiced-2.3.4/spiced
+from 2.4.x: v2.4.3 (newest recorded), $RUNNER_TEMP/spicescript-<pid>/spiced-2.4.3/spiced
 == orders-upgrade[from=2.3.x]: …
-   from   v2.3.3 (2.3.x)
+   from   v2.3.4 (2.3.x)
 ```
 
 Executors start on the release too, and `upgrade` moves the scheduler and
-executors to the binary under test. Because `X.Y.x` follows the releases, a
-new patch release changes what the same commit upgrades from.
+executors to the binary under test. Because `X.Y.x` follows the recorded
+releases, recording a new patch release changes what the same commit upgrades from.
 
 - Without `from:`, instances start on the binary under test and `upgrade` is a
   restart. A `from:` on a script with no `upgrade` step is rejected.
