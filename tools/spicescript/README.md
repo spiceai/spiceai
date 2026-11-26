@@ -202,7 +202,12 @@ release as a combination of its own), else `--duckdb-version`, else the
 newest release `test/duckdb_versions.json` lists. `spiced` loads one DuckDB
 library, so the `duckdb` and `ducklake` sources of one run must resolve to
 the same release; the runner refuses the run before starting any source
-otherwise. The CLI and library are downloaded once into `~/.cache/spicescript/duckdb-<version>/`;
+otherwise. The CLI and library are downloaded once into `~/.cache/spicescript/duckdb-<version>/`.
+Each archive is checked against the SHA-256 `test/duckdb_versions.json` records for it
+(`cli_sha256` and `sha256`, by platform) before anything is unpacked from it, and is kept
+beside what was taken from it; a later run hashes the kept archive again and takes the
+file from it afresh, so a changed file or archive in the cache is never run. A release
+or platform with no recorded checksum is refused.
 `SPICESCRIPT_DUCKDB_CLI` (`duckdb` sources), `SPICESCRIPT_DUCKLAKE_DUCKDB`
 (`ducklake` sources) and `SPICESCRIPT_DUCKDB_LIBRARY` name local builds
 instead.

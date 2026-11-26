@@ -1,5 +1,5 @@
 {
-  "description": "The DuckDB releases Spice is tested with. duckdb: and ducklake: datasets, and the tests that use DuckDB as an oracle, load the DuckDB library installed on the host; the datasets need 1.5.2 or later (MINIMUM_DUCKDB_VERSION in crates/data_components/src/adbc_helpers.rs) and the oracle 1.5.0 or later. The first entry is that minimum and every other entry is the newest patch release of a supported line, so CI tests both ends of each line Spice accepts. Keep the list in ascending order: the last entry is the release the tests, CI and spicescript's duckdb and ducklake sources use by default (--duckdb-version picks another), and CI runs the DuckDB scripts again on every other entry (.github/workflows/e2e_test_ci.yml). Each entry records the SHA-256 of its shared-library archive per platform, which scripts/libduckdb.py checks before installing it; the Dockerfiles carry the same checksums for the newest entry.",
+  "description": "The DuckDB releases Spice is tested with. duckdb: and ducklake: datasets, and the tests that use DuckDB as an oracle, load the DuckDB library installed on the host; the datasets need 1.5.2 or later (MINIMUM_DUCKDB_VERSION in crates/data_components/src/adbc_helpers.rs) and the oracle 1.5.0 or later. The first entry is that minimum and every other entry is the newest patch release of a supported line, so CI tests both ends of each line Spice accepts. Keep the list in ascending order: the last entry is the release the tests, CI and spicescript's duckdb and ducklake sources use by default (--duckdb-version picks another), and CI runs the DuckDB scripts again on every other entry (.github/workflows/e2e_test_ci.yml). Each entry records the SHA-256 of its shared-library archive per platform (sha256), which scripts/libduckdb.py checks before installing it, and of its CLI archive (cli_sha256); spicescript's duckdb and ducklake sources check both archives before unpacking either, and refuse a release or platform with no checksum here (tools/spicescript/src/source/duckdb_cli.rs). The Dockerfiles carry the library checksums for the newest entry.",
   "versions": [
     {
       "version": "1.5.2",
@@ -7,6 +7,11 @@
         "linux-amd64": "4711438f0fdb04f0441803409bec5430b763d4f2ac3482c1f97cfa6b5ecb4c15",
         "linux-arm64": "b4acbd9d871c99788c303af982f2e39325f28fd415f9a927d0a73e206f09e75d",
         "osx-universal": "524f3537330a1b747556a0c98b62a46865a3f48c7ead2b2035c62f1ad3e5ca8b"
+      },
+      "cli_sha256": {
+        "linux-amd64": "fc9145affabca627431e73ddaf6b8117e5c192692480c13886f227be202d5d15",
+        "linux-arm64": "28b15a8d78e6df62f6ec43da6b0e6397dcd28e25ab93d847df3c5c97f59375f5",
+        "osx-universal": "de789904e1b0b5f305d31b88a6fd8bd4f6ed3f63a00d95f8c7a2559a0995a2f1"
       }
     },
     {
@@ -15,6 +20,11 @@
         "linux-amd64": "b845005f5132a7d8180057c35e14a7626632258782f871a90861b19c1c03841b",
         "linux-arm64": "b72ed9f05003f5e9d2015f7ceada6416b377d9dd33169cdde3c9e33897856eee",
         "osx-universal": "e0bc007d9b0094c0970ac1847a8601d10aad07cbd2910ce586ec810f77b638d6"
+      },
+      "cli_sha256": {
+        "linux-amd64": "6e89deac1ebbc36eed0291caf8b567b030c7b86ac35998f71854e22b3c5d5e2f",
+        "linux-arm64": "c544e92c9b7c31fc53c2139802cabd8e2d1b2b3e3f933117f31611239c1402db",
+        "osx-universal": "80a80c68736bd7dea53e8b02447e9759db0c8596ea156476ba396c44f54c5810"
       }
     },
     {
@@ -23,6 +33,11 @@
         "linux-amd64": "993ad89e7dfca66cd6da994c2cad090c2fc160ddf9f550498a098ab4bb13cfb1",
         "linux-arm64": "c60eecf91143ca6bbac55c4f4d40dc22520488b0ac257c86e0fe9a2b451cf2b7",
         "osx-universal": "14cd63180614cfd961f7959146ecd9087527ff20b67311efdc3fa1c29c18204d"
+      },
+      "cli_sha256": {
+        "linux-amd64": "c6507206baf7793c6013dbd82368469a45f20dc0e17a6f92f204602f652ed2bc",
+        "linux-arm64": "859e1875d2a9515fbb4bf8871061437a14af82320da68c753f094c4b776348fe",
+        "osx-universal": "8a8f67e7c7f7d1392fa63ba3971948391392fe2a25fca63e7008e33c50beb4c2"
       }
     }
   ]
