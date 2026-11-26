@@ -247,5 +247,25 @@ class CheckCiCachePinsTest(unittest.TestCase):
         self.assertNotIn("releases/latest", action.read_text())
 
 
+    def test_the_driver_downloads_are_pinned_files(self):
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for name in ("oracle-instantclient", "simba-spark-odbc", "athena-odbc"):
+            self.assertIn(name, result.stdout)
+        self.edit_pins(lambda pins: pins["oracle-instantclient"].update({"sha256": "0" * 63}))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("oracle-instantclient.sha256 is not a lowercase hex SHA-256.", result.stdout)
+
+    def test_setup_odbc_must_fetch_both_drivers_through_their_pins(self):
+        path = self.tmp / ".github/actions/setup-odbc/action.yml"
+        text = path.read_text()
+        path.write_text(text.replace("fetch_pinned.sh\" athena-odbc", "true\" athena-odbc"))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(".github/actions/setup-odbc/action.yml does not download athena-odbc", result.stdout)
+        self.assertNotIn("does not download simba-spark-odbc", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

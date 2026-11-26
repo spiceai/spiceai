@@ -71,5 +71,17 @@
       "win64": "f0c128dc0d8492eceece83bb459a4c0e316764b929ffbf1aa416357fd644edd3",
       "win32": "031777688173e6414cfaead74da4c16d7cf2da490bca4e0d0c2458008587f105"
     }
+  },
+  "oracle-instantclient": {
+    "url": "https://download.oracle.com/otn_software/linux/instantclient/2326400/instantclient-basic-linux.x64-23.26.4.0.0.zip",
+    "sha256": "cab59aa3b411b3b50898e456fa9aabfe48d67e25cbc1bb23303800390ce7de26"
+  },
+  "simba-spark-odbc": {
+    "url": "https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/odbc/2.8.2/SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip",
+    "sha256": "1d719810b18160e933a48d4868c3a688f2edb44b9b5ff927b1789d48906fc3c8"
+  },
+  "athena-odbc": {
+    "url": "https://downloads.athena.us-east-1.amazonaws.com/drivers/ODBC/v2.0.3.0/Linux/AmazonAthenaODBC-2.0.3.0.rpm",
+    "sha256": "6b4b306f5ebb67ecebdd8a98808a7e33a60bb01f40dcf12c41685ac1b95e37bc"
   }
 }

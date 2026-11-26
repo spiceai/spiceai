@@ -47,6 +47,9 @@ FETCHED_PINS = {
     "mc": (".github/actions/setup-minio/action.yml", ".github/actions/upload-to-minio/action.yml"),
     "sccache": (".github/actions/setup-sccache/action.yml",),
     "protoc": (".github/actions/install-protoc/action.yml",),
+    "oracle-instantclient": (".github/actions/setup-oracle-odpi/action.yml",),
+    "simba-spark-odbc": (".github/actions/setup-odbc/action.yml",),
+    "athena-odbc": (".github/actions/setup-odbc/action.yml",),
 }
 # A call in a shell script: `fetch_pinned.sh" NAME DEST [TARGET]`, with TARGET a literal or a
 # variable such as "$target".

@@ -15,45 +15,11 @@ runs:
         # Ubuntu 24.04+ renamed libaio1 to libaio1t64 for 64-bit time_t transition
         sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1
 
-        # Download and extract Oracle Instant Client
-        ic_url="https://download.oracle.com/otn_software/linux/instantclient/instantclient-basic-linuxx64.zip"
-
-        # Retry only a failure of the network or Oracle's download server, which
-        # says nothing about the change under test, as setup-minio does for the
-        # MinIO client. Any other error, such as a 404, fails at once. `curl
-        # --retry` alone does not retry a dropped connection (exit 56), and
-        # `--retry-all-errors` would retry a 404 as well. `--fail` keeps an HTTP
-        # error page from being saved as basic.zip and failing later in unzip.
-        download_instant_client() {
-          local attempts=4 delay=5 attempt status code retry
-          for ((attempt = 1; ; attempt++)); do
-            status=0
-            code="$(curl --fail --silent --show-error --location --connect-timeout 30 --max-time 600 \
-              --write-out '%{http_code}' --output basic.zip "$ic_url")" || status=$?
-            [ "$status" -eq 0 ] && return 0
-            retry=false
-            case "$status" in
-              # Could not resolve or connect, partial body, timeout, TLS connect
-              # error, empty reply, send or receive failure, HTTP/2 stream error.
-              6 | 7 | 18 | 28 | 35 | 52 | 55 | 56 | 92) retry=true ;;
-              # --fail turns every HTTP error into 22; retry only a server-side one.
-              22) if [[ "$code" =~ ^(408|429|5[0-9][0-9])$ ]]; then retry=true; fi ;;
-            esac
-            if [ "$retry" != true ]; then
-              echo "::error::Downloading Oracle Instant Client from $ic_url failed (curl exit $status, HTTP $code), which is not a network or server failure, so it was not retried."
-              return "$status"
-            fi
-            if [ "$attempt" -ge "$attempts" ]; then
-              echo "::error::Downloading Oracle Instant Client from $ic_url failed $attempt times with a network or server error (last curl exit $status). Oracle's download server may be down; re-run the job once it recovers."
-              return "$status"
-            fi
-            echo "::warning::Downloading Oracle Instant Client failed with a network or server error (curl exit $status, attempt $attempt of $attempts); retrying in ${delay}s."
-            sleep "$delay"
-            delay=$((delay * 2))
-          done
-        }
-
-        download_instant_client
+        # Oracle Instant Client 23.26.4.0.0 Basic, the release pinned in
+        # .github/ci-cache/pins.json with the SHA-256 Oracle publishes on its download page.
+        # .github/scripts/cached_fetch.sh checks the zip against it, and retries only a
+        # failure of the network or Oracle's download server.
+        bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" oracle-instantclient basic.zip
         mkdir linux
         unzip basic.zip -d linux -x "META-INF/*"
         IC_DIR=$PWD/$(ls -d linux/instantclient*)

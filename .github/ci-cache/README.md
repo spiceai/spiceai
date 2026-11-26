@@ -102,6 +102,17 @@ entry itself as `(Get-Content … | ConvertFrom-Json).'<name>'`, names its targe
   is not a pre-release and is at least two weeks old, take each zip's `digest` from
   `gh api repos/protocolbuffers/protobuf/releases/tags/v<version>`, and check it against a
   download.
+- **`oracle-instantclient`**: Oracle Instant Client 23.26.4.0.0 Basic for Linux x86_64, for
+  `setup-oracle-odpi`. The action used to download Oracle's unversioned
+  `instantclient-basic-linuxx64.zip`, which is whatever 23.26 build Oracle points it at; the
+  pin is the current release on Oracle's Linux x86-64 download page, with the SHA-256 that
+  page lists beside it. A new release lives in its own directory
+  (`instantclient/<version without dots>/`), so a bump changes the whole URL.
+- **`simba-spark-odbc`** and **`athena-odbc`**: the Databricks (Simba Spark) ODBC driver
+  2.8.2.1013 for Debian and the Amazon Athena ODBC driver 2.0.3.0 RPM, for `setup-odbc`.
+  Neither vendor publishes a checksum for these releases, so each pin is the SHA-256 of a
+  download from the release's own versioned URL (for Athena, the download's MD5 also matches
+  the S3 ETag the server reports).
 
 ## How the cache is filled
 
