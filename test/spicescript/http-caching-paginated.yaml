@@ -1,6 +1,7 @@
 # Regression test for #16676: a Cayenne caching acceleration over a paginated
 # HTTP API cached none of a paginated response.
 name: http-caching-paginated
+duration: 66s
 description: >
   A Cayenne caching acceleration over a paginated HTTP API caches every page
   of a response, as it caches a one-page response holding one row or several,

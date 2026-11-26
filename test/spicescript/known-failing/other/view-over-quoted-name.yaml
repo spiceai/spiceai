@@ -1,4 +1,5 @@
 name: view-over-quoted-name
+duration: 91s
 description: >
   A Spicepod view that reads a dataset whose quoted name holds capitals
   (`name: '"Orders"'`) answers the dataset's rows, and the runtime becomes

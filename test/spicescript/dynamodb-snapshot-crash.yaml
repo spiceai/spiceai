@@ -1,4 +1,5 @@
 name: dynamodb-snapshot-crash
+duration: 33s
 description: >
   A DynamoDB Streams changes-mode acceleration that is killed partway through a
   reload does not resume from the stream position an earlier run saved. The

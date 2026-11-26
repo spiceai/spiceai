@@ -123,8 +123,8 @@ struct Cli {
     #[arg(long, default_value_t = 1, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     runs_per_script: u32,
 
-    /// Record each script's run time in `recordings/durations.json` beside
-    /// it, the estimate `--jobs` orders scripts by; scripts without one may
+    /// Record each script's run time in its `duration` line, the estimate
+    /// `--partition` and `--jobs` order scripts by; scripts without one may
     /// run. Times from a `--jobs 1` run are the least disturbed by neighbours.
     #[arg(long = "record-durations")]
     record_durations: bool,
@@ -149,6 +149,14 @@ struct Cli {
     /// Exclude scripts with any of these tags, even when --only-tag matches.
     #[arg(long, value_enum, value_name = "TAG")]
     exclude_tag: Vec<script::Tag>,
+
+    /// Fail the run when a selected script is not run because a variable its
+    /// `requires-env` names is unset. Without it such a script is listed as
+    /// not run and the run's result does not count it: for CI jobs that are
+    /// meant to hold every credential, so a lost one fails rather than
+    /// quietly testing less.
+    #[arg(long)]
+    require_all_env: bool,
 
     /// Cap every check's wait (`eventually`, a refresh) at this long, such
     /// as `20s`: for scripts expected to fail, which otherwise wait out every
@@ -281,6 +289,26 @@ async fn run(cli: Cli) -> Result<bool> {
     if cli.check {
         return check(&paths, &scripts);
     }
+    if cli.cluster {
+        // Before any source starts: a script that cannot run distributed
+        // should not fail on a source it would never use.
+        (paths, scripts) = paths
+            .into_iter()
+            .zip(scripts)
+            .filter_map(|(path, script)| match &script.defaults.single_node {
+                Some(reason) => {
+                    println!("skip {} under --cluster: {reason}", script.name);
+                    None
+                }
+                None => Some((path, script)),
+            })
+            .unzip();
+    }
+    let not_run: Vec<results::NotRun>;
+    (paths, scripts, not_run) = without_missing_env(paths, scripts);
+    for script in &not_run {
+        println!("not run: {script}");
+    }
 
     // Each base release the selected runs start on, resolved and downloaded
     // once; `--from` replaces them all.
@@ -367,7 +395,13 @@ async fn run(cli: Cli) -> Result<bool> {
         cluster: cli.cluster,
         work_dir,
         keep: cli.keep,
-        spice_cli: cli.spice,
+        // `spice` steps run in the instance's directory, so a relative path
+        // is resolved here, against this one; a bare name stays a PATH lookup.
+        spice_cli: if cli.spice.components().count() > 1 && cli.spice.is_relative() {
+            std::path::absolute(&cli.spice)?
+        } else {
+            cli.spice
+        },
         pki,
         log_capture: cli
             .log_capture
@@ -425,6 +459,7 @@ async fn run(cli: Cli) -> Result<bool> {
         seconds: 0.0,
         scripts: Vec::new(),
         summaries: Vec::new(),
+        not_run: not_run.clone(),
     };
     while let Some((path, script, repetition, run_options, report, out, waited)) =
         futures::StreamExt::next(&mut running).await
@@ -524,19 +559,8 @@ async fn run(cli: Cli) -> Result<bool> {
         );
     }
     if cli.record_durations {
-        // By directory, each into its own durations file.
-        let mut by_dir: std::collections::BTreeMap<
-            std::path::PathBuf,
-            Vec<(String, std::time::Duration)>,
-        > = std::collections::BTreeMap::new();
         for (script, took, _, _) in &timings {
-            by_dir
-                .entry(script.dir.clone())
-                .or_default()
-                .push((script.file_stem.clone(), *took));
-        }
-        for (dir, took) in &by_dir {
-            script::Script::record_durations(dir, took)?;
+            script::Script::record_duration(&script.path, *took)?;
         }
         println!("recorded the duration of {} script(s)", timings.len());
     }
@@ -571,14 +595,58 @@ async fn run(cli: Cli) -> Result<bool> {
         results.write(file)?;
         println!("results: {}", file.display());
     }
+    // Listed last, beside the totals: a script that did not run is not a
+    // pass, whatever the totals say.
+    for script in &not_run {
+        if cli.require_all_env {
+            println!("FAILED not run: {script} (--require-all-env)");
+        } else {
+            println!("not run: {script}");
+        }
+    }
     println!(
-        "{} scripts: {passed} checks passed, {} failed{}, in {:.1}s",
+        "{} scripts: {passed} checks passed, {} failed{}{}, in {:.1}s",
         scripts.len(),
         failures.len(),
         expected_failures_note(expected),
+        not_run_note(not_run.len()),
         run_started.elapsed().as_secs_f64()
     );
-    Ok(failures.is_empty() || cli.record_failures)
+    let missing_env_fails = cli.require_all_env && !not_run.is_empty();
+    Ok((failures.is_empty() || cli.record_failures) && !missing_env_fails)
+}
+
+/// Splits off the scripts whose `requires-env` names an unset variable.
+fn without_missing_env(
+    paths: Vec<PathBuf>,
+    scripts: Vec<script::Script>,
+) -> (Vec<PathBuf>, Vec<script::Script>, Vec<results::NotRun>) {
+    let mut not_run = Vec::new();
+    let (paths, scripts) = paths
+        .into_iter()
+        .zip(scripts)
+        .filter_map(|(path, script)| {
+            let missing = script.missing_env();
+            if missing.is_empty() {
+                return Some((path, script));
+            }
+            not_run.push(results::NotRun {
+                name: script.name,
+                file: path,
+                missing_env: missing,
+            });
+            None
+        })
+        .unzip();
+    (paths, scripts, not_run)
+}
+
+fn not_run_note(count: usize) -> String {
+    match count {
+        0 => String::new(),
+        1 => ", 1 script not run".to_string(),
+        n => format!(", {n} scripts not run"),
+    }
 }
 
 fn validate_repetitions(cli: &Cli) -> Result<()> {

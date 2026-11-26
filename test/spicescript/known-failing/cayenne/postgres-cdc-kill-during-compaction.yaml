@@ -1,5 +1,6 @@
 # Known failing (#15540).
 name: postgres-cdc-kill-during-compaction
+duration: 540s
 description: >
   spiced killed while Cayenne is compacting a CDC-fed table loses and
   duplicates nothing: after a restart the table equals the source, and

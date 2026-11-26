@@ -1,4 +1,5 @@
 name: clickhouse-literals
+duration: 59s
 tags: [long]
 description: >
   Every column of a ClickHouse table of edge values compared with each edge
@@ -51,4 +52,8 @@ steps:
           (8, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
   - start: {}
   - query: SELECT id, f, d, i8, u8, s FROM c ORDER BY id
+  # Every Date32 value, read back: decoding the column is a patch to the
+  # spiceai/clickhouse-rs fork that only a real server reaches, since the
+  # wire type is what selects the 32-bit column (docs/dev/fork_patches.md).
+  - query: SELECT id, dt FROM c ORDER BY id
   - corpus: corpus/clickhouse-literals.sql
