@@ -365,8 +365,16 @@ installSpiceCli() {
         mkdir -p "$SPICE_CLI_INSTALL_DIR"
     fi
 
-    # Install the binary
-    cp "$tmp_dir/$SPICE_CLI_FILENAME" "$SPICE_CLI_INSTALL_DIR/"
+    # Copied next to the installed binary, then renamed over it: a spice running from the install
+    # directory does not block the upgrade, as writing over it in place would on Linux ("Text file
+    # busy"), and a failed copy leaves the installed binary as it was.
+    local staged="$SPICE_CLI_INSTALL_DIR/.$SPICE_CLI_FILENAME.install.$$"
+    if ! { cp "$tmp_dir/$SPICE_CLI_FILENAME" "$staged" && chmod 755 "$staged" && mv -f "$staged" "$SPICE_CLI_FILE"; }; then
+        rm -f "$staged"
+        echo -e "${red}Error:${reset} Failed to install $SPICE_CLI_FILENAME into $SPICE_CLI_INSTALL_DIR"
+        rm -rf "$tmp_dir"
+        exit 1
+    fi
 
     if [ -f "$SPICE_CLI_FILE" ]; then
         echo -e "${green}✓${reset} $SPICE_CLI_FILENAME installed to $SPICE_CLI_INSTALL_DIR"
@@ -405,11 +413,16 @@ installSpiced() {
         runAsRoot mkdir -p "$SPICED_INSTALL_DIR"
     fi
 
-    # Install the binary
-    if [ "$USE_SUDO" = "true" ]; then
-        runAsRoot cp "$tmp_dir/$SPICED_FILENAME" "$SPICED_INSTALL_DIR/"
-    else
-        cp "$tmp_dir/$SPICED_FILENAME" "$SPICED_INSTALL_DIR/"
+    # Copied next to the installed binary, then renamed over it: a spiced running from the install
+    # directory does not block the upgrade, as writing over it in place would on Linux ("Text file
+    # busy"), and a failed copy leaves the installed binary as it was.
+    local staged="$SPICED_INSTALL_DIR/.$SPICED_FILENAME.install.$$"
+    if ! { runAsRoot cp "$tmp_dir/$SPICED_FILENAME" "$staged" && runAsRoot chmod 755 "$staged" &&
+        runAsRoot mv -f "$staged" "$SPICED_FILE"; }; then
+        runAsRoot rm -f "$staged" || true
+        echo -e "${red}Error:${reset} Failed to install $SPICED_FILENAME into $SPICED_INSTALL_DIR"
+        rm -rf "$tmp_dir"
+        exit 1
     fi
 
     if [ -f "$SPICED_FILE" ]; then

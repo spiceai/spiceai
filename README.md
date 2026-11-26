@@ -436,7 +436,7 @@ Install the Spice CLI:
 On **macOS, Linux, and WSL**:
 
 ```bash
-curl https://install.spiceai.org | /bin/bash
+curl -fsSL https://install.spiceai.org | sh
 ```
 
 Or using `brew`:
