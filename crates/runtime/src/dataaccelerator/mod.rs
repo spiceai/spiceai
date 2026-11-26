@@ -187,7 +187,11 @@ mod test {
                 ..Default::default()
             };
             let unset = crate::builder::connector_unset_refresh_mode(from);
-            let pre_init = crate::builder::cayenne_write_profile(&spicepod_accel, unset)
+            let pre_init = crate::builder::cayenne_write_profile(
+                &spicepod_accel,
+                unset,
+                Some(crate::builder::spicepod_dataset_source(from)),
+            )
                 .expect("the cayenne engine is linked in this test binary");
 
             // Post-init: the same pod as an initialized dataset, classified by the engine
@@ -211,7 +215,13 @@ mod test {
                 acceleration,
             );
             let post_init = accelerator_cayenne::CayenneAccelerator::new()
-                .spicepod_write_profile(&spicepod_accel, resolved)
+                .spicepod_write_profile(
+                    &spicepod_accel,
+                    resolved,
+                    runtime_acceleration::acceleration_source::AccelerationSource::connector_name(
+                        &dataset,
+                    ),
+                )
                 .expect("the cayenne engine classifies its own acceleration");
 
             assert_eq!(
@@ -242,7 +252,24 @@ mod test {
         let explicit_changes = both_agree("s3://bucket/path", Some(SpicepodRefreshMode::Changes));
         assert!(explicit_changes.uses_cdc_tier);
         let _ = both_agree("debezium:my.topic", Some(SpicepodRefreshMode::Full));
-        let _ = both_agree("sink", None);
+
+        // A sink takes rows only through writes, appended or with refresh disabled
+        // (an unset mode): its appends are inlined, with compaction and no CDC tier.
+        for (from, refresh_mode) in [
+            ("sink", None),
+            ("sink", Some(SpicepodRefreshMode::Append)),
+            ("sink:otel_logs", Some(SpicepodRefreshMode::Append)),
+        ] {
+            let sink = both_agree(from, refresh_mode);
+            assert!(!sink.uses_cdc_tier, "a sink has no source to replay from");
+            assert!(sink.needs_compaction);
+            assert!(sink.inlines_small_writes, "a sink inlines its appends");
+            assert_eq!(sink.inline_max_bytes, 64 * 1024 * 1024);
+        }
+        // An append from a source with no refresh interval is still a bulk append.
+        let bulk = both_agree("s3://bucket/path", Some(SpicepodRefreshMode::Append));
+        assert!(!bulk.inlines_small_writes);
+        assert_eq!(bulk.inline_max_bytes, 0);
     }
 
     /// Internal tables reach Cayenne through `InternalAccelerationSource`; that must

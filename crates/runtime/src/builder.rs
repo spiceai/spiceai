@@ -1233,7 +1233,7 @@ pub(crate) fn connector_unset_refresh_mode(from: &str) -> RefreshMode {
 
 /// The connector name in a Spicepod `from:` value, via the same normalization the
 /// initialized `Dataset` uses (`runtime_component::DatasetSpec::source`).
-fn spicepod_dataset_source(from: &str) -> &str {
+pub(crate) fn spicepod_dataset_source(from: &str) -> &str {
     if from == "sink" || from.is_empty() {
         return "sink";
     }
@@ -1484,18 +1484,22 @@ fn cayenne_accelerations(
 > {
     use std::borrow::Cow;
 
+    // Each acceleration with what its source's connector resolves an unset
+    // `refresh_mode` to, and the connector's name where it has one of its own.
     app.datasets
         .iter()
         .map(|dataset| {
             (
                 dataset.acceleration.as_ref().map(Cow::Borrowed),
                 connector_unset_refresh_mode(&dataset.from),
+                Some(spicepod_dataset_source(&dataset.from)),
             )
         })
         .chain(app.views.iter().map(|view| {
             (
                 view.acceleration.as_ref().map(Cow::Borrowed),
                 RefreshMode::Full,
+                None,
             )
         }))
         .chain(app.catalogs.iter().map(|catalog| {
@@ -1507,15 +1511,17 @@ fn cayenne_accelerations(
             });
             // The expansion always names a `refresh_mode` (catalog acceleration
             // requires one), so this fallback is never consulted.
-            (converted, RefreshMode::Changes)
+            (converted, RefreshMode::Changes, None)
         }))
-        .filter_map(|(accel, unset)| accel.map(|accel| (accel, unset)))
-        .filter(|(accel, _)| accel.enabled && accel.engine_name().eq_ignore_ascii_case("cayenne"))
-        .filter_map(|(accel, unset)| {
+        .filter_map(|(accel, unset, connector)| accel.map(|accel| (accel, unset, connector)))
+        .filter(|(accel, _, _)| {
+            accel.enabled && accel.engine_name().eq_ignore_ascii_case("cayenne")
+        })
+        .filter_map(|(accel, unset, connector)| {
             // The engine classifies; this only enumerates. Filtered rather than
             // defaulted: a build with no Cayenne engine linked declares no Cayenne
             // workload, which is exactly what the budget should see.
-            cayenne_write_profile(&accel, unset).map(|profile| (accel, profile))
+            cayenne_write_profile(&accel, unset, connector).map(|profile| (accel, profile))
         })
 }
 
@@ -1527,6 +1533,7 @@ fn cayenne_accelerations(
 pub(crate) fn cayenne_write_profile(
     acceleration: &spicepod::acceleration::Acceleration,
     unset_refresh_mode: RefreshMode,
+    connector: Option<&str>,
 ) -> Option<data_accelerator_api::SpicepodWriteProfile> {
     data_accelerator_api::DATA_ACCELERATOR_REGISTRATIONS
         .iter()
@@ -1534,7 +1541,7 @@ pub(crate) fn cayenne_write_profile(
         .and_then(|registration| {
             registration
                 .build_with_defaults()?
-                .spicepod_write_profile(acceleration, unset_refresh_mode)
+                .spicepod_write_profile(acceleration, unset_refresh_mode, connector)
         })
 }
 
@@ -1617,30 +1624,47 @@ fn estimate_cayenne_reservation_bytes(
         // Inline-admission state: the bounded Arrow buffer a write is admitted
         // through, plus the Arrow IPC entry it serializes into. Byte-valued
         // params, so no MB conversion; the accelerator's key lists (with the
-        // `cayenne_`-prefixed aliases) and its unset defaults are mirrored here.
+        // `cayenne_`-prefixed aliases) are mirrored here, and its unset defaults
+        // come with the profile.
         if profile.inlines_small_writes {
             let inline_entry =
-                parse_u64(&params, &["cayenne_inline_max_bytes", "inline_max_bytes"]).unwrap_or(
-                    u64::try_from(cayenne::metadata::DEFAULT_INLINE_MAX_BYTES).unwrap_or(u64::MAX),
-                );
+                parse_u64(&params, &["cayenne_inline_max_bytes", "inline_max_bytes"])
+                    .unwrap_or(u64::try_from(profile.inline_max_bytes).unwrap_or(u64::MAX));
             let inline_buffer = parse_u64(
                 &params,
                 &["cayenne_inline_max_buffer_bytes", "inline_max_buffer_bytes"],
             )
-            .unwrap_or(
-                u64::try_from(cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES)
-                    .unwrap_or(u64::MAX),
-            );
+            .unwrap_or(u64::try_from(profile.inline_max_buffer_bytes).unwrap_or(u64::MAX));
             total = total
                 .saturating_add(inline_entry)
                 .saturating_add(inline_buffer);
+        }
+
+        // The inline memtable accumulates inlined writes until a flush, on every
+        // profile that inlines writes and keeps them across writes; a whole-table
+        // replace (no compaction) keeps one entry, which the admission state above
+        // already counts.
+        if profile.inlines_small_writes && profile.needs_compaction {
+            // Inline memtable is byte-valued; match the accelerator's key list including
+            // the `cayenne_`-prefixed aliases (see the `accelerator-cayenne` crate).
+            let inline = parse_u64(
+                &params,
+                &[
+                    "cayenne_inline_flush_max_bytes",
+                    "inline_flush_max_bytes",
+                    "cayenne_inline_memtable_max_bytes",
+                    "inline_memtable_max_bytes",
+                ],
+            )
+            .unwrap_or(DEFAULT_INLINE_BYTES);
+            total = total.saturating_add(inline);
         }
 
         if !profile.uses_cdc_tier {
             continue;
         }
         // Write-path state below: only a small-write (CDC-profile) table populates
-        // the keyset, the coalesce buffer, or the inline memtable.
+        // the keyset or the coalesce buffer.
         //
         // MB-valued cache params -> bytes; else the accelerator's auto host-fraction cap.
         let keyset = parse_u64(
@@ -1651,25 +1675,10 @@ fn estimate_cayenne_reservation_bytes(
             || (total_memory / KEYSET_CACHE_HOST_FRACTION).clamp(256 * MIB, 8 * GIB),
             |mb| mb.saturating_mul(MIB),
         );
-        // Inline memtable is byte-valued; match the accelerator's key list including
-        // the `cayenne_`-prefixed aliases (see the `accelerator-cayenne` crate).
-        let inline = parse_u64(
-            &params,
-            &[
-                "cayenne_inline_flush_max_bytes",
-                "inline_flush_max_bytes",
-                "cayenne_inline_memtable_max_bytes",
-                "inline_memtable_max_bytes",
-            ],
-        )
-        .unwrap_or(DEFAULT_INLINE_BYTES);
         // Per-dataset coalesce override wins over the global (mirrors cdc_config_overlay).
         let coalesce =
             parse_u64(&params, &["cdc_max_coalesced_bytes"]).unwrap_or(global_coalesce_bytes);
-        total = total
-            .saturating_add(keyset)
-            .saturating_add(coalesce)
-            .saturating_add(inline);
+        total = total.saturating_add(keyset).saturating_add(coalesce);
     }
 
     // Scan-path cache: one process-wide cache shared by every table, so it is
