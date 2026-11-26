@@ -131,13 +131,13 @@ pub fn state_location_of(data_path: &str) -> Option<String> {
         .map(str::to_string)
         .collect();
     // `<location>/cayenne/v1/datasets/<folder>/data`.
-    let keep = segments
-        .len()
-        .checked_sub(if segments.len() >= 5 && segments[segments.len() - 5] == "cayenne" {
+    let keep = segments.len().checked_sub(
+        if segments.len() >= 5 && segments[segments.len() - 5] == "cayenne" {
             5
         } else {
             4
-        })?;
+        },
+    )?;
     url.set_path(&format!("/{}", segments[..keep].join("/")));
     url.set_query(None);
     url.set_fragment(None);
@@ -574,7 +574,7 @@ mod replica_read_message_tests {
     #[test]
     fn durations_read_in_whole_units() {
         assert_eq!(describe_duration(Duration::from_hours(1)), "1 hour");
-        assert_eq!(describe_duration(Duration::from_secs(90 * 60)), "90 minutes");
+        assert_eq!(describe_duration(Duration::from_mins(90)), "90 minutes");
         assert_eq!(describe_duration(Duration::from_secs(15)), "15 seconds");
         assert_eq!(describe_duration(Duration::from_secs(1)), "1 second");
     }

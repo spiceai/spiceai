@@ -1411,8 +1411,8 @@ impl Inner {
                 if entries.is_empty() {
                     return Ok(self.followed(served));
                 }
-                let oldest = Self::oldest_prepared(&entries)
-                    .unwrap_or_else(|| reader.published_ms());
+                let oldest =
+                    Self::oldest_prepared(&entries).unwrap_or_else(|| reader.published_ms());
                 self.revision += 1;
                 self.note_followed_revision(oldest);
                 if let Err(error) = Self::apply_followed(&mut self.reader.state, entries) {
@@ -1478,7 +1478,8 @@ impl Inner {
         // The records after the floor carry their commit times. Commits folded
         // into the checkpoint are older, so a lag measured from these is a
         // lower bound.
-        let oldest = Self::oldest_prepared(&opened.records).unwrap_or_else(|| reader.published_ms());
+        let oldest =
+            Self::oldest_prepared(&opened.records).unwrap_or_else(|| reader.published_ms());
         let replayed = replay_state(opened)?;
         self.reader.state = replayed.state;
         self.revision += 1;

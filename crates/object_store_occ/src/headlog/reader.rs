@@ -92,7 +92,8 @@ impl Reader {
                 // since, a collector deleted it below the newer floor: open
                 // from the newer head. Otherwise it is missing, an error.
                 Err(error) if retries < OPEN_RETRIES && is_not_found(&error) => {
-                    let (latest, latest_published_ms) = read_head_at(store.as_ref(), &prefix).await?;
+                    let (latest, latest_published_ms) =
+                        read_head_at(store.as_ref(), &prefix).await?;
                     if latest.head.incarnation != state.head.incarnation
                         || latest.head.floor <= state.head.floor
                     {

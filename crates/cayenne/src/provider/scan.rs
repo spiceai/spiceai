@@ -1417,10 +1417,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
         let mapped: futures::stream::BoxStream<'static, Result<arrow::record_batch::RecordBatch>> =
             match read_deadline {
                 Some(deadline) => Box::pin(ReadDeadlineStream {
-                    input: Box::pin(RecordBatchStreamAdapter::new(
-                        Arc::clone(&schema),
-                        mapped,
-                    )),
+                    input: Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), mapped)),
                     deadline,
                     stopped: false,
                 }),

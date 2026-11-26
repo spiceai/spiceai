@@ -4923,7 +4923,9 @@ impl DataFusion {
             Some(engine) => engine.writer_role(dataset).await,
             None => None,
         };
-        let replica = writer_role.as_ref().is_some_and(|role| !*role.writes.borrow());
+        let replica = writer_role
+            .as_ref()
+            .is_some_and(|role| !*role.writes.borrow());
         if let Some(role) = &writer_role {
             self.runtime_status()
                 .set_dataset_writer(&dataset.name, role.writer.clone());

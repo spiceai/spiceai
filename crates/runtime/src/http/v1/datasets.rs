@@ -335,7 +335,9 @@ fn dataset_writer(df: &DataFusion, ds: &Dataset) -> Option<String> {
     ds.acceleration.as_ref().filter(|a| a.enabled)?;
     match df.runtime_status().dataset_writer(&ds.name) {
         runtime_status::WriterKnown::Shared(writer) => writer,
-        runtime_status::WriterKnown::NotShared => Some(util::instance_id::instance_id().to_string()),
+        runtime_status::WriterKnown::NotShared => {
+            Some(util::instance_id::instance_id().to_string())
+        }
     }
 }
 

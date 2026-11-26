@@ -2174,7 +2174,9 @@ pub fn replica_lags() -> Vec<(String, Duration)> {
 fn unix_time_ms_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 fn scan_view_instant_as_ns(now: Instant) -> u64 {
@@ -35432,10 +35434,8 @@ impl CayenneTableProvider {
         let unreachable = |cause: String| Error::QueryRead {
             source: crate::dataset_storage::QueryReadError::LocationUnreachable {
                 dataset: self.table_metadata.table_name.clone(),
-                location: crate::metastore_layout::state_location_of(
-                    &self.table_metadata.path,
-                )
-                .unwrap_or_else(|| self.table_metadata.path.clone()),
+                location: crate::metastore_layout::state_location_of(&self.table_metadata.path)
+                    .unwrap_or_else(|| self.table_metadata.path.clone()),
                 cause,
             },
         };
@@ -38696,14 +38696,14 @@ impl CayenneTableProvider {
             task::spawn_blocking(move || {
                 provider.build_scan_view(raw, structural_version, captured_at)
             })
-                .await
-                .map_err(|join_error| {
-                    Arc::new(datafusion_common::DataFusionError::Execution(format!(
-                        "scan-view build task failed to join: {join_error}"
-                    )))
-                })?
-                .map(Arc::new)
-                .map_err(Arc::new)
+            .await
+            .map_err(|join_error| {
+                Arc::new(datafusion_common::DataFusionError::Execution(format!(
+                    "scan-view build task failed to join: {join_error}"
+                )))
+            })?
+            .map(Arc::new)
+            .map_err(Arc::new)
         }
         .boxed()
         .shared();

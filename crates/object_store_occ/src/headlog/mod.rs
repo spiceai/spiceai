@@ -334,7 +334,9 @@ impl Writer {
             spilled: None,
             prepared_unix_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX)),
+                .map_or(0, |since| {
+                    u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+                }),
         };
         let mut encoded = record.encode_to_vec();
         // A large record would let a few records fill a batch; its payload
