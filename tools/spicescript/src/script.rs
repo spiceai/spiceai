@@ -457,6 +457,9 @@ pub enum Action {
         /// `upgrade`: start again on the binary under test (from the one
         /// `--from` started the instance on).
         upgrade: bool,
+        /// `downgrade`: start again on the binary the instance started on, the
+        /// release `from:` or `--from` names, as a rollback does.
+        downgrade: bool,
     },
     WaitReady {
         timeout: Duration,
@@ -557,11 +560,20 @@ pub enum Action {
         keep: Vec<String>,
     },
     /// Checks the files under the instance's directory, by path relative to it,
-    /// and that no directory matches `lacks_dirs` (paths end in `/`).
+    /// that no directory matches `lacks_dirs` (paths end in `/`), and that every
+    /// file `unchanged_since` names (a `mark-files` id) is still there, unchanged.
     AssertFiles {
         contains: Vec<regex::Regex>,
         lacks: Vec<regex::Regex>,
         lacks_dirs: Vec<regex::Regex>,
+        unchanged_since: Option<String>,
+    },
+    /// Keep the size and a digest of every file under the instance's directory
+    /// whose relative path matches one of `matching` (every file when it is
+    /// empty), for a later `assert-files: { unchanged-since: <id> }`.
+    MarkFiles {
+        id: String,
+        matching: Vec<regex::Regex>,
     },
     StopBackground {
         id: String,
@@ -1659,6 +1671,7 @@ const ACTIONS: &[&str] = &[
     "kill-spiced",
     "restart",
     "upgrade",
+    "downgrade",
     "wait-ready",
     "edit-spicepod",
     "flight-put",
@@ -1685,6 +1698,7 @@ const ACTIONS: &[&str] = &[
     "dbgen",
     "source-query",
     "assert-files",
+    "mark-files",
     "wipe-instance-dir",
     "stop-background",
     "spice",
@@ -1719,6 +1733,7 @@ const REACH_NO_SPICED: &[&str] = &[
 /// has none of.
 const UPSTREAM_ONLY: &[&str] = &[
     "upgrade",
+    "downgrade",
     "kill-executor",
     "start-executors",
     "add-executor",
@@ -1733,6 +1748,7 @@ const FAULT_ACTIONS: &[&str] = &[
     "kill-spiced",
     "restart",
     "upgrade",
+    "downgrade",
     "wait-ready",
     "kill-executor",
     "start-executors",
@@ -1840,12 +1856,13 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
         "kill-spiced" => Action::Kill {
             signal: parse_signal(arg.get("signal"))?.unwrap_or(KillSignal::Kill),
         },
-        "restart" | "upgrade" => Action::Restart {
+        "restart" | "upgrade" | "downgrade" => Action::Restart {
             wait_ready: wait_ready(&arg)?,
             patch: patch(&arg)?,
             kill: parse_signal(arg.get("kill"))?,
             ready_timeout: opts.duration_in(&arg, "ready-timeout")?,
             upgrade: name == "upgrade",
+            downgrade: name == "downgrade",
         },
         "kill-executor" => Action::KillExecutor(
             serde_json::from_value(arg.clone())
@@ -2089,20 +2106,25 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
         "assert-files" => {
             let mut inner = Opts::of_mapping(
                 arg,
-                "`assert-files` takes a mapping with `contains`, `lacks` or `lacks-dirs`",
+                "`assert-files` takes a mapping with `contains`, `lacks`, `lacks-dirs` or `unchanged-since`",
             )?;
             let contains = inner.patterns("contains")?;
             let lacks = inner.patterns("lacks")?;
             let lacks_dirs = inner.patterns("lacks-dirs")?;
+            let unchanged_since = inner.string("unchanged-since")?;
             inner.finish()?;
             ensure!(
-                !contains.is_empty() || !lacks.is_empty() || !lacks_dirs.is_empty(),
-                "`assert-files` needs `contains`, `lacks` or `lacks-dirs`"
+                !contains.is_empty()
+                    || !lacks.is_empty()
+                    || !lacks_dirs.is_empty()
+                    || unchanged_since.is_some(),
+                "`assert-files` needs `contains`, `lacks`, `lacks-dirs` or `unchanged-since`"
             );
             Action::AssertFiles {
                 contains,
                 lacks,
                 lacks_dirs,
+                unchanged_since,
             }
         }
         "wipe-instance-dir" => {
@@ -2629,6 +2651,23 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
             })
         }
         "mark-metrics" => Action::MarkMetrics(string_arg(&arg, name)?),
+        "mark-files" => {
+            if arg.is_string() {
+                Action::MarkFiles {
+                    id: string_arg(&arg, name)?,
+                    matching: Vec::new(),
+                }
+            } else {
+                let mut inner = Opts::of_mapping(
+                    arg,
+                    "`mark-files` takes an id, or a mapping with `id` and `matching`",
+                )?;
+                let id = inner.string("id")?.context("`mark-files` needs an `id`")?;
+                let matching = inner.patterns("matching")?;
+                inner.finish()?;
+                Action::MarkFiles { id, matching }
+            }
+        }
         "load" => Action::Load(parse_load(arg, base)?),
         "sleep" => Action::Sleep(parse_duration(&arg)?),
         _ => unreachable!("every name in ACTIONS is handled"),
@@ -3724,7 +3763,7 @@ steps:
             ),
             (
                 "{ queries: [SELECT 1], duration: 5s, recover-within: 1s, faults: [{ at: 1s, query: SELECT 1 }] }",
-                "a fault runs one of start, stop, kill-spiced, restart, upgrade, wait-ready, kill-executor, start-executors, add-executor, not `query`",
+                "a fault runs one of start, stop, kill-spiced, restart, upgrade, downgrade, wait-ready, kill-executor, start-executors, add-executor, not `query`",
             ),
             (
                 "{ queries: [SELECT 1], duration: 5s, recover-within: 1s, faults: [{ kill-executor: 0 }] }",
