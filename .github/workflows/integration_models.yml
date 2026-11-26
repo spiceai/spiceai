@@ -720,7 +720,7 @@ jobs:
           machine: ${{ runner.name }}
 
       - name: Upload test archive to spiceio
-        if: env.HAS_SPICEIO_SECRET == 'true'
+        if: env.HAS_SPICEIO_SECRET == 'true' && github.ref != 'refs/heads/trunk'
         env:
           SPICEIO_ENDPOINT: ${{ steps.setup-spiceio-build.outputs.endpoint }}
         run: |
@@ -729,8 +729,8 @@ jobs:
           archive_url="${SPICEIO_ENDPOINT%/}/${AI_INTEGRATION_EXTENDED_TEST_ARCHIVE_S3_URI#s3://}"
           curl --fail --silent --show-error --upload-file ./integration-extended.tar.zst "$archive_url"
 
+      # Also the only copy on trunk, which keeps the share off its builds.
       - name: Upload test archive
-        if: env.HAS_SPICEIO_SECRET != 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ai-integration-test-archive-extended

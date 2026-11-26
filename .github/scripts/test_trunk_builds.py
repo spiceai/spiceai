@@ -237,6 +237,33 @@ class ClusterImageTest(unittest.TestCase):
         self.assertEqual(len(re.findall(r'image_tag="trunk-', run)), 1)
 
 
+class ShareOffTrunkTest(unittest.TestCase):
+    """A step that needs the macOS share's endpoint runs only where the share is set up."""
+
+    def test_a_step_that_requires_the_share_is_kept_off_trunk_too(self):
+        checked = 0
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            jobs = (yaml.safe_load(path.read_text()) or {}).get("jobs") or {}
+            for name, job in jobs.items():
+                steps = (job or {}).get("steps") or []
+                guarded = [
+                    s["id"]
+                    for s in steps
+                    if "spiceio/.github/actions/setup@" in str(s.get("uses", ""))
+                    and s.get("id")
+                    and "github.ref != 'refs/heads/trunk'" in str(s.get("if", ""))
+                ]
+                for step in steps:
+                    env = step.get("env") or {}
+                    reads = [k for k, v in env.items() if any(f"steps.{i}.outputs.endpoint" in str(v) for i in guarded)]
+                    if not any(f"${{{k}:?" in str(step.get("run", "")) for k in reads):
+                        continue
+                    checked += 1
+                    with self.subTest(workflow=path.name, job=name, step=step.get("name")):
+                        self.assertIn("github.ref != 'refs/heads/trunk'", str(step.get("if", "")))
+        self.assertGreater(checked, 0)
+
+
 class MssqlBenchImageTest(unittest.TestCase):
     PINNED = re.compile(r"'ghcr\.io/spiceai/spice-mssql-bench@sha256:[0-9a-f]{64}'")
 
