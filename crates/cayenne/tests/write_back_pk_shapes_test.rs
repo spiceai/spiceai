@@ -36,7 +36,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
-use cayenne::{CayenneTableProviderBuilder, CayenneTransaction, MetadataCatalog};
+use cayenne::{CayenneTransaction, MetadataCatalog};
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
@@ -44,7 +44,7 @@ use datafusion_table_providers::util::{
 
 macro_rules! pk_shape_round_trip {
     ($name:ident, $key:expr) => {
-        test_with_backends!($name);
+        test_on_data_store!($name);
 
         async fn $name(fixture: common::TestFixture) -> Result<(), Box<dyn std::error::Error>> {
             assert_marker_round_trip(&fixture, Arc::new($key)).await
@@ -103,19 +103,24 @@ async fn write_back_table(
 
     let ctx = SessionContext::new();
     let catalog = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-        .with_durable_write_back(true)
-        .create(CreateTableOptions {
-            table_name: "write_back_marker".to_string(),
-            schema: Arc::clone(&schema),
-            primary_key: vec!["id".to_string()],
-            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-                "id".to_string(),
-            ]))),
-            base_path: fixture.data_path.to_string_lossy().to_string(),
-            partition_column: None,
-            vortex_config: VortexConfig::default(),
-        })
+    let provider = fixture
+        .data_store
+        .create_with(
+            catalog,
+            ctx.runtime_env(),
+            CreateTableOptions {
+                table_name: "write_back_marker".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                    "id".to_string(),
+                ]))),
+                base_path: fixture.data_store.base_path("write_back_marker"),
+                partition_column: None,
+                vortex_config: VortexConfig::default(),
+            },
+            |builder| builder.with_durable_write_back(true),
+        )
         .await?;
 
     Ok((provider, schema))
@@ -206,7 +211,7 @@ async fn assert_marker_round_trip(
     Ok(())
 }
 
-test_with_backends!(a_claim_cursor_reaches_every_marker_exactly_once);
+test_on_data_store!(a_claim_cursor_reaches_every_marker_exactly_once);
 
 /// The delivery worker pages the marker set, resuming past markers it could not
 /// deliver so one undeliverable key cannot pin the claim. That cursor has to be
@@ -244,7 +249,7 @@ async fn a_claim_cursor_reaches_every_marker_exactly_once(
     Ok(())
 }
 
-test_with_backends!(a_claim_cursor_reaches_newer_markers_past_an_undeliverable_page);
+test_on_data_store!(a_claim_cursor_reaches_newer_markers_past_an_undeliverable_page);
 
 /// The reason the cursor exists: a marker the worker cannot deliver stays in the
 /// table, and the claim is ordered by commit sequence, so re-claiming the oldest
@@ -299,7 +304,7 @@ async fn a_claim_cursor_reaches_newer_markers_past_an_undeliverable_page(
     Ok(())
 }
 
-test_with_backends!(a_claim_cursor_pages_a_marker_set_larger_than_one_claim);
+test_on_data_store!(a_claim_cursor_pages_a_marker_set_larger_than_one_claim);
 
 /// A claim page is bounded, so the marker set routinely outgrows it. Paging has
 /// to cover a set larger than one claim without repeating or skipping a marker.

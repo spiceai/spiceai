@@ -54,7 +54,7 @@ use crate::common;
 use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::metadata::{CdcDurability, CreateTableOptions, VortexConfig};
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, SlotAdvancer};
+use cayenne::{CayenneTableProvider, MetadataCatalog, SlotAdvancer};
 use common::TestFixture;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -98,7 +98,7 @@ async fn setup_table(
         schema: pk_schema(),
         primary_key: vec!["id".to_string()], // Int64 PK -> KEY-based deletion (the unguarded path)
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(name),
         partition_column: None,
         vortex_config: VortexConfig {
             // Every write lands in a Vortex file immediately, so the file-scan
@@ -110,8 +110,12 @@ async fn setup_table(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let table =
-        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
+    let table = Arc::new(
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), options)
+            .await?,
+    );
     ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
     Ok((table, ctx))
 }
@@ -203,7 +207,7 @@ async fn limit_underdelivery_key_deletion_impl(fixture: TestFixture) -> TestResu
     Ok(())
 }
 
-test_with_backends!(limit_underdelivery_key_deletion_impl);
+test_on_data_store!(limit_underdelivery_key_deletion_impl);
 
 /// Rows written durably before the in-memory deletes.
 const MEM_TIER_ROWS: i64 = 1_000;
@@ -299,7 +303,7 @@ async fn limit_with_in_memory_cdc_deletes(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.join(&name).to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(&name),
         partition_column: None,
         vortex_config: VortexConfig {
             cdc_durability: CdcDurability::Memory,
@@ -321,7 +325,9 @@ async fn limit_with_in_memory_cdc_deletes(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let mut table = Arc::new(
-        CayenneTableProvider::create_table(Arc::clone(&catalog), options, ctx.runtime_env())
+        fixture
+            .data_store
+            .create(Arc::clone(&catalog), ctx.runtime_env(), options)
             .await?,
     );
     table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
@@ -383,8 +389,9 @@ async fn limit_with_in_memory_cdc_deletes(
         ctx.deregister_table("t")?;
         drop(table);
         table = Arc::new(
-            CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
-                .open(&name)
+            fixture
+                .data_store
+                .open(Arc::clone(&catalog), ctx.runtime_env(), &name)
                 .await?,
         );
         table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
@@ -458,6 +465,6 @@ async fn limit_with_in_memory_cdc_deletes_after_checkpoints_impl(
     limit_with_in_memory_cdc_deletes(&fixture, DurableRows::CdcCheckpoints).await
 }
 
-test_with_backends!(limit_with_in_memory_cdc_deletes_after_overwrite_impl);
-test_with_backends!(limit_with_in_memory_cdc_deletes_after_reopen_impl);
-test_with_backends!(limit_with_in_memory_cdc_deletes_after_checkpoints_impl);
+test_on_data_store!(limit_with_in_memory_cdc_deletes_after_overwrite_impl);
+test_on_data_store!(limit_with_in_memory_cdc_deletes_after_reopen_impl);
+test_on_data_store!(limit_with_in_memory_cdc_deletes_after_checkpoints_impl);

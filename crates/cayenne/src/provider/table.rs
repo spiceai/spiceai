@@ -3669,7 +3669,7 @@ pub struct CayenneTableProvider {
     /// as it does an in-flight append's.
     staging_deletes_after_commit: Arc<ParkingMutex<HashSet<String>>>,
     /// Admission of change-stream appends to staging: each holds it shared while
-    /// it stages, and a write that tombstones keys holds it exclusively while it
+    /// it stages, and a key delete or an overwrite holds it exclusively while it
     /// waits for the appends staged before it to commit
     /// ([`Self::lock_write_after_staged_appends`]), so no new append stages ahead
     /// of it meanwhile.
@@ -3971,6 +3971,7 @@ pub struct CayenneTableProviderBuilder {
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
     secondary_indexes: Vec<Vec<String>>,
+    automatic_index_columns: Vec<String>,
     index_persistence: IndexPersistence,
     index_word_bits: Option<u32>,
     dataset_name: Option<Arc<str>>,
@@ -4000,13 +4001,35 @@ fn validated_lookup_index_keys(
     schema: &arrow_schema::Schema,
     indexes: &[Vec<String>],
     memory_mode: bool,
+    automatic_index_columns: &[String],
 ) -> CatalogResult<Vec<super::lookup_index::KeySpec>> {
     let invalid = |message| Error::InvalidConfiguration {
         table: table_name.to_string(),
         message,
     };
     let mut keys: Vec<super::lookup_index::KeySpec> = Vec::new();
-    for key in super::lookup_index::KeySpec::from_indexes(indexes) {
+    let mut indexes = indexes.to_vec();
+    // Requested metadata also covers tables whose stored column predates the
+    // marker. Only columns present in the opened schema receive an index.
+    indexes.extend(
+        automatic_index_columns
+            .iter()
+            .filter(|name| schema.column_with_name(name).is_some())
+            .map(|name| vec![name.clone()]),
+    );
+    indexes.extend(
+        schema
+            .fields()
+            .iter()
+            .filter(|field| {
+                field
+                    .metadata()
+                    .get(arrow_tools::metadata_keys::AUTOMATIC_INDEX_METADATA_KEY)
+                    .is_some_and(|value| value == "true")
+            })
+            .map(|field| vec![field.name().clone()]),
+    );
+    for key in super::lookup_index::KeySpec::from_indexes(&indexes) {
         let mut columns = Vec::with_capacity(key.columns().len());
         for column in key.columns() {
             let column =
@@ -4126,6 +4149,7 @@ struct CayenneTableProviderOpenOptions {
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
     secondary_indexes: Vec<Vec<String>>,
+    automatic_index_columns: Vec<String>,
     index_persistence: IndexPersistence,
     index_word_bits: Option<u32>,
     dataset_name: Option<Arc<str>>,
@@ -4183,6 +4207,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: false,
             scan_view_reuse: ScanViewReuse::UntilInvalidated,
             secondary_indexes: Vec::new(),
+            automatic_index_columns: Vec::new(),
             index_persistence: IndexPersistence::default(),
             index_word_bits: None,
             dataset_name: None,
@@ -4313,6 +4338,24 @@ impl CayenneTableProviderBuilder {
         self
     }
 
+    /// Request internal indexes from field metadata, independently of configured
+    /// indexes. Missing columns in an older stored schema are ignored on open.
+    #[must_use]
+    pub fn with_schema_indexes(mut self, schema: &arrow_schema::Schema) -> Self {
+        self.automatic_index_columns = schema
+            .fields()
+            .iter()
+            .filter(|field| {
+                field
+                    .metadata()
+                    .get(arrow_tools::metadata_keys::AUTOMATIC_INDEX_METADATA_KEY)
+                    .is_some_and(|value| value == "true")
+            })
+            .map(|field| field.name().clone())
+            .collect();
+        self
+    }
+
     /// Whether the secondary index runs persist as run files. Hidden, for
     /// testing.
     #[doc(hidden)]
@@ -4350,6 +4393,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
             secondary_indexes: self.secondary_indexes,
+            automatic_index_columns: self.automatic_index_columns,
             index_persistence: self.index_persistence,
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
@@ -4376,6 +4420,7 @@ impl CayenneTableProviderBuilder {
             &options.schema,
             &self.secondary_indexes,
             options.vortex_config.memory_mode,
+            &self.automatic_index_columns,
         )?;
         // A create of a table the catalog holds opens it (a restart creates
         // every table again); an error reading it counts as a new table, which
@@ -4392,6 +4437,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
             secondary_indexes: self.secondary_indexes,
+            automatic_index_columns: self.automatic_index_columns,
             index_persistence: self.index_persistence,
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
@@ -4485,6 +4531,25 @@ pub(crate) fn refused_until_reload(refuses_queries: bool) -> &'static str {
         "writes and queries are refused"
     } else {
         "writes are refused"
+    }
+}
+
+/// The error of a commit by `writer` (such as "a write") to `table` that failed
+/// with `error`, and whose outcome could not be read back (`read_error`): its
+/// files are kept, and the table refuses what [`refused_until_reload`] names.
+pub(crate) fn unresolved_commit_error(
+    table: String,
+    writer: &str,
+    error: &dyn std::fmt::Display,
+    read_error: &dyn std::fmt::Display,
+    refuses_queries: bool,
+) -> Error {
+    Error::IncompleteWrite {
+        table,
+        message: format!(
+            "{writer}'s commit failed ({error}), and reading back whether it committed failed too ({read_error}). Its files are kept, and {} until the table is reloaded from its catalog. Restart Spice to reload it",
+            refused_until_reload(refuses_queries)
+        ),
     }
 }
 
@@ -7342,12 +7407,20 @@ impl CayenneTableProvider {
         !self.pk_deletion_strategy.is_position_based() && self.upsert_bloom_eligible()
     }
 
-    /// `write_lock`, for a write that tombstones keys, taken once every append
-    /// staged before this call has committed or been abandoned, so the write
-    /// acts on the appended rows like on every other committed row (see
-    /// [`Self::key_tombstones_wait_for_staged_appends`]). The wait holds
-    /// [`Self::append_admission`] so no append stages meanwhile, and not
-    /// `write_lock`, which an append into the current snapshot takes to commit.
+    /// `write_lock`, taken once every append staged before this call has
+    /// committed or been abandoned, so the write acts on the appended rows like
+    /// on every other committed row: a key delete (see
+    /// [`Self::key_tombstones_wait_for_staged_appends`]) or an overwrite, which
+    /// replaces them. `write` names the waiting write in the timeout error.
+    ///
+    /// The wait holds [`Self::append_admission`], so no new append stages
+    /// meanwhile, and not `write_lock`, which an append into the current
+    /// snapshot takes to commit. A same-record scope that already holds
+    /// unpublished changes to this table writes past it: the wait is for that
+    /// scope's record, which commits only after the scope's last write. Such a
+    /// write can stage while the wait holds admission, so the lock is taken
+    /// only once nothing is in flight under it, which no append can change
+    /// while it is held.
     ///
     /// # Errors
     ///
@@ -7355,21 +7428,41 @@ impl CayenneTableProvider {
     /// committed within the drain timeout.
     pub(crate) async fn lock_write_after_staged_appends(
         &self,
+        write: &str,
     ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
-        let _admission = self.append_admission.write().await;
-        if !self
-            .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
-            .await
-        {
-            return Err(Error::Internal {
-                table: self.table_metadata.table_name.clone(),
-                message: format!(
-                    "A change-stream write did not commit within {} s, so the delete or update was not applied; retry it",
-                    STAGED_WRITE_DRAIN_TIMEOUT.as_secs()
-                ),
-            });
+        let _admission = if self.scope_has_unpublished_changes() {
+            None
+        } else {
+            Some(self.append_admission.write().await)
+        };
+        let deadline = Instant::now() + STAGED_WRITE_DRAIN_TIMEOUT;
+        loop {
+            if !self
+                .drain_inflight_staged_writes(deadline.saturating_duration_since(Instant::now()))
+                .await
+            {
+                return Err(Error::Internal {
+                    table: self.table_metadata.table_name.clone(),
+                    message: format!(
+                        "A change-stream write did not commit within {} s, so {write} was not applied; retry it",
+                        STAGED_WRITE_DRAIN_TIMEOUT.as_secs()
+                    ),
+                });
+            }
+            let write_guard = self.write_lock_arc().lock_owned().await;
+            if !self.staged_writes_inflight_by_others() {
+                return Ok(write_guard);
+            }
         }
-        Ok(self.write_lock_arc().lock_owned().await)
+    }
+
+    /// Whether a key delete or an overwrite holds [`Self::append_admission`]
+    /// while it waits for the appends staged before it, so a test can start a
+    /// write only once that wait has begun. `#[doc(hidden)]`: not a stable API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn append_admission_held_exclusively(&self) -> bool {
+        self.append_admission.try_read().is_err()
     }
 
     /// Wait for in-flight pipelined Stage-B publishes (staged WALs, staged
@@ -7388,15 +7481,19 @@ impl CayenneTableProvider {
     /// lock + listing fence and therefore completes under the held lock.
     pub(crate) async fn drain_inflight_staged_writes(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
-        while self.staging_appends_inflight_by_others()
-            || self.inline_changes_unpublished_by_others()
-        {
+        while self.staged_writes_inflight_by_others() {
             if Instant::now() >= deadline {
                 return false;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         true
+    }
+
+    /// Whether a write of another same-record scope, or of none, has staged or
+    /// committed a change that is not yet published.
+    fn staged_writes_inflight_by_others(&self) -> bool {
+        self.staging_appends_inflight_by_others() || self.inline_changes_unpublished_by_others()
     }
 
     pub(crate) fn staging_wal_present(&self) -> &AtomicBool {
@@ -7501,15 +7598,18 @@ impl CayenneTableProvider {
         ));
 
         let lock_wait_start = Instant::now();
-        // Held while this append stages: a key delete waiting for the appends
-        // staged before it holds it exclusively
+        // Held while this append stages: a key delete or an overwrite waiting
+        // for the appends staged before it holds it exclusively
         // (`lock_write_after_staged_appends`). Not taken under an outer
-        // `write_lock` hold, which already excludes that delete.
-        let _admission = if super::write_lock_held::is_held() {
-            None
-        } else {
-            Some(self.append_admission.read().await)
-        };
+        // `write_lock` hold, which already excludes that write, nor by a
+        // same-record scope that already holds unpublished changes here, whose
+        // record that write may be waiting for.
+        let _admission =
+            if super::write_lock_held::is_held() || self.scope_has_unpublished_changes() {
+                None
+            } else {
+                Some(self.append_admission.read().await)
+            };
         // Autocommit UPDATE already holds `write_lock`. A second acquire
         // deadlocks. `acquire_or_share` reuses that hold; spawned commit
         // keeps a clone of it (task-locals do not cross `tokio::spawn`).
@@ -12079,6 +12179,7 @@ impl CayenneTableProvider {
             durable_write_back,
             scan_view_reuse,
             secondary_indexes,
+            automatic_index_columns,
             index_persistence,
             index_word_bits,
             dataset_name,
@@ -12338,6 +12439,7 @@ impl CayenneTableProvider {
             &table_metadata.schema,
             &secondary_indexes,
             table_metadata.vortex_config.memory_mode,
+            &automatic_index_columns,
         )?;
         // Shared with the lookup index, which invalidates cached scan views when
         // its published index changes.
@@ -24542,6 +24644,7 @@ impl CayenneTableProvider {
                     &new_snapshot_id,
                 )
                 .await
+                && !self.compaction_commit_landed(&new_snapshot_id, &e).await?
             {
                 drop(listing_guard);
                 self.cleanup_failed_compaction_snapshot(&new_snapshot_id)
@@ -29438,6 +29541,7 @@ impl CayenneTableProvider {
             if let Err(e) = self
                 .commit_snapshot_rewrite(&snapshot_id_before, &new_snapshot_id, &scope, cold_cap)
                 .await
+                && !self.compaction_commit_landed(&new_snapshot_id, &e).await?
             {
                 drop(listing_guard);
                 self.cleanup_failed_compaction_snapshot(&new_snapshot_id)
@@ -32933,6 +33037,56 @@ impl CayenneTableProvider {
                 new_snapshot_id,
                 self.table_metadata.table_name
             );
+        }
+    }
+
+    /// Whether the compaction commit that makes `new_snapshot_id` current
+    /// landed although it reported `error`. A commit to a table in the
+    /// object-native location may land with its response lost; the table then
+    /// reads its state back in the background, and this waits for that and reads
+    /// the current snapshot, as a failed write does
+    /// ([`super::append_commit::resolve_failed_commit`]). The caller holds the
+    /// listing fence, so no append commits to the replaced snapshot meanwhile,
+    /// and publishes the output when it landed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::IncompleteWrite`] when the state cannot be read back: the output
+    /// is kept, and the table refuses writes and queries until it is reloaded.
+    async fn compaction_commit_landed(
+        &self,
+        new_snapshot_id: &str,
+        error: &crate::catalog::CatalogError,
+    ) -> Result<bool> {
+        if !self.data_in_object_native_location() {
+            return Ok(false);
+        }
+        let table = self.table_metadata.table_name.as_str();
+        match super::append_commit::once_readable(|| self.catalog.get_table(table)).await {
+            Ok(metadata) => {
+                let landed = metadata.current_snapshot_id == new_snapshot_id;
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table,
+                    new_snapshot_id,
+                    landed,
+                    %error,
+                    "Read back the outcome of a compaction commit that reported a failure"
+                );
+                Ok(landed)
+            }
+            Err(read_error) => {
+                self.uncommitted_files.forget(new_snapshot_id);
+                self.publication_outcome_unknown
+                    .store(true, Ordering::Release);
+                Err(unresolved_commit_error(
+                    table.to_string(),
+                    "a compaction",
+                    error,
+                    &read_error,
+                    true,
+                ))
+            }
         }
     }
 
