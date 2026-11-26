@@ -4,6 +4,7 @@
 # Spice serves the value from before the write, and the write never reaches
 # PostgreSQL once it accepts writes again.
 name: postgres-write-back-pending-across-rebuild
+duration: 70s
 description: >
   A write-back write still pending delivery survives a restart in which the
   acceleration is rebuilt from the source: Spice keeps serving it, and it

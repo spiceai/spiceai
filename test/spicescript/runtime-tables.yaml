@@ -1,4 +1,5 @@
 name: runtime-tables
+duration: 309s
 description: >
   Spice's own system tables are Cayenne tables held in memory and keep their
   SQL surface. runtime.task_history and

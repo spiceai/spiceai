@@ -1,4 +1,5 @@
 name: mongodb-schema
+duration: 70s
 tags: [long]
 description: >
   MongoDB collections whose schema is not known at startup, federated and

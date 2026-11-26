@@ -4,6 +4,7 @@
 # answers success and the dataset reports Ready.
 # Move this script to test/spicescript/ once it passes.
 name: schema-add-column-full-refresh
+duration: 50s
 description: >
   Under full refresh, a column added at the source is served by
   append_new_columns and sync_all_columns after the next refresh, and block

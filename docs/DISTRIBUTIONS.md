@@ -57,7 +57,7 @@ The default distribution includes the standard data and AI/ML feature set. This 
 **Installation:**
 
 ```bash
-curl https://install.spiceai.org | /bin/bash
+curl -fsSL https://install.spiceai.org | sh
 ```
 
 **Docker:**

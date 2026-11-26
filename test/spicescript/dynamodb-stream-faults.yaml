@@ -1,4 +1,5 @@
 name: dynamodb-stream-faults
+duration: 173s
 tags: [long]
 description: >
   A DynamoDB Streams changes-mode acceleration survives faults in the stream

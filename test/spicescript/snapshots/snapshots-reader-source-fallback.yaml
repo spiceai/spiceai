@@ -1,4 +1,5 @@
 name: snapshots-reader-source-fallback
+duration: 55s
 description: >
   Explicit snapshot readers retain their configured source fallback: before
   publication on_registration serves source rows, and on_zero_results:

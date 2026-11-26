@@ -1,4 +1,5 @@
 name: mysql-types-acceleration
+duration: 23s
 tags: [long]
 description: >
   A MySQL table with every common type (bit, unsigned, time, blob, set, JSON

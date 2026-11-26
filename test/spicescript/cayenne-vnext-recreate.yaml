@@ -1,4 +1,5 @@
 name: cayenne-vnext-recreate
+duration: 7s
 description: >
   Three Cayenne datasets on SQLite move to `runtime.params.cayenne_vnext`,
   where each loads from its source into the object-native metastore while its

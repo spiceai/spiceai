@@ -1,4 +1,5 @@
 name: snapshots-policies
+duration: 34s
 description: >
   When Cayenne snapshots are written and read. On a time interval with
   `snapshots_creation_policy: always`, one per interval whether or not the

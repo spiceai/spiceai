@@ -5,6 +5,7 @@
 # each template once. Every answer must still be the one the source gives for
 # that lookup's own values.
 name: sidecar-parameterized-lookups
+duration: 6s
 description: >
   Through a sidecar, lookups that differ only in their key values answer as
   PostgreSQL does, and the upstream receives them as parameterized Substrait
