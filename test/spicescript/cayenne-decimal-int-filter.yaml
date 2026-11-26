@@ -5,6 +5,7 @@
 # decimal(20,0)?". A partitioned table writes files from its first load; any
 # table does once it flushes.
 name: cayenne-decimal-int-filter
+duration: 4s
 description: >
   A filter with arithmetic between a decimal column and an integer answers on
   a Cayenne acceleration as it does on PostgreSQL, whether the rows are in

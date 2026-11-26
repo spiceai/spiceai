@@ -1,4 +1,5 @@
 name: files-coverage
+duration: 152s
 tags: [long]
 description: >
   Tables read from Parquet and CSV files answer the extended corpus and

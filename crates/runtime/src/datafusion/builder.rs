@@ -1423,6 +1423,7 @@ impl DataFusionBuilder {
                 )
             }),
             schema_evolve_locks: TokioRwLock::new(HashMap::new()),
+            append_queues: parking_lot::Mutex::new(HashMap::new()),
             change_generations: super::change_generations::ChangeGenerations::default(),
             bootstrap_owners: parking_lot::Mutex::new(HashMap::new()),
             snapshot_writers: parking_lot::Mutex::new(HashMap::new()),

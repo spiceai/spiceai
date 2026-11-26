@@ -6,6 +6,7 @@
 # crates/runtime-acceleration/src/change_sink/cdc.rs). Reading it as a batch
 # panicked the refresh worker, and the dataset stayed in error.
 name: sidecar-append-stream-keyed
+duration: 6s
 description: >
   A sidecar dataset that reads an upstream dataset with a primary key over its
   append stream loads the upstream's rows.

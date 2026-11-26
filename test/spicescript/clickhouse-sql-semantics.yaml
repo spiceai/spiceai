@@ -1,4 +1,5 @@
 name: clickhouse-sql-semantics
+duration: 19s
 tags: [long]
 description: >
   ClickHouse federation preserves SQL NULL, Unicode, decimal aggregation and

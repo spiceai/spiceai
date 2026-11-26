@@ -400,7 +400,6 @@ impl Reload {
             batch,
             true,
             true,
-            false,
         ))
     }
 }

@@ -1,5 +1,6 @@
 # Known failing (#15540).
 name: cayenne-file-durability-date-key
+duration: 76s
 description: >
   Change capture into Cayenne with `cayenne_cdc_durability: file` applies
   deletes and updates to a table keyed on (int, date) as it does in the

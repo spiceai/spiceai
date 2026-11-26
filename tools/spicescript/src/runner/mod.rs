@@ -84,7 +84,7 @@ mod steps;
 
 use api::{http_step, refresh, source_query, spice_cli};
 use background::{start_background, stop_background};
-use checks::{assert_files, assert_log, assert_status, metric_value, wait_metric};
+use checks::{assert_files, assert_log, assert_status, mark_files, metric_value, wait_metric};
 use cluster::{
     bridge_address, check_bridged_sources, cluster_args, make_cluster_ready, published_to_bridge,
     spicepod_for_bridge, start_executors, undistributed_engine, unpartitionable_acceleration,
@@ -492,6 +492,9 @@ struct Instance {
     spiced: Spiced,
     /// The binary under test, which an `upgrade` step starts.
     target_binary: PathBuf,
+    /// The binary the instance started on, which a `downgrade` step starts:
+    /// the release `from:` or `--from` names, or else the binary under test.
+    first_binary: PathBuf,
     base_release: Option<crate::release::BaseRelease>,
     /// The cluster executors started beside `spiced` (by `--cluster`,
     /// `defaults.cluster` or `defaults.executor-args`), spares last.
@@ -527,6 +530,8 @@ struct Instance {
     background: BTreeMap<String, Background>,
     /// `/metrics` scrapes taken by `mark-metrics`, by id.
     metric_marks: BTreeMap<String, String>,
+    /// Files recorded by `mark-files`, by id.
+    file_marks: BTreeMap<String, checks::FileMarks>,
     /// When this instance began each corpus's queries, by corpus position:
     /// the start of the `eventually` limit they share.
     corpus_started: BTreeMap<usize, Instant>,
@@ -1407,7 +1412,7 @@ async fn create_instances(
                 })
                 .transpose()
                 .context("the sidecar")?;
-            let mut spiced = Spiced::new(first_binary, dir, env)?;
+            let mut spiced = Spiced::new(first_binary.clone(), dir, env)?;
             let port = |name: &str| {
                 context["instance"][name]
                     .as_u64()
@@ -1431,6 +1436,7 @@ async fn create_instances(
                 variant: variant_name.clone(),
                 spiced,
                 target_binary: target.binary.clone(),
+                first_binary,
                 base_release: base_release.cloned(),
                 active_executors: executors.len().saturating_sub(spare_count),
                 executors,
@@ -1441,6 +1447,7 @@ async fn create_instances(
                 broken: None,
                 answers: BTreeMap::new(),
                 metric_marks: BTreeMap::new(),
+                file_marks: BTreeMap::new(),
                 named: BTreeMap::new(),
                 context: context_for_steps,
                 spice_cli: options.spice_cli.clone(),

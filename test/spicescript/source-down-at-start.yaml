@@ -1,4 +1,5 @@
 name: source-down-at-start
+duration: 18s
 tags: [long]
 description: >
   A dataset whose source is unreachable when Spice first starts reports the

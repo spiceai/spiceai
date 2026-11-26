@@ -1,4 +1,5 @@
 name: snapshots-reader-publication-failures
+duration: 217s
 description: >
   A snapshot reader keeps serving the exact loaded rows when published
   metadata rolls back, names a missing archive, or fails checksum verification

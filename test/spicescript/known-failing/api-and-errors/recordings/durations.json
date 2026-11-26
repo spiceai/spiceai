@@ -1,7 +1,0 @@
-{
-  "config-errors-known": 124,
-  "connector-errors-gaps": 153,
-  "http-float-specials": 4,
-  "refresh-api-changes": 8,
-  "refresh-api-invalid-sql": 6
-}

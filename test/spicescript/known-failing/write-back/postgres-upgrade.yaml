@@ -3,6 +3,7 @@
 # rebuilds the write-back acceleration from the source, and a rebuild loses the
 # write-back write still pending at the upgrade. From 2.4.x it passes.
 name: postgres-upgrade
+duration: 63s
 description: >
   A runtime upgraded in place from each of the last two releases keeps serving what it held: a file acceleration on Cayenne
   answers as before and as the source does, a CDC acceleration

@@ -1,5 +1,6 @@
 name: query-protocols
-tags: [long]
+duration: 24s
+tags: [long, macos-smoke]
 description: >
   Documented SQL functions and syntax, plus seeded random queries, return the
   same rows over Flight, Flight SQL and HTTP JSON.

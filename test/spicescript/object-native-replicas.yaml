@@ -1,4 +1,5 @@
 name: object-native-replicas
+duration: 83s
 description: >
   Two instances run the same Spicepod against one state location and one
   Postgres source. The first to start writes the dataset; the second serves its
