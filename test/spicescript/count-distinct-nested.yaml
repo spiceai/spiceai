@@ -1,0 +1,52 @@
+name: count-distinct-nested
+description: >
+  Several COUNT(DISTINCT …) in one query, one of them over a list or a
+  struct, count 50,000 distinct nested values under a 512 MiB
+  `runtime.query.memory_limit`, grouped or not, read from Parquet in place
+  and accelerated into Cayenne. Each stored distinct value is charged for its
+  own bytes, not for the batch it was read from (spiceai/datafusion#287).
+
+sources:
+  lake: { kind: files }
+
+variants:
+  federated: {}
+  cayenne: cayenne-file
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: count-distinct-nested
+  runtime:
+    query: { memory_limit: 512MiB }
+  datasets:
+    - from: 'file://${sources.lake.path}/t/'
+      name: t
+      params: { file_format: parquet }
+
+defaults:
+  compare-variants: false
+
+steps:
+  - generate:
+      lake:
+        table: t
+        rows: 50000
+        seed: 7
+        primary-key: id
+        format: parquet
+        files: 2
+        columns:
+          - { name: id, sequence: 0 }
+  - start: {}
+  - query: SELECT count(*) AS n FROM t
+    expect: { rows: [['50000']] }
+  # Two distincts, so no single-distinct GROUP BY rewrite: each keeps its own set of values.
+  - query: SELECT count(DISTINCT [id, id + 1, id % 7]) AS dl, count(DISTINCT id % 5) AS dg FROM t
+    expect: { rows: [['50000', '5']] }
+  - query: SELECT count(DISTINCT named_struct('a', id, 'b', id % 7)) AS ds, count(DISTINCT id % 5) AS dg FROM t
+    expect: { rows: [['50000', '5']] }
+  - query: SELECT id % 5 AS g, count(DISTINCT [id, id % 7]) AS dl, count(DISTINCT id % 3) AS d3 FROM t GROUP BY id % 5 ORDER BY g
+    expect: { rows: [['0', '10000', '3'], ['1', '10000', '3'], ['2', '10000', '3'], ['3', '10000', '3'], ['4', '10000', '3']] }

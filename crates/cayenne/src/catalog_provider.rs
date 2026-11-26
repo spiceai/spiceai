@@ -320,8 +320,8 @@ impl CayenneCatalogProvider {
 
         // Initialize SQLite catalog
         let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
-        let catalog = Arc::new(CayenneCatalog::new(connection_string).context(CatalogInitSnafu)?)
-            as Arc<dyn MetadataCatalog>;
+        let catalog = CayenneCatalog::new(connection_string).context(CatalogInitSnafu)?;
+        let catalog = Arc::new(catalog) as Arc<dyn MetadataCatalog>;
 
         catalog.init().await.context(CatalogInitSnafu)?;
 

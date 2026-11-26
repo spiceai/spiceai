@@ -24,6 +24,9 @@ use scheduler::task::ScheduledTask;
 use tonic::async_trait;
 use tracing_futures::Instrument;
 
+use runtime_auth::{AuthPrincipalRef, AuthRequestContext, SystemPrincipal};
+use runtime_request_context::{Protocol, RequestContext};
+
 use crate::Runtime;
 use crate::http::v1::run_sql;
 
@@ -96,7 +99,20 @@ impl ScheduledTask for WorkerPromptTask {
                 return Ok(());
             };
 
-            if let Err(e) = model.chat_request(chat_request).await {
+            // The prompt is the operator's, configured in the Spicepod, so it runs as the
+            // runtime acting for the operator: with write access, so its model may call the
+            // read-write tools (an MCP server's, `store_memory`) the operator gave it. With no
+            // principal it could only read.
+            let outcome: std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> =
+                async {
+                    let context = Arc::new(RequestContext::builder(Protocol::Internal).build());
+                    let principal: AuthPrincipalRef = Arc::new(SystemPrincipal);
+                    context.set_auth_principal(principal)?;
+                    context.scope(model.chat_request(chat_request)).await?;
+                    Ok(())
+                }
+                .await;
+            if let Err(e) = outcome {
                 tracing::error!(
                     "Failed to execute worker prompt task for worker '{worker_name}': {e}",
                 );

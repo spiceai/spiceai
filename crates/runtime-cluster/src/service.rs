@@ -1494,7 +1494,7 @@ mod tests {
         let metadata = store
             .get_cached_table_metadata(&table)
             .expect("metadata entry must exist for zero-partition table");
-        assert!(metadata.partitions.is_empty());
+        assert_eq!(metadata.partitions, [] as [PartitionMetadata; 0]);
         assert!(
             metadata.updated_at > 0,
             "updated_at must be stamped so the readiness shortcut can trip"
@@ -2345,7 +2345,7 @@ mod tests {
         ));
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let handles = registry
-            .register("exec1".to_string(), "p1", tx)
+            .register("exec1".to_string(), "p1", None, tx)
             .await
             .handles;
         let mut updates = ack_and_forward(rx, handles.pending_acks);

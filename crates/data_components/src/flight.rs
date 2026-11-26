@@ -50,11 +50,23 @@ use tonic::metadata::MetadataMap;
 
 use self::write::FlightTableWriter;
 
+mod delegated_search;
 #[cfg(test)]
 pub(crate) mod dictionary_id_fixture;
 pub mod federation;
 pub mod stream;
 mod substrait;
+pub mod substrait_parameters;
+
+pub use substrait::{
+    ParameterizedProbeIntervals, SpiceSubstraitRead, SubstraitTemplate,
+    parameterized_plans_refused, probe_takes_parameterized_plans_for_tests,
+    set_parameterized_probe_intervals_for_tests, spice_substrait_read,
+};
+
+pub use delegated_search::{
+    SEARCH_CALL_TYPE_URL, SEARCH_SCORE_COLUMN, delegated_search, delegated_search_schema,
+};
 pub mod write;
 
 #[derive(Debug, Snafu)]

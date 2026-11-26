@@ -54,8 +54,12 @@ pub mod wire;
 // crate boundary, which the in-crate definition never had to allow.
 #[snafu(visibility(pub))]
 pub enum Error {
+    /// The provider's error can quote the request URL, built from the model's `endpoint`,
+    /// so URL credentials are removed from it: the message is logged and reported by
+    /// `/v1/models`.
     #[snafu(display(
-        "Failed to check the status of the model. An error occurred: {source} Verify the model configuration."
+        "Failed to check the status of the model. An error occurred: {} Verify the model configuration.",
+        redact::redact_message_credentials(&source.to_string())
     ))]
     HealthCheckError {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -87,6 +91,14 @@ pub enum Error {
         "Failed to load the model. An error occurred: {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToLoadModel {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// The model's provider refused, or could not be reached for, the exchange that gives the
+    /// model its access token. The source names the provider, its reason and where to look, so it
+    /// is the whole message.
+    #[snafu(display("{source}"))]
+    FailedToAuthenticate {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
@@ -128,8 +140,12 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// `from` is shown without the credentials a URL in it can carry: the message is logged
+    /// and reported by `/v1/models`. It is redacted as a whole source, so a secret with a
+    /// space in it goes too.
     #[snafu(display(
-        "An unsupported model source was specified in the 'from' parameter: '{from}'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/models"
+        "An unsupported model source was specified in the 'from' parameter: '{}'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/models",
+        redact::redact_source_credentials(from)
     ))]
     UnknownModelSource { from: String },
 
@@ -189,6 +205,24 @@ pub enum Error {
         "Model '{model}' is split across nodes over connections that are neither authenticated nor encrypted, so it loads only when spiced runs with `--allow-insecure-connections`. Start spiced with `--allow-insecure-connections` on every node in `nodes`, and only on a trusted private network: any host that reaches a node's GPU server can use that GPU."
     ))]
     InsecureConnectionsNotAllowed { model: String },
+
+    /// A model split across nodes that each load its weights named no quantization in `files`,
+    /// and the Hub's listing was not read, so this node chose among what its own cache holds.
+    /// `reason` says why only the cache was read, as a clause, and `pinned` is the `files`
+    /// entries that load `quantization`.
+    #[snafu(display(
+        "Model '{model}' is split across nodes by mistral.rs, which has each node load the weights itself, and {reason}, so this node chose quantization {quantization} among what its Hugging Face cache holds, and another node's cache need not hold the same. Name the quantization in the model's `files`, so that every node loads the same quantization: `files: [{pinned}]`. See: https://spiceai.org/docs/components/models/huggingface"
+    ))]
+    SplitModelChoseFromCache {
+        model: String,
+        quantization: String,
+        pinned: String,
+        reason: String,
+        /// Whether a retry cannot clear it: `HF_HUB_OFFLINE` or `TRANSFORMERS_OFFLINE` is set,
+        /// so only the `files` it names or a restart without them can. With the Hub out of reach
+        /// instead, a later load can read its listing.
+        configuration: bool,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -217,7 +251,8 @@ impl Error {
             | Self::ResponsesNotSupported { .. }
             // Only restarting spiced with `--allow-insecure-connections` clears it.
             | Self::InsecureConnectionsNotAllowed { .. } => true,
-            Self::FailedToDownloadModel { configuration, .. } => *configuration,
+            Self::FailedToDownloadModel { configuration, .. }
+            | Self::SplitModelChoseFromCache { configuration, .. } => *configuration,
             // A loader can wrap a configuration error, such as rejected pickle weights.
             Self::FailedToLoadModel { source } => source
                 .downcast_ref::<Self>()
@@ -227,6 +262,7 @@ impl Error {
             | Self::ModelNotFound { .. }
             | Self::FailedToLoadTokenizer { .. }
             | Self::ModelFileMissing { .. }
+            | Self::FailedToAuthenticate { .. }
             | Self::ToolNotFound { .. } => false,
         }
     }
@@ -643,6 +679,72 @@ mod tests {
 
     use super::{ApiErrorKind, Chat, Error, Result, SqlGeneration, message_to_content};
     use async_openai::error::ApiError;
+
+    /// A provider error quoting the request URL keeps the URL, without its credentials, and
+    /// the `)` that closes it.
+    #[test]
+    fn health_check_message_leaves_out_url_credentials() {
+        let error = Error::HealthCheckError {
+            source: "http error: error sending request for url (http://127.0.0.1:1/v1?api_key=abc123/chat/completions)".into(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "Failed to check the status of the model. An error occurred: http error: error sending request for url (http://127.0.0.1:1/v1?api_key=***) Verify the model configuration."
+        );
+    }
+
+    /// The message is logged and reported by `/v1/models`, so a credential in the URL a
+    /// model's `from` names stays out of it, and the rest of the source stays in.
+    #[test]
+    fn unknown_model_source_message_leaves_out_url_credentials() {
+        let error = Error::UnknownModelSource {
+            from: "https://alice:hunter2@models.example.com/v1?api_key=abc123&region=us"
+                .to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "An unsupported model source was specified in the 'from' parameter: 'https://models.example.com/v1?api_key=***&region=us'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/models"
+        );
+    }
+
+    /// `from` is a whole source, so the URL in it runs to its end: a password, token or
+    /// query value with a space in it stays out of the message, after a connector prefix
+    /// too.
+    #[test]
+    fn unknown_model_source_message_leaves_out_credentials_with_spaces() {
+        let cases = [
+            (
+                "openai:https://alice:MY PASSWORD@models.example.invalid/v1",
+                "openai:https://models.example.invalid/v1",
+            ),
+            (
+                "custom:https://models.example.invalid/v1?api_key=MY KEY&region=us",
+                "custom:https://models.example.invalid/v1?api_key=***&region=us",
+            ),
+            (
+                "https://MY TOKEN@models.example.invalid/v1",
+                "https://models.example.invalid/v1",
+            ),
+        ];
+        let messages: Vec<String> = cases
+            .iter()
+            .map(|(from, _)| {
+                Error::UnknownModelSource {
+                    from: (*from).to_string(),
+                }
+                .to_string()
+            })
+            .collect();
+        let expected: Vec<String> = cases
+            .iter()
+            .map(|(_, shown)| {
+                format!(
+                    "An unsupported model source was specified in the 'from' parameter: '{shown}'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/models"
+                )
+            })
+            .collect();
+        assert_eq!(messages, expected);
+    }
 
     #[test]
     fn each_error_type_reads_back_as_its_kind() {

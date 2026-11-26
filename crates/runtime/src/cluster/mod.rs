@@ -20,7 +20,7 @@ use crate::cluster::partition::{
     executor_request_initial_partitions,
     scheduler_task::{PartitionAssignmentConfig, PartitionAssignmentTask},
 };
-use crate::config::{ClusterConfig, ClusterRole};
+use crate::config::{ClusterConfig, ClusterRole, Role};
 use crate::jobs::JobExecutor;
 use crate::{
     CLUSTER_INTERNAL_SERVER, CLUSTER_PARTITION_ASSIGNMENT_TASK, CLUSTER_SCHEDULER_REGISTRY,
@@ -83,6 +83,9 @@ use url::Url;
 use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 use util::session_state::builder_from_existing;
 const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+/// How long an executor waits for the TLS handshake with a scheduler address
+/// when it reads the certificate the scheduler presents there.
+const OBSERVE_SCHEDULER_TIMEOUT: Duration = Duration::from_secs(5);
 const SCHEDULER_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// Upper bound on retries when the scheduler returns `Unavailable` to
@@ -299,6 +302,26 @@ type SchedulerEndpointOverride = Arc<
 struct SchedulerPollHandle {
     cancel: CancellationToken,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// The addresses an executor knows the scheduler by: the configured scheduler
+/// address and each scheduler's advertise address from the membership.
+fn scheduler_addresses_with(scheduler_url: &Url, members: &[String]) -> Vec<String> {
+    let mut addresses = Vec::with_capacity(members.len() + 1);
+    addresses.push(scheduler_url.to_string());
+    for member in members {
+        if !addresses.contains(member) {
+            addresses.push(member.clone());
+        }
+    }
+    addresses
+}
+
+/// The host and port of a scheduler address given as a URL or as `host:port`,
+/// as an executor connects to it.
+fn scheduler_host_and_port(address: &str) -> Option<(String, u16)> {
+    let url = Url::parse(&normalize_scheduler_endpoint(address, true)).ok()?;
+    Some((url.host_str()?.to_string(), url.port_or_known_default()?))
 }
 
 fn normalize_scheduler_endpoint(address: &str, tls_enabled: bool) -> String {
@@ -628,7 +651,9 @@ mod composite_flight_service;
 pub mod datafusion;
 mod heartbeat;
 pub mod partition;
+pub(crate) mod peer;
 mod reaper;
+mod scheduler_grpc;
 pub(crate) mod scheduler_registry;
 mod servers;
 mod service;
@@ -641,6 +666,7 @@ pub use partition::{PartitionMetadata, PartitionStore, TablePartitionMetadata};
 pub use reaper::{Reaper, ReaperOutcome};
 pub use runtime_cluster::ControlStreamManager;
 pub use runtime_cluster::ExecutorOutboundBroadcaster;
+use runtime_cluster::peer::SchedulerIdentities;
 use runtime_cluster::store::{AccelerationsPartitions, CatalogPartitions};
 pub use runtime_cluster::{ExecutorRegistry, FederatedPartitionProvider, TablePartitions};
 // Moved to `runtime-cluster`; re-exported so `runtime::cluster::{metrics_collector, pki}` still resolve.
@@ -699,6 +725,9 @@ struct ClusterTlsConfigInner {
     /// `ClientTlsConfig`). All three rotate together via a single
     /// `ArcSwap` swap inside the bundle.
     bundle: Arc<pki::ClusterPkiBundle>,
+    /// On an executor, the identities the scheduler presents, observed by
+    /// connecting to the scheduler's addresses. Empty on a scheduler.
+    schedulers: Arc<SchedulerIdentities>,
     /// Drop-guard for the watcher. In the centralized path the binary
     /// owns the [`runtime_tls::TlsControl`] for the whole process; this
     /// `Arc` is purely a safety net so the watcher dispatcher outlives
@@ -760,9 +789,70 @@ impl ClusterTlsConfig {
                 key_path: key_path_buf,
                 server_config,
                 bundle,
+                schedulers: Arc::new(SchedulerIdentities::new()),
                 watcher_keepalive: Arc::clone(control.watcher()),
             }),
         })
+    }
+
+    /// The identities the scheduler presents, as this executor last observed
+    /// them at the scheduler's addresses.
+    #[must_use]
+    pub fn scheduler_identities(&self) -> &Arc<SchedulerIdentities> {
+        &self.inner.schedulers
+    }
+
+    /// Whether this node's own certificate is valid for `host` — the host it
+    /// advertises to its peers. A node advertises only an address its
+    /// certificate names.
+    #[must_use]
+    pub fn self_certificate_names_host(&self, host: &str) -> bool {
+        self.inner.bundle.self_certificate_names_host(host)
+    }
+
+    /// The subject of this node's own certificate, for messages.
+    #[must_use]
+    pub fn self_subject(&self) -> String {
+        self.inner.bundle.self_subject()
+    }
+
+    /// Records how this node is reached by its peers, so a later certificate
+    /// reload that drops the advertise host is rejected (see
+    /// [`pki::ClusterPkiBundle::set_advertise_identity`]).
+    pub fn set_advertise_identity(&self, node_kind: &str, node_id: &str, host: &str) {
+        self.inner
+            .bundle
+            .set_advertise_identity(node_kind, node_id, host);
+    }
+
+    /// Connects to each of the scheduler addresses `addresses` (URLs or
+    /// `host:port`) and records the identity the scheduler presents at each, so
+    /// requests this executor serves can be told to come from the scheduler.
+    /// An address that cannot be reached keeps the identity last observed there.
+    pub async fn observe_schedulers(&self, addresses: &[String]) {
+        let observations = addresses.iter().map(|address| async move {
+            let (host, port) = scheduler_host_and_port(address)?;
+            match self
+                .inner
+                .bundle
+                .observe_peer_identity(&host, port, OBSERVE_SCHEDULER_TIMEOUT)
+                .await
+            {
+                Ok(identity) => Some((address.clone(), identity)),
+                Err(err) => {
+                    tracing::debug!(
+                        "Failed to read the certificate of the scheduler at '{address}': {err}"
+                    );
+                    None
+                }
+            }
+        });
+        let observed = futures::future::join_all(observations)
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+        self.inner.schedulers.record(addresses, observed);
     }
 
     /// Reloadable `rustls::ServerConfig` for accepting inbound mTLS
@@ -884,8 +974,8 @@ impl ResolvedClusterConfig {
             }
         };
 
-        // Determine effective cluster role (explicit or implicit from scheduler_address)
-        let is_cluster_role = config.role.is_some() || config.scheduler_address.is_some();
+        // A scheduler or executor, explicit or implied by `--scheduler-address`.
+        let is_cluster_role = config.cluster_role().is_some();
 
         // Validate all cluster role requirements at once
         if is_cluster_role {
@@ -1014,10 +1104,11 @@ impl ResolvedClusterConfig {
         }
     }
 
-    /// Returns the cluster role.
+    /// The role this runtime runs as, including the executor role implied by
+    /// `--scheduler-address`.
     #[must_use]
-    pub fn role(&self) -> Option<&ClusterRole> {
-        self.config.role.as_ref()
+    pub fn role(&self) -> Role {
+        self.config.effective_role()
     }
 
     /// Returns the fully qualified URL that this node advertises to other
@@ -1033,20 +1124,13 @@ impl ResolvedClusterConfig {
         )
     }
 
-    /// Returns the effective cluster role.
+    /// Returns the effective cluster role, `None` for a server or sidecar.
     ///
     /// This accounts for the implicit executor role: if `--scheduler-address` is set
     /// but no explicit `--role` is specified, this returns `ClusterRole::Executor`.
     #[must_use]
     pub fn effective_role(&self) -> Option<ClusterRole> {
-        if let Some(role) = &self.config.role {
-            return Some(role.clone());
-        }
-        // If scheduler_address is set, implicitly assume executor role
-        if self.config.scheduler_address.is_some() {
-            return Some(ClusterRole::Executor);
-        }
-        None
+        self.config.cluster_role()
     }
 
     /// Returns the cluster bind address.
@@ -1140,7 +1224,50 @@ impl ResolvedClusterConfig {
 }
 
 /// Creates & binds a Ballista scheduler to the Runtime handle, then updates status
+/// Checks that this node's own cluster certificate names `advertise_host`, the
+/// address other cluster nodes connect to it at, and arms the same check for
+/// later certificate reloads, which keep the current certificate on a mismatch
+/// (spiceai/spiceai#16481). On a mismatch, logs and returns the startup message.
+fn ensure_certificate_names_advertise_address(
+    tls: &ClusterTlsConfig,
+    node_kind: &str,
+    node_id: &str,
+    advertise_host: &str,
+) -> Result<(), String> {
+    tls.set_advertise_identity(node_kind, node_id, advertise_host);
+    if tls.self_certificate_names_host(advertise_host) {
+        return Ok(());
+    }
+    let message = runtime_cluster::peer::advertise_address_mismatch_message(
+        runtime_cluster::peer::MismatchSite::Startup,
+        node_kind,
+        node_id,
+        &tls.self_subject(),
+        advertise_host,
+    );
+    tracing::error!("{message}");
+    Err(message)
+}
+
 pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()> {
+    // Executors connect to a scheduler at the address it advertises, so a
+    // scheduler whose certificate does not name that address is unreachable:
+    // refuse to start rather than serve a cluster no executor can join.
+    if let (Some(tls), Some(advertise_host)) = (
+        rt.df.cluster_config.tls_config(),
+        rt.df.cluster_config.node_advertise_address(),
+    ) {
+        ensure_certificate_names_advertise_address(
+            tls,
+            "scheduler",
+            rt.df.cluster_config.instance_id(),
+            advertise_host,
+        )
+        .map_err(|message| crate::Error::FailedToStartClusterScheduler {
+            source: message.into(),
+        })?;
+    }
+
     let (scheduler, executor_stream_registry) = create_scheduler_server(rt).await?;
 
     rt.df
@@ -1389,6 +1516,17 @@ pub async fn initialize_cluster_executor(
     // id. A UUIDv7 sorts by creation time, so a later run's id compares greater.
     let process_id = uuid::Uuid::now_v7().to_string();
 
+    // Before this executor registers, check its own certificate names the
+    // address it advertises. The scheduler would otherwise refuse the
+    // registration; failing here puts the error in this executor's own log, where
+    // the operator who just deployed it is looking.
+    if let Some(tls) = rt.df.cluster_config.tls_config() {
+        ensure_certificate_names_advertise_address(tls, "executor", &executor_id, &advertise_host)
+            .map_err(|message| FailedToStartClusterExecutor {
+                source: message.into(),
+            })?;
+    }
+
     // Fetch the app definition from the scheduler to get temp_directory for the work_dir.
     // This ensures shuffle files are written to the configured directory.
     //
@@ -1417,6 +1555,17 @@ pub async fn initialize_cluster_executor(
                 Vec::new()
             }
         };
+
+    // Read the certificate the scheduler presents at each of its addresses before
+    // this executor registers, so its Flight server tells the scheduler's requests
+    // from other nodes' from the first one.
+    if let Some(tls) = rt.df.cluster_config.tls_config() {
+        tls.observe_schedulers(&scheduler_addresses_with(
+            scheduler_url,
+            &initial_scheduler_addresses,
+        ))
+        .await;
+    }
 
     let app_definition_request = GetAppDefinitionRequest {
         executor_id: executor_id.clone(),
@@ -1646,6 +1795,7 @@ pub async fn initialize_cluster_executor(
     let executor_for_manager = Arc::clone(&executor);
     let codec_for_manager = codec;
     let initial_scheduler_addresses_for_manager = initial_scheduler_addresses.clone();
+    let cluster_tls_for_manager = rt.df.cluster_config.tls_config().cloned();
     let available_task_slots_for_manager = Arc::clone(&available_task_slots);
 
     let control_stream_executor_id = executor_id.clone();
@@ -1784,6 +1934,15 @@ pub async fn initialize_cluster_executor(
                                 "Scheduler membership refresh returned empty list; keeping existing schedulers"
                             );
                             continue;
+                        }
+                        // Before a new scheduler learns this executor's endpoint,
+                        // so its first request is recognized as the scheduler's.
+                        if let Some(tls) = cluster_tls_for_manager.as_ref() {
+                            tls.observe_schedulers(&scheduler_addresses_with(
+                                &scheduler_url_for_manager,
+                                &addresses,
+                            ))
+                            .await;
                         }
                         // Update control streams with new scheduler membership
                         control_stream_manager.update_schedulers(addresses.clone());
@@ -2310,7 +2469,10 @@ async fn create_scheduler_server(
                 .context(FailedToStartClusterSchedulerSnafu)?,
         ),
 
-        grpc_server_max_decoding_message_size: u32::MAX,
+        grpc_server_max_decoding_message_size: u32::try_from(
+            servers::SCHEDULER_MAX_DECODING_MESSAGE_SIZE,
+        )
+        .unwrap_or(u32::MAX),
         grpc_server_max_encoding_message_size: u32::MAX,
 
         override_create_grpc_client_endpoint,
@@ -2483,6 +2645,7 @@ async fn executor_bind_app(
     );
     let secret_store_names: Vec<String> = app_def.secrets.iter().map(|s| s.name.clone()).collect();
     *rt.app.write().await = Some(app_def);
+    rt.search_primary_keys.update(Arc::clone(&rt.app)).await;
 
     // Create a cluster client for secrets. This channel outlives every secret
     // resolution on the executor, so it is the one that most needs the keepalive
@@ -2644,7 +2807,11 @@ fn apply_distributed_execution_config(cfg: SessionConfig) -> SessionConfig {
     // execution requires — among other things it disables CollectLeft broadcast joins
     // (whose left child must be a single partition, invalid once the input is a
     // multi-partition shuffle) and round-robin repartition.
-    let mut cfg = cfg.ballista_restricted_configuration();
+    let mut cfg = cfg
+        .ballista_restricted_configuration()
+        // The adaptive planner plans with its own physical rules, without the
+        // cluster rules that refuse scans an executor cannot read correctly.
+        .with_ballista_adaptive_query_planner(false);
 
     // These optimizations rely on shared mutable state within a single process and are
     // incorrect (or fatal) once a plan is split into stages that run in separate
@@ -2736,15 +2903,15 @@ mod tests {
     #[test]
     fn cluster_roles_require_cluster_mtls_files() {
         use super::ResolvedClusterConfig;
-        use crate::config::{ClusterConfig, ClusterRole};
+        use crate::config::{ClusterConfig, Role};
 
         let advertised = || ClusterConfig {
             node_advertise_address: Some("127.0.0.1".to_string()),
             ..ClusterConfig::default()
         };
         for (node, config) in [
-            ("scheduler", advertised().with_role(ClusterRole::Scheduler)),
-            ("executor", advertised().with_role(ClusterRole::Executor)),
+            ("scheduler", advertised().with_role(Role::Scheduler)),
+            ("executor", advertised().with_role(Role::Executor)),
             (
                 "executor implied by --scheduler-address",
                 ClusterConfig {
@@ -2771,7 +2938,7 @@ mod tests {
     #[test]
     fn insecure_connections_flag_starts_a_node_without_mtls() {
         use super::ResolvedClusterConfig;
-        use crate::config::{ClusterConfig, ClusterRole};
+        use crate::config::{ClusterConfig, Role};
         use clap::Parser;
 
         let config = ClusterConfig::try_parse_from([
@@ -2784,11 +2951,82 @@ mod tests {
         ])
         .expect("--allow-insecure-connections should parse");
         assert!(config.allow_insecure_connections);
-        assert_eq!(config.role, Some(ClusterRole::Scheduler));
+        assert_eq!(config.role, Some(Role::Scheduler));
 
         let resolved = ResolvedClusterConfig::try_new(config)
             .expect("a node started with the insecure flag should start");
         assert!(!resolved.tls_enabled());
+    }
+
+    /// `--role` selects every role; omitted, it is `server`, or `executor` when
+    /// `--scheduler-address` is set. A server or sidecar is not a cluster node,
+    /// so it starts without the cluster flags a scheduler or executor requires.
+    #[test]
+    fn role_flag_selects_the_runtime_role() {
+        use super::ResolvedClusterConfig;
+        use crate::config::{ClusterConfig, ClusterRole, Role};
+        use clap::Parser;
+
+        let parse = |args: &[&str]| {
+            ClusterConfig::try_parse_from(std::iter::once("spiced").chain(args.iter().copied()))
+                .expect("arguments should parse")
+        };
+        for (args, role, cluster_role) in [
+            (&[][..], Role::Server, None),
+            (&["--role", "server"][..], Role::Server, None),
+            (&["--role", "sidecar"][..], Role::Sidecar, None),
+            (
+                &["--role", "scheduler"][..],
+                Role::Scheduler,
+                Some(ClusterRole::Scheduler),
+            ),
+            (
+                &["--role", "executor"][..],
+                Role::Executor,
+                Some(ClusterRole::Executor),
+            ),
+            (
+                &["--scheduler-address", "https://127.0.0.1:50052"][..],
+                Role::Executor,
+                Some(ClusterRole::Executor),
+            ),
+        ] {
+            let config = parse(args);
+            assert_eq!(config.effective_role(), role, "{args:?}");
+            assert_eq!(config.cluster_role(), cluster_role, "{args:?}");
+            assert_eq!(config.validate_role(), Ok(()), "{args:?}");
+            if cluster_role.is_none() {
+                let resolved = ResolvedClusterConfig::try_new(config)
+                    .expect("a server or sidecar needs no cluster flags");
+                assert_eq!(resolved.role(), role, "{args:?}");
+                assert_eq!(resolved.effective_role(), None, "{args:?}");
+            }
+        }
+
+        let error = ClusterConfig::try_parse_from(["spiced", "--role", "cluster"])
+            .expect_err("an unknown role must not parse");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        assert!(
+            error
+                .to_string()
+                .contains("[possible values: server, sidecar, scheduler, executor]"),
+            "{error}"
+        );
+
+        for role in ["server", "sidecar"] {
+            let config = parse(&[
+                "--role",
+                role,
+                "--scheduler-address",
+                "https://127.0.0.1:50052",
+            ]);
+            assert_eq!(
+                config.validate_role(),
+                Err(format!(
+                    "`--scheduler-address` joins a cluster as an executor and cannot be used with `--role {role}`. Remove `--scheduler-address`, or use `--role executor`."
+                ))
+            );
+        }
     }
 
     #[test]
@@ -2956,6 +3194,16 @@ mod tests {
         assert!(!opts.optimizer.enable_physical_uncorrelated_scalar_subquery);
         // Ballista restricted configuration disables round-robin repartition.
         assert!(!opts.optimizer.enable_round_robin_repartition);
+    }
+
+    #[test]
+    fn distributed_execution_config_keeps_the_static_planner() {
+        use ballista_core::extension::SessionConfigExt;
+        let cfg = super::apply_distributed_execution_config(
+            ::datafusion::prelude::SessionConfig::new_with_ballista()
+                .with_ballista_adaptive_query_planner(true),
+        );
+        assert!(!cfg.ballista_adaptive_query_planner_enabled());
     }
 
     fn create_signed_certificate(

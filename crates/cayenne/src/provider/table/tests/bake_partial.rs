@@ -641,7 +641,7 @@ async fn a_bake_input_files_row_count_comes_exact_from_its_footer() {
                     &state,
                     id,
                     Some(&projection),
-                    &captured.subset(vec![file.clone()]),
+                    &captured.narrowed_to(vec![file.clone()]),
                 )
                 .await
                 .expect("key scan");

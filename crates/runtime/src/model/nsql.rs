@@ -68,7 +68,10 @@ use crate::{
     datafusion::{
         SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA,
         request_context_extension::get_current_datafusion,
-        udf::{UserFunctionInfo, effective_user_function_volatility, user_function_infos},
+        udf::{
+            UserFunctionInfo, effective_user_function_volatility, user_function_display_from,
+            user_function_infos,
+        },
     },
     tools::{SpiceModelTool, utils::tool_call_error_response},
 };
@@ -397,14 +400,10 @@ impl NsqlContextOptions {
     }
 }
 
+/// A tool result as context text: a string as it is, anything else as compact JSON. Pretty JSON
+/// would put each value of a row on a line of its own.
 fn value_to_context_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        _ => match serde_json::to_string_pretty(value) {
-            Ok(text) => text,
-            Err(_) => value.to_string(),
-        },
-    }
+    runtime_tools::result::tool_result_text(value).into_owned()
 }
 
 async fn tool_context_text(
@@ -700,7 +699,6 @@ fn is_vector_search_index(kind: &str) -> bool {
     matches!(
         kind,
         "NativeVectorIndex"
-            | "duckdb_vector_index"
             | "elasticsearch_index"
             | "s3_vector_index"
             | "memory_vector_index"
@@ -2092,7 +2090,7 @@ pub(crate) fn user_function_context_entries(
                 syntax: Some(user_function_syntax(declaration)),
                 kind: declaration.kind.as_str().to_string(),
                 volatility: effective_user_function_volatility(declaration).to_string(),
-                from: declaration.from.clone(),
+                from: user_function_display_from(declaration),
                 description: declaration.description.clone().or(function.description),
             })
         })
@@ -2807,7 +2805,7 @@ mod tests {
             function: VECTOR_SEARCH_UDTF_NAME.to_string(),
             syntax: format!("{VECTOR_SEARCH_UDTF_NAME}(docs, 'query text', {column})"),
             model: "embed_model".to_string(),
-            engine: Some("duckdb_vector_index".to_string()),
+            engine: Some("s3_vectors".to_string()),
             row_id_columns: vec!["id".to_string()],
             vector_size: Some(384),
             chunked: false,

@@ -28,7 +28,7 @@ use arrow::record_batch::RecordBatch;
 
 use cayenne::metadata::CreateTableOptions;
 
-use cayenne::{CayenneTableProvider, MetadataCatalog};
+use cayenne::MetadataCatalog;
 
 use datafusion::datasource::TableProvider;
 
@@ -37,7 +37,7 @@ use datafusion::prelude::*;
 use std::sync::Arc;
 
 // Generate test variants for each backend
-test_with_backends!(test_cayenne_basic_workflow_impl);
+test_on_data_store!(test_cayenne_basic_workflow_impl);
 
 async fn test_cayenne_basic_workflow_impl(
     fixture: common::TestFixture,
@@ -59,19 +59,21 @@ async fn test_cayenne_basic_workflow_impl(
         schema: Arc::<arrow::datatypes::Schema>::clone(&schema),
         primary_key: vec![],
         on_conflict: None,
-        base_path: data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("test_table"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     // 3. Create Cayenne table provider
     let ctx = SessionContext::new();
-    let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(catalog),
-        table_options,
-        ctx.runtime_env(),
-    )
-    .await?;
+    let table = fixture
+        .data_store
+        .create(
+            Arc::<common::FixtureCatalog>::clone(catalog),
+            ctx.runtime_env(),
+            table_options,
+        )
+        .await?;
     println!("✓ Table created");
 
     // 4. Verify table schema
@@ -382,10 +384,12 @@ async fn test_cayenne_basic_workflow_impl(
     // Create a fresh table provider by reading from catalog
     // This simulates what happens when spiced restarts or a new client connects
     let catalog_arc: Arc<dyn cayenne::MetadataCatalog> =
-        Arc::<cayenne::CayenneCatalog>::clone(catalog);
+        Arc::<common::FixtureCatalog>::clone(catalog);
     let fresh_ctx = SessionContext::new();
-    let fresh_table =
-        CayenneTableProvider::new("test_table", catalog_arc, fresh_ctx.runtime_env()).await?;
+    let fresh_table = fixture
+        .data_store
+        .open(catalog_arc, fresh_ctx.runtime_env(), "test_table")
+        .await?;
 
     // Create a fresh context and register the fresh table
     fresh_ctx.register_table("test_table", Arc::new(fresh_table))?;
@@ -522,6 +526,7 @@ fn verify_sqlite_metadata(
 }
 
 // Generate test variants for each backend
+// Stays on SQLite: it reopens a SQLite catalog file.
 test_with_backends!(test_cayenne_catalog_persistence_impl);
 
 async fn test_cayenne_catalog_persistence_impl(
@@ -533,6 +538,9 @@ async fn test_cayenne_catalog_persistence_impl(
 
     let connection_string = match fixture.backend_type {
         common::BackendType::Sqlite => format!("sqlite://{}", db_path.to_string_lossy()),
+        common::BackendType::ObjectNative => {
+            return Err("this test reopens a SQLite catalog file".into());
+        }
     };
 
     // Create catalog and initialize
@@ -554,13 +562,12 @@ async fn test_cayenne_catalog_persistence_impl(
 }
 
 // Generate test variants for each backend
-test_with_backends!(test_cayenne_statistics_impl);
+test_on_data_store!(test_cayenne_statistics_impl);
 
 async fn test_cayenne_statistics_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use arrow::datatypes::{DataType, Field, Schema};
-    use cayenne::CayenneTableProvider;
     use cayenne::metadata::CreateTableOptions;
     use datafusion::common::TableReference;
     use datafusion::execution::context::SessionContext;
@@ -572,7 +579,6 @@ async fn test_cayenne_statistics_impl(
 
     // 1. Setup test environment
     let catalog = fixture.catalog;
-    let data_path = fixture.data_path;
 
     // 2. Create table
     let schema = Arc::new(Schema::new(vec![
@@ -585,18 +591,20 @@ async fn test_cayenne_statistics_impl(
         schema: Arc::<arrow::datatypes::Schema>::clone(&schema),
         primary_key: vec![],
         on_conflict: None,
-        base_path: data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("stats_table"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let ctx = SessionContext::new();
-    let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(&catalog),
-        table_options,
-        ctx.runtime_env(),
-    )
-    .await?;
+    let table = fixture
+        .data_store
+        .create(
+            Arc::<common::FixtureCatalog>::clone(&catalog),
+            ctx.runtime_env(),
+            table_options,
+        )
+        .await?;
     println!("✓ Table created");
 
     // 3. Check that statistics method is available and delegates to ListingTable
@@ -640,7 +648,7 @@ async fn test_cayenne_statistics_impl(
 }
 
 // Generate test variants for each backend
-test_with_backends!(test_cayenne_core_data_types_impl);
+test_on_data_store!(test_cayenne_core_data_types_impl);
 
 async fn test_cayenne_core_data_types_impl(
     fixture: common::TestFixture,
@@ -659,7 +667,6 @@ async fn test_cayenne_core_data_types_impl(
     println!("\n🧪 Testing Cayenne core data type support with {backend_name}...");
 
     let catalog = fixture.catalog;
-    let data_path = fixture.data_path;
 
     // Create table with all core supported data types
     let schema = Arc::new(Schema::new(vec![
@@ -700,18 +707,20 @@ async fn test_cayenne_core_data_types_impl(
         schema: Arc::<arrow::datatypes::Schema>::clone(&schema),
         primary_key: vec!["col_int64".to_string()],
         on_conflict: None,
-        base_path: data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("types_test"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let ctx = SessionContext::new();
-    let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(&catalog),
-        table_options,
-        ctx.runtime_env(),
-    )
-    .await?;
+    let table = fixture
+        .data_store
+        .create(
+            Arc::<common::FixtureCatalog>::clone(&catalog),
+            ctx.runtime_env(),
+            table_options,
+        )
+        .await?;
     tracing::info!("✓ Table created with {} columns", schema.fields().len());
     ctx.register_table("types_test", Arc::new(table))?;
 
@@ -908,7 +917,7 @@ async fn test_cayenne_core_data_types_impl(
 }
 
 // Generate test variants for each backend
-test_with_backends!(test_cayenne_sorted_insert_impl);
+test_on_data_store!(test_cayenne_sorted_insert_impl);
 
 /// Test that `sort_columns` configuration properly sorts data during insert operations.
 ///
@@ -920,7 +929,6 @@ async fn test_cayenne_sorted_insert_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let catalog = &fixture.catalog;
-    let data_path = &fixture.data_path;
     let backend_name = fixture.backend_type.name();
 
     println!("✓ Catalog initialized with {backend_name} backend");
@@ -943,7 +951,7 @@ async fn test_cayenne_sorted_insert_impl(
         schema: Arc::<arrow::datatypes::Schema>::clone(&schema),
         primary_key: vec![],
         on_conflict: None,
-        base_path: data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("sorted_table"),
         partition_column: None,
         vortex_config,
     };
@@ -951,12 +959,14 @@ async fn test_cayenne_sorted_insert_impl(
     // Create table with sort configuration
     let ctx = SessionContext::new();
     let table: Arc<dyn TableProvider> = Arc::new(
-        CayenneTableProvider::create_table(
-            Arc::<cayenne::CayenneCatalog>::clone(catalog),
-            table_options,
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                Arc::<common::FixtureCatalog>::clone(catalog),
+                ctx.runtime_env(),
+                table_options,
+            )
+            .await?,
     );
     println!("✓ Table created with sort_columns=['timestamp']");
 
@@ -1046,12 +1056,14 @@ async fn test_cayenne_sorted_insert_impl(
     // Use a fresh SessionContext and reopen provider to avoid stale table state after writes.
     let verify_ctx = SessionContext::new();
     let reopened_table: Arc<dyn TableProvider> = Arc::new(
-        cayenne::CayenneTableProviderBuilder::new(
-            Arc::<cayenne::CayenneCatalog>::clone(catalog),
-            verify_ctx.runtime_env(),
-        )
-        .open("sorted_table")
-        .await?,
+        fixture
+            .data_store
+            .open(
+                Arc::<common::FixtureCatalog>::clone(catalog),
+                verify_ctx.runtime_env(),
+                "sorted_table",
+            )
+            .await?,
     );
     verify_ctx.register_table("sorted_table", reopened_table)?;
 

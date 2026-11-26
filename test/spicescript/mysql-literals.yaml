@@ -1,4 +1,5 @@
 name: mysql-literals
+tags: [long]
 description: >
   Every column of a MySQL table of edge values compared with each edge value
   of its type, in each comparison form (=, <, >=, <>, IN, BETWEEN), answers
@@ -12,6 +13,8 @@ sources:
 variants:
   federated: {}
   cayenne: cayenne-file
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
 
 spicepod:
   version: v1

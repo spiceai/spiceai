@@ -418,7 +418,11 @@ impl SpiceObjectStoreRegistry {
         {
             s3_builder = s3_builder.with_access_key_id(key);
             s3_builder = s3_builder.with_secret_access_key(secret);
-            if let Some(token) = params.get("session_token") {
+            // An unset session-token secret resolves to an empty string; static keys need no token.
+            if let Some(token) = params
+                .get("session_token")
+                .filter(|token| !token.is_empty())
+            {
                 s3_builder = s3_builder.with_token(token);
             }
         }
@@ -1658,7 +1662,7 @@ mod tests {
     fn test_endpoint_for_s3_url_style_path_keeps_endpoint() {
         let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
             "https://t3.storage.dev",
-            "spiceai-public-datasets",
+            "spice-datasets-gjezag77s0hu",
             S3UrlStyle::Path,
         )
         .expect("path-style endpoint should parse");
@@ -1670,27 +1674,30 @@ mod tests {
     fn test_endpoint_for_s3_url_style_vhost_adds_bucket_prefix() {
         let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
             "https://t3.storage.dev",
-            "spiceai-public-datasets",
-            S3UrlStyle::VirtualHosted,
-        )
-        .expect("virtual-hosted endpoint should parse");
-
-        assert_eq!(endpoint, "https://spiceai-public-datasets.t3.storage.dev");
-    }
-
-    #[test]
-    fn test_endpoint_for_s3_url_style_vhost_always_prepends_bucket() {
-        // Even when bucket name matches the start of the host, always prepend.
-        let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
-            "https://spiceai-public-datasets.t3.storage.dev",
-            "spiceai-public-datasets",
+            "spice-datasets-gjezag77s0hu",
             S3UrlStyle::VirtualHosted,
         )
         .expect("virtual-hosted endpoint should parse");
 
         assert_eq!(
             endpoint,
-            "https://spiceai-public-datasets.spiceai-public-datasets.t3.storage.dev"
+            "https://spice-datasets-gjezag77s0hu.t3.storage.dev"
+        );
+    }
+
+    #[test]
+    fn test_endpoint_for_s3_url_style_vhost_always_prepends_bucket() {
+        // Even when bucket name matches the start of the host, always prepend.
+        let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
+            "https://spice-datasets-gjezag77s0hu.t3.storage.dev",
+            "spice-datasets-gjezag77s0hu",
+            S3UrlStyle::VirtualHosted,
+        )
+        .expect("virtual-hosted endpoint should parse");
+
+        assert_eq!(
+            endpoint,
+            "https://spice-datasets-gjezag77s0hu.spice-datasets-gjezag77s0hu.t3.storage.dev"
         );
     }
 

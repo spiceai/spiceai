@@ -1,4 +1,5 @@
 name: mysql-cdc-kill-during-compaction
+tags: [long]
 description: >
   spiced killed while Cayenne compacts a table fed by MySQL binlog CDC loses and
   duplicates nothing: after a restart the table equals the source. Each run
@@ -7,6 +8,12 @@ description: >
 sources: { src: { kind: mysql } }
 matrix:
   run: [1, 2, 3]
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
+
 spicepod:
   version: v1
   kind: Spicepod
@@ -27,6 +34,9 @@ spicepod:
           cayenne_compaction_background_interval_ms: '200'
 defaults:
   expect: { oracle: src }
+  # Each variant runs its own source and its own timed writer, so their row
+  # counts differ by design; each is checked against its own source instead.
+  compare-variants: false
 steps:
   - generate:
       src:

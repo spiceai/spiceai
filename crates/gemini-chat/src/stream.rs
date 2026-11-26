@@ -171,7 +171,6 @@ struct State {
 
 /// `chunks`, a chat completion's stream, as a stream of Gemini responses of `model`. An error
 /// ends it.
-#[must_use]
 pub fn response_stream(
     chunks: ChatCompletionResponseStream,
     model: String,

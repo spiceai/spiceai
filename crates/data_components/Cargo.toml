@@ -32,6 +32,7 @@ bb8-oracle = { version = "0.3", features = ["chrono"], optional = true }
 bigdecimal = { workspace = true, optional = true }
 bytes.workspace = true
 chrono.workspace = true
+cpu-budget.workspace = true
 connector-postgres-common = { path = "../data-connectors/connector-postgres-common", optional = true }
 dashmap = "6.1"
 dataformat-json = { path = "../dataformat-json" }
@@ -49,17 +50,11 @@ db_connection_pool = { path = "../db_connection_pool" }
 delta_kernel = { workspace = true, optional = true }
 delta_kernel_default_engine = { workspace = true, optional = true }
 document_parse = { path = "../document_parse" }
-duckdb = { workspace = true, features = [
-    "bundled",
-    "r2d2",
-    "vtab",
-    "vtab-arrow",
-    "appender-arrow",
-], optional = true }
 duration-parse = { path = "../duration-parse" }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
 moka.workspace = true
+opentelemetry.workspace = true
 globset.workspace = true
 hash-index = { path = "../hash-index", features = ["metrics"] }
 http-body-limit = { path = "../http-body-limit" }
@@ -87,6 +82,7 @@ rustc-hash = "2"
 oracle = { version = "0.6", optional = true }
 native-tls = { workspace = true, optional = true }
 percent-encoding.workspace = true
+pbjson-types = "0.8.0"
 prost.workspace = true
 pgwire-replication = { workspace = true, optional = true }
 postgres-native-tls = { workspace = true, optional = true }
@@ -96,12 +92,12 @@ rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex.workspace = true
 reqwest.workspace = true
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
+runtime-object-store = { path = "../runtime-object-store" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-udfs-api = { path = "../runtime-udfs-api" }
 runtime-request-context = { path = "../runtime-request-context", features = [
   "datafusion",
 ] }
-rusqlite = { workspace = true, optional = true }
 elasticsearch = { path = "../elasticsearch", optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 s3_vectors_metadata_filter = { path = "../s3_vectors_metadata_filter", optional = true }
@@ -125,10 +121,9 @@ tokio-postgres = { workspace = true, features = [
 tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true }
 tracing.workspace = true
-turso = { workspace = true, optional = true }
-turso-shared = { workspace = true, optional = true }
 twox-hash.workspace = true
 url.workspace = true
+redact = { path = "../redact" }
 util = { path = "../util", features = ["datafusion"] }
 uuid.workspace = true
 zip = "9.1"
@@ -151,13 +146,6 @@ debezium = ["dep:rdkafka", "dep:apache-avro"]
 default = []
 delta_lake = ["dep:delta_kernel", "dep:delta_kernel_default_engine"]
 elasticsearch = ["dep:elasticsearch"]
-duckdb = [
-    "adbc",
-    "dep:duckdb",
-    "db_connection_pool/duckdb",
-    "datafusion-table-providers/duckdb",
-    "datafusion-table-providers/duckdb-federation",
-]
 flightsql = []
 kafka = ["dep:rdkafka"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
@@ -186,12 +174,6 @@ postgres = [
 s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter"]
 snowflake = ["dep:snowflake-api", "db_connection_pool/snowflake"]
 spark_connect = ["dep:spark-connect-rs"]
-sqlite = [
-    "dep:rusqlite",
-    "datafusion-table-providers/sqlite",
-    "datafusion-table-providers/sqlite-federation",
-]
-turso = ["dep:turso", "dep:turso-shared", "datafusion-table-providers/sqlite-federation"]
 
 [dev-dependencies]
 arrow = { workspace = true, features = ["prettyprint"] }
@@ -205,11 +187,12 @@ iceberg-storage-opendal.workspace = true
 iceberg_test_utils = { workspace = true, features = ["tests"] }
 insta.workspace = true
 object_store = { workspace = true }
+rusqlite = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 wiremock = "0.6"
-zstd = "0.13.3"
+zstd = "0.13.5"
 
 [[bench]]
 harness = false
@@ -237,6 +220,11 @@ required-features = ["bench", "kafka"]
 
 [[bench]]
 harness = false
+name = "debezium_decode"
+required-features = ["debezium"]
+
+[[bench]]
+harness = false
 name = "pgoutput_decode"
 required-features = ["postgres"]
 
@@ -252,3 +240,9 @@ workspace = true
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+
+# Installs a counting `#[global_allocator]` to check that decoding an Avro body
+# allocates in proportion to the body, not to the item counts it declares.
+[[test]]
+name = "avro_decode_allocation"
+path = "tests/avro_decode_allocation.rs"

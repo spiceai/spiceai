@@ -18,8 +18,8 @@ limitations under the License.
 
 use crate::context::RuntimeContext;
 use crate::error::{
-    ConnectionFailedSnafu, InvalidArgumentSnafu, InvalidResponseSnafu, ModelNotFoundSnafu,
-    NoModelsConfiguredSnafu, Result,
+    ConnectionFailedSnafu, InvalidArgumentSnafu, InvalidResponseSnafu, InvalidUsageSnafu,
+    ModelNotFoundSnafu, NoModelsConfiguredSnafu, Result,
 };
 use crate::output::{OutputFormat, write_json};
 use crate::sse::{SseDecoder, SseEvent};
@@ -68,7 +68,9 @@ pub struct ChatArgs {
     pub message: Option<String>,
 
     /// Sampling temperature (0.0 = deterministic, higher = more random).
-    #[arg(long)]
+    // Negative numbers are accepted here so `--temperature -1` reaches `validate_temperature`
+    // and gets its message; otherwise clap reads `-1` as an unknown flag.
+    #[arg(long, allow_negative_numbers = true)]
     pub temperature: Option<f32>,
 
     /// Override the runtime HTTP endpoint (e.g. `http://localhost:8090`).
@@ -473,12 +475,29 @@ fn map_model_error(error: repl::util::UtilError) -> crate::error::Error {
     }
 }
 
+/// Reject a temperature no model accepts before any request is made.
+fn validate_temperature(temperature: Option<f32>) -> Result<()> {
+    match temperature {
+        Some(t) if !t.is_finite() => InvalidUsageSnafu {
+            message: format!("temperature must be a finite number, got {t}"),
+        }
+        .fail(),
+        Some(t) if t < 0.0 => InvalidUsageSnafu {
+            message: format!("temperature must be greater than or equal to 0, got {t}"),
+        }
+        .fail(),
+        _ => Ok(()),
+    }
+}
+
 /// Execute the `chat` command.
 ///
 /// # Errors
 ///
 /// Returns an error if the API requests fail or input/output fails.
 pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
+    validate_temperature(args.temperature)?;
+
     // Check if running in a terminal (interactive) vs piped input
     let is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
 
@@ -1153,6 +1172,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn validate_temperature_rejects_negative_and_non_finite_values() {
+        for t in [-1.0, -0.001, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = validate_temperature(Some(t)).expect_err("expected an invalid temperature");
+            assert!(
+                matches!(err, crate::error::Error::InvalidUsage { .. }),
+                "{t}: {err}"
+            );
+        }
+        let err = validate_temperature(Some(-1.0)).expect_err("expected an invalid temperature");
+        assert!(
+            err.to_string()
+                .contains("temperature must be greater than or equal to 0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_temperature_accepts_zero_positive_and_unset() {
+        for t in [None, Some(0.0), Some(0.7), Some(2.0)] {
+            assert!(validate_temperature(t).is_ok(), "{t:?}");
+        }
+    }
+
     /// One SSE event carrying `text` as a content delta — the shape of every chunk a chat
     /// completion stream sends.
     fn content_event(text: &str) -> String {
@@ -1328,10 +1371,20 @@ mod tests {
         ];
         let server = SlowServer::dribbling_then_holding(chunks, Duration::from_millis(10));
 
-        let response = tokio::time::timeout(Duration::from_secs(5), responses_stream_from(&server))
-            .await
-            .expect("the terminal event ends the read without waiting for the server to hang up")
-            .expect("a completed Responses stream is an answer");
+        // The clock covers the request alone. Building the context's HTTP clients reads the
+        // system proxy settings, which on macOS lists the test binary's directory, and with
+        // many test processes starting at once that takes seconds.
+        let ctx = unhurried_context(server.url());
+        let config = responses_chat_config();
+        let messages = one_shot_prompt();
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_chat_streaming(&ctx, &config, &messages, false, false),
+        )
+        .await
+        .expect("the terminal event ends the read without waiting for the server to hang up")
+        .expect("a completed Responses stream is an answer");
 
         assert_eq!(response.content, "Hello, world");
         let usage = response.usage.expect("the terminal event carries usage");

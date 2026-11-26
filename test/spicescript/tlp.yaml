@@ -1,4 +1,5 @@
 name: tlp
+tags: [long]
 description: >
   Ternary logic partitioning over random predicates: for each predicate p the
   rows of a table equal those WHERE p, WHERE NOT (p) and WHERE (p) IS NULL
@@ -17,9 +18,9 @@ matrix:
 variants:
   federated: {}
   cayenne: cayenne-file
-  duckdb: duckdb-file
-  sqlite: sqlite-file
-  arrow: arrow
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
+  cayenne-memory: cayenne-memory
   adbc:
     when: { backend: duckdb }
     datasets:

@@ -20,6 +20,7 @@ permissions:
 
 jobs:
   dispatch:
+    environment: secret-free
     name: Dispatch integration tests on trunk
     runs-on: spiceai-dev-runners
     # One API call; a minute is generous even for a slow runner checkout.

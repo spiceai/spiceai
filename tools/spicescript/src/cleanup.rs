@@ -59,6 +59,11 @@ pub fn keep_containers() {
     KEEP_CONTAINERS.store(true, Ordering::Relaxed);
 }
 
+/// Whether `--keep` asked for containers to be left running.
+pub fn keeping_containers() -> bool {
+    KEEP_CONTAINERS.load(Ordering::Relaxed)
+}
+
 pub fn track_container(id: &str, name: &str, network: Option<&str>) {
     CONTAINERS.lock().insert(
         id.to_string(),
@@ -125,9 +130,7 @@ fn remove_all() {
             continue;
         };
         // Only the process this runner started, not one that reused its pid.
-        if crate::reap::command_line(raw)
-            .is_some_and(|c| c.contains(&format!("--http 127.0.0.1:{port}")))
-        {
+        if crate::reap::command_line(raw).is_some_and(|c| crate::spiced::serves_http_on(&c, port)) {
             let _ = nix::sys::signal::kill(Pid::from_raw(raw), Signal::SIGKILL);
         }
     }

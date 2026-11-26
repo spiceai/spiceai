@@ -25,7 +25,7 @@ use crate::dataconnector::http_rate_control;
 use crate::dataconnector::parameters::ConnectorParams;
 use crate::token_providers::databricks::{
     AUTH_MODE_DESCRIPTION, AUTH_MODES, AuthCredentials, build_auth_credentials,
-    get_m2m_token_provider, get_u2m_token_provider,
+    get_m2m_token_provider, get_u2m_token_provider, get_workload_identity_token_provider,
 };
 use async_trait::async_trait;
 use data_components::Read;
@@ -57,21 +57,40 @@ use url::Url;
 pub struct Databricks {
     params: Parameters,
     initialization: ComponentInitialization,
+    /// The client ID whose user tokens load this catalog (U2M auth).
+    user_token_client_id: Option<String>,
 }
 
 impl Databricks {
     #[must_use]
     pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
-        let component_initialization = match build_auth_credentials(&params.parameters) {
-            Ok(AuthCredentials::U2M(_)) => ComponentInitialization::OnTrigger,
-            _ => ComponentInitialization::default(),
+        let user_token_client_id = match build_auth_credentials(&params.parameters) {
+            Ok(AuthCredentials::U2M(client_id)) if serves_user_tokens(&params.parameters) => {
+                Some(client_id.to_string())
+            }
+            _ => None,
+        };
+        let component_initialization = if user_token_client_id.is_some() {
+            ComponentInitialization::OnTrigger
+        } else {
+            ComponentInitialization::default()
         };
 
         Arc::new(Self {
             params: params.parameters,
             initialization: component_initialization,
+            user_token_client_id,
         })
     }
+}
+
+/// Whether the catalog's mode reads the token of each request. A Spark Connect session keeps the
+/// token it was built with, so it cannot serve user-to-machine (U2M) tokens.
+fn serves_user_tokens(params: &Parameters) -> bool {
+    matches!(
+        params.get("mode").expose().ok(),
+        Some("delta_lake" | "sql_warehouse")
+    )
 }
 
 pub const PARAMETERS: &[ParameterSpec] = &[
@@ -133,8 +152,10 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .default("auto"),
 
     // Databricks M2M Service Principal credentials
-    ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
+    ParameterSpec::component("client_id").secret().description("The client ID of the Databricks service principal. Defaults to `DATABRICKS_CLIENT_ID` for workload identity federation or beside a client secret."),
     ParameterSpec::component("client_secret").secret().description("The client secret of the Databricks service principal."),
+    ParameterSpec::component("oidc_token_filepath").secret().description("A file that holds the workload's identity token, read again for every exchange, such as a Kubernetes projected service account token. With `databricks_client_id`, it authenticates with workload identity federation. Defaults to `DATABRICKS_OIDC_TOKEN_FILEPATH`."),
+    ParameterSpec::component("token_audience").secret().description("The audience of the identity token Spice requests from a GitHub Actions job or the workload's cloud identity, such as the Databricks account ID. With `databricks_client_id`, it authenticates with workload identity federation. Defaults to `DATABRICKS_TOKEN_AUDIENCE`."),
 
     // S3 storage options
     ParameterSpec::component("aws_region")
@@ -279,6 +300,14 @@ impl CatalogConnector for Databricks {
                 connector_component: ConnectorComponent::from(catalog),
             }
         })?;
+        if matches!(auth_credentials, AuthCredentials::U2M(_)) && !serves_user_tokens(&self.params)
+        {
+            return Err(super::Error::InvalidConfigurationNoSource {
+                connector: "databricks".into(),
+                message: "User-to-machine (U2M) authentication requires 'mode' to be 'delta_lake' or 'sql_warehouse'. For details, visit: https://spiceai.org/docs/components/catalogs/databricks#params".into(),
+                connector_component: ConnectorComponent::from(catalog),
+            });
+        }
 
         let token_provider: Arc<dyn TokenProvider> = match auth_credentials {
             AuthCredentials::Token(token) => Arc::new(StaticTokenProvider::new(token.clone())),
@@ -303,6 +332,18 @@ impl CatalogConnector for Databricks {
                         connector_component: ConnectorComponent::from(catalog),
                     })?
             }
+            AuthCredentials::WorkloadIdentity(identity) => get_workload_identity_token_provider(
+                &format!("catalog '{}' (databricks)", catalog.name),
+                endpoint,
+                identity,
+                &runtime.token_provider_registry,
+            )
+            .await
+            .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                connector: "databricks".to_string(),
+                source: source.into(),
+                connector_component: ConnectorComponent::from(catalog),
+            })?,
         };
 
         // Copy the catalog params into the dataset params, and allow user to override
@@ -481,7 +522,9 @@ impl CatalogConnector for Databricks {
         )
         .await
         {
-            Ok(provider) => provider,
+            Ok(provider) => {
+                provider.with_change_listener(super::clear_caches_on_catalog_change(&runtime))
+            }
             Err(e) => {
                 return Err(super::Error::UnableToGetCatalogProvider {
                     connector: "databricks".to_string(),
@@ -496,6 +539,10 @@ impl CatalogConnector for Databricks {
 
     fn initialization(&self) -> ComponentInitialization {
         self.initialization
+    }
+
+    fn user_token_client_id(&self) -> Option<&str> {
+        self.user_token_client_id.as_deref()
     }
 }
 
@@ -514,8 +561,8 @@ fn table_reference_creator_delta_lake(uc_table: &UCTable) -> Option<TableReferen
         tracing::warn!("{}", uc_table.catalog_managed_skip_warning());
         return None;
     }
-    let storage_location = uc_table.storage_location.as_deref()?;
-    // Don't append a trailing slash here — `DeltaTable::from` calls
+    let storage_location = uc_table.object_storage_location()?;
+    // Don't append a trailing slash here — `DeltaTable::open` calls
     // `ensure_folder_location` which already adds one when needed.
     // Unconditionally appending caused double-slash paths (e.g.
     // "file:///path/to/table//") when the catalog API returned
@@ -564,6 +611,18 @@ async fn create_token_provider_for_catalog(
                     connector_component: ConnectorComponent::from(catalog),
                 })
         }
+        AuthCredentials::WorkloadIdentity(identity) => get_workload_identity_token_provider(
+            &format!("catalog '{}' (databricks)", catalog.name),
+            endpoint,
+            identity,
+            &token_provider_registry,
+        )
+        .await
+        .map_err(|source| super::Error::UnableToGetCatalogProvider {
+            connector: "databricks".to_string(),
+            source: source.into(),
+            connector_component: ConnectorComponent::from(catalog),
+        }),
     }
 }
 

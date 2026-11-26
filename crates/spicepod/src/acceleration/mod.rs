@@ -526,11 +526,12 @@ pub struct Acceleration {
     /// The acceleration engine. Defaults to `cayenne`, or to `arrow` on Windows, where
     /// Cayenne is not available.
     ///
-    /// Every engine other than `cayenne` (`arrow`, `duckdb`, `sqlite`, `turso`, and
-    /// `postgres`) is deprecated in v2.4 and will be removed in v2.5; a Spicepod that uses
-    /// one logs a warning at startup and on hot reload. Set `engine: cayenne`, or leave
-    /// `engine` unset, then delete the old engine's acceleration files and snapshots. On
-    /// Windows, run Spice in Docker or WSL to use Cayenne. See
+    /// Every engine other than `cayenne` (`arrow`) is
+    /// deprecated in v2.4 and will be removed in v2.5; a Spicepod that uses one logs a
+    /// warning at startup and on hot reload. Set `engine: cayenne`, or leave `engine`
+    /// unset, then delete the old engine's acceleration files and snapshots. On Windows,
+    /// run Spice in Docker or WSL to use Cayenne. `duckdb`, `postgres`, `sqlite` and
+    /// `turso` were removed in v2.5: a dataset or view that sets one fails to load. See
     /// <https://spiceai.org/docs/components/data-accelerators/cayenne/migration>.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
@@ -877,7 +878,10 @@ mod tests {
         // `enabled: false` alone is a complete, deliberate configuration and
         // must stay silent, or every dataset that turns acceleration off warns.
         let acceleration = acceleration_from_yaml("enabled: false");
-        assert!(acceleration.fields_ignored_when_disabled().is_empty());
+        assert_eq!(
+            acceleration.fields_ignored_when_disabled(),
+            [] as [String; 0]
+        );
     }
 
     #[test]
@@ -890,7 +894,10 @@ mod tests {
                 mode: memory
             ",
         );
-        assert!(acceleration.fields_ignored_when_disabled().is_empty());
+        assert_eq!(
+            acceleration.fields_ignored_when_disabled(),
+            [] as [String; 0]
+        );
     }
 
     #[test]
@@ -905,7 +912,10 @@ mod tests {
             ",
         );
         assert!(acceleration.enabled, "enabled defaults to true");
-        assert!(acceleration.fields_ignored_when_disabled().is_empty());
+        assert_eq!(
+            acceleration.fields_ignored_when_disabled(),
+            [] as [String; 0]
+        );
     }
 
     #[test]
@@ -921,7 +931,10 @@ mod tests {
                 ready_state: on_load
             ",
         );
-        assert!(acceleration.fields_ignored_when_disabled().is_empty());
+        assert_eq!(
+            acceleration.fields_ignored_when_disabled(),
+            [] as [String; 0]
+        );
     }
 
     #[test]
@@ -1117,12 +1130,7 @@ mod tests {
             yaml::from_str("{}").expect("Failed to parse Acceleration");
 
         assert!(!acceleration.maintained_aggregates.is_enabled());
-        assert!(
-            acceleration
-                .maintained_aggregates
-                .enabled_aggregates()
-                .is_empty()
-        );
+        assert_eq!(acceleration.maintained_aggregates.enabled_aggregates(), []);
     }
 
     #[test]
@@ -1139,12 +1147,7 @@ mod tests {
 
         assert!(!acceleration.maintained_aggregates.is_enabled());
         assert_eq!(acceleration.maintained_aggregates.len(), 1);
-        assert!(
-            acceleration
-                .maintained_aggregates
-                .enabled_aggregates()
-                .is_empty()
-        );
+        assert_eq!(acceleration.maintained_aggregates.enabled_aggregates(), []);
     }
 
     #[test]

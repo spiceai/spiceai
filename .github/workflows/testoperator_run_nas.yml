@@ -23,10 +23,17 @@ on:
         type: boolean
         default: false
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   run-nas-bench:
     name: Run network-attached storage benchmark tests
     runs-on: spiceai-macos
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     timeout-minutes: 600
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -47,19 +54,28 @@ jobs:
           fi
           echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
-      - name: Build spicepod validator
-        uses: ./.github/actions/build-spicepod-validator
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: $/.github/actions/rustfs-credentials
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '36000'
+          export-env: 'false'
+
+      - name: Build spicepod validator
+        uses: $/.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate spicepod
         run: |
           spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
       - name: Setup spiced
-        uses: ./.github/actions/setup-spiced
+        uses: $/.github/actions/setup-spiced
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
@@ -68,14 +84,15 @@ jobs:
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
 
       - name: Build Testoperator
-        uses: ./.github/actions/build-testoperator
+        uses: $/.github/actions/build-testoperator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup Testoperator
-        uses: ./.github/actions/setup-testoperator-data
+        uses: $/.github/actions/setup-testoperator-data
         with:
           query_set: tpch
 
@@ -93,9 +110,10 @@ jobs:
             --metrics \
             --scale-factor 1
         env:
-          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          UNAS_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
+          S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
+          S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
+          S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
+          SMB_PASSWORD: ${{ secrets.SMB_PASSWORD }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}

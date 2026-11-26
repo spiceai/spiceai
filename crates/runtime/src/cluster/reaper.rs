@@ -280,9 +280,9 @@ mod tests {
 
         let r = Reaper::new(Arc::clone(&cs), Arc::clone(&hb));
         // A reaper that has just started has seen no version yet.
-        assert!(r.tick().await.expect("tick").evicted.is_empty());
+        assert_eq!(r.tick().await.expect("tick").evicted, [] as [String; 0]);
         tokio::time::advance(TTL.saturating_sub(Duration::from_secs(1))).await;
-        assert!(r.tick().await.expect("tick").evicted.is_empty());
+        assert_eq!(r.tick().await.expect("tick").evicted, [] as [String; 0]);
         tokio::time::advance(Duration::from_secs(1)).await;
         let out = r.tick().await.expect("tick");
         assert_eq!(out.evicted, vec!["a".to_string()]);
@@ -297,7 +297,7 @@ mod tests {
         add_entry(&cs, entry("a", id, 0, 30_000)).await;
         // No heartbeat written.
         let r = Reaper::new(Arc::clone(&cs), Arc::clone(&hb));
-        assert!(r.tick().await.expect("tick").evicted.is_empty());
+        assert_eq!(r.tick().await.expect("tick").evicted, [] as [String; 0]);
         tokio::time::advance(TTL).await;
         let out = r.tick().await.expect("tick");
         assert_eq!(out.evicted, vec!["a".to_string()]);
@@ -310,14 +310,14 @@ mod tests {
         let (cs, hb) = setup().await;
         let r = Reaper::new(Arc::clone(&cs), Arc::clone(&hb));
         add_entry(&cs, entry("a", Uuid::new_v4(), 0, 30_000)).await;
-        assert!(r.tick().await.expect("tick").evicted.is_empty());
+        assert_eq!(r.tick().await.expect("tick").evicted, [] as [String; 0]);
         tokio::time::advance(TTL).await;
         assert_eq!(r.tick().await.expect("tick").evicted, vec!["a".to_string()]);
 
         add_entry(&cs, entry("a", Uuid::new_v4(), 0, 30_000)).await;
-        assert!(r.tick().await.expect("tick").evicted.is_empty());
+        assert_eq!(r.tick().await.expect("tick").evicted, [] as [String; 0]);
         tokio::time::advance(TTL.saturating_sub(Duration::from_secs(1))).await;
-        assert!(r.tick().await.expect("tick").evicted.is_empty());
+        assert_eq!(r.tick().await.expect("tick").evicted, [] as [String; 0]);
         tokio::time::advance(Duration::from_secs(1)).await;
         assert_eq!(r.tick().await.expect("tick").evicted, vec!["a".to_string()]);
     }
@@ -332,7 +332,7 @@ mod tests {
             hb.heartbeat("a", id, 1_000 + beat * 10_000, 30_000)
                 .await
                 .expect("hb");
-            assert!(r.tick().await.expect("tick").evicted.is_empty());
+            assert_eq!(r.tick().await.expect("tick").evicted, [] as [String; 0]);
             tokio::time::advance(Duration::from_secs(10)).await;
         }
     }
@@ -439,7 +439,7 @@ mod tests {
             Arc::clone(&cs),
             Arc::new(SchedulerHeartbeatStore::new(late_store, "")),
         );
-        assert!(r.tick().await.expect("tick").evicted.is_empty());
+        assert_eq!(r.tick().await.expect("tick").evicted, [] as [String; 0]);
         tokio::time::advance(Duration::from_secs(10)).await;
 
         *late.delay.lock().expect("delay") = Some(Duration::from_secs(25));
@@ -486,7 +486,7 @@ mod tests {
         add_entry(&cs, entry("a", id, 990_000, 30_000)).await;
         let r = Reaper::new(Arc::clone(&cs), Arc::clone(&hb));
         let out = r.tick().await.expect("tick");
-        assert!(out.evicted.is_empty());
+        assert_eq!(out.evicted, [] as [String; 0]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -500,10 +500,10 @@ mod tests {
         // about to be overwritten by the new process).
         hb.heartbeat("a", old, 1_000, 30_000).await.expect("hb");
         let r = Reaper::new(Arc::clone(&cs), Arc::clone(&hb));
-        assert!(r.tick().await.expect("tick").evicted.is_empty());
+        assert_eq!(r.tick().await.expect("tick").evicted, [] as [String; 0]);
         tokio::time::advance(TTL * 2).await;
         let out = r.tick().await.expect("tick");
-        assert!(out.evicted.is_empty());
+        assert_eq!(out.evicted, [] as [String; 0]);
         let snap = cs.read().await.expect("read");
         assert!(snap.schedulers.contains_key("a"));
     }

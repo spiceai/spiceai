@@ -220,10 +220,52 @@ pub struct Settings {
     pub cache_dir: PathBuf,
     /// The root of `hf-xet`'s shard cache.
     pub xet_cache_dir: PathBuf,
-    /// Only the cache is read; the Hub is never contacted.
-    pub offline: bool,
+    /// Only the cache is read and the Hub is never contacted, because of the variables named.
+    pub offline: Option<Offline>,
     /// Every file is read through the Hub's `resolve` redirect, never the Xet protocol.
     pub xet_disabled: bool,
+}
+
+/// The variables that keep Spice off the Hub, so that a message names the one set and the fix
+/// unsets what is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Offline {
+    /// `HF_HUB_OFFLINE` alone.
+    HfHub,
+    /// `TRANSFORMERS_OFFLINE` alone.
+    Transformers,
+    /// Both.
+    Both,
+}
+
+impl Offline {
+    /// The variables set, from whether `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE` are.
+    #[must_use]
+    pub fn of(hf_hub: bool, transformers: bool) -> Option<Self> {
+        match (hf_hub, transformers) {
+            (true, false) => Some(Self::HfHub),
+            (false, true) => Some(Self::Transformers),
+            (true, true) => Some(Self::Both),
+            (false, false) => None,
+        }
+    }
+
+    /// The variables as a message names them: `` `HF_HUB_OFFLINE` ``, or both, joined by "and".
+    #[must_use]
+    pub fn variables(self) -> &'static str {
+        match self {
+            Self::HfHub => "`HF_HUB_OFFLINE`",
+            Self::Transformers => "`TRANSFORMERS_OFFLINE`",
+            Self::Both => "`HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE`",
+        }
+    }
+
+    /// "`HF_HUB_OFFLINE` is set", or "... are set" for both.
+    #[must_use]
+    pub fn is_set(self) -> String {
+        let verb = if self == Self::Both { "are" } else { "is" };
+        format!("{} {verb} set", self.variables())
+    }
 }
 
 /// The process environment, or a stand-in a test controls without mutating process state.
@@ -294,8 +336,10 @@ impl Settings {
             token_scope,
             cache_dir,
             xet_cache_dir,
-            offline: is_true(var(HF_HUB_OFFLINE).as_deref())
-                || is_true(var(TRANSFORMERS_OFFLINE).as_deref()),
+            offline: Offline::of(
+                is_true(var(HF_HUB_OFFLINE).as_deref()),
+                is_true(var(TRANSFORMERS_OFFLINE).as_deref()),
+            ),
             xet_disabled: is_true(var(HF_HUB_DISABLE_XET).as_deref()),
         })
     }
@@ -763,16 +807,29 @@ mod tests {
     #[tokio::test]
     async fn offline_and_xet_switches_take_huggingface_hubs_truthy_values() {
         for value in ["1", "true", "TRUE", "yes", "On"] {
-            assert!(
+            assert_eq!(
                 resolve(&env(&[(HF_HUB_OFFLINE, value)]), None, None)
                     .await
                     .offline,
+                Some(Offline::HfHub),
                 "{value}"
             );
-            assert!(
+            assert_eq!(
                 resolve(&env(&[(TRANSFORMERS_OFFLINE, value)]), None, None)
                     .await
                     .offline,
+                Some(Offline::Transformers),
+                "{value}"
+            );
+            assert_eq!(
+                resolve(
+                    &env(&[(HF_HUB_OFFLINE, value), (TRANSFORMERS_OFFLINE, value)]),
+                    None,
+                    None
+                )
+                .await
+                .offline,
+                Some(Offline::Both),
                 "{value}"
             );
             assert!(
@@ -783,10 +840,11 @@ mod tests {
             );
         }
         for value in ["0", "false", "no", "off", ""] {
-            assert!(
-                !resolve(&env(&[(HF_HUB_OFFLINE, value)]), None, None)
+            assert_eq!(
+                resolve(&env(&[(HF_HUB_OFFLINE, value)]), None, None)
                     .await
                     .offline,
+                None,
                 "{value}"
             );
         }

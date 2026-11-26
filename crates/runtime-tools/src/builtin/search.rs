@@ -34,7 +34,7 @@ use runtime_search::search_engine::{SearchEngine, parse_explicit_primary_keys};
 use runtime_search::table_provider_explorer::TableProviderExplorer;
 use runtime_search::types::to_pretty;
 use tokio::sync::RwLock;
-use tools::SpiceModelTool;
+use tools::{SpiceModelTool, ToolAccess};
 
 pub struct SearchTool<E: TableProviderExplorer + Clone> {
     name: String,
@@ -88,7 +88,12 @@ impl<E: TableProviderExplorer + Clone + 'static> SpiceModelTool for SearchTool<E
         parameters::<SearchRequestBaseJson>()
     }
 
-    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    /// Searches datasets the caller can query.
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadOnly
+    }
+
+    async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::search", tool = self.name().to_string(), input = arg);
 
         let tool_use_result = async {
@@ -97,7 +102,9 @@ impl<E: TableProviderExplorer + Clone + 'static> SpiceModelTool for SearchTool<E
 
             let vs = SearchEngine::new(
                 Arc::clone(&self.df),
-                parse_explicit_primary_keys(Arc::clone(&self.app)).await,
+                parse_explicit_primary_keys(Arc::clone(&self.app))
+                    .await
+                    .into(),
                 self.explorer.clone(),
             );
 

@@ -12,7 +12,7 @@ The new version tag and the previous version tag to diff against (e.g. `v2.0.0-r
 ## Modes
 
 - **Create**: No release notes file exists yet for the version. Build the file from scratch following all steps below.
-- **Update**: Argument is `update` (or the release notes file already exists). Treat the existing file as the source of truth for tone, ordering and editorial decisions, and only ADD entries for commits landed since the file was last edited. Do not rewrite or reorder existing sections unless the user asks explicitly.
+- **Update**: Argument is `update` (or the release notes file already exists). Treat the existing file as the source of truth for tone, ordering and editorial decisions, and only ADD entries for commits landed since the file was last edited. Do not rewrite or reorder existing sections unless the user asks explicitly. A request to "fix and improve" the notes is that explicit ask: restructure the opening and the sections to meet this skill, re-check each claim against its PR, and keep the changelog, contributors, and upgrade instructions unless they are wrong.
 
 To detect update mode and find the relevant commit range:
 
@@ -63,8 +63,8 @@ For each change that survives filtering, take these from the PR body, not from t
 
   Every "when …" and "and …" in the PR's description of the trigger narrows the reach. A bug seen in a user deployment reaches further than one found only by a test.
 - **Consequence class**, worst first:
-  1. Silent wrong results or data loss (missing rows, wrong counts, corruption).
-  2. Security fixes.
+  1. Security fixes.
+  2. Silent wrong results or data loss (missing rows, wrong counts, corruption). The notes present these as bug fixes: see [Frame correctness fixes as bug fixes](#frame-correctness-fixes-as-bug-fixes).
   3. Failures users see: query errors, crashes, refreshes or startups that fail.
   4. Changes users must act on: breaking changes, changed defaults, deprecations.
   5. Measured performance gains on common paths.
@@ -72,9 +72,19 @@ For each change that survives filtering, take these from the PR body, not from t
   7. Narrow items: edge cases, rare configurations, diagnostics, log wording.
 - **Provenance**, when the PR says: a regression in this release line, a bug that existed only in an earlier RC of this release, or a long-standing bug.
 
-Reach decides what goes into the opening, and the consequence class orders items of similar reach. The opening serves the whole readership, so its top items are the ones that reach the most deployments: a query error that any user of the default accelerator can hit outranks a wrong-result fix that needs three conditions at once. A rare-combination item does not lead, whatever its class, unless it can cause lasting data loss or a security exposure. It still gets named: by its symptom in the opening's grouping sentence, so the users it affected can recognize it, and first in its own section, with its conditions stated.
+Reach decides what goes into the opening, and the consequence class orders items of similar reach. The opening serves the whole readership, so its top items are the ones that reach the most deployments: a query error that any user of the default accelerator can hit outranks a wrong-result fix that needs three conditions at once. A rare-combination item does not lead, whatever its class, unless it is a security exposure. It still gets named: by its area in the opening's grouping sentence, and first in its own section, with its conditions stated.
 
 These are not signals: PR size, the length of the PR body, a `feat:` versus `fix:` prefix, how much engineering the change took, and how novel it is. A big PR with a long body about a rare case is still a rare case.
+
+### Frame correctness fixes as bug fixes
+
+A fix for wrong, missing, or stale results is a bug fix, and the notes present it as one. The facts stay complete and accurate. The emphasis stays at what a reader needs to recognize the bug and decide what to do.
+
+- **In the opening, name the area, not the consequence.** "It also fixes bugs in file and S3 datasets, HTTP caching mode, and Spicepod reload." A correctness fix does not lead the opening, and the opening does not say "wrong data" or "data loss".
+- **In headings, name the area.** Write "File and S3 Dataset Bug Fixes", not "File Datasets Keep Correct Data". A narrow correctness fix goes into an area's bug-fix list, not into a subsection of its own.
+- **In the entry, state the symptom once, as a fact.** "When a file changed its column order, values loaded under the wrong column names." Affected users must still recognize the bug, so keep the trigger and the conditions. Leave out emphasis that adds no fact for the reader, such as "with no warning", "the dataset stayed `Ready`", or a dramatic example.
+- **Never word it as an enhancement**, and never say who was not affected unless the PR establishes it (see [Keep every claim as narrow as the PR](#keep-every-claim-as-narrow-as-the-pr)).
+- **A required action still goes where readers act.** If users must check data or rebuild an acceleration, say so in the opening's upgrade sentence and in `## Breaking Changes` or `## Upgrading`.
 
 ### Keep every claim as narrow as the PR
 
@@ -87,14 +97,16 @@ Release notes for a database must be as correct as its query results. A claim th
 - **Say what the users left out should do.** When a change leaves a gap (a platform that keeps the old behavior, a configuration the change does not cover), name those users and the action, in the opening if the action matters.
 - **Highlight titles are claims too.** "Queries never time out" is an absolute claim. "The default query timeout rises to 300 seconds" is not.
 
-If a fix stopped rows from going missing, say that queries returned incomplete results and for which datasets. If the PR does not show that, do not imply it. Say how likely the problem was, without inflating or minimizing it.
+If a fix stopped rows from going missing, its bug-fix entry says that queries returned incomplete results, and for which datasets. If the PR does not show that, do not imply it. Say how likely the problem was, without inflating or minimizing it.
+
+A sentence that introduces a group of items is a claim about every item in the group. "Each of these changes now stops with an error" is false when one item changes a status code or a query result without an error. Name the exceptions instead.
 
 ### Write the opening paragraph
 
-1. **Sentence one: the version, the kind of release, and why it exists.** "For early testing and feedback" says nothing about this release. Say what the release is for: its theme, or the fact that it is a stabilization release that contains only fixes since the previous RC, or the main fix that justifies a patch.
-2. **The one to three top-ranked items**, each as the symptom and who it affects. Use the user's words: the error they saw, the rows they missed. Do not use the internal mechanism.
-3. **One sentence that counts and groups the rest**, e.g. "It also fixes N other issues: <symptom in area>, <symptom in area>, and <area>." Name a rare-combination wrong-result fix here by its symptom, so its users can find it. Do not explain any of them here. When an item's conditions do not fit in this sentence, mark it as conditional ("in some setups", "in specific configurations") and let its section give the conditions. Never state it as if it applied everywhere.
-4. **Who should upgrade and what to do first.** Name the audience, and say who does not need to act when the PRs establish it. If there are breaking changes, required steps, or a setting that some users should now change, state it here or point to it. When the lead is a wrong-result or security fix, put the upgrade verdict right after it, as Rust 1.52.1 does.
+1. **Sentence one: the version, the kind of release, and why it exists.** "For early testing and feedback" says nothing about this release. Say what the release is for: its theme, or the fact that it is a stabilization release that contains only fixes since the previous RC, or the main fix that justifies a patch. A patch release that fixes security advisories or adds security hardening is a "security patch and hardening release". Say so in sentence one, and lead with the security fixes: the advisory count and the classes of issue (SSRF, denial of service, command injection).
+2. **The one to three top-ranked items**, each as the symptom and who it affects. Use the user's words: the error they saw, the failure they hit. Do not use the internal mechanism.
+3. **One sentence that counts and groups the rest**, e.g. "It also fixes N other issues: <symptom in area>, <symptom in area>, and <area>." Name the areas of the correctness fixes here, as bug fixes ([Frame correctness fixes as bug fixes](#frame-correctness-fixes-as-bug-fixes)). Do not explain any of them here. When an item's conditions do not fit in this sentence, mark it as conditional ("in some setups", "in specific configurations") and let its section give the conditions. Never state it as if it applied everywhere.
+4. **Who should upgrade and what to do first.** Name the audience, and say who does not need to act when the PRs establish it. If there are breaking changes, required steps, or a setting that some users should now change, state it here or point to it. When the lead is a security fix, put the upgrade verdict right after it, as Rust 1.52.1 does.
 
 Keep the opening to about 60–120 words. The details belong in the sections below it, which the opening links to through the highlights. Keeping conditions and provenance makes an opening grow. When it runs long, cut from its bottom, never from a claim's conditions: shorten the grouping part to areas with their "in specific setups" markers, and drop items that the reader will meet in the highlights or in their own section anyway.
 
@@ -168,9 +180,9 @@ STE constrains sentence construction, never technical depth. Keep every setting 
 
 4. **Categorize changes** into:
    - Major new features (deserve their own `### Subsection` with description, key points, and YAML examples when configuration changes).
-   - Dependency upgrades (presented in a table at the end of `## What's New`).
+   - Dependency upgrades: a subsection for DataFusion and each major upstream upgrade, the security advisories, and the version table at the end of `## What's New`, as in [Dependencies](#dependencies).
    - Smaller improvements (bullet list under broader subsections such as `### SQL, Query, and Developer Experience` or `### Caching & Search`).
-   - Breaking changes (with before/after migration guidance).
+   - Breaking changes (with before/after migration guidance). In a patch release, frame each one by the security or correctness fix it comes from, as in [Breaking changes in a patch release](#breaking-changes-in-a-patch-release).
    - Bug fixes (grouped by area, e.g. `### Connector Bug Fixes`), each led by the fixed symptom, as in [the inverted pyramid](#shape-the-notes-as-an-inverted-pyramid).
 
 5. **Rank the changes** as described in [Lead with what matters to the reader](#lead-with-what-matters-to-the-reader). Write the ranked list down, with the symptom, reach, and consequence class for each item, before you draft any prose. The opening and the highlights come from the top of that list.
@@ -206,6 +218,11 @@ STE constrains sentence construction, never technical depth. Keep every setting 
 
 The ranking decides the opening, the highlights, and the order of the `## What's New` subsections. Keep the Highlights bullets and the subsections in the same relative order so the reader can move between them without surprise.
 
+Two fixed rules come before the ranking:
+
+- **A DataFusion upgrade is always the first `## What's New` subsection**, whatever its rank, and the first row of the dependency table.
+- **In a security patch and hardening release, the security subsections come next**, before any other feature or fix.
+
 Use the thematic order below to group the remaining subsections and to break ties between changes of similar rank. It never lifts a narrow change above a broader or more severe one.
 
 1. **Spice Cayenne** — first among changes of similar rank when there is meaningful Cayenne news.
@@ -218,6 +235,45 @@ Use the thematic order below to group the remaining subsections and to break tie
 8. Acceleration (`refresh_mode: snapshot`, new accelerator features)
 9. AI / LLM (Prompt caching, Responses API)
 10. Cross-cutting trailing sections inside `## What's New`: Distributed Cluster Improvements → Caching & Search → Security Improvements → SQL/Developer Experience → Connector Bug Fixes → Dependency Updates.
+
+## Dependencies
+
+- **DataFusion.** The `### DataFusion <version>` subsection opens `## What's New`. It lists the query bugs that the upgrade fixes, as bug fixes, and points to any breaking change that the upgrade causes.
+- **Other major upstream upgrades.** An upgrade of ADBC, Arrow, Iceberg, DuckDB, Vortex, Ballista, or a similar library that users build on gets its own `### <Name> <version>` subsection. Summarize the upstream changes between the two versions from the upstream release notes and changelog at the release tags (`gh release view <tag> -R <owner>/<repo>`). Include only what reaches Spice users, and say where each change applies:
+  - the part that ships in the runtime, such as the ADBC driver manager;
+  - the part that users install separately, such as ADBC drivers, which this upgrade does not change.
+
+  When a Spice fork already carried an upstream fix, say that the behavior does not change, and say what the fork still patches. Link the upstream release.
+- **Security advisories.** List each advisory ID (RUSTSEC, GHSA, CVE), linked to its advisory page, grouped by area, with a few words on the class of issue. Order the areas by reach. The count in the opening equals the number of IDs listed. Verify every advisory link.
+- **The version table.** `### Dependency Updates` is always a table, and it is the last subsection of `## What's New`:
+
+  ```markdown
+  | Dependency / Component | v2.4.2  | v2.4.3  |
+  | ---------------------- | ------- | ------- |
+  | Apache DataFusion      | v55.2.0 | v55.3.0 |
+  | ADBC                   | v0.24.0 | v0.25.0 |
+  | `rmcp`                 | v3.3.0  | v3.10.0 |
+  | `zip` 3                | v3.0.0  | Removed |
+  ```
+
+  DataFusion is the first row. Use the product name for a major dependency and the backticked crate name for a crate. Read every version from the previous tag and from the release ref, never from a PR title. A crates.io dependency's version comes from `Cargo.lock`:
+
+  ```bash
+  lockver(){ git show "$1":Cargo.lock | awk -v n="$2" '$0=="name = \""n"\""{getline; gsub(/version = |"/,""); print}' | sort -V | tr '\n' ' '; }
+  for c in datafusion adbc_core rmcp; do echo "$c | $(lockver v2.4.2 $c)| $(lockver origin/release/2.4 $c)"; done
+  ```
+
+  A git dependency, one whose `Cargo.lock` `source` starts with `git+`, can carry a placeholder version there. Vortex's tagged releases publish `0.1.0`, so `Cargo.lock` reads `vortex 0.1.0` for Vortex v0.86.1. For such a dependency, take the release from the comment on its pin in the root `Cargo.toml` at both refs (`# branch: spiceai-55 (vortex 0.86.1)`), and check it against the fork branch or the upstream tag. The lockfile still identifies the pinned revision.
+
+  When a crate has several locked versions, show the one that changed. Write `Removed` only for what the release drops. When other major versions of the crate remain, name the dropped major in the row (`` `zip` 3 ``), so the row does not claim that the whole crate is gone. After the table, one sentence links to the dependency subsections and to the advisory list.
+
+## Breaking changes in a patch release
+
+A patch release breaks a setup only to fix a security or correctness problem, so each breaking change says which fix it comes from.
+
+- Group the items under `### Security` and `### Correctness` inside `## Breaking Changes`, with security first. Inside a group, an item that comes from the DataFusion upgrade comes first.
+- Each item starts with a bold title that names the change. Then come the reason, the old and the new behavior, and what to do.
+- An introductory sentence holds for every item, or it names the exceptions. Most such changes replace a silent fallback with an error that names the cause. A changed status code or a changed query result has no error, so the sentence names those items.
 
 ## Project-specific conventions
 
@@ -241,5 +297,7 @@ Verify any new doc link you introduce actually resolves. If a deep link cannot b
 ## Output
 
 Save the release notes as `docs/release_notes/v<version>.md`. In update mode, edit the existing file in place and commit with a `docs(release): update v<version> notes with latest trunk PRs` style message.
+
+A patch release's notes live on `trunk` and on its `release/X.Y` branch. Make the change on `trunk`, then say in the report that `release/X.Y` needs the same commit. On `trunk`, a push dismisses the approvals a PR already has, so settle the editorial changes before you push, and push them together.
 
 Report the commit range you used and why, the ranked list behind the opening, and the checker result with the file. State the error count for the prose you authored (zero, once fixed) and name any warning you chose to keep, with the reason. In update mode, list the pre-existing errors you left in place as a separate count, so a reader does not read your zero as a whole-file zero, and propose a new opening if a new change outranks the current lead. A silent pass tells the reviewer nothing about which judgements you made.

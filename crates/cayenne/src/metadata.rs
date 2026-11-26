@@ -1114,7 +1114,7 @@ pub struct VortexConfig {
     /// failure) the scan transparently falls back to directory listing, so this
     /// flag never makes a scan miss a live file. The manifest is populated to be
     /// equal to the directory listing by construction (see
-    /// `upsert_snapshot_manifest_from_listing`).
+    /// `upsert_snapshot_manifest_from_files`).
     #[serde(default)]
     pub scan_from_manifest: bool,
     /// Which widening schema differences detected at table open (the requested
@@ -1821,7 +1821,7 @@ mod tests {
             write_concurrency: Some(8),
             ..VortexConfig::default()
         };
-        assert!(ok.config_warnings(8).is_empty());
+        assert_eq!(ok.config_warnings(8), [] as [String; 0]);
     }
 
     #[test]

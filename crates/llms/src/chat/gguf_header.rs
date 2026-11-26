@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 
 use tokio::io::AsyncReadExt;
 
+use super::gguf_files;
+
 /// The architecture a draft model names; it drafts for a model, so it never decides.
 const DRAFTER: &str = "dflash";
 
@@ -149,6 +151,16 @@ fn scan(reader: &mut Reader<'_>) -> Result<Header, Short> {
     Ok(Header::Unknown)
 }
 
+/// Whether the GGUF whose first `len` bytes `read` returns is a `DFlash` drafter by its header,
+/// as the engine tells one apart from the model's weights.
+pub(crate) async fn names_a_drafter<F, Fut, E>(read: F) -> Result<bool, E>
+where
+    F: Fn(u64) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, E>>,
+{
+    Ok(read_architecture(read).await?.as_deref() == Some(DRAFTER))
+}
+
 /// The architecture in the header of a GGUF whose first `len` bytes `read` returns, reading
 /// more until the key is found or [`MAX_READ`] bytes were read.
 async fn read_architecture<F, Fut, E>(read: F) -> Result<Option<String>, E>
@@ -173,28 +185,40 @@ where
     }
 }
 
-/// The files whose headers decide a model's architecture, in the order to read them: the
-/// `-00001-of-` shard a sharded model is opened from, else every file but an `mtp-` draft head.
+/// The files whose headers decide a model's architecture, in the order to read them. An MTP
+/// draft head is set aside, as the engine sets it aside to draft with. Of the rest, the files
+/// that hold the model's weights by name ([`gguf_files::is_model_weights`]), or all of the rest
+/// when none does: the `-00001-of-` shards a sharded model is opened from first, then the others.
+/// A projector named ahead of the weights names another architecture.
 fn candidates<P: AsRef<Path>>(weights: &[P]) -> Vec<&P> {
-    let named = |w: &&P, part: &str| {
-        w.as_ref()
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.contains(part))
-    };
-    let first: Vec<&P> = weights.iter().filter(|w| named(w, "-00001-of-")).collect();
-    if !first.is_empty() {
-        return first;
+    fn name<P: AsRef<Path>>(w: &P) -> Option<&str> {
+        w.as_ref().file_name().and_then(|name| name.to_str())
     }
-    weights
+    let trunk: Vec<&P> = weights
         .iter()
-        .filter(|w| {
-            !w.as_ref()
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("mtp-"))
-        })
-        .collect()
+        .filter(|w| !name(w).is_some_and(gguf_files::is_draft_head))
+        .collect();
+    let model: Vec<&P> = trunk
+        .iter()
+        .copied()
+        .filter(|w| name(w).is_some_and(gguf_files::is_model_weights))
+        .collect();
+    let weights: Vec<&P> = if model.is_empty() { trunk } else { model };
+    // Only a series' first shard holds the architecture, as gguf-split writes it, so the other
+    // shards are not read.
+    let opening: Vec<&P> = weights
+        .iter()
+        .copied()
+        .filter(|w| name(w).is_some_and(gguf_files::opens_a_set))
+        .collect();
+    let weights = if opening.is_empty() { weights } else { opening };
+    // The engine opens a model from its first `-00001-of-` shard, else from its first file, and
+    // sets aside a drafter it tells by its header: read in that order, so that when the first
+    // file is a drafter's, passed over for its header, the weights' is read next.
+    let (first, rest): (Vec<&P>, Vec<&P>) = weights
+        .into_iter()
+        .partition(|w| name(w).is_some_and(|name| name.contains("-00001-of-")));
+    first.into_iter().chain(rest).collect()
 }
 
 /// The architecture a model of GGUF `weights` names in its first shard's header, read by
@@ -323,6 +347,50 @@ mod tests {
         assert_eq!(
             local_architecture(&[dir.path().join("absent-00001-of-00002.gguf")]).await,
             None
+        );
+        // a projector named ahead of the weights, or named as a shard, is passed over; named
+        // alone, it is read
+        let projector = write("mmproj-F16.gguf", "clip");
+        let sharded_projector = write("model-mmproj-00001-of-00001.gguf", "clip");
+        let weights = write("model-Q4_K_M.gguf", "qwen3");
+        assert_eq!(
+            local_architecture(&[projector.clone(), sharded_projector, weights]).await,
+            Some("qwen3".to_string())
+        );
+        assert_eq!(
+            local_architecture(&[projector]).await,
+            Some("clip".to_string())
+        );
+        // lone weights beside a sharded drafter: each set's opening file is read in turn, and
+        // the drafter's is passed over
+        let lone_weights = write("model-IQ4_XS.gguf", "qwen3");
+        let drafter_first = write("helper-Q8_0-00001-of-00002.gguf", "dflash");
+        let drafter_second = dir.path().join("helper-Q8_0-00002-of-00002.gguf");
+        std::fs::write(&drafter_second, b"no header").expect("the second shard is written");
+        assert_eq!(
+            local_architecture(&[lone_weights, drafter_first, drafter_second]).await,
+            Some("qwen3".to_string())
+        );
+        // a series' other shards are never read: only its first holds the architecture
+        let silent_first = dir.path().join("silent-Q8_0-00001-of-00002.gguf");
+        std::fs::write(&silent_first, b"no header").expect("the first shard is written");
+        let speaking_second = write("silent-Q8_0-00002-of-00002.gguf", "qwen3");
+        assert_eq!(
+            local_architecture(&[silent_first, speaking_second]).await,
+            None
+        );
+        // an MTP head is set aside before the weights are looked for, sharded or not
+        let imatrix_named = write("model-Q4_K_M-imatrix.gguf", "qwen3");
+        let head = write("mtp-model-Q8_0.gguf", "qwen3-mtp");
+        assert_eq!(
+            local_architecture(&[imatrix_named, head]).await,
+            Some("qwen3".to_string())
+        );
+        let sharded_head = write("mtp-model-Q8_0-00001-of-00001.gguf", "qwen3-mtp");
+        let lone = write("model-Q8_0.gguf", "qwen3");
+        assert_eq!(
+            local_architecture(&[sharded_head, lone]).await,
+            Some("qwen3".to_string())
         );
     }
 }

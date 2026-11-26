@@ -1,4 +1,5 @@
 name: federation-differential
+tags: [long]
 description: >
   A query corpus answers the same through Spice as on the source itself, for
   PostgreSQL, MySQL, DuckDB and DuckLake, both federated (each query rewritten and pushed
@@ -15,6 +16,8 @@ variants:
   federated: {}
   cayenne:
     datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: { datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
   # duckdb: now exercises ADBC read-only alongside oracle: src. Direct adbc:
   # takes the write lock; PostgreSQL-mirror scripts retain that variant.
 
@@ -138,4 +141,4 @@ steps:
     only: federated
   - explain: SELECT id FROM t WHERE i > 40
     contains: CayenneAccelerationExec
-    only: cayenne
+    only: [cayenne, cayenne-object-native]

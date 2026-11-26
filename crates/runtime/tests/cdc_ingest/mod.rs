@@ -67,7 +67,8 @@ fn cdc_orders_dataset() -> Dataset {
     on_conflict.insert("id".to_string(), OnConflictBehavior::Upsert);
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("arrow".to_string()),
+        engine: Some("cayenne".to_string()),
+        mode: spicepod::acceleration::Mode::Memory,
         refresh_mode: Some(RefreshMode::Changes),
         primary_key: Some("id".to_string()),
         on_conflict,

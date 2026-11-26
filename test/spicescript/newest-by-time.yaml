@@ -1,4 +1,5 @@
 name: newest-by-time
+tags: [long]
 description: >
   A Cayenne acceleration with a primary key and a time_column keeps, per key,
   the row with the greatest time, whatever order the versions arrive in (a
@@ -10,9 +11,19 @@ description: >
 
 sources:
   src: { kind: postgres }
+  # The state location of the object-native-s3 variant.
+  lake: { kind: rustfs }
 
 matrix:
   mode: [memory, file]
+
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite, and
+# with the data in an S3 state location too.
+variants:
+  as-written: federated
+  object-native: object-native
+  object-native-s3: object-native-s3
 
 spicepod:
   version: v1
@@ -193,3 +204,14 @@ steps:
   - query: SELECT id, v FROM e_child
     expect: { rows: [['1', 'timed']] }
     eventually: 30s
+
+  # Object-native data: in file mode the accelerations' data files are in the
+  # state location, and no data file is in the instance's directory.
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/e_full-, contains: /data/, min: 1 }
+    only: object-native-s3
+    when: { mode: file }
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/, max: 0 }
+    only: object-native-s3
+    when: { mode: memory }
+  - assert-files: { lacks: ['(^|/)s3:', '\.vortex$', '\.arrow$'] }
+    only: object-native-s3

@@ -77,21 +77,22 @@ const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_CLIENT_TIMEOUT: Duration = Duration::from_secs(DEFAULT_CLIENT_TIMEOUT_SECS);
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
-fn parse_pagination_max_pages(value: &str) -> Option<usize> {
+/// `pagination_max_pages`: a positive number of pages, or `nolimit` (`Ok(None)`). Any
+/// other value is an error, so a limit the operator set is never silently dropped.
+fn parse_pagination_max_pages(value: &str) -> Result<Option<usize>, ()> {
     let trimmed = value.trim();
     if trimmed.eq_ignore_ascii_case("nolimit") {
-        return None;
+        return Ok(None);
     }
+    match trimmed.parse::<usize>() {
+        Ok(max_pages) if max_pages > 0 => Ok(Some(max_pages)),
+        _ => Err(()),
+    }
+}
 
-    if let Ok(max_pages) = trimmed.parse::<usize>() {
-        Some(max_pages)
-    } else {
-        tracing::warn!(
-            "Invalid pagination_max_pages value '{}': expected a positive integer or 'nolimit'. The parameter will be ignored.",
-            value
-        );
-        Some(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES)
-    }
+/// `max_request_partitions`: a positive number of requests. Any other value is an error.
+fn parse_max_request_partitions(value: &str) -> Option<usize> {
+    value.trim().parse::<usize>().ok().filter(|max| *max > 0)
 }
 
 /// Resolves the hosts a redirect introduced through [`ssrf::redirect_destination_guard`], so a
@@ -345,7 +346,7 @@ struct HttpProviderParams {
     allowed_paths: Vec<String>,
     request_filters: RequestFilterParams,
     rate_control: HttpRateControlConfig,
-    max_request_partitions: Option<usize>,
+    max_request_partitions: usize,
     cache_max_size_bytes: usize,
     cache_fallback_ttl: Option<Duration>,
     health_probe: Option<String>,
@@ -523,13 +524,26 @@ impl Https {
             None => None,
         };
 
-        let max_request_partitions = self
+        // One request per combination of request filter values, so the bound always
+        // applies; a value that is not a positive integer is refused rather than dropped.
+        let max_request_partitions = match self
             .params
             .get("max_request_partitions")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|value| *value > 0);
+        {
+            Some(value) => parse_max_request_partitions(value).ok_or_else(|| {
+                DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: format!(
+                        "`max_request_partitions` must be a positive integer, got '{value}'. Set it to the most requests one query may send, or remove it to use the default of {}. See: https://spiceai.org/docs/components/data-connectors/https",
+                        data_components::http::provider::DEFAULT_MAX_REQUEST_PARTITIONS
+                    ),
+                }
+            })?,
+            None => data_components::http::provider::DEFAULT_MAX_REQUEST_PARTITIONS,
+        };
 
         let health_probe = self
             .params
@@ -576,15 +590,19 @@ impl Https {
                 .ok()
                 .map(std::string::ToString::to_string);
 
-            let max_pages = self
-                .params
-                .get("pagination_max_pages")
-                .expose()
-                .ok()
-                .map_or(
-                    Some(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES),
-                    parse_pagination_max_pages,
-                );
+            let max_pages = match self.params.get("pagination_max_pages").expose().ok() {
+                Some(value) => parse_pagination_max_pages(value).map_err(|()| {
+                    DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "https".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        message: format!(
+                            "`pagination_max_pages` must be a positive integer or 'nolimit', got '{value}'. Set it to the most pages one request may fetch, or remove it to use the default of {}. See: https://spiceai.org/docs/components/data-connectors/https",
+                            data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES
+                        ),
+                    }
+                })?,
+                None => Some(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES),
+            };
 
             let data_map_to_array = self
                 .params
@@ -999,11 +1017,37 @@ impl Https {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(90);
 
-        let origin_host = Url::parse(dataset.from.as_str())
-            .ok()
+        let from = Url::parse(dataset.from.as_str()).ok();
+        let origin_host = from
+            .as_ref()
             .and_then(|url| url.host_str().map(redirect_host_key));
         let resolver = RedirectHostResolver::default();
         let redirect_hosts = Arc::clone(&resolver.redirect_hosts);
+        // `http_headers`, an OAuth2 token header that `auth_header_name` names other than
+        // `Authorization`, and enabled header filters (which send the headers a query names) are
+        // credentials reqwest does not remove when a redirect leaves the dataset's origin.
+        let sends_custom_header = param_is_set(&self.params, "http_headers")
+            || self
+                .params
+                .get("auth_header_name")
+                .expose()
+                .ok()
+                .map(str::trim)
+                .is_some_and(|name| {
+                    !name.is_empty() && !name.eq_ignore_ascii_case("authorization")
+                })
+            || self
+                .params
+                .get("request_header_filters")
+                .expose()
+                .ok()
+                .is_some_and(util::parse_enabled);
+        // The dataset URL's user info is sent as Basic credentials.
+        let sends_credentials = sends_custom_header
+            || any_oauth_param_set(&self.params)
+            || from
+                .as_ref()
+                .is_some_and(|url| !url.username().is_empty() || url.password().is_some());
 
         let mut builder = Client::builder()
             .user_agent(util::spiceai_user_agent())
@@ -1013,6 +1057,18 @@ impl Https {
                 const MAX_REDIRECTS: usize = 5;
                 if attempt.previous().len() >= MAX_REDIRECTS {
                     return attempt.error("too many redirects");
+                }
+                if sends_custom_header
+                    && ssrf::redirect_leaves_origin(attempt.previous(), attempt.url())
+                {
+                    let refused = ssrf::DestinationRefused::off_origin(attempt.url());
+                    return attempt.error(refused);
+                }
+                if sends_credentials
+                    && ssrf::redirect_continues_off_origin(attempt.previous(), attempt.url())
+                {
+                    let refused = ssrf::DestinationRefused::redirect_chain(attempt.url());
+                    return attempt.error(refused);
                 }
                 // SSRF defense-in-depth: refuse to follow a redirect to an
                 // internal target, with the same classifier URL tables use.
@@ -2043,7 +2099,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("max_request_headers_length")
             .description("Maximum size (in bytes) for request_headers filter values. Default: 16384 (16KiB)."),
         ParameterSpec::runtime("max_request_partitions")
-            .description("Maximum number of HTTP request partitions that can be created from request_path, request_query, request_body, and request_headers filters. If unset, the number of request partitions is not capped."),
+            .description("Maximum number of distinct requests one query may send to this dataset, one for each combination of request_path, request_query, request_body and request_headers values. Each request may fetch up to `pagination_max_pages` pages. Default: 1000."),
         ParameterSpec::runtime("response_cache_max_size_bytes")
             .description("Byte budget for the responses this dataset caches, counting response bodies and the request keys they are held under. Once reached, entries are evicted to stay inside it. Set '0' to disable the response cache. Default: 67108864 (64 MiB), applied per dataset, so raise it only where a dataset earns it. Applies to dynamic JSON API endpoints only; structured HTTP file datasets do not use this cache."),
         ParameterSpec::runtime("response_cache_fallback_ttl")
@@ -2063,7 +2119,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("pagination_data_pointer")
             .description("JSON pointer (RFC 6901) to the data array in each page's response (e.g., '/data', '/results', '/items'). When set, only the array at this path is returned as data rows."),
         ParameterSpec::runtime("pagination_max_pages")
-            .description("Maximum number of pages to fetch for pagination. Default: 100. Set to 'nolimit' to disable the limit."),
+            .description("Maximum number of pages one request may fetch with pagination: a positive integer, or 'nolimit' to disable the limit. Default: 100."),
         ParameterSpec::runtime("pagination_data_map_to_array")
             .description("When 'enabled', if the data at pagination_data_pointer (or the top-level response) is a JSON object/map, extract its values as rows instead of treating it as a single row. Default: 'disabled'.")
             .one_of(&["enabled", "disabled"]),
@@ -3816,7 +3872,45 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             vec!["x-sandbox-id", "x-region"]
         );
         assert_eq!(params.request_filters.max_headers_length, 2048);
-        assert_eq!(params.max_request_partitions, Some(7000));
+        assert_eq!(params.max_request_partitions, 7000);
+    }
+
+    #[tokio::test]
+    async fn request_and_page_limits_default_and_refuse_values_they_cannot_use() {
+        let connector = test_connector_with(&[]).await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        let params = connector
+            .resolve_http_provider_params(&dataset)
+            .expect("defaults resolve");
+        assert_eq!(params.max_request_partitions, 1000);
+
+        for (value, shown) in [("0", "'0'"), ("1k", "'1k'"), ("-5", "'-5'")] {
+            let connector = test_connector_with(&[("max_request_partitions", value)]).await;
+            let Err(error) = connector.resolve_http_provider_params(&dataset) else {
+                panic!("max_request_partitions {value} is refused");
+            };
+            assert!(
+                error.to_string().contains(&format!(
+                    "`max_request_partitions` must be a positive integer, got {shown}. Set it to the most requests one query may send, or remove it to use the default of 1000. See: https://spiceai.org/docs/components/data-connectors/https"
+                )),
+                "{error}"
+            );
+        }
+
+        for value in ["1k", "0"] {
+            let connector =
+                test_connector_with(&[("pagination", "enabled"), ("pagination_max_pages", value)])
+                    .await;
+            let Err(error) = connector.resolve_http_provider_params(&dataset) else {
+                panic!("pagination_max_pages {value} is refused");
+            };
+            assert!(
+                error.to_string().contains(&format!(
+                    "`pagination_max_pages` must be a positive integer or 'nolimit', got '{value}'. Set it to the most pages one request may fetch, or remove it to use the default of 100. See: https://spiceai.org/docs/components/data-connectors/https"
+                )),
+                "{error}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4723,12 +4817,12 @@ uGgYIHbi/F+GaiUPzDyqe5p9
     }
 
     #[tokio::test]
-    async fn compression_bomb_is_refused_just_past_the_floor_without_retrying() {
+    async fn compression_bomb_is_refused_without_retrying() {
         let len = http_body_limit::RATIO_CHECK_FLOOR_BYTES + 64 * MIB;
         let body = gzip_json(len, |_| b'A');
         assert!(
-            body.len() * http_body_limit::MAX_COMPRESSION_RATIO < len,
-            "the response expands past the ratio: {} bytes on the wire",
+            body.len() * http_body_limit::Codec::Gzip.max_ratio() < len,
+            "the response expands past gzip's ratio: {} bytes on the wire",
             body.len()
         );
         let (origin, requests) = serve_gzip(body).await;
@@ -4742,40 +4836,21 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             ),
         };
         let (prefix, rest) = message
-            .split_once(" decoded (")
-            .unwrap_or_else(|| panic!("no byte counts in {message}"));
-        let (counts, suffix) = rest
             .split_once(" received)")
-            .unwrap_or_else(|| panic!("no byte counts in {message}"));
+            .unwrap_or_else(|| panic!("no sizes in {message}"));
         assert!(
-            prefix.ends_with(&format!(
+            prefix.contains(&format!(
                 "Failed to read the response from {origin} for dataset 'http_test': the \
-                 gzip-compressed response body expanded more than 100:1 when"
+                 gzip-compressed response expanded more than 400:1 (64."
             )),
             "{message}"
         );
         assert_eq!(
-            suffix,
-            ", which is refused once a body passes 64 MiB decoded. Ask the endpoint for an \
-             uncompressed response by adding `Accept-Encoding: identity` to `http_headers`, \
-             or request less data per call. \
-             See: https://spiceai.org/docs/components/data-connectors/https"
+            rest,
+            ", far past what real data compresses to, so it was refused as a compression \
+             bomb. If the data is genuine, have the origin serve it uncompressed or at a lower \
+             compression level. See: https://spiceai.org/docs/components/data-connectors/https"
         );
-
-        // Refused as soon as it passed the floor: never more than one decode block past it.
-        let (decoded, received) = counts
-            .split_once(" bytes from ")
-            .unwrap_or_else(|| panic!("malformed byte counts in {message}"));
-        let decoded: usize = decoded.parse().expect("decoded byte count");
-        let received: usize = received.parse().expect("received byte count");
-        assert!(
-            decoded > http_body_limit::RATIO_CHECK_FLOOR_BYTES
-                && decoded
-                    <= http_body_limit::RATIO_CHECK_FLOOR_BYTES
-                        + http_body_limit::DECODE_BLOCK_BYTES,
-            "refused at {decoded} decoded bytes"
-        );
-        assert!(decoded > received * http_body_limit::MAX_COMPRESSION_RATIO);
 
         // The refusal is permanent: the origin is asked once, not once per retry.
         assert_eq!(made, 1);
@@ -4787,7 +4862,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let body = gzip_json(len, ids);
         let ratio = len / body.len();
         assert!(
-            (2..http_body_limit::MAX_COMPRESSION_RATIO).contains(&ratio),
+            (2..http_body_limit::Codec::Gzip.max_ratio()).contains(&ratio),
             "the response compresses {ratio}:1"
         );
         let (origin, requests) = serve_gzip(body).await;
@@ -4900,5 +4975,235 @@ uGgYIHbi/F+GaiUPzDyqe5p9
 
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Answers `/a` with a redirect to its own `/b`, and every other path with [`OK_RESPONSE`].
+    /// Counts the requests for `/b`.
+    async fn serve_chain_target() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the test server");
+        let port = listener.local_addr().expect("test server address").port();
+        let second_hops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&second_hops);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let response = if request.starts_with(b"GET /a ") {
+                    "HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    OK_RESPONSE
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (port, second_hops)
+    }
+
+    /// Requests a dataset at `http://{userinfo}localhost.:<port>/data` whose origin redirects to
+    /// `/a` on another port, which redirects to its own `/b`. Every hop keeps the dataset's host
+    /// name, so no hop is refused as internal. Returns the result, the number of requests for
+    /// `/b`, and the target's port.
+    async fn get_through_a_redirect_chain(
+        userinfo: &str,
+        extra: &[(&str, &str)],
+    ) -> (reqwest::Result<reqwest::Response>, usize, u16) {
+        let (target_port, second_hops) = serve_chain_target().await;
+        let (origin_port, _) = serve_fixed(format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://localhost.:{target_port}/a\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        ))
+        .await;
+        let origin = format!("http://{userinfo}localhost.:{origin_port}/data");
+        let mut params = vec![("file_format", "json")];
+        params.extend_from_slice(extra);
+        let connector = test_connector_with(&params).await;
+        let dataset = test_dataset(&origin, RefreshMode::Append, None).await;
+        let client = connector
+            .build_http_client(&dataset)
+            .await
+            .expect("build the HTTP client");
+        let result = client.get(&origin).send().await;
+        (
+            result,
+            second_hops.load(std::sync::atomic::Ordering::SeqCst),
+            target_port,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_dataset_with_credentials_does_not_follow_a_redirect_chain_that_continues_on_another_host()
+     {
+        for (userinfo, extra) in [
+            ("svc:s3cret@", &[][..]),
+            (
+                "",
+                &[("auth_token_url", "https://example.com/oauth/token")][..],
+            ),
+        ] {
+            let (result, second_hops, target_port) =
+                get_through_a_redirect_chain(userinfo, extra).await;
+
+            let error = result.expect_err("the redirect chain is refused");
+            let chain = || {
+                std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |e| {
+                    e.source()
+                })
+            };
+            let message = chain()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(": ");
+            assert!(
+                message.contains(&format!(
+                    "Refused to connect to http://localhost.:{target_port}: {}",
+                    ssrf::REDIRECT_CHAIN_REFUSED
+                )),
+                "the refusal names only the target's origin with {userinfo:?} {extra:?}: {message}"
+            );
+            assert!(
+                chain().any(|e| e.downcast_ref::<ssrf::DestinationRefused>().is_some()),
+                "the HTTP table provider shows the reason only for a DestinationRefused: {message}"
+            );
+            assert_eq!(
+                second_hops, 0,
+                "the second hop on the target is never requested with {userinfo:?} {extra:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dataset_without_credentials_follows_a_redirect_chain_that_continues_on_another_host()
+    {
+        let (result, second_hops, _) = get_through_a_redirect_chain("", &[]).await;
+
+        let response = result.expect("the redirect chain is followed");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(second_hops, 1);
+    }
+
+    /// Parameters that send a custom credential header.
+    const CUSTOM_HEADER_PARAMS: &[(&str, &str)] = &[
+        ("http_headers", "X-Api-Key: test-key"),
+        ("auth_header_name", "X-Api-Token"),
+        ("request_header_filters", "enabled"),
+    ];
+
+    /// Requests a dataset at `http://localhost.:<port>/data` whose origin redirects to `/data` on
+    /// another port of the same host. Returns the result, the number of requests the target
+    /// received, and the target's port.
+    async fn get_through_a_redirect_off_the_origin(
+        extra: &[(&str, &str)],
+    ) -> (reqwest::Result<reqwest::Response>, usize, u16) {
+        let (target_port, target_requests) = serve_fixed(OK_RESPONSE.to_string()).await;
+        let (origin_port, _) = serve_fixed(format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://localhost.:{target_port}/data\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        ))
+        .await;
+        let origin = format!("http://localhost.:{origin_port}/data");
+        let mut params = vec![("file_format", "json")];
+        params.extend_from_slice(extra);
+        let connector = test_connector_with(&params).await;
+        let dataset = test_dataset(&origin, RefreshMode::Append, None).await;
+        let client = connector
+            .build_http_client(&dataset)
+            .await
+            .expect("build the HTTP client");
+        let result = client.get(&origin).send().await;
+        (
+            result,
+            target_requests.load(std::sync::atomic::Ordering::SeqCst),
+            target_port,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_dataset_with_a_custom_credential_header_does_not_follow_a_redirect_off_its_origin() {
+        for extra in CUSTOM_HEADER_PARAMS {
+            let (result, target_requests, target_port) =
+                get_through_a_redirect_off_the_origin(&[*extra]).await;
+
+            let error = result.expect_err("the redirect is refused");
+            let chain = || {
+                std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |e| {
+                    e.source()
+                })
+            };
+            let message = chain()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(": ");
+            assert!(
+                message.contains(&format!(
+                    "Refused to connect to http://localhost.:{target_port}: {}",
+                    ssrf::OFF_ORIGIN_REDIRECT_REFUSED
+                )),
+                "the refusal names the target's origin with {extra:?}: {message}"
+            );
+            assert!(
+                chain().any(|e| e.downcast_ref::<ssrf::DestinationRefused>().is_some()),
+                "the HTTP table provider shows the reason only for a DestinationRefused: {message}"
+            );
+            assert_eq!(
+                target_requests, 0,
+                "the redirect target is never requested with {extra:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dataset_with_a_custom_credential_header_follows_a_redirect_within_its_origin() {
+        for extra in CUSTOM_HEADER_PARAMS {
+            let (port, second_hops) = serve_chain_target().await;
+            let url = format!("http://localhost.:{port}/a");
+            let connector = test_connector_with(&[("file_format", "json"), *extra]).await;
+            let dataset = test_dataset(&url, RefreshMode::Append, None).await;
+            let client = connector
+                .build_http_client(&dataset)
+                .await
+                .expect("build the HTTP client");
+
+            let response = client
+                .get(&url)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("the redirect is followed with {extra:?}: {e}"));
+
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(
+                second_hops.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{extra:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dataset_without_a_custom_credential_header_follows_a_redirect_off_its_origin() {
+        for extra in [
+            &[][..],
+            &[("auth_token_url", "https://example.com/oauth/token")][..],
+            &[
+                ("auth_token_url", "https://example.com/oauth/token"),
+                ("auth_header_name", "authorization"),
+            ][..],
+        ] {
+            let (result, target_requests, _) = get_through_a_redirect_off_the_origin(extra).await;
+
+            let response =
+                result.unwrap_or_else(|e| panic!("the redirect is followed with {extra:?}: {e}"));
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(target_requests, 1, "{extra:?}");
+        }
     }
 }

@@ -24,11 +24,6 @@ runtime-metrics = { path = "../runtime-metrics" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 twox-hash.workspace = true
 spice-table = { path = "../spice-table" }
-duckdb = { workspace = true, features = [
-    "bundled",
-    "r2d2",
-    "extensions-full",
-], optional = true }
 fundu.workspace = true
 futures.workspace = true
 object_store.workspace = true
@@ -44,7 +39,6 @@ runtime-object-store = { path = "../runtime-object-store" }
 runtime-secrets = { path = "../runtime-secrets" }
 runtime-state-location = { path = "../runtime-state-location" }
 s3-event-notifications = { path = "../s3-event-notifications" }
-rusqlite = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -54,7 +48,6 @@ tar = "0.4"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["fs", "sync"] }
 tracing.workspace = true
-turso = { workspace = true, optional = true }
 url.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 utoipa = { workspace = true, optional = true }
@@ -65,13 +58,10 @@ libc = "0.2"
 
 [features]
 default = []
-duckdb = ["dep:duckdb"]
 openapi = ["dep:utoipa"]
 snapshots = []
-sqlite = ["dep:rusqlite"]
 # An `AccelerationSource` the engine crates can build in their own tests.
 test-support = []
-turso = ["dep:turso"]
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -82,6 +72,10 @@ hex = "0.4"
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+harness = false
+name = "change_sink_grouping"
 
 [[bench]]
 harness = false

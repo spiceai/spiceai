@@ -17,6 +17,8 @@ sources:
 variants:
   search-cache-on: {}
   search-cache-off: { spicepod: { runtime: { caching: { search_results: { enabled: false } } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1

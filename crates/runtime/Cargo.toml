@@ -72,11 +72,6 @@ datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
 spice-table = { path = "../spice-table" }
 document_parse = { path = "../document_parse" }
-duckdb = { workspace = true, features = [
-    "bundled",
-    "r2d2",
-    "extensions-full",
-], optional = true }
 event_stream = { path = "../event_stream" }
 flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
@@ -160,13 +155,13 @@ rmcp = { workspace = true, optional = true, features = [
     "transport-streamable-http-server",
     "transport-streamable-http-client-reqwest",
 ] }
+redact = { path = "../redact" }
 runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-api-types = { path = "../runtime-api-types" }
 runtime-async = { path = "../runtime-async" }
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
-runtime-checkpoint-duckdb = { path = "../runtime-checkpoint-duckdb", optional = true }
-runtime-checkpoint-sqlite = { path = "../runtime-checkpoint-sqlite", optional = true }
 runtime-component = { path = "../runtime-component" }
+runtime-config = { path = "../runtime-config" }
 runtime-metrics = { path = "../runtime-metrics" }
 runtime-auth = { path = "../runtime-auth" }
 runtime-cluster = { path = "../runtime-cluster" }
@@ -192,7 +187,6 @@ runtime-secrets = { path = "../runtime-secrets", default-features = false }
 runtime-state-location = { path = "../runtime-state-location" }
 runtime-status = { path = "../runtime-status" }
 runtime-table-partition = { path = "../runtime-table-partition" }
-rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 elasticsearch = { path = "../elasticsearch", optional = true }
 duration-parse = { workspace = true, optional = true }
@@ -220,7 +214,6 @@ tiberius = { workspace = true, optional = true }
 token_provider = { path = "../token_provider" }
 tokenizers.workspace = true
 tokio.workspace = true
-tokio-rusqlite = { workspace = true, optional = true }
 tokio-rustls = "0.26.0"
 tokio-stream.workspace = true
 tokio-util.workspace = true
@@ -233,13 +226,12 @@ tracing.workspace = true
 tracing-futures.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
-turso-shared = { workspace = true }
 twox-hash.workspace = true
 typetag = "0.2.22"
 url.workspace = true
 util = { path = "../util", features = ["datafusion", "http"] }
 utoipa = { workspace = true, features = ["axum_extras"], optional = true }
-utoipa-swagger-ui = { version = "9", features = [
+utoipa-swagger-ui = { version = "10", features = [
     "axum",
     "vendored",
 ], optional = true }
@@ -256,6 +248,9 @@ yaml = { path = "../yaml" }
 
 [dev-dependencies]
 anyhow.workspace = true
+# `TestAccelerationSource`, for unit tests that create a Cayenne table, which
+# needs a source.
+runtime-acceleration = { path = "../runtime-acceleration", features = ["test-support"] }
 runtime-drasi = { path = "../runtime-drasi", features = ["test-util"] }
 async-graphql = "7.0.17"
 async-graphql-axum = "7.0.16"
@@ -289,6 +284,7 @@ connector-databricks = { path = "../data-connectors/connector-databricks" }
 connector-delta-lake = { path = "../data-connectors/connector-delta-lake" }
 connector-dremio = { path = "../data-connectors/connector-dremio" }
 connector-duckdb = { path = "../data-connectors/connector-duckdb" }
+duckdb-oracle = { path = "../duckdb-oracle" }
 connector-ducklake = { path = "../data-connectors/connector-ducklake" }
 connector-flightsql = { path = "../data-connectors/connector-flightsql" }
 connector-ftp = { path = "../data-connectors/connector-ftp" }
@@ -303,13 +299,7 @@ connector-mongodb = { path = "../data-connectors/connector-mongodb" }
 connector-mssql = { path = "../data-connectors/connector-mssql" }
 connector-mysql = { path = "../data-connectors/connector-mysql" }
 connector-oracle = { path = "../data-connectors/connector-oracle" }
-accelerator-postgres = { path = "../accelerators/accelerator-postgres" }
-runtime-checkpoint-postgres = { path = "../runtime-checkpoint-postgres" }
-accelerator-sqlite = { path = "../accelerators/accelerator-sqlite" }
-accelerator-turso = { path = "../accelerators/accelerator-turso" }
-accelerator-duckdb = { path = "../accelerators/accelerator-duckdb" }
 accelerator-cayenne = { path = "../accelerators/accelerator-cayenne" }
-turso.workspace = true
 connector-postgres = { path = "../data-connectors/connector-postgres" }
 connector-scylladb = { path = "../data-connectors/connector-scylladb" }
 tokio-postgres = { workspace = true }
@@ -363,18 +353,6 @@ elasticsearch = [
     "search/elasticsearch",
     "runtime-search/elasticsearch",
 ]
-duckdb = [
-    "dep:adbc_core",
-    "dep:adbc_driver_manager",
-    "dep:duckdb",
-    "dep:runtime-checkpoint-duckdb",
-    "db_connection_pool/duckdb",
-    "data_components/duckdb",
-    "datafusion-optimizer-rules/duckdb",
-    "runtime-acceleration/duckdb",
-    "search/duckdb",
-    "runtime-search/duckdb",
-]
 # Test-only marker: the DynamoDB connector now lives in `connector-dynamodb` (a
 # dev-dependency, registered unconditionally by `do_register_test_connectors`).
 # This gates the `tests/dynamodb` integration suite; the AWS SDK it uses directly is
@@ -387,7 +365,6 @@ ftp = ["runtime-object-store/ftp"]
 http-functions = ["runtime-datafusion-udfs/http-functions"]
 rate-control = []
 wasm-functions = ["runtime-datafusion-udfs/wasm-functions"]
-wasm-functions-compile = ["runtime-datafusion-udfs/wasm-functions-compile"]
 iceberg-write = []
 imap = []
 kafka = ["data_components/kafka", "runtime-table/kafka"]
@@ -427,10 +404,6 @@ postgres = [
     "data_components/postgres",
     "datafusion-table-providers/postgres",
 ]
-# Selects the PostgreSQL-accelerator integration tests. The engine itself is a crate
-# (`accelerator-postgres`), linked by `spiced` in a shipped build and by the dev-dependency
-# below for these tests, so this feature no longer pulls anything into the library.
-postgres-accel = ["postgres"]
 
 s3_vectors = [
     "data_components/s3_vectors",
@@ -453,22 +426,6 @@ spark = ["data_components/spark_connect", "connector-databricks/spark"]
 # Registers the Cayenne catalog connector. Intended for benchmarking only;
 # deliberately excluded from the default feature set.
 spicebench = []
-sqlite = [
-    "dep:tokio-rusqlite",
-    "dep:runtime-checkpoint-sqlite",
-    "db_connection_pool/sqlite",
-    "data_components/sqlite",
-    "dep:rusqlite",
-    "runtime-acceleration/sqlite",
-]
-turso = [
-    "dep:tokio-rusqlite",
-    "db_connection_pool/sqlite",
-    "data_components/sqlite",
-    "data_components/turso",
-    "dep:rusqlite",
-    "runtime-acceleration/turso",
-]
 vortex = []
 
 [[bench]]

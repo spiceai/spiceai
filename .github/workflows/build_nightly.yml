@@ -28,8 +28,13 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   check_commits:
+    environment: secret-free
     runs-on: ubuntu-24.04
     outputs:
       has_new_commits: ${{ steps.check_commits.outputs.has_new_commits }}
@@ -60,6 +65,7 @@ jobs:
         shell: bash
 
   setup:
+    environment: secret-free
     needs: check_commits
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
@@ -91,6 +97,7 @@ jobs:
   # ==================== BINARY BUILD JOBS ====================
 
   build-linux-x64:
+    environment: secret-free
     name: Build - Linux x64
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
@@ -117,16 +124,16 @@ jobs:
           grep '^version =' Cargo.toml
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Set up make
-        uses: ./.github/actions/setup-make
+        uses: $/.github/actions/setup-make
 
       - name: Set up cc
-        uses: ./.github/actions/setup-cc
+        uses: $/.github/actions/setup-cc
 
       - name: Install protoc
-        uses: ./.github/actions/install-protoc
+        uses: $/.github/actions/install-protoc
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
@@ -149,17 +156,18 @@ jobs:
           ./spiced --version
           ./spice version
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spiced_linux_x86_64
           path: spiced_linux_x86_64.tar.gz
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spice_linux_x86_64
           path: spice_linux_x86_64.tar.gz
 
   build-linux-arm64:
+    environment: secret-free
     name: Build - Linux aarch64
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
@@ -186,10 +194,10 @@ jobs:
           grep '^version =' Cargo.toml
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Set up cc
-        uses: ./.github/actions/setup-cc
+        uses: $/.github/actions/setup-cc
 
       - name: Install missing tools
         run: |
@@ -197,7 +205,7 @@ jobs:
           sudo apt-get install build-essential libssl-dev pkg-config cmake unzip -y
 
       - name: Install protoc
-        uses: ./.github/actions/install-protoc
+        uses: $/.github/actions/install-protoc
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
@@ -220,17 +228,18 @@ jobs:
           ./spiced --version
           ./spice version
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spiced_linux_aarch64
           path: spiced_linux_aarch64.tar.gz
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spice_linux_aarch64
           path: spice_linux_aarch64.tar.gz
 
   build-macos-arm64:
+    environment: secret-free
     name: Build - macOS aarch64
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
@@ -270,7 +279,7 @@ jobs:
           # first — and any brew-level breakage (an unreadable global lock, a half-written
           # `brew`) then fails the build over a toolchain it already had (#13463).
           # `setup-cc` probes the same way for every other macOS job; this step and its
-          # twin in build_and_release.yml are the two that still call brew directly.
+          # twin in build_release.yml are the two that still call brew directly.
           brew_bin="$(command -v brew || true)"
           if [ -z "$brew_bin" ]; then
             echo "::error::'brew' is not on PATH, so cmake and unixodbc cannot be installed or verified on this runner."
@@ -352,10 +361,10 @@ jobs:
           echo "LIBRARY_PATH=$library_path" >> "$GITHUB_ENV"
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Install protoc
-        uses: ./.github/actions/install-protoc
+        uses: $/.github/actions/install-protoc
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
@@ -378,12 +387,12 @@ jobs:
           ./spiced --version
           ./spice version
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spiced_darwin_aarch64
           path: spiced_darwin_aarch64.tar.gz
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spice_darwin_aarch64
           path: spice_darwin_aarch64.tar.gz
@@ -397,12 +406,16 @@ jobs:
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
     runs-on: hosted-linux-arm-runner
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download spiced binary
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: spiced_linux_aarch64
           path: /tmp
@@ -435,15 +448,19 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before building so the ubuntu base image
         # pull uses authenticated rate limits instead of anonymous (per-IP) limits.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Build ARM64 Docker image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -456,7 +473,7 @@ jobs:
           cache-to: type=gha,scope=build-docker-arm64,mode=max
 
       - name: Upload ARM64 Docker image
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: images-arm64
           path: /tmp/image-arm64-default.tar
@@ -467,12 +484,16 @@ jobs:
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
     runs-on: ubuntu-24.04
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download spiced binary
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: spiced_linux_x86_64
           path: /tmp
@@ -486,15 +507,19 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before building so the ubuntu base image
         # pull uses authenticated rate limits instead of anonymous (per-IP) limits.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Build AMD64 Docker image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -507,7 +532,7 @@ jobs:
           cache-to: type=gha,scope=build-docker-amd64,mode=max
 
       - name: Upload AMD64 Docker image
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: images-amd64
           path: /tmp/image-amd64-default.tar
@@ -518,6 +543,11 @@ jobs:
     if: needs.check_commits.outputs.has_new_commits == 'true' && (github.event_name == 'schedule' || inputs.publish)
 
     runs-on: ubuntu-24.04
+    environment: ci
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -526,7 +556,7 @@ jobs:
 
       # Download Docker image artifacts
       - name: Download Docker image artifacts
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: /tmp
           pattern: images-*
@@ -539,24 +569,28 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before pulling so we use the authenticated
         # rate limits instead of anonymous (per-IP) limits when pulling
         # registry:2 below.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Start local registry
         run: |
-          docker run -d -p 5000:5000 --restart=always --name registry registry:2
+          docker run -d -p 5000:5000 --restart=always --name registry registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
 
       - name: Login to GitHub Package Registry
         if: github.event_name == 'schedule' || inputs.publish
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}

@@ -20,10 +20,8 @@ use std::sync::Arc;
 
 use datafusion_execution::{config::SessionConfig, runtime_env::RuntimeEnv};
 use tokio::sync::Semaphore;
-use vortex::VortexSessionDefault;
 use vortex::file::WriteStrategyBuilder;
 use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions, WriteShardConfig};
-use vortex_session::VortexSession;
 
 use super::tuning::{self, ActuatorValues, IngestStats, LiveActuators, TuningBounds};
 use crate::metadata::{DeletionMode, DeltaEncoding, StorageClass, VortexConfig};
@@ -128,6 +126,12 @@ pub struct CayenneContext {
     /// Rows the deletion index's last reclaim removed per tombstone, which scales
     /// both deletion-index triggers (see [`super::deletion_yield`]).
     deletion_index_yield: super::deletion_yield::DeletionIndexYield,
+    /// Key deletion vectors the table's metastore holds, as the last compaction
+    /// trigger counted them; `0` until the first count. Read by the whole-table
+    /// reclaim of a key-delete table (see `deletion_vector_reclaim_decision`).
+    key_deletion_vector_files: std::sync::atomic::AtomicUsize,
+    /// Paces the whole-table reclaims of a table that is not `auto`.
+    whole_table_reclaim_pace: super::pk_deletion_mode::WholeTableReclaimPace,
     /// Consecutive eligible control ticks on which a goal stayed violated while the
     /// controller had no move left — no eligible adjustment, whether because every
     /// relevant lever is clamped at its bound OR the helpful lever is blocked by a
@@ -337,6 +341,8 @@ impl CayenneContext {
             bake_gate_last_samples: std::sync::atomic::AtomicU64::new(0),
             reclaim_gate_last_samples: std::sync::atomic::AtomicU64::new(0),
             deletion_index_yield: super::deletion_yield::DeletionIndexYield::default(),
+            key_deletion_vector_files: std::sync::atomic::AtomicUsize::new(0),
+            whole_table_reclaim_pace: super::pk_deletion_mode::WholeTableReclaimPace::default(),
             goal_stuck_ticks: std::sync::atomic::AtomicU64::new(0),
             last_write: parking_lot::Mutex::new(None),
             coupled_writer: std::sync::atomic::AtomicBool::new(false),
@@ -394,13 +400,14 @@ impl CayenneContext {
         strategy: WriteStrategyBuilder,
         shard: Option<WriteShardConfig>,
     ) -> Arc<VortexFormat> {
-        let session = VortexSession::default().set(strategy);
         let mut options = Self::vortex_table_options(&self.config);
         // This format only writes files, so it has no use for a read-path cache.
         // Clearing the size keeps it from building a private one when no
         // process-wide segment cache is installed.
         options.segment_cache_size_bytes = None;
-        let format = VortexFormat::new_with_options(session, options);
+        let format =
+            VortexFormat::new_with_options(super::delta_encoding::write_session(), options)
+                .with_write_strategy(strategy);
         let format = match shard {
             Some(config) => format.with_write_shard(config),
             None => format,
@@ -417,15 +424,16 @@ impl CayenneContext {
         cold_target_file_size_mb: usize,
         shard: Option<WriteShardConfig>,
     ) -> Arc<VortexFormat> {
-        let session = VortexSession::default().set(
-            super::delta_encoding::full_strategy_builder_for(&self.config.compression_strategy),
-        );
         let mut options = Self::vortex_table_options(&self.config);
         options.target_file_size_mb = cold_target_file_size_mb;
         // Write-only format: it never scans, so drop the read-path cache size and
         // avoid building a private `SharedSegmentCache` per promotion.
         options.segment_cache_size_bytes = None;
-        let format = VortexFormat::new_with_options(session, options);
+        let format =
+            VortexFormat::new_with_options(super::delta_encoding::write_session(), options)
+                .with_write_strategy(super::delta_encoding::full_strategy_builder_for(
+                    &self.config.compression_strategy,
+                ));
         let format = match shard {
             Some(config) => format.with_write_shard(config),
             None => format,
@@ -726,6 +734,26 @@ impl CayenneContext {
     pub(crate) fn effective_reclaim_deletion_index_trigger(&self) -> usize {
         self.deletion_index_yield
             .scale_trigger(self.configured_deletion_index_trigger())
+    }
+
+    /// Key deletion vectors the metastore held at the last count.
+    #[must_use]
+    pub(crate) fn key_deletion_vector_files(&self) -> usize {
+        self.key_deletion_vector_files
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record how many key deletion vectors the metastore holds.
+    pub(crate) fn set_key_deletion_vector_files(&self, files: usize) {
+        self.key_deletion_vector_files
+            .store(files, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The pace of this table's whole-table reclaims when it is not `auto`.
+    pub(crate) fn whole_table_reclaim_pace(
+        &self,
+    ) -> &super::pk_deletion_mode::WholeTableReclaimPace {
+        &self.whole_table_reclaim_pace
     }
 
     /// Record a deletion-index reclaim (a bake or a whole-table rewrite) that
@@ -1205,25 +1233,27 @@ impl CayenneContext {
     /// The format carries Vortex scan/write options, including the shared
     /// segment-cache capacity for scans created from this context.
     fn create_vortex_format(config: &VortexConfig) -> Arc<VortexFormat> {
-        // Create a Vortex session with default encodings. The session's write
-        // strategy is the table's FULL encoding tier: the BtrBlocks cascade by
-        // default, optionally extended with the Zstd string scheme when
-        // `cayenne_compression_strategy=zstd`, with string and binary data blocks
-        // capped (see `delta_encoding::full_strategy_builder_for`).
-        // Maintenance writes and full-level delta writes inherit it; light
-        // delta-encoding levels override it per write via
-        // `write_format_with_strategy` (see `provider::delta_encoding`).
-        let vortex_session = VortexSession::default().set(
-            super::delta_encoding::full_strategy_builder_for(&config.compression_strategy),
-        );
-
+        // A Vortex session with default encodings, writing with the table's FULL
+        // encoding tier: the BtrBlocks cascade by default, optionally extended
+        // with the Zstd string scheme when `cayenne_compression_strategy=zstd`,
+        // with string and binary data blocks capped (see
+        // `delta_encoding::full_strategy_builder_for`). Maintenance writes and
+        // full-level delta writes inherit it; light delta-encoding levels
+        // override it per write via `write_format_with_strategy` (see
+        // `provider::delta_encoding`).
+        //
         // Cayenne opts into the shared cache: its data files carry a uuid7 write
         // id beneath a uuid7 snapshot directory, so a path is written once and
         // never reused, and retirement invalidates it explicitly.
-        Arc::new(VortexFormat::new_with_process_segment_cache(
-            vortex_session,
-            Self::vortex_table_options(config),
-        ))
+        Arc::new(
+            VortexFormat::new_with_process_segment_cache(
+                super::delta_encoding::write_session(),
+                Self::vortex_table_options(config),
+            )
+            .with_write_strategy(super::delta_encoding::full_strategy_builder_for(
+                &config.compression_strategy,
+            )),
+        )
     }
 
     /// Table options shared by the base format and any per-write format

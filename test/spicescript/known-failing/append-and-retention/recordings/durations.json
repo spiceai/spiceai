@@ -1,8 +1,9 @@
 {
-  "append-iso-day": 36,
-  "append-iso-offset": 6,
+  "append-iso-day": 68,
   "append-negative-epoch": 6,
   "append-null-time": 5,
-  "append-same-time": 6,
-  "retention-epoch-formats": 57
+  "append-same-time": 7,
+  "retention-epoch-formats": 89,
+  "retention-sql-after-append-refresh": 5,
+  "retention-sql-filtered-read": 5
 }

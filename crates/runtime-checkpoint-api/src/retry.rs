@@ -19,7 +19,7 @@ limitations under the License.
 //! Sidecar writes share the accelerator's connection pool with the accelerator's own
 //! CDC-apply transactions, so they contend. How that contention is *reported* differs
 //! per engine, which is why the classifier below is a string heuristic rather than a
-//! typed match: `rusqlite`, `Turso`, `DuckDB` and `tokio-postgres` each phrase it
+//! typed match: `rusqlite`, `DuckDB` and `tokio-postgres` each phrase it
 //! differently.
 
 use std::time::Duration;

@@ -1,4 +1,5 @@
 name: conflict-batches
+tags: [long]
 description: >
   Cayenne keeps one row per primary key, the version that arrived last, for a
   key repeated in one refresh or statement, across record batches and within
@@ -11,6 +12,8 @@ description: >
 
 sources:
   src: { kind: postgres }
+  # The state location of the object-native-s3 variants.
+  lake: { kind: rustfs }
 
 matrix:
   mode: [memory, file]
@@ -23,6 +26,29 @@ variants:
   partitioned:
     when: { mode: file }
     datasets: { across: &part { acceleration: { partition_by: [region] } }, wsame: *part, wdiff: *part, ap: *part }
+  # Each variant above that keeps an unpartitioned Cayenne file acceleration,
+  # with the prototype object-native Cayenne metastore. `cayenne_vnext` does
+  # not support `partition_by` yet (#16308), so `tp` is unpartitioned here.
+  upsert-object-native: { datasets: { across: *upsert, wsame: *upsert, wdiff: *upsert, ap: *upsert, lp: *upsert, tp: &unpartitioned { acceleration: { partition_by: null } } }, spicepod: &vnext { runtime: { params: { cayenne_vnext: enabled } } } }
+  drop-object-native: { datasets: { across: *drop, wsame: *drop, wdiff: *drop, ap: *drop, lp: *drop, tp: *unpartitioned }, spicepod: *vnext }
+  none-object-native: { datasets: { tp: *unpartitioned }, spicepod: *vnext }
+  # The same with the data in an S3 state location (`object-native-s3` in variants.yaml).
+  upsert-object-native-s3:
+    datasets: { across: *upsert, wsame: *upsert, wdiff: *upsert, ap: *upsert, lp: *upsert, tp: *unpartitioned }
+    spicepod: &s3
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state:
+          location: s3://${sources.lake.bucket}/state/
+          params:
+            s3_endpoint: ${sources.lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.lake.key}
+            s3_secret: ${sources.lake.secret}
+            allow_http: 'true'
+  drop-object-native-s3: { datasets: { across: *drop, wsame: *drop, wdiff: *drop, ap: *drop, lp: *drop, tp: *unpartitioned }, spicepod: *s3 }
+  none-object-native-s3: { datasets: { tp: *unpartitioned }, spicepod: *s3 }
 
 spicepod:
   version: v1
@@ -159,8 +185,21 @@ steps:
   - query: SELECT id, v FROM t WHERE id IN (3, 100000)
     expect: { rows: [['100000', v3]] }
 
-  # Partitioned: the update would collide in one partition, so no partition changes.
+  # Partitioned (unpartitioned in the object-native variants): the update would
+  # collide in one partition, so no partition changes.
   - spice-exec: UPDATE tp SET id = 2 WHERE id = 1
     expect-error: "Failed to update dataset 'tp': the new '(id, region)' of 1 row matches a key already stored, so nothing was changed."
   - query: SELECT CAST(id AS VARCHAR) || ':' || v AS r FROM tp
     expect: { rows: [['1:a1'], ['3:a3'], ['1:b1'], ['3:b3'], ['1:c1'], ['3:c3'], ['1:d1'], ['3:d3'], ['1:e1'], ['3:e3'], ['1:z1'], ['2:z2']] }
+
+  # Object-native data: the file accelerations' logs, and `lp`'s data files, are
+  # in the state location, and no data file is in the instance's directory.
+  # `tp`'s few rows stay inline in its log, so it has no `data/` file.
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/lp-, contains: /head, min: 1 }
+    only: &s3-variants [upsert-object-native-s3, drop-object-native-s3, none-object-native-s3]
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/lp-, contains: /data/, min: 1 }
+    only: *s3-variants
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/tp-, contains: /head, min: 1 }
+    only: *s3-variants
+  - assert-files: { lacks: ['(^|/)s3:', '\.vortex$', '\.arrow$'] }
+    only: *s3-variants

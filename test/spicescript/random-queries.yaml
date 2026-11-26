@@ -1,4 +1,5 @@
 name: random-queries
+tags: [long]
 description: >
   Random queries over nested subqueries (filters, groupings, DISTINCT,
   ORDER BY … LIMIT on a unique key, joins, UNION ALL) under outer queries that
@@ -17,9 +18,9 @@ matrix:
 variants:
   federated: {}
   cayenne: cayenne-file
-  duckdb: duckdb-file
-  sqlite: sqlite-file
-  arrow: arrow
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
+  cayenne-memory: cayenne-memory
   adbc:
     when: { backend: duckdb }
     datasets:

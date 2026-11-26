@@ -37,7 +37,9 @@ fn make_dataset(path: &str, name: &str) -> Dataset {
 #[expect(clippy::expect_used)]
 fn get_params() -> Params {
     let _ = std::env::var("NEW_DATABRICKS_HOST").expect("NEW_DATABRICKS_HOST is not set");
-    let _ = std::env::var("NEW_DATABRICKS_TOKEN").expect("NEW_DATABRICKS_TOKEN is not set");
+    let _ =
+        std::env::var("DATABRICKS_OIDC_CLIENT_ID").expect("DATABRICKS_OIDC_CLIENT_ID is not set");
+    let _ = std::env::var("DATABRICKS_OIDC_AUDIENCE").expect("DATABRICKS_OIDC_AUDIENCE is not set");
     let _ = std::env::var("NEW_DATABRICKS_SQL_WAREHOUSE_ID")
         .expect("NEW_DATABRICKS_SQL_WAREHOUSE_ID is not set");
 
@@ -48,8 +50,12 @@ fn get_params() -> Params {
                 "${ env:NEW_DATABRICKS_HOST }".to_string(),
             ),
             (
-                "databricks_token".to_string(),
-                "${ env:NEW_DATABRICKS_TOKEN }".to_string(),
+                "databricks_client_id".to_string(),
+                "${ env:DATABRICKS_OIDC_CLIENT_ID }".to_string(),
+            ),
+            (
+                "databricks_token_audience".to_string(),
+                "${ env:DATABRICKS_OIDC_AUDIENCE }".to_string(),
             ),
             (
                 "databricks_sql_warehouse_id".to_string(),
@@ -80,7 +86,7 @@ async fn databricks_sql_warehouse_managed_table_test() -> Result<(), anyhow::Err
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("databricks_sql_warehouse_managed_test")
-                .with_dataset(make_dataset("spiceai_sandbox.tpch.lineitem", "lineitem"))
+                .with_dataset(make_dataset("spiceai_ci.tpch.lineitem", "lineitem"))
                 .build();
 
             configure_test_datafusion();
@@ -142,7 +148,7 @@ async fn databricks_sql_warehouse_schema_inference_test() -> Result<(), anyhow::
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("databricks_sql_warehouse_schema_test")
-                .with_dataset(make_dataset("spiceai_sandbox.tpch.nation", "nation"))
+                .with_dataset(make_dataset("spiceai_ci.tpch.nation", "nation"))
                 .build();
 
             configure_test_datafusion();
@@ -204,7 +210,7 @@ async fn databricks_sql_warehouse_dataset_registration_test() -> Result<(), anyh
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("databricks_sql_warehouse_registration_test")
-                .with_dataset(make_dataset("spiceai_sandbox.tpch.nation", "nation"))
+                .with_dataset(make_dataset("spiceai_ci.tpch.nation", "nation"))
                 .build();
 
             configure_test_datafusion();
@@ -267,7 +273,7 @@ async fn databricks_sql_warehouse_external_table_test() -> Result<(), anyhow::Er
         .scope(async {
             let app = AppBuilder::new("databricks_sql_warehouse_external_test")
                 .with_dataset(make_dataset(
-                    "spiceai_sandbox.integration.external_table",
+                    "spiceai_ci.integration.external_table",
                     "external_table",
                 ))
                 .build();
@@ -392,7 +398,7 @@ async fn databricks_sql_warehouse_materialized_view_test() -> Result<(), anyhow:
         .scope(async {
             let app = AppBuilder::new("databricks_sql_warehouse_mv_test")
                 .with_dataset(make_dataset(
-                    "spiceai_sandbox.integration.materialized_view_table",
+                    "spiceai_ci.integration.materialized_view_table",
                     "mv_table",
                 ))
                 .build();

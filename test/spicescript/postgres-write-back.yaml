@@ -1,4 +1,5 @@
 name: postgres-write-back
+tags: [long]
 description: >
   PostgreSQL CDC into file-mode Cayenne, with and without
   `write_mode: write_back`. A write-back dataset refuses a write outside a
@@ -11,6 +12,12 @@ description: >
 
 sources:
   src: { kind: postgres }
+
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
 
 spicepod:
   version: v1

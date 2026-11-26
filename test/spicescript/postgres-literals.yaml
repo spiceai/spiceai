@@ -1,4 +1,5 @@
 name: postgres-literals
+tags: [long]
 description: >
   Every column of a table of edge values compared with each edge value of its
   type, in each comparison form (=, <, >=, <>, IN, BETWEEN, and as a grouping
@@ -13,6 +14,8 @@ sources:
 variants:
   federated: {}
   cayenne: cayenne-file
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
 
 spicepod:
   version: v1
@@ -58,6 +61,9 @@ steps:
           (10, 0.30000000000000004, 0.1, 2.5, 25, 10, 10, 10, e'a''b"c\\d_e', '\x5c',
            '2024-06-30 23:59:59+14', '2024-06-30 23:59:59', '2024-06-30'),
           (11, 'NaN', 1, 2.5, 25, 11, 11, 11, 'naïve', '\x00',
-           '2024-03-10 10:00:00+00', '2024-03-10 10:00:00', '2024-03-10');
+           '2024-03-10 10:00:00+00', '2024-03-10 10:00:00', '2024-03-10'),
+          (12, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'a\''b', NULL, NULL, NULL, NULL),
+          (13, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'x''''y', NULL, NULL, NULL, NULL),
+          (14, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'trail\', NULL, NULL, NULL, NULL);
   - start: {}
   - corpus: corpus/postgres-literals.sql

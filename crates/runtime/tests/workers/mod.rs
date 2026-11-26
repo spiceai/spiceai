@@ -19,6 +19,7 @@ use futures::TryStreamExt;
 use runtime::Runtime;
 use snafu::ResultExt;
 use spicepod::component::model::Model;
+use spicepod::component::runtime::{Runtime as SpicepodRuntime, TaskHistory};
 use spicepod::component::worker::{LoadBalanceParams, RouterConfig, Worker};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -64,10 +65,9 @@ fn create_sql_worker(name: &str, sql: &str, cron: &str) -> Worker {
 
 fn get_openai_model(model: impl Into<String>, name: impl Into<String>) -> Model {
     let mut model = Model::new(format!("openai:{}", model.into()), name);
-    model.params.insert(
-        "openai_api_key".to_string(),
-        "${ secrets:SPICE_OPENAI_API_KEY }".into(),
-    );
+    model
+        .params
+        .extend(crate::utils::openai_credential_params());
     model.params.insert("tools".into(), "auto".into());
     model
 }
@@ -78,7 +78,7 @@ async fn test_worker_with_cron() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope_retry(3, || async {
-            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            verify_env_secret_exists(crate::utils::openai_credential_secret())
                 .await
                 .map_err(anyhow::Error::msg)?;
 
@@ -146,13 +146,22 @@ async fn test_sql_worker_with_cron() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope_retry(3, || async {
-            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            verify_env_secret_exists(crate::utils::openai_credential_secret())
                 .await
                 .map_err(anyhow::Error::msg)?;
 
             let ds_tpcds_item = get_tpcds_dataset("item", None, None);
 
+            // The snapshot asserts the query's result preview, which the query only
+            // builds when `captured_output` is not `none` (the default).
             let app = AppBuilder::new("test_worker_with_cron")
+                .with_runtime(SpicepodRuntime {
+                    task_history: TaskHistory {
+                        captured_output: "truncated".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
                 .with_dataset(ds_tpcds_item)
                 .with_worker(create_sql_worker(
                     "sql_scheduled",

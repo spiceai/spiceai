@@ -49,16 +49,20 @@ runtime-request-context = { path = "../runtime-request-context" }
 schemars.workspace = true
 serde.workspace = true
 secrecy.workspace = true
-serde_json.workspace = true
+# `float_roundtrip`: tool results are parsed back into `serde_json::Value`, and the default float
+# parser can change a value's last digit (`1e-30` reads back as `9.999999999999999e-31`).
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 shell-words.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 sse-stream = { version = "0.2.6", optional = true }
 tools = { path = "../tools" }
 tokio.workspace = true
+tokio-util = { workspace = true, optional = true }
 uuid.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
+redact = { path = "../redact" }
 url.workspace = true
 utoipa = { workspace = true, optional = true }
 util = { path = "../util" }
@@ -67,15 +71,23 @@ util = { path = "../util" }
 default = []
 # `tools/mcp` gates `tools::McpProxy` and `SpiceModelTool::as_mcp_proxy`, both of which
 # `mcp::tool` names, so the crate's MCP code needs it as much as it needs `rmcp` itself.
-mcp = ["dep:bytes", "dep:reqwest", "dep:rmcp", "dep:sse-stream", "tools/mcp"]
+mcp = ["dep:bytes", "dep:reqwest", "dep:rmcp", "dep:sse-stream", "dep:tokio-util", "tools/mcp"]
 openapi = ["dep:utoipa"]
 
 [dev-dependencies]
 axum.workspace = true
+criterion = { version = "0.7", features = ["html_reports"] }
 bytes.workspace = true
 http-body-util = "0.1"
+# Checks tool results against the MCP `outputSchema` the tools declare (`result_schema`),
+# with a validator that shares no code with the schema or the encoder.
+jsonschema = { version = "0.60.2", default-features = false }
 tower.workspace = true
 tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+harness = false
+name = "result_encoder"

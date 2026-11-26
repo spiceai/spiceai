@@ -27,7 +27,10 @@ use spicepod::{
     param::{ParamValue, Params},
 };
 
-use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
+use crate::{
+    configure_test_datafusion, init_tracing,
+    utils::{aws_session_token_param, test_request_context},
+};
 
 pub fn get_s3_dataset(s3_uri: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(s3_uri, name);
@@ -43,7 +46,10 @@ pub fn get_s3_dataset(s3_uri: &str, name: &str) -> Dataset {
 }
 
 pub fn get_s3_hive_partitioned_dataset(name: &str, infer_partitions: bool) -> Dataset {
-    let mut dataset = Dataset::new("s3://spiceai-public-datasets/hive_partitioned_data/", name);
+    let mut dataset = Dataset::new(
+        "s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/",
+        name,
+    );
     dataset.params = Some(Params::from_string_map(
         vec![
             ("file_format".to_string(), "parquet".to_string()),
@@ -71,7 +77,7 @@ async fn s3_federation() -> Result<(), anyhow::Error> {
                     "taxi_trips",
                 ))
                 .with_dataset(get_s3_dataset(
-                    "s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet",
+                    "s3://spice-datasets-gjezag77s0hu/taxi_small_samples/taxi_sample.parquet",
                     "taxi_sample",
                 ))
                 .build();
@@ -194,7 +200,7 @@ async fn s3_schema_evolution() -> Result<(), anyhow::Error> {
         .scope(async {
             let app = AppBuilder::new("s3_schema")
                 .with_dataset(get_s3_dataset(
-                    "s3://spiceai-public-datasets/test_schema_evolution/",
+                    "s3://spice-datasets-gjezag77s0hu/test_schema_evolution/",
                     "lineitem",
                 ))
                 .build();
@@ -244,8 +250,8 @@ async fn s3_bulk_bucket_schema() -> Result<(), anyhow::Error> {
         .scope(async {
             let app = AppBuilder::new("s3_schema")
                 .with_dataset(get_s3_dataset(
-                    "s3://spiceai-public-datasets/tpch_sf1000/lineitem/",
-                    "lineitem",
+                    "s3://spice-datasets-gjezag77s0hu/taxi_trips_2024_partitioned/",
+                    "taxi_trips",
                 ))
                 .build();
 
@@ -264,7 +270,7 @@ async fn s3_bulk_bucket_schema() -> Result<(), anyhow::Error> {
 
             let mut query_result = rt
                 .datafusion()
-                .query_builder("describe lineitem;")
+                .query_builder("describe taxi_trips;")
                 .build()
                 .run()
                 .await
@@ -289,7 +295,7 @@ async fn s3_schema_source_path() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let mut ds1 = get_s3_dataset(
-                "s3://spiceai-public-datasets/test_schema_evolution/",
+                "s3://spice-datasets-gjezag77s0hu/test_schema_evolution/",
                 "ds1_customer",
             );
 
@@ -298,14 +304,14 @@ async fn s3_schema_source_path() -> Result<(), anyhow::Error> {
                 params.data.insert(
                     "schema_source_path".to_string(),
                     ParamValue::String(
-                        "s3://spiceai-public-datasets/test_schema_evolution/1/"
+                        "s3://spice-datasets-gjezag77s0hu/test_schema_evolution/1/"
                             .to_string(),
                     ),
                 );
             }
 
             let mut ds2 = get_s3_dataset(
-                "s3://spiceai-public-datasets/test_schema_evolution/",
+                "s3://spice-datasets-gjezag77s0hu/test_schema_evolution/",
                 "ds2_customer",
             );
 
@@ -314,14 +320,14 @@ async fn s3_schema_source_path() -> Result<(), anyhow::Error> {
                 params.data.insert(
                     "schema_source_path".to_string(),
                     ParamValue::String(
-                        "s3://spiceai-public-datasets/test_schema_evolution/1/data_0_0_10.parquet"
+                        "s3://spice-datasets-gjezag77s0hu/test_schema_evolution/1/data_0_0_10.parquet"
                             .to_string(),
                     ),
                 );
             }
 
             let mut ds3 = get_s3_dataset(
-                "s3://spiceai-public-datasets/test_schema_evolution/",
+                "s3://spice-datasets-gjezag77s0hu/test_schema_evolution/",
                 "ds3_lineitem",
             );
 
@@ -330,7 +336,7 @@ async fn s3_schema_source_path() -> Result<(), anyhow::Error> {
                 params.data.insert(
                     "schema_source_path".to_string(),
                     ParamValue::String(
-                        "s3://spiceai-public-datasets/test_schema_evolution/2/data_0_2_11-new.parquet"
+                        "s3://spice-datasets-gjezag77s0hu/test_schema_evolution/2/data_0_2_11-new.parquet"
                             .to_string(),
                     ),
                 );
@@ -390,7 +396,7 @@ async fn s3_schema_source_path_authenticated() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let mut parts_ds = get_s3_dataset(
-                "s3://databricks-workspace-stack-473ec-bucket/unity-catalog/8429759719709712/__unitystorage/catalogs/fa937541-ca24-4f62-a93b-088db0fb40af/tables/e0dcf887-3bef-4c85-8863-e786e74756de/",
+                "s3://spiceai-ci-s3-dataset-private/schema_source_path/parts/",
                 "parts",
             );
 
@@ -399,7 +405,7 @@ async fn s3_schema_source_path_authenticated() -> Result<(), anyhow::Error> {
                 params.data.insert(
                     "schema_source_path".to_string(),
                     ParamValue::String(
-                        "s3://databricks-workspace-stack-473ec-bucket/unity-catalog/8429759719709712/__unitystorage/catalogs/fa937541-ca24-4f62-a93b-088db0fb40af/tables/e0dcf887-3bef-4c85-8863-e786e74756de/part_key=0/part-00091-21d6926a-7a96-4159-afe6-25c9f574110e.c000.snappy.parquet"
+                        "s3://spiceai-ci-s3-dataset-private/schema_source_path/parts/part_key=0/part-00091-21d6926a-7a96-4159-afe6-25c9f574110e.c000.snappy.parquet"
                             .to_string(),
                     ),
                 );
@@ -415,9 +421,15 @@ async fn s3_schema_source_path_authenticated() -> Result<(), anyhow::Error> {
                     "s3_secret".to_string(),
                     ParamValue::String("${secrets:NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY}".to_string()),
                 );
+                if let Some((param, value)) = aws_session_token_param(
+                    "s3_session_token",
+                    "NEW_AWS_DATABRICKS_DELTA_SESSION_TOKEN",
+                ) {
+                    params.data.insert(param, ParamValue::String(value));
+                }
                 params.data.insert(
                     "s3_region".to_string(),
-                    ParamValue::String("us-east-1".to_string()),
+                    ParamValue::String("us-east-2".to_string()),
                 );
                 params.data.insert(
                     "hive_partitioning_enabled".to_string(),
@@ -500,7 +512,7 @@ async fn s3_url_table_sql_api() -> Result<(), anyhow::Error> {
             let mut query_result = rt
                 .datafusion()
                 .query_builder(
-                    "SELECT * FROM 's3://spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet' LIMIT 10",
+                    "SELECT * FROM 's3://spice-datasets-gjezag77s0hu/taxi_small_samples/taxi_sample.parquet' LIMIT 10",
                 )
                 .build()
                 .run()
@@ -520,7 +532,7 @@ async fn s3_url_table_sql_api() -> Result<(), anyhow::Error> {
             let mut query_result = rt
                 .datafusion()
                 .query_builder(
-                    "SELECT * FROM 's3://spiceai-public-datasets/hive_partitioned_data/' LIMIT 10",
+                    "SELECT * FROM 's3://spice-datasets-gjezag77s0hu/hive_partitioned_data/' LIMIT 10",
                 )
                 .build()
                 .run()
@@ -575,7 +587,7 @@ async fn s3_url_table_dataframe_api() -> Result<(), anyhow::Error> {
             let df = rt
                 .datafusion()
                 .ctx
-                .table("s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet")
+                .table("s3://spice-datasets-gjezag77s0hu/taxi_small_samples/taxi_sample.parquet")
                 .await?
                 .limit(0, Some(10))?;
 
@@ -588,7 +600,7 @@ async fn s3_url_table_dataframe_api() -> Result<(), anyhow::Error> {
             let df = rt
                 .datafusion()
                 .ctx
-                .table("s3://spiceai-public-datasets/hive_partitioned_data/")
+                .table("s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/")
                 .await?
                 .limit(0, Some(10))?;
 
@@ -601,7 +613,7 @@ async fn s3_url_table_dataframe_api() -> Result<(), anyhow::Error> {
             let df = rt
                 .datafusion()
                 .ctx
-                .table("s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet")
+                .table("s3://spice-datasets-gjezag77s0hu/taxi_small_samples/taxi_sample.parquet")
                 .await?
                 .filter(col("\"VendorID\"").eq(lit(1)))?
                 .limit(0, Some(5))?;

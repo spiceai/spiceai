@@ -641,12 +641,12 @@ mod tests {
             serde_json::json!({
                 "name": "customer",
                 "status": "Error",
-                "error_message": "Failed to connect to endpoint 'grpc://dremio-client:32010'"
+                "error_message": "Failed to connect to endpoint 'grpc://dremio.example.internal:32010'"
             }),
             serde_json::json!({
                 "name": "lineitem",
                 "status": "Error",
-                "error_message": "Failed to connect to endpoint 'grpc://dremio-client:32010'"
+                "error_message": "Failed to connect to endpoint 'grpc://dremio.example.internal:32010'"
             }),
         ];
 
@@ -661,7 +661,7 @@ mod tests {
             "the summary must name the first failing dataset, got: {summary}"
         );
         assert!(
-            summary.contains("grpc://dremio-client:32010"),
+            summary.contains("grpc://dremio.example.internal:32010"),
             "the summary must carry the unreachable endpoint, got: {summary}"
         );
     }

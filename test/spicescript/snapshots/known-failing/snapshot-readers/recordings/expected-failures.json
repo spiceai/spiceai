@@ -1,0 +1,32 @@
+{
+  "cayenne-snapshot-reader-path-change": [
+    {
+      "run": "cayenne-snapshot-reader-path-change",
+      "who": "reader",
+      "key": "query: SELECT count(*) AS n, sum(id) AS s FROM t #2",
+      "kind": "error",
+      "signature": "stopped matching after <duration> (<n> attempts): Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for t: Acceleration not ready; loading initial data for t",
+      "group": "snapshot-readers"
+    }
+  ],
+  "snapshot-source-moved-location": [
+    {
+      "run": "snapshot-source-moved-location",
+      "who": "reader",
+      "key": "query: SELECT count(*) AS n FROM t",
+      "kind": "error",
+      "signature": "stopped matching after <duration> (<n> attempts): the query succeeded, but the script expected an error:",
+      "group": "snapshot-readers"
+    }
+  ],
+  "snapshot-source-projected-publisher": [
+    {
+      "run": "snapshot-source-projected-publisher",
+      "who": "reader",
+      "key": "assert-status: {\"dataset\":\"t\",\"message-contains\":\"stores only some of its source's columns (SELECT id FROM t)\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected status Error, saw status=Ready ready=true message=",
+      "group": "snapshot-readers"
+    }
+  ]
+}

@@ -333,7 +333,7 @@ impl CayennePartitionedOverwriteSink {
         catalog: &CayenneCatalog,
         prepared: &[PreparedOverwrite],
     ) -> datafusion::common::Result<()> {
-        let max_attempts = turso_shared::DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+        let max_attempts = write_retry::DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
         for attempt in 1..=max_attempts {
             let mut txn = catalog
                 .begin_transaction()
@@ -361,7 +361,7 @@ impl CayennePartitionedOverwriteSink {
                     );
                 }
                 if attempt < max_attempts && cayenne::is_retryable_write_conflict(&e) {
-                    let delay = turso_shared::retry_backoff_delay(attempt);
+                    let delay = write_retry::retry_backoff_delay(attempt);
                     tracing::debug!(
                         attempt,
                         max_attempts,
@@ -377,7 +377,7 @@ impl CayennePartitionedOverwriteSink {
             match txn.commit().await {
                 Ok(()) => return Ok(()),
                 Err(e) if attempt < max_attempts && cayenne::is_retryable_write_conflict(&e) => {
-                    let delay = turso_shared::retry_backoff_delay(attempt);
+                    let delay = write_retry::retry_backoff_delay(attempt);
                     tracing::debug!(
                         attempt,
                         max_attempts,

@@ -392,7 +392,7 @@ mod tests {
         )
         .expect("an absent connection yields no rows");
 
-        assert!(rows.is_empty());
+        assert_eq!(rows, [] as [Value; 0]);
     }
 
     /// A node that cannot become a row must count as missing, not as delivered.
@@ -484,7 +484,7 @@ mod tests {
 
         let rows = fan_out(&empty, &REVIEWS, "spiceai", "spiceai", |_| {})
             .expect("a connection with no children yields no rows");
-        assert!(rows.is_empty());
+        assert_eq!(rows, [] as [Value; 0]);
     }
 
     #[test]

@@ -40,12 +40,28 @@ const FAILED: u8 = 5;
 const CANCELLED: u8 = 6;
 const REUSED: u8 = 7;
 
+/// How the rows of one complete HTTP response identify their request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestPages {
+    /// The source does not paginate: the response is one page, and its rows
+    /// store the request's own path, query and body.
+    Single,
+    /// The source paginates. Each row stores the path and query of the page
+    /// it came from, and the request's body, so the rows of one response,
+    /// now or on a later fetch, may carry several paths and queries.
+    Paginated {
+        /// Whether the fetch followed a link to another page.
+        followed_pages: bool,
+    },
+}
+
 /// Completion of one dedicated HTTP source execution, across all its partitions.
 /// Reusing a tracked plan invalidates the token rather than sharing a prior result.
 #[derive(Clone, Debug)]
 pub struct HttpFetchCompletion {
     partitions: Arc<[AtomicU8]>,
     followed_page: Arc<AtomicBool>,
+    paginated_source: bool,
 }
 
 impl HttpFetchCompletion {
@@ -55,7 +71,15 @@ impl HttpFetchCompletion {
                 .map(|_| AtomicU8::new(NOT_STARTED))
                 .collect(),
             followed_page: Arc::new(AtomicBool::new(false)),
+            paginated_source: false,
         }
+    }
+
+    /// Marks the fetch as reading a source configured for pagination.
+    #[must_use]
+    pub(super) fn for_paginated_source(mut self) -> Self {
+        self.paginated_source = true;
+        self
     }
 
     /// True only after every stream naturally reaches EOF without any source cap.
@@ -75,6 +99,28 @@ impl HttpFetchCompletion {
         self.partitions.len() == 1
             && self.is_complete()
             && !self.followed_page.load(Ordering::Acquire)
+    }
+
+    /// Whether one request partition reached EOF with no source cap, and how
+    /// its rows identify the request: `None` until then, and for a fetch of
+    /// several partitions. A page cap (`pagination_max_pages`), a limit, a
+    /// failed or transient page, or a cancelled stream never completes.
+    ///
+    /// A paginated source answers [`RequestPages::Paginated`] even for a
+    /// response that fit on one page, because the stored rows it replaces may
+    /// span several. The classification also records whether this fetch followed
+    /// another page, for destinations that can store only single-page responses.
+    #[must_use]
+    pub fn complete_request(&self) -> Option<RequestPages> {
+        (self.partitions.len() == 1 && self.is_complete()).then(|| {
+            if self.paginated_source || self.followed_page.load(Ordering::Acquire) {
+                RequestPages::Paginated {
+                    followed_pages: self.followed_page.load(Ordering::Acquire),
+                }
+            } else {
+                RequestPages::Single
+            }
+        })
     }
 
     pub(super) fn start(&self, partition: usize, limited: bool) -> CompletionGuard {
@@ -109,7 +155,7 @@ pub(super) struct Progress {
 impl Progress {
     fn mark(&self, outcome: u8) {
         let state = &self.completion.partitions[self.partition];
-        let _ = state.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        let _ = state.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             if current == REUSED || (outcome == COMPLETE && current != RUNNING) {
                 None
             } else {

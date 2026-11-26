@@ -88,11 +88,15 @@ def archive_url(version: str, release: str) -> str:
     return f"{base}/libduckdb-{release}.zip"
 
 
-def download(url: str, version: str, attempts: int = 5) -> bytes:
+def download(url: str, version: str, attempts: int = 8) -> bytes:
     """The archive at `url`, retried with backoff so a transient release-CDN
     5xx, connection reset or truncated body does not fail a sign-off. A
     truncated body raises `http.client.IncompleteRead`, which is not an
-    `OSError`."""
+    `OSError`.
+
+    The waits double from 2s and stop growing at 60s, about three minutes in
+    all over eight attempts: GitHub's release downloads answer 504 in bursts
+    that outlast the 30s the first four waits add up to."""
     for attempt in range(1, attempts + 1):
         try:
             with urllib.request.urlopen(url, timeout=300) as response:
@@ -103,7 +107,7 @@ def download(url: str, version: str, attempts: int = 5) -> bytes:
                     f"Failed to download DuckDB {version} from {url} after {attempts} attempts: {e}"
                 ) from e
             print(f"warning: downloading {url} failed ({e}); retrying", file=sys.stderr)
-            time.sleep(2**attempt)
+            time.sleep(min(2**attempt, 60))
     raise AssertionError("unreachable")
 
 

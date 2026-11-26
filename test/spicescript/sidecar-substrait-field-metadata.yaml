@@ -1,0 +1,62 @@
+# A sidecar over a federated PostgreSQL upstream plans each column with the
+# upstream's descriptive metadata (`source_type`), and the upstream's answer
+# need not carry it. The sidecar takes descriptive metadata from its plan
+# (`conform_batch` in crates/data_components/src/flight/substrait.rs). A
+# sidecar that compared it would refuse these answers with "Remote Substrait
+# result schema differs from the planned schema", most visibly lookups that
+# return the column they filter on.
+name: sidecar-substrait-field-metadata
+description: >
+  Through a sidecar, point lookups and filters that also return the column
+  they filter on answer as PostgreSQL does, as they do on the upstream.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: sidecar-substrait-field-metadata-upstream
+  datasets:
+    - { from: 'postgres:public.orders', name: orders, params: '${sources.src.params}' }
+
+sidecar:
+  spicepod:
+    version: v1
+    kind: Spicepod
+    name: sidecar-substrait-field-metadata-app
+    datasets:
+      - from: spice.ai:orders
+        name: orders
+        params: { spiceai_endpoint: 'http://127.0.0.1:${instance.flight_port}' }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - generate:
+      src:
+        table: orders
+        rows: 5000
+        seed: 12
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: customer_id, int: [1, 320], nulls: 0.05 }
+          - { name: amount, decimal: { range: [0, 1000], scale: 2 } }
+          - { name: status, choice: [open, shipped, returned] }
+  - start: {}
+  # The upstream answers each of them, and so does the sidecar.
+  - query: SELECT id, amount FROM orders WHERE id = 1234
+    on: upstream
+  - query: SELECT customer_id, amount FROM orders WHERE customer_id = 7
+    on: upstream
+  - query: SELECT id, amount FROM orders WHERE amount > 995
+    on: upstream
+  - query: SELECT id, amount FROM orders WHERE id = 1234
+  - query: SELECT id, customer_id, amount, status FROM orders WHERE id = 1234
+  - query: SELECT customer_id, amount FROM orders WHERE customer_id = 7
+  - query: SELECT id, amount FROM orders WHERE amount > 995
+  # And these, which filter on a column they do not return.
+  - query: SELECT amount, status FROM orders WHERE id = 1234
+  - query: SELECT id, amount FROM orders WHERE customer_id = 7

@@ -39,14 +39,14 @@ use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
 use datafusion_physical_plan::collect;
 
-test_with_backends!(test_update_single_row_by_pk_impl);
-test_with_backends!(test_update_with_expression_impl);
-test_with_backends!(test_update_multi_column_impl);
-test_with_backends!(test_update_set_null_impl);
-test_with_backends!(test_update_zero_match_impl);
-test_with_backends!(test_update_no_filter_all_rows_impl);
-test_with_backends!(test_update_preserves_inline_append_path_impl);
-test_with_backends!(test_concurrent_same_key_updates_keep_the_row_impl);
+test_on_data_store!(test_update_single_row_by_pk_impl);
+test_on_data_store!(test_update_with_expression_impl);
+test_on_data_store!(test_update_multi_column_impl);
+test_on_data_store!(test_update_set_null_impl);
+test_on_data_store!(test_update_zero_match_impl);
+test_on_data_store!(test_update_no_filter_all_rows_impl);
+test_on_data_store!(test_update_preserves_inline_append_path_impl);
+test_on_data_store!(test_concurrent_same_key_updates_keep_the_row_impl);
 
 /// Build a `CayenneTableProvider` with schema (id, name, value) and `id` as PK.
 async fn make_test_table(
@@ -64,15 +64,17 @@ async fn make_test_table(
         schema,
         primary_key: vec!["id".to_string()],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     Ok(Arc::new(table))
 }
 

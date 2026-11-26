@@ -29,7 +29,7 @@ limitations under the License.
 //!    then enrolls this instance *before the runtime is built or any
 //!    listener binds*, so the durable identity exists by the time anything
 //!    else here runs.
-//! 2. `$SPICE_CONFIG_DIR/identity.json` contains a usable previously-enrolled
+//! 2. `$SPICE_CONFIG_DIR/cloud-connect/identity.json` contains a usable previously-enrolled
 //!    identity — reconnection is automatic, with no flag.
 //!
 //! If neither is true, this module never opens a connection. An existing
@@ -82,6 +82,7 @@ use runtime::datafusion::query::Error as QueryError;
 use runtime::status::ComponentStatus;
 #[cfg(test)]
 use runtime_cloud_connect::config::IDENTITY_FILE;
+use runtime_cloud_connect::config::INCOMING_CLOUD_MANAGED_SPICEPOD_FILE;
 use runtime_cloud_connect::config::{
     CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig, DEPLOYMENT_TRANSACTION_FILE,
     DEPLOYMENT_TRANSACTION_INCOMING_FILE, INCOMING_SECRET_CACHE_FILE,
@@ -335,6 +336,53 @@ fn reconcile_requested_endpoint(
     }
 }
 
+/// Why this instance's Cloud Connect state directory cannot be used, so the
+/// runtime does not start.
+#[derive(Debug, snafu::Snafu)]
+#[snafu(display("Failed to start: {source}"))]
+pub struct StateDirectoryError {
+    source: runtime_cloud_connect::state_dir::Error,
+}
+
+/// Move Cloud Connect state an earlier version kept in the config directory
+/// into the state directory, then apply the state-directory rule to it.
+///
+/// Called from `main` with the instance directory claimed and before the
+/// `--token` bootstrap, so that nothing is read from or written to a state
+/// directory another account could have changed. An instance that has never
+/// enrolled and starts without `--token` has no state directory; nothing is
+/// created and nothing is logged for it.
+///
+/// # Errors
+///
+/// Returns [`StateDirectoryError`] when the state directory, or a config
+/// directory that still holds state to move, cannot be trusted or used.
+pub async fn prepare_state_directory(args: &crate::Args) -> Result<(), StateDirectoryError> {
+    let config_dir = CloudConnectConfig::default_config_dir();
+    runtime_cloud_connect::state_dir::migrate_legacy_state(&config_dir)
+        .await
+        .map_err(|source| StateDirectoryError { source })?;
+    let state_dir = runtime_cloud_connect::state_dir::state_dir(&config_dir);
+    let create = args.token.is_some();
+    // `main`'s subscriber is thread-local until the runtime installs the
+    // global one, so it goes with the check to the blocking thread.
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    tokio::task::spawn_blocking(move || {
+        tracing::dispatcher::with_default(&dispatch, || {
+            runtime_cloud_connect::state_dir::check(&state_dir, create)
+        })
+    })
+    .await
+    .map_err(|source| StateDirectoryError {
+        source: runtime_cloud_connect::state_dir::Error::Io {
+            path: CloudConnectConfig::default_state_dir(),
+            source: std::io::Error::other(format!("state directory task panicked: {source}")),
+        },
+    })?
+    .map_err(|source| StateDirectoryError { source })?;
+    Ok(())
+}
+
 /// Why a `--token` bootstrap could not produce a durable identity. Every
 /// message is safe to print: none can contain the enrollment key.
 #[derive(Debug, snafu::Snafu)]
@@ -421,10 +469,16 @@ pub async fn bootstrap_enrollment(args: &mut crate::Args) -> Result<(), Bootstra
 #[derive(Debug)]
 pub struct CloudManagedSpicepod {
     pub path: PathBuf,
-    /// The persisted YAML, kept so an `ApplySpicepod` can tell a redelivery of
-    /// the running deployment from a new one without re-reading the file.
+    /// The persisted YAML. Startup builds the app's root manifest from these
+    /// bytes rather than reopening `path`, so it is the file that was checked
+    /// when it was read; an `ApplySpicepod` also compares against them to tell
+    /// a redelivery of the running deployment from a new one.
     pub spicepod_yaml: String,
 }
+
+/// Largest cloud-managed Spicepod read back at startup: the most a deployment
+/// can deliver, since the control stream decodes no message larger than this.
+const MAX_CLOUD_MANAGED_SPICEPOD_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct CloudManagedSpicepodReadError {
@@ -455,17 +509,63 @@ pub async fn cloud_managed_spicepod(
     read_cloud_managed_spicepod(path).await
 }
 
+/// Read the persisted deployment, accepting only the file a deployment writes:
+/// a singly-linked regular file owned by this service, never a link.
+///
+/// The name is fixed and known before any deployment lands, so in a config
+/// directory another account can add entries to, anything else at it may have
+/// been put there to choose this instance's configuration. That is refused
+/// with an error naming the file rather than started from.
 async fn read_cloud_managed_spicepod(
     path: PathBuf,
 ) -> std::result::Result<Option<CloudManagedSpicepod>, CloudManagedSpicepodReadError> {
-    match tokio::fs::read_to_string(&path).await {
+    let read_path = path.clone();
+    let read = tokio::task::spawn_blocking(move || {
+        runtime_cloud_connect::identity::read_owned_state_file_optional(
+            &read_path,
+            MAX_CLOUD_MANAGED_SPICEPOD_BYTES,
+        )
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err(std::io::Error::other(format!(
+            "the read task stopped: {error}"
+        )))
+    });
+    let bytes = match read {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(None),
+        Err(source) => {
+            let source = unsafe_deployment_file(source, &path);
+            return Err(CloudManagedSpicepodReadError { path, source });
+        }
+    };
+    match String::from_utf8(bytes) {
         Ok(spicepod_yaml) => Ok(Some(CloudManagedSpicepod {
             path,
             spicepod_yaml,
         })),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(CloudManagedSpicepodReadError { path, source }),
+        Err(source) => Err(CloudManagedSpicepodReadError {
+            path,
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+        }),
     }
+}
+
+/// Add the fix to a refusal of the persisted deployment file at `path`. I/O
+/// failures that are not about the file's shape pass through unchanged.
+fn unsafe_deployment_file(source: std::io::Error, path: &Path) -> std::io::Error {
+    if source.kind() != std::io::ErrorKind::InvalidData {
+        return source;
+    }
+    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::io::Error::new(
+        source.kind(),
+        format!(
+            "{source}. Spice loads only the deployment file it wrote itself, so this one is not loaded. Delete it; the next Spice Cloud deployment writes it again, and `chmod go-w '{}'` keeps others from replacing it. See: https://spiceai.org/docs/cli/reference/cloud",
+            config_dir.display()
+        ),
+    )
 }
 
 /// The delivered-secrets store and its cache key, restored from local state.
@@ -681,10 +781,11 @@ struct Reconciled {
 ///
 /// [`Runtime::apply_app`] reconciles catalogs, datasets, views, models and
 /// functions into a running process, so those are taken from the deployment.
-/// Every other section configures something that was built while the process
-/// started — the servers, the CPU budget, the embedding models, the secret
-/// stores — and nothing re-reads it, so the deployed value is persisted for the
-/// next start while the value in effect is kept and named in
+/// Every other section is kept as the process started — the servers, the CPU
+/// budget and the secret stores, which nothing re-reads, and the embedding
+/// models and rerankers, which a deployment does not reload — so the deployed
+/// value is persisted for the next start while the value in effect is kept and
+/// named in
 /// [`Reconciled::restart_required`]. Keeping it is what makes the app this
 /// process reports the app it is actually serving, which is in turn what lets
 /// the next deployment be diffed against something true.
@@ -713,6 +814,7 @@ fn reconcile(active: &App, deployed: App) -> Reconciled {
         runtime,
         management,
         snapshots,
+        refused_components,
     } = deployed;
 
     let mut restart_required = Vec::new();
@@ -739,6 +841,10 @@ fn reconcile(active: &App, deployed: App) -> Reconciled {
         views,
         models,
         functions,
+        // What the deployment's dependencies may not load. It describes the
+        // deployed components, which are reconciled, and a reload logs any it
+        // newly refuses.
+        refused_components,
         // Read at start only to label anonymous telemetry, which is already
         // running: the label keeps the name the instance started under, and
         // nothing else in a running process is built from the app's name. Take
@@ -1261,6 +1367,14 @@ impl SpicedRuntimeHandle {
                 // failure.
                 return Ok(());
             };
+            if secrets.is_empty() {
+                // An app with no secrets: the next start must resolve none.
+                return match std::fs::remove_file(&path) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(format!("remove the delivered-secret cache: {error}")),
+                };
+            }
             let Some(key) = identity.cache_key() else {
                 return Err("the enrolled identity has no delivered-secret cache key; reconnect this instance, then deploy again so the secrets survive a restart".to_string());
             };
@@ -1303,6 +1417,10 @@ impl SpicedRuntimeHandle {
     ) -> (SecretCachePromotion, Option<String>) {
         let incoming = config_dir.join(INCOMING_SECRET_CACHE_FILE);
         let _ = std::fs::remove_file(&incoming);
+        if secrets.is_empty() {
+            // An app with no secrets leaves no cache for the next start.
+            return (SecretCachePromotion::Remove, None);
+        }
         let Some(key) = Self::cache_key_at(&self.identity_path_at(config_dir)) else {
             let error = "the enrolled identity has no delivered-secret cache key; reconnect this instance, then deploy again so the secrets survive a restart".to_string();
             tracing::warn!("Spice Cloud Connect: could not cache delivered secrets: {error}");
@@ -1318,7 +1436,7 @@ impl SpicedRuntimeHandle {
     }
 
     /// Write the delivered secrets to the cache for a deployment that has
-    /// nothing else left to do.
+    /// nothing else left to do, or remove the cache when the set is empty.
     ///
     /// The values are the ones this instance already holds — that is what makes
     /// the deployment a redelivery — but the cache is what the next start
@@ -1328,13 +1446,13 @@ impl SpicedRuntimeHandle {
     async fn refresh_secret_cache(
         &self,
         config_dir: &Path,
-        delivered_secrets: Option<runtime_cloud_connect::sealed_secrets::DeliveredSecrets>,
+        delivered_secrets: runtime_cloud_connect::sealed_secrets::DeliveredSecrets,
         mutation: runtime_cloud_connect::MutationLock,
     ) -> Option<String> {
         self.cache_delivered_secrets_locked(
             config_dir,
             config_dir,
-            Arc::new(delivered_secrets?),
+            Arc::new(delivered_secrets),
             mutation,
         )
         .await
@@ -1409,7 +1527,7 @@ impl SpicedRuntimeHandle {
         &self,
         config_dir: &Path,
         spicepod_yaml: &str,
-        delivered_secrets: Option<runtime_cloud_connect::sealed_secrets::DeliveredSecrets>,
+        delivered_secrets: runtime_cloud_connect::sealed_secrets::DeliveredSecrets,
     ) -> Result<serde_json::Value, CommandError> {
         // `Runtime::apply_app` is a diff against components already registered
         // from the current app. It cannot safely create the first app after an
@@ -1426,16 +1544,13 @@ impl SpicedRuntimeHandle {
         // The cache writer crosses into the blocking pool. Put the potentially
         // 1 MiB delivery behind an Arc once so that handoff is constant-time and
         // this async driver never clones the secret names or values.
-        let delivered_secrets = delivered_secrets.map(Arc::new);
+        let delivered_secrets = Arc::new(delivered_secrets);
         let staged =
             stage_cloud_managed_spicepod(config_dir, spicepod_yaml, &self.runtime_overrides)
                 .await?;
 
-        let (cache_promotion, cache_error) = delivered_secrets
-            .as_ref()
-            .map_or((SecretCachePromotion::Preserve, None), |secrets| {
-                self.stage_delivered_secrets_cache(config_dir, secrets)
-            });
+        let (cache_promotion, cache_error) =
+            self.stage_delivered_secrets_cache(config_dir, &delivered_secrets);
 
         // Commit the on-disk generation before exposing any of its secret
         // values to component resolution. This is the visibility boundary: if
@@ -1445,9 +1560,7 @@ impl SpicedRuntimeHandle {
             .promote_with_secret_cache(config_dir, cache_promotion)
             .await?;
 
-        let delivered_names = delivered_secrets
-            .as_ref()
-            .map(|secrets| secrets.keys().cloned().collect::<Vec<String>>());
+        let delivered_names = delivered_secrets.keys().cloned().collect::<Vec<String>>();
         let counts = ComponentCounts::of(&deployed_app);
 
         let Some(active) = active else {
@@ -1476,12 +1589,7 @@ impl SpicedRuntimeHandle {
             }));
         };
 
-        // `None` when the deployment carried no payload at all, which says
-        // nothing about the values in effect — a rotation pending from an
-        // earlier deployment stays pending.
-        let secrets_pending = delivered_secrets
-            .as_ref()
-            .map(|secrets| self.install_delivered_secrets(secrets));
+        let secrets_pending = self.install_delivered_secrets(&delivered_secrets);
 
         // The app captured after initial load settled is the configuration in
         // effect here. Holding that generation keeps a deployment from being
@@ -1496,12 +1604,10 @@ impl SpicedRuntimeHandle {
         let restart_required = {
             let mut pending = self.pending.write();
             pending.sections = sections;
-            if let Some(secrets) = secrets_pending {
-                // A delivered set the next start would not resolve is pending
-                // just as much as one this process cannot install: either way
-                // what is on disk is not what the app runs on.
-                pending.secrets = secrets || cache_error.is_some();
-            }
+            // A delivered set the next start would not resolve is pending just
+            // as much as one this process cannot install: either way what is on
+            // disk is not what the app runs on.
+            pending.secrets = secrets_pending || cache_error.is_some();
             pending.restart_required()
         };
 
@@ -1679,7 +1785,6 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             delivered_secrets,
             app_id,
         } = deployment;
-        let mut delivered_secrets = delivered_secrets;
 
         // One apply at a time. What this deployment is diffed against is only
         // immutable if nothing else can persist a spicepod, install secrets, or
@@ -1753,29 +1858,24 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         // so it does not make a redelivery into an apply. Anything else — a new
         // name, a rotated value, a withdrawn one — is a change the spicepod text
         // does not show.
-        let secrets_settled = delivered_secrets
-            .as_ref()
-            .is_none_or(|secrets| self.delivered_secrets.holds(secrets));
+        let secrets_settled = self.delivered_secrets.holds(&delivered_secrets);
 
         // Cloned out of the lock rather than compared under it: the guard must
         // not be held across the awaits below.
         let desired = self.desired.read().clone();
         if secrets_settled && desired.as_deref() == Some(spicepod_yaml) {
-            let secrets_redelivered = delivered_secrets.is_some();
             let cache_error = self
                 // This branch returns after the cache outcome, so transfer the
                 // apply guard into the blocking writer. Cancellation then
                 // cannot release it while the uncancellable write continues.
-                .refresh_secret_cache(config_dir, delivered_secrets.take(), mutation)
+                .refresh_secret_cache(config_dir, delivered_secrets, mutation)
                 .await;
             let restart_required = {
                 let mut pending = self.pending.write();
                 // A delivery this instance holds in full settles a rotation an
                 // earlier one left pending — but only once the cache holds it
                 // too, because that is what the next start resolves.
-                if secrets_redelivered {
-                    pending.secrets = cache_error.is_some();
-                }
+                pending.secrets = cache_error.is_some();
                 pending.restart_required()
             };
             tracing::info!(
@@ -2208,16 +2308,19 @@ struct StagedSpicepod {
     app: App,
     incoming: std::path::PathBuf,
     canonical: std::path::PathBuf,
+    /// The bytes that were validated. Promotion checks that the file it renamed
+    /// onto `canonical` holds exactly these, as a regular file this service
+    /// owns, so a file swapped in at `incoming` after validation is never
+    /// committed.
+    spicepod_yaml: Vec<u8>,
 }
 
 /// What the deployment transaction should do with the delivered-secret cache.
 enum SecretCachePromotion {
-    /// The deployment carried no secret update, so the current cache remains
-    /// part of the new generation.
-    Preserve,
     /// Promote this already encrypted owner-only staged cache.
     Replace(PathBuf),
-    /// The deployment carried secrets but no durable cache could be produced.
+    /// No cache belongs to the new generation: the deployment carried no
+    /// secrets, or no durable cache could be produced for the ones it carried.
     /// Removing the prior cache prevents a restart from mixing generations.
     Remove,
 }
@@ -2296,7 +2399,6 @@ impl StagedSpicepod {
         let cache_path = config_dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
         let marker = config_dir.join(DEPLOYMENT_TRANSACTION_FILE);
         let marker_incoming = config_dir.join(DEPLOYMENT_TRANSACTION_INCOMING_FILE);
-        let cache_mutated = !matches!(&cache, SecretCachePromotion::Preserve);
 
         let spicepod_existed = snapshot_optional_file(&self.canonical, &previous_spicepod)
             .await
@@ -2305,20 +2407,16 @@ impl StagedSpicepod {
                     "snapshot the current Cloud Connect Spicepod before promotion: {error}"
                 ))
             })?;
-        let cache_existed = if cache_mutated {
-            snapshot_optional_file(&cache_path, &previous_cache)
-                .await
-                .map_err(|error| {
-                    CommandError::failed(format!(
-                        "snapshot the current delivered-secret cache before promotion: {error}"
-                    ))
-                })?
-        } else {
-            false
-        };
+        let cache_existed = snapshot_optional_file(&cache_path, &previous_cache)
+            .await
+            .map_err(|error| {
+                CommandError::failed(format!(
+                    "snapshot the current delivered-secret cache before promotion: {error}"
+                ))
+            })?;
         let transaction = DeploymentTransaction {
             spicepod_existed,
-            cache_mutated,
+            cache_mutated: true,
             cache_existed,
         };
         write_deployment_transaction(&marker_incoming, &marker, transaction)
@@ -2332,8 +2430,17 @@ impl StagedSpicepod {
         let promotion = async {
             remove_optional_file(&self.canonical).await?;
             tokio::fs::rename(&self.incoming, &self.canonical).await?;
+            // The rename moves whatever entry is at `incoming`. Commit only the
+            // deployment that was validated.
+            if !holds_staged_spicepod(&self.canonical, &self.spicepod_yaml).await? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{INCOMING_CLOUD_MANAGED_SPICEPOD_FILE} in the config directory was replaced after it was validated, so it was not committed. Check who else can write to the config directory, then deploy again"
+                    ),
+                ));
+            }
             match &cache {
-                SecretCachePromotion::Preserve => {}
                 SecretCachePromotion::Replace(incoming) => {
                     remove_optional_file(&cache_path).await?;
                     tokio::fs::rename(incoming, &cache_path).await?;
@@ -2438,7 +2545,26 @@ async fn restore_optional_snapshot(
     }
     remove_optional_file(canonical).await?;
     // Copy instead of rename so recovery is idempotent if this process exits
-    // before the transaction marker itself can be removed.
+    // before the transaction marker itself can be removed. The copy creates the
+    // canonical file exclusively and follows no link on either side, so an
+    // entry planted at either name after the checks above is refused rather
+    // than read or written through.
+    #[cfg(unix)]
+    {
+        let (snapshot, canonical) = (snapshot.to_path_buf(), canonical.to_path_buf());
+        let copied = tokio::task::spawn_blocking(move || {
+            runtime_cloud_connect::identity::snapshot_regular_file_create_new(&snapshot, &canonical)
+        })
+        .await
+        .map_err(|error| std::io::Error::other(format!("the restore task stopped: {error}")))??;
+        if !copied {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "the snapshot to restore disappeared",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
     tokio::fs::copy(snapshot, canonical).await?;
     Ok(())
 }
@@ -2487,11 +2613,16 @@ async fn recover_deployment_transaction(config_dir: &Path) -> std::io::Result<()
     Ok(())
 }
 
-/// Validate a cloud-managed spicepod against a sibling `*.incoming.yml` temp
+/// Validate a cloud-managed spicepod and write it to a sibling `*.incoming.yml`
 /// file, so a bad push never clobbers the last known-good spicepod on disk.
 ///
 /// On any failure the canonical file is left untouched — the instance keeps
-/// serving it — and the temp file is cleaned up.
+/// serving it — and the staged file is cleaned up.
+///
+/// The staged file is always one this call creates: any entry already at its
+/// name is removed, then the file is created exclusively without following a
+/// link, owner-only. The root manifest is built from the delivered bytes, not
+/// by reading the file back, so what is validated is what was delivered.
 ///
 /// `runtime_overrides` are applied to the built app exactly as the start path
 /// applies them, so a deployment applied to this process lands the app a restart
@@ -2512,12 +2643,13 @@ async fn stage_cloud_managed_spicepod(
         .await
         .map_err(|e| CommandError::failed(format!("create config dir: {e}")))?;
 
-    let incoming = config_dir.join("spicepod-cloud-managed.incoming.yml");
-    tokio::fs::write(&incoming, spicepod_yaml)
+    let incoming = config_dir.join(INCOMING_CLOUD_MANAGED_SPICEPOD_FILE);
+    write_staged_spicepod(&incoming, spicepod_yaml)
         .await
         .map_err(|e| CommandError::failed(format!("write spicepod: {e}")))?;
 
-    match AppBuilder::build_from_path(incoming.clone()).await {
+    match AppBuilder::build_from_manifest_bytes(spicepod_yaml.as_bytes().to_vec(), &incoming).await
+    {
         Ok(mut app) => {
             // Rendered before the cleanup below: the error is not `Send`, so
             // holding it across an `.await` would make this future unspawnable.
@@ -2535,6 +2667,7 @@ async fn stage_cloud_managed_spicepod(
                 app,
                 incoming,
                 canonical,
+                spicepod_yaml: spicepod_yaml.as_bytes().to_vec(),
             })
         }
         Err(e) => {
@@ -2544,6 +2677,54 @@ async fn stage_cloud_managed_spicepod(
                 "invalid spicepod: {e}"
             )))
         }
+    }
+}
+
+/// Create `incoming` afresh and write `spicepod_yaml` to it durably.
+///
+/// Removing the name first unlinks whatever entry is there (a link is removed,
+/// not followed), and the exclusive no-follow create then fails rather than
+/// open anything that reappears at the name. A file this call created but could
+/// not finish writing is removed.
+async fn write_staged_spicepod(incoming: &Path, spicepod_yaml: &str) -> std::io::Result<()> {
+    remove_optional_file(incoming).await?;
+    let staged = incoming.to_path_buf();
+    let bytes = spicepod_yaml.as_bytes().to_vec();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        let mut file = runtime_cloud_connect::identity::create_state_file_new(&staged)?;
+        let written = file.write_all(&bytes).and_then(|()| file.sync_all());
+        if written.is_err() {
+            let _ = std::fs::remove_file(&staged);
+        }
+        written
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("the staging task stopped: {error}")))?
+}
+
+/// Whether the file now at `path` is the validated deployment: exactly
+/// `expected`, in a singly-linked regular file this service owns.
+///
+/// Read without following a link, so a link at `path` never passes even when
+/// it points at the right bytes. Comparing the bytes, rather than an inode
+/// number, keeps the check meaningful on filesystems that do not preserve
+/// inode numbers across a rename.
+async fn holds_staged_spicepod(path: &Path, expected: &[u8]) -> std::io::Result<bool> {
+    let path = path.to_path_buf();
+    let max_bytes = u64::try_from(expected.len()).unwrap_or(u64::MAX);
+    let read = tokio::task::spawn_blocking(move || {
+        runtime_cloud_connect::identity::read_owned_state_file_optional(&path, max_bytes)
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("the check task stopped: {error}")))?;
+    match read {
+        Ok(Some(bytes)) => Ok(bytes == expected),
+        Ok(None) => Ok(false),
+        // A link, a second hard link, another owner, or more bytes than were
+        // validated: not the staged file.
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -2998,6 +3179,87 @@ mod tests {
             )
             .expect("committed cache"),
             "new cache"
+        );
+        assert!(!dir.join(DEPLOYMENT_TRANSACTION_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A deployment never writes through an entry already at the staging name:
+    /// the staged file is always one the deployment creates. A link planted
+    /// there is replaced, its target is untouched, and the canonical file that
+    /// is committed is a regular, owner-only file with the delivered bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_at_the_staging_name_is_replaced_not_written_through() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = scratch_dir("staging-name-link");
+        let outside = scratch_dir("staging-name-link-target");
+        let victim = outside.join("operator-owned.yml");
+        std::fs::write(&victim, "leave me alone\n").expect("write the link target");
+        std::os::unix::fs::symlink(&victim, dir.join("spicepod-cloud-managed.incoming.yml"))
+            .expect("plant a link at the staging name");
+
+        let (_, canonical) = stage_cloud_managed_spicepod(&dir, VALID_SPICEPOD, &[])
+            .await
+            .expect("stage the deployment")
+            .promote_with_secret_cache(&dir, SecretCachePromotion::Remove)
+            .await
+            .expect("commit the deployment");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read the link target"),
+            "leave me alone\n",
+            "the deployment must not be written through the planted link"
+        );
+        let metadata = std::fs::symlink_metadata(&canonical).expect("stat the canonical file");
+        assert!(
+            metadata.file_type().is_file(),
+            "the committed deployment must be a regular file, not the planted link"
+        );
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&canonical).expect("read the canonical file"),
+            VALID_SPICEPOD
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// What is committed is what was validated. A staged file replaced between
+    /// validation and promotion is not committed, and the previous deployment
+    /// is restored.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_staged_file_replaced_after_validation_is_not_committed() {
+        const PREVIOUS: &str = "version: v2\nkind: Spicepod\nname: previous-deployment\n";
+        const SUBSTITUTED: &str = "version: v2\nkind: Spicepod\nname: substituted\n";
+
+        let dir = scratch_dir("staging-substituted");
+        let canonical = dir.join(CLOUD_MANAGED_SPICEPOD_FILE);
+        std::fs::write(&canonical, PREVIOUS).expect("write the previous deployment");
+
+        let staged = stage_cloud_managed_spicepod(&dir, VALID_SPICEPOD, &[])
+            .await
+            .expect("stage the deployment");
+        let incoming = dir.join("spicepod-cloud-managed.incoming.yml");
+        std::fs::remove_file(&incoming).expect("remove the staged file");
+        std::fs::write(&incoming, SUBSTITUTED).expect("put another file in its place");
+
+        let err = staged
+            .promote_with_secret_cache(&dir, SecretCachePromotion::Remove)
+            .await
+            .expect_err("a substituted staged file must not be committed");
+        assert_eq!(
+            err.to_string(),
+            "promote the Cloud Connect deployment transaction: spicepod-cloud-managed.incoming.yml in the config directory was replaced after it was validated, so it was not committed. Check who else can write to the config directory, then deploy again; the previous deployment was restored"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&canonical).expect("read the canonical file"),
+            PREVIOUS,
+            "the previous deployment must be what the next start serves"
         );
         assert!(!dir.join(DEPLOYMENT_TRANSACTION_FILE).exists());
 
@@ -3543,7 +3805,7 @@ datasets:
         };
         assert_eq!(alone.restart_required(), vec!["secrets".to_string()]);
 
-        assert!(Pending::default().restart_required().is_empty());
+        assert_eq!(Pending::default().restart_required(), [] as [String; 0]);
     }
 
     // ----------------------------------------------------------------------
@@ -3658,7 +3920,7 @@ views:
         SpicepodDeployment {
             config_dir,
             spicepod_yaml,
-            delivered_secrets: None,
+            delivered_secrets: DeliveredSecrets::new(),
             app_id: None,
         }
     }
@@ -3680,7 +3942,7 @@ views:
         handle.clear_cloud_delivered_secrets().await;
 
         assert!(handle.delivered_secrets.is_empty());
-        assert!(handle.delivered_secrets.names().is_empty());
+        assert_eq!(handle.delivered_secrets.names(), [] as [String; 0]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3869,6 +4131,10 @@ views:
     /// the delivered-secrets cache writable — without one the cache is skipped
     /// and a test asserting on it would pass for the wrong reason.
     fn enroll_with_a_cache_key(identity_path: &Path) {
+        write_identity(identity_path, true);
+    }
+
+    fn write_identity(identity_path: &Path, with_cache_key: bool) {
         let mock_pem = "-----BEGIN PRIVATE KEY-----\nMOCK\n-----END PRIVATE KEY-----\n".to_string();
         let mut identity = runtime_cloud_connect::identity::Identity {
             identifier: "inst_test".to_string(),
@@ -3892,10 +4158,12 @@ views:
             enc_previous_private_key_pem: String::new(),
             cache_key_b64: String::new(),
         };
-        assert!(
-            identity.ensure_cache_key(),
-            "the identity mints a cache key"
-        );
+        if with_cache_key {
+            assert!(
+                identity.ensure_cache_key(),
+                "the identity mints a cache key"
+            );
+        }
         IdentityStore::store(identity_path, &identity).expect("write the identity");
     }
 
@@ -3996,7 +4264,7 @@ views:
         );
         assert_eq!(persisted_spicepod(&dir), SERVING_PLUS_VIEW);
         assert_eq!(handle.desired.read().as_deref(), Some(SERVING_PLUS_VIEW));
-        assert!(handle.pending.read().restart_required().is_empty());
+        assert_eq!(handle.pending.read().restart_required(), [] as [String; 0]);
         assert!(
             !handle.runtime.status().is_shutdown(),
             "no deployment may drain the runtime"
@@ -4077,7 +4345,7 @@ views:
             .expect("reverting the pending section applies");
         assert_eq!(document["restart_required"], serde_json::json!([]));
         assert_eq!(document["live"], serde_json::json!(true));
-        assert!(handle.pending.read().restart_required().is_empty());
+        assert_eq!(handle.pending.read().restart_required(), [] as [String; 0]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4283,7 +4551,7 @@ tools:
 
         assert_eq!(persisted_spicepod(&dir), SERVING);
         assert_eq!(handle.desired.read().as_deref(), Some(SERVING));
-        assert!(handle.pending.read().restart_required().is_empty());
+        assert_eq!(handle.pending.read().restart_required(), [] as [String; 0]);
         assert_eq!(live_view_names(&handle).await, vec!["served_view"]);
         assert_eq!(
             query_rows(&handle.runtime, "SELECT n FROM served_view").await,
@@ -4309,7 +4577,7 @@ tools:
             .apply_spicepod(SpicepodDeployment {
                 config_dir: &dir,
                 spicepod_yaml: INVALID_SPICEPOD,
-                delivered_secrets: Some(delivered("api_key", b"value-two")),
+                delivered_secrets: delivered("api_key", b"value-two"),
                 app_id: None,
             })
             .await
@@ -4344,7 +4612,7 @@ tools:
             .apply_spicepod(SpicepodDeployment {
                 config_dir: &dir,
                 spicepod_yaml: SERVING_PLUS_VIEW,
-                delivered_secrets: Some(delivered("api_key", b"value-one")),
+                delivered_secrets: delivered("api_key", b"value-one"),
                 app_id: None,
             })
             .await
@@ -4359,7 +4627,7 @@ tools:
             .apply_spicepod(SpicepodDeployment {
                 config_dir: &dir,
                 spicepod_yaml: INVALID_SPICEPOD,
-                delivered_secrets: Some(delivered("api_key", b"value-two")),
+                delivered_secrets: delivered("api_key", b"value-two"),
                 app_id: None,
             })
             .await
@@ -4395,7 +4663,7 @@ tools:
             .apply_spicepod(SpicepodDeployment {
                 config_dir: &dir,
                 spicepod_yaml: SERVING,
-                delivered_secrets: Some(delivered("api_key", b"value-one")),
+                delivered_secrets: delivered("api_key", b"value-one"),
                 app_id: None,
             })
             .await
@@ -4431,7 +4699,7 @@ tools:
             .apply_spicepod(SpicepodDeployment {
                 config_dir: &dir,
                 spicepod_yaml: SERVING_PLUS_VIEW,
-                delivered_secrets: Some(delivered("api_key", b"value-one")),
+                delivered_secrets: delivered("api_key", b"value-one"),
                 app_id: None,
             })
             .await
@@ -4457,7 +4725,7 @@ tools:
             .apply_spicepod(SpicepodDeployment {
                 config_dir: &dir,
                 spicepod_yaml: SERVING,
-                delivered_secrets: Some(delivered("api_key", b"value-two")),
+                delivered_secrets: delivered("api_key", b"value-two"),
                 app_id: None,
             })
             .await
@@ -4484,13 +4752,86 @@ tools:
             .apply_spicepod(SpicepodDeployment {
                 config_dir: &dir,
                 spicepod_yaml: SERVING_PLUS_VIEW,
-                delivered_secrets: Some(delivered("api_key", b"value-one")),
+                delivered_secrets: delivered("api_key", b"value-one"),
                 app_id: None,
             })
             .await
             .expect("reverting the rotation applies");
         assert_eq!(reverted["restart_required"], serde_json::json!([]));
         assert_eq!(reverted["live"], serde_json::json!(true));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Removing every secret from an app redeploys it with none. The withdrawal
+    /// lands the way a rotation does: this process keeps resolving the values
+    /// until spiced starts again, and that start resolves none of them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deployment_with_no_secrets_withdraws_the_delivered_ones() {
+        let dir = scratch_dir("secret-withdrawal");
+        let handle = handle_serving(&dir, SERVING).await;
+        enroll_with_a_cache_key(&dir.join(IDENTITY_FILE));
+
+        handle
+            .apply_spicepod(SpicepodDeployment {
+                config_dir: &dir,
+                spicepod_yaml: SERVING_PLUS_VIEW,
+                delivered_secrets: delivered("api_key", b"value-one"),
+                app_id: None,
+            })
+            .await
+            .expect("a deployment delivering a secret applies");
+        assert!(
+            cached_secrets(&dir)
+                .expect("the applied deployment cached its secrets")
+                .holds(&delivered("api_key", b"value-one"))
+        );
+
+        let withdrawn = handle
+            .apply_spicepod(deployment(&dir, SERVING_PLUS_VIEW))
+            .await
+            .expect("the same spicepod with no secrets applies");
+        assert_eq!(withdrawn["delivered_secrets"], serde_json::json!([]));
+        assert_eq!(
+            withdrawn["restart_required"],
+            serde_json::json!(["secrets"]),
+            "the withdrawn value stays in effect until spiced starts again"
+        );
+        assert!(
+            cached_secrets(&dir).is_none_or(|cache| cache.is_empty()),
+            "the next start must not resolve a withdrawn secret"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An app with no secrets needs no cache, so deploying or redelivering it
+    /// settles on an identity that has no cache key, and leaves no cache from
+    /// an earlier deployment for the next start.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_app_with_no_secrets_needs_no_cache_key() {
+        let dir = scratch_dir("no-secrets-no-key");
+        let handle = handle_serving(&dir, SERVING).await;
+        write_identity(&dir.join(IDENTITY_FILE), false);
+        let cache = dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
+        std::fs::write(&cache, b"left by an earlier deployment").expect("write a cache");
+
+        let redelivered = handle
+            .apply_spicepod(deployment(&dir, SERVING))
+            .await
+            .expect("the redelivery is answered");
+        assert_eq!(redelivered["secrets_cache_error"], serde_json::Value::Null);
+        assert_eq!(redelivered["restart_required"], serde_json::json!([]));
+        assert!(!cache.exists(), "the next start must find no cache");
+
+        std::fs::write(&cache, b"left by an earlier deployment").expect("write a cache");
+        let deployed = handle
+            .apply_spicepod(deployment(&dir, SERVING_PLUS_VIEW))
+            .await
+            .expect("a changed spicepod with no secrets applies");
+        assert_eq!(deployed["secrets_cache_error"], serde_json::Value::Null);
+        assert_eq!(deployed["restart_required"], serde_json::json!([]));
+        assert!(!cache.exists(), "the next start must find no cache");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4514,7 +4855,7 @@ tools:
             .apply_spicepod(SpicepodDeployment {
                 config_dir: &dir,
                 spicepod_yaml: SERVING_PLUS_VIEW,
-                delivered_secrets: Some(delivered("api_key", b"value-one")),
+                delivered_secrets: delivered("api_key", b"value-one"),
                 app_id: None,
             })
             .await
@@ -4545,7 +4886,7 @@ tools:
             .apply_spicepod(SpicepodDeployment {
                 config_dir: &dir,
                 spicepod_yaml: SERVING_PLUS_VIEW,
-                delivered_secrets: Some(delivered("api_key", b"value-one")),
+                delivered_secrets: delivered("api_key", b"value-one"),
                 app_id: None,
             })
             .await

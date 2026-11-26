@@ -17,7 +17,6 @@ limitations under the License.
 use arrow_schema::SchemaRef;
 
 use crate::{access::AccessMode, find_first_delimiter};
-use acceleration::Engine;
 use datafusion::common::TableReference;
 use datafusion::sql::sqlparser::{
     dialect::{Dialect, GenericDialect},
@@ -36,6 +35,7 @@ pub mod acceleration;
 pub mod declared_schema;
 pub mod declared_type;
 pub mod metadata;
+pub use metadata::ResolvedTimeColumns;
 pub mod replication;
 pub mod schema_inference;
 
@@ -662,10 +662,6 @@ impl DatasetSpec {
     #[must_use]
     pub fn is_file_accelerated(&self) -> bool {
         if let Some(acceleration) = &self.acceleration {
-            if acceleration.engine == Engine::PostgreSQL {
-                return true;
-            }
-
             return acceleration.enabled
                 && matches!(
                     acceleration.mode,

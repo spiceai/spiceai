@@ -59,32 +59,30 @@ limitations under the License.
 use std::sync::LazyLock;
 
 use vortex::VortexSessionDefault;
-use vortex::array::ArrayId;
-use vortex::editions::{ComponentKind, EditionSessionExt};
 use vortex::file::WriteStrategyBuilder;
 use vortex::utils::aliases::hash_set::HashSet;
-use vortex_btrblocks::schemes::{float, integer, string};
-use vortex_btrblocks::{BtrBlocksCompressorBuilder, Scheme, SchemeExt};
+use vortex_btrblocks::schemes::{binary, float, integer, string};
+use vortex_btrblocks::{BtrBlocksCompressorBuilder, CompressionSessionExt, SchemeExt, SchemeId};
 use vortex_session::VortexSession;
 
-/// Keep only the schemes in `compressor` whose encodings a Cayenne write may
-/// serialize.
+/// The session every Cayenne write uses, built once: the default encodings,
+/// compression schemes and editions.
 ///
-/// A Vortex writer accepts only the encodings of its session's enabled
-/// editions. It limits its own default cascade to them, but it uses an explicit
-/// strategy as given and fails the write on any other encoding
-/// (`Serialized array ID … not permitted by ctx`). The default scheme set
-/// includes such schemes, for example the one that emits `fastlanes.delta`.
-/// Cayenne builds every write session with `VortexSession::default()`, so the
-/// permitted encodings are those of the default editions.
-fn permitted_schemes(compressor: BtrBlocksCompressorBuilder) -> BtrBlocksCompressorBuilder {
-    static PERMITTED: LazyLock<HashSet<ArrayId>> = LazyLock::new(|| {
-        VortexSession::default()
-            .enabled_component_ids(ComponentKind::Array)
-            .into_iter()
-            .collect()
-    });
-    compressor.retain_allowed_encodings(&PERMITTED)
+/// A Vortex writer accepts only the encodings of its session's enabled editions,
+/// and fails the write on any other (`Serialized array ID … not permitted by
+/// ctx`). Every compressor below starts from this session, which keeps only the
+/// schemes whose encodings those editions permit.
+static WRITE_SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::default);
+
+/// The session every Cayenne write format uses: the one its write strategies are built from.
+pub(crate) fn write_session() -> VortexSession {
+    WRITE_SESSION.clone()
+}
+
+/// The writer's default compressor: the session's schemes in the default preset,
+/// which leaves out Zstd and Pco.
+fn default_compressor() -> BtrBlocksCompressorBuilder {
+    BtrBlocksCompressorBuilder::from_session(&WRITE_SESSION)
 }
 
 /// The most uncompressed bytes one data block of a string or binary column may reference.
@@ -97,30 +95,33 @@ fn permitted_schemes(compressor: BtrBlocksCompressorBuilder) -> BtrBlocksCompres
 /// are under the cap (rows under 512 bytes) is written exactly as without it.
 const DATA_BLOCK_MAX_BYTES: u64 = 4 << 20;
 
-/// A write strategy that compresses with the permitted schemes of `compressor`.
+/// A write strategy that compresses with `compressor`.
 fn write_strategy(compressor: BtrBlocksCompressorBuilder) -> WriteStrategyBuilder {
-    WriteStrategyBuilder::default()
-        .with_btrblocks_builder(permitted_schemes(compressor))
+    WriteStrategyBuilder::from_session(&WRITE_SESSION)
+        .with_btrblocks_builder(compressor)
         .with_data_block_max_bytes(Some(DATA_BLOCK_MAX_BYTES))
 }
 
-/// Build a [`BtrBlocksCompressorBuilder`] restricted to exactly `schemes`.
+/// Build a [`BtrBlocksCompressorBuilder`] restricted to the schemes `ids` name.
 ///
-/// Starts from [`BtrBlocksCompressorBuilder::empty`] (no schemes registered)
-/// and registers each scheme in turn. Anything the registered schemes cannot
-/// shrink falls back to the canonical (uncompressed) encoding — there is no
-/// explicit "uncompressed" scheme to add in the pinned Vortex API.
-///
-/// Callers must pass a duplicate-free list:
-/// [`BtrBlocksCompressorBuilder::with_new_scheme`] panics on a repeated
-/// [`SchemeId`](vortex_btrblocks::SchemeId). The light-level sets below are
-/// curated by hand and contain no duplicates.
-fn builder_with_schemes(schemes: &[&'static dyn Scheme]) -> BtrBlocksCompressorBuilder {
-    schemes
+/// Starts from the session's schemes, so the ones whose encodings its editions
+/// do not permit stay out, and a scheme the session registers in one version
+/// (such as frame-of-reference) is kept whichever version that is. The compact
+/// preset leaves Zstd available, which the default preset drops; every scheme
+/// outside `ids` is then excluded. With no schemes, anything the cascade cannot
+/// shrink falls back to the canonical (uncompressed) encoding.
+fn builder_with_schemes(ids: &[SchemeId]) -> BtrBlocksCompressorBuilder {
+    let wanted: HashSet<SchemeId> = ids.iter().copied().collect();
+    let excluded: Vec<SchemeId> = WRITE_SESSION
+        .compression()
+        .schemes()
         .iter()
-        .fold(BtrBlocksCompressorBuilder::empty(), |builder, &scheme| {
-            builder.with_new_scheme(scheme)
-        })
+        .map(|scheme| scheme.id())
+        .filter(|id| !wanted.contains(id))
+        .collect();
+    default_compressor()
+        .with_compact()
+        .exclude_schemes(excluded)
 }
 
 use crate::metadata::{
@@ -136,15 +137,21 @@ use crate::metadata::{
 /// Zstd string schemes (which the default deliberately excludes); the cascade then
 /// picks them per column when they win.
 pub(crate) fn full_strategy_builder_for(strategy: &CompressionStrategy) -> WriteStrategyBuilder {
+    write_strategy(full_compressor_for(strategy))
+}
+
+/// The compressor of the FULL tier for `strategy`.
+fn full_compressor_for(strategy: &CompressionStrategy) -> BtrBlocksCompressorBuilder {
     match strategy {
-        CompressionStrategy::Btrblocks => write_strategy(BtrBlocksCompressorBuilder::default()),
-        CompressionStrategy::Zstd => {
-            // The default cascade deliberately excludes the Zstd string scheme;
-            // add it so the per-column search can pick it when it wins.
-            write_strategy(
-                BtrBlocksCompressorBuilder::default().with_new_scheme(&string::ZstdScheme),
-            )
-        }
+        CompressionStrategy::Btrblocks => default_compressor(),
+        // The default preset leaves out the Zstd string scheme. The compact preset
+        // keeps it, along with the binary Zstd and Pco schemes, which stay out so
+        // that only the string search widens.
+        CompressionStrategy::Zstd => default_compressor().with_compact().exclude_schemes([
+            binary::ZstdScheme.id(),
+            integer::PcoScheme.id(),
+            float::PcoScheme.id(),
+        ]),
     }
 }
 
@@ -297,26 +304,26 @@ pub(crate) fn effective_level(encoding: DeltaEncoding, write_class: WriteClass) 
 /// byte-for-byte today's behavior. Lower levels return a
 /// [`WriteStrategyBuilder`] whose compressor is restricted to the level's
 /// scheme set (see the module table).
-pub(crate) fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuilder> {
+#[must_use]
+pub fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuilder> {
     if level >= FULL_LEVEL {
         return None;
     }
 
-    // Pinned-Vortex `BtrBlocks` is scheme-list driven: an `empty()` builder has
-    // no schemes, so the cascade falls back to canonical (uncompressed) arrays
-    // for anything the registered schemes can't shrink — there is no explicit
-    // "uncompressed" scheme to add. Each light level starts from `empty()` and
-    // registers a widening subset; the full tier (handled above by the early
-    // return) keeps the session-default cascade.
+    // `BtrBlocks` is scheme-list driven: with no schemes the cascade falls back
+    // to canonical (uncompressed) arrays for anything it cannot shrink — there
+    // is no explicit "uncompressed" scheme to add. Each light level keeps a
+    // widening subset of the session's schemes; the full tier (handled above by
+    // the early return) keeps the session-default cascade.
     let builder = match level {
         // 0: no schemes — pure canonical/uncompressed (zero search, zero transform).
         0 => BtrBlocksCompressorBuilder::empty(),
         // 1: + sparse detection (near-free; common CDC shapes). Constant
         // detection is built into the cascading compressor as of Vortex 0.79.
         1 => builder_with_schemes(&[
-            &integer::SparseScheme,
-            &float::NullDominatedSparseScheme,
-            &string::NullDominatedSparseScheme,
+            integer::SparseScheme.id(),
+            float::NullDominatedSparseScheme.id(),
+            string::NullDominatedSparseScheme.id(),
         ]),
         // 2 (the `auto` light level): string Zstd only. One entropy-coding
         // pass over the string residual captures most of the transient-file
@@ -327,27 +334,27 @@ pub(crate) fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuild
         // canonical here; compaction's FULL re-encode optimizes them for the
         // long-lived artifact. Dict+numeric light sets remain at level 3 as
         // the explicit A/B rung (dict+zstd measured only ~4% smaller).
-        2 => builder_with_schemes(&[&string::ZstdScheme]),
+        2 => builder_with_schemes(&[string::ZstdScheme.id()]),
         // 3: rich light — dictionaries + cheap numeric schemes + Zstd.
         3 => builder_with_schemes(&[
-            &integer::SparseScheme,
-            &integer::IntDictScheme,
-            &integer::FoRScheme,
-            &integer::BitPackingScheme,
-            &integer::ZigZagScheme,
-            &integer::RunEndScheme,
-            &integer::SequenceScheme,
-            &float::NullDominatedSparseScheme,
-            &float::FloatDictScheme,
-            &float::FloatRLEScheme,
-            &string::NullDominatedSparseScheme,
-            &string::StringDictScheme,
-            &string::ZstdScheme,
+            integer::SparseScheme.id(),
+            integer::IntDictScheme.id(),
+            integer::FoRScheme::v1().id(),
+            integer::BitPackingScheme::v1().id(),
+            integer::ZigZagScheme.id(),
+            integer::RunEndScheme.id(),
+            integer::SequenceScheme.id(),
+            float::NullDominatedSparseScheme.id(),
+            float::FloatDictScheme.id(),
+            float::FloatRLEScheme.id(),
+            string::NullDominatedSparseScheme.id(),
+            string::StringDictScheme.id(),
+            string::ZstdScheme.id(),
         ]),
         // 4-6: everything in the default set except FSST — the symbol-table
         // training is the profiled dominant fixed cost on small string-bearing
         // deltas; numeric schemes keep their full default sets.
-        _ => BtrBlocksCompressorBuilder::default().exclude_schemes([string::FSSTScheme.id()]),
+        _ => default_compressor().exclude_schemes([string::FSSTScheme.id()]),
     };
 
     Some(write_strategy(builder))
@@ -435,39 +442,46 @@ mod tests {
         );
     }
 
+    /// `zstd` adds the Zstd string scheme to the search, which the default
+    /// cascade leaves out: on strings whose repeats are longer than FSST's
+    /// symbols, only the `zstd` strategy encodes with it.
     #[test]
     fn zstd_full_strategy_includes_zstd_string_schemes() {
-        // Engagement at the mapping level: `zstd` must actually add the Zstd
-        // string scheme to the search (the default set excludes it).
-        // The pinned Vortex builder no longer exposes its scheme list, so probe
-        // membership through `with_new_scheme`, which panics iff a scheme with
-        // the same `SchemeId` is already registered.
-        //
-        // The default cascade must NOT contain the Zstd string scheme — adding
-        // it must therefore succeed (no panic). This is the distinguishing
-        // addition that makes `cayenne_compression_strategy=zstd` real.
-        let added = std::panic::catch_unwind(|| {
-            BtrBlocksCompressorBuilder::default().with_new_scheme(&string::ZstdScheme)
-        });
-        assert!(
-            added.is_ok(),
-            "the default cascade must NOT already include the Zstd string \
-             scheme (it is the zstd param's distinguishing addition)"
-        );
+        use vortex::array::IntoArray;
+        use vortex::array::VortexSessionExecute;
+        use vortex::array::arrays::VarBinViewArray;
 
-        // ...and once added, it must survive the edition filter: registering it
-        // a second time must panic, proving the zstd full-tier builder
-        // genuinely carries the Zstd string scheme.
-        let double_add = std::panic::catch_unwind(|| {
-            permitted_schemes(
-                BtrBlocksCompressorBuilder::default().with_new_scheme(&string::ZstdScheme),
-            )
-            .with_new_scheme(&string::ZstdScheme)
-        });
+        // A 2 KiB run repeated in every row, with a short unique suffix.
+        let mut state = 0x9e37_79b9_u64;
+        let base: String = (0..2048)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                char::from(b'a' + u8::try_from(state % 26).expect("a letter"))
+            })
+            .collect();
+        let strings = VarBinViewArray::from_iter_str((0..1024).map(|row| format!("{base}{row}")))
+            .into_array();
+
+        let encodings = |strategy: &CompressionStrategy| {
+            let mut ctx = WRITE_SESSION.create_execution_ctx();
+            full_compressor_for(strategy)
+                .build()
+                .compress(&strings, &mut ctx)
+                .expect("compress")
+                .display_tree_encodings_only()
+                .to_string()
+        };
+        let zstd = encodings(&CompressionStrategy::Zstd);
+        let btrblocks = encodings(&CompressionStrategy::Btrblocks);
         assert!(
-            double_add.is_err(),
-            "the zstd full-tier compressor must include the Zstd string scheme \
-             in the search"
+            zstd.contains("zstd"),
+            "the zstd strategy encodes these strings with Zstd: {zstd}"
+        );
+        assert!(
+            !btrblocks.contains("zstd"),
+            "the default cascade has no Zstd scheme: {btrblocks}"
         );
     }
 
@@ -513,15 +527,18 @@ mod tests {
         );
     }
 
-    /// Writes `batch` through `session` and returns the file bytes and its segment count.
+    /// Writes `batch` with `strategy`, or the writer default, and returns the file bytes and
+    /// its segment count.
     async fn write_file(
-        session: vortex_session::VortexSession,
+        strategy: Option<WriteStrategyBuilder>,
         batch: &arrow::array::RecordBatch,
     ) -> (vortex::buffer::ByteBuffer, usize) {
         use vortex::array::stream::ArrayStreamAdapter;
         use vortex::arrow::ArrowSessionExt;
         use vortex::buffer::ByteBufferMut;
         use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt};
+
+        let session = write_session();
 
         let schema = batch.schema();
         let arrow = session.arrow();
@@ -532,8 +549,11 @@ mod tests {
         drop(arrow);
         let stream = ArrayStreamAdapter::new(dtype, futures::stream::iter([chunk]));
         let mut file = ByteBufferMut::empty();
-        session
-            .write_options()
+        let mut options = session.write_options();
+        if let Some(strategy) = strategy {
+            options = options.with_strategy(strategy.build());
+        }
+        options
             .write(&mut file, stream)
             .await
             .expect("write the probe table");
@@ -580,15 +600,11 @@ mod tests {
     /// Below the data block cap the full tier is the Vortex writer's own default, to the byte.
     #[tokio::test]
     async fn btrblocks_full_tier_matches_the_writer_default_below_the_cap() {
-        use vortex::VortexSessionDefault;
-        use vortex_session::VortexSession;
-
         // 64-byte strings: an 8,192-row block references ~640 KiB, under the 4 MiB cap.
         let batch = keyed_strings(20_000, 64);
-        let (default_file, _) = write_file(VortexSession::default(), &batch).await;
+        let (default_file, _) = write_file(None, &batch).await;
         let (full_file, _) = write_file(
-            VortexSession::default()
-                .set(full_strategy_builder_for(&CompressionStrategy::Btrblocks)),
+            Some(full_strategy_builder_for(&CompressionStrategy::Btrblocks)),
             &batch,
         )
         .await;
@@ -602,19 +618,20 @@ mod tests {
     /// Over the cap a string column's blocks are split, and the file reads back as written.
     #[tokio::test]
     async fn btrblocks_full_tier_splits_wide_string_blocks() {
-        use vortex::VortexSessionDefault;
         use vortex::array::stream::ArrayStreamExt;
         use vortex::arrow::ArrowSessionExt;
         use vortex::file::OpenOptionsSessionExt;
-        use vortex_session::VortexSession;
 
         // ~3 KB strings: an 8,192-row block references ~24 MiB, so a 4 MiB cap
         // splits it into 1,024-row blocks.
         let batch = keyed_strings(16_384, 3000);
-        let (default_file, default_segments) = write_file(VortexSession::default(), &batch).await;
-        let session = VortexSession::default()
-            .set(full_strategy_builder_for(&CompressionStrategy::Btrblocks));
-        let (full_file, full_segments) = write_file(session.clone(), &batch).await;
+        let (default_file, default_segments) = write_file(None, &batch).await;
+        let session = write_session();
+        let (full_file, full_segments) = write_file(
+            Some(full_strategy_builder_for(&CompressionStrategy::Btrblocks)),
+            &batch,
+        )
+        .await;
         assert!(
             full_segments >= default_segments + 12,
             "a 4 MiB cap must split the two 8,192-row blocks of `s`: {full_segments} segments vs {default_segments}"
@@ -661,31 +678,9 @@ mod tests {
     /// The size of the file `batch` is written to through the strategy `level` resolves
     /// to; a full level writes with the session-default cascade.
     async fn encoded_file_size(level: u8, batch: &arrow::array::RecordBatch) -> usize {
-        use vortex::VortexSessionDefault;
-        use vortex::array::stream::ArrayStreamAdapter;
-        use vortex::arrow::ArrowSessionExt;
-        use vortex::buffer::ByteBufferMut;
-        use vortex::file::WriteOptionsSessionExt;
-        use vortex_session::VortexSession;
-
-        let mut session = VortexSession::default();
-        if let Some(strategy) = strategy_builder_for_level(level) {
-            session = session.set(strategy);
-        }
-        let schema = batch.schema();
-        let arrow = session.arrow();
-        let dtype = arrow
-            .from_arrow_schema(&schema)
-            .expect("schema converts to a Vortex dtype");
-        let chunk = arrow.from_arrow_record_batch(batch.clone(), &schema);
-        drop(arrow);
-        let stream = ArrayStreamAdapter::new(dtype, futures::stream::iter([chunk]));
-        let mut file = ByteBufferMut::empty();
-        session
-            .write_options()
-            .write(&mut file, stream)
+        write_file(strategy_builder_for_level(level), batch)
             .await
-            .expect("write the probe column");
-        file.len()
+            .0
+            .len()
     }
 }

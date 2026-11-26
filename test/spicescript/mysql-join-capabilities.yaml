@@ -1,4 +1,5 @@
 name: mysql-join-capabilities
+tags: [long]
 description: Full joins stay local for MySQL while supported joins still federate.
 sources:
   my: { kind: mysql }
@@ -7,6 +8,8 @@ variants:
   federated: {}
   postgres: { datasets: { l: { from: 'postgres:l', params: '${sources.pg.params}' }, r: { from: 'postgres:r', params: '${sources.pg.params}' } } }
   cayenne: { datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: { datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file } } }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
 spicepod:
   version: v1
   kind: Spicepod

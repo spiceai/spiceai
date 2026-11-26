@@ -39,10 +39,10 @@ use snafu::Snafu;
 pub use context::{Batch, Context, ContextParams, Truncation};
 pub use devices::gpu_free_memory;
 pub use model::{Model, ModelParams, Vocab};
-pub use mtp::{DraftKind, Mtp, MtpParams};
+pub use mtp::{DraftKind, DraftRequest, Mtp, MtpParams};
 pub use sampler::Sampler;
 
-/// The llama.cpp release this crate is built from, such as `b11999`.
+/// The llama.cpp release this crate is built from, such as `v1.0.0`.
 pub const RELEASE: &str = env!("LLAMA_CPP_RELEASE");
 
 mod sys {
@@ -109,6 +109,11 @@ pub enum Error {
 
     #[snafu(display("The grammar cannot be passed to llama.cpp: {source}"))]
     GrammarNul { source: std::ffi::NulError },
+
+    #[snafu(display(
+        "llama.cpp has no next token to pick: the grammar the reply is held to allows none of the model's tokens here"
+    ))]
+    NothingToPick,
 
     #[snafu(display("llama.cpp could not turn the JSON schema into a grammar: {reason}"))]
     JsonSchema { reason: String },

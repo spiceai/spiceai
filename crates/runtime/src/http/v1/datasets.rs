@@ -24,6 +24,7 @@ use crate::{
         DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA,
         request_context_extension::get_current_datafusion,
     },
+    http::optional_json::OptionalJson,
 };
 use app::App;
 use axum::{
@@ -395,7 +396,7 @@ pub struct AccelerationRequest {
         ("name" = String, Path, description = "The name of the dataset to refresh.")
     ),
     request_body(
-        description = "On-demand refresh request for a specific dataset.",
+        description = "Optional overrides for this refresh. An empty body, with or without `Content-Type: application/json`, is the same as `{}`.",
         content((
             RefreshOverrides = "application/json",
             example = json!({
@@ -418,6 +419,12 @@ pub struct AccelerationRequest {
                 "message": "Dataset taxi_trips not found"
             })
         ))),
+        (status = 409, description = "The dataset is deferred and no query has initialized it yet: none has referenced it, or its initialization failed. Query the dataset to initialize it, or to see the error that prevents it, then refresh", content((
+            MessageResponse = "application/json",
+            example = json!({
+                "message": "Dataset eth_recent_blocks is not initialized yet: it is initialized by a query that references it, and no query has initialized it. Query the dataset to initialize it, or to see the error that prevents it, then refresh. See: https://spiceai.org/docs/components/data-accelerators/data-refresh#ready-state"
+            })
+        ))),
         (status = 400, description = "Dataset is not accelerated, or the overrides are invalid: a `refresh_mode` other than `full` or `append`, or a `refresh_sql` that does not parse or omits the dataset's `time_column`", content((
             MessageResponse = "application/json",
             example = json!({
@@ -435,10 +442,11 @@ pub struct AccelerationRequest {
 pub(crate) async fn refresh(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Path(dataset_name): Path<String>,
-    overrides_opt: Option<Json<RefreshOverrides>>,
-    // No body, or one without a JSON `Content-Type`, is `None`. A JSON body that does
-    // not deserialize is rejected before the handler runs: 400 for malformed JSON, 422
-    // for an unknown field value such as an unknown `refresh_mode`.
+    // An empty or whitespace-only body is `None` whatever the `Content-Type`, the same as
+    // `{}`. A JSON body is rejected before the handler runs: 400 for malformed JSON, 422
+    // for an unknown field value such as an unknown `refresh_mode`. A non-empty body
+    // under a non-JSON `Content-Type` is 415. See `OptionalJson`.
+    OptionalJson(overrides): OptionalJson<RefreshOverrides>,
 ) -> Response {
     let app_lock = tokio::select! {
         lock = app.read() => lock,
@@ -507,10 +515,7 @@ pub(crate) async fn refresh(
 
     let table_ref = TableReference::parse_str(name);
 
-    match df
-        .refresh_table(&table_ref, overrides_opt.map(|Json(overrides)| overrides))
-        .await
-    {
+    match df.refresh_table(&table_ref, overrides).await {
         Ok(_) => (
             status::StatusCode::CREATED,
             Json(MessageResponse {
@@ -525,6 +530,13 @@ pub(crate) async fn refresh(
             },
         ) => (
             status::StatusCode::BAD_REQUEST,
+            Json(MessageResponse {
+                message: format!("{err}"),
+            }),
+        )
+            .into_response(),
+        Err(err @ crate::datafusion::Error::DatasetNotInitialized { .. }) => (
+            status::StatusCode::CONFLICT,
             Json(MessageResponse {
                 message: format!("{err}"),
             }),
@@ -688,7 +700,7 @@ mod tests {
             })
         });
         DatasetResponseItem {
-            from: "s3://spiceai-public-datasets/trips.parquet".to_string(),
+            from: "s3://spice-datasets-gjezag77s0hu/trips.parquet".to_string(),
             name: name.to_string(),
             replication_enabled: false,
             acceleration_enabled: true,
@@ -718,7 +730,7 @@ mod tests {
         assert_eq!(
             csv,
             "from,name,replication_enabled,acceleration_enabled,status,error,error_message,last_refresh,next_refresh,properties.search,properties.vector_search\n\
-             s3://spiceai-public-datasets/trips.parquet,trips,false,true,,,,,,supported,unsupported\n"
+             s3://spice-datasets-gjezag77s0hu/trips.parquet,trips,false,true,,,,,,supported,unsupported\n"
         );
     }
 
@@ -738,8 +750,8 @@ mod tests {
         assert_eq!(
             csv,
             "from,name,replication_enabled,acceleration_enabled,status,error,error_message,last_refresh,next_refresh,properties.search,properties.vector_search\n\
-             s3://spiceai-public-datasets/trips.parquet,ready_trips,false,true,Ready,,,,,supported,unsupported\n\
-             s3://spiceai-public-datasets/trips.parquet,broken_trips,false,true,Error,dataset.auth,UnableToConnectInvalidUsernameOrPassword,,,supported,unsupported\n"
+             s3://spice-datasets-gjezag77s0hu/trips.parquet,ready_trips,false,true,Ready,,,,,supported,unsupported\n\
+             s3://spice-datasets-gjezag77s0hu/trips.parquet,broken_trips,false,true,Error,dataset.auth,UnableToConnectInvalidUsernameOrPassword,,,supported,unsupported\n"
         );
         let broken = csv
             .lines()

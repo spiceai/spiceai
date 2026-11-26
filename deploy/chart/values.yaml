@@ -6,11 +6,45 @@ image:
   tag: latest-models # 2.5.0-unstable
 replicaCount: 1
 
-# Update strategy for the Deployment (used when stateful.enabled is false).
+# The role spiced runs as (`spiced --role`):
+#   server     The default: serves queries over its own datasets.
+#   sidecar    Serves an application's queries beside it, and sends reads from
+#              a remote Spice runtime as Substrait plans created locally.
+#   scheduler  Plans distributed queries and assigns their tasks to executors.
+#   executor   Joins a scheduler's cluster and runs the tasks it assigns.
+# A cluster is one release with `role: scheduler` and one with `role: executor`.
+role: server
+
+# Cluster settings, used only with `role: scheduler` or `role: executor`.
+cluster:
+  # The scheduler's cluster address. Required for `role: executor`, e.g.
+  # https://spice-scheduler-spiceai:50052 for a scheduler release named spice-scheduler.
+  schedulerAddress: ''
+  # The host or IP other cluster nodes reach this node at; its certificate must
+  # name it. Defaults to the pod's stable DNS name,
+  # `<pod>.<release>-spiceai-headless.<namespace>.svc.cluster.local`.
+  advertiseAddress: ''
+  # The port of the cluster's internal gRPC service.
+  port: 50052
+  # Cluster mTLS: a Secret holding `ca.crt`, `tls.crt` and `tls.key`, the layout
+  # cert-manager writes. Each certificate must name the address its node is
+  # reached at: the scheduler Service host, and each node's advertise address.
+  # Give the scheduler and executor releases separate certificates and Secrets:
+  # a certificate shared by both roles would let any executor act as the
+  # scheduler. See the chart README.
+  tls:
+    secretName: ''
+  # Run the cluster without mTLS. Use only on a trusted network, for development
+  # and testing: cluster connections are neither authenticated nor encrypted.
+  allowInsecureConnections: false
+
+# Update strategy for the Deployment (used when stateful.enabled is false and
+# role is not scheduler or executor).
 # strategy:
 #   type: Recreate
 
-# Update strategy for the StatefulSet (used when stateful.enabled is true).
+# Update strategy for the StatefulSet (used when stateful.enabled is true or
+# role is scheduler or executor).
 # updateStrategy:
 #   type: RollingUpdate
 

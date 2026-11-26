@@ -216,6 +216,7 @@ impl CayennePartitionCreator {
         .with_retention_filters(self.retention_filters.clone())
         .with_scan_view_reuse(self.scan_view_reuse)
         .with_secondary_indexes(self.secondary_indexes.clone())
+        .with_schema_indexes(&self.schema)
         .with_dataset_name(&self.table_name)
         .with_partitioned_table_conflict_detection(self.vortex_config.pk_conflict_detection);
         if let Some(ref rb) = self.time_retention_filter_builder {
@@ -425,6 +426,15 @@ impl PartitionCreator for CayennePartitionCreator {
                     });
                 }
             };
+
+            // `open` does not go through `create_table`, so the child's stored
+            // data files are checked here, as a table that is not rebuilt.
+            self.catalog
+                .verify_existing_stored_data_files(cayenne_table.table_name())
+                .await
+                .map_err(|error| creator::Error::InferringPartitions {
+                    source: Box::new(error),
+                })?;
 
             let table_provider = Arc::new(cayenne_table);
             self.init_partition_provider(&table_provider);

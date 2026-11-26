@@ -44,6 +44,7 @@ pub mod access;
 pub mod catalog;
 pub mod column;
 pub mod dataset;
+pub mod vector_engine;
 pub mod view;
 
 #[derive(Debug, Snafu)]
@@ -322,10 +323,4 @@ mod tests {
 }
 pub mod schema_evolution;
 
-/// Which role this runtime plays in a cluster deployment. Parsed from the CLI, so
-/// it carries clap's `ValueEnum`.
-#[derive(Debug, Clone, PartialEq, Eq, clap::ValueEnum)]
-pub enum ClusterRole {
-    Scheduler,
-    Executor,
-}
+pub use runtime_config::{ClusterRole, Role};

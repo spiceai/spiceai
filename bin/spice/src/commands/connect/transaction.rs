@@ -260,7 +260,8 @@ async fn execute_with_inner<P: Prompter>(
     preflight_request(&request)?;
     telemetry.stage("local_state");
     let directory = canonical_instance_directory(request.dir.as_deref()).await?;
-    let config_dir = CloudConnectConfig::resolve_config_dir(Some(&directory));
+    let instance_config_dir = CloudConnectConfig::resolve_config_dir(Some(&directory));
+    let config_dir = super::local_state_dir(&instance_config_dir).await?;
     let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
     // A pending draft names the authority its operation already committed to,
     // so it decides what a resumed run needs — and says so in terms of that
@@ -311,7 +312,7 @@ async fn execute_with_inner<P: Prompter>(
         })?;
     let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
     let _runtime_lock =
-        runtime_cloud_connect::RuntimeLock::acquire(&config_dir).map_err(|source| {
+        runtime_cloud_connect::RuntimeLock::acquire(&instance_config_dir).map_err(|source| {
             Error::CloudConnectIo {
                 message: format!(
                     "{source} Stop the running instance before using `spice cloud link`."
@@ -1049,9 +1050,12 @@ async fn enroll(attempt: EnrollAttempt<'_>) -> Result<EnrollmentResult> {
         EnrollmentAuthority::Token { .. } => OrganizationBinding::Assertion,
         EnrollmentAuthority::AuthenticatedSession { .. } => OrganizationBinding::Fixed,
     };
+    // Spice Cloud parses the version as semver, which the `(<commit>)` the CLI and
+    // runtime print after it is not.
     let runtime_version = ctx
         .runtime_version()
         .unwrap_or_else(|_| crate::commands::version::cli_version());
+    let runtime_version = crate::commands::version::without_commit(&runtime_version).to_string();
     let mut config =
         CloudConnectConfig::from_env_at(runtime_version.clone(), config_dir.to_path_buf());
     config.enroll_endpoint.clone_from(&endpoint.value);
@@ -2333,7 +2337,7 @@ mod tests {
     async fn a_pending_token_draft_resumes_without_the_chooser() {
         let instance = tempfile::tempdir().expect("create instance directory");
         let directory = instance.path().canonicalize().expect("canonical tempdir");
-        let config_dir = CloudConnectConfig::resolve_config_dir(Some(&directory));
+        let config_dir = CloudConnectConfig::resolve_state_dir(Some(&directory));
         let endpoint = closed_endpoint();
         let published = EnrollmentDraft::load_or_create(
             &config_dir,
@@ -2427,7 +2431,7 @@ mod tests {
         for replacement in replacements {
             let instance = tempfile::tempdir().expect("create instance directory");
             let directory = instance.path().canonicalize().expect("canonical tempdir");
-            let config_dir = CloudConnectConfig::resolve_config_dir(Some(&directory));
+            let config_dir = CloudConnectConfig::resolve_state_dir(Some(&directory));
             let routed = EnrollmentDraft::load_or_create(
                 &config_dir,
                 &InstanceFacts::gather("v0.0.0-racing-test", &config_dir),
@@ -2491,7 +2495,7 @@ mod tests {
     async fn a_pending_login_draft_answers_before_the_flag_rules_do() {
         let instance = tempfile::tempdir().expect("create instance directory");
         let directory = instance.path().canonicalize().expect("canonical tempdir");
-        let config_dir = CloudConnectConfig::resolve_config_dir(Some(&directory));
+        let config_dir = CloudConnectConfig::resolve_state_dir(Some(&directory));
         let endpoint = closed_endpoint();
         let published = EnrollmentDraft::load_or_create(
             &config_dir,
@@ -2555,7 +2559,7 @@ mod tests {
     async fn a_resumed_operation_that_vanished_publishes_nothing() {
         let instance = tempfile::tempdir().expect("create instance directory");
         let directory = instance.path().canonicalize().expect("canonical tempdir");
-        let config_dir = CloudConnectConfig::resolve_config_dir(Some(&directory));
+        let config_dir = CloudConnectConfig::resolve_state_dir(Some(&directory));
         let endpoint = closed_endpoint();
         EnrollmentDraft::load_or_create(
             &config_dir,

@@ -387,9 +387,9 @@ impl VectorRejection {
 /// nothing (#13872). `Inf` is neither `== 0.0` nor `is_nan()`, so it does not merely escape
 /// the narrow limb, it actively prevents it from matching.
 ///
-/// **Not every vector write reaches this.** The DuckDB vector index applies no criterion at
-/// all, and `PutVectors`' DataFusion sink spells its own — see #13901. Do not read a call to
-/// this as a guarantee that some other path enforced it.
+/// **Not every vector write reaches this.** `PutVectors`' DataFusion sink spells its own
+/// criterion — see #13901. Do not read a call to this as a guarantee that some other path
+/// enforced it.
 ///
 /// `NoDirection` is tested first so that a vector which is both — `[NaN, NaN]` — is
 /// reported under the more specific of the two, which is what the paths counting the
@@ -630,7 +630,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::float_cmp)]
     fn test_create_embedding_array_valid_embeddings() {
         let embeddings = vec![Some(vec![0.1, 0.2, 0.3]), None, Some(vec![0.7, 0.8, 0.9])];
 
@@ -678,7 +677,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::float_cmp)]
     fn test_update_embedding_column_in_batch_with_existing_column() {
         let record = create_test_record_batch_with_embeddings(
             vec![Some("hello"), Some("world")],
@@ -712,7 +710,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::float_cmp)]
     fn test_update_embedding_column_in_batch_append_embedding_column() {
         let record = create_test_record_batch_text_only(vec![Some("hello"), Some("world")]);
 
@@ -904,12 +901,15 @@ mod tests {
 
     #[test]
     fn keys_to_evict_is_empty_when_the_write_rejected_nothing() {
-        assert!(keys_to_evict([("a", Indexed), ("b", Indexed)]).is_empty());
+        assert_eq!(
+            keys_to_evict([("a", Indexed), ("b", Indexed)]),
+            [] as [String; 0]
+        );
     }
 
     #[test]
     fn keys_to_evict_is_empty_for_a_batch_that_names_no_key() {
-        assert!(keys_to_evict(std::iter::empty()).is_empty());
+        assert_eq!(keys_to_evict(std::iter::empty()), [] as [String; 0]);
     }
 
     #[test]

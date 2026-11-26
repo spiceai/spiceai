@@ -704,11 +704,6 @@ fn arrow_cells(name: &str, array: &ArrayRef) -> Result<(Kind, Vec<Cell>), anyhow
 // Test
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread")]
-async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
-    run_tpch_postgres_replication("duckdb", false).await
-}
-
 /// The same lifecycle on Cayenne, keyed by `primary_key` alone.
 #[tokio::test(flavor = "multi_thread")]
 async fn tpch_postgres_replication_end_to_end_cayenne() -> Result<(), anyhow::Error> {
@@ -1014,4 +1009,144 @@ async fn run_tpch_postgres_replication(
             Ok(())
         })
         .await
+}
+
+/// File-mode snapshots bypass CDC sub-batches; WAL changes still use that sink.
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_snapshot_bulk_append_cayenne_file() -> Result<(), anyhow::Error> {
+    run_snapshot_append(Mode::File).await
+}
+
+/// Memory-mode acceleration keeps applying snapshot envelopes through CDC.
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_snapshot_append_cayenne_memory_fallback() -> Result<(), anyhow::Error> {
+    run_snapshot_append(Mode::Memory).await
+}
+
+fn snapshot_cdc_paths(registry: &prometheus::Registry) -> f64 {
+    registry
+        .gather()
+        .into_iter()
+        .filter(|family| family.name() == "dataset_acceleration_cdc_apply_path_total")
+        .flat_map(|family| family.get_metric().to_vec())
+        .filter(|series| {
+            series
+                .get_label()
+                .iter()
+                .any(|label| label.name() == "dataset" && label.value() == "snapshot_composite")
+        })
+        .map(|series| series.get_counter().value())
+        .sum()
+}
+
+fn snapshot_dataset(port: usize, mode: Mode, dir: &Path) -> Dataset {
+    let mut params: HashMap<String, String> = common::get_pg_params(port)
+        .into_iter()
+        .map(|(key, value)| (key, value.expose_secret().to_string()))
+        .collect();
+    // Exercise several reader batches and an empty holder-final batch.
+    params.insert("pg_replication_bootstrap_batch_size".into(), "256".into());
+    params.insert("pg_replication_slot".into(), "snapshot_bulk_test".into());
+    let mut dataset = Dataset::new("postgres:public.snapshot_composite", "snapshot_composite");
+    dataset.params = Some(Params::from_string_map(params));
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("cayenne".into()),
+        mode,
+        refresh_mode: Some(RefreshMode::Changes),
+        primary_key: Some("(tenant, id)".into()),
+        params: Some(Params::from_string_map(HashMap::from([
+            (
+                "cayenne_file_path".into(),
+                dir.join("data").to_string_lossy().into_owned(),
+            ),
+            (
+                "cayenne_metadata_dir".into(),
+                dir.join("metadata").to_string_lossy().into_owned(),
+            ),
+        ]))),
+        ..Acceleration::default()
+    });
+    dataset
+}
+
+async fn wait_snapshot_matches_source(
+    rt: &Runtime,
+    source: &tokio_postgres::Client,
+    stage: &str,
+) -> Result<(), anyhow::Error> {
+    let sql = "SELECT tenant, id, payload FROM snapshot_composite";
+    let expected = answer_from_postgres(source, sql).await?;
+    let deadline = tokio::time::Instant::now() + CHANGE_PROPAGATION_TIMEOUT;
+    loop {
+        let actual = answer_from_batches(&run_query(rt, sql).await?)?;
+        let comparison = assert_same_answer(
+            "cayenne",
+            stage,
+            "snapshot_composite",
+            sql,
+            &actual,
+            &expected,
+        );
+        if comparison.is_ok() || tokio::time::Instant::now() >= deadline {
+            return comparison;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn run_snapshot_append(mode: Mode) -> Result<(), anyhow::Error> {
+    crate::utils::require_process_per_test("the snapshot test installs a global metrics provider");
+    let registry = prometheus::Registry::new();
+    let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+        .with_resource(opentelemetry_sdk::Resource::builder().build())
+        .with_reader(runtime::prometheus_reader(registry.clone())?)
+        .build();
+    opentelemetry::global::set_meter_provider(provider);
+    let _tracing = init_tracing(Some("integration=debug,runtime_table=debug,info"));
+    register_test_connectors().await;
+    test_request_context().scope(async {
+        let container = common::start_postgres_docker_container_with_logical_wal().await?;
+        let port = container.host_port(5432)?;
+        let source = connect(port).await?;
+        exec(&source, "CREATE TABLE snapshot_composite (tenant int NOT NULL, id int NOT NULL, payload text, PRIMARY KEY (tenant, id));
+            INSERT INTO snapshot_composite SELECT t, i, CASE WHEN i % 7 = 0 THEN NULL ELSE 'value-' || t || '-' || i END
+            FROM generate_series(1, 4) t CROSS JOIN generate_series(1, 1024) i").await?;
+        let dir = tempfile::tempdir()?;
+        let bulk = matches!(mode, Mode::File);
+        let dataset = snapshot_dataset(usize::from(port), mode, dir.path());
+        let app = AppBuilder::new("snapshot_bulk_append")
+            .with_sql_cache(SQLResultsCacheConfig { enabled: false, ..Default::default() })
+            .with_dataset(dataset).build();
+        configure_test_datafusion();
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+        let outcome = async {
+            tokio::time::timeout(Duration::from_secs(90), Arc::clone(&rt).load_components()).await?;
+            runtime_ready_check(&rt).await;
+            wait_snapshot_matches_source(&rt, &source, "snapshot").await?;
+            let paths = snapshot_cdc_paths(&registry);
+            if bulk {
+                assert!(paths.abs() < f64::EPSILON, "snapshot must bypass CDC apply paths, got {paths}");
+            } else {
+                assert!(paths > 0.0, "ineligible memory snapshot must use CDC apply paths");
+            }
+            exec(&source, "BEGIN;
+                INSERT INTO snapshot_composite VALUES (5, 1, NULL);
+                UPDATE snapshot_composite SET payload = 'changed' WHERE tenant = 2 AND id = 7;
+                DELETE FROM snapshot_composite WHERE tenant = 3 AND id = 11;
+                COMMIT").await?;
+            wait_snapshot_matches_source(&rt, &source, "WAL insert/update/delete").await?;
+            assert!(snapshot_cdc_paths(&registry) > paths, "WAL must use the CDC sink; the metric must be live");
+            // Prove the equal answers are read from the acceleration.
+            container.pause().await?;
+            let accelerated = tokio::time::timeout(PAUSED_SOURCE_QUERY_TIMEOUT,
+                run_query(&rt, "SELECT tenant, id, payload FROM snapshot_composite")).await;
+            container.unpause().await?;
+            let accelerated = answer_from_batches(&accelerated??)?;
+            let expected = answer_from_postgres(&source, "SELECT tenant, id, payload FROM snapshot_composite").await?;
+            assert_same_answer("cayenne", "paused source", "snapshot_composite", "SELECT *", &accelerated, &expected)
+        }.await;
+        rt.shutdown().await;
+        outcome
+    }).await
 }

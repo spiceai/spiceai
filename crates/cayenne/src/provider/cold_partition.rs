@@ -180,6 +180,10 @@ impl LazyBloom<'_> {
     }
 }
 
+/// A tombstone as [`lowest_cold_relevant_tombstone_sequence`] tests it: its key
+/// (one value per PK column), its delete sequence, and its bloom probe bytes.
+type TombstoneToTest<'a> = (&'a [ScalarValue], i64, Option<&'a [u8]>);
+
 /// The lowest delete sequence among `tombstones` that may still hide a row of
 /// one of `cold_files`, or `None` when none can.
 ///
@@ -218,7 +222,7 @@ pub(crate) fn lowest_cold_relevant_tombstone_sequence(
             bloom: LazyBloom::Unparsed(probes.and(file.pk_bloom.as_deref())),
         })
         .collect();
-    let mut ordered: Vec<(&[ScalarValue], i64, Option<&[u8]>)> = tombstones
+    let mut ordered: Vec<TombstoneToTest<'_>> = tombstones
         .iter()
         .enumerate()
         .map(|(i, (key, delete_sequence))| {

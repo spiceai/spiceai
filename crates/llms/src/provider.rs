@@ -23,7 +23,6 @@ limitations under the License.
 use async_openai::Client;
 use async_openai::config::Config;
 use async_openai::error::{ApiError, OpenAIError};
-use async_openai::middleware::ReqwestService;
 use async_trait::async_trait;
 use reqwest::StatusCode;
 use secrecy::SecretString;
@@ -133,19 +132,22 @@ pub fn format_models_hint(models: &[String], provider_name: &str) -> String {
     hint
 }
 
-/// Builds an `async-openai` client that sends each request once. `async-openai` retries `429` and
-/// `5xx` responses by default; Spice retries and rate-controls requests itself, so a second layer
-/// would multiply attempts and hide the provider's first answer.
+/// Builds an `async-openai` client that sends each request to the provider once. `async-openai`
+/// retries `429` and `5xx` responses by default; Spice retries and rate-controls requests itself,
+/// so a second layer would multiply attempts and hide the provider's first answer.
+///
+/// The client does send a request again when the provider never received it. See [`http_retry`].
+/// The endpoint is held to a connect timeout, a read timeout and a bound on what one response
+/// may hold in memory.
 #[must_use]
 pub fn client_without_retry<C: Config>(config: C) -> Client<C> {
-    let http_client = reqwest::Client::new();
-    Client::build(http_client.clone(), config).with_http_service(ReqwestService::new(http_client))
+    crate::model_http::client(config, crate::model_http::Limits::default())
 }
 
 /// Creates an HTTP client with standard timeout and TLS settings.
 #[must_use]
 pub fn create_http_client() -> Option<reqwest::Client> {
-    reqwest::Client::builder()
+    http_retry::client_builder()
         .user_agent(util::spiceai_user_agent())
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(API_TIMEOUT)
@@ -354,7 +356,7 @@ mod tests {
     #[test]
     fn test_format_models_hint_empty() {
         let result = format_models_hint(&[], "test");
-        assert!(result.is_empty());
+        assert_eq!(result, "");
     }
 
     #[test]

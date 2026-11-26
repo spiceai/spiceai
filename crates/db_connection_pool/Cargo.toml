@@ -33,10 +33,6 @@ util = { path = "../util", features = ["datafusion"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [features]
-duckdb = [
-  "datafusion-table-providers/duckdb",
-  "datafusion-table-providers/duckdb-federation",
-]
 mysql = ["datafusion-table-providers/mysql"]
 postgres = [
   "dep:tokio",
@@ -48,10 +44,6 @@ snowflake = [
   "dep:snowflake-api",
   "dep:pkcs8",
   "dep:serde_json",
-]
-sqlite = [
-  "datafusion-table-providers/sqlite",
-  "datafusion-table-providers/sqlite-federation",
 ]
 
 [lints]

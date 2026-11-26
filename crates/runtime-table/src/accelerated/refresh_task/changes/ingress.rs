@@ -237,6 +237,11 @@ impl RefreshTask {
         let mut built: VecDeque<ChangeStreamItem> = VecDeque::new();
         let mut carried: Option<SourceItem> = None;
         let mut source_ended = false;
+        // Set once the acceleration declines the snapshot bulk append, so the rest
+        // of that snapshot takes the sink without probing storage per envelope.
+        // Only a decline is remembered: an acceptance is probed again once pending
+        // writes have published, because those writes can make the table non-empty.
+        let mut snapshot_bulk_declined = false;
         let mut received_timestamp = None;
         let mut metadata_flush_count = 0_u64;
         let mut reload_requests = self.reload_requests.lock().take();
@@ -349,7 +354,60 @@ impl RefreshTask {
                 }
                 Event::Published(await_front(&mut pending).await)
             } else if let Some(envelope) = held.as_ref() {
-                if envelope.history_unavailable() {
+                if !envelope.is_snapshot_rows() {
+                    snapshot_bulk_declined = false;
+                }
+                let bulk_snapshot = envelope.is_snapshot_rows()
+                    && !envelope.history_unavailable()
+                    && !snapshot_bulk_declined
+                    && {
+                        let accepted = self.accelerator_takes_versioned_append().await;
+                        snapshot_bulk_declined = !accepted;
+                        accepted
+                    };
+                if bulk_snapshot {
+                    if pending.is_empty() {
+                        let Some(envelope) = held.take() else {
+                            continue;
+                        };
+                        match self
+                            .consume_snapshot(
+                                envelope,
+                                &mut source,
+                                &mut built,
+                                &mut carried,
+                                source_ended,
+                            )
+                            .await
+                        {
+                            Ok((boundary, rows)) => {
+                                if rows > 0 {
+                                    self.update_last_updated_at();
+                                    if let Some(cache) = context.caching.and_then(Weak::upgrade)
+                                        && let Err(error) = cache
+                                            .invalidate_for_refresh(context.dataset_name.clone())
+                                            .await
+                                        && !self.runtime_status.is_shutdown()
+                                    {
+                                        tracing::error!(
+                                            "Failed to invalidate cached query plans and search results for dataset {} after a refresh, so they may reflect the previous data until they expire: {error}",
+                                            context.dataset_name
+                                        );
+                                    }
+                                }
+                                // Re-enter source handling so heartbeats, readiness,
+                                // and timestamps retain their normal treatment.
+                                built.push_front(Ok(boundary));
+                            }
+                            Err(error) => {
+                                self.source_error(&context, &error).await;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    Event::Published(await_front(&mut pending).await)
+                } else if envelope.history_unavailable() {
                     if pending.is_empty() {
                         let Some(envelope) = held.take() else {
                             continue;
@@ -433,7 +491,7 @@ impl RefreshTask {
                     let timestamp = (!envelope.is_heartbeat())
                         .then(|| envelope.source_commit_ts_ms())
                         .flatten();
-                    let (committer, rows, ready, _) = envelope.into_lazy_parts();
+                    let (committer, rows, ready, _, _) = envelope.into_lazy_parts();
                     let options = WriteOptions {
                         recovery: if committer.supports_deferral() {
                             Recovery::Replayable
@@ -442,8 +500,11 @@ impl RefreshTask {
                         },
                         delete_batch_size: config.delete_subbatch_max.max(1),
                     };
-                    match permit.submit(ChangeBatch::cdc_rows(rows, Arc::clone(&ingress)), options)
-                    {
+                    match permit.submit_with_position(
+                        ChangeBatch::cdc_rows(rows, Arc::clone(&ingress)),
+                        options,
+                        position_write(committer.as_ref()),
+                    ) {
                         Ok(submission) => {
                             pending.push_back(PendingSource {
                                 submission,
@@ -500,7 +561,10 @@ impl RefreshTask {
                             metrics::CDC_SOURCE_ARRIVAL_LAG_MS.record(lag, labels.dataset());
                         }
                     }
-                    if envelope.is_no_op_heartbeat() && !envelope.history_unavailable() {
+                    if envelope.is_no_op_heartbeat()
+                        && !envelope.history_unavailable()
+                        && !envelope.is_snapshot_rows()
+                    {
                         if envelope.is_dataset_ready() {
                             if let Some(last) = pending.back_mut() {
                                 last.ready = true;
@@ -687,7 +751,7 @@ impl RefreshTask {
             return false;
         }
         let no_op = envelope.is_no_op_heartbeat();
-        let (committer, batch, ready, _) = match envelope.into_parts_offloaded().await {
+        let (committer, batch, ready, _, _) = match envelope.into_parts_offloaded().await {
             Ok(parts) => parts,
             Err(error) => {
                 self.source_error(context, &DataFusionError::External(Box::new(error)))
@@ -740,9 +804,10 @@ impl RefreshTask {
                 return false;
             }
         };
-        let submission = match permit.submit(
+        let submission = match permit.submit_with_position(
             ChangeBatch::cdc_rows(cdc::LazyChangeBatch::ready(batch), Arc::clone(ingress)),
             options,
+            position_write(committer.as_ref()),
         ) {
             Ok(submission) => submission,
             Err(error) => {
@@ -772,4 +837,17 @@ impl RefreshTask {
             }
         }
     }
+}
+
+/// The committer's source position as the sink takes it, for a storage engine
+/// that commits the position in the same record as the write.
+fn position_write(
+    committer: &(dyn cdc::CommitChange + Send + Sync),
+) -> Option<runtime_acceleration::change_sink::PositionWrite> {
+    let record = committer.record_position()?;
+    Some(Box::pin(async move {
+        record
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+    }))
 }

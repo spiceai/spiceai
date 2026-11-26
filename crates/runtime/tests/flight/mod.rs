@@ -32,7 +32,6 @@ use futures::{Stream, TryStreamExt as _};
 use rand::RngExt as _;
 use runtime::{
     Runtime,
-    accelerated::refresh::Refresh,
     auth::EndpointAuth,
     component::dataset::acceleration::{Acceleration, Engine},
     config::Config,
@@ -262,10 +261,10 @@ async fn register_test_table(
         schema,
         None,
         Acceleration {
-            engine: Engine::Arrow,
+            engine: Engine::Cayenne,
+            mode: runtime_acceleration::acceleration::Mode::Memory,
             ..Acceleration::default()
         },
-        Refresh::default(),
         None,
         Arc::new(RwLock::new(Secrets::default())),
         runtime,

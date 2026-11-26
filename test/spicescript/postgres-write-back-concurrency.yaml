@@ -1,4 +1,5 @@
 name: postgres-write-back-concurrency
+tags: [long]
 description: >
   Writes through Spice to a CDC Cayenne dataset backed by PostgreSQL,
   running while the source itself is written, end in the same rows in Spice
@@ -13,6 +14,8 @@ sources:
 variants:
   write-back: {}
   write-through: { datasets: { '*': { acceleration: { write_mode: write_through } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1
@@ -60,7 +63,7 @@ steps:
         BEGIN; UPDATE acct SET bal = bal + 1 WHERE id = 1 + (${round} % 100);
         INSERT INTO log VALUES (${round} + 1, 'spice'); COMMIT;
       every: 20ms
-    only: write-back
+    only: [write-back, object-native]
   - background:
       id: spice-writes
       concurrency: 2

@@ -74,7 +74,10 @@ pub mod caching_eviction;
 mod caching_scan_tests;
 pub mod checkpoint_primary_key;
 pub mod fallback_retention;
-pub use fallback_retention::{Error as FallbackRetentionKeepError, FallbackRetentionKeep};
+pub use fallback_retention::{
+    Error as FallbackRetentionKeepError, FallbackRetentionKeep, ensure_no_fallible_implicit_cast,
+};
+pub(crate) mod exact_string_time;
 pub mod federation;
 pub(crate) mod index_rebuild;
 pub mod partition_scope;
@@ -593,6 +596,9 @@ pub struct Builder {
     append_cursor_store: Option<refresh_task::append_cursor::AppendCursorStore>,
     node_local: bool,
     append_grouping: Option<Arc<AppendGrouping>>,
+    /// Forwards committed append refreshes to the dataset's `DoExchange`
+    /// subscribers.
+    data_update_publisher: Option<runtime_acceleration::dataupdate::DataUpdatePublisher>,
 }
 
 impl Builder {
@@ -653,6 +659,7 @@ impl Builder {
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
             user_facing_schema: None,
             cdc_param_overrides: None,
+            data_update_publisher: None,
             fallback_retention_keep: None,
             append_cursor_store: None,
             node_local: false,
@@ -1026,6 +1033,17 @@ impl Builder {
         self
     }
 
+    /// Forward each committed append refresh to the dataset's `DoExchange`
+    /// subscribers, so an append stream from this dataset delivers the rows
+    /// its refreshes append.
+    pub fn data_update_publisher(
+        &mut self,
+        publisher: Option<runtime_acceleration::dataupdate::DataUpdatePublisher>,
+    ) -> &mut Self {
+        self.data_update_publisher = publisher;
+        self
+    }
+
     /// Provide per-dataset `cdc_*` parameter overrides drawn from
     /// `dataset.acceleration.params`. These layer on top of the runtime-global
     /// CDC config only for this dataset's changes stream;
@@ -1303,6 +1321,7 @@ impl Builder {
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
         refresher.with_engine_type_rewrites(self.engine_type_rewrites);
         refresher.with_cdc_param_overrides(self.cdc_param_overrides);
+        refresher.with_data_update_publisher(self.data_update_publisher);
 
         // Durable federated write-back (#11838): a WriteBack Cayenne table whose
         // commit path marks dirty keys gets a per-table delivery worker that
@@ -1827,6 +1846,12 @@ impl AcceleratedTable {
     /// Returns [`Error::InvalidRefreshOverrides`] describing the first problem found.
     pub async fn validate_refresh_overrides(&self, overrides: &RefreshOverrides) -> Result<()> {
         let refresh = self.refresh_params.read().await.clone();
+        let has_primary_key = self.accelerator.constraints().is_some_and(|constraints| {
+            !get_primary_keys_from_constraints(constraints, &self.accelerator.schema()).is_empty()
+        });
+        overrides
+            .validate_append_keys(&refresh, has_primary_key)
+            .context(InvalidRefreshOverridesSnafu)?;
         overrides
             .validate_for(&self.dataset_name, &refresh, self.federated.schema())
             .context(InvalidRefreshOverridesSnafu)
@@ -2369,7 +2394,31 @@ impl AcceleratedTable {
                 let mut batch_write_tx = self.batch_write_tx.clone().ok_or_else(|| {
                     DataFusionError::Internal("batch_write_tx missing in caching mode".to_string())
                 })?;
+                // Neither reads the accelerator before the origin answers, so the
+                // scan is planned only if a failing fetch needs it.
+                // Apply row limits above the entry restriction so unrelated
+                // candidate entries cannot hide matching rows.
+                let federated_provider = self.federated.table_provider().await;
+                let restriction = Arc::new(caching::RequestEntryRestriction::for_lookup(
+                    filters,
+                    federated_provider.as_ref(),
+                ));
+                let mut cache_scan_filters = scan_filters.to_vec();
+                if let Some(filter) = restriction.scan_filter(&self.accelerator.schema()) {
+                    cache_scan_filters.push(filter);
+                }
+                let scan_filters = cache_scan_filters.as_slice();
+                let cache_scan_limit = if restriction.is_active(&self.accelerator.schema()) {
+                    None
+                } else {
+                    limit
+                };
                 let input = if caching::uses_source_first(
+                    filters,
+                    self.cache_ttl,
+                    self.cache_stale_while_revalidate_ttl,
+                    self.cache_stale_if_error,
+                ) || caching::passes_through(
                     filters,
                     self.cache_ttl,
                     self.cache_stale_while_revalidate_ttl,
@@ -2387,7 +2436,7 @@ impl AcceleratedTable {
                             state,
                             scan_projection,
                             scan_filters,
-                            limit,
+                            cache_scan_limit,
                         ),
                         filters_to_reapply,
                         schema,
@@ -2398,7 +2447,7 @@ impl AcceleratedTable {
                     batch_write_tx = batch_write_tx.observe_cache_scan();
                     let input = self
                         .accelerator
-                        .scan(state, scan_projection, scan_filters, limit)
+                        .scan(state, scan_projection, scan_filters, cache_scan_limit)
                         .await?;
                     caching::CachingScanInput::Planned(wrap_with_filter(
                         input,
@@ -2407,7 +2456,6 @@ impl AcceleratedTable {
                     )?)
                 };
 
-                let federated_provider = self.federated.table_provider().await;
                 Arc::new(caching::CachingAccelerationScanExec::new(
                     input,
                     self.cache_ttl,
@@ -2417,6 +2465,7 @@ impl AcceleratedTable {
                     Arc::clone(&self.accelerator),
                     self.dataset_name.to_string(),
                     self.io_runtime.clone(),
+                    restriction,
                     filters.to_vec(),
                     projection.cloned(),
                     limit,
@@ -2972,6 +3021,7 @@ fn extend_projection_for_caching(
     for col in [
         caching::CACHE_REFRESHED_AT_COLUMN,
         caching::CACHE_NAMESPACE_COLUMN,
+        caching::CACHE_REQUEST_COLUMN,
     ] {
         let Ok(idx) = schema.index_of(col) else {
             continue;

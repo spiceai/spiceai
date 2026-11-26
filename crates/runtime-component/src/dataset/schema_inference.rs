@@ -47,9 +47,7 @@ use super::acceleration::{Acceleration, Engine, IndexType, OnConflictBehavior, R
 ///   duplicate the primary key, and any the engine cannot build — see
 ///   `unindexable_column`).
 /// - **sort columns**: applied when no engine sort param is configured, routed to
-///   the engine-appropriate `acceleration.params` key. Never applied for `DuckDB`
-///   when the acceleration carries a primary key, indexes, or `on_conflict`:
-///   `DuckDB`'s on-refresh sort rewrites the table without preserving constraints.
+///   the engine-appropriate `acceleration.params` key.
 /// - **shard key** (Cayenne only): the source's declared partition/shard key is
 ///   applied as `cayenne_shard_key_columns` when the user set none and it differs
 ///   from the primary key.
@@ -79,27 +77,16 @@ pub fn apply_inferred_schema(
     // - `append` never gets inferred constraints: appends incrementally re-read the
     //   source, an engine cannot retrofit a constraint onto rows already appended,
     //   and an overlapping re-read window would violate a just-added key.
-    // - `full` gets them except on DuckDB: DuckDB's refresh machinery rebuilds
-    //   versioned internal tables and verifies declared constraints against the
-    //   table the previous refresh left behind — a lifecycle that no pre-existing
-    //   configuration exercised with auto-applied constraints (its on-refresh sort
-    //   rewrite drops them outright; see `apply_inferred_sort`). Until that write
-    //   path provably preserves constraints across refreshes, DuckDB keeps its
-    //   pre-inference behavior: primary key / indexes apply only when the user
-    //   declares them.
+    // - `full` gets them.
     // - `changes` (CDC) always gets them: the change stream requires the primary
     //   key, and the physical base table is created with it up front (no versioned
     //   rebuild), matching what an explicit `primary_key` would do.
     // The remaining modes (`disabled`, `caching`, `snapshot`) follow the `full`
-    // rule via the `_` arm: their loads replace whole tables rather than
-    // incrementally appending, so the append hazard does not apply.
+    // rule: their loads replace whole tables rather than incrementally
+    // appending, so the append hazard does not apply.
     // The inferred *sort* is not a physical constraint (it is a refresh-time ORDER
     // BY / compaction order) and is gated separately in `apply_inferred_sort`.
-    let constraints_applicable = match resolved_refresh_mode {
-        RefreshMode::Append => false,
-        RefreshMode::Changes => true,
-        _ => engine != Engine::DuckDB,
-    };
+    let constraints_applicable = resolved_refresh_mode != RefreshMode::Append;
     if !constraints_applicable
         && ((acceleration.primary_key.is_none() && !inferred.primary_key.is_empty())
             || (acceleration.indexes.is_empty() && !inferred.indexes.is_empty()))
@@ -155,24 +142,10 @@ pub fn apply_inferred_schema(
         .as_ref()
         .map(|pk| pk.iter().map(ToString::to_string).collect());
 
-    // 2) Secondary indexes — only when the user configured none, and never for
-    // DuckDB. A DuckDB upsert sets every non-key column, and an update that sets an
-    // indexed column is executed as a delete plus an insert, so each change to a row
-    // gives it a new row id. DuckDB's primary-key index holds at most two row ids per
-    // key, so the third version of a key written while a query that began before the
-    // second is still running fails to commit ("write-write conflict on key"), and
-    // for a change stream that stops replication of the dataset (#13929). Without a
-    // secondary index the upsert updates the row in place and never adds a row id.
+    // 2) Secondary indexes — only when the user configured none.
     let mut applied_indexes = 0usize;
     let infer_indexes = constraints_applicable && acceleration.indexes.is_empty();
-    if infer_indexes && engine == Engine::DuckDB {
-        if !inferred.indexes.is_empty() {
-            tracing::debug!(
-                dataset = %dataset_name,
-                "Skipping inferred secondary indexes; a DuckDB upsert that sets an indexed column rewrites the row, which fails to commit while an older query is still reading it"
-            );
-        }
-    } else if infer_indexes {
+    if infer_indexes {
         for index in &inferred.indexes {
             if !index.columns.iter().all(|c| has_column(c)) {
                 continue;
@@ -205,7 +178,7 @@ pub fn apply_inferred_schema(
 
     // 3) Sort columns — only when no engine sort param is configured. Whether a
     // change-stream dataset gets one is engine-dependent (decided inside
-    // `apply_inferred_sort`): for DuckDB/Arrow the inferred sort drives the
+    // `apply_inferred_sort`): for Arrow the inferred sort drives the
     // refresh itself, which is a no-op for a change stream and risks perturbing
     // its initial snapshot, so it stays disabled. Cayenne is the exception — its
     // `cayenne_sort_columns` sorts the background COMPACTION rewrite, not the
@@ -294,21 +267,19 @@ fn apply_inferred_sort(
 
     // Each key is the *external* spelling the engine's parameter validation
     // accepts: a `ParameterSpec::component` param must carry the engine prefix
-    // (`arrow_sort_columns`, `cayenne_sort_columns`), while DuckDB's
-    // `on_refresh_sort_columns` is a `ParameterSpec::runtime` param and takes
-    // none. An unprefixed component key is dropped by `runtime_parameters` with a
-    // user-facing warning about a parameter the user never wrote (#14023).
+    // (`arrow_sort_columns`, `cayenne_sort_columns`). An unprefixed component key
+    // is dropped by `runtime_parameters` with a user-facing warning about a
+    // parameter the user never wrote (#14023).
     let engine = acceleration.engine.to_unpartitioned();
     let key = match engine {
-        Engine::DuckDB => "on_refresh_sort_columns",
         Engine::Arrow => "arrow_sort_columns",
         Engine::Cayenne => "cayenne_sort_columns",
-        // Sqlite / Turso / PostgreSQL accelerators have no sort param.
-        _ => return false,
+        // `to_unpartitioned` folds `PartitionedArrow` into `Arrow`.
+        Engine::PartitionedArrow => return false,
     };
 
     // For `refresh_mode: changes`, skip engines whose sort param drives the
-    // refresh itself (DuckDB `on_refresh_sort_columns`, Arrow `arrow_sort_columns`): a
+    // refresh itself (Arrow `arrow_sort_columns`): a
     // refresh-time sort is a no-op for a change stream and risks perturbing the
     // initial snapshot. Cayenne is the exception — `cayenne_sort_columns` sorts
     // the background compaction rewrite, not the change stream (which stays
@@ -321,32 +292,11 @@ fn apply_inferred_sort(
     // Respect any user-configured sort param. Cayenne and Arrow also read the
     // unprefixed `sort_columns` straight from the acceleration params, so a user
     // who wrote that spelling has configured a sort even though validation warns
-    // about the missing prefix. Checked before the DuckDB constraint guard below
-    // so an explicitly-sorted dataset is reported as user-configured, not as a
-    // constraint-preservation skip.
+    // about the missing prefix.
     let user_configured = acceleration.params.contains_key(key)
         || (matches!(engine, Engine::Cayenne | Engine::Arrow)
             && acceleration.params.contains_key("sort_columns"));
     if user_configured {
-        return false;
-    }
-
-    // DuckDB's on-refresh sort is applied by rewriting the freshly-written table
-    // (`CREATE OR REPLACE TABLE … AS SELECT … ORDER BY …`), which does NOT
-    // preserve primary keys or indexes — an inferred sort would silently strip
-    // the table's constraints on the first write and every upsert after that
-    // would then fail ("conflict target is not referenced by a UNIQUE/PRIMARY
-    // KEY CONSTRAINT"). Never infer a sort for DuckDB when the acceleration
-    // carries any constraint or upsert target (user-declared — inference never
-    // adds them for DuckDB).
-    if engine == Engine::DuckDB
-        && (acceleration.primary_key.is_some()
-            || !acceleration.indexes.is_empty()
-            || !acceleration.on_conflict.is_empty())
-    {
-        tracing::debug!(
-            "Skipping inferred sort; DuckDB's on-refresh sort rewrite would not preserve the configured primary key/indexes/on_conflict target"
-        );
         return false;
     }
 
@@ -511,7 +461,7 @@ mod tests {
     fn applies_primary_key_and_seeds_upsert_for_changes() {
         // CDC (`refresh_mode: changes`) needs the upsert on_conflict to route WAL
         // UPDATE events, so it is seeded alongside the inferred primary key.
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Cayenne);
         let inferred = InferredSchema {
             primary_key: vec!["id".to_string()],
             ..InferredSchema::default()
@@ -536,7 +486,7 @@ mod tests {
         // Outside CDC the on_conflict must NOT be seeded: a configured on_conflict
         // forces accelerator-only writes, which would silently reroute
         // `write_mode: write_through` DML away from the federated source.
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Cayenne);
         let inferred = InferredSchema {
             primary_key: vec!["id".to_string()],
             ..InferredSchema::default()
@@ -557,7 +507,7 @@ mod tests {
     fn seeds_primary_key_upsert_alongside_other_on_conflict() {
         // A user-configured on_conflict for a non-PK column must not prevent the
         // inferred primary key from getting its own upsert (CDC requires it).
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Cayenne);
         acc.on_conflict.insert(
             col_ref(&["name"]),
             OnConflictBehavior::Upsert(UpsertOptions::default()),
@@ -585,7 +535,7 @@ mod tests {
 
     #[test]
     fn respects_user_primary_key() {
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Cayenne);
         acc.primary_key = Some(col_ref(&["user_id"]));
         let inferred = InferredSchema {
             primary_key: vec!["id".to_string()],
@@ -606,7 +556,7 @@ mod tests {
 
     #[test]
     fn skips_primary_key_with_missing_column() {
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Cayenne);
         let inferred = InferredSchema {
             primary_key: vec!["absent".to_string()],
             ..InferredSchema::default()
@@ -622,197 +572,12 @@ mod tests {
     }
 
     #[test]
-    fn duckdb_skips_inferred_constraints_for_full() {
-        // DuckDB rebuilds a versioned internal table per full refresh and verifies
-        // declared constraints against the previous table — inferred constraints
-        // fail that verification on the second refresh, so they are never applied.
-        // The inferred sort is not a physical constraint and still applies.
-        let mut acc = accel(Engine::DuckDB);
-        let inferred = InferredSchema {
-            primary_key: vec!["id".to_string()],
-            indexes: vec![InferredIndex {
-                columns: vec!["email".to_string()],
-                unique: true,
-            }],
-            sort_columns: vec![sort("created_at", true)],
-            ..InferredSchema::default()
-        };
-        apply_inferred_schema(
-            &mut acc,
-            &inferred,
-            &schema(&["id", "email", "created_at"]),
-            "ds",
-            RefreshMode::Full,
-        );
-
-        assert!(acc.primary_key.is_none());
-        assert!(acc.indexes.is_empty());
-        assert!(acc.on_conflict.is_empty());
-        assert_eq!(
-            acc.params
-                .get("on_refresh_sort_columns")
-                .map(String::as_str),
-            Some("created_at DESC")
-        );
-    }
-
-    #[test]
-    fn duckdb_applies_constraints_for_changes() {
-        // CDC does not use the versioned rebuild (the base table is created with
-        // the key up front), and the changes path requires the primary key — so
-        // DuckDB gets the inferred key + upsert in changes mode, matching what an
-        // explicit `primary_key` configuration would do.
-        let mut acc = accel(Engine::DuckDB);
-        let inferred = InferredSchema {
-            primary_key: vec!["id".to_string()],
-            ..InferredSchema::default()
-        };
-        apply_inferred_schema(
-            &mut acc,
-            &inferred,
-            &schema(&["id", "name"]),
-            "ds",
-            RefreshMode::Changes,
-        );
-
-        assert_eq!(acc.primary_key, Some(col_ref(&["id"])));
-        assert!(matches!(
-            acc.on_conflict.get(&col_ref(&["id"])),
-            Some(OnConflictBehavior::Upsert(_))
-        ));
-    }
-
-    // Regression test for #13929: an inferred secondary index turned every DuckDB CDC
-    // upsert into a delete plus an insert, which fails to commit under concurrent reads.
-    #[test]
-    fn duckdb_skips_inferred_secondary_indexes_for_changes() {
-        let mut acc = accel(Engine::DuckDB);
-        let inferred = InferredSchema {
-            primary_key: vec!["id".to_string()],
-            indexes: vec![
-                InferredIndex {
-                    columns: vec!["last".to_string(), "first".to_string()],
-                    unique: false,
-                },
-                InferredIndex {
-                    columns: vec!["email".to_string()],
-                    unique: true,
-                },
-            ],
-            ..InferredSchema::default()
-        };
-        apply_inferred_schema(
-            &mut acc,
-            &inferred,
-            &schema(&["id", "first", "last", "email"]),
-            "ds",
-            RefreshMode::Changes,
-        );
-
-        assert_eq!(acc.primary_key, Some(col_ref(&["id"])));
-        assert!(matches!(
-            acc.on_conflict.get(&col_ref(&["id"])),
-            Some(OnConflictBehavior::Upsert(_))
-        ));
-        assert!(
-            acc.indexes.is_empty(),
-            "no inferred secondary index may reach a DuckDB acceleration: {:?}",
-            acc.indexes
-        );
-    }
-
-    #[test]
-    fn duckdb_keeps_user_configured_indexes_for_changes() {
-        let mut acc = accel(Engine::DuckDB);
-        acc.indexes.insert(col_ref(&["email"]), IndexType::Unique);
-        let inferred = InferredSchema {
-            primary_key: vec!["id".to_string()],
-            indexes: vec![InferredIndex {
-                columns: vec!["last".to_string()],
-                unique: false,
-            }],
-            ..InferredSchema::default()
-        };
-        apply_inferred_schema(
-            &mut acc,
-            &inferred,
-            &schema(&["id", "last", "email"]),
-            "ds",
-            RefreshMode::Changes,
-        );
-
-        assert_eq!(acc.indexes.len(), 1);
-        assert_eq!(
-            acc.indexes.get(&col_ref(&["email"])),
-            Some(&IndexType::Unique)
-        );
-    }
-
-    #[test]
-    fn duckdb_skips_inferred_sort_when_user_primary_key_configured() {
-        // DuckDB's on-refresh sort rewrites the table without preserving
-        // constraints, so an inferred sort must never be seeded when the user
-        // declared a primary key — it would silently strip that key on the first
-        // write (merge-queue regression: explicit-PK append dataset failed every
-        // upsert after the sort rewrite).
-        let mut acc = accel(Engine::DuckDB);
-        acc.primary_key = Some(col_ref(&["id"]));
-        let inferred = InferredSchema {
-            sort_columns: vec![sort("id", false)],
-            ..InferredSchema::default()
-        };
-        apply_inferred_schema(
-            &mut acc,
-            &inferred,
-            &schema(&["id", "created_at"]),
-            "ds",
-            RefreshMode::Full,
-        );
-        assert!(!acc.params.contains_key("on_refresh_sort_columns"));
-    }
-
-    #[test]
-    fn duckdb_append_with_user_constraints_infers_nothing() {
-        // The exact shape of the merge-queue retention failure: DuckDB + append +
-        // user-declared primary key and on_conflict. Inference must leave the
-        // dataset completely untouched — no constraints (append) and no sort
-        // (DuckDB constraint-preservation rule).
-        let mut acc = accel(Engine::DuckDB);
-        acc.primary_key = Some(col_ref(&["id"]));
-        acc.on_conflict.insert(
-            col_ref(&["id"]),
-            OnConflictBehavior::Upsert(UpsertOptions::default()),
-        );
-        let inferred = InferredSchema {
-            primary_key: vec!["id".to_string()],
-            indexes: vec![InferredIndex {
-                columns: vec!["name".to_string()],
-                unique: true,
-            }],
-            sort_columns: vec![sort("id", false)],
-            ..InferredSchema::default()
-        };
-        apply_inferred_schema(
-            &mut acc,
-            &inferred,
-            &schema(&["id", "name"]),
-            "ds",
-            RefreshMode::Append,
-        );
-
-        assert_eq!(acc.primary_key, Some(col_ref(&["id"])));
-        assert!(acc.indexes.is_empty());
-        assert_eq!(acc.on_conflict.len(), 1);
-        assert!(acc.params.is_empty());
-    }
-
-    #[test]
     fn append_skips_inferred_constraints() {
         // Append incrementally re-reads the source: an engine cannot retrofit a
         // constraint onto rows already appended, and an overlapping re-read window
         // would violate a just-added key — so append never gets inferred
         // constraints, on any engine.
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Cayenne);
         let inferred = InferredSchema {
             primary_key: vec!["id".to_string()],
             indexes: vec![InferredIndex {
@@ -836,7 +601,7 @@ mod tests {
 
     #[test]
     fn applies_unique_and_non_unique_indexes() {
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Cayenne);
         let inferred = InferredSchema {
             indexes: vec![
                 InferredIndex {
@@ -870,7 +635,7 @@ mod tests {
 
     #[test]
     fn skips_index_equal_to_primary_key() {
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Cayenne);
         let inferred = InferredSchema {
             primary_key: vec!["id".to_string()],
             indexes: vec![InferredIndex {
@@ -894,7 +659,7 @@ mod tests {
 
     #[test]
     fn skips_inferred_indexes_when_user_configured_any() {
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Cayenne);
         acc.indexes
             .insert(col_ref(&["existing"]), IndexType::Enabled);
         let inferred = InferredSchema {
@@ -1024,7 +789,7 @@ mod tests {
             "a dictionary column is keyed by its values"
         );
 
-        let mut acc = accel(Engine::Sqlite);
+        let mut acc = accel(Engine::Arrow);
         apply_inferred_schema(&mut acc, &inferred, &schema, "t", RefreshMode::Full);
         assert_eq!(acc.indexes.len(), 4, "other engines index any column type");
     }
@@ -1053,28 +818,6 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("https://spiceai.org/docs/"), "{message}");
-    }
-
-    #[test]
-    fn duckdb_sort_param_carries_direction() {
-        let mut acc = accel(Engine::DuckDB);
-        let inferred = InferredSchema {
-            sort_columns: vec![sort("created_at", true), sort("id", false)],
-            ..InferredSchema::default()
-        };
-        apply_inferred_schema(
-            &mut acc,
-            &inferred,
-            &schema(&["created_at", "id"]),
-            "ds",
-            RefreshMode::Full,
-        );
-        assert_eq!(
-            acc.params
-                .get("on_refresh_sort_columns")
-                .map(String::as_str),
-            Some("created_at DESC, id ASC")
-        );
     }
 
     #[test]
@@ -1151,9 +894,9 @@ mod tests {
 
     #[test]
     fn respects_user_sort_param() {
-        let mut acc = accel(Engine::DuckDB);
+        let mut acc = accel(Engine::Arrow);
         acc.params
-            .insert("on_refresh_sort_columns".to_string(), "custom".to_string());
+            .insert("arrow_sort_columns".to_string(), "custom".to_string());
         let inferred = InferredSchema {
             sort_columns: vec![sort("created_at", true)],
             ..InferredSchema::default()
@@ -1166,33 +909,14 @@ mod tests {
             RefreshMode::Full,
         );
         assert_eq!(
-            acc.params
-                .get("on_refresh_sort_columns")
-                .map(String::as_str),
+            acc.params.get("arrow_sort_columns").map(String::as_str),
             Some("custom")
         );
     }
 
     #[test]
-    fn sqlite_has_no_sort_param() {
-        let mut acc = accel(Engine::Sqlite);
-        let inferred = InferredSchema {
-            sort_columns: vec![sort("created_at", true)],
-            ..InferredSchema::default()
-        };
-        apply_inferred_schema(
-            &mut acc,
-            &inferred,
-            &schema(&["created_at"]),
-            "ds",
-            RefreshMode::Full,
-        );
-        assert!(acc.params.is_empty());
-    }
-
-    #[test]
     fn filters_missing_sort_columns() {
-        let mut acc = accel(Engine::DuckDB);
+        let mut acc = accel(Engine::Arrow);
         let inferred = InferredSchema {
             sort_columns: vec![sort("created_at", true), sort("absent", false)],
             ..InferredSchema::default()
@@ -1205,20 +929,18 @@ mod tests {
             RefreshMode::Full,
         );
         assert_eq!(
-            acc.params
-                .get("on_refresh_sort_columns")
-                .map(String::as_str),
+            acc.params.get("arrow_sort_columns").map(String::as_str),
             Some("created_at DESC")
         );
     }
 
     #[test]
     fn does_not_apply_sort_for_changes_refresh_mode_on_refresh_time_engines() {
-        // DuckDB/Arrow apply the inferred sort as a *refresh-time* sort, which is
+        // Arrow applies the inferred sort as a *refresh-time* sort, which is
         // a no-op for a change stream and risks perturbing its initial snapshot —
         // so it stays disabled in changes mode. (Cayenne is the exception; see
         // `applies_sort_for_changes_refresh_mode_on_cayenne`.)
-        let mut acc = accel(Engine::DuckDB);
+        let mut acc = accel(Engine::Arrow);
         let inferred = InferredSchema {
             sort_columns: vec![sort("created_at", true)],
             ..InferredSchema::default()
@@ -1333,7 +1055,7 @@ mod tests {
 
     #[test]
     fn empty_inferred_is_noop() {
-        let mut acc = accel(Engine::DuckDB);
+        let mut acc = accel(Engine::Arrow);
         apply_inferred_schema(
             &mut acc,
             &InferredSchema::default(),
@@ -1347,8 +1069,8 @@ mod tests {
     }
 
     #[test]
-    fn duckdb_sort_param_carries_nulls_placement() {
-        let mut acc = accel(Engine::DuckDB);
+    fn arrow_sort_param_carries_nulls_placement() {
+        let mut acc = accel(Engine::Arrow);
         let inferred = InferredSchema {
             sort_columns: vec![
                 InferredSortColumn {
@@ -1372,9 +1094,7 @@ mod tests {
             RefreshMode::Full,
         );
         assert_eq!(
-            acc.params
-                .get("on_refresh_sort_columns")
-                .map(String::as_str),
+            acc.params.get("arrow_sort_columns").map(String::as_str),
             Some("created_at DESC NULLS FIRST, id ASC NULLS LAST")
         );
     }
@@ -1468,7 +1188,7 @@ mod tests {
 
     #[test]
     fn skips_shard_key_on_non_cayenne_engines() {
-        let mut acc = accel(Engine::DuckDB);
+        let mut acc = accel(Engine::Arrow);
         let inferred = InferredSchema {
             shard_key: vec!["tenant_id".to_string()],
             ..InferredSchema::default()

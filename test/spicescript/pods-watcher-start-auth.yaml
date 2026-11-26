@@ -1,0 +1,46 @@
+name: pods-watcher-start-auth
+description: >
+  A runtime started with the spicepod watched, whose spicepod does not load,
+  serves nothing until it does, and then authenticates callers as that
+  spicepod's `runtime.auth` says, as a runtime started from a valid spicepod
+  does.
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: pods-watcher-start-auth
+  runtime:
+    auth:
+      api-key:
+        enabled: true
+        keys: [pods-watcher-start-auth-key:rw]
+        # Not a field of `api-key`, so the spicepod does not load until the
+        # edit below removes it.
+        not_a_field: true
+
+defaults:
+  api-key: pods-watcher-start-auth-key
+  spiced-args: [--pods-watcher-enabled]
+
+steps:
+  - start: { wait: false }
+  - assert-log:
+      contains: ['does not start serving until it loads']
+    eventually: 60s
+  - http: { path: /health, api-key: none }
+    expect: { refused: true }
+    consistently: 3s
+  - http: { method: POST, path: /v1/sql, body: SELECT 1 AS one, api-key: none }
+    expect: { refused: true }
+
+  - edit-spicepod:
+      spicepod: { runtime: { auth: { api-key: { not_a_field: null } } } }
+  - wait-ready: { timeout: 120s }
+  - assert-log:
+      contains: ['Loaded the spicepod in .*; starting the runtime']
+  - http: { method: POST, path: /v1/sql, body: SELECT 1 AS one, api-key: none }
+    expect: { status: 401 }
+  - http: { method: POST, path: /v1/sql, body: SELECT 1 AS one }
+    expect: { status: 200, body-contains: '"one":1' }
+  - query: SELECT 1 AS one
+    expect: { rows: [['1']] }

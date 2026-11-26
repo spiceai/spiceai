@@ -5,7 +5,7 @@ Spice provides two ways to connect to [DuckLake](https://ducklake.select/) catal
 1. **Catalog Connector**: Automatically discovers all schemas and tables in a DuckLake catalog
 2. **Data Connector**: Connects to specific tables in a DuckLake catalog
 
-Both connectors load the system-installed DuckDB library through ADBC and use its `ducklake` extension. Install DuckDB 1.5.0 or later (`libduckdb`) on the system library path, or register the `duckdb` ADBC driver manifest. Reads use UTC. Spice checks the installed version when opening each connector.
+Both connectors load the system-installed DuckDB library through ADBC and use its `ducklake` extension. Install DuckDB 1.5.2 or later (`libduckdb`) on the system library path, or register the `duckdb` ADBC driver manifest. Reads use UTC. Spice checks the installed version when opening each connector.
 
 ## Overview
 
@@ -158,7 +158,7 @@ datasets:
     params:
       connection_string: s3://my-bucket/warehouse/metadata.ducklake
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_check_interval: 10m
 ```
@@ -234,7 +234,7 @@ JOIN my_catalog.customers.profiles b ON a.customer_id = b.id;
 
 ## How It Works
 
-1. **Extension Loading**: Spice opens the installed DuckDB through ADBC, checks that its version is at least 1.5.0, and loads the `ducklake` extension
+1. **Extension Loading**: Spice opens the installed DuckDB through ADBC, checks that its version is at least 1.5.2, and loads the `ducklake` extension
 2. **Catalog Attachment**: The DuckLake catalog is attached using `ATTACH 'ducklake:<connection_string>' AS <name>`
 3. **Schema Discovery**: Spice queries `information_schema.schemata` to discover available schemas
 4. **Table Discovery**: For each schema, Spice queries `information_schema.tables` to discover tables

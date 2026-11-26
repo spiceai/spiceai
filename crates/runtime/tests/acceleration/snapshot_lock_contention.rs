@@ -45,7 +45,6 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use data_components::arrow::write::MemTable;
-use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
 use futures::future::join_all;
@@ -635,7 +634,7 @@ async fn test_snapshot_lock_contention_effect_on_queries() -> anyhow::Result<()>
 /// This test creates real accelerator instances for each supported engine type
 /// and measures the lock contention impact when snapshots are created during query load.
 ///
-/// Run with: `cargo test -p runtime --features "snapshots duckdb sqlite" test_lock_contention_across_accelerator_engines -- --ignored --nocapture`
+/// Run with: `cargo test -p runtime --features snapshots test_lock_contention_across_accelerator_engines -- --ignored --nocapture`
 #[tokio::test]
 #[ignore = "Performance test - requires accelerator features and manual execution"]
 async fn test_lock_contention_across_accelerator_engines() -> anyhow::Result<()> {
@@ -643,19 +642,10 @@ async fn test_lock_contention_across_accelerator_engines() -> anyhow::Result<()>
 
     println!("\n=== Lock Contention Comparison Across Accelerator Engines ===\n");
 
-    #[cfg(feature = "duckdb")]
     {
-        println!("--- Testing DuckDB Engine ---");
-        if let Err(e) = run_engine_contention_test(EngineType::DuckDB).await {
-            println!("DuckDB test failed: {e}");
-        }
-    }
-
-    #[cfg(feature = "sqlite")]
-    {
-        println!("\n--- Testing SQLite Engine ---");
-        if let Err(e) = run_engine_contention_test(EngineType::Sqlite).await {
-            println!("SQLite test failed: {e}");
+        println!("--- Testing Cayenne file Engine ---");
+        if let Err(e) = run_engine_contention_test(EngineType::CayenneFile).await {
+            println!("Cayenne file test failed: {e}");
         }
     }
 
@@ -675,20 +665,14 @@ async fn test_lock_contention_across_accelerator_engines() -> anyhow::Result<()>
 /// Supported engine types for contention testing
 #[derive(Debug, Clone, Copy)]
 enum EngineType {
-    #[cfg(feature = "duckdb")]
-    DuckDB,
-    #[cfg(feature = "sqlite")]
-    Sqlite,
+    CayenneFile,
     Cayenne,
 }
 
 impl std::fmt::Display for EngineType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            #[cfg(feature = "duckdb")]
-            Self::DuckDB => write!(f, "DuckDB"),
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite => write!(f, "SQLite"),
+            Self::CayenneFile => write!(f, "Cayenne file"),
             Self::Cayenne => write!(f, "Cayenne"),
         }
     }
@@ -697,22 +681,13 @@ impl std::fmt::Display for EngineType {
 impl EngineType {
     fn to_acceleration_engine(self) -> AccelerationEngine {
         match self {
-            #[cfg(feature = "duckdb")]
-            Self::DuckDB => AccelerationEngine::DuckDB,
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite => AccelerationEngine::Sqlite,
-            Self::Cayenne => AccelerationEngine::Cayenne,
+            Self::CayenneFile | Self::Cayenne => AccelerationEngine::Cayenne,
         }
     }
 }
 
 /// Run contention test for a specific engine type
 async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<()> {
-    use data_accelerator_api::DataAccelerator;
-    use datafusion::common::{Constraints, ToDFSchema};
-    use datafusion_expr::CreateExternalTable;
-    use std::collections::HashMap;
-
     let temp_root = unique_temp_dir(&format!("lock_contention_{engine_type}"));
     let snapshot_dir = temp_root.join("snapshots");
     let db_file = temp_root.join(format!("acceleration.{engine_type}"));
@@ -726,69 +701,30 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
         Field::new("value", DataType::Int32, false),
     ]));
 
-    let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))?;
-
     // Create engine-specific accelerator
     let accelerator: Arc<dyn TableProvider> = match engine_type {
-        #[cfg(feature = "duckdb")]
-        EngineType::DuckDB => {
-            use accelerator_duckdb::DuckDBAccelerator;
-
-            let mut options = HashMap::new();
-            options.insert("open".to_string(), db_file.display().to_string());
-
-            let cmd = CreateExternalTable {
-                schema: df_schema,
-                name: TableReference::bare("test_table"),
-                locations: vec![],
-                file_type: String::new(),
-                table_partition_cols: vec![],
-                if_not_exists: true,
-                or_replace: false,
-                definition: None,
-                order_exprs: vec![],
-                unbounded: false,
-                options,
-                constraints: Constraints::new_unverified(vec![]),
-                column_defaults: HashMap::default(),
-                temporary: false,
-            };
-
-            let engine = DuckDBAccelerator::new();
-            engine
-                .create_external_table(cmd, None, vec![], None)
-                .await
-                .map_err(|e| anyhow::anyhow!("DuckDB table creation failed: {e}"))?
-        }
-        #[cfg(feature = "sqlite")]
-        EngineType::Sqlite => {
-            use accelerator_sqlite::SqliteAccelerator;
-
-            let mut options = HashMap::new();
-            options.insert("file".to_string(), db_file.display().to_string());
-
-            let cmd = CreateExternalTable {
-                schema: df_schema,
-                name: TableReference::bare("test_table"),
-                locations: vec![],
-                file_type: String::new(),
-                table_partition_cols: vec![],
-                if_not_exists: true,
-                or_replace: false,
-                definition: None,
-                order_exprs: vec![],
-                unbounded: false,
-                options,
-                constraints: Constraints::new_unverified(vec![]),
-                column_defaults: HashMap::default(),
-                temporary: false,
-            };
-
-            let engine = SqliteAccelerator::new();
-            engine
-                .create_external_table(cmd, None, vec![], None)
-                .await
-                .map_err(|e| anyhow::anyhow!("SQLite table creation failed: {e}"))?
+        EngineType::CayenneFile => {
+            use cayenne::{CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog};
+            tokio::fs::create_dir_all(temp_root.join("metadata")).await?;
+            let catalog = Arc::new(CayenneCatalog::new(format!(
+                "sqlite://{}",
+                temp_root.join("metadata/cayenne.db").display()
+            ))?) as Arc<dyn MetadataCatalog>;
+            catalog.init().await?;
+            let ctx = SessionContext::new();
+            Arc::new(
+                CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+                    .create(cayenne::metadata::CreateTableOptions {
+                        table_name: "test_table".to_string(),
+                        schema: Arc::clone(&schema),
+                        primary_key: vec![],
+                        on_conflict: None,
+                        base_path: db_file.display().to_string(),
+                        partition_column: None,
+                        vortex_config: cayenne::metadata::VortexConfig::default(),
+                    })
+                    .await?,
+            )
         }
         EngineType::Cayenne => {
             // For Cayenne/Arrow, use MemTable as it's in-memory
@@ -797,17 +733,8 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
     };
 
     // Insert test data for file-based engines
-    #[cfg(any(feature = "duckdb", feature = "sqlite"))]
-    match engine_type {
-        #[cfg(feature = "duckdb")]
-        EngineType::DuckDB => {
-            insert_test_data(&accelerator, &schema, 10_000).await?;
-        }
-        #[cfg(feature = "sqlite")]
-        EngineType::Sqlite => {
-            insert_test_data(&accelerator, &schema, 10_000).await?;
-        }
-        _ => {}
+    if matches!(engine_type, EngineType::CayenneFile) {
+        insert_test_data(&accelerator, &schema, 10_000).await?;
     }
 
     // Set up snapshot infrastructure
@@ -831,9 +758,20 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
 
     let snapshot_manager = Arc::new(
         SnapshotManager::try_new(
-            format!("lock_contention_{engine_type}"),
+            if matches!(engine_type, EngineType::CayenneFile) {
+                "test_table".to_string()
+            } else {
+                format!("lock_contention_{engine_type}")
+            },
             snapshot_behavior,
-            runtime_acceleration::snapshot::AccelerationLayout::file(local_snapshot_file),
+            if matches!(engine_type, EngineType::CayenneFile) {
+                runtime_acceleration::snapshot::AccelerationLayout::cayenne(
+                    temp_root.join("metadata"),
+                    db_file,
+                )
+            } else {
+                runtime_acceleration::snapshot::AccelerationLayout::file(local_snapshot_file)
+            },
             engine_type.to_acceleration_engine(),
         )
         .await
@@ -972,7 +910,6 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
 }
 
 /// Insert test data into an accelerator table
-#[cfg(any(feature = "duckdb", feature = "sqlite"))]
 async fn insert_test_data(
     table: &Arc<dyn TableProvider>,
     schema: &Arc<Schema>,

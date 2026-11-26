@@ -31,8 +31,10 @@ pub const ROLES: [&str; 2] = ["scheduler", "executor"];
 
 /// Writes `ca.crt` and, for each of [`ROLES`], `<role>.crt` and `<role>.key`
 /// into `dir`, and returns `dir`. Each node certificate is valid for
-/// `localhost` and `127.0.0.1`, for both server and client authentication,
-/// since a cluster node is both.
+/// `localhost`, `127.0.0.1` and this machine's routable address, for both
+/// server and client authentication, since a cluster node is both. Nodes
+/// meet at the routable address when executors run in bridge containers
+/// (see [`crate::spiced::ContainerRun::bridge`]).
 pub fn generate(dir: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(dir).with_context(|| {
         format!(
@@ -65,6 +67,11 @@ pub fn generate(dir: &Path) -> Result<PathBuf> {
             SanType::DnsName("localhost".try_into()?),
             SanType::IpAddress(std::net::Ipv4Addr::LOCALHOST.into()),
         ];
+        // A machine without a default route has no such address, and runs
+        // no bridged executors either.
+        if let Ok(address) = crate::docker::routable_address() {
+            node.subject_alt_names.push(SanType::IpAddress(address));
+        }
         node.key_usages = vec![
             KeyUsagePurpose::DigitalSignature,
             KeyUsagePurpose::KeyEncipherment,

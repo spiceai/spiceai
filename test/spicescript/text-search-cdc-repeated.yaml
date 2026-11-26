@@ -2,12 +2,19 @@
 # text_search asked once before a document arrives through change capture
 # finds it when asked again with the identical text (#15392).
 name: text-search-cdc-repeated
+tags: [long]
 description: >
   A text_search over a change-captured Cayenne dataset, asked again with the
   identical text after a document arrives, finds it.
 
 sources:
   src: { kind: postgres }
+
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
 
 spicepod:
   version: v1

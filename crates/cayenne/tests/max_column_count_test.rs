@@ -30,7 +30,6 @@ use crate::common;
 
 use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use cayenne::CayenneTableProvider;
 use cayenne::metadata::CreateTableOptions;
 use common::insert_batch;
 use datafusion::datasource::TableProvider;
@@ -44,13 +43,12 @@ const MAX_COLUMN_COUNT: usize = 1000;
 const TEST_ROW_COUNT: usize = 100;
 
 // Generate test variants for each backend
-test_with_backends!(test_max_column_count_impl);
+test_on_data_store!(test_max_column_count_impl);
 
 async fn test_max_column_count_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let catalog = &fixture.catalog;
-    let data_path = &fixture.data_path;
     let backend_name = fixture.backend_type.name();
 
     println!("Testing max column count ({MAX_COLUMN_COUNT} columns) with {backend_name} backend");
@@ -84,18 +82,20 @@ async fn test_max_column_count_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: None,
-        base_path: data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("wide_table"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let ctx = SessionContext::new();
-    let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(catalog),
-        table_options,
-        ctx.runtime_env(),
-    )
-    .await?;
+    let table = fixture
+        .data_store
+        .create(
+            Arc::<common::FixtureCatalog>::clone(catalog),
+            ctx.runtime_env(),
+            table_options,
+        )
+        .await?;
     println!("✓ Created Cayenne table with {MAX_COLUMN_COUNT} columns");
 
     // Verify table schema
@@ -317,7 +317,6 @@ mod additional_tests {
     async fn test_moderate_column_count() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = common::TestFixture::new(common::BackendType::Sqlite).await?;
         let catalog = &fixture.catalog;
-        let data_path = &fixture.data_path;
 
         // Create schema
         let mut fields = Vec::with_capacity(COLUMN_COUNT);
@@ -333,18 +332,20 @@ mod additional_tests {
             schema: Arc::clone(&schema),
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: data_path.to_string_lossy().to_string(),
+            base_path: fixture.data_store.base_path("moderate_wide_table"),
             partition_column: None,
             vortex_config: cayenne::metadata::VortexConfig::default(),
         };
 
         let ctx = SessionContext::new();
-        let table = CayenneTableProvider::create_table(
-            Arc::<cayenne::CayenneCatalog>::clone(catalog),
-            table_options,
-            ctx.runtime_env(),
-        )
-        .await?;
+        let table = fixture
+            .data_store
+            .create(
+                Arc::<common::FixtureCatalog>::clone(catalog),
+                ctx.runtime_env(),
+                table_options,
+            )
+            .await?;
 
         // Create and insert data
         let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(COLUMN_COUNT);

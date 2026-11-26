@@ -44,6 +44,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+// Links the Cayenne engine's registration into this test binary, whose
+// dataset it accelerates.
+use accelerator_cayenne as _;
 use app::AppBuilder;
 use runtime::Runtime;
 use runtime_request_context::{Protocol, RequestContext, UserAgent};
@@ -112,7 +115,7 @@ fn lookup_dataset(dir: &std::path::Path) -> Dataset {
     // against.
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("arrow".to_string()),
+        engine: Some("cayenne".to_string()),
         mode: Mode::Memory,
         refresh_mode: Some(RefreshMode::Full),
         ..Acceleration::default()
