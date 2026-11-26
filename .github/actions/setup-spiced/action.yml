@@ -136,8 +136,15 @@ runs:
           echo "::error::setup-spiced: '$source_ref' is not a plain ref."
           exit 1
         fi
-        if [ "$source_ref" != refs/heads/trunk ] && [ "$source_ref" != "$GITHUB_REF" ]; then
-          echo "::error::This run, on $GITHUB_REF, runs only a spiced that trunk or this run's own ref built, and $source_ref built this one. Run the workflow on that ref instead: its build runs only with that ref's own credentials."
+        # A pull request's run may also read its base branch's builds, as a pull request into trunk
+        # reads trunk's: the run is unprivileged (its credentials write only its own prefix, and its
+        # CI role is the read-only one), and the build is one the base branch's own runs made.
+        pull_request_base() {
+          [ "${GITHUB_EVENT_NAME:-}" = pull_request ] && [ -n "${GITHUB_BASE_REF:-}" ] &&
+            [ "$1" = "refs/heads/${GITHUB_BASE_REF}" ]
+        }
+        if [ "$source_ref" != refs/heads/trunk ] && [ "$source_ref" != "$GITHUB_REF" ] && ! pull_request_base "$source_ref"; then
+          echo "::error::This run, on $GITHUB_REF, runs only a spiced that trunk or this run's own ref built (or, for a pull request, its base branch), and $source_ref built this one. Run the workflow on that ref instead: its build runs only with that ref's own credentials."
           exit 1
         fi
         case "$source_ref" in

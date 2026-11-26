@@ -131,6 +131,9 @@ jobs:
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
+          # The branch's own build: a run on the branch reads its own ref's, and a pull request
+          # its base branch's, never trunk's, whose runtime is another release's.
+          ref: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}
 
       - name: Download the baseline release
         id: baseline

@@ -171,8 +171,9 @@ class StoreTest(unittest.TestCase):
             script = f"cd {self.checkout}\n{script}"
         return self.run_script(script, env)
 
-    def locate(self, github_ref, ref="refs/heads/trunk", spiced_commit=""):
-        return self.run_step("locate", {"GITHUB_REF": github_ref, "REF": ref, "INPUT_SPICED_COMMIT": spiced_commit})
+    def locate(self, github_ref, ref="refs/heads/trunk", spiced_commit="", event="push", base_ref=""):
+        return self.run_step("locate", {"GITHUB_REF": github_ref, "REF": ref, "INPUT_SPICED_COMMIT": spiced_commit,
+                                        "GITHUB_EVENT_NAME": event, "GITHUB_BASE_REF": base_ref})
 
     def store_prefix(self, github_ref, repository_id=REPOSITORY_ID):
         return self.run_script(self.prefix_steps["prefix"]["run"],
@@ -398,6 +399,34 @@ class SetupSpicedTest(StoreTest):
                 self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
                 self.assertIn("runs only a spiced that trunk or this run's own ref built", proc.stdout)
                 self.assertEqual(located, {})
+
+    def test_a_pull_request_reads_its_base_branchs_build(self):
+        prefix = f"untrusted/{REPOSITORY_ID}/{RELEASE}/"
+        proc, located = self.locate(PULL_REQUEST, ref=RELEASE, event="pull_request", base_ref="release/2.4")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(located["prefix"], prefix)
+        # Only its own base, and only for a pull_request event: the base name comes from the runner.
+        for event, base_ref in (("pull_request", "release/2.5"), ("pull_request", ""), ("push", "release/2.4"),
+                                ("pull_request_target", "release/2.4"), ("workflow_dispatch", "release/2.4")):
+            with self.subTest(event=event, base_ref=base_ref):
+                proc, located = self.locate(PULL_REQUEST, ref=RELEASE, event=event, base_ref=base_ref)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertEqual(located, {})
+
+    def test_release_24s_cold_start_reads_the_branchs_own_build(self):
+        workflow = yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "testoperator_run_cold_start.yml").read_text())
+        step = next(s for s in workflow["jobs"]["cold-start"]["steps"] if s.get("id") == "setup-spiced")
+        self.assertEqual(
+            step["with"]["ref"],
+            "${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}",
+        )
+        # What that ref is on each run: the branch's own prefix, never trunk's keys.
+        for github_ref, event, base_ref, ref in ((RELEASE, "workflow_dispatch", "", RELEASE),
+                                                 (PULL_REQUEST, "pull_request", "release/2.4", RELEASE)):
+            with self.subTest(event=event):
+                proc, located = self.locate(github_ref, ref=ref, event=event, base_ref=base_ref)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(located["prefix"], f"untrusted/{REPOSITORY_ID}/{RELEASE}/")
 
     def test_the_latest_build_is_the_newest_stored_commit_under_the_prefix(self):
         prefix = f"untrusted/{REPOSITORY_ID}/{RELEASE}/"
