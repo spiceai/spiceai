@@ -1202,6 +1202,13 @@ impl RefreshWriteProfile {
         )
     }
 
+    /// Whether inlined writes accumulate in the inline tier until a flush, so its
+    /// flush caps are sized from the host: true for the profiles that inline and keep
+    /// files across writes. A whole-table replace leaves one inline entry.
+    pub(crate) const fn accumulates_inline_writes(self) -> bool {
+        self.inlines_small_writes() && self.needs_compaction()
+    }
+
     /// The per-write inline admission caps `(rows, entry bytes, buffer bytes)` this
     /// profile applies when no param sets them; all zero when it inlines nothing.
     pub(crate) const fn inline_admission_caps(self) -> (usize, usize, usize) {
@@ -2134,13 +2141,15 @@ impl CayenneAccelerator {
             );
 
             // Inline-memtable flush caps scale with memory + the metastore's
-            // storage medium; only the small-write/CDC profile inlines, so other
-            // profiles keep the floor (the caps are then ignored downstream).
-            let inline_flush_caps = if small_write {
-                hw.inline_flush_caps(workload)
-            } else {
-                autotune::InlineFlushCaps::FLOOR
-            };
+            // storage medium on every profile whose inline tier accumulates writes
+            // until a flush; the others keep the floor (the caps are then ignored
+            // downstream, or bind on a single entry).
+            let inline_flush_caps =
+                if refresh_write_profile(source, acceleration).accumulates_inline_writes() {
+                    hw.inline_flush_caps(workload)
+                } else {
+                    autotune::InlineFlushCaps::FLOOR
+                };
             apply_refresh_mode_defaults(&mut config, source, acceleration, inline_flush_caps);
 
             // In-RAM CDC tier caps (`cdc_durability: memory`) scale with host
@@ -9900,7 +9909,31 @@ mod tests {
                 config.compaction_trigger_files, SMALL_WRITE_COMPACTION_TRIGGER_FILES,
                 "{table_name}"
             );
-            assert!((2 * 1_048_576..=256 * 1_048_576).contains(&config.inline_flush_max_bytes));
+            // The inline tier holds many appends between flushes, so its flush caps
+            // are sized from the host exactly as a small-write table's, not the floor.
+            let mut small_write = TestAccelerationSource::new("cdc_reference");
+            small_write.set_acceleration(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                refresh_mode: Some(RefreshMode::Changes),
+                ..Default::default()
+            });
+            let reference = CayenneAccelerator::get_vortex_config("cdc_reference", &small_write)
+                .await
+                .expect("config should be valid");
+            assert_eq!(
+                (
+                    config.inline_flush_max_bytes,
+                    config.inline_flush_max_rows,
+                    config.inline_flush_max_segments
+                ),
+                (
+                    reference.inline_flush_max_bytes,
+                    reference.inline_flush_max_rows,
+                    reference.inline_flush_max_segments
+                ),
+                "{table_name}"
+            );
         }
 
         // The same append from a source with a refresh keeps the bulk-append profile.
