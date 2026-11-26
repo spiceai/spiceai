@@ -337,8 +337,16 @@ jobs:
           output-credentials: true
 
       # On trunk the app runs only an image spiced_docker_dev built and attested on trunk: the tag
-      # is resolved to its digest here and that digest's attestation checked. A release channel or
-      # EC2 release image is published by the release process, not this check.
+      # is resolved to its digest here and that digest's attestation checked, and the tag must still
+      # name that digest when the app starts and when the run ends. The dev channel's own default
+      # image is checked by nothing, so a trunk run does not take it. A release channel or EC2
+      # release image is published by the release process, not this check.
+      - name: Refuse an unverified cluster app image on trunk
+        if: github.ref == 'refs/heads/trunk' && env.CB_CUSTOM_IMAGE_TAG == '' && env.CB_CHANNEL == 'internal'
+        run: |
+          echo "::error::On trunk the internal channel runs only a custom_image_tag, whose attestation this run verifies; give the trunk-<commit> image to run."
+          exit 1
+
       - name: Resolve the cluster app image
         id: app-image
         if: env.CB_CUSTOM_IMAGE_TAG != '' && github.ref == 'refs/heads/trunk'
@@ -346,19 +354,11 @@ jobs:
           IMAGE_TAG: ${{ env.CB_CUSTOM_IMAGE_TAG }}
         run: |
           set -euo pipefail
-          if ! [[ "${IMAGE_TAG}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
-            echo "::error::custom_image_tag '${IMAGE_TAG}' is not an image tag."
-            exit 1
-          fi
-          token="$(curl -fsSL "https://ghcr.io/token?scope=repository:spiceai/spiceai-dev:pull" | jq -r .token)"
-          digest="$(curl -fsSI -H "Authorization: Bearer ${token}" \
-            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
-            "https://ghcr.io/v2/spiceai/spiceai-dev/manifests/${IMAGE_TAG}" | tr -d '\r' | awk -F': ' 'tolower($1) == "docker-content-digest" { print $2 }')"
-          if ! [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::Could not read the digest of ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}."
-            exit 1
-          fi
-          echo "image=ghcr.io/spiceai/spiceai-dev@${digest}" >> "$GITHUB_OUTPUT"
+          digest="$(bash .github/scripts/ghcr_digest.sh spiceai/spiceai-dev "${IMAGE_TAG}")"
+          {
+            echo "digest=${digest}"
+            echo "image=ghcr.io/spiceai/spiceai-dev@${digest}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Verify the cluster app image's attestation
         if: github.ref == 'refs/heads/trunk' && steps.app-image.outputs.image != ''
@@ -403,6 +403,11 @@ jobs:
           EXECUTOR_REPLICAS: ${{ env.CB_EXECUTOR_REPLICAS }}
           CHANNEL: ${{ env.CB_CHANNEL }}
           CUSTOM_IMAGE_TAG: ${{ env.CB_CUSTOM_IMAGE_TAG }}
+          # The digest this run verified for CUSTOM_IMAGE_TAG (on trunk). spidapter deploys by it once
+          # CLUSTER_APP_IMAGE_BY_DIGEST is true, the switch for a Spice Cloud that deploys a
+          # `<tag>@<digest>` reference; until then it sends the tag, and the tag is checked below.
+          SPIDAPTER_IMAGE_DIGEST: ${{ steps.app-image.outputs.digest }}
+          SPIDAPTER_IMAGE_BY_DIGEST: ${{ vars.CLUSTER_APP_IMAGE_BY_DIGEST == 'true' }}
           SHUFFLE_LOCATION: ${{ env.CB_SHUFFLE_LOCATION }}
           QUERY_TEMP_DIRECTORY: ${{ env.CB_QUERY_TEMP_DIRECTORY }}
           APP_STORAGE_SIZE_GB: ${{ env.CB_APP_STORAGE_SIZE_GB }}
@@ -484,6 +489,15 @@ jobs:
             export SPIDAPTER_IMAGE_TAG="${CUSTOM_IMAGE_TAG}"
             ADAPTER_CHANNEL="internal"
           fi
+          # The tag must still name the digest this run verified when the app starts.
+          if [ -n "${SPIDAPTER_IMAGE_DIGEST}" ]; then
+            now="$(bash .github/scripts/ghcr_digest.sh spiceai/spiceai-dev "${CUSTOM_IMAGE_TAG}")"
+            if [ "${now}" != "${SPIDAPTER_IMAGE_DIGEST}" ]; then
+              echo "::error::ghcr.io/spiceai/spiceai-dev:${CUSTOM_IMAGE_TAG} names ${now} now, not ${SPIDAPTER_IMAGE_DIGEST}, the digest this run verified."
+              exit 1
+            fi
+            echo "Deploying by digest: ${SPIDAPTER_IMAGE_BY_DIGEST}"
+          fi
           # spidapter reads the channel from the SPIDAPTER_CHANNEL env var (applied
           # to the SCP compute config in stdio_server). The `stdio` subcommand no
           # longer accepts a --channel flag.
@@ -531,6 +545,22 @@ jobs:
           else
             run_bench federated-direct "${CUSTOM_IMAGE_TAG}"
           fi
+
+      # The tag must have named the verified digest for the whole run: a tag pushed again while the
+      # app ran means its results are not this image's.
+      - name: Check the cluster app image did not move
+        if: always() && steps.app-image.outputs.digest != ''
+        env:
+          IMAGE_TAG: ${{ env.CB_CUSTOM_IMAGE_TAG }}
+          VERIFIED: ${{ steps.app-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          now="$(bash .github/scripts/ghcr_digest.sh spiceai/spiceai-dev "${IMAGE_TAG}")"
+          if [ "${now}" != "${VERIFIED}" ]; then
+            echo "::error::ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} names ${now} now, not ${VERIFIED}, the digest this run verified, so the app may have run another image; its results are not this image's."
+            exit 1
+          fi
+          echo "ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} still names ${VERIFIED}."
 
       - name: Re-authorize for cleanup
         if: always() && env.CB_COMPUTE == 'ec2'

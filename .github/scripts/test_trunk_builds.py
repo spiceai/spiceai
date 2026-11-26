@@ -201,6 +201,56 @@ class ClusterImageTest(unittest.TestCase):
         self.assertEqual(verify["with"]["image"], "${{ steps.app-image.outputs.image }}")
         self.assertEqual(verify["with"]["signer-workflow"], ".github/workflows/spiced_docker_dev.yml")
 
+    def test_the_app_is_given_the_verified_digest_and_the_tag_must_keep_naming_it(self):
+        steps = job_steps("testoperator_run_cluster_bench_aws.yml", "run-cluster-bench")
+        names = [s.get("name") or "" for s in steps]
+        run_index = next(i for i, n in enumerate(names) if n.startswith("Run the cluster benchmark"))
+        run = steps[run_index]
+        self.assertEqual(run["env"]["SPIDAPTER_IMAGE_DIGEST"], "${{ steps.app-image.outputs.digest }}")
+        self.assertEqual(run["env"]["SPIDAPTER_IMAGE_BY_DIGEST"], "${{ vars.CLUSTER_APP_IMAGE_BY_DIGEST == 'true' }}")
+        self.assertIn('ghcr_digest.sh spiceai/spiceai-dev "${CUSTOM_IMAGE_TAG}"', run["run"])
+        self.assertLess(run["run"].index("ghcr_digest.sh"), run["run"].index("run_bench federated-direct "))
+        after = steps[names.index("Check the cluster app image did not move")]
+        self.assertGreater(names.index("Check the cluster app image did not move"), run_index)
+        self.assertEqual(after["if"], "always() && steps.app-image.outputs.digest != ''")
+        for now, ok in (("sha256:" + "a" * 64, True), ("sha256:" + "b" * 64, False)):
+            with self.subTest(now=now), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                (work / ".github" / "scripts").mkdir(parents=True)
+                (work / ".github" / "scripts" / "ghcr_digest.sh").write_text(f"echo {now}\n")
+                proc = subprocess.run(["bash", "-e", "-c", after["run"]], cwd=work, capture_output=True, text=True,
+                                      env={**os.environ, "IMAGE_TAG": "trunk-0123456789ab", "VERIFIED": "sha256:" + "a" * 64})
+                self.assertEqual(proc.returncode == 0, ok, proc.stdout + proc.stderr)
+
+    def test_a_trunk_run_takes_no_unverified_dev_channel_image(self):
+        steps = job_steps("testoperator_run_cluster_bench_aws.yml", "run-cluster-bench")
+        refuse = next(s for s in steps if s.get("name") == "Refuse an unverified cluster app image on trunk")
+        self.assertEqual(
+            refuse["if"],
+            "github.ref == 'refs/heads/trunk' && env.CB_CUSTOM_IMAGE_TAG == '' && env.CB_CHANNEL == 'internal'",
+        )
+        self.assertIn("exit 1", refuse["run"])
+
+    def test_ghcr_digest_reads_the_tags_digest_and_refuses_anything_else(self):
+        script = Path(__file__).with_name("ghcr_digest.sh")
+        good = "sha256:" + "c" * 64
+        for header, tag, ok in ((f"Docker-Content-Digest: {good}", "trunk-0123456789ab", True),
+                                ("Docker-Content-Digest: sha256:short", "trunk-0123456789ab", False),
+                                (f"Docker-Content-Digest: {good}", "a b", False),
+                                (f"Docker-Content-Digest: {good}", "x\ny", False)):
+            with self.subTest(header=header, tag=tag), tempfile.TemporaryDirectory() as tmp:
+                bin_dir = Path(tmp)
+                (bin_dir / "curl").write_text(
+                    "#!/usr/bin/env bash\n"
+                    'case "$*" in *token*) echo \'{"token":"t"}\' ;; *) printf \'HTTP/2 200\\r\\n%s\\r\\n\' "$HEADER" ;; esac\n'
+                )
+                (bin_dir / "curl").chmod(0o755)
+                proc = subprocess.run(["bash", str(script), "spiceai/spiceai-dev", tag], capture_output=True, text=True,
+                                      env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HEADER": header})
+                self.assertEqual(proc.returncode == 0, ok, proc.stdout + proc.stderr)
+                if ok:
+                    self.assertEqual(proc.stdout.strip(), good)
+
     def test_a_trunk_dispatch_takes_only_a_trunk_commit(self):
         steps = job_steps("testoperator_dispatch_cluster.yml", "resolve-image")
         script = next(s for s in steps if s.get("id") == "resolve")["run"]
