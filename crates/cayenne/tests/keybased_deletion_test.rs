@@ -42,10 +42,7 @@ use arrow::array::{Int64Array, RecordBatch, StringArray};
 
 use arrow::datatypes::{DataType, Field, Schema};
 
-use cayenne::{
-    CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog,
-    metadata::CreateTableOptions,
-};
+use cayenne::{CayenneTableProvider, MetadataCatalog, metadata::CreateTableOptions};
 
 use common::TestFixture;
 
@@ -91,7 +88,7 @@ async fn setup_string_pk_table(
         schema: Arc::clone(&schema),
         primary_key: vec!["code".to_string()],
         on_conflict: None, // String PK -> RowConverter strategy
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -100,7 +97,10 @@ async fn setup_string_pk_table(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
@@ -118,7 +118,7 @@ async fn setup_composite_pk_table(
         schema: Arc::clone(&schema),
         primary_key: vec!["region".to_string(), "id".to_string()],
         on_conflict: None, // Composite PK -> RowConverter strategy
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -127,7 +127,10 @@ async fn setup_composite_pk_table(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
@@ -238,7 +241,7 @@ async fn test_string_pk_delete_all_empty_filter_impl(fixture: TestFixture) -> Te
     );
     Ok(())
 }
-test_with_backends!(test_string_pk_delete_all_empty_filter_impl);
+test_on_data_store!(test_string_pk_delete_all_empty_filter_impl);
 
 /// Composite-PK `(region, id)` delete-all over file-resident rows must remove
 /// every row. Guards the composite `RowConverter` delete-all path.
@@ -265,7 +268,7 @@ async fn test_composite_pk_delete_all_empty_filter_impl(fixture: TestFixture) ->
     assert_eq!(get_row_count(&ctx, "composite_delete_all").await?, 0);
     Ok(())
 }
-test_with_backends!(test_composite_pk_delete_all_empty_filter_impl);
+test_on_data_store!(test_composite_pk_delete_all_empty_filter_impl);
 
 // =============================================================================
 // STRING PK TESTS
@@ -302,7 +305,7 @@ async fn test_string_pk_basic_deletion_impl(fixture: TestFixture) -> TestResult<
     Ok(())
 }
 
-test_with_backends!(test_string_pk_basic_deletion_impl);
+test_on_data_store!(test_string_pk_basic_deletion_impl);
 
 // Edge Case 2: String PK - delete with no matches
 async fn test_string_pk_delete_no_matches_impl(fixture: TestFixture) -> TestResult<()> {
@@ -325,7 +328,7 @@ async fn test_string_pk_delete_no_matches_impl(fixture: TestFixture) -> TestResu
     Ok(())
 }
 
-test_with_backends!(test_string_pk_delete_no_matches_impl);
+test_on_data_store!(test_string_pk_delete_no_matches_impl);
 
 // Edge Case 3: String PK - delete all rows
 async fn test_string_pk_delete_all_rows_impl(fixture: TestFixture) -> TestResult<()> {
@@ -364,7 +367,7 @@ async fn test_string_pk_delete_all_rows_impl(fixture: TestFixture) -> TestResult
     Ok(())
 }
 
-test_with_backends!(test_string_pk_delete_all_rows_impl);
+test_on_data_store!(test_string_pk_delete_all_rows_impl);
 
 // Edge Case 4: String PK - idempotent deletion
 async fn test_string_pk_idempotent_delete_impl(fixture: TestFixture) -> TestResult<()> {
@@ -393,7 +396,7 @@ async fn test_string_pk_idempotent_delete_impl(fixture: TestFixture) -> TestResu
     Ok(())
 }
 
-test_with_backends!(test_string_pk_idempotent_delete_impl);
+test_on_data_store!(test_string_pk_idempotent_delete_impl);
 
 // Edge Case 5: String PK - special characters and Unicode
 async fn test_string_pk_special_characters_impl(fixture: TestFixture) -> TestResult<()> {
@@ -430,7 +433,7 @@ async fn test_string_pk_special_characters_impl(fixture: TestFixture) -> TestRes
     Ok(())
 }
 
-test_with_backends!(test_string_pk_special_characters_impl);
+test_on_data_store!(test_string_pk_special_characters_impl);
 
 // Edge Case 6: String PK - projection without PK column
 async fn test_string_pk_projection_after_delete_impl(fixture: TestFixture) -> TestResult<()> {
@@ -473,7 +476,7 @@ async fn test_string_pk_projection_after_delete_impl(fixture: TestFixture) -> Te
     Ok(())
 }
 
-test_with_backends!(test_string_pk_projection_after_delete_impl);
+test_on_data_store!(test_string_pk_projection_after_delete_impl);
 
 // Edge Case 7: String PK - multi-file deletion
 async fn test_string_pk_multi_file_deletion_impl(fixture: TestFixture) -> TestResult<()> {
@@ -512,7 +515,7 @@ async fn test_string_pk_multi_file_deletion_impl(fixture: TestFixture) -> TestRe
     Ok(())
 }
 
-test_with_backends!(test_string_pk_multi_file_deletion_impl);
+test_on_data_store!(test_string_pk_multi_file_deletion_impl);
 
 // =============================================================================
 // COMPOSITE PK TESTS
@@ -552,7 +555,7 @@ async fn test_composite_pk_basic_deletion_impl(fixture: TestFixture) -> TestResu
     Ok(())
 }
 
-test_with_backends!(test_composite_pk_basic_deletion_impl);
+test_on_data_store!(test_composite_pk_basic_deletion_impl);
 
 // Edge Case 9: Composite PK - delete by partial key (multiple rows)
 async fn test_composite_pk_partial_key_deletion_impl(fixture: TestFixture) -> TestResult<()> {
@@ -598,7 +601,7 @@ async fn test_composite_pk_partial_key_deletion_impl(fixture: TestFixture) -> Te
     Ok(())
 }
 
-test_with_backends!(test_composite_pk_partial_key_deletion_impl);
+test_on_data_store!(test_composite_pk_partial_key_deletion_impl);
 
 // Edge Case 10: Composite PK - delete non-existent key
 async fn test_composite_pk_delete_nonexistent_impl(fixture: TestFixture) -> TestResult<()> {
@@ -626,7 +629,7 @@ async fn test_composite_pk_delete_nonexistent_impl(fixture: TestFixture) -> Test
     Ok(())
 }
 
-test_with_backends!(test_composite_pk_delete_nonexistent_impl);
+test_on_data_store!(test_composite_pk_delete_nonexistent_impl);
 
 // Edge Case 11: Composite PK - idempotent deletion
 async fn test_composite_pk_idempotent_delete_impl(fixture: TestFixture) -> TestResult<()> {
@@ -657,7 +660,7 @@ async fn test_composite_pk_idempotent_delete_impl(fixture: TestFixture) -> TestR
     Ok(())
 }
 
-test_with_backends!(test_composite_pk_idempotent_delete_impl);
+test_on_data_store!(test_composite_pk_idempotent_delete_impl);
 
 // Edge Case 12: Composite PK - multi-file deletion
 async fn test_composite_pk_multi_file_deletion_impl(fixture: TestFixture) -> TestResult<()> {
@@ -702,7 +705,7 @@ async fn test_composite_pk_multi_file_deletion_impl(fixture: TestFixture) -> Tes
     Ok(())
 }
 
-test_with_backends!(test_composite_pk_multi_file_deletion_impl);
+test_on_data_store!(test_composite_pk_multi_file_deletion_impl);
 
 // Edge Case 13: Composite PK - stress test with interleaved operations
 async fn test_composite_pk_stress_interleaved_impl(fixture: TestFixture) -> TestResult<()> {
@@ -762,7 +765,7 @@ async fn test_composite_pk_stress_interleaved_impl(fixture: TestFixture) -> Test
     Ok(())
 }
 
-test_with_backends!(test_composite_pk_stress_interleaved_impl);
+test_on_data_store!(test_composite_pk_stress_interleaved_impl);
 
 // Edge Case 14: Composite PK - persistence after delete
 async fn test_composite_pk_persistence_after_delete_impl(fixture: TestFixture) -> TestResult<()> {
@@ -774,7 +777,7 @@ async fn test_composite_pk_persistence_after_delete_impl(fixture: TestFixture) -
         schema: Arc::clone(&schema),
         primary_key: vec!["region".to_string(), "id".to_string()],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -783,7 +786,9 @@ async fn test_composite_pk_persistence_after_delete_impl(fixture: TestFixture) -
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(Arc::clone(&catalog), table_options, ctx.runtime_env())
+        fixture
+            .data_store
+            .create(Arc::clone(&catalog), ctx.runtime_env(), table_options)
             .await?,
     );
 
@@ -805,8 +810,9 @@ async fn test_composite_pk_persistence_after_delete_impl(fixture: TestFixture) -
     // Reopen table
     let ctx = SessionContext::new();
     let table2 = Arc::new(
-        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-            .open(table_name)
+        fixture
+            .data_store
+            .open(catalog, ctx.runtime_env(), table_name)
             .await?,
     );
 
@@ -817,7 +823,7 @@ async fn test_composite_pk_persistence_after_delete_impl(fixture: TestFixture) -
     Ok(())
 }
 
-test_with_backends!(test_composite_pk_persistence_after_delete_impl);
+test_on_data_store!(test_composite_pk_persistence_after_delete_impl);
 
 // Edge Case 15: String PK - insert after delete (reusing PK) - UPSERT BEHAVIOR
 // With the compaction-on-upsert fix, inserting a row with a previously deleted PK
@@ -907,4 +913,4 @@ async fn test_string_pk_insert_after_delete_same_pk_impl(fixture: TestFixture) -
     Ok(())
 }
 
-test_with_backends!(test_string_pk_insert_after_delete_same_pk_impl);
+test_on_data_store!(test_string_pk_insert_after_delete_same_pk_impl);

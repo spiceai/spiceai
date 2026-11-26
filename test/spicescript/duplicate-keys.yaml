@@ -1,4 +1,5 @@
 name: duplicate-keys
+duration: 12s
 description: >
   A source without a key can hold several copies of a key the dataset declares
   as its primary key. Each engine and on_conflict behavior serves a defined

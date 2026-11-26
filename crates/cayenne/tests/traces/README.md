@@ -69,11 +69,12 @@ removed from the prototype, each reports the broken guarantee instead:
 
 | File | Run | Content |
 |---|---|---|
-| mem-tier-seal-delete-only.jsonl | mem-tier-seal-delete-only | 7 witnesses + 20 walks (seed 42, 40 steps) |
-| mem-tier-seal-delete-only-sqlite.jsonl | mem-tier-seal-delete-only-sqlite | 7 witnesses + 20 walks (seed 42, 40 steps) |
+| mem-tier-seal-delete-only.jsonl | mem-tier-seal-delete-only | 8 witnesses + 20 walks (seed 42, 40 steps) |
+| mem-tier-seal-delete-only-sqlite.jsonl | mem-tier-seal-delete-only-sqlite | 8 witnesses + 20 walks (seed 42, 40 steps) |
 | mem-tier-current-3-exhaust.jsonl | mem-tier-current-3-exhaust | seal control witnesses |
 | mem-tier-no-one-call.jsonl | mem-tier-no-one-call | split-commit control witnesses |
 | mem-tier-no-capture-reservation.jsonl | mem-tier-no-capture-reservation | late seal reservation control witnesses |
+| mem-tier-no-pruned-floor.jsonl | mem-tier-no-pruned-floor | bake tag without the pruned-delete floor control witnesses |
 
 Generated serially from the repository root, starting with absent output files
 (`TRACE_JSON` appends). One model thread keeps the minimized witnesses the same
@@ -89,6 +90,7 @@ WALK=42:20:40 TRACE_JSON=crates/cayenne/tests/traces/mem-tier-seal-delete-only-s
 EXHAUST=1 TRACE_JSON=crates/cayenne/tests/traces/mem-tier-current-3-exhaust.jsonl target/release/cayenne-metastore-model run mem-tier-current-3-exhaust
 EXHAUST=1 TRACE_JSON=crates/cayenne/tests/traces/mem-tier-no-one-call.jsonl target/release/cayenne-metastore-model run mem-tier-no-one-call
 EXHAUST=1 TRACE_JSON=crates/cayenne/tests/traces/mem-tier-no-capture-reservation.jsonl target/release/cayenne-metastore-model run mem-tier-no-capture-reservation
+EXHAUST=1 TRACE_JSON=crates/cayenne/tests/traces/mem-tier-no-pruned-floor.jsonl target/release/cayenne-metastore-model run mem-tier-no-pruned-floor
 ```
 
 `provider/table/tests/mem_tier_model_replay.rs` drives the real CDC apply, seal,

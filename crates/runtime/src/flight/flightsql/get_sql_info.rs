@@ -498,6 +498,12 @@ static INSTANCE: std::sync::LazyLock<SqlInfoData> = std::sync::LazyLock::new(|| 
     // don't yet support `CancelQuery` action
     builder.append(SqlInfoFlightSqlServerCancel, false);
     builder.append(SqlInfoFlightSqlServerStatementTimeout, 0i32);
+    // A sidecar sends its plans as parameterized Substrait tickets only to an
+    // upstream that reports this; one that does not is sent plain plans.
+    builder.append(
+        flight_client::parameterized_ticket::SQL_INFO_PARAMETERIZED_SUBSTRAIT,
+        flight_client::parameterized_ticket::PARAMETERIZED_SUBSTRAIT_VERSION,
+    );
     builder.append(SqlInfoFlightSqlServerTransactionTimeout, 0i32);
     // SQL syntax information
     builder.append(SqlInfo::SqlDdlCatalog, false);
@@ -642,5 +648,48 @@ mod tests {
             .build()
             .expect("sql info batch");
         assert!(all.num_rows() > 2);
+    }
+
+    /// A sidecar trusts the parameterized Substrait version only beside Spice's
+    /// server name, so the answer must carry both, at the types it reads them
+    /// as: a string name and an int32 version.
+    #[test]
+    fn reports_the_parameterized_substrait_version_beside_the_server_name() {
+        use arrow::array::{Array, AsArray};
+        use arrow::datatypes::{Int32Type, UInt32Type};
+        use flight_client::parameterized_ticket::{
+            PARAMETERIZED_SUBSTRAIT_VERSION, SPICE_SERVER_NAME, SQL_INFO_PARAMETERIZED_SUBSTRAIT,
+        };
+
+        let server_name = SqlInfo::FlightSqlServerName as u32;
+        let batch = sql::CommandGetSqlInfo {
+            info: vec![server_name, SQL_INFO_PARAMETERIZED_SUBSTRAIT],
+        }
+        .into_builder(get_sql_info_data())
+        .build()
+        .expect("sql info batch");
+        let names = batch.column(0).as_primitive::<UInt32Type>();
+        let values = batch.column(1).as_union();
+        let mut found = (None, None);
+        for row in 0..batch.num_rows() {
+            let value = values.value(row);
+            match names.value(row) {
+                name if name == server_name => {
+                    found.0 = Some(value.as_string::<i32>().value(0).to_string());
+                }
+                SQL_INFO_PARAMETERIZED_SUBSTRAIT => {
+                    assert!(!value.is_null(0));
+                    found.1 = Some(value.as_primitive::<Int32Type>().value(0));
+                }
+                other => panic!("unrequested code {other}"),
+            }
+        }
+        assert_eq!(
+            found,
+            (
+                Some(SPICE_SERVER_NAME.to_string()),
+                Some(PARAMETERIZED_SUBSTRAIT_VERSION)
+            )
+        );
     }
 }

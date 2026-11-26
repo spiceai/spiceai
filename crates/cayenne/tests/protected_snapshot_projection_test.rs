@@ -61,7 +61,7 @@ async fn setup_table(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -70,7 +70,10 @@ async fn setup_table(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
@@ -179,4 +182,4 @@ async fn test_protected_snapshot_projection_reorder_impl(fixture: TestFixture) -
     Ok(())
 }
 
-test_with_backends!(test_protected_snapshot_projection_reorder_impl);
+test_on_data_store!(test_protected_snapshot_projection_reorder_impl);

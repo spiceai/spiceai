@@ -93,7 +93,7 @@ async fn file_backed_table(
         schema,
         primary_key: Vec::new(),
         on_conflict: None,
-        base_path: fixture.data_path.join(name).to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(name),
         partition_column: None,
         vortex_config: VortexConfig {
             inline_max_rows: 0,
@@ -102,8 +102,12 @@ async fn file_backed_table(
         },
     };
     let ctx = SessionContext::new();
-    let table =
-        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
+    let table = Arc::new(
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), options)
+            .await?,
+    );
     common::insert_batch(table.as_ref(), batch).await?;
     Ok(table)
 }
@@ -230,4 +234,4 @@ async fn a_swapped_join_filter_survives_the_sort_merge_rewrite_impl(
     Ok(())
 }
 
-test_with_backends!(a_swapped_join_filter_survives_the_sort_merge_rewrite_impl);
+test_on_data_store!(a_swapped_join_filter_survives_the_sort_merge_rewrite_impl);

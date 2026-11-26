@@ -1,4 +1,5 @@
 name: case-mixed-widths
+duration: 16s
 description: >
   A CASE with branches of different integer widths answers with the wider
   type, and ranking functions can be negated, wherever the query runs.

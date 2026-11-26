@@ -1,4 +1,5 @@
 name: cluster-text-search
+duration: 40s
 description: >
   Known failing (#15539): empty answers, on a cluster only. `text_search` over a
   Cayenne dataset with a full-text index returns no rows, with no error,

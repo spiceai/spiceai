@@ -31,21 +31,20 @@ use arrow::array::{Array, Int64Array, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::{CayenneTableProvider, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-test_with_backends!(no_pk_delete_removes_inline_rows_without_writing_a_file);
-test_with_backends!(no_pk_delete_spans_inline_and_file_rows);
-test_with_backends!(no_pk_position_delete_replaces_the_earlier_vector_of_its_file);
-test_with_backends!(no_pk_full_rewrite_removes_the_vector_files_it_clears);
-test_with_backends!(no_pk_mutations_match_a_row_model);
+test_on_data_store!(no_pk_delete_removes_inline_rows_without_writing_a_file);
+test_on_data_store!(no_pk_delete_spans_inline_and_file_rows);
+test_on_data_store!(no_pk_position_delete_replaces_the_earlier_vector_of_its_file);
+test_on_data_store!(no_pk_full_rewrite_removes_the_vector_files_it_clears);
+test_on_data_store!(no_pk_mutations_match_a_row_model);
 
 /// One stored row: `(id, grp, val)`.
 type Row = (i64, Option<String>, Option<i64>);
@@ -87,20 +86,22 @@ async fn create_table(
 ) -> Result<(Arc<CayenneTableProvider>, SessionContext, String), Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
-            CreateTableOptions {
-                table_name: name.to_string(),
-                schema: schema(),
-                primary_key: vec![],
-                on_conflict: None,
-                base_path: fixture.data_path.to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config,
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: name.to_string(),
+                    schema: schema(),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path(name),
+                    partition_column: None,
+                    vortex_config,
+                },
+            )
+            .await?,
     );
     ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
     let table_id = fixture.catalog.get_table(name).await?.table_id;
@@ -163,63 +164,63 @@ async fn rows(ctx: &SessionContext, table: &str) -> Result<Vec<Row>, Box<dyn std
     Ok(out)
 }
 
-/// Data files and deletion-vector files under `root`.
-fn files_on_disk(root: &Path) -> (Vec<PathBuf>, BTreeSet<PathBuf>) {
-    let mut data_files = Vec::new();
-    let mut vector_files = BTreeSet::new();
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "vortex") {
-                data_files.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "arrow")
-                && path
-                    .components()
-                    .any(|component| component.as_os_str() == "deletions")
-            {
-                vector_files.insert(path);
-            }
-        }
-    }
-    (data_files, vector_files)
+/// The data files of `table` and the names of the deletion vectors under its
+/// data path, as the data store holds them.
+async fn stored_files(
+    fixture: &common::TestFixture,
+    table: &CayenneTableProvider,
+) -> Result<(Vec<common::StoredFile>, BTreeSet<String>), Box<dyn std::error::Error>> {
+    let table_dir = format!("{}/", table.table_id());
+    let stored = fixture
+        .data_store
+        .list_files(&table.metadata().path)
+        .await?;
+    let vector_files = stored
+        .iter()
+        .filter(|file| file.is_deletion_vector())
+        .map(|file| file.name().to_string())
+        .collect();
+    let data_files = stored
+        .into_iter()
+        .filter(|file| file.is_data_file() && file.relative.starts_with(&table_dir))
+        .collect();
+    Ok((data_files, vector_files))
 }
 
-/// The catalog's deletion-vector rows for `table_id`, as file paths.
+/// The names of the catalog's deletion vectors for `table_id`.
 async fn catalog_vector_files(
     fixture: &common::TestFixture,
     table_id: &str,
-) -> Result<BTreeSet<PathBuf>, Box<dyn std::error::Error>> {
+) -> Result<BTreeSet<String>, Box<dyn std::error::Error>> {
     Ok(fixture
         .catalog
         .get_table_delete_files(table_id)
         .await?
         .into_iter()
-        .map(|file| PathBuf::from(file.path))
+        .map(|file| file.path.rsplit('/').next().unwrap_or_default().to_string())
         .collect())
 }
 
-/// Wait until the deletion-vector files on disk are exactly the ones the catalog
-/// names. Superseded and cleared files are removed in the background.
+/// Wait until the deletion vectors the store holds are exactly the ones the
+/// catalog names. Superseded and cleared files are removed in the background,
+/// and a table in the object-native location keeps them for the data-file
+/// retention, which this ends.
 async fn wait_for_vector_files_to_match_catalog(
     fixture: &common::TestFixture,
-    table_id: &str,
+    table: &CayenneTableProvider,
 ) -> TestResult {
+    let table_id = table.table_id();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
+        common::reclaim_delayed_deletes(fixture, table).await;
         let referenced = catalog_vector_files(fixture, table_id).await?;
-        let (_, on_disk) = files_on_disk(&fixture.data_path);
-        if on_disk == referenced {
+        let (_, stored) = stored_files(fixture, table).await?;
+        if stored == referenced {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
-                "deletion-vector files on disk {on_disk:?} still differ from the catalog's {referenced:?}"
+                "deletion vectors in the store {stored:?} still differ from the catalog's {referenced:?}"
             )
             .into());
         }
@@ -246,7 +247,7 @@ async fn no_pk_delete_removes_inline_rows_without_writing_a_file(
         3,
         "the rows start in the inline memtable"
     );
-    assert_eq!(files_on_disk(&fixture.data_path).0, [] as [PathBuf; 0]);
+    assert_eq!(stored_files(&fixture, &table).await?.0, []);
 
     assert_eq!(
         delete(&ctx, "DELETE FROM inline_delete WHERE id = 2").await?,
@@ -261,7 +262,7 @@ async fn no_pk_delete_removes_inline_rows_without_writing_a_file(
     assert_eq!(inlined.len(), 1, "the entry was rewritten in place");
     assert_eq!(inlined[0].record_count, 2);
     assert!(
-        files_on_disk(&fixture.data_path).0.is_empty(),
+        stored_files(&fixture, &table).await?.0.is_empty(),
         "the delete wrote no data file"
     );
     assert!(
@@ -304,7 +305,7 @@ async fn no_pk_delete_spans_inline_and_file_rows(fixture: common::TestFixture) -
         ]),
     )
     .await?;
-    assert_eq!(files_on_disk(&fixture.data_path).0.len(), 1);
+    assert_eq!(stored_files(&fixture, &table).await?.0.len(), 1);
     assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 3);
 
     // Rows 1 and 4 are in the file, row 7 is inline.
@@ -324,7 +325,7 @@ async fn no_pk_delete_spans_inline_and_file_rows(fixture: common::TestFixture) -
         ]
     );
     assert_eq!(
-        files_on_disk(&fixture.data_path).0.len(),
+        stored_files(&fixture, &table).await?.0.len(),
         1,
         "the delete did not flush the inline rows to a file"
     );
@@ -356,7 +357,7 @@ async fn no_pk_delete_spans_inline_and_file_rows(fixture: common::TestFixture) -
         rows(&ctx, "mixed_delete").await?,
         vec![row(2, Some("b"), Some(2)), row(9, Some("b"), None)]
     );
-    assert_eq!(files_on_disk(&fixture.data_path).0.len(), 1);
+    assert_eq!(stored_files(&fixture, &table).await?.0.len(), 1);
     Ok(())
 }
 
@@ -367,7 +368,7 @@ async fn no_pk_position_delete_replaces_the_earlier_vector_of_its_file(
         create_table(&fixture, "vector_replace", files_only_config()).await?;
     let all: Vec<Row> = (1..=10).map(|id| row(id, Some("g"), Some(id))).collect();
     common::insert_batch(&table, batch(&all)).await?;
-    let (data_files, _) = files_on_disk(&fixture.data_path);
+    let (data_files, _) = stored_files(&fixture, &table).await?;
     assert_eq!(data_files.len(), 1, "the rows are in one file");
 
     for id in 1..=3 {
@@ -384,16 +385,16 @@ async fn no_pk_position_delete_replaces_the_earlier_vector_of_its_file(
         "one vector row per data file: {vectors:?}"
     );
     assert_eq!(vectors[0].delete_count, 3, "it holds all three deletes");
-    let data_file_name = data_files[0].file_name().expect("file name");
+    let data_file_name = data_files[0].name();
     assert!(
         vectors[0]
             .source_data_file_path
             .as_deref()
-            .is_some_and(|path| path.ends_with(&*data_file_name.to_string_lossy())),
+            .is_some_and(|path| path.ends_with(data_file_name)),
         "the vector names the data file: {vectors:?}"
     );
-    wait_for_vector_files_to_match_catalog(&fixture, &table_id).await?;
-    assert_eq!(files_on_disk(&fixture.data_path).1.len(), 1);
+    wait_for_vector_files_to_match_catalog(&fixture, &table).await?;
+    assert_eq!(stored_files(&fixture, &table).await?.1.len(), 1);
 
     let expected: Vec<Row> = (4..=10).map(|id| row(id, Some("g"), Some(id))).collect();
     assert_eq!(rows(&ctx, "vector_replace").await?, expected);
@@ -401,12 +402,14 @@ async fn no_pk_position_delete_replaces_the_earlier_vector_of_its_file(
     // The deletes are durable: a fresh provider reads them back from the one row.
     drop(table);
     let reopened_ctx = SessionContext::new();
-    let reopened = CayenneTableProviderBuilder::new(
-        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
-        reopened_ctx.runtime_env(),
-    )
-    .open("vector_replace")
-    .await?;
+    let reopened = fixture
+        .data_store
+        .open(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            reopened_ctx.runtime_env(),
+            "vector_replace",
+        )
+        .await?;
     reopened_ctx.register_table("vector_replace", Arc::new(reopened))?;
     assert_eq!(rows(&reopened_ctx, "vector_replace").await?, expected);
     Ok(())
@@ -435,14 +438,14 @@ async fn no_pk_full_rewrite_removes_the_vector_files_it_clears(
             .collect();
         common::insert_batch(&table, batch(&rows)).await?;
     }
-    assert_eq!(files_on_disk(&fixture.data_path).0.len(), 3);
+    assert_eq!(stored_files(&fixture, &table).await?.0.len(), 3);
     assert_eq!(
         delete(&ctx, "DELETE FROM rewrite_cleanup WHERE id IN (2, 7, 12)").await?,
         3
     );
-    wait_for_vector_files_to_match_catalog(&fixture, &table_id).await?;
+    wait_for_vector_files_to_match_catalog(&fixture, &table).await?;
     assert_eq!(
-        files_on_disk(&fixture.data_path).1.len(),
+        stored_files(&fixture, &table).await?.1.len(),
         3,
         "one vector per data file before the rewrite"
     );
@@ -457,7 +460,7 @@ async fn no_pk_full_rewrite_removes_the_vector_files_it_clears(
         catalog_vector_files(&fixture, &table_id).await?.is_empty(),
         "the rewrite folded every delete into its output"
     );
-    wait_for_vector_files_to_match_catalog(&fixture, &table_id).await?;
+    wait_for_vector_files_to_match_catalog(&fixture, &table).await?;
     let expected: Vec<Row> = (1..=15)
         .filter(|id| ![2, 7, 12].contains(id))
         .map(|id| row(id, Some("g"), Some(id)))
@@ -589,11 +592,11 @@ async fn no_pk_mutations_match_a_row_model(fixture: common::TestFixture) -> Test
                 5..=8 => {
                     deletes_meeting_inline_rows +=
                         usize::from(fixture.catalog.get_inlined_data_count(&table_id).await? > 0);
-                    deletes_meeting_file_rows += usize::from(
-                        !files_on_disk(Path::new(table.table_path_str()))
-                            .0
-                            .is_empty(),
-                    );
+                    // A table in the object-native location keeps retired files
+                    // for the data-file retention; only live files count here.
+                    common::reclaim_delayed_deletes(&fixture, &table).await;
+                    deletes_meeting_file_rows +=
+                        usize::from(!stored_files(&fixture, &table).await?.0.is_empty());
                     let (predicate, matches) = random_delete(&mut rng, next_id);
                     let expected = model.iter().filter(|row| matches(row)).count();
                     let deleted = delete(&ctx, &format!("DELETE FROM {name} WHERE {predicate}"))

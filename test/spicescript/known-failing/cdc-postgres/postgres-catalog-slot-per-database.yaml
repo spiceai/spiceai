@@ -1,6 +1,7 @@
 # Known failing (#15543): both instances derive one slot name from the catalog name
 # alone; the second never becomes ready. Move up a level once it passes.
 name: postgres-catalog-slot-per-database
+duration: 95s
 description: >
   Two Spice instances, each with an accelerated catalog named `pg` on its own
   database of one PostgreSQL server, both become ready and each follows its own

@@ -4,6 +4,7 @@
 # restart its refreshes fail and its status is Error, naming the column.) Move
 # up a level once it passes.
 name: schema-frozen-status
+duration: 86s
 description: >
   A dataset that can no longer refresh because its source schema changed in a
   way its `on_schema_change` mode cannot evolve reports it in its status,
