@@ -22,28 +22,41 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        # The snapshot commit is made and pushed from a repository of this step's own, never from
-        # the checkout's: on a self-hosted Mac another job can write the checkout's .git, and git
-        # keeps adding config that runs a program (hooks, `hook.<name>.command`, fsmonitor,
-        # filters) or sends a push elsewhere (`url.<x>.insteadOf`). The step's repository borrows
-        # the checkout's objects, takes the tested commit from it, and has no config, hooks or
-        # attribute drivers of its own; git's global and system config are not read either.
-        export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+        # The snapshot commit is made and pushed from a repository of this step's own, and git
+        # runs no command in the checkout's: on a self-hosted Mac another job can write the
+        # checkout's .git, and git keeps adding config that runs a program (hooks,
+        # `hook.<name>.command`, fsmonitor, filters, a partial clone's fetch command) or sends a
+        # push elsewhere (`url.<x>.insteadOf`). The step's repository only borrows the checkout's
+        # objects, which their hashes fix, and has no config, hooks or attribute drivers of its own.
+        # Neither git's global and system config nor the user's git attributes and ignore files
+        # are read, and nothing is fetched.
+        export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_NO_LAZY_FETCH=1
         workspace="$(pwd -P)"
         checkout_git="$workspace/.git"
         if [ ! -d "$checkout_git/objects" ]; then
-          echo "::error::$workspace has no .git directory to take the tested commit from; not pushing."
+          echo "::error::$workspace has no .git directory to take the tested commit's objects from; not pushing."
           exit 1
         fi
-        # The only thing read from the checkout's repository: the commit it has checked out.
-        base="$(git --git-dir="$checkout_git" rev-parse --verify 'HEAD^{commit}')"
+        # The tested commit is the run's own: every caller checks it out (test_mac_workspace.py
+        # checks that), and nothing in the checkout can name another parent.
+        base="${GITHUB_SHA:-}"
+        if ! [[ "$base" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::error::GITHUB_SHA is '$base', not a commit; not pushing."
+          exit 1
+        fi
         snap_git="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/snap-push.XXXXXX")"
         git init -q --bare --template= "$snap_git"
+        mkdir "$snap_git/xdg"
         printf '%s\n' "$checkout_git/objects" > "$snap_git/objects/info/alternates"
         if [ -f "$checkout_git/shallow" ]; then
           cp "$checkout_git/shallow" "$snap_git/shallow"
         fi
-        export GIT_DIR="$snap_git" GIT_WORK_TREE="$workspace" GIT_INDEX_FILE="$snap_git/index"
+        export GIT_DIR="$snap_git" GIT_WORK_TREE="$workspace" GIT_INDEX_FILE="$snap_git/index" \
+          XDG_CONFIG_HOME="$snap_git/xdg"
+        if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+          echo "::error::The checkout does not hold $base, the commit this run tested; not pushing."
+          exit 1
+        fi
         git read-tree "$base"
         git add -- '*.snap'
         if git diff --cached --quiet "$base"; then
@@ -92,14 +105,15 @@ runs:
         echo "Created snapshot update PR -> ${PR_URL}"
         gh pr merge --squash --auto "${BRANCH_NAME}" || echo "Auto-merge not available for this branch; PR created and requires manual merge."
         # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
-        bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "${commit}"
+        # This action's own copy, not the checkout's.
+        bash "$GITHUB_ACTION_PATH/../../scripts/approve_bot_pr_runs.sh" "${BRANCH_NAME}" "${commit}"
 
         # Close any earlier open snapshot-update PR this job opened against the same
         # base with the same title: the one above supersedes it. Matching the base keeps
         # a manual branch run from closing the scheduled trunk PRs (or vice versa), and
         # matching this job's branches keeps jobs that share the default title
         # (integration_models.yml) from closing each other's PRs, which hold other files.
-        EXISTING_PR_JSON="$(mktemp)"
+        EXISTING_PR_JSON="$(mktemp "$snap_git/prs.XXXXXX")"
         gh pr list --state open --base "${BASE_BRANCH}" --limit 100 --json number,title,headRefName,author,body,url > "${EXISTING_PR_JSON}"
         jq -r --arg title "${PR_TITLE}" --arg url "${PR_URL}" --arg prefix "${BRANCH_PREFIX}" '
           [.[]

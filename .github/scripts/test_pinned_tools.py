@@ -259,9 +259,9 @@ class PinnedToolsTest(unittest.TestCase):
         run = step("push-snap-changes", "Upload snapshots to branch")["run"]
         # No git config but git's defaults: not the host's, and not the checkout's (its commit is
         # made in a repository of the step's own; test_mac_workspace.py runs it).
-        setup = run.index("export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1")
-        self.assertLess(setup, run.index("git --git-dir"))
+        setup = run.index("export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_NO_LAZY_FETCH=1")
         self.assertLess(setup, run.index("git init -q --bare --template="))
+        self.assertNotIn("--git-dir", run)
         self.assertNotIn("git config", run)
         self.assertNotIn("push origin", run)
 

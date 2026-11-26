@@ -148,22 +148,29 @@ class PushSnapChangesConfigTest(unittest.TestCase):
         git(self.tmp, "init", "-q", "--bare", str(self.evil))
         # As a checkout has it; the step does not read it.
         git(self.repo, "remote", "add", "origin", f"file://{self.server}/owner/repo.git")
+        self.marker = self.tmp / "ran"
+        # The checkout's copy of the approval script must never run; the action's own does.
         (self.repo / ".github" / "scripts").mkdir(parents=True)
-        (self.repo / ".github" / "scripts" / "approve_bot_pr_runs.sh").write_text("exit 0\n")
+        (self.repo / ".github" / "scripts" / "approve_bot_pr_runs.sh").write_text(f"touch '{self.marker}'\n")
+        self.action = self.tmp / "action" / ".github" / "actions" / "push-snap-changes"
+        self.action.mkdir(parents=True)
+        (self.tmp / "action" / ".github" / "scripts").mkdir()
+        (self.tmp / "action" / ".github" / "scripts" / "approve_bot_pr_runs.sh").write_text(
+            f'echo "approve $*" >> "{self.tmp / "calls"}"\n')
         (self.tmp / "temp").mkdir()
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
         self.calls = self.tmp / "calls"
         (self.bin / "gh").write_text(f'#!/bin/sh\necho "gh $*" >> "{self.calls}"\n')
         (self.bin / "gh").chmod(0o755)
-        self.marker = self.tmp / "ran"
 
     def run_step(self, workspace=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "RUNNER_"))}
         env.update({"PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}", "RUNNER_TEMP": str(self.tmp / "temp"),
                     "HOME": str(self.tmp), "GH_TOKEN": "the-token", "GITHUB_REPOSITORY": "owner/repo",
                     "GITHUB_SERVER_URL": f"file://{self.server}", "GITHUB_RUN_ID": "7", "GITHUB_JOB": "job",
-                    "GITHUB_REF_NAME": "trunk", "PR_TITLE": "x", "PR_DESCRIPTION": ""})
+                    "GITHUB_REF_NAME": "trunk", "PR_TITLE": "x", "PR_DESCRIPTION": "",
+                    "GITHUB_SHA": self.base, "GITHUB_ACTION_PATH": str(self.action)})
         return subprocess.run(["bash", "-e", "-c", step("push-snap-changes", "Upload snapshots to branch")],
                               cwd=workspace or self.repo, env=env, capture_output=True, text=True, timeout=60)
 
@@ -212,6 +219,8 @@ class PushSnapChangesConfigTest(unittest.TestCase):
                 self.assertNotIn(b"the-token", path.read_bytes(), path)
         self.assertEqual(git(self.repo, "rev-parse", "HEAD").strip(), self.base)
         self.assertIn("gh pr create", self.calls.read_text())
+        commit = git(server, "rev-parse", "snapshot-update/job-7").strip()
+        self.assertIn(f"approve snapshot-update/job-7 {commit}", self.calls.read_text())
 
     def test_hooks_defined_in_config_do_not_run(self):
         # git 2.54's `hook.<name>.command` runs whatever core.hooksPath says.
@@ -230,12 +239,53 @@ class PushSnapChangesConfigTest(unittest.TestCase):
     def test_a_shallow_checkout_pushes_its_snapshots(self):
         shallow = self.tmp / "shallow"
         git(self.tmp, "clone", "-q", "--depth", "1", f"file://{self.server}/owner/repo.git", str(shallow))
-        (shallow / ".github" / "scripts").mkdir(parents=True)
-        (shallow / ".github" / "scripts" / "approve_bot_pr_runs.sh").write_text("exit 0\n")
         (shallow / "b.snap").write_text("new\n")
         proc = self.run_step(shallow)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(git(self.server / "owner" / "repo.git", "show", "snapshot-update/job-7:b.snap"), "new\n")
+
+    def test_the_parent_is_the_runs_commit_whatever_the_checkout_says(self):
+        # Another job moves the checkout's HEAD to a commit of its own.
+        (self.repo / "other.txt").write_text("slipped in\n")
+        git(self.repo, "add", "other.txt")
+        git(self.repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "planted")
+        (self.repo / "a.snap").write_text("updated\n")
+        proc = self.run_step()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        server = self.server / "owner" / "repo.git"
+        self.assertEqual(git(server, "rev-parse", "snapshot-update/job-7^").strip(), self.base)
+        self.assertEqual(git(server, "diff", "--name-only", self.base, "snapshot-update/job-7").split(), ["a.snap"])
+
+    def test_a_partial_clone_fetch_planted_in_the_checkout_does_not_run(self):
+        program = self.tmp / "program"
+        program.write_text(f"#!/bin/sh\ntouch '{self.marker}'\nexit 1\n")
+        program.chmod(0o755)
+        for key, value in (("core.repositoryformatversion", "1"), ("extensions.partialClone", "origin"),
+                           ("remote.origin.promisor", "true"), ("remote.origin.url", "ssh://example.invalid/repo.git"),
+                           ("core.sshCommand", str(program))):
+            git(self.repo, "config", key, value)
+        loose = self.repo / ".git" / "objects" / self.base[:2] / self.base[2:]
+        loose.unlink()
+        proc = self.run_step()
+        self.assertFalse(self.marker.exists(), "a command from the checkout's config ran")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn(f"The checkout does not hold {self.base}", proc.stdout)
+        self.assertEqual(self.pushed(), ["refs/heads/trunk"])
+
+    def test_every_caller_checks_out_the_runs_own_commit(self):
+        # The step takes the tested commit from GITHUB_SHA, so each job that runs it checks that out.
+        callers = 0
+        for path in sorted((ROOT / ".github" / "workflows").glob("*.y*ml")):
+            for name, job in (yaml.safe_load(path.read_text()).get("jobs") or {}).items():
+                steps = (job or {}).get("steps") or []
+                if not any(str(s.get("uses", "")).endswith("/push-snap-changes") for s in steps):
+                    continue
+                callers += 1
+                for s in steps:
+                    if str(s.get("uses", "")).startswith("actions/checkout@"):
+                        with self.subTest(workflow=path.name, job=name):
+                            self.assertIn((s.get("with") or {}).get("ref", "${{ github.sha }}"), ("${{ github.sha }}",))
+        self.assertGreater(callers, 0)
 
     def test_unchanged_snapshots_push_nothing(self):
         (self.repo / "other.txt").write_text("not a snapshot\n")
