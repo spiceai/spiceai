@@ -164,7 +164,8 @@ fn order_views_by_dependencies(validated_views: &[ValidatedView]) -> Option<Vec<
 type TablesRead = HashMap<ResolvedTableReference, TableReference>;
 
 /// The tables a view's SQL reads: every table the planner looks up to plan it,
-/// including tables only a subquery reads, and no CTEs. `None` when the SQL
+/// including tables only a subquery reads, and the tables its table functions
+/// search, and no CTEs. `None` when the SQL
 /// does not resolve, in which case registering the view reports the error.
 fn view_reads(state: &datafusion::execution::SessionState, sql: &str) -> Option<TablesRead> {
     let mut statements = DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}).ok()?;
@@ -172,7 +173,10 @@ fn view_reads(state: &datafusion::execution::SessionState, sql: &str) -> Option<
         return None;
     }
     let statement = statements.pop_front()?;
-    let tables = state.resolve_table_references(&statement).ok()?;
+    let mut tables = state.resolve_table_references(&statement).ok()?;
+    // The planner does not look up a table function's table arguments, e.g. the
+    // `docs` of `text_search(docs, 'fox')`, as tables.
+    tables.extend(view::get_dependent_table_names(&statement));
     Some(
         tables
             .into_iter()
