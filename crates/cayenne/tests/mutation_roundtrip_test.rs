@@ -108,7 +108,7 @@ async fn setup_table(
         schema: Arc::clone(&schema),
         primary_key,
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -117,7 +117,10 @@ async fn setup_table(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
@@ -225,7 +228,7 @@ async fn test_insert_single_row_impl(fixture: TestFixture) -> TestResult<()> {
     Ok(())
 }
 
-test_with_backends!(test_insert_single_row_impl);
+test_on_data_store!(test_insert_single_row_impl);
 
 // =============================================================================
 // TEST 2: Batch Insert
@@ -259,7 +262,7 @@ async fn test_insert_batch_impl(fixture: TestFixture) -> TestResult<()> {
     Ok(())
 }
 
-test_with_backends!(test_insert_batch_impl);
+test_on_data_store!(test_insert_batch_impl);
 
 // =============================================================================
 // TEST 3: Large Batch Insert (1000+ rows)
@@ -301,7 +304,7 @@ async fn test_insert_large_batch_impl(fixture: TestFixture) -> TestResult<()> {
     Ok(())
 }
 
-test_with_backends!(test_insert_large_batch_impl);
+test_on_data_store!(test_insert_large_batch_impl);
 
 // =============================================================================
 // TEST 4: Multiple Batch Inserts
@@ -352,7 +355,7 @@ async fn test_insert_multiple_batches_impl(fixture: TestFixture) -> TestResult<(
     Ok(())
 }
 
-test_with_backends!(test_insert_multiple_batches_impl);
+test_on_data_store!(test_insert_multiple_batches_impl);
 
 // =============================================================================
 // TEST 5: Delete Single Row
@@ -393,7 +396,7 @@ async fn test_delete_single_row_impl(fixture: TestFixture) -> TestResult<()> {
     Ok(())
 }
 
-test_with_backends!(test_delete_single_row_impl);
+test_on_data_store!(test_delete_single_row_impl);
 
 // =============================================================================
 // TEST 6: Delete Multiple Rows with Filter
@@ -432,7 +435,7 @@ async fn test_delete_multiple_rows_impl(fixture: TestFixture) -> TestResult<()> 
     Ok(())
 }
 
-test_with_backends!(test_delete_multiple_rows_impl);
+test_on_data_store!(test_delete_multiple_rows_impl);
 
 // =============================================================================
 // TEST 7: Delete All Rows
@@ -466,7 +469,7 @@ async fn test_delete_all_rows_impl(fixture: TestFixture) -> TestResult<()> {
     Ok(())
 }
 
-test_with_backends!(test_delete_all_rows_impl);
+test_on_data_store!(test_delete_all_rows_impl);
 
 // =============================================================================
 // TEST 8: Delete with No Matches
@@ -500,7 +503,7 @@ async fn test_delete_no_matches_impl(fixture: TestFixture) -> TestResult<()> {
     Ok(())
 }
 
-test_with_backends!(test_delete_no_matches_impl);
+test_on_data_store!(test_delete_no_matches_impl);
 
 // =============================================================================
 // TEST 9: Upsert - Delete then Insert Same Key
@@ -545,7 +548,7 @@ async fn test_upsert_same_key_impl(fixture: TestFixture) -> TestResult<()> {
     Ok(())
 }
 
-test_with_backends!(test_upsert_same_key_impl);
+test_on_data_store!(test_upsert_same_key_impl);
 
 // =============================================================================
 // TEST 10: Multiple Upserts on Same Key
@@ -591,7 +594,7 @@ async fn test_multiple_upserts_same_key_impl(fixture: TestFixture) -> TestResult
     Ok(())
 }
 
-test_with_backends!(test_multiple_upserts_same_key_impl);
+test_on_data_store!(test_multiple_upserts_same_key_impl);
 
 // =============================================================================
 // TEST 11: Insert After Delete All
@@ -636,7 +639,7 @@ async fn test_insert_after_delete_all_impl(fixture: TestFixture) -> TestResult<(
     Ok(())
 }
 
-test_with_backends!(test_insert_after_delete_all_impl);
+test_on_data_store!(test_insert_after_delete_all_impl);
 
 // =============================================================================
 // TEST 12: Multi-column Update (all non-PK columns)
@@ -698,7 +701,7 @@ async fn test_multi_column_update_impl(fixture: TestFixture) -> TestResult<()> {
     Ok(())
 }
 
-test_with_backends!(test_multi_column_update_impl);
+test_on_data_store!(test_multi_column_update_impl);
 
 // =============================================================================
 // TEST 13: Nullable Field Handling
@@ -747,7 +750,7 @@ async fn test_nullable_field_mutations_impl(fixture: TestFixture) -> TestResult<
     Ok(())
 }
 
-test_with_backends!(test_nullable_field_mutations_impl);
+test_on_data_store!(test_nullable_field_mutations_impl);
 
 // =============================================================================
 // TEST 14: Boundary Value Mutations
@@ -798,7 +801,7 @@ async fn test_boundary_values_impl(fixture: TestFixture) -> TestResult<()> {
     Ok(())
 }
 
-test_with_backends!(test_boundary_values_impl);
+test_on_data_store!(test_boundary_values_impl);
 
 // =============================================================================
 // TEST 15: Interleaved Insert and Delete Operations
@@ -857,7 +860,7 @@ async fn test_interleaved_ops_impl(fixture: TestFixture) -> TestResult<()> {
     Ok(())
 }
 
-test_with_backends!(test_interleaved_ops_impl);
+test_on_data_store!(test_interleaved_ops_impl);
 
 // =============================================================================
 // TEST 16: Small Frequent Updates (Many small mutations)
@@ -908,7 +911,7 @@ async fn test_small_frequent_updates_impl(fixture: TestFixture) -> TestResult<()
     Ok(())
 }
 
-test_with_backends!(test_small_frequent_updates_impl);
+test_on_data_store!(test_small_frequent_updates_impl);
 
 // =============================================================================
 // TEST 17: Large Batch Delete
@@ -963,7 +966,7 @@ async fn test_large_batch_delete_impl(fixture: TestFixture) -> TestResult<()> {
     Ok(())
 }
 
-test_with_backends!(test_large_batch_delete_impl);
+test_on_data_store!(test_large_batch_delete_impl);
 
 // =============================================================================
 // TEST 18: Timestamp Column Mutations
@@ -1006,7 +1009,7 @@ async fn test_timestamp_mutations_impl(fixture: TestFixture) -> TestResult<()> {
     Ok(())
 }
 
-test_with_backends!(test_timestamp_mutations_impl);
+test_on_data_store!(test_timestamp_mutations_impl);
 
 // =============================================================================
 // TEST 19: Stress Test - Many Concurrent-Style Operations
@@ -1062,7 +1065,7 @@ async fn test_stress_many_operations_impl(fixture: TestFixture) -> TestResult<()
     Ok(())
 }
 
-test_with_backends!(test_stress_many_operations_impl);
+test_on_data_store!(test_stress_many_operations_impl);
 
 // =============================================================================
 // TEST 20: Bulk Delete then Bulk Insert (Full Table Replacement)
@@ -1110,4 +1113,4 @@ async fn test_full_table_replacement_impl(fixture: TestFixture) -> TestResult<()
     Ok(())
 }
 
-test_with_backends!(test_full_table_replacement_impl);
+test_on_data_store!(test_full_table_replacement_impl);

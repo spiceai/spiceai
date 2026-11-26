@@ -39,10 +39,10 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
 
-test_with_backends!(test_accounting_tracks_keyset_and_deletions_impl);
-test_with_backends!(test_accounting_against_bounded_pool_preserves_correctness_impl);
-test_with_backends!(test_accounting_rehydrates_deletions_on_open_impl);
-test_with_backends!(test_accounting_tracks_inline_file_deletions_impl);
+test_on_data_store!(test_accounting_tracks_keyset_and_deletions_impl);
+test_on_data_store!(test_accounting_against_bounded_pool_preserves_correctness_impl);
+test_on_data_store!(test_accounting_rehydrates_deletions_on_open_impl);
+test_on_data_store!(test_accounting_tracks_inline_file_deletions_impl);
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -122,16 +122,18 @@ async fn test_accounting_tracks_keyset_and_deletions_impl(
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            catalog,
-            table_options(
-                "mem_track",
-                fixture.data_path.to_string_lossy().to_string(),
-                key_mode_file_config(),
-            ),
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                catalog,
+                ctx.runtime_env(),
+                table_options(
+                    "mem_track",
+                    fixture.data_store.base_path("mem_track"),
+                    key_mode_file_config(),
+                ),
+            )
+            .await?,
     );
     ctx.register_table(
         "mem_track",
@@ -220,16 +222,18 @@ async fn test_accounting_against_bounded_pool_preserves_correctness_impl(
 
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            catalog,
-            table_options(
-                "mem_bounded",
-                fixture.data_path.to_string_lossy().to_string(),
-                key_mode_file_config(),
-            ),
-            Arc::clone(&runtime_env),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                catalog,
+                Arc::clone(&runtime_env),
+                table_options(
+                    "mem_bounded",
+                    fixture.data_store.base_path("mem_bounded"),
+                    key_mode_file_config(),
+                ),
+            )
+            .await?,
     );
     ctx.register_table(
         "mem_bounded",
@@ -283,16 +287,18 @@ async fn test_accounting_rehydrates_deletions_on_open_impl(
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            Arc::clone(&catalog),
-            table_options(
-                "mem_reopen",
-                fixture.data_path.to_string_lossy().to_string(),
-                key_mode_file_config(),
-            ),
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                Arc::clone(&catalog),
+                ctx.runtime_env(),
+                table_options(
+                    "mem_reopen",
+                    fixture.data_store.base_path("mem_reopen"),
+                    key_mode_file_config(),
+                ),
+            )
+            .await?,
     );
     ctx.register_table(
         "mem_reopen",
@@ -307,7 +313,10 @@ async fn test_accounting_rehydrates_deletions_on_open_impl(
     );
 
     let reopened = Arc::new(
-        CayenneTableProvider::new("mem_reopen", Arc::clone(&catalog), ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .open(Arc::clone(&catalog), ctx.runtime_env(), "mem_reopen")
+            .await?,
     );
     let reopened_accounted = reopened.accounted_memory_bytes();
     assert!(
@@ -343,16 +352,18 @@ async fn test_accounting_tracks_inline_file_deletions_impl(
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            catalog,
-            table_options(
-                "mem_inline_delete",
-                fixture.data_path.to_string_lossy().to_string(),
-                key_mode_inline_upsert_config(),
-            ),
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                catalog,
+                ctx.runtime_env(),
+                table_options(
+                    "mem_inline_delete",
+                    fixture.data_store.base_path("mem_inline_delete"),
+                    key_mode_inline_upsert_config(),
+                ),
+            )
+            .await?,
     );
     ctx.register_table(
         "mem_inline_delete",

@@ -23,7 +23,11 @@ use spicepod::component::caching::{
 
 use crate::{Runtime, datafusion::SPICE_RUNTIME_SCHEMA};
 
-const DEFAULT_CACHED_PLANS_MAX_CAPACITY: u64 = 512;
+/// How many logical plans the plans cache keeps.
+pub(crate) const DEFAULT_CACHED_PLANS_MAX_CAPACITY: u64 = 512;
+
+/// How long the plans cache keeps a plan.
+pub(crate) const CACHED_PLANS_TTL: Duration = Duration::from_hours(1);
 
 impl Runtime {
     #[must_use]
@@ -78,7 +82,7 @@ impl Runtime {
             Ok(hash_builder) => {
                 let plans_cache_provider = Arc::new(SimpleCache::new(
                     DEFAULT_CACHED_PLANS_MAX_CAPACITY,
-                    Duration::from_hours(1),
+                    CACHED_PLANS_TTL,
                     hash_builder,
                 ))
                 .as_tabled_provider();

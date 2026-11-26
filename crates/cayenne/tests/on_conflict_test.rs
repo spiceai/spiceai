@@ -27,7 +27,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 
 use cayenne::metadata::{CreateTableOptions, PkConflictDetection, VortexConfig};
 
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::{CayenneTableProvider, MetadataCatalog};
 
 use datafusion::prelude::SessionContext;
 
@@ -36,9 +36,9 @@ use datafusion_table_providers::util::{
 };
 
 // Run against all supported backends.
-test_with_backends!(test_on_conflict_upsert_impl);
-test_with_backends!(test_pk_conflict_detection_none_blind_appends_impl);
-test_with_backends!(test_pk_conflict_detection_none_rejects_upsert_impl);
+test_on_data_store!(test_on_conflict_upsert_impl);
+test_on_data_store!(test_pk_conflict_detection_none_blind_appends_impl);
+test_on_data_store!(test_pk_conflict_detection_none_rejects_upsert_impl);
 
 async fn test_on_conflict_upsert_impl(
     fixture: common::TestFixture,
@@ -55,15 +55,17 @@ async fn test_on_conflict_upsert_impl(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("conflict_upsert"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
 
     ctx.register_table(
@@ -129,15 +131,17 @@ async fn test_pk_conflict_detection_none_blind_appends_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("conflict_blind_append"),
         partition_column: None,
         vortex_config,
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
 
     ctx.register_table(
@@ -195,7 +199,7 @@ async fn test_pk_conflict_detection_none_rejects_upsert_impl(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("conflict_none_upsert"),
         partition_column: None,
         vortex_config,
     };
@@ -221,11 +225,11 @@ async fn test_pk_conflict_detection_none_rejects_upsert_impl(
 // sharing a PK. It keeps one row, the last, whatever `on_conflict` the table was
 // created with.
 
-test_with_backends!(test_upsert_in_batch_versions_keep_last_impl);
-test_with_backends!(test_upsert_in_batch_duplicate_keeps_last_impl);
-test_with_backends!(test_upsert_in_batch_duplicate_over_existing_keeps_last_impl);
-test_with_backends!(test_do_nothing_table_keeps_last_impl);
-test_with_backends!(test_upsert_in_batch_duplicate_composite_pk_impl);
+test_on_data_store!(test_upsert_in_batch_versions_keep_last_impl);
+test_on_data_store!(test_upsert_in_batch_duplicate_keeps_last_impl);
+test_on_data_store!(test_upsert_in_batch_duplicate_over_existing_keeps_last_impl);
+test_on_data_store!(test_do_nothing_table_keeps_last_impl);
+test_on_data_store!(test_upsert_in_batch_duplicate_composite_pk_impl);
 
 /// Helper: collect `(id, name)` rows sorted by id.
 async fn collect_id_name(
@@ -267,15 +271,16 @@ async fn make_id_name_table(
         schema,
         primary_key: vec!["id".to_string()],
         on_conflict: Some(on_conflict),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(name),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProviderBuilder::new(catalog_arc, ctx.runtime_env())
-            .create(table_options)
+        fixture
+            .data_store
+            .create(catalog_arc, ctx.runtime_env(), table_options)
             .await?,
     );
     ctx.register_table(
@@ -428,15 +433,18 @@ async fn test_upsert_in_batch_duplicate_composite_pk_impl(
             "region".to_string(),
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture
+            .data_store
+            .base_path("upsert_in_batch_dup_composite"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProviderBuilder::new(catalog_arc, ctx.runtime_env())
-            .create(table_options)
+        fixture
+            .data_store
+            .create(catalog_arc, ctx.runtime_env(), table_options)
             .await?,
     );
     ctx.register_table(
@@ -491,8 +499,8 @@ async fn test_upsert_in_batch_duplicate_composite_pk_impl(
 // A composite key is only actionable if the rejection says which of its columns
 // carried the null.
 
-test_with_backends!(test_null_composite_pk_names_the_null_column_impl);
-test_with_backends!(test_null_composite_pk_names_the_null_column_blind_append_impl);
+test_on_data_store!(test_null_composite_pk_names_the_null_column_impl);
+test_on_data_store!(test_null_composite_pk_names_the_null_column_blind_append_impl);
 
 /// A table keyed on `(region, id)` whose `region` is nullable, so a null reaches the
 /// write path's validation instead of `DataFusion`'s non-nullable column check.
@@ -512,14 +520,17 @@ async fn nullable_composite_pk_table(
         schema,
         primary_key: vec!["region".to_string(), "id".to_string()],
         on_conflict,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config,
     };
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog_arc, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(
         table_name,

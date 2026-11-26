@@ -137,8 +137,9 @@ test_scripts_are_executable() {
     [[ -x "$INSTALL_SCRIPT" ]] && [[ -x "$INSTALL_SPICED_SCRIPT" ]]
 }
 
+# install.sh is POSIX sh, so that `curl ... | sh` works; install-spiced.sh needs bash.
 test_scripts_have_shebang() {
-    head -1 "$INSTALL_SCRIPT" | grep -q "#!/usr/bin/env bash" && \
+    head -1 "$INSTALL_SCRIPT" | grep -qx "#!/bin/sh" && \
     head -1 "$INSTALL_SPICED_SCRIPT" | grep -q "#!/usr/bin/env bash"
 }
 
@@ -970,11 +971,26 @@ STUB
 #   OFFLINE_GH      loggedout (default), pass, or fail (the attestation check), or absent (no gh)
 #   OFFLINE_HASH    ok (default), or none (sha256sum, shasum and openssl print nothing and fail)
 #   OFFLINE_BODY_BYTES  the size of the release notes in the API's release (default: a few bytes)
+#   OFFLINE_LATEST  redirect (default: github.com/.../releases/latest redirects to the release's
+#                   tag page, as GitHub does), or none (it answers 404)
+#   OFFLINE_BINARY  ok (default: the binary prints "CLI version: v0.0.0"), broken (it fails as
+#                   a binary for another libc does), or wrong-version (it reports 9.9.9)
 # and how the install runs from these:
 #   OFFLINE_VERSION       the version to install (default 0.0.0), or latest to pass none
 #   OFFLINE_CLIENT        curl (default) or wget, the only one of them on PATH
 #   OFFLINE_RATE_LIMITED  latest or tags: that API request gets a rate limit error
 #   OFFLINE_RATE_LIMIT_STATUS  the status of that error, 403 (default) or 429
+#   OFFLINE_SHELL         the shell the script is piped into (default /bin/bash)
+#   OFFLINE_UNAME_S, OFFLINE_UNAME_M  what `uname -s` and `uname -m` print (default: the host's)
+#   OFFLINE_ROSETTA       what `sysctl -n sysctl.proc_translated` prints (default: no sysctl stub)
+#   OFFLINE_LDD           what `ldd --version` prints (default: no ldd stub)
+#   OFFLINE_UID           what `id -u` prints (default: no id stub)
+#   OFFLINE_AGENTS        AI coding agent commands to stub (claude codex copilot grok), each of
+#                         which records its arguments to $home.agents and succeeds
+#   OFFLINE_AGENT_FAIL    the stubbed agent whose plugin install fails
+#   OFFLINE_AGENT_ALREADY the stubbed agent whose plugin install fails as already installed
+#   OFFLINE_TTY_INPUT     when set, the install runs on a pseudo-terminal, as a person at a
+#                         terminal runs it, and this is what they type
 # Usage: run_installer_offline <script> <binary> <asset> <home> [VAR=value...], where the
 # VAR=value pairs go into the installer's environment. The log is $home.log, and the requests
 # GitHub got are in $home.requests, one "<path> <auth>" line each (see install-fake-github.py).
@@ -995,7 +1011,11 @@ run_installer_offline() {
     mkdir -p "$stubs/pkg" "$api/tags" "$dl"
     : > "$case_dir/requests"
     ln -sf "$case_dir/requests" "$home.requests"
-    printf '#!/bin/sh\necho "CLI version: v0.0.0"\n' > "$stubs/pkg/$binary"
+    case "${OFFLINE_BINARY:-ok}" in
+        ok) printf '#!/bin/sh\necho "CLI version: v0.0.0"\n' > "$stubs/pkg/$binary" ;;
+        broken) printf '#!/bin/sh\necho "%s: error while loading shared libraries: libgcc_s.so.1: cannot open shared object file" >&2\nexit 127\n' "$binary" > "$stubs/pkg/$binary" ;;
+        wrong-version) printf '#!/bin/sh\necho "spice 9.9.9"\n' > "$stubs/pkg/$binary" ;;
+    esac
     chmod +x "$stubs/pkg/$binary"
     tar czf "$dl/$asset" -C "$stubs/pkg" "$binary"
     digest=$(sha256_of "$dl/$asset")
@@ -1023,7 +1043,37 @@ run_installer_offline() {
                 "x-ratelimit-limit: 60" "x-ratelimit-remaining: 0" "x-ratelimit-reset: 4102444800"
             ;;
     esac
+    if [ "${OFFLINE_LATEST:-redirect}" = redirect ]; then
+        fake_github_status "$name" dl/releases/latest 302 "" "location: https://github.com/spiceai/spiceai/releases/tag/v0.0.0"
+    fi
     write_client_shim "$stubs" "${OFFLINE_CLIENT:-curl}" "$name" || { echo "no ${OFFLINE_CLIENT:-curl} installed"; return 1; }
+    if [ -n "${OFFLINE_UNAME_S:-}${OFFLINE_UNAME_M:-}" ]; then
+        cat > "$stubs/uname" <<STUB
+#!/bin/sh
+case "\$1" in
+    -s|"") echo "${OFFLINE_UNAME_S:-$(uname -s)}" ;;
+    -m) echo "${OFFLINE_UNAME_M:-$(uname -m)}" ;;
+    *) exec $(command -v uname) "\$@" ;;
+esac
+STUB
+        chmod +x "$stubs/uname"
+    fi
+    if [ -n "${OFFLINE_ROSETTA:-}" ]; then
+        printf '#!/bin/sh\necho "%s"\n' "$OFFLINE_ROSETTA" > "$stubs/sysctl"
+        chmod +x "$stubs/sysctl"
+    fi
+    if [ -n "${OFFLINE_LDD:-}" ]; then
+        printf '#!/bin/sh\necho "%s" >&2\nexit 1\n' "$OFFLINE_LDD" > "$stubs/ldd"
+        chmod +x "$stubs/ldd"
+    fi
+    if [ -n "${OFFLINE_UID:-}" ]; then
+        cat > "$stubs/id" <<STUB
+#!/bin/sh
+[ "\$1" = -u ] && { echo "$OFFLINE_UID"; exit 0; }
+exec $(command -v id) "\$@"
+STUB
+        chmod +x "$stubs/id"
+    fi
     cat > "$stubs/sudo" <<STUB
 #!/bin/sh
 echo "\$*" >> "$home.sudo"
@@ -1049,12 +1099,55 @@ STUB
             chmod +x "$stubs/$tool"
         done
     fi
+    local agent
+    for agent in ${OFFLINE_AGENTS:-}; do
+        cat > "$stubs/$agent" <<STUB
+#!/bin/sh
+echo "$agent \$*" >> "$home.agents"
+case "\$*" in *marketplace*) echo "marketplace added"; exit 0 ;; esac
+case "${OFFLINE_AGENT_FAIL:-}" in $agent) echo "boom: network unreachable" >&2; exit 1 ;; esac
+case "${OFFLINE_AGENT_ALREADY:-}" in $agent) echo "Error: repo 'skills-734724f4' already installed" >&2; exit 1 ;; esac
+echo "installed"
+STUB
+        chmod +x "$stubs/$agent"
+    done
     : > "$home.sudo"
     : > "$home.gh"
-    local version_arg="0.0.0"
-    [ "${OFFLINE_VERSION:-0.0.0}" = latest ] && version_arg=""
-    env -i HOME="$home" PATH="$stubs:$SYSTEM_BIN" SHELL=/bin/bash "$@" \
-        /bin/bash -c "cat '$script' | /bin/bash -s -- $version_arg" > "$home.log" 2>&1 < /dev/null
+    : > "$home.agents"
+    local version_arg="${OFFLINE_VERSION:-0.0.0}"
+    [ "$version_arg" = latest ] && version_arg=""
+    local command=(env -i HOME="$home" PATH="$stubs:$SYSTEM_BIN" SHELL=/bin/bash "$@"
+        /bin/bash -c "cat '$script' | ${OFFLINE_SHELL:-/bin/bash} -s -- $version_arg")
+    if [ -n "${OFFLINE_TTY_INPUT+set}" ]; then
+        run_on_terminal "$OFFLINE_TTY_INPUT" "${command[@]}" > "$home.log" 2>&1 < /dev/null
+    else
+        "${command[@]}" > "$home.log" 2>&1 < /dev/null
+    fi
+}
+
+# Runs a command with a new pseudo-terminal as its controlling terminal, stdin, stdout and stderr,
+# and types $1 into it, as a person at a terminal would. Prints what the terminal showed, and
+# exits with the command's exit code.
+run_on_terminal() {
+    local input="$1"
+    shift
+    python3 -I -c '
+import os, pty, sys
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp(sys.argv[2], sys.argv[2:])
+os.write(fd, sys.argv[1].encode())
+while True:
+    try:
+        data = os.read(fd, 65536)
+    except OSError:
+        break
+    if not data:
+        break
+    sys.stdout.buffer.write(data)
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+' "$input" "$@"
 }
 
 # install.sh, offline. Extra arguments are VAR=value pairs for its environment.
@@ -1090,11 +1183,12 @@ test_install_sh_unwritable_dir_uses_sudo() {
     grep -q "^-- mkdir -p $home/locked/new/bin" "$home.sudo"
 }
 
+# The new spice is copied next to the old one, under a temporary name, then renamed over it.
 test_install_sh_explicit_use_sudo_is_honored() {
     local home="$TEST_TMP_DIR/explicit-sudo-home"
     mkdir -p "$home"
     run_install_offline "$home" USE_SUDO=true || true
-    grep -q "^-- cp .* $home/.spice/bin$" "$home.sudo"
+    grep -q "^-- cp .* $home/.spice/bin/\.spice\.install\.[0-9]*$" "$home.sudo" || { cat "$home.sudo" "$home.log"; return 1; }
 }
 
 # regression test: install-spiced.sh created its install directory with a plain mkdir before
@@ -1573,8 +1667,9 @@ api_request_count_is() {
 }
 
 # With no token, no request carries an Authorization header, and the install of the latest release
-# still verifies, against the sha256 GitHub recorded, with two API requests: the latest release
-# and the release's asset list.
+# still verifies, against the sha256 GitHub recorded, with one API request, for the release's asset
+# list. The latest release comes from where github.com/.../releases/latest redirects, which is not
+# an API request.
 test_installs_without_a_token() {
     local installer="$1" client="$2" home asset
     home=$(test_home "no-token-$installer-$client")
@@ -1584,7 +1679,7 @@ test_installs_without_a_token() {
     installed_by "$installer" "$home" &&
         log_has "$home" "Verified the sha256 of $asset against the sha256 GitHub recorded for $asset in release v0.0.0." &&
         requests_are "$home" \
-            "api/releases/latest none" \
+            "dl/releases/latest none" \
             "api/releases/tags/v0.0.0 none" \
             "dl/releases/download/v0.0.0/SHA256SUMS none" \
             "dl/releases/download/v0.0.0/$asset none"
@@ -1603,32 +1698,47 @@ test_sends_the_token_to_the_api() {
         echo "$unauthenticated"
         return 1
     fi
-    installed_by "$installer" "$home" && api_request_count_is "$home" 2
+    installed_by "$installer" "$home" && api_request_count_is "$home" 1
 }
 
-# A release with SHA256SUMS needs one API request, for the latest release, and none to verify.
-test_verifies_sha256sums_with_one_api_request() {
+# The latest release of a release with SHA256SUMS installs with no API request at all, so the
+# API rate limit cannot stop it.
+test_verifies_sha256sums_with_no_api_request() {
     local installer="$1" home
     home=$(test_home "api-budget-$installer")
     OFFLINE_VERSION=latest run_named_installer_offline "$installer" "$home" || { cat "$home.log"; return 1; }
     installed_by "$installer" "$home" &&
         log_has "$home" "against the SHA256SUMS of release v0.0.0." &&
-        api_request_count_is "$home" 1
+        api_request_count_is "$home" 0
 }
 
-# A rate-limited lookup of the latest release stops the install before any download, asks once,
-# and says how to get past the limit.
+# When the github.com redirect gives no release, the latest release comes from the API. A
+# rate-limited lookup there stops the install before any download, asks once, and says how to
+# get past the limit.
 test_stops_when_the_latest_release_lookup_is_rate_limited() {
     local installer="$1" client="$2" home
     home=$(test_home "limited-latest-$installer-$client")
-    if OFFLINE_VERSION=latest OFFLINE_RATE_LIMITED=latest OFFLINE_CLIENT="$client" \
+    if OFFLINE_VERSION=latest OFFLINE_LATEST=none OFFLINE_RATE_LIMITED=latest OFFLINE_CLIENT="$client" \
         run_named_installer_offline "$installer" "$home"; then
         cat "$home.log"
         return 1
     fi
     ! installed_by "$installer" "$home" &&
         log_has "$home" "If the GitHub API rate limit was exceeded, set GITHUB_TOKEN or pass a version to install" &&
-        requests_are "$home" "api/releases/latest none"
+        requests_are "$home" "dl/releases/latest none" "api/releases/latest none"
+}
+
+# The API is the fallback for the latest release, and it gets GITHUB_TOKEN.
+test_falls_back_to_the_api_for_the_latest_release() {
+    local installer="$1" client="$2" home
+    home=$(test_home "latest-api-$installer-$client")
+    OFFLINE_VERSION=latest OFFLINE_LATEST=none OFFLINE_CLIENT="$client" \
+        run_named_installer_offline "$installer" "$home" GITHUB_TOKEN=installer-test-token || { cat "$home.log"; return 1; }
+    installed_by "$installer" "$home" || return 1
+    if ! grep -qx "dl/releases/latest none" "$home.requests" || ! grep -qx "api/releases/latest Bearer" "$home.requests"; then
+        cat "$home.requests"
+        return 1
+    fi
 }
 
 # A rate-limited lookup of the sha256 GitHub recorded stops the install with the token hint and
@@ -1682,6 +1792,514 @@ test_installs_without_gh() {
     installed_by "$installer" "$home" &&
         log_has "$home" "Verified the sha256 of $asset against the SHA256SUMS of release v0.0.0." &&
         log_has "$home" "Skipped the build attestation check of $asset: the GitHub CLI (gh) is not installed or not logged in."
+}
+
+# =============================================================================
+# install.sh: Shells, Versions, Platforms and Privileges
+# =============================================================================
+
+# The README one-liner pipes the installer into a shell, which on Debian and Ubuntu `sh` is dash.
+test_install_sh_runs_under_posix_sh() {
+    local shell home ran=0
+    for shell in dash /bin/sh "busybox sh"; do
+        command -v "${shell%% *}" > /dev/null 2>&1 || continue
+        home=$(test_home "posix-sh-$(basename "${shell// /-}")")
+        OFFLINE_SHELL="$shell" run_install_offline "$home" || { echo "under $shell:"; cat "$home.log"; return 1; }
+        installed_cli "$home" || { echo "under $shell:"; cat "$home.log"; return 1; }
+        ran=$((ran + 1))
+    done
+    [[ $ran -gt 0 ]] || { echo "no POSIX shell to run the installer with"; return 1; }
+}
+
+test_install_sh_accepts_a_v_prefixed_version() {
+    local home
+    home=$(test_home "v-prefix")
+    OFFLINE_VERSION=v0.0.0 run_install_offline "$home" || { cat "$home.log"; return 1; }
+    installed_cli "$home" || return 1
+    if ! grep -qx "dl/releases/download/v0.0.0/$(asset_of install.sh) none" "$home.requests"; then
+        cat "$home.requests"
+        return 1
+    fi
+}
+
+test_install_sh_rejects_an_invalid_version_before_any_request() {
+    local home
+    home=$(test_home "bad-version")
+    if OFFLINE_VERSION=banana run_install_offline "$home"; then cat "$home.log"; return 1; fi
+    ! installed_cli "$home" && log_has "$home" "'banana' is not a Spice release version" && requests_are "$home"
+}
+
+test_install_sh_prints_its_help() {
+    local home
+    home=$(test_home "help")
+    OFFLINE_VERSION=--help run_install_offline "$home" || { cat "$home.log"; return 1; }
+    ! installed_cli "$home" &&
+        log_has "$home" "SPICE_INSTALL_NO_MODIFY_PATH=1" &&
+        log_has "$home" "NONINTERACTIVE=1" &&
+        requests_are "$home"
+}
+
+# Under sudo from a regular user, spice would be installed for root, so the installer stops
+# before any download.
+test_install_sh_refuses_to_run_under_sudo() {
+    local home
+    home=$(test_home "under-sudo")
+    if OFFLINE_UID=0 run_install_offline "$home" SUDO_USER=alice; then cat "$home.log"; return 1; fi
+    ! installed_cli "$home" &&
+        log_has "$home" "Do not run the Spice CLI installer with sudo." &&
+        log_has "$home" "SPICE_INSTALL_ALLOW_SUDO=1" &&
+        requests_are "$home"
+}
+
+test_install_sh_runs_under_sudo_when_asked_to() {
+    local home other
+    home=$(test_home "under-sudo-allowed")
+    OFFLINE_UID=0 run_install_offline "$home" SUDO_USER=alice SPICE_INSTALL_ALLOW_SUDO=1 || { cat "$home.log"; return 1; }
+    installed_cli "$home" || return 1
+    other=$(test_home "under-sudo-system-dir")
+    OFFLINE_UID=0 run_install_offline "$other" SUDO_USER=alice SPICE_CLI_INSTALL_DIR="$other/opt/bin" || { cat "$other.log"; return 1; }
+    [[ -x "$other/opt/bin/spice" ]]
+}
+
+# A shell under Rosetta 2 reports x86_64; the native Apple silicon build runs there.
+test_install_sh_installs_the_native_build_under_rosetta() {
+    local home
+    home=$(test_home "rosetta")
+    OFFLINE_UNAME_S=Darwin OFFLINE_UNAME_M=x86_64 OFFLINE_ROSETTA=1 \
+        run_installer_offline "$INSTALL_SCRIPT" spice spice_darwin_aarch64.tar.gz "$home" || { cat "$home.log"; return 1; }
+    installed_cli "$home" &&
+        log_has "$home" "This shell runs under Rosetta 2" &&
+        grep -qx "dl/releases/download/v0.0.0/spice_darwin_aarch64.tar.gz none" "$home.requests"
+}
+
+test_install_sh_refuses_an_intel_mac() {
+    local home
+    home=$(test_home "intel-mac")
+    if OFFLINE_UNAME_S=Darwin OFFLINE_UNAME_M=x86_64 OFFLINE_ROSETTA=0 \
+        run_installer_offline "$INSTALL_SCRIPT" spice spice_darwin_x86_64.tar.gz "$home"; then
+        cat "$home.log"
+        return 1
+    fi
+    ! installed_cli "$home" && log_has "$home" "darwin-x86_64 does not have a pre-built binary" && requests_are "$home"
+}
+
+# The Linux builds need glibc. On a musl system the installer says so before downloading.
+test_install_sh_refuses_a_musl_system() {
+    local home
+    home=$(test_home "musl")
+    if OFFLINE_UNAME_S=Linux OFFLINE_UNAME_M=x86_64 OFFLINE_LDD="musl libc (x86_64)" \
+        run_installer_offline "$INSTALL_SCRIPT" spice spice_linux_x86_64.tar.gz "$home"; then
+        cat "$home.log"
+        return 1
+    fi
+    ! installed_cli "$home" && log_has "$home" "this system uses musl libc" && requests_are "$home"
+}
+
+test_install_spiced_sh_refuses_a_musl_system() {
+    local home
+    home=$(test_home "spiced-musl")
+    if OFFLINE_UNAME_S=Linux OFFLINE_UNAME_M=x86_64 OFFLINE_LDD="musl libc (x86_64)" \
+        run_installer_offline "$INSTALL_SPICED_SCRIPT" spiced spiced_linux_x86_64.tar.gz "$home" SPICED_INSTALL_DIR="$home/bin"; then
+        cat "$home.log"
+        return 1
+    fi
+    [[ ! -e "$home/bin/spiced" ]] && log_has "$home" "this system uses musl libc" && requests_are "$home"
+}
+
+# =============================================================================
+# Replacing an Installed Binary
+# =============================================================================
+
+# Writes an executable at $1 that prints "$2".
+old_binary() {
+    mkdir -p "$(dirname "$1")"
+    printf '#!/bin/sh\necho "%s"\n' "$2" > "$1"
+    chmod +x "$1"
+}
+
+# A binary that cannot start here (another libc, an older glibc) is not installed, and the
+# installed one stays as it was, with no temporary file left beside it.
+test_install_sh_keeps_the_installed_spice_when_the_new_one_cannot_run() {
+    local home
+    home=$(test_home "broken-binary")
+    old_binary "$home/.spice/bin/spice" "spice 0.0.1"
+    if OFFLINE_BINARY=broken run_install_offline "$home"; then cat "$home.log"; return 1; fi
+    log_has "$home" "does not run on this system (exit status 127), so it was not installed" &&
+        log_has "$home" "error while loading shared libraries" &&
+        grep -qx 'echo "spice 0.0.1"' "$home/.spice/bin/spice" &&
+        [[ "$(ls -A "$home/.spice/bin")" == "spice" ]] &&
+        ! grep -qs "spice installer" "$home/.bash_profile" "$home/.bashrc" "$home/.profile"
+}
+
+test_install_sh_refuses_a_binary_reporting_another_version() {
+    local home
+    home=$(test_home "wrong-version")
+    if OFFLINE_BINARY=wrong-version run_install_offline "$home"; then cat "$home.log"; return 1; fi
+    ! installed_cli "$home" && log_has "$home" "The downloaded spice reports version 9.9.9, not 0.0.0"
+}
+
+test_install_spiced_sh_keeps_the_installed_spiced_when_the_new_one_cannot_run() {
+    local home
+    home=$(test_home "spiced-broken-binary")
+    old_binary "$home/bin/spiced" "spiced 0.0.1"
+    if OFFLINE_BINARY=broken run_install_spiced_offline "$home"; then cat "$home.log"; return 1; fi
+    log_has "$home" "does not run on this system (exit status 127), so it was not installed" &&
+        grep -qx 'echo "spiced 0.0.1"' "$home/bin/spiced" &&
+        [[ "$(ls -A "$home/bin")" == "spiced" ]]
+}
+
+test_install_spiced_sh_accepts_a_v_prefixed_version() {
+    local home
+    home=$(test_home "spiced-v-prefix")
+    OFFLINE_VERSION=v0.0.0 run_install_spiced_offline "$home" || { cat "$home.log"; return 1; }
+    [[ -x "$home/bin/spiced" ]]
+}
+
+# Runs installer $1 into home $2 while the binary at $3, a copy of sleep, is running, and passes
+# when the install succeeds and leaves the new binary at $3. Linux refuses to write a running
+# binary in place ("Text file busy"), so this needs the rename.
+upgrades_a_running_binary() {
+    local installer="$1" home="$2" binary="$3" pid rc=0
+    mkdir -p "$(dirname "$binary")"
+    cp "$(command -v sleep)" "$binary"
+    "$binary" 60 &
+    pid=$!
+    for _ in $(seq 1 50); do
+        [[ "$(readlink "/proc/$pid/exe" 2>/dev/null)" == "$binary" ]] && break
+        sleep 0.1
+    done
+    [[ "$(readlink "/proc/$pid/exe" 2>/dev/null)" == "$binary" ]] || { kill "$pid"; echo "the stand-in never started"; return 1; }
+    run_named_installer_offline "$installer" "$home" || rc=$?
+    kill -0 "$pid" 2>/dev/null || { echo "the running binary was stopped"; rc=1; }
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    [[ $rc -eq 0 ]] || { cat "$home.log"; return 1; }
+    grep -q "CLI version: v0.0.0" "$binary" || { echo "$binary was not replaced"; cat "$home.log"; return 1; }
+}
+
+test_install_sh_upgrades_a_running_spice() {
+    local home
+    home=$(test_home "running-spice")
+    upgrades_a_running_binary install.sh "$home" "$home/.spice/bin/spice"
+}
+
+test_install_spiced_sh_upgrades_a_running_spiced() {
+    local home
+    home=$(test_home "running-spiced")
+    upgrades_a_running_binary install-spiced.sh "$home" "$home/bin/spiced"
+}
+
+# =============================================================================
+# install.sh: PATH Setup
+# =============================================================================
+
+PATH_BEGIN="# >>> spice installer >>>"
+
+# Fails, naming the entry, unless directory $1 holds no entries but those named after it,
+# dotfiles included.
+holds_only() {
+    local dir="$1" entry name
+    shift
+    for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        name="${entry##*/}"
+        case " $* " in
+            *" $name "*) ;;
+            *) echo "unexpected in $dir: $name"; return 1 ;;
+        esac
+    done
+}
+
+# What `command -v spice` finds in a new shell ($2, e.g. "bash -lc") for home $1.
+spice_in_new_shell() {
+    local home="$1" shell="$2"
+    env -i HOME="$home" ${ZDOTDIR:+ZDOTDIR="$ZDOTDIR"} PATH=/usr/bin:/bin $shell 'command -v spice' 2>/dev/null < /dev/null | tail -n 1 | tr -d '\r'
+}
+
+# The files bash reads: on Linux .bashrc, for the interactive shells terminals start, and the
+# login file (here .profile); on macOS, where terminals start login shells, .bash_profile.
+test_install_sh_puts_spice_on_path_for_new_bash_shells() {
+    local home found
+    home=$(test_home "path-bash")
+    run_install_offline "$home" || { cat "$home.log"; return 1; }
+    if [[ "$(host_os)" == linux ]]; then
+        grep -qxF "$PATH_BEGIN" "$home/.bashrc" && grep -qxF "$PATH_BEGIN" "$home/.profile" && [[ ! -e "$home/.bash_profile" ]] ||
+            { ls -A "$home"; return 1; }
+        found=$(spice_in_new_shell "$home" "bash -ic")
+        [[ "$found" == "$home/.spice/bin/spice" ]] || { echo "interactive bash found '$found'"; return 1; }
+    else
+        grep -qxF "$PATH_BEGIN" "$home/.bash_profile" && [[ ! -e "$home/.bashrc" && ! -e "$home/.profile" ]] ||
+            { ls -A "$home"; return 1; }
+    fi
+    found=$(spice_in_new_shell "$home" "bash -lc")
+    [[ "$found" == "$home/.spice/bin/spice" ]] || { echo "login bash found '$found'"; return 1; }
+    log_has "$home" "Added $home/.spice/bin to PATH in" && log_has "$home" "export PATH=\"\$HOME/.spice/bin:\$PATH\""
+}
+
+# bash reads the first of .bash_profile, .bash_login and .profile; a new .bash_profile would hide
+# an existing .profile.
+test_install_sh_does_not_hide_an_existing_profile() {
+    local home
+    home=$(test_home "path-existing-profile")
+    echo "# mine" > "$home/.profile"
+    run_install_offline "$home" || { cat "$home.log"; return 1; }
+    [[ ! -e "$home/.bash_profile" ]] && grep -qxF "# mine" "$home/.profile" && grep -qxF "$PATH_BEGIN" "$home/.profile"
+}
+
+test_install_sh_honors_zdotdir() {
+    local home file found
+    home=$(test_home "path-zdotdir")
+    run_install_offline "$home" SHELL=/bin/zsh ZDOTDIR="$home/zdot" || { cat "$home.log"; return 1; }
+    if [[ "$(host_os)" == linux ]]; then file="$home/zdot/.zshrc"; else file="$home/zdot/.zprofile"; fi
+    grep -qxF "$PATH_BEGIN" "$file" && [[ ! -e "$home/.zshrc" && ! -e "$home/.zprofile" ]] || { ls -AR "$home"; return 1; }
+    if command -v zsh > /dev/null 2>&1; then
+        found=$(ZDOTDIR="$home/zdot" spice_in_new_shell "$home" "zsh -lic")
+        [[ "$found" == "$home/.spice/bin/spice" ]] || { echo "zsh found '$found'"; return 1; }
+    fi
+}
+
+test_install_sh_writes_a_fish_conf_d_file() {
+    local home file found
+    home=$(test_home "path-fish")
+    run_install_offline "$home" SHELL=/usr/bin/fish || { cat "$home.log"; return 1; }
+    file="$home/.config/fish/conf.d/spice.fish"
+    grep -qF "set -gx PATH \"\$HOME/.spice/bin\" \$PATH" "$file" || { cat "$file"; return 1; }
+    if command -v fish > /dev/null 2>&1; then
+        found=$(spice_in_new_shell "$home" "fish -c")
+        [[ "$found" == "$home/.spice/bin/spice" ]] || { echo "fish found '$found'"; return 1; }
+    fi
+}
+
+test_install_sh_writes_csh_setenv() {
+    local home found
+    home=$(test_home "path-csh")
+    run_install_offline "$home" SHELL=/bin/tcsh || { cat "$home.log"; return 1; }
+    grep -qxF "setenv PATH \"\$HOME/.spice/bin:\${PATH}\"" "$home/.cshrc" || { cat "$home/.cshrc"; return 1; }
+    if command -v tcsh > /dev/null 2>&1; then
+        found=$(env -i HOME="$home" PATH=/usr/bin:/bin tcsh -c 'which spice' 2>/dev/null < /dev/null)
+        [[ "$found" == "$home/.spice/bin/spice" ]] || { echo "tcsh found '$found'"; return 1; }
+    fi
+}
+
+# Running the installer again finds its block instead of adding another.
+test_install_sh_path_setup_is_idempotent() {
+    local home file
+    home=$(test_home "path-twice")
+    run_install_offline "$home" || { cat "$home.log"; return 1; }
+    run_install_offline "$home" || { cat "$home.log"; return 1; }
+    for file in "$home/.bashrc" "$home/.profile" "$home/.bash_profile"; do
+        [[ -e "$file" ]] || continue
+        [[ "$(grep -cxF "$PATH_BEGIN" "$file")" == 1 ]] || { echo "$file:"; cat "$file"; return 1; }
+    done
+    log_has "$home" "already puts $home/.spice/bin on PATH for new terminals"
+}
+
+test_install_sh_puts_a_custom_dir_on_path() {
+    local home found
+    home=$(test_home "path-custom")
+    run_install_offline "$home" SPICE_CLI_INSTALL_DIR="$home/tools/bin" || { cat "$home.log"; return 1; }
+    [[ -x "$home/tools/bin/spice" && ! -e "$home/.spice" ]] || return 1
+    found=$(spice_in_new_shell "$home" "bash -lc")
+    [[ "$found" == "$home/tools/bin/spice" ]] || { echo "login bash found '$found'"; return 1; }
+    grep -qF "\"\$HOME/tools/bin:\${PATH}\"" "$home/.profile" "$home/.bash_profile" 2>/dev/null
+}
+
+test_install_sh_puts_a_dir_outside_home_on_path() {
+    local home dir found
+    home=$(test_home "path-outside-home")
+    dir="$TEST_TMP_DIR/outside-home-bin"
+    run_install_offline "$home" SPICE_CLI_INSTALL_DIR="$dir" || { cat "$home.log"; return 1; }
+    found=$(spice_in_new_shell "$home" "bash -lc")
+    [[ "$found" == "$dir/spice" ]] || { echo "login bash found '$found'"; return 1; }
+}
+
+test_install_sh_leaves_profiles_alone_when_the_dir_is_on_path() {
+    local home
+    home=$(test_home "path-already")
+    run_install_offline "$home" PATH="$home/.spice/bin:$home.stubs:$SYSTEM_BIN" || { cat "$home.log"; return 1; }
+    installed_cli "$home" && holds_only "$home" .spice &&
+        log_has "$home" "$home/.spice/bin is on your PATH, so 'spice' runs the new install."
+}
+
+test_install_sh_no_modify_path_leaves_profiles_alone() {
+    local home
+    home=$(test_home "path-no-modify")
+    run_install_offline "$home" SPICE_INSTALL_NO_MODIFY_PATH=1 || { cat "$home.log"; return 1; }
+    installed_cli "$home" && holds_only "$home" .spice &&
+        log_has "$home" "Left your shell profiles unchanged, because SPICE_INSTALL_NO_MODIFY_PATH=1 is set." &&
+        log_has "$home" "export PATH=\"\$HOME/.spice/bin:\$PATH\""
+}
+
+# A directory whose name a profile line would have to escape is left to the user.
+test_install_sh_leaves_an_unusual_dir_to_the_user() {
+    local home
+    home=$(test_home "path-unusual")
+    run_install_offline "$home" SPICE_CLI_INSTALL_DIR="$home/we\$ird/bin" || { cat "$home.log"; return 1; }
+    [[ -x "$home/we\$ird/bin/spice" ]] && holds_only "$home" "we\$ird" &&
+        log_has "$home" "to PATH in your shell profile"
+}
+
+# The profile bash reads first on this host, for a home without one.
+first_bash_profile() {
+    if [[ "$(host_os)" == linux ]]; then echo "$1/.bashrc"; else echo "$1/.bash_profile"; fi
+}
+
+# The line an installer without the marked block wrote counts as the setup.
+test_install_sh_keeps_a_legacy_path_line() {
+    local home file
+    home=$(test_home "path-legacy")
+    file=$(first_bash_profile "$home")
+    printf '%s\n' "export PATH=\"\$HOME/.spice/bin:\$PATH\"" > "$file"
+    run_install_offline "$home" || { cat "$home.log"; return 1; }
+    ! grep -qxF "$PATH_BEGIN" "$file" || { cat "$file"; return 1; }
+}
+
+# A block whose line is out of date is rewritten in place: a symlinked profile stays a symlink.
+test_install_sh_updates_its_block_through_a_symlink() {
+    local home file
+    home=$(test_home "path-symlink")
+    file=$(first_bash_profile "$home")
+    mkdir -p "$home/dotfiles"
+    printf '%s\n' "# mine" "$PATH_BEGIN" "export PATH=\"/old/bin:\$PATH\"" "# <<< spice installer <<<" "# after" > "$home/dotfiles/profile"
+    ln -s "$home/dotfiles/profile" "$file"
+    run_install_offline "$home" || { cat "$home.log"; return 1; }
+    [[ -L "$file" ]] || { echo "$file is no longer a symlink"; return 1; }
+    grep -qxF "# mine" "$home/dotfiles/profile" && grep -qxF "# after" "$home/dotfiles/profile" &&
+        ! grep -qF "/old/bin" "$home/dotfiles/profile" &&
+        grep -qF "*\":\$HOME/.spice/bin:\"*" "$home/dotfiles/profile" &&
+        [[ "$(grep -cxF "$PATH_BEGIN" "$home/dotfiles/profile")" == 1 ]] || { cat "$home/dotfiles/profile"; return 1; }
+}
+
+test_install_sh_leaves_an_unterminated_block_alone() {
+    local home file before
+    home=$(test_home "path-unterminated")
+    file=$(first_bash_profile "$home")
+    printf '%s\n' "$PATH_BEGIN" "# the rest of my profile" > "$file"
+    before=$(cat "$file")
+    run_install_offline "$home" || { cat "$home.log"; return 1; }
+    [[ "$(cat "$file")" == "$before" ]] && log_has "$home" "line with no '# <<< spice installer <<<' line after it"
+}
+
+test_install_sh_warns_about_another_spice_on_path() {
+    local home
+    home=$(test_home "other-spice")
+    old_binary "$home/brew/bin/spice" "spice 0.0.1"
+    run_install_offline "$home" PATH="$home/brew/bin:$home.stubs:$SYSTEM_BIN" || { cat "$home.log"; return 1; }
+    log_has "$home" "Another spice is installed at $home/brew/bin/spice. New terminals run $home/.spice/bin/spice"
+}
+
+test_install_sh_prints_no_color_codes_off_a_terminal() {
+    local home
+    home=$(test_home "no-color")
+    OFFLINE_SUMS=none OFFLINE_DIGEST=null run_install_offline "$home" SPICE_INSTALL_ALLOW_UNVERIFIED=1 || { cat "$home.log"; return 1; }
+    log_has "$home" "Warning:" && log_lacks "$home" $'\033['
+}
+
+# =============================================================================
+# install.sh: Spice Skills for AI Coding Agents
+# =============================================================================
+
+# Fails, printing the log, unless the agent commands home $1 ran are exactly the lines that follow.
+agents_ran() {
+    local home="$1"
+    shift
+    local expected=""
+    [[ $# -eq 0 ]] || expected=$(printf '%s\n' "$@")
+    [[ "$(cat "$home.agents")" == "$expected" ]] && return 0
+    echo "agent commands of $(basename "$home"):"
+    diff <(echo "$expected") "$home.agents"
+    cat "$home.log"
+    return 1
+}
+
+test_skills_are_never_offered_without_a_terminal() {
+    local home
+    home=$(test_home "skills-no-terminal")
+    OFFLINE_AGENTS="claude codex" run_install_offline "$home" || { cat "$home.log"; return 1; }
+    installed_cli "$home" && agents_ran "$home" &&
+        log_lacks "$home" "Install the Spice skills plugin for:" &&
+        log_has "$home" "To add the Spice skills to your AI coding agents, see https://github.com/spiceai/skills#installation"
+}
+
+test_skills_are_not_offered_when_no_agent_is_installed() {
+    local home
+    home=$(test_home "skills-no-agent")
+    OFFLINE_TTY_INPUT=$'a\n' run_install_offline "$home" || { cat "$home.log"; return 1; }
+    installed_cli "$home" && log_lacks "$home" "Spice skills"
+}
+
+test_skills_install_for_the_chosen_agent() {
+    local home
+    home=$(test_home "skills-one")
+    OFFLINE_AGENTS="claude codex grok" OFFLINE_TTY_INPUT=$'1\n' run_install_offline "$home" || { cat "$home.log"; return 1; }
+    log_has "$home" "1) Claude Code" && log_has "$home" "2) Codex" && log_has "$home" "3) Grok Build" &&
+        agents_ran "$home" "claude plugin marketplace add spiceai/skills" "claude plugin install spiceai@spiceai" &&
+        log_has "$home" "Installed the Spice skills plugin for Claude Code."
+}
+
+test_skills_install_for_every_agent() {
+    local home
+    home=$(test_home "skills-all")
+    OFFLINE_AGENTS="claude codex copilot grok" OFFLINE_TTY_INPUT=$'a\n' run_install_offline "$home" || { cat "$home.log"; return 1; }
+    agents_ran "$home" \
+        "claude plugin marketplace add spiceai/skills" "claude plugin install spiceai@spiceai" \
+        "codex plugin marketplace add spiceai/skills" "codex plugin add spiceai@spiceai" \
+        "copilot plugin marketplace add spiceai/skills" "copilot plugin install spiceai@spiceai" \
+        "grok plugin install spiceai/skills --trust"
+}
+
+test_skills_install_for_several_agents() {
+    local home
+    home=$(test_home "skills-several")
+    OFFLINE_AGENTS="claude codex grok" OFFLINE_TTY_INPUT=$'3, 2\n' run_install_offline "$home" || { cat "$home.log"; return 1; }
+    agents_ran "$home" "grok plugin install spiceai/skills --trust" \
+        "codex plugin marketplace add spiceai/skills" "codex plugin add spiceai@spiceai"
+}
+
+test_skills_default_to_none() {
+    local home
+    home=$(test_home "skills-none")
+    OFFLINE_AGENTS="claude codex" OFFLINE_TTY_INPUT=$'\n' run_install_offline "$home" || { cat "$home.log"; return 1; }
+    installed_cli "$home" && agents_ran "$home" && log_has "$home" "To add the Spice skills later"
+}
+
+test_skills_ask_again_after_an_invalid_answer() {
+    local home
+    home=$(test_home "skills-invalid")
+    OFFLINE_AGENTS="claude codex" OFFLINE_TTY_INPUT=$'9\n2\n' run_install_offline "$home" || { cat "$home.log"; return 1; }
+    log_has "$home" "Answer with numbers from 1 to 2, a for all, or n for none." &&
+        agents_ran "$home" "codex plugin marketplace add spiceai/skills" "codex plugin add spiceai@spiceai"
+}
+
+# Automation that has a terminal says so with CI or NONINTERACTIVE.
+test_skills_are_not_offered_in_ci_or_noninteractive() {
+    local home var
+    for var in CI=true NONINTERACTIVE=1; do
+        home=$(test_home "skills-${var%%=*}")
+        OFFLINE_AGENTS="claude codex" OFFLINE_TTY_INPUT=$'a\n' run_install_offline "$home" "$var" || { cat "$home.log"; return 1; }
+        installed_cli "$home" || return 1
+        agents_ran "$home" || return 1
+        log_lacks "$home" "Install the Spice skills plugin for:" || return 1
+    done
+}
+
+# An agent that fails to install the plugin does not fail the install of spice.
+test_skills_failure_does_not_fail_the_install() {
+    local home
+    home=$(test_home "skills-fail")
+    OFFLINE_AGENTS="claude codex" OFFLINE_AGENT_FAIL=claude OFFLINE_TTY_INPUT=$'a\n' run_install_offline "$home" ||
+        { cat "$home.log"; return 1; }
+    installed_cli "$home" &&
+        log_has "$home" "Could not install the Spice skills plugin for Claude Code (exit status 1). spice itself is installed." &&
+        log_has "$home" "boom: network unreachable" &&
+        log_has "$home" "Installed the Spice skills plugin for Codex."
+}
+
+test_skills_already_installed_is_not_a_failure() {
+    local home
+    home=$(test_home "skills-already")
+    OFFLINE_AGENTS="grok" OFFLINE_AGENT_ALREADY=grok OFFLINE_TTY_INPUT=$'1\n' run_install_offline "$home" || { cat "$home.log"; return 1; }
+    log_has "$home" "The Spice skills plugin is already installed for Grok Build." && log_lacks "$home" "Could not install"
 }
 
 # Runs sha256Of from install.sh with only the given tools on PATH.
@@ -1982,9 +2600,10 @@ run_all_tests() {
             run_test "$installer ($client): installs without a token, sending no Authorization header" "test_installs_without_a_token $installer $client"
             run_test "$installer ($client): sends GITHUB_TOKEN with every API request" "test_sends_the_token_to_the_api $installer $client"
             run_test "$installer ($client): stops when the latest release lookup is rate limited" "test_stops_when_the_latest_release_lookup_is_rate_limited $installer $client"
+            run_test "$installer ($client): falls back to the API for the latest release" "test_falls_back_to_the_api_for_the_latest_release $installer $client"
             run_test "$installer ($client): stops when the checksum lookup is rate limited" "test_stops_when_the_checksum_lookup_is_rate_limited $installer $client"
         done
-        run_test "$installer: verifies SHA256SUMS with one API request" "test_verifies_sha256sums_with_one_api_request $installer"
+        run_test "$installer: verifies SHA256SUMS with no API request" "test_verifies_sha256sums_with_no_api_request $installer"
         run_test "$installer: opt-out installs when the checksum lookup is rate limited" "test_opt_out_installs_when_the_checksum_lookup_is_rate_limited $installer"
         run_test "$installer: installs without gh, skipping the attestation check" "test_installs_without_gh $installer"
     done
@@ -1999,6 +2618,65 @@ run_all_tests() {
     run_test "install-spiced.sh: runAsRoot keeps its arguments literal" test_install_spiced_sh_run_as_root_keeps_arguments_literal
     run_test "install-nightly.sh: runAsRoot keeps its arguments literal" test_install_nightly_sh_run_as_root_keeps_arguments_literal
     run_test "installers never call eval" test_installers_do_not_eval
+    echo ""
+
+    # install.sh: shells, versions, platforms and privileges
+    echo "--- Shells, Versions, Platforms and Privileges ---"
+    run_test "install.sh runs under POSIX sh" test_install_sh_runs_under_posix_sh
+    run_test "install.sh accepts a v-prefixed version" test_install_sh_accepts_a_v_prefixed_version
+    run_test "install.sh rejects an invalid version before any request" test_install_sh_rejects_an_invalid_version_before_any_request
+    run_test "install.sh prints its help" test_install_sh_prints_its_help
+    run_test "install.sh refuses to run under sudo" test_install_sh_refuses_to_run_under_sudo
+    run_test "install.sh runs under sudo when asked to" test_install_sh_runs_under_sudo_when_asked_to
+    run_test "install.sh installs the native build under Rosetta 2" test_install_sh_installs_the_native_build_under_rosetta
+    run_test "install.sh refuses an Intel Mac" test_install_sh_refuses_an_intel_mac
+    run_test "install.sh refuses a musl system" test_install_sh_refuses_a_musl_system
+    run_test "install-spiced.sh refuses a musl system" test_install_spiced_sh_refuses_a_musl_system
+    run_test "install-spiced.sh accepts a v-prefixed version" test_install_spiced_sh_accepts_a_v_prefixed_version
+    echo ""
+
+    echo "--- Replacing an Installed Binary ---"
+    run_test "install.sh keeps the installed spice when the new one cannot run" test_install_sh_keeps_the_installed_spice_when_the_new_one_cannot_run
+    run_test "install.sh refuses a binary reporting another version" test_install_sh_refuses_a_binary_reporting_another_version
+    run_test "install-spiced.sh keeps the installed spiced when the new one cannot run" test_install_spiced_sh_keeps_the_installed_spiced_when_the_new_one_cannot_run
+    if [[ "$(host_os)" == linux ]]; then
+        run_test "install.sh upgrades a running spice" test_install_sh_upgrades_a_running_spice
+        run_test "install-spiced.sh upgrades a running spiced" test_install_spiced_sh_upgrades_a_running_spiced
+    else
+        skip_test "Upgrading a running binary" "only Linux refuses to write a running binary in place"
+    fi
+    echo ""
+
+    echo "--- PATH Setup ---"
+    run_test "install.sh puts spice on PATH for new bash shells" test_install_sh_puts_spice_on_path_for_new_bash_shells
+    run_test "install.sh does not hide an existing .profile" test_install_sh_does_not_hide_an_existing_profile
+    run_test "install.sh honors ZDOTDIR" test_install_sh_honors_zdotdir
+    run_test "install.sh writes a fish conf.d file" test_install_sh_writes_a_fish_conf_d_file
+    run_test "install.sh writes csh setenv" test_install_sh_writes_csh_setenv
+    run_test "install.sh PATH setup is idempotent" test_install_sh_path_setup_is_idempotent
+    run_test "install.sh puts a custom dir on PATH" test_install_sh_puts_a_custom_dir_on_path
+    run_test "install.sh puts a dir outside HOME on PATH" test_install_sh_puts_a_dir_outside_home_on_path
+    run_test "install.sh leaves profiles alone when the dir is on PATH" test_install_sh_leaves_profiles_alone_when_the_dir_is_on_path
+    run_test "install.sh SPICE_INSTALL_NO_MODIFY_PATH leaves profiles alone" test_install_sh_no_modify_path_leaves_profiles_alone
+    run_test "install.sh leaves an unusual dir to the user" test_install_sh_leaves_an_unusual_dir_to_the_user
+    run_test "install.sh keeps a legacy PATH line" test_install_sh_keeps_a_legacy_path_line
+    run_test "install.sh updates its block through a symlink" test_install_sh_updates_its_block_through_a_symlink
+    run_test "install.sh leaves an unterminated block alone" test_install_sh_leaves_an_unterminated_block_alone
+    run_test "install.sh warns about another spice on PATH" test_install_sh_warns_about_another_spice_on_path
+    run_test "install.sh prints no color codes off a terminal" test_install_sh_prints_no_color_codes_off_a_terminal
+    echo ""
+
+    echo "--- Spice Skills for AI Coding Agents ---"
+    run_test "skills are never offered without a terminal" test_skills_are_never_offered_without_a_terminal
+    run_test "skills are not offered when no agent is installed" test_skills_are_not_offered_when_no_agent_is_installed
+    run_test "skills install for the chosen agent" test_skills_install_for_the_chosen_agent
+    run_test "skills install for every agent" test_skills_install_for_every_agent
+    run_test "skills install for several agents" test_skills_install_for_several_agents
+    run_test "skills default to none" test_skills_default_to_none
+    run_test "skills ask again after an invalid answer" test_skills_ask_again_after_an_invalid_answer
+    run_test "skills are not offered in CI or with NONINTERACTIVE" test_skills_are_not_offered_in_ci_or_noninteractive
+    run_test "a skills failure does not fail the install" test_skills_failure_does_not_fail_the_install
+    run_test "skills already installed is not a failure" test_skills_already_installed_is_not_a_failure
     echo ""
 
     # Error Handling

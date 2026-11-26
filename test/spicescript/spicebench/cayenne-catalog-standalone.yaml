@@ -1,4 +1,5 @@
 name: cayenne-catalog-standalone
+duration: 1s
 description: >
   A Cayenne catalog outside a cluster is refused: the catalog reports Error
   naming distributed mode, and its tables cannot be created or read.

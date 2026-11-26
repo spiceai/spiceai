@@ -1,4 +1,5 @@
 name: timezone-rules
+duration: 1s
 description: >
   Named time zone conversions follow the IANA tz database Spice bundles. Each
   zone changed its rules after tzdata 2025b; the expected local times are the
