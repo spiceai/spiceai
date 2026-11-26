@@ -149,6 +149,13 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$RELEASE_BRANCH" =~ ^release/[0-9]+\.[0-9]+$ ]] || { echo "::error::'$RELEASE_BRANCH' is not a release/<major>.<minor> branch."; exit 1; }
+          # The leg runs the release branch's own copy of this workflow, so that copy must offer
+          # `schedule: release`; otherwise GitHub refuses the dispatch with only an HTTP 422.
+          definition="$(gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows/testoperator_dispatch.yml?ref=$RELEASE_BRANCH" -H 'Accept: application/vnd.github.raw')"
+          if ! grep -qE "^[[:space:]]+- '?release'?[[:space:]]*$" <<<"$definition"; then
+            echo "::error::$RELEASE_BRANCH's testoperator_dispatch.yml has no release leg (\`schedule: release\`) yet, so its daily benchmarks cannot run on that branch. Merge the change that adds it to $RELEASE_BRANCH."
+            exit 1
+          fi
           gh workflow run testoperator_dispatch.yml --repo "$GITHUB_REPOSITORY" --ref "$RELEASE_BRANCH" -f schedule=release
           echo "Started testoperator_dispatch.yml on $RELEASE_BRANCH with schedule: release."
 

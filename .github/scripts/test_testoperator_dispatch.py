@@ -113,6 +113,41 @@ class TestoperatorDispatchTest(unittest.TestCase):
         self.assertIn('--ref "$RELEASE_BRANCH" -f schedule=release', run)
         self.assertIn("^release/[0-9]+\\.[0-9]+$", run)
 
+    def start_leg(self, definition):
+        """Run the leg's step with a stub gh that serves `definition` as the branch's copy."""
+        run = self.jobs["dispatch-release"]["steps"][0]["run"]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "definition.yml").write_text(definition)
+            calls = tmp / "calls"
+            (tmp / "gh").write_text(
+                "#!/usr/bin/env bash\n"
+                f'echo "$*" >> "{calls}"\n'
+                f'if [ "$1" = api ]; then cat "{tmp / "definition.yml"}"; fi\n'
+            )
+            (tmp / "gh").chmod(0o755)
+            env = {
+                **os.environ,
+                "PATH": f"{tmp}:{os.environ['PATH']}",
+                "RELEASE_BRANCH": "release/2.4",
+                "GITHUB_REPOSITORY": "spiceai/spiceai",
+                "GH_TOKEN": "x",
+            }
+            proc = subprocess.run(["bash", "-e", "-c", run], env=env, capture_output=True, text=True)
+            return proc, calls.read_text().splitlines() if calls.exists() else []
+
+    def test_the_leg_starts_only_on_a_branch_whose_copy_has_it(self):
+        own = (Path(__file__).resolve().parents[1] / "workflows" / "testoperator_dispatch.yml").read_text()
+        proc, calls = self.start_leg(own)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("workflow run testoperator_dispatch.yml --repo spiceai/spiceai --ref release/2.4 -f schedule=release", calls)
+        without = own.replace("          - 'release'\n", "")
+        self.assertNotEqual(without, own)
+        proc, calls = self.start_leg(without)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("has no release leg", proc.stdout)
+        self.assertFalse(any(c.startswith("workflow run") for c in calls), calls)
+
     def test_a_scheduled_run_dispatches_no_manual_suite(self):
         condition = self.jobs["dispatch-input"]["if"]
         for schedule in ("daily", "weekly", "release"):
