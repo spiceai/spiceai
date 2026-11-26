@@ -150,6 +150,7 @@ pub mod app_context_extension;
 pub mod builder;
 pub(crate) mod caching_retention;
 mod change_generations;
+pub mod federated_template;
 use change_generations::{
     ChangeGenerations, GenerationOwner, GenerationPermit, PreparedGeneration,
 };
@@ -1466,6 +1467,9 @@ pub struct DataFusion {
     /// resolved a definition the clear retired would outlive it. A write holds the read
     /// guard across its check and insert, so a clear cannot count in between.
     plans_generation: TokioRwLock<u64>,
+    /// Physical plans of fully federated queries, one per query shape, bound to
+    /// each request's literal values (see [`federated_template`]).
+    federated_templates: federated_template::FederatedTemplates,
     /// First 10 distinct SQL results-cache plan shapes, replayed after the
     /// first full/append refresh until the cache is full. No-op unless
     /// `runtime.caching.sql_results.warmup` is `on_first_refresh`.
@@ -7246,10 +7250,6 @@ impl DataFusion {
             None
         };
 
-        let generation = session
-            .config()
-            .get_extension::<PlansGeneration>()
-            .map(|generation| generation.0);
         let (plan, placeholders) = self.create_logical_plan(session, sql, parameters).await?;
 
         // A plan is not cached when it holds substituted table-function parameters,
@@ -7262,13 +7262,43 @@ impl DataFusion {
             && !matches!(plan, LogicalPlan::Ddl(_))
         {
             tracing::trace!("caching plan for {sql}");
-            let current = self.plans_generation.read().await;
-            if generation == Some(*current) {
-                cache.put_raw_key(&cache_key.as_u64(), plan.clone()).await;
-            }
+            self.put_plan_planned_in(cache.as_ref(), session, cache_key, &plan)
+                .await;
         }
 
         Ok(plan)
+    }
+
+    /// Stores `plan`, planned against `session`, in the plans cache under `key`,
+    /// unless the cache has been cleared since `session` was copied: such a plan
+    /// may hold a definition the clear retired (see `plans_generation`).
+    pub(crate) async fn cache_plan_planned_in(
+        &self,
+        session: &SessionState,
+        key: &RawCacheKey,
+        plan: &LogicalPlan,
+    ) {
+        if let Some(cache) = self.plans_cache_provider() {
+            self.put_plan_planned_in(cache.as_ref(), session, key, plan)
+                .await;
+        }
+    }
+
+    async fn put_plan_planned_in(
+        &self,
+        cache: &(dyn TabledCacheProvider<LogicalPlan> + Send + Sync),
+        session: &SessionState,
+        key: &RawCacheKey,
+        plan: &LogicalPlan,
+    ) {
+        let generation = session
+            .config()
+            .get_extension::<PlansGeneration>()
+            .map(|generation| generation.0);
+        let current = self.plans_generation.read().await;
+        if generation == Some(*current) {
+            cache.put_raw_key(&key.as_u64(), plan.clone()).await;
+        }
     }
 
     /// Route SQL through the planner, which intercepts DDL extensions and
@@ -7334,6 +7364,7 @@ impl DataFusion {
                 .config_mut()
                 .set_extension(Arc::new(PlansGeneration(*generation)));
         }
+        self.federated_templates.clear();
         if let Some(cache_provider) = self.plans_cache_provider() {
             cache_provider.invalidate_all().await;
         }
