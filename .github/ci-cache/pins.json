@@ -42,5 +42,12 @@
       "aarch64-apple-darwin": "63752a1919a3a4793173ec70f8f212621a7ce38ba6a246095984482f4de20f9f",
       "x86_64-apple-darwin": "bc107f1fb0228de7fa32413c89c1b305cea9cd256e94b01150cd054128145429"
     }
+  },
+  "mc": {
+    "version": "RELEASE.2025-08-13T08-35-41Z",
+    "url": "https://public-data.spiceai.org/mc.{target}.{version}",
+    "sha256": {
+      "linux-amd64": "01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891"
+    }
   }
 }

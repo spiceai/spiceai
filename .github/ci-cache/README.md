@@ -66,6 +66,28 @@ download the same file with no bound.
   check it against a download. `check_ci_cache_pins.py` fails a host `setup-rust` maps
   that has no pin.
 
+### Tools fetched through `fetch_pinned.sh`
+
+The tools and files below are downloaded by name with
+`bash .github/scripts/fetch_pinned.sh <name> <dest> [<target>]`, which reads the entry's URL
+and SHA-256 from `pins.json` and hands them to `cached_fetch.sh`. An entry pins one file
+(`url`, `sha256`), or one release of a tool for each build of it (`version`, a `url` with
+`{version}` and `{target}`, and a `sha256` per target). A name or target without a pin fails
+before anything is downloaded. `check_ci_cache_pins.py` keeps each entry well formed, and
+requires every file in its `FETCHED_PINS` table to fetch the entry this way and a pin for
+every target that file can ask for, read from the `case` arms that set it
+(`x86_64) target=linux-amd64 ;;`). A PowerShell step, which cannot run the script, reads the
+entry itself as `(Get-Content … | ConvertFrom-Json).'<name>'`, names its target as
+`$target = '<target>'`, and checks the download with `Get-FileHash` before using it.
+
+- **`mc`**: the MinIO client, for `setup-minio` and `upload-to-minio` on Linux x86_64.
+  MinIO no longer serves mc (dl.min.io answers 410 for every release and checksum), so the
+  source is the copy on `public-data.spiceai.org`, and the SHA-256 is the one MinIO's own
+  Homebrew tap lists for that release (`mc.rb` in `minio/homebrew-stable`, commit
+  `e17bb437a50742ecd571b5ce0c1c72e05baa1487`); the mirror's file matches it. `setup-minio`'s
+  macOS (Homebrew) and Windows (dl.min.io) steps are unchanged: no source serves a pinnable
+  build for either any more, and no job runs the action there.
+
 ## How the cache is filled
 
 By the jobs that use it. When the bucket answers that it lacks a file (404) or holds the

@@ -7,6 +7,10 @@ a toolchain bump that forgets the pin would lose the cache silently; this check 
 It also requires a rustup-init pin for every host setup-rust maps: setup-rust installs
 rustup only from that pin, so a host without one fails wherever rustup is missing, and on
 a self-hosted Mac, whose jobs always install their own, every time.
+
+And for every entry the actions and workflows download through fetch_pinned.sh
+(FETCHED_PINS), it requires each file that downloads it to do so through that script, and
+a pin for every target the file can ask for, read from its `case` arms.
 """
 
 import json
@@ -34,6 +38,25 @@ ACTION_TARGET = re.compile(r"^\s*[A-Za-z]+-[A-Za-z0-9_]+\)\s*target=([A-Za-z0-9_
 # hosts it installs rustup for, from the rustup-init pinned for each.
 SETUP_RUST_HOST = re.compile(r"^\s*[A-Za-z]+-[A-Za-z0-9_]+\)\s*host_triple=([A-Za-z0-9_.-]+)\s*;;", re.M)
 RUSTUP_ARCHIVE = "https://static.rust-lang.org/rustup/archive/"
+
+# The pins.json entries that actions and workflows download through
+# .github/scripts/fetch_pinned.sh, and the files that download each. Every file listed must
+# fetch its entry that way, and every target it can ask for must be pinned: a target without
+# a pin fails the job that asks for it, on the platform that asks, and nowhere else.
+FETCHED_PINS = {
+    "mc": (".github/actions/setup-minio/action.yml", ".github/actions/upload-to-minio/action.yml"),
+}
+# A call in a shell script: `fetch_pinned.sh" NAME DEST [TARGET]`, with TARGET a literal or a
+# variable such as "$target".
+FETCH_CALL = re.compile(
+    r"""fetch_pinned\.sh["']?[ \t]+([A-Za-z0-9_.-]+)[ \t]+(?:"[^"\n]*"|'[^'\n]*'|[^\s;|&)]+)"""
+    r"""(?:[ \t]+(?:"([^"\n]*)"|'([^'\n]*)'|([^\s;|&)#]+)))?"""
+)
+# A PowerShell step reads the entry itself, as `(... | ConvertFrom-Json).'NAME'`, and names
+# the target it checks as `$target = 'TARGET'`.
+PWSH_PIN = re.compile(r"ConvertFrom-Json\s*\)\s*\.\s*'([A-Za-z0-9_.-]+)'")
+PWSH_TARGET = re.compile(r"\$target\s*=\s*'([^'\n]+)'")
+SHELL_VARIABLE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
 
 
 def main() -> int:
@@ -98,6 +121,9 @@ def main() -> int:
         errors.extend(rustup_init_errors(rustup))
         errors.extend(dockerfile_rustup_errors(rustup))
 
+    for name, users in FETCHED_PINS.items():
+        errors.extend(fetched_pin_errors(pins, name, users))
+
     for error in errors:
         print(f"::error file={PINS_PATH.relative_to(ROOT)}::{error}")
     if not errors:
@@ -105,7 +131,96 @@ def main() -> int:
             f"OK: {PINS_PATH.relative_to(ROOT)} pins Rust {', '.join(rust['toolchains'])}, "
             f"cargo-deny {deny['version']}, cargo-nextest {nextest['version']} and rustup-init {rustup['version']}."
         )
+        fetched = [f"{name} {pins[name]['version']}" if "version" in pins[name] else name for name in FETCHED_PINS]
+        print(f"OK: fetched through fetch_pinned.sh, and pinned for every target asked for: {', '.join(fetched)}.")
     return 1 if errors else 0
+
+
+def fetched_pin_errors(pins: dict, name: str, users: tuple) -> list:
+    """An entry fetch_pinned.sh downloads: well formed, and pinned for every target its users ask for."""
+    pin = pins.get(name)
+    if not isinstance(pin, dict):
+        return [
+            f"{PINS_PATH.relative_to(ROOT)} has no {name} entry, so {', '.join(users)} cannot download it "
+            "through fetch_pinned.sh."
+        ]
+    errors = []
+    url = pin.get("url", "")
+    hashes = pin.get("sha256")
+    if not isinstance(url, str) or not url.startswith("https://"):
+        errors.append(f"{name}.url must be an https URL.")
+        url = ""
+    if isinstance(hashes, dict):
+        version = pin.get("version", "")
+        if not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", version):
+            errors.append(f"{name}.version '{version}' is not a release version.")
+        if url and ("{version}" not in url or "{target}" not in url):
+            errors.append(f"{name}.url must contain {{version}} and {{target}}, since {name} pins one file per target.")
+        if not hashes:
+            errors.append(f"{name}.sha256 pins no target.")
+        for target, sha256 in hashes.items():
+            if not isinstance(sha256, str) or not SHA256.fullmatch(sha256):
+                errors.append(f"{name}.sha256.{target} is not a lowercase hex SHA-256.")
+    else:
+        if "version" in pin:
+            errors.append(f"{name} has a version but one SHA-256; pin one file per target, or drop the version.")
+        if url and "{" in url:
+            errors.append(f"{name}.url names a template, but {name} pins one file.")
+        if not isinstance(hashes, str) or not SHA256.fullmatch(hashes):
+            errors.append(f"{name}.sha256 is not a lowercase hex SHA-256.")
+
+    for user in users:
+        text = (ROOT / user).read_text()
+        targets, found, unread = requested_targets(text, name)
+        if not found:
+            errors.append(
+                f"{user} does not download {name} through .github/scripts/fetch_pinned.sh (or read its pin in "
+                f"PowerShell as `ConvertFrom-Json).'{name}'`), so nothing checks what it downloads against "
+                f"{PINS_PATH.relative_to(ROOT)}."
+            )
+        for variable in unread:
+            errors.append(
+                f"{user} fetches {name} for the target in ${variable}, but has no `<case>) {variable}=<target> ;;` "
+                "arm to read the targets from; update this check with the file."
+            )
+        for target in sorted(targets):
+            if isinstance(hashes, dict) and not target:
+                errors.append(f"{user} fetches {name} with no target, but {name} pins one file per target.")
+            elif isinstance(hashes, dict) and target not in hashes:
+                errors.append(
+                    f"{name}.sha256 has no pin for {target}, which {user} asks for, so it would fail there. "
+                    "Take the SHA-256 from the publisher's checksum and check it against a download."
+                )
+            elif not isinstance(hashes, dict) and target:
+                errors.append(f"{user} asks for {name} for {target}, but {name} pins one file for no target.")
+    return errors
+
+
+def requested_targets(text: str, name: str) -> tuple:
+    """The targets `text` asks fetch_pinned.sh (or a PowerShell step) for NAME's pin, whether
+    it asks at all, and the variables naming a target that no `case` arm assigns."""
+    targets, unread = set(), []
+    found = False
+    for match in FETCH_CALL.finditer(text):
+        if match.group(1) != name:
+            continue
+        found = True
+        target = next((group for group in match.group(2, 3, 4) if group is not None), "")
+        variable = SHELL_VARIABLE.fullmatch(target)
+        if variable is None:
+            targets.add(target)
+            continue
+        arms = re.findall(
+            rf"^[^\S\n]*[^\n)]+\)[^\S\n]*{re.escape(variable.group(1))}=([A-Za-z0-9_.-]+)[^\S\n]*;;", text, re.M
+        )
+        if arms:
+            targets.update(arms)
+        elif variable.group(1) not in unread:
+            unread.append(variable.group(1))
+    if any(match.group(1) == name for match in PWSH_PIN.finditer(text)):
+        found = True
+        targets.update(PWSH_TARGET.findall(text))
+    return targets, found, unread
 
 
 def cargo_nextest_errors(nextest: dict) -> list:

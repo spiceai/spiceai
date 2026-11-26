@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Tests for check_ci_cache_pins.py, run on a copy of the files it reads.
 
-Each test copies the checker, pins.json, rust-toolchain.toml, Dockerfile-cuda and the
-install-cargo-deny, setup-rust and setup-nextest actions into a temporary tree laid out
-like the repository, changes one of them, and runs the checker there as CI does.
+Each test copies the checker, pins.json, rust-toolchain.toml, Dockerfile-cuda, the
+install-cargo-deny, setup-rust and setup-nextest actions, and every file that downloads a pin
+through fetch_pinned.sh, into a temporary tree laid out like the repository, changes one of
+them, and runs the checker there as CI does.
 """
 
 import json
@@ -24,6 +25,10 @@ FILES = [
     "Dockerfile-cuda",
     "rust-toolchain.toml",
 ]
+sys.path.insert(0, str(ROOT / ".github" / "scripts"))
+from check_ci_cache_pins import FETCHED_PINS  # noqa: E402
+
+FILES += sorted({user for users in FETCHED_PINS.values() for user in users})
 
 
 class CheckCiCachePinsTest(unittest.TestCase):
@@ -139,6 +144,74 @@ class CheckCiCachePinsTest(unittest.TestCase):
         self.edit_pins(lambda pins: pins["rustup-init"].update({"version": "9.9.9"}))
         result = self.run_check()
         self.assertIn("Dockerfile-cuda has ARG RUSTUP_VERSION=", result.stdout)
+
+    # --- pins fetched through fetch_pinned.sh ---------------------------------------------
+
+    def write(self, name, text):
+        (self.tmp / name).write_text(text)
+
+    def test_every_fetched_pin_passes(self):
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OK: fetched through fetch_pinned.sh", result.stdout)
+        self.assertIn("mc RELEASE.2025-08-13T08-35-41Z", result.stdout)
+
+    def test_every_target_a_minio_action_asks_for_must_be_pinned(self):
+        self.edit_pins(lambda pins: pins["mc"]["sha256"].pop("linux-amd64"))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        for user in FETCHED_PINS["mc"]:
+            self.assertIn(f"mc.sha256 has no pin for linux-amd64, which {user} asks for", result.stdout)
+
+    def test_a_missing_fetched_entry_fails(self):
+        self.edit_pins(lambda pins: pins.pop("mc"))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("has no mc entry", result.stdout)
+
+    def test_a_file_that_downloads_a_pinned_tool_itself_fails(self):
+        self.write(
+            ".github/actions/upload-to-minio/action.yml",
+            "name: Upload to MinIO\nruns:\n  using: composite\n  steps:\n    - shell: bash\n"
+            "      run: sudo wget https://public-data.spiceai.org/mc -O /usr/local/bin/mc\n",
+        )
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(
+            ".github/actions/upload-to-minio/action.yml does not download mc through .github/scripts/fetch_pinned.sh",
+            result.stdout,
+        )
+
+    def test_a_target_variable_with_no_case_arm_fails(self):
+        path = self.tmp / ".github/actions/setup-minio/action.yml"
+        path.write_text(path.read_text().replace("x86_64) target=linux-amd64 ;;", "x86_64) arch=linux-amd64 ;;"))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("fetches mc for the target in $target, but has no `<case>) target=<target> ;;` arm", result.stdout)
+
+    def test_a_malformed_fetched_pin_fails(self):
+        def change(pins):
+            pins["mc"]["version"] = "latest release"
+            pins["mc"]["url"] = "http://public-data.spiceai.org/mc"
+            pins["mc"]["sha256"]["linux-amd64"] = "ABC"
+
+        self.edit_pins(change)
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("mc.version 'latest release' is not a release version.", result.stdout)
+        self.assertIn("mc.url must be an https URL.", result.stdout)
+        self.assertIn("mc.sha256.linux-amd64 is not a lowercase hex SHA-256.", result.stdout)
+
+    def test_a_single_file_pin_takes_no_template_or_target(self):
+        def change(pins):
+            pins["mc"] = {"url": "https://example.com/{version}/mc", "sha256": "1" * 64}
+
+        self.edit_pins(change)
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("mc.url names a template, but mc pins one file.", result.stdout)
+        self.assertIn("asks for mc for linux-amd64, but mc pins one file for no target.", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
