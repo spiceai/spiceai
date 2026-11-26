@@ -1,4 +1,5 @@
 name: postgres-catalog-cdc
+duration: 24s
 description: >
   A PostgreSQL catalog accelerated by change capture accelerates every table it
   can key (a primary key, a replica identity index, or FULL) on one shared

@@ -1,5 +1,6 @@
 # Known failing (#16780).
 name: cayenne-startup-many-deletion-vectors
+duration: 1624s
 description: >
   A keyed Cayenne table with object-native data in an S3 state location 20 ms
   away is ready within 15 s of a restart after 20,000 single-key deletes, and

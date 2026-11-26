@@ -1,4 +1,5 @@
 name: adbc-duckdb-catalog
+duration: 3s
 description: >
   Discover DuckDB schemas and tables through the ADBC catalog, select tables
   with include/exclude patterns, and compare typed rows, aggregates and joins

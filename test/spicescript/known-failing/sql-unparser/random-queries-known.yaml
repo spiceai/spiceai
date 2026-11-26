@@ -2,6 +2,7 @@
 # PostgreSQL and accelerated variants guard the shared nested-query paths.
 # Failing queries are saved beside each instance's log.
 name: random-queries-known
+duration: 256s
 description: >
   Random queries over nested subqueries (filters, groupings, DISTINCT,
   ORDER BY … LIMIT on a unique key, joins, UNION ALL) under outer queries that

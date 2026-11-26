@@ -1,4 +1,5 @@
 name: cayenne-vnext-restart
+duration: 4s
 description: >
   A file-mode Cayenne acceleration in the object-native metastore writes no
   SQLite metastore file (`cayenne.db`), and a restart still finds it: the

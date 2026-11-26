@@ -1,5 +1,6 @@
 # Known failing (#15545).
 name: clickhouse-decimals
+duration: 67s
 description: >
   ClickHouse decimals are served, federated and accelerated, as ClickHouse
   answers, including negative decimals whose digits are fewer than their

@@ -1,4 +1,5 @@
 name: metrics-agreement-cdc
+duration: 41s
 tags: [long]
 description: >
   Metrics agree with a known workload: change capture of 100 inserts, 40

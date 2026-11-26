@@ -1,4 +1,5 @@
 name: snapshots-index-restore
+duration: 11s
 description: >
   A snapshot restored onto empty local storage while Postgres is offline
   preserves every row and its secondary lookup index (#14803, #15068).

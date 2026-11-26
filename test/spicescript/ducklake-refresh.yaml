@@ -1,4 +1,5 @@
 name: ducklake-refresh
+duration: 37s
 tags: [long]
 description: >
   A DuckLake table answers through Spice like DuckDB reading the same lake:
