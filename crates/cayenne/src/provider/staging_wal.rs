@@ -1321,7 +1321,7 @@ impl CayenneTableProvider {
         if !self.begin_final_key_write(&staging_snapshot_id, &self.get_current_snapshot_id()) {
             self.clear_new_staging_snapshot_dir(&staging_snapshot_id)
                 .await?;
-            self.staging_may_have_files().store(true, Ordering::Release);
+            self.mark_staging_may_have_files(&staging_snapshot_id);
         }
 
         let (row_count, _writer_ops, _stats_acc) = match self

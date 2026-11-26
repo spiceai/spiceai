@@ -113,9 +113,17 @@ where
     /// stored now (`None` when the key is empty). `weight` must be
     /// [`Sizeable::get_memory_size`] of `value`.
     ///
-    /// The predicate is borrowed, so this cannot move onto the blocking pool.
-    /// It follows [`CacheBackend::replace_if`]: `block_in_place` on a
-    /// multi-thread runtime, inline on a current-thread runtime.
+    /// A value of at most `INLINE_ADMISSION_MAX_BYTES` under an empty key is
+    /// admitted on the calling task by [`ShardedCache::try_insert_if`], as
+    /// [`Self::insert_with_weight`] admits one. Anything else, including a
+    /// replacement of a resident, follows [`CacheBackend::replace_if`]: the
+    /// predicate is borrowed, so it cannot move onto the blocking pool, and it
+    /// runs under `block_in_place` on a multi-thread runtime, inline on a
+    /// current-thread runtime.
+    ///
+    /// `admit` can be evaluated twice: once by the inline attempt, and again
+    /// when that attempt hands the value back after accepting it (the budget was
+    /// taken in between, say). It must be a pure function of what it is shown.
     pub fn insert_if(
         &self,
         key: u64,
@@ -123,6 +131,15 @@ where
         weight: usize,
         admit: &(dyn for<'v> Fn(Option<&'v V>) -> bool + Send + Sync),
     ) -> bool {
+        // The blocking-pool handoff costs more than a small admission.
+        let value = if weight <= INLINE_ADMISSION_MAX_BYTES {
+            match self.cache.try_insert_if(key, value, weight, admit) {
+                Ok(stored) => return stored,
+                Err(value) => value,
+            }
+        } else {
+            value
+        };
         let run = || self.cache.insert_if(key, value, weight, admit);
         match tokio::runtime::Handle::try_current() {
             Ok(handle)

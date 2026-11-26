@@ -295,10 +295,8 @@ impl Lab {
             TimeKind::Timestamp => TimeFormat::Timestamp,
             TimeKind::Text => TimeFormat::ISO8601,
         });
-        // Cayenne takes a directory; SQLite takes a `.db` file.
         let (file_param, file_name) = match accel.engine {
             "cayenne" => ("cayenne_file_path", format!("accelerator-{name}")),
-            "sqlite" => ("sqlite_file", format!("accelerator-{name}.db")),
             other => panic!("the lab has no file parameter for engine {other}"),
         };
         let data_path = self.temp.path().join(file_name);

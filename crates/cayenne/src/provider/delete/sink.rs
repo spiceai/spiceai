@@ -729,10 +729,9 @@ pub struct CayenneDeletionSink {
     /// index it is judged by (see [`DeleteScanSource::tombstones_at_capture`]). `None` on
     /// internal persist-only helpers, which capture without them.
     capture_locks: Option<CaptureLocks>,
-    /// The owning table's `file_deletion_fence`, which removing the files of
-    /// superseded position deletion vectors waits for. `None` leaves those files
-    /// on disk.
-    file_deletion_fence: Option<Arc<tokio::sync::RwLock<()>>>,
+    /// The owning table, which reclaims the files of the position deletion
+    /// vectors a delete supersedes. `None` leaves those files in place.
+    owner: Option<Arc<super::super::CayenneTableProvider>>,
     /// The owning table's storage when its data path is an object-store URL;
     /// deletion vectors are written, read and removed through its store.
     dataset_storage: Option<Arc<DatasetStorage>>,
@@ -806,7 +805,7 @@ impl CayenneDeletionSink {
             count_exact: false,
             scan_input_version: None,
             capture_locks: None,
-            file_deletion_fence: None,
+            owner: None,
             dataset_storage,
             committed_snapshot: None,
         }
@@ -824,14 +823,11 @@ impl CayenneDeletionSink {
         self
     }
 
-    /// Wire the owning table's `file_deletion_fence`, so a position delete removes
-    /// the files of the deletion vectors it supersedes.
+    /// Wire the owning table, so a position delete reclaims the deletion vectors
+    /// it supersedes.
     #[must_use]
-    pub(crate) fn with_file_deletion_fence(
-        mut self,
-        file_deletion_fence: Arc<tokio::sync::RwLock<()>>,
-    ) -> Self {
-        self.file_deletion_fence = Some(file_deletion_fence);
+    pub(crate) fn with_owner(mut self, table: super::super::CayenneTableProvider) -> Self {
+        self.owner = Some(Arc::new(table));
         self
     }
 
@@ -873,15 +869,12 @@ impl CayenneDeletionSink {
             .collect())
     }
 
-    /// Remove the files of `replaced` vector rows once the commit that dropped them
-    /// has succeeded. See [`super::vector_io::remove_dropped_deletion_vector_files`].
+    /// Reclaim the files of `replaced` vector rows once the commit that dropped
+    /// them has succeeded. See
+    /// [`super::super::CayenneTableProvider::remove_dropped_deletion_vector_files`].
     pub(crate) fn remove_replaced_deletion_vector_files(&self, replaced: Vec<DeleteFile>) {
-        if let Some(fence) = &self.file_deletion_fence {
-            super::vector_io::remove_dropped_deletion_vector_files(
-                replaced,
-                Arc::clone(fence),
-                self.dataset_storage.clone(),
-            );
+        if let Some(table) = &self.owner {
+            table.remove_dropped_deletion_vector_files(replaced);
         }
     }
 

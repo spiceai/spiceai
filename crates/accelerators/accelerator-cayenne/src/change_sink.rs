@@ -230,11 +230,12 @@ impl CayenneChangeSinkBackend {
                 .any(|(op, _)| matches!(op, ChangeOperationType::Truncate))
             && (!self.buffers_cdc_in_memory() || !self.is_replayable(&batch, &groups, options));
         if !same_record {
-            return self.apply_cdc_groups(batch, options, ctx).await;
+            return self.apply_cdc_groups(batch, groups, options, ctx).await;
         }
-        let (write, after_commit) =
-            cayenne::catalog::with_same_record_commits(self.apply_cdc_groups(batch, options, ctx))
-                .await;
+        let (write, after_commit) = cayenne::catalog::with_same_record_commits(
+            self.apply_cdc_groups(batch, groups, options, ctx),
+        )
+        .await;
         let mut write = write?;
         let catalog = Arc::clone(self.table.catalog());
         let table_id = self.table.table_id().to_string();
@@ -275,13 +276,15 @@ impl CayenneChangeSinkBackend {
         Ok(write)
     }
 
+    /// The caller groups the batch once, encoding every row's primary key,
+    /// and passes the result in.
     async fn apply_cdc_groups(
         &self,
         batch: CdcBatch,
+        groups: Vec<(ChangeOperationType, Vec<usize>)>,
         options: WriteOptions,
         ctx: &SessionContext,
     ) -> Result<BackendWrite> {
-        let groups = group_into_sub_batches(&batch);
         reject_unknown_operations(&groups)?;
         let replayable = self.is_replayable(&batch, &groups, options);
         self.select_recovery_path(if replayable {

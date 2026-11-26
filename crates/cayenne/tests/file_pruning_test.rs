@@ -27,8 +27,8 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use cayenne::SlotAdvancer;
 use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneTableProvider, SlotAdvancer};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -37,10 +37,10 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
 
-test_with_backends!(test_listing_file_pruning_disjoint_id_ranges_impl);
-test_with_backends!(test_listing_file_pruning_disjoint_decimal_ranges_impl);
-test_with_backends!(test_mem_tier_upsert_point_lookup_not_pruned_by_own_tombstone_impl);
-test_with_backends!(test_is_null_keeps_rows_whose_nulls_carry_no_null_bit_impl);
+test_on_data_store!(test_listing_file_pruning_disjoint_id_ranges_impl);
+test_on_data_store!(test_listing_file_pruning_disjoint_decimal_ranges_impl);
+test_on_data_store!(test_mem_tier_upsert_point_lookup_not_pruned_by_own_tombstone_impl);
+test_on_data_store!(test_is_null_keeps_rows_whose_nulls_carry_no_null_bit_impl);
 
 fn files_scanned_from_plan(plan: &str) -> Option<usize> {
     plan.lines().find_map(|line| {
@@ -99,7 +99,7 @@ async fn test_listing_file_pruning_disjoint_id_ranges_impl(
         schema: Arc::clone(&schema),
         primary_key: vec![],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("file_pruning_table"),
         partition_column: None,
         vortex_config: VortexConfig {
             sort_columns: vec!["id".to_string()],
@@ -111,7 +111,10 @@ async fn test_listing_file_pruning_disjoint_id_ranges_impl(
     let ctx = SessionContext::new();
     let catalog = Arc::clone(&fixture.catalog);
     let provider = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(
         "file_pruning_table",
@@ -200,7 +203,7 @@ async fn test_listing_file_pruning_disjoint_decimal_ranges_impl(
         schema: Arc::clone(&schema),
         primary_key: vec![],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("decimal_pruning_table"),
         partition_column: None,
         vortex_config: VortexConfig {
             sort_columns: vec!["amount".to_string()],
@@ -212,7 +215,10 @@ async fn test_listing_file_pruning_disjoint_decimal_ranges_impl(
     let ctx = SessionContext::new();
     let catalog = Arc::clone(&fixture.catalog);
     let provider = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(
         "decimal_pruning_table",
@@ -300,7 +306,7 @@ async fn test_mem_tier_upsert_point_lookup_not_pruned_by_own_tombstone_impl(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("mem_tier_pruning"),
         partition_column: None,
         vortex_config: VortexConfig {
             cdc_durability: CdcDurability::Memory,
@@ -312,7 +318,10 @@ async fn test_mem_tier_upsert_point_lookup_not_pruned_by_own_tombstone_impl(
     let ctx = SessionContext::new();
     let catalog = Arc::clone(&fixture.catalog);
     let provider = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(
         "mem_tier_pruning",
@@ -428,24 +437,22 @@ async fn test_is_null_keeps_rows_whose_nulls_carry_no_null_bit_impl(
     // A small append to a default table is published inline.
     let inline_catalog = Arc::clone(&fixture.catalog);
     let inline = Arc::new(
-        CayenneTableProvider::create_table(
-            inline_catalog,
-            CreateTableOptions {
-                table_name: "unmarked_nulls_inline".to_string(),
-                schema: Arc::clone(&schema),
-                primary_key: vec![],
-                on_conflict: None,
-                base_path: fixture
-                    .data_path
-                    .join("unmarked_nulls_inline")
-                    .to_string_lossy()
-                    .to_string(),
-                partition_column: None,
-                vortex_config: VortexConfig::default(),
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                inline_catalog,
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: "unmarked_nulls_inline".to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path("unmarked_nulls_inline"),
+                    partition_column: None,
+                    vortex_config: VortexConfig::default(),
+                },
+            )
+            .await?,
     );
     ctx.register_table(
         "unmarked_nulls_inline",
@@ -461,30 +468,28 @@ async fn test_is_null_keeps_rows_whose_nulls_carry_no_null_bit_impl(
     // A change-stream write to a memory-durability table is published through the RAM tier.
     let ram_catalog = Arc::clone(&fixture.catalog);
     let ram = Arc::new(
-        CayenneTableProvider::create_table(
-            ram_catalog,
-            CreateTableOptions {
-                table_name: "unmarked_nulls_ram".to_string(),
-                schema: Arc::clone(&schema),
-                primary_key: vec!["id".to_string()],
-                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-                    "id".to_string(),
-                ]))),
-                base_path: fixture
-                    .data_path
-                    .join("unmarked_nulls_ram")
-                    .to_string_lossy()
-                    .to_string(),
-                partition_column: None,
-                vortex_config: VortexConfig {
-                    cdc_durability: CdcDurability::Memory,
-                    deletion_mode: DeletionMode::Key,
-                    ..VortexConfig::default()
+        fixture
+            .data_store
+            .create(
+                ram_catalog,
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: "unmarked_nulls_ram".to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                        "id".to_string(),
+                    ]))),
+                    base_path: fixture.data_store.base_path("unmarked_nulls_ram"),
+                    partition_column: None,
+                    vortex_config: VortexConfig {
+                        cdc_durability: CdcDurability::Memory,
+                        deletion_mode: DeletionMode::Key,
+                        ..VortexConfig::default()
+                    },
                 },
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+            )
+            .await?,
     );
     ctx.register_table(
         "unmarked_nulls_ram",
@@ -506,27 +511,25 @@ async fn test_is_null_keeps_rows_whose_nulls_carry_no_null_bit_impl(
     // With inline writes off, the same append is written to a Vortex file.
     let file_catalog = Arc::clone(&fixture.catalog);
     let file = Arc::new(
-        CayenneTableProvider::create_table(
-            file_catalog,
-            CreateTableOptions {
-                table_name: "unmarked_nulls_file".to_string(),
-                schema: Arc::clone(&schema),
-                primary_key: vec![],
-                on_conflict: None,
-                base_path: fixture
-                    .data_path
-                    .join("unmarked_nulls_file")
-                    .to_string_lossy()
-                    .to_string(),
-                partition_column: None,
-                vortex_config: VortexConfig {
-                    inline_max_rows: 0,
-                    ..VortexConfig::default()
+        fixture
+            .data_store
+            .create(
+                file_catalog,
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: "unmarked_nulls_file".to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path("unmarked_nulls_file"),
+                    partition_column: None,
+                    vortex_config: VortexConfig {
+                        inline_max_rows: 0,
+                        ..VortexConfig::default()
+                    },
                 },
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+            )
+            .await?,
     );
     ctx.register_table(
         "unmarked_nulls_file",

@@ -1,4 +1,5 @@
 name: cluster-aggregate-over-limit
+tags: [long]
 description: >
   On a cluster, an aggregate over a subquery with ORDER BY … LIMIT counts the
   limited rows: the partial aggregate sent to executors keeps the limit.

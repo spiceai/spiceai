@@ -13,25 +13,23 @@ cayenne-file:
 cayenne-memory:
   datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: memory } } }
 
-# The prototype object-native Cayenne metastore, for every Cayenne dataset as written.
+# The prototype object-native Cayenne metastore, for every Cayenne dataset as
+# written, with the state location named. With the flag on, a Cayenne file
+# acceleration keeps its data files in `runtime.state.location`, so an instance
+# that loses its directory (`wipe-instance-dir`) serves the dataset again from
+# the location alone. This location is a directory inside the instance's own,
+# standing for storage the instance does not lose:
+# `wipe-instance-dir: { keep: [state] }`.
 object-native:
-  spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+  spicepod:
+    runtime:
+      params: { cayenne_vnext: enabled }
+      state: { location: 'file://${instance.dir}/state/' }
 # `cayenne-file` with the prototype object-native Cayenne metastore.
 cayenne-file-object-native:
   datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file } } }
   spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
 
-# `object-native` with the state location named. With the flag on, a Cayenne
-# file acceleration keeps its data files in `runtime.state.location`, so an
-# instance that loses its directory (`wipe-instance-dir`) serves the dataset
-# again from the location alone. This location is a directory inside the
-# instance's own, standing for storage the instance does not lose:
-# `wipe-instance-dir: { keep: [state] }`.
-object-native-local:
-  spicepod:
-    runtime:
-      params: { cayenne_vnext: enabled }
-      state: { location: 'file://${instance.dir}/state/' }
 # The state location in an S3-compatible store; the script declares a `rustfs`
 # source named `lake`.
 object-native-s3:

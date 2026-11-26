@@ -93,7 +93,7 @@ async fn setup_table_with_config(
         schema: Arc::clone(&schema),
         primary_key: primary_key.clone(),
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(primary_key))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config,
     };
@@ -102,7 +102,10 @@ async fn setup_table_with_config(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
     Ok((table, ctx))
@@ -222,7 +225,7 @@ async fn test_insert_inlines_despite_pending_deletions_impl(
     Ok(())
 }
 
-test_with_backends!(test_insert_inlines_despite_pending_deletions_impl);
+test_on_data_store!(test_insert_inlines_despite_pending_deletions_impl);
 
 // =============================================================================
 // Test 2: Upsert with file-backed conflict inlines + writes deletion vector
@@ -276,7 +279,7 @@ async fn test_upsert_file_conflict_inlines_impl(fixture: TestFixture) -> TestRes
     Ok(())
 }
 
-test_with_backends!(test_upsert_file_conflict_inlines_impl);
+test_on_data_store!(test_upsert_file_conflict_inlines_impl);
 
 // =============================================================================
 // Test 3: Inlined upsert survives restart
@@ -333,8 +336,9 @@ async fn test_inlined_upsert_survives_restart_impl(fixture: TestFixture) -> Test
         Arc::clone(&catalog2) as Arc<dyn MetadataCatalog>;
 
     let ctx2 = SessionContext::new();
-    let provider2 = cayenne::CayenneTableProviderBuilder::new(catalog_trait2, ctx2.runtime_env())
-        .open("restart_tbl")
+    let provider2 = fixture
+        .data_store
+        .open(catalog_trait2, ctx2.runtime_env(), "restart_tbl")
         .await?;
     let provider2 = Arc::new(provider2);
     ctx2.register_table(
@@ -360,7 +364,7 @@ async fn test_inlined_upsert_survives_restart_impl(fixture: TestFixture) -> Test
     Ok(())
 }
 
-test_with_backends!(test_inlined_upsert_survives_restart_impl);
+test_on_data_store!(test_inlined_upsert_survives_restart_impl);
 
 // =============================================================================
 // Test 4: Interleaved delete + insert + upsert (TPC-C pattern)
@@ -442,7 +446,7 @@ async fn test_interleaved_delete_insert_upsert_impl(fixture: TestFixture) -> Tes
     Ok(())
 }
 
-test_with_backends!(test_interleaved_delete_insert_upsert_impl);
+test_on_data_store!(test_interleaved_delete_insert_upsert_impl);
 
 // =============================================================================
 // Test 5: Composite PK (RowConverterBased) upsert with file conflict inlines
@@ -508,7 +512,7 @@ async fn test_composite_pk_upsert_file_conflict_inlines_impl(
     Ok(())
 }
 
-test_with_backends!(test_composite_pk_upsert_file_conflict_inlines_impl);
+test_on_data_store!(test_composite_pk_upsert_file_conflict_inlines_impl);
 
 // =============================================================================
 // Test 6: Checkpoint after inlined upsert materialises correctly
@@ -556,7 +560,7 @@ async fn test_checkpoint_after_inlined_upsert_impl(fixture: TestFixture) -> Test
     Ok(())
 }
 
-test_with_backends!(test_checkpoint_after_inlined_upsert_impl);
+test_on_data_store!(test_checkpoint_after_inlined_upsert_impl);
 
 // =============================================================================
 // Test 7: Two successive inline upserts on same PK
@@ -629,8 +633,9 @@ async fn test_double_inline_upsert_same_pk_impl(fixture: TestFixture) -> TestRes
         Arc::clone(&catalog2) as Arc<dyn MetadataCatalog>;
 
     let ctx2 = SessionContext::new();
-    let provider2 = cayenne::CayenneTableProviderBuilder::new(catalog_trait2, ctx2.runtime_env())
-        .open("dbl_upsert")
+    let provider2 = fixture
+        .data_store
+        .open(catalog_trait2, ctx2.runtime_env(), "dbl_upsert")
         .await?;
     let provider2 = Arc::new(provider2);
     ctx2.register_table(
@@ -645,7 +650,7 @@ async fn test_double_inline_upsert_same_pk_impl(fixture: TestFixture) -> TestRes
     Ok(())
 }
 
-test_with_backends!(test_double_inline_upsert_same_pk_impl);
+test_on_data_store!(test_double_inline_upsert_same_pk_impl);
 
 // =============================================================================
 // Test 8: Delete of an inlined PK
@@ -706,7 +711,7 @@ async fn test_delete_of_inlined_pk_impl(fixture: TestFixture) -> TestResult<()> 
     Ok(())
 }
 
-test_with_backends!(test_delete_of_inlined_pk_impl);
+test_on_data_store!(test_delete_of_inlined_pk_impl);
 
 // =============================================================================
 // Test 9: Mixed inline + file conflicts in one upsert batch
@@ -777,7 +782,7 @@ async fn test_mixed_inline_and_file_conflicts_impl(fixture: TestFixture) -> Test
     Ok(())
 }
 
-test_with_backends!(test_mixed_inline_and_file_conflicts_impl);
+test_on_data_store!(test_mixed_inline_and_file_conflicts_impl);
 
 // =============================================================================
 // Test: Upsert after an inline checkpoint tombstones the flushed prior version
@@ -836,7 +841,7 @@ async fn test_inline_checkpoint_then_upsert_no_duplicate_pk_int64_impl(
     Ok(())
 }
 
-test_with_backends!(test_inline_checkpoint_then_upsert_no_duplicate_pk_int64_impl);
+test_on_data_store!(test_inline_checkpoint_then_upsert_no_duplicate_pk_int64_impl);
 
 // Composite-PK counterpart (`RowConverterBased` strategy — the shape used by the
 // CDC tables exercised in benchmarks). Same guarantee as the int64 variant: the
@@ -895,7 +900,7 @@ async fn test_inline_checkpoint_then_upsert_no_duplicate_pk_composite_impl(
     Ok(())
 }
 
-test_with_backends!(test_inline_checkpoint_then_upsert_no_duplicate_pk_composite_impl);
+test_on_data_store!(test_inline_checkpoint_then_upsert_no_duplicate_pk_composite_impl);
 
 // =============================================================================
 // Concurrent upsert/scan stress test
@@ -1055,8 +1060,8 @@ async fn assert_no_duplicate_pk_under_concurrent_upserts(
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 8))]
-async fn test_concurrent_upsert_scan_no_duplicate_pk_no_inline() -> TestResult<()> {
-    common::run_with_backend(common::BackendType::Sqlite, |fixture| {
+async fn test_concurrent_upsert_scan_no_duplicate_pk_no_inline_on_data_store() -> TestResult<()> {
+    common::run_with_backend(common::BackendType::for_data_store(), |fixture| {
         assert_no_duplicate_pk_under_concurrent_upserts(
             fixture,
             0,
@@ -1067,8 +1072,8 @@ async fn test_concurrent_upsert_scan_no_duplicate_pk_no_inline() -> TestResult<(
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 8))]
-async fn test_concurrent_upsert_scan_no_duplicate_pk_inline() -> TestResult<()> {
-    common::run_with_backend(common::BackendType::Sqlite, |fixture| {
+async fn test_concurrent_upsert_scan_no_duplicate_pk_inline_on_data_store() -> TestResult<()> {
+    common::run_with_backend(common::BackendType::for_data_store(), |fixture| {
         assert_no_duplicate_pk_under_concurrent_upserts(
             fixture,
             DEFAULT_INLINE_MAX_ROWS,

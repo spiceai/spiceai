@@ -228,6 +228,9 @@ pub mod postgres_accelerated;
 #[cfg(feature = "snowflake")]
 pub mod snowflake;
 pub mod spice_cloud;
+#[cfg(test)]
+#[cfg(feature = "delta_lake")]
+mod storage_location_tests;
 #[cfg(feature = "delta_lake")]
 pub mod unity_catalog;
 
@@ -467,6 +470,12 @@ pub trait CatalogConnector: Send + Sync {
     /// Returns whether the catalog connector should be initialized on startup or on trigger.
     fn initialization(&self) -> ComponentInitialization {
         ComponentInitialization::default()
+    }
+
+    /// The OAuth client ID whose user tokens, sent with a request, load a catalog that
+    /// initializes on trigger.
+    fn user_token_client_id(&self) -> Option<&str> {
+        None
     }
 }
 

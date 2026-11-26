@@ -25,14 +25,28 @@ limitations under the License.
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use clap::ValueEnum as _;
 use indexmap::IndexMap;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
+
+/// A script's tags, which `--only-tag` and `--exclude-tag` select on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum Tag {
+    /// Too slow for the run before every merge, for what it catches there: the
+    /// merge queue runs `--exclude-tag long`, and the post-merge run on trunk
+    /// runs every script. As with Go's `-short`, a script runs before merge
+    /// unless it opts out.
+    Long,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Script {
     pub name: String,
+    #[serde(default)]
+    pub tags: Vec<Tag>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -402,6 +416,9 @@ pub enum Action {
         /// `false` waits only for `spiced` to answer HTTP, for a start whose
         /// datasets are expected not to become ready.
         wait_ready: bool,
+        /// `false` waits for nothing, for a start that is expected not to
+        /// serve yet; a later `wait-ready` waits for it.
+        wait: bool,
         /// A change to the spicepod, kept for every later start.
         patch: Option<VariantSpec>,
     },
@@ -847,6 +864,8 @@ pub struct HttpStep {
     pub timing: Timing,
     /// The API key the request presents (`api-key: none` for none).
     pub key: crate::spiced::Key,
+    /// Nothing answers: the connection is refused (`expect: { refused: true }`).
+    pub refused: bool,
 }
 
 /// Checks the instance's `spiced.log`, across every start.
@@ -1113,7 +1132,19 @@ impl Script {
             .remove("steps")
             .context("A script needs `steps`")?;
         expand_shared_variants(&mut root, shared)?;
+        let has_tags = root.as_object().is_some_and(|map| map.contains_key("tags"));
         let mut script: Script = serde_json::from_value(root)?;
+        if has_tags {
+            check_tags_on_one_line(text)?;
+        }
+        for (i, tag) in script.tags.iter().enumerate() {
+            ensure!(
+                !script.tags[..i].contains(tag),
+                "Duplicate tag `{}`; list each tag only once",
+                tag.to_possible_value()
+                    .map_or_else(String::new, |value| value.get_name().to_string())
+            );
+        }
         let Value::Array(steps) = steps else {
             bail!("`steps` must be a list");
         };
@@ -1738,11 +1769,19 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
     }
     let mut opts = Opts(map);
     let action = match name {
-        "start" => Action::Start {
-            ready_timeout: opts.duration_in(&arg, "ready-timeout")?,
-            wait_ready: wait_ready(&arg)?,
-            patch: patch(&arg)?,
-        },
+        "start" => {
+            let wait = start_waits(&arg)?;
+            ensure!(
+                wait || (arg.get("ready").is_none() && arg.get("ready-timeout").is_none()),
+                "`start` with `wait: false` waits for nothing, so it takes no `ready` or `ready-timeout`; put them on a later `wait-ready`"
+            );
+            Action::Start {
+                ready_timeout: opts.duration_in(&arg, "ready-timeout")?,
+                wait_ready: wait_ready(&arg)?,
+                wait,
+                patch: patch(&arg)?,
+            }
+        }
         "stop" => Action::Stop,
         "kill-spiced" => Action::Kill {
             signal: parse_signal(arg.get("signal"))?.unwrap_or(KillSignal::Kill),
@@ -2227,10 +2266,16 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
             let mut body_matches = Vec::new();
             let mut body_lacks = Vec::new();
             let mut json = Vec::new();
+            let mut refused = false;
             let (status, expect_headers, lacks_headers, body_contains) = match opts.take("expect") {
                 None => (None, Vec::new(), Vec::new(), None),
                 Some(Value::Object(e)) => {
                     let mut e = Opts(e);
+                    refused = e.bool("refused")?;
+                    ensure!(
+                        !refused || e.0.is_empty(),
+                        "`refused: true` expects no response, so it takes no other expectation"
+                    );
                     let status = e.parse::<u16>("status", "`status` must be a number")?;
                     let expect_headers = pairs(e.take("headers"), "headers")?;
                     let lacks_headers: Vec<String> = e
@@ -2286,6 +2331,7 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
                 json,
                 timing,
                 key,
+                refused,
             })
         }
         "assert-log" => {
@@ -2702,6 +2748,15 @@ fn wait_ready(arg: &Value) -> Result<bool> {
     }
 }
 
+/// `wait:` on `start`: `false` starts `spiced` and waits for nothing.
+fn start_waits(arg: &Value) -> Result<bool> {
+    match arg.get("wait") {
+        None => Ok(true),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => bail!("`wait` must be true or false"),
+    }
+}
+
 /// A `patch:` on `start` or `restart`: the same shape as a variant.
 fn patch(arg: &Value) -> Result<Option<VariantSpec>> {
     arg.get("patch")
@@ -2749,6 +2804,45 @@ fn parse_signal(v: Option<&Value>) -> Result<Option<KillSignal>> {
         Some("STOP-then-KILL") => Ok(Some(KillSignal::StopThenKill)),
         Some(other) => bail!("unknown signal '{other}', expected KILL or STOP-then-KILL"),
     }
+}
+
+/// A script's `tags` must be one line of plain names, `tags: [long]`: CI selects the changed
+/// scripts to run before merge by that line (`grep` for the tag, and
+/// `git diff -I'^tags:'` to ignore a change to it alone), which a block list or
+/// a flow list over several lines would slip past.
+fn check_tags_on_one_line(text: &str) -> Result<()> {
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("tags:"))
+        .collect();
+    let one_line = match lines.as_slice() {
+        [line] => {
+            let value = line["tags:".len()..]
+                .split(" #")
+                .next()
+                .unwrap_or_default()
+                .trim();
+            // Plain names only: a quoted or escaped spelling (`"lo\u006eg"`)
+            // decodes to a tag the line does not spell out.
+            value
+                .strip_prefix('[')
+                .and_then(|rest| rest.strip_suffix(']'))
+                .is_some_and(|names| {
+                    names.trim().is_empty()
+                        || names.split(',').all(|name| {
+                            let name = name.trim();
+                            !name.is_empty()
+                                && name.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                        })
+                })
+        }
+        _ => false,
+    };
+    ensure!(
+        one_line,
+        "Write `tags` on one line with plain names, as `tags: [long]`: CI selects scripts to run before merge by that line"
+    );
+    Ok(())
 }
 
 pub fn parse_duration(v: &Value) -> Result<Duration> {
@@ -2915,6 +3009,76 @@ fn read_durations(dir: &Path) -> Result<std::collections::BTreeMap<String, u64>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tags_parse() {
+        let script =
+            Script::parse("name: s\ntags: [long]\nspicepod: {}\nsteps: []").expect("tags parse");
+        assert_eq!(script.tags, vec![Tag::Long]);
+    }
+
+    #[test]
+    fn tags_reject_unknown_tag() {
+        let error = Script::parse("name: s\ntags: [slow]\nspicepod: {}\nsteps: []")
+            .expect_err("unknown tag");
+        assert_eq!(error.to_string(), "unknown variant `slow`, expected `long`");
+    }
+
+    #[test]
+    fn tags_must_be_one_line() {
+        let ok = |text: &str| {
+            Script::parse(text)
+                .map(|s| s.tags)
+                .map_err(|e| e.to_string())
+        };
+        let rejected = Err(
+            "Write `tags` on one line with plain names, as `tags: [long]`: CI selects scripts to run before merge by that line".to_string(),
+        );
+        assert_eq!(
+            ok("name: s\ntags: [long]\nspicepod: {}\nsteps: []"),
+            Ok(vec![Tag::Long])
+        );
+        assert_eq!(
+            ok("name: s\ntags: [long] # waits on a source's clock\nspicepod: {}\nsteps: []"),
+            Ok(vec![Tag::Long])
+        );
+        assert_eq!(ok("name: s\ntags: []\nspicepod: {}\nsteps: []"), Ok(vec![]));
+        assert_eq!(ok("name: s\nspicepod: {}\nsteps: []"), Ok(vec![]));
+        assert_eq!(
+            ok("name: s\ntags:\n  - long\nspicepod: {}\nsteps: []"),
+            rejected
+        );
+        assert_eq!(
+            ok("name: s\ntags: [\n  long]\nspicepod: {}\nsteps: []"),
+            rejected
+        );
+        assert_eq!(
+            ok("{name: s, tags: [long], spicepod: {}, steps: []}"),
+            rejected
+        );
+        assert_eq!(
+            ok("name: s\ntags: [\"lo\\u006eg\"]\nspicepod: {}\nsteps: []"),
+            rejected
+        );
+        assert_eq!(
+            ok("name: s\ntags: ['long']\nspicepod: {}\nsteps: []"),
+            rejected
+        );
+        assert_eq!(
+            ok("name: s\ntags: [ long ]\nspicepod: {}\nsteps: []"),
+            Ok(vec![Tag::Long])
+        );
+    }
+
+    #[test]
+    fn tags_reject_duplicate_tag() {
+        let error = Script::parse("name: s\ntags: [long, long]\nspicepod: {}\nsteps: []")
+            .expect_err("duplicate tag");
+        assert_eq!(
+            error.to_string(),
+            "Duplicate tag `long`; list each tag only once"
+        );
+    }
 
     #[test]
     fn sample_objects_takes_its_bounds_and_needs_six_samples() {

@@ -40,7 +40,7 @@ use mongodb::{
 };
 use runtime_checkpoint_api::mongodb::{MongoCheckpointMetadata, MongoCheckpointStore};
 use runtime_component::dataset::DatasetSpec;
-use runtime_component::dataset::acceleration::{Acceleration, Engine, OnConflictBehavior};
+use runtime_component::dataset::acceleration::{Acceleration, Engine};
 use runtime_parameters::{ExposedParamLookup, Parameters};
 use std::{sync::Arc, time::Duration};
 use tokio_stream::StreamExt as TokioStreamExt;
@@ -232,7 +232,7 @@ pub fn build_changes_stream(
                 )))?;
             let ready = build_ready_signal_envelope(&schema)
                 .map_err(|error| StreamError::Arrow(error.to_string()))?;
-            let (_, batch, is_ready, _) = ready.into_parts()
+            let (_, batch, is_ready, _, _) = ready.into_parts()
                 .map_err(|error| StreamError::Arrow(error.to_string()))?;
             let committer: Box<dyn CommitChange + Send + Sync> = match mongo_sys.as_ref() {
                 Some(sys) => Box::new(MongoResumeTokenCommitter::new(
@@ -245,7 +245,7 @@ pub fn build_changes_stream(
             };
             // Not a history-unavailable signal: this is the readiness envelope
             // re-wrapped with the resume-token committer.
-            yield ChangeEnvelope::from_parts(committer, batch, is_ready, false);
+            yield ChangeEnvelope::from_parts(committer, batch, is_ready, false, false);
 
             tracing::info!(
                 dataset = %dataset.name,
@@ -615,19 +615,6 @@ fn resolve_primary_keys(
         )));
     }
 
-    // Cayenne keeps one row per primary key on its own; the other upsert
-    // engines replace a row only through an `on_conflict` upsert keyed on it.
-    if !matches!(engine, Engine::Cayenne)
-        && !matches!(
-            acceleration.on_conflict.get(primary_key),
-            Some(OnConflictBehavior::Upsert(_))
-        )
-    {
-        return Err(data_components::cdc::StreamError::External(format!(
-            "mongodb change streams for dataset `{dataset_name}` require `acceleration.on_conflict` keyed on `primary_key` with `upsert` behavior so UPDATE events replace existing rows. Add: `on_conflict: {{ _id: upsert }}`."
-        )));
-    }
-
     for key in &primary_keys {
         if schema.field_with_name(key).is_err() {
             return Err(data_components::cdc::StreamError::External(format!(
@@ -792,7 +779,7 @@ mod tests {
     use datafusion_table_providers::util::{
         column_reference::ColumnReference, constraints::UpsertOptions,
     };
-    use runtime_component::dataset::acceleration::{Acceleration, RefreshMode};
+    use runtime_component::dataset::acceleration::{Acceleration, OnConflictBehavior, RefreshMode};
     use secrecy::SecretString;
     use std::collections::HashMap;
 
@@ -828,7 +815,7 @@ mod tests {
         );
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::Sqlite,
+            engine: Engine::Cayenne,
             refresh_mode: Some(RefreshMode::Changes),
             primary_key: Some(primary_key),
             on_conflict,
@@ -881,7 +868,7 @@ mod tests {
     fn rejects_missing_primary_key() {
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::Sqlite,
+            engine: Engine::Cayenne,
             refresh_mode: Some(RefreshMode::Changes),
             ..Default::default()
         };
@@ -891,22 +878,6 @@ mod tests {
             .expect_err("missing primary key should fail");
 
         assert!(error.to_string().contains("primary_key"));
-    }
-
-    #[test]
-    fn rejects_missing_upsert() {
-        let acceleration = Acceleration {
-            enabled: true,
-            engine: Engine::Sqlite,
-            refresh_mode: Some(RefreshMode::Changes),
-            primary_key: Some(ColumnReference::new(vec!["_id".to_string()])),
-            ..Default::default()
-        };
-
-        let dataset_name = datafusion::common::TableReference::bare("users");
-        let error = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema())
-            .expect_err("missing upsert should fail");
-        assert!(error.to_string().contains("on_conflict"));
     }
 
     #[test]
@@ -935,7 +906,7 @@ mod tests {
         );
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::Sqlite,
+            engine: Engine::Cayenne,
             refresh_mode: Some(RefreshMode::Changes),
             primary_key: Some(primary_key),
             on_conflict,
@@ -952,7 +923,7 @@ mod tests {
     fn rejects_composite_primary_key_before_missing_upsert() {
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::Sqlite,
+            engine: Engine::Cayenne,
             refresh_mode: Some(RefreshMode::Changes),
             primary_key: Some(ColumnReference::new(vec![
                 "_id".to_string(),
@@ -978,7 +949,7 @@ mod tests {
         );
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::Sqlite,
+            engine: Engine::Cayenne,
             refresh_mode: Some(RefreshMode::Changes),
             primary_key: Some(primary_key),
             on_conflict,

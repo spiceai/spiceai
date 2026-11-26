@@ -67,7 +67,9 @@ crates and runs, in order:
 1. `make lint-rust PACKAGES="…" FEATURES="…"` — lint the crates you touched
 2. `make nextest-packages PACKAGES="…" FEATURES="…"` — their unit tests
 3. `make lint-rust` — the full workspace lint
-4. `make nextest verify-cli` — all unit tests, then assert the `spice` binary exists
+4. `make nextest verify-cli` — all unit tests, then assert the `spice` binary exists.
+   The slowest tests are left to `trunk_tests.yml` (see *Trunk Health*); run them
+   with `make nextest-post-merge`.
 
 Steps 1-2 exist to fail fast: a lint or test failure in the crate you edited is
 the likeliest outcome, and step 3 is by far the longest, so covering your own
@@ -91,8 +93,9 @@ package defaults; the full workspace gate still runs.
 
 Nextest's test build also builds the CLI. `verify-cli` checks cargo's emitted
 artifacts and executes the CLI, using the same selection, features, and profile.
-The merge queue's required `Build (release profile)` job separately builds the
-CLI, `spiced`, and the release install.
+The merge queue's required `E2E Test CI` separately builds the CLI and `spiced`
+in the release profile, on Linux x86_64 and macOS aarch64, and runs its tests
+against those binaries.
 
 Sign-off clears inherited Make flags and nextest filters, profile, retry, and
 empty-suite overrides before invoking the gate. A focused `make nextest` remains
@@ -342,10 +345,10 @@ When you can't (or don't want to) run the checks on your machine, dispatch the
 **Remote Sign-off** GitHub Actions workflow on a self-hosted runner:
 
 ```bash
-make signoff-remote                 # current branch
+make signoff-remote                 # current branch; prints the command that watches the run
 # equivalent to:
-gh workflow run signoff.yml -f branch=<your-branch>
-gh run watch --workflow signoff.yml
+gh workflow run signoff.yml -f branch=<your-branch>   # prints the created run's URL
+gh run watch <run-id>                                  # the number that URL ends in
 ```
 
 Sign-off runs only where it is accountable: your machine, or the Actions
@@ -444,11 +447,12 @@ even when the check is already green, which is the one case the success path
 deliberately skips. If the status post itself fails, the run says so and leaves
 **Attestation** showing the previous sign-off; re-dispatch or push to move it.
 
-Two cases the re-run cannot cover, both reported by the run rather than hidden:
-an **Attestation** run that is still in flight may already have read the status
-this verdict replaced, so it can finish green and needs re-running by hand; and
-a HEAD that only merges the base branch can *inherit* an earlier sign-off, which
-the failing status on HEAD does not veto ([#12357](https://github.com/spiceai/spiceai/issues/12357)).
+One case the re-run cannot cover, reported by the run rather than hidden: an
+**Attestation** run that is still in flight may already have read the status
+this verdict replaced, so it can finish green and needs re-running by hand. A
+HEAD that only merges the base branch cannot inherit past the failure, because
+**Attestation** rejects a failed sign-off on HEAD before it looks for one to
+inherit.
 
 A branch whose sign-off keeps running out of budget is contending for the pool
 rather than doing anything wrong. Remote runs already skip the branch-scoped
@@ -461,8 +465,12 @@ SSH key access to the host and `gh` auth on that machine.
 
 ### A cancelled Remote Sign-off is not a failed one
 
-`signoff.yml` sets `concurrency: signoff-<pr|branch>` with `cancel-in-progress`, so
-re-dispatching sign-off for a branch cancels the run before it. A cancelled job is
+`signoff.yml` cancels in progress at two levels: the workflow's concurrency group
+is keyed on the dispatch input (`signoff-<pr|branch>`), and the sign-off job's on
+the commit that input resolves to (`signoff-commit-<sha>`). So re-dispatching
+sign-off for a branch cancels the run before it, and so does dispatching
+`-f pr_number=<N>` for a commit a `-f branch=<branch>` run is already signing off,
+or the other way round. A cancelled job is
 killed by signal, and a run that was signalled judged nothing — so it must publish
 no verdict at all, in either direction: not the `failure` that says the branch's
 checks failed, and not the `success` that would clear a branch whose checks were
@@ -501,10 +509,10 @@ that passed and cost another 1-4 hour run:
 
 - Its own `Sign off` step completed, and the cancel signal landed in the window
   before the correction ran.
-- A second run signed the same commit off. The concurrency group keys on the
-  dispatch *input*, so `-f branch=my-branch` and `-f pr_number=123` for that same
-  branch are different groups: they do not cancel each other, and either can be
-  cancelled after the other has succeeded.
+- An earlier run had already signed the same commit off. Runs for one commit
+  share the sign-off job's commit-keyed group whichever input dispatched them, so
+  they cancel each other rather than overlap; but a re-dispatch for a commit that
+  is already signed off can itself be cancelled, and it then finds that `success`.
 
 **It reads until the commit stops changing.** The `if: cancelled()` step starts
 when the `Sign off` step is *marked* cancelled, which is before that step's
@@ -757,6 +765,84 @@ reviews the change and signs off on your behalf (or pushes a small follow-up and
 signs off). This mirrors the trusted-committer model — the full suite in the
 merge queue is still the real gate.
 
+## Trunk Health
+
+Some tests run after merge rather than in the merge queue: `trunk_tests.yml`
+runs the comprehensive set on `trunk` every 12 hours. That includes the nextest
+tests the gate leaves out (`NEXTEST_POST_MERGE_FILTER` in the `Makefile`, run by
+`make nextest-post-merge`), which neither `make signoff` nor the merge queue runs. A failure it finds is
+tracked as an open issue labeled `trunk-broken`, or as an open PR labeled
+`fixes-trunk` that fixes or reverts it. The required **Trunk Health** check
+(`trunk_health.yml`) keeps those from being ignored.
+
+**It blocks merging when either holds:**
+
+- **Overdue:** an open `trunk-broken` issue or `fixes-trunk` PR has carried its
+  label for more than 24 hours. The age counts from the most recent time the
+  label was added. The 24 hours are for triage: a flake or an infrastructure
+  fault should not stop all merging before anyone has looked at it.
+- **Untriaged:** the last four completed scheduled `trunk_tests.yml` runs on `trunk`
+  failed (cancelled runs are skipped), nothing is labeled, and nobody has
+  triaged a trunk failure since the older of those runs started. Triage is
+  adding or removing a `trunk-broken` or `fixes-trunk` label, or closing an
+  item that carries one. Filing the failure as a `trunk-broken` issue clears
+  this and starts that issue's 24 hours; dismissing an item or merging its fix
+  clears it until four more runs fail. Four is high on purpose: the labeled
+  items are the gate, and this only catches a failure nobody filed.
+
+**A PR may merge anyway when any holds:**
+
+- it is labeled `fixes-trunk`;
+- it closes, by a closing keyword such as `Fixes #N`, an issue labeled
+  `trunk-broken` (a plain mention does not count, nor does closing an
+  unlabeled issue);
+- it is a pure revert from a branch of this repository, by the same rule as
+  [Reverts are fast-tracked](#reverts-are-fast-tracked)
+  (`.github/scripts/pure_revert.mjs`). The rule reads the revert footers and
+  does not prove the changes undo the commits, so a fork's revert needs the
+  `fixes-trunk` label instead.
+
+The merge queue merges up to three entries together once the last one's checks
+pass, so the entries queued ahead of a PR merge on its run as well. In the
+merge queue the gate therefore judges every PR the group would merge: its own
+and those ahead of it not yet on `trunk`. A fix can't carry an unrelated PR
+past the block by being queued behind it.
+
+**Removing the label is the only override.** If an item should not block
+merging (a flake, an infrastructure fault, a failure in a test that is being
+retired), a maintainer removes its label. That is visible in the issue's
+history and needs no admin bypass. It also counts as triage, so the failed runs
+before it do not trip the untriaged condition; a failure that keeps happening
+trips it again after four more failed runs.
+
+**Where it runs.** It reports on the same branches as the other required checks, and guards only `trunk`: for a PR into a release or feature branch it passes at once, so a broken trunk never blocks a release fix. The merge-queue run is the one that blocks. The run on a
+pull request is advisory: it always passes, and when merging is blocked it
+posts one comment listing the blocking items and how to unblock. The run
+repeats only on the PR's own events (a push, a label, an edit), so the comment
+shows trunk's state as of the PR's last event: it can say blocked after the
+block cleared, and a PR that sees no events gets no warning when an item
+becomes overdue. The merge-queue run always reads the current state. A fork's
+token cannot comment, so on a fork PR the report is in the job summary. The
+gate reads labels, label events, workflow runs and the PR's closing issues
+with the job's token, and runs `.github/scripts/trunk_health.mjs` from the
+base commit, never the PR's. The workflow file that runs it still comes from
+the PR, as for every check here, so a change to `trunk_health.yml` or to the
+gate's script is a change to the gate and gets the same review as any other
+`.github/` change (CODEOWNERS). When it cannot read that state in the merge
+queue, it fails closed; re-run the check. Only closing links to this
+repository's issues count toward the exemption.
+
+Anyone with triage permission can add or remove the labels, so they can block
+or unblock merging: the same trust level as approving or enqueueing a PR.
+
+**Rollout.** Once `trunk_health.yml` is on `trunk`, a maintainer creates the
+two labels (`gh label create trunk-broken`, `gh label create fixes-trunk`) and
+runs `scripts/signoff install --yes`, which adds `Trunk Health` to the required
+checks (see [Configure the ruleset](#configure-the-ruleset)). Until then the
+check runs but does not block. It is safe to require before
+`trunk_tests.yml` exists: with no such workflow, the untriaged condition
+stays off.
+
 ## For maintainers
 
 ### What runs where
@@ -782,7 +868,6 @@ Required checks in the merge queue (the `trunk` ruleset):
 - `enforce-pull-with-spice`
 - `Rust Lint`
 - `Build and Test`
-- `Build (release profile)`
 - `Integration Tests (part 1/2/3)`
 - `ADBC Integration Tests`
 - `Check Rust Licenses`
@@ -798,8 +883,10 @@ and a required check nothing reports blocks every pull request instead of
 passing it. Re-enable the workflow before adding it back to `REQUIRED_CHECKS`.
 
 Advisory checks that also run on `merge_group` but don't block (they can be
-promoted to required with a gate job later): `integration tests (llms)`,
-`Elasticsearch Integration Tests`, `Helm Lint`.
+promoted to required with a gate job later): `Elasticsearch Integration Tests`,
+`Helm Lint`. The model integration tests (`integration tests (llms)`) run after
+merge instead: on a push that touches the model crates, and in every
+`trunk_tests.yml` run, where a failure counts toward Trunk Health.
 
 GitHub uses one required-checks list both before queue entry and on the merge
 queue commit. Therefore every required workflow triggers on both `pull_request`

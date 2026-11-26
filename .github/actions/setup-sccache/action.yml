@@ -102,6 +102,13 @@ runs:
         elif [[ -n "${MINIO_ACCESS_KEY}" && -n "${MINIO_SECRET_KEY}" && -n "${MINIO_SESSION_TOKEN}" ]]; then
           echo "Temporary credentials go to the cache server only; leaving them out of the job environment."
         elif [[ -n "${MINIO_ACCESS_KEY}" && -n "${MINIO_SECRET_KEY}" ]]; then
+          # Appended to $GITHUB_ENV as NAME=value: a newline would inject more entries.
+          for value in "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}"; do
+            if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+              echo "::error::setup-sccache: MinIO credentials must not contain a newline"
+              exit 1
+            fi
+          done
           echo "AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY}" >> $GITHUB_ENV
           echo "AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_KEY}" >> $GITHUB_ENV
         else
@@ -118,6 +125,8 @@ runs:
     - name: Set up sccache (Linux)
       if: runner.os == 'Linux' && inputs.minio_endpoint != ''
       shell: bash
+      env:
+        INPUT_MINIO_ENDPOINT: ${{ inputs.minio_endpoint }}
       run: |
         sudo apt-get update && sudo apt-get install wget -y
         wget -q https://github.com/mozilla/sccache/releases/download/v0.9.1/sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
@@ -126,11 +135,14 @@ runs:
         echo "SCCACHE_CACHE_SIZE=4T" >> $GITHUB_ENV
         : "${SCCACHE_CONF:=${RUNNER_TEMP}/sccache/config}"
         mkdir -p "$(dirname "${SCCACHE_CONF}")"
-        printf '[cache.s3]\nbucket = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = false\nregion = "us-east-1"\n' "${{ inputs.minio_endpoint }}" > "${SCCACHE_CONF}"
+        printf '[cache.s3]\nbucket = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = false\nregion = "us-east-1"\n' "${INPUT_MINIO_ENDPOINT}" > "${SCCACHE_CONF}"
 
     - name: Set up sccache (macOS)
       if: runner.os == 'macOS' && (inputs.minio_endpoint != '' || inputs.spiceio_endpoint != '')
       shell: bash
+      env:
+        INPUT_SPICEIO_ENDPOINT: ${{ inputs.spiceio_endpoint }}
+        INPUT_MINIO_ENDPOINT: ${{ inputs.minio_endpoint }}
       run: |
         if ! command -v sccache &> /dev/null; then
           echo "::warning::sccache is not installed on this macOS runner; building without the compiler cache."
@@ -143,14 +155,14 @@ runs:
         SCCACHE_NO_CREDS="false"
 
         # Use spiceio if its endpoint was provided
-        if [[ -n "${{ inputs.spiceio_endpoint }}" ]]; then
-          SCCACHE_ENDPOINT="${{ inputs.spiceio_endpoint }}"
+        if [[ -n "${INPUT_SPICEIO_ENDPOINT}" ]]; then
+          SCCACHE_ENDPOINT="${INPUT_SPICEIO_ENDPOINT}"
           SCCACHE_REGION="us-west-1"
           SCCACHE_NO_CREDS="true"
           echo "SCCACHE_CACHE_SIZE=2T" >> $GITHUB_ENV
           echo "Using spiceio at $SCCACHE_ENDPOINT"
-        elif [[ -n "${{ inputs.minio_endpoint }}" ]]; then
-          SCCACHE_ENDPOINT="${{ inputs.minio_endpoint }}"
+        elif [[ -n "${INPUT_MINIO_ENDPOINT}" ]]; then
+          SCCACHE_ENDPOINT="${INPUT_MINIO_ENDPOINT}"
           echo "SCCACHE_CACHE_SIZE=200G" >> $GITHUB_ENV
           echo "Using MinIO at $SCCACHE_ENDPOINT"
         else
@@ -165,6 +177,8 @@ runs:
     - name: Set up sccache (Windows)
       if: runner.os == 'Windows' && inputs.minio_endpoint != ''
       shell: pwsh
+      env:
+        INPUT_MINIO_ENDPOINT: ${{ inputs.minio_endpoint }}
       run: |
         $ErrorActionPreference = 'Stop'
         # Download and install sccache
@@ -192,7 +206,7 @@ runs:
         }
         $configDir = Split-Path $configPath -Parent
         New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-        $config = "[cache.s3]`nbucket = `"sccache`"`nendpoint = `"${{ inputs.minio_endpoint }}`"`nuse_ssl = false`nserver_side_encryption = false`nno_credentials = false`nregion = `"us-east-1`""
+        $config = "[cache.s3]`nbucket = `"sccache`"`nendpoint = `"${env:INPUT_MINIO_ENDPOINT}`"`nuse_ssl = false`nserver_side_encryption = false`nno_credentials = false`nregion = `"us-east-1`""
         $config | Out-File -FilePath $configPath -Encoding utf8
 
     - name: Confirm the compiler cache answers before wrapping rustc

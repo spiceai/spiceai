@@ -2,6 +2,8 @@
 name: Cayenne object-native
 
 # Checks the object-native metastore model, stores, and conditional writes.
+# Pull requests and the merge queue run the quick set; trunk_tests.yml calls
+# this with `set: all` so a failure of the deep set counts toward Trunk Health.
 on:
   pull_request:
     paths:
@@ -18,13 +20,21 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
   merge_group:
-  # Nightly: every run, including the controls.
-  schedule:
-    - cron: '30 7 * * *'
+  workflow_call:
+    inputs:
+      ref:
+        description: 'The commit to test (default: the calling run''s commit)'
+        required: false
+        type: string
+        default: ''
+      set:
+        description: 'quick (the pull-request set) or all (the trunk tests set)'
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       set:
-        description: 'quick (the pull-request set) or all (the nightly set)'
+        description: 'quick (the pull-request set) or all (the trunk tests set)'
         type: choice
         options: [quick, all]
         default: quick
@@ -32,22 +42,30 @@ on:
 permissions:
   contents: read
 
+# A call runs under its caller's ref and event, so it keys on its own run and
+# never cancels, or is cancelled by, another run.
 concurrency:
-  group: cayenne-object-native-${{ github.ref }}-${{ github.event_name }}
+  group: cayenne-object-native-${{ github.ref }}-${{ github.event_name }}${{ inputs.ref && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 
 env:
+  # The CI cache's anonymous read URL (.github/ci-cache/README.md). setup-rust and
+  # install-cargo-deny read pinned downloads from it, falling back to the source; empty
+  # where the repository has no CI object store, which turns the cache off.
+  CI_CACHE_URL: ${{ vars.TEST_MINIO_ENDPOINT && format('{0}/ci-cache', vars.TEST_MINIO_ENDPOINT) || '' }}
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUSTC_WRAPPER: ''
   RUSTC_WORKSPACE_WRAPPER: ''
-  # The suites that read and write data files: the property and model fuzz
-  # lanes, deletion vectors, reclamation, per-dataset stores and object-native data.
+  # The suites that read and write data files: every `test_on_data_store!` test, the property
+  # and model fuzz lanes, deletion vectors, reclamation, per-dataset stores and object-native data.
   SUITES: >-
+    test(/_on_data_store$/) |
     test(/^mutation_property_test::/) | test(/^mutation_model_test::/) |
     test(/^deletion_vector/) | test(/^orphan_dv_compaction_test::/) |
     test(/^object_store_reclaim_test::/) | test(/^per_dataset_store_test::/) |
-    test(/^object_native_data_test::/) | test(/^snapshot_cleanup_convergence_test::/)
+    test(/^object_native_data_test::/) | test(/^snapshot_cleanup_convergence_test::/) |
+    test(/^uncommitted_file_adoption_test::/)
 
 jobs:
   changes:
@@ -57,9 +75,9 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      model: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || steps.paths.outputs.model == 'true' }}
-      stores: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || steps.paths.outputs.stores == 'true' }}
-      object_store_occ: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || steps.paths.outputs.object_store_occ == 'true' }}
+      model: ${{ (github.event_name != 'pull_request' && github.event_name != 'merge_group') || steps.paths.outputs.model == 'true' }}
+      stores: ${{ (github.event_name != 'pull_request' && github.event_name != 'merge_group') || steps.paths.outputs.stores == 'true' }}
+      object_store_occ: ${{ (github.event_name != 'pull_request' && github.event_name != 'merge_group') || steps.paths.outputs.object_store_occ == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -101,10 +119,7 @@ jobs:
 
   model:
     needs: changes
-    concurrency:
-      group: cayenne-metastore-model-${{ github.ref }}-${{ github.event_name }}
-      cancel-in-progress: true
-    name: Check the metastore model (${{ (github.event_name == 'schedule' || inputs.set == 'all') && 'all' || 'quick' }})
+    name: Check the metastore model (${{ inputs.set == 'all' && 'all' || 'quick' }})
     # Runs the change's code on persistent self-hosted runners, so fork and
     # Dependabot pull requests run it only from the merge queue.
     if: >-
@@ -114,16 +129,17 @@ jobs:
       github.event.pull_request.user.login != 'dependabot[bot]'))
     environment: secret-free
     runs-on: spiceai-dev-runners
-    # `quick` took 40 s on a 16-core Mac; `all` is not yet timed.
-    timeout-minutes: ${{ (github.event_name == 'schedule' || inputs.set == 'all') && 720 || 60 }}
+    # Build included, on the dev runners: `quick` 14-20 min, `all` 55-62 min.
+    timeout-minutes: ${{ inputs.set == 'all' && 180 || 60 }}
     env:
       CARGO_INCREMENTAL: 0
       RUSTC_WRAPPER: ''
       RUSTC_WORKSPACE_WRAPPER: ''
-      SET: ${{ (github.event_name == 'schedule' || inputs.set == 'all') && 'all' || 'quick' }}
+      SET: ${{ inputs.set == 'all' && 'all' || 'quick' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
           # The merge-group path filter diffs against the queue's base.
           fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}
@@ -153,38 +169,44 @@ jobs:
       - name: Check the design documents' model citations
         run: target/release/cayenne-metastore-model cite-check docs/design/object-native-metastore.md docs/design/object-native-metastore-technical.md
       - name: Run the ${{ env.SET }} model set
+        if: ${{ !cancelled() }}
         # Controls (in `all`) require EXHAUST=1.
         env:
           EXHAUST: ${{ env.SET == 'all' && '1' || '' }}
         run: target/release/cayenne-metastore-model "$SET"
 
-  # The data-path suites on an S3-compatible store: a RustFS container stands
-  # in for S3, so the suites see real HTTP, conditional writes and ranged reads.
-  s3:
+  # The data-path suites on each store: `rustfs` is a RustFS container standing
+  # in for S3 (real HTTP, conditional writes and ranged reads), `memory` an
+  # in-process store, and `local-location` a local directory.
+  data-path:
     needs: changes
-    concurrency:
-      group: cayenne-data-store-s3-${{ github.ref }}-${{ github.event_name }}
-      cancel-in-progress: true
-    name: Object-native (rustfs)
+    name: Object-native (${{ matrix.store }})
     # Runs the change's code on persistent self-hosted runners, so fork and
     # Dependabot pull requests run it only from the merge queue.
     if: >-
-      needs.changes.outputs.stores == 'true' && github.event_name != 'schedule' &&
+      needs.changes.outputs.stores == 'true' &&
       (github.event_name != 'pull_request' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.login != 'dependabot[bot]'))
     environment: secret-free
     runs-on: spiceai-dev-runners
-    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        store: ${{ fromJSON(inputs.set == 'all' && '["memory", "local-location", "rustfs"]' || '["rustfs", "memory"]') }}
+    # At 0.25 the build takes about 25 min and the suites about 8. Full depth
+    # has 4x the seeds and 4x the ops; it is not yet timed, so allow 16x.
+    timeout-minutes: ${{ inputs.set == 'all' && 180 || 120 }}
     env:
-      CAYENNE_TEST_DATA_STORE: rustfs
-      # Bounded seeds: the job runs on every qualifying pull request.
-      CAYENNE_PROPTEST_SCALE: '0.25'
-      CAYENNE_PROPTEST_OPS_SCALE: '0.25'
+      CAYENNE_TEST_DATA_STORE: ${{ matrix.store }}
+      # Bounded seeds on pull requests and the merge queue; full depth in `all`.
+      CAYENNE_PROPTEST_SCALE: ${{ inputs.set == 'all' && '1' || '0.25' }}
+      CAYENNE_PROPTEST_OPS_SCALE: ${{ inputs.set == 'all' && '1' || '0.25' }}
       RUSTFS_CONTAINER: cayenne-data-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
           fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}
       - uses: $/.github/actions/setup-rust
@@ -194,6 +216,7 @@ jobs:
       - uses: $/.github/actions/setup-nextest
 
       - name: Start RustFS
+        if: matrix.store == 'rustfs'
         env:
           ACCESS_KEY: cayenne-data
           SECRET_KEY: cayenne-data-secret
@@ -229,25 +252,22 @@ jobs:
 
       # retries = 0: a seeded walk that fails prints its seed and history, and a
       # retry could only hide it.
-      - name: Run the data-path suites on S3
+      - name: Run the data-path suites on ${{ matrix.store }}
         # Tests named `_sqlite` run on SQLite whatever the store, so sign-off covers them.
         run: cargo nextest run --locked -p cayenne --test integration --retries 0 --no-fail-fast -E "($SUITES) - test(/_sqlite$/)"
       # What Cayenne's data path needs from an S3-compatible store.
       - name: Run the S3 store conformance test
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.store == 'rustfs' }}
         run: cargo nextest run --locked -p cayenne --test integration --retries 0 -E 'test(/^rustfs_store_conformance_test::/)'
 
       - name: Stop RustFS
-        if: always()
+        if: always() && matrix.store == 'rustfs'
         run: |
           docker logs "$RUSTFS_CONTAINER" 2>&1 | tail -n 200 || true
           docker rm -f "$RUSTFS_CONTAINER" > /dev/null 2>&1 || true
 
   object_store_occ:
     needs: changes
-    concurrency:
-      group: cayenne-object-store-occ-${{ github.ref }}-${{ github.event_name }}
-      cancel-in-progress: true
     name: Object store OCC
     # Runs the change's code on persistent self-hosted runners, so fork and
     # Dependabot pull requests run it only from the merge queue.
@@ -262,6 +282,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
           fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}
       - uses: $/.github/actions/setup-rust
