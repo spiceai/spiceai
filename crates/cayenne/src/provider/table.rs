@@ -3062,6 +3062,12 @@ pub struct CayenneTableProvider {
     /// not see. Consumed on first fire.
     #[cfg(test)]
     test_after_small_file_list_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired after a read of the inline rows has populated the
+    /// shared inline cache and before it takes its result, so a test can land the
+    /// store of another reader that populated it for an older generation.
+    /// Consumed on first fire.
+    #[cfg(test)]
+    test_after_inline_populate_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Test-only probe of the writer-concurrent full rewrite's capture, so a test
     /// can order a staged write's publish against it. Consumed on first fire.
     #[cfg(test)]
@@ -12456,6 +12462,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_after_small_file_list_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_after_inline_populate_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_rewrite_capture_probe: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_rewrite_post_capture_hook: Arc::new(ParkingMutex::new(None)),
@@ -15037,6 +15045,8 @@ impl CayenneTableProvider {
             test_pre_rewrite_commit_hook: Arc::clone(&self.test_pre_rewrite_commit_hook),
             #[cfg(test)]
             test_after_small_file_list_hook: Arc::clone(&self.test_after_small_file_list_hook),
+            #[cfg(test)]
+            test_after_inline_populate_hook: Arc::clone(&self.test_after_inline_populate_hook),
             #[cfg(test)]
             test_rewrite_capture_probe: Arc::clone(&self.test_rewrite_capture_probe),
             #[cfg(test)]
@@ -36906,9 +36916,20 @@ impl CayenneTableProvider {
         }
 
         let current_gen = self.inlined_generation.load(Ordering::Acquire);
-        // Cache miss: populate both `batches` and `view` together.
-        self.populate_inlined_cache(current_gen).await?;
-        Ok((*self.inlined_cache.load().batches).clone())
+        // Cache miss: populate both `batches` and `view` together, and return the
+        // view built for `current_gen`. The shared slot may already hold another
+        // reader's view of an older generation (the last store wins), and a caller
+        // that acts on the rows, such as a flush that then clears them, must get
+        // the ones it read.
+        let built = self.populate_inlined_cache(current_gen).await?;
+        #[cfg(test)]
+        {
+            let hook = self.test_after_inline_populate_hook.lock().take();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+        Ok((*built.batches).clone())
     }
 
     /// The inline rows a key-set rebuild folds in: inside a same-record scope
@@ -36952,8 +36973,8 @@ impl CayenneTableProvider {
                 return Ok(Arc::clone(&cached.view));
             }
         }
-        self.populate_inlined_cache(current_gen).await?;
-        Ok(Arc::clone(&self.inlined_cache.load().view))
+        let built = self.populate_inlined_cache(current_gen).await?;
+        Ok(Arc::clone(&built.view))
     }
 
     /// Materialize the inline view for `generation` into `inlined_cache`,
@@ -36987,8 +37008,10 @@ impl CayenneTableProvider {
     /// the same generation read the same corpus and produce identical views; the
     /// last `ArcSwap::store` wins. If a writer bumps the generation between the
     /// caller's load and this store, the stored entry simply misses next read and
-    /// is recomputed — no data is lost or corrupted.
-    async fn populate_inlined_cache(&self, generation: u64) -> Result<()> {
+    /// is recomputed. A caller uses the view this returns, the one built for
+    /// `generation`, never the shared slot, which another reader may have
+    /// overwritten with an older view by the time it looks.
+    async fn populate_inlined_cache(&self, generation: u64) -> Result<Arc<InlinedCache>> {
         // cycle-5 TASK 1: if the pending tombstone-delta queue has outgrown its
         // cap, take the bounded over-cap path (full rebuild + queue release). The
         // common per-batch single-tombstone case stays well under the cap and
@@ -37027,8 +37050,9 @@ impl CayenneTableProvider {
         // the ordered queue's back) — O(new deltas), not O(queue). The queue is
         // bounded by `rebuild_inlined_cache_over_cap` and fully cleared at
         // checkpoint/overwrite/recovery.
-        self.inlined_cache.store(Arc::new(new_cache));
-        Ok(())
+        let built = Arc::new(new_cache);
+        self.inlined_cache.store(Arc::clone(&built));
+        Ok(built)
     }
 
     /// Over-cap fallback for [`Self::populate_inlined_cache`] (cycle-5 TASK 1):
@@ -37048,7 +37072,7 @@ impl CayenneTableProvider {
     /// at/below the seq captured BEFORE the corpus read (deltas pushed afterward
     /// have higher seqs and are retained), and the corpus read reflects every
     /// tombstone, so the released queue cannot drop a still-needed removal.
-    async fn rebuild_inlined_cache_over_cap(&self) -> Result<()> {
+    async fn rebuild_inlined_cache_over_cap(&self) -> Result<Arc<InlinedCache>> {
         // Capture the queue seq to drain through BEFORE the corpus read so a
         // tombstone published during the rebuild (higher seq) is retained.
         let drain_through = self.pending_tombstone_deltas.lock().seq;
@@ -37070,8 +37094,9 @@ impl CayenneTableProvider {
             .lock()
             .drain_through(drain_through);
 
-        self.inlined_cache.store(Arc::new(new_cache));
-        Ok(())
+        let built = Arc::new(new_cache);
+        self.inlined_cache.store(Arc::clone(&built));
+        Ok(built)
     }
 
     /// Full rebuild: read the entire `cayenne_inlined_data` corpus, decode each
@@ -37945,6 +37970,10 @@ impl CayenneTableProvider {
         // completes (a durable-publish burst) would starve this capture indefinitely.
         let capture_wait_start = Instant::now();
         let mut capture_attempts: u32 = 0;
+        // The view the last miss rebuilt, for its generation: on the final attempt
+        // this is what the scan takes, never the shared slot, which another reader
+        // may have overwritten with an older view since.
+        let mut rebuilt_view: Option<Arc<Vec<Arc<InlinedViewEntry>>>> = None;
         let (deletion_snapshot, protected_map, inlined_view) = loop {
             capture_attempts += 1;
             let final_attempt = capture_attempts >= Self::MAX_SCAN_CAPTURE_ATTEMPTS;
@@ -37966,7 +37995,9 @@ impl CayenneTableProvider {
                              view (the deletion + tier snapshots captured in \
                              this same block keep visibility correct)"
                         );
-                        Some(Arc::clone(&self.inlined_cache.load().view))
+                        Some(rebuilt_view.take().unwrap_or_else(|| {
+                            Arc::clone(&self.inlined_cache.load().view)
+                        }))
                     }
                     None => None,
                 };
@@ -37983,12 +38014,12 @@ impl CayenneTableProvider {
                 break captured;
             }
 
-            self.read_inlined_batches().await.map_err(|e| {
+            rebuilt_view = Some(self.cached_inlined_view().await.map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(
                     "Failed to read inlined data for table {}: {e}",
                     self.table_metadata.table_name
                 ))
-            })?;
+            })?);
         };
 
         // Capture the complete warm file set under the fence. Pinning a snapshot
