@@ -1229,7 +1229,7 @@ async fn attach_member(
             tracing::warn!(
                 dataset = %dataset_name,
                 connection = %source.key.label(),
-                "Dataset '{dataset_name}' has no binlog position it can resume from and its acceleration may already hold rows, so it will be rebuilt from the source before changes are applied"
+                "Dataset '{dataset_name}' does not resume from a recorded binlog position and its acceleration may already hold rows, so it will be rebuilt from the source before changes are applied"
             );
             // No snapshot runs on this path — the consumer's rebuild replaces it
             // — so the gauge's "finished, or skipped" state is reached here.

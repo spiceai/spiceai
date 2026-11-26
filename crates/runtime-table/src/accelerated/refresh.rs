@@ -1515,8 +1515,6 @@ impl Refresher {
                     }
                     Some(checkpointer) => Some(tokio::spawn(clear_changes_loaded(
                         checkpointer,
-                        Arc::clone(&checkpoint_schema),
-                        Arc::clone(&self.accelerator_write_mutex),
                         dataset_name.clone(),
                     ))),
                     None => None,
@@ -2016,7 +2014,11 @@ fn record_changes_loaded(
         // A mark from an earlier run stays valid if this write fails.
         let marked_before = records_changes_loaded(&checkpointer).await;
         let report = |cause: &dyn std::fmt::Display| {
-            if !marked_before && !runtime_status.is_shutdown() {
+            if marked_before || runtime_status.is_shutdown() {
+                tracing::debug!(
+                    "Dataset '{dataset_name}' did not update the record that its acceleration is loaded; the earlier record stays. Cause: {cause}"
+                );
+            } else {
                 tracing::warn!(
                     "Dataset '{dataset_name}' could not record its acceleration as loaded, so the next start waits for its source before serving it. Cause: {cause}. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
                 );
@@ -2043,21 +2045,16 @@ fn record_changes_loaded(
     }
 }
 
-/// Rewrites a checkpoint marked as loaded by a change stream without the mark.
+/// Deletes a checkpoint marked as loaded by a change stream, so the dataset starts
+/// as a change stream that never wrote one.
 async fn clear_changes_loaded(
     checkpointer: Arc<dyn DatasetCheckpointer>,
-    checkpoint_schema: Arc<Schema>,
-    accelerator_write_mutex: Arc<Mutex<()>>,
     dataset_name: TableReference,
 ) {
     if !records_changes_loaded(&checkpointer).await {
         return;
     }
-    let written = {
-        let _guard = accelerator_write_mutex.lock().await;
-        checkpointer.checkpoint(&checkpoint_schema, None).await
-    };
-    if let Err(error) = written {
+    if let Err(error) = checkpointer.delete().await {
         tracing::warn!(
             "Dataset '{dataset_name}' could not clear the record that its acceleration is loaded, so if its configuration later allows it, a restart may serve this acceleration before its source answers. Cause: {error}. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
         );
@@ -2735,7 +2732,7 @@ mod tests {
         assert!(checkpointer.stored().is_none());
     }
 
-    /// A stale mark is cleared; an unmarked checkpoint is left alone.
+    /// A marked checkpoint is deleted; an unmarked one is left alone.
     #[tokio::test]
     async fn a_dataset_not_served_from_its_acceleration_clears_the_loaded_mark() {
         let schema = changes_checkpoint_schema();
@@ -2743,30 +2740,24 @@ mod tests {
         let clear = |checkpointer: &Arc<StoringCheckpointer>| {
             clear_changes_loaded(
                 Arc::clone(checkpointer) as Arc<dyn DatasetCheckpointer>,
-                Arc::clone(&schema),
-                Arc::new(Mutex::new(())),
                 TableReference::bare("orders"),
             )
         };
-
-        clear(&checkpointer).await;
-        assert!(
-            checkpointer.stored().is_none(),
-            "nothing to clear without a checkpoint"
-        );
 
         *checkpointer.schema.lock() = Some(
             super::super::checkpoint_primary_key::with_changes_loaded(&schema),
         );
         clear(&checkpointer).await;
-        let stored = checkpointer.stored().expect("the checkpoint is rewritten");
-        assert!(!super::super::checkpoint_primary_key::records_changes_loaded(&stored));
-        assert_eq!(stored.fields(), schema.fields());
+        assert!(
+            checkpointer.stored().is_none(),
+            "a marked checkpoint is deleted"
+        );
 
+        *checkpointer.schema.lock() = Some(Arc::clone(&schema));
         clear(&checkpointer).await;
         let unchanged = checkpointer.stored().expect("the checkpoint is kept");
         assert!(
-            Arc::ptr_eq(&stored, &unchanged),
+            Arc::ptr_eq(&schema, &unchanged),
             "an unmarked checkpoint is left alone"
         );
     }

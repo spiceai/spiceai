@@ -4961,6 +4961,15 @@ impl DataFusion {
             if partition_scope.is_some() && acceleration == AccelerationContents::NonEmpty {
                 acceleration = AccelerationContents::Unknown;
             }
+            // A dataset served from its acceleration is queried while it loads, so an
+            // acceleration observed empty is reported as unproven: any load must then
+            // replace it atomically rather than fill it in place.
+            if resumes_changes
+                && source_table_provider.awaits_source()
+                && acceleration.is_provably_empty()
+            {
+                acceleration = AccelerationContents::Unknown;
+            }
 
             let changes_stream = source
                 .changes_stream(
