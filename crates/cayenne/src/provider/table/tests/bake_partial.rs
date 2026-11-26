@@ -843,3 +843,88 @@ async fn a_productive_bake_that_leaves_the_index_over_its_trigger_keeps_it() {
         before - residual
     );
 }
+
+/// A table whose data is in the object-native location names each snapshot's
+/// files in its manifest and carries no file by a link or a copy, so its bake
+/// keeps no input file: it rewrites every one, and commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bake_in_the_object_native_location_rewrites_every_file() {
+    use crate::metadata::ObjectStoreConfig;
+    use crate::metastore::object_native::{ObjectNativeCatalog, new_dataset_folder};
+    use object_store::memory::InMemory;
+
+    let name = "bake_partial_object_native";
+    let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let catalog = ObjectNativeCatalog::open_or_create_at(
+        Arc::clone(&bucket),
+        ObjectStorePath::from("state/cayenne/v1/catalog"),
+        "s3://bucket/state/cayenne/v1",
+    )
+    .await
+    .expect("open the object-native catalog");
+    catalog.init().await.expect("init the catalog");
+    let data_url = format!(
+        "s3://bucket/{}/{}/data",
+        catalog.datasets_prefix(),
+        new_dataset_folder(name)
+    );
+    let ctx = SessionContext::new();
+    // Registered as a deployment registers its bucket, so a scan of the
+    // table's files resolves the store.
+    ctx.runtime_env().register_object_store(
+        &url::Url::parse("s3://bucket").expect("bucket url"),
+        Arc::clone(&bucket),
+    );
+    let provider = CayenneTableProviderBuilder::new(Arc::new(catalog), ctx.runtime_env())
+        .with_object_store(ObjectStoreConfig {
+            url: url::Url::parse(&data_url).expect("data url"),
+            store: Arc::clone(&bucket),
+        })
+        .create(CreateTableOptions {
+            table_name: name.to_string(),
+            schema: schema(Key::Composite),
+            primary_key: Key::Composite.columns(),
+            on_conflict: Some(on_conflict(Key::Composite)),
+            base_path: data_url.clone(),
+            partition_column: None,
+            vortex_config: config(),
+        })
+        .await
+        .expect("create the table in the object-native location");
+    assert!(
+        provider.data_in_object_native_location(),
+        "precondition: the table's data is in the object-native location"
+    );
+    provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+    // Any file may be kept by size, so only the location decides.
+    provider.test_bake_files.lock().link_min_file_bytes = Some(0);
+
+    // A first checkpoint of keys no later write touches holds no row the bake
+    // deletes, so a split would keep its files; the checkpoints after it replay
+    // and delete each other's keys, leaving tombstones to bake.
+    let mut model = Model::new();
+    let untouched: Vec<(i64, i64)> = (1_000_000..1_000_000 + ROWS_PER_CHECKPOINT)
+        .map(|ts| (ts, -1))
+        .collect();
+    for (ts, v) in &untouched {
+        model.insert((*ts, hash_of(*ts)), *v);
+    }
+    upsert(&provider, Key::Composite, &untouched).await;
+    provider.checkpoint_mem_tier().await.expect("checkpoint");
+    write_checkpoints_keyed(&[(&provider, Key::Composite)], &mut model, 0..6, true).await;
+    assert!(
+        provider.pk_deletion_snapshot().delete_len() > 0,
+        "precondition: the replays and deletes left tombstones"
+    );
+    bake(&provider, "a table in the object-native location").await;
+    assert_eq!(
+        provider.test_bake_files.lock().last,
+        None,
+        "the bake rewrote every input file and kept none"
+    );
+    assert_rows(
+        &rows_of(&provider, name, Key::Composite).await,
+        &model,
+        "after a bake in the object-native location",
+    );
+}

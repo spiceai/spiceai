@@ -33412,8 +33412,11 @@ impl CayenneTableProvider {
     /// a row from them (see [`Self::bake_file_holds_deleted_rows`]), or `None`
     /// when the bake must rewrite every file: no file can be kept, the table keeps
     /// state keyed by file path that a linked file would lose (a secondary
-    /// index, position deletes), or its layout requires the rewrite (cluster or
-    /// authoritative sort columns).
+    /// index, position deletes), its layout requires the rewrite (cluster or
+    /// authoritative sort columns), or its data is in the object-native location,
+    /// which carries a file into a snapshot only by naming it in the manifest,
+    /// never by the link or copy that keeps a file here
+    /// ([`Self::link_or_copy_snapshot_files`]).
     ///
     /// Each input is split over one capture of its directory listing — what its
     /// scan reads — so its rewritten and kept files are exactly its files. A file
@@ -33433,6 +33436,7 @@ impl CayenneTableProvider {
             || self.holds_position_deletes()
             || self.context.has_cluster_by()
             || self.context.sort_columns_are_authoritative()
+            || self.data_in_object_native_location()
             || pk_indices.is_empty()
         {
             return None;
