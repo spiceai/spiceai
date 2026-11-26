@@ -11,6 +11,12 @@ inputs:
     description: whether to include evidence in the question
     required: false
     default: 'false'
+  bird_bench_commit:
+    description: >-
+      Full commit SHA of spiceai/spice-bird-bench to check out; its spicepods and data are
+      what the benchmark loads.
+    required: false
+    default: 'd236fc0be5e1e43bbb18159f1e1924b8cf6c45c8'
 
 outputs:
   spicepod_dependency:
@@ -45,33 +51,53 @@ runs:
         New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 
     # actions/checkout should not be used with composite actions. Would reset workspace/github repo state.
+    # Only the pinned commit is fetched, by its SHA, and checked out; nothing reads the default
+    # branch. git checks every object it fetches against the SHA that names it.
     - name: Clone bird-bench repo (no checkout action) (Linux/macOS)
       if: runner.os != 'Windows'
       shell: bash
+      env:
+        BIRD_BENCH_COMMIT: ${{ inputs.bird_bench_commit }}
       run: |
         set -euxo pipefail
+        if ! [[ "$BIRD_BENCH_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::error::bird_bench_commit must be a full commit SHA of spiceai/spice-bird-bench, got '$BIRD_BENCH_COMMIT'."
+          exit 1
+        fi
 
-        git clone \
-          --depth 1 \
-          --filter=blob:none \
-          --sparse \
-          https://github.com/spiceai/spice-bird-bench.git bird-bench
-
+        git init -q bird-bench
         cd bird-bench
+        git remote add origin https://github.com/spiceai/spice-bird-bench.git
         git sparse-checkout set dev_20240627
+        git fetch --depth 1 --filter=blob:none origin "$BIRD_BENCH_COMMIT"
+        git checkout -q --detach FETCH_HEAD
+        test "$(git rev-parse HEAD)" = "$BIRD_BENCH_COMMIT"
 
     - name: Clone bird-bench repo (no checkout action) (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
+      env:
+        BIRD_BENCH_COMMIT: ${{ inputs.bird_bench_commit }}
       run: |
-        git clone `
-          --depth 1 `
-          --filter=blob:none `
-          --sparse `
-          https://github.com/spiceai/spice-bird-bench.git bird-bench
+        $ErrorActionPreference = 'Stop'
+        $commit = $env:BIRD_BENCH_COMMIT
+        if ($commit -cnotmatch '^[0-9a-f]{40}$') {
+          Write-Output "::error::bird_bench_commit must be a full commit SHA of spiceai/spice-bird-bench, got '$commit'."
+          exit 1
+        }
+        function Invoke-Git {
+          & git @args
+          if ($LASTEXITCODE -ne 0) { throw "git $args failed with exit code $LASTEXITCODE" }
+        }
 
+        Invoke-Git init -q bird-bench
         cd bird-bench
-        git sparse-checkout set dev_20240627
+        Invoke-Git remote add origin https://github.com/spiceai/spice-bird-bench.git
+        Invoke-Git sparse-checkout set dev_20240627
+        Invoke-Git fetch --depth 1 --filter=blob:none origin $commit
+        Invoke-Git checkout -q --detach FETCH_HEAD
+        $head = (& git rev-parse HEAD).Trim()
+        if ($head -ne $commit) { throw "checked out $head, not the pinned $commit" }
 
     - name: Configure Bird-Bench Data (Linux/macOS)
       id: configure_bird_bench

@@ -4,8 +4,8 @@ description: 'Build and install the ADBC BigQuery driver from source'
 inputs:
   adbc_bigquery_commit:
     description: >-
-      Commit of spiceai/bigquery to build the driver from: upstream go/v1.15.0
-      plus the Spice patches docs/dev/fork_patches.md lists.
+      Full commit SHA of spiceai/bigquery to build the driver from: upstream go/v1.15.0
+      plus the Spice patches docs/dev/fork_patches.md lists. Only that commit is fetched.
     required: false
     default: '5bf335f677816f0f39d1a2557fc402ba93895764'
   go_version:
@@ -45,10 +45,28 @@ runs:
         set -eu
         DRIVER_DIR="/etc/adbc/drivers"
 
-        git clone --depth=1 https://github.com/spiceai/bigquery.git /tmp/adbc-bigquery
+        case "$ADBC_BIGQUERY_COMMIT" in
+          *[!0-9a-f]* | '')
+            echo "::error::adbc_bigquery_commit must be a full commit SHA of spiceai/bigquery, got '${ADBC_BIGQUERY_COMMIT}'."
+            exit 1
+            ;;
+        esac
+        if [ "${#ADBC_BIGQUERY_COMMIT}" -ne 40 ]; then
+          echo "::error::adbc_bigquery_commit must be a full, 40-character commit SHA of spiceai/bigquery, got '${ADBC_BIGQUERY_COMMIT}'."
+          exit 1
+        fi
+
+        # Only the pinned commit is fetched, by its SHA; nothing reads the default branch, and
+        # git checks every object it fetches against the SHA that names it.
+        git init -q /tmp/adbc-bigquery
         cd /tmp/adbc-bigquery
+        git remote add origin https://github.com/spiceai/bigquery.git
         git fetch --depth=1 origin "$ADBC_BIGQUERY_COMMIT"
-        git checkout "$ADBC_BIGQUERY_COMMIT"
+        git checkout -q --detach FETCH_HEAD
+        if [ "$(git rev-parse HEAD)" != "$ADBC_BIGQUERY_COMMIT" ]; then
+          echo "::error::Checked out $(git rev-parse HEAD), not the pinned ${ADBC_BIGQUERY_COMMIT}."
+          exit 1
+        fi
         cd go
 
         # A driver without these patches still builds and loads, so check for
