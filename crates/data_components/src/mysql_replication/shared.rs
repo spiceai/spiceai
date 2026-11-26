@@ -107,7 +107,6 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use mysql_async::Conn;
 use mysql_async::binlog::events::{EventData, RotateEvent, RowsEventData, TableMapEvent};
-use mysql_async::prelude::Queryable;
 use rustc_hash::FxHashMap;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
