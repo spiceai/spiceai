@@ -600,7 +600,9 @@ async fn a_changes_dataset_loads_only_with_a_primary_key() -> Result<(), anyhow:
             };
             assert_eq!(
                 message,
-                "Cannot setup the dataset cdc_keyless (postgres) with an invalid configuration. \
+                "Not served: waits for its source because it uses `refresh_mode: changes`, and its \
+                 change stream has not finished loading the acceleration. \
+                 Cause: Cannot setup the dataset cdc_keyless (postgres) with an invalid configuration. \
                  Table `public.cdc_keyless` has no primary key, and `refresh_mode: changes` needs \
                  one to apply UPDATE and DELETE events. Set `acceleration.primary_key` to the \
                  columns that identify a row. Postgres sends those columns with every change \

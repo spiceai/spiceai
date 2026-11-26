@@ -997,7 +997,7 @@ impl Runtime {
         // once when its first attempt fails. Not before: a source that is reached only
         // when it is read (HTTP, S3) can fail after the dataset is already served
         // from its acceleration, and then it does not wait.
-        let waits_for_source = parking_lot::Mutex::new(match Self::waits_for_source_reason(&ds) {
+        let waits_for_source = parking_lot::Mutex::new(match Self::serving_wait_reason(&ds) {
             Some(reason)
                 if !bootstrap_status.is_pending()
                     && crate::dataconnector::sink::recorded_checkpoint_schema(&ds)
@@ -1314,7 +1314,17 @@ impl Runtime {
         if !ds.is_file_accelerated() {
             return None;
         }
-        Self::waits_for_source_reason(ds)
+        Self::serving_wait_reason(ds)
+    }
+
+    /// [`Self::waits_for_source_reason`], or for an eligible change stream whose
+    /// acceleration is not recorded as loaded, why it waits all the same.
+    fn serving_wait_reason(ds: &Dataset) -> Option<String> {
+        Self::waits_for_source_reason(ds).or_else(|| {
+            resumes_changes_after_restart(ds).then(|| {
+                "`refresh_mode: changes`, and its change stream has not finished loading the acceleration".to_string()
+            })
+        })
     }
 
     /// Registers `ds` against its existing acceleration without waiting for the
@@ -1385,9 +1395,13 @@ impl Runtime {
     /// checkpoint records the key.
     async fn existing_acceleration_schema(ds: &Dataset) -> Option<arrow_schema::SchemaRef> {
         let schema = crate::dataconnector::sink::recorded_checkpoint_schema(ds).await?;
-        // Only a checkpoint written by the change stream shows the acceleration is loaded.
-        if resumes_changes_after_restart(ds)
-            && !runtime_table::accelerated::checkpoint_primary_key::records_changes_loaded(&schema)
+        // For a connector that resumes its change stream, only a marked checkpoint
+        // of an eligible dataset shows the acceleration is loaded.
+        if uses_resuming_change_stream(ds)
+            && !(resumes_changes_after_restart(ds)
+                && runtime_table::accelerated::checkpoint_primary_key::records_changes_loaded(
+                    &schema,
+                ))
         {
             return None;
         }
@@ -3996,6 +4010,15 @@ fn not_served_status(reason: &str, cause: &str) -> String {
 /// Whether `ds` is a `refresh_mode: changes` dataset whose change stream resumes
 /// after a restart from a recorded position, so it is served from its existing
 /// acceleration at startup and starts its stream once the source answers.
+/// Whether `ds` is a `refresh_mode: changes` dataset of a connector that resumes
+/// its change stream after a restart.
+fn uses_resuming_change_stream(ds: &Dataset) -> bool {
+    ds.acceleration
+        .as_ref()
+        .is_some_and(|acceleration| acceleration.refresh_mode == Some(RefreshMode::Changes))
+        && crate::dataconnector::connector_resumes_changes_after_restart(ds.source())
+}
+
 pub(crate) fn resumes_changes_after_restart(ds: &Dataset) -> bool {
     ds.acceleration
         .as_ref()

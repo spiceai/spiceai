@@ -311,15 +311,21 @@ impl DataConnector for ReconnectingConnector {
                 None => None,
             };
             stream.unwrap_or_else(|| {
-                if !resuming.runtime().status().is_shutdown() {
+                let status = resuming.runtime().status();
+                if !status.is_shutdown() {
                     let cause = if reached.is_some() {
                         "its connector did not start a change stream"
                     } else {
                         "the connection to its source was abandoned"
                     };
-                    tracing::warn!(
+                    let message = format!(
                         "Dataset '{}' did not start its change stream because {cause}, so it is served from its acceleration without applying new changes. Restart the runtime to retry. See: https://spiceai.org/docs/features/data-acceleration/data-refresh",
                         dataset.name
+                    );
+                    tracing::warn!("{message}");
+                    status.update_dataset(
+                        &dataset.name,
+                        crate::status::ComponentStatus::error_with_message(message),
                     );
                 }
                 futures::stream::empty().boxed()

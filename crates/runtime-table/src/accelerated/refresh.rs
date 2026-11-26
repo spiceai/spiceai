@@ -2059,7 +2059,7 @@ async fn clear_changes_loaded(
     };
     if let Err(error) = written {
         tracing::warn!(
-            "Dataset '{dataset_name}' could not update its acceleration record, so a later start may serve its existing acceleration while its source is unavailable, although its configuration now waits for the source. Cause: {error}. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+            "Dataset '{dataset_name}' could not update its acceleration checkpoint. Cause: {error}. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
         );
     }
 }
@@ -2587,21 +2587,16 @@ mod tests {
         }
     }
 
-    /// Stores the schema of the last checkpoint and counts the writes.
+    /// Stores the schema of the last checkpoint.
     #[derive(Default)]
     struct StoringCheckpointer {
         schema: parking_lot::Mutex<Option<SchemaRef>>,
-        writes: std::sync::atomic::AtomicUsize,
         fails: AtomicBool,
     }
 
     impl StoringCheckpointer {
         fn stored(&self) -> Option<SchemaRef> {
             self.schema.lock().clone()
-        }
-
-        fn writes(&self) -> usize {
-            self.writes.load(Ordering::Acquire)
         }
     }
 
@@ -2620,7 +2615,6 @@ mod tests {
                 return Err("the checkpoint store is unavailable".into());
             }
             *self.schema.lock() = Some(Arc::clone(schema));
-            self.writes.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
 
@@ -2692,7 +2686,10 @@ mod tests {
             !task.is_finished(),
             "the task must wait for the ready signal"
         );
-        assert_eq!(checkpointer.writes(), 0, "no checkpoint before ready");
+        assert!(
+            checkpointer.stored().is_none(),
+            "no checkpoint before ready"
+        );
 
         completion.record_untriggered();
         timeout(Duration::from_secs(10), task)
@@ -2703,7 +2700,6 @@ mod tests {
         let stored = checkpointer.stored().expect("a checkpoint after ready");
         assert!(super::super::checkpoint_primary_key::records_changes_loaded(&stored));
         assert_eq!(stored.fields(), changes_checkpoint_schema().fields());
-        assert_eq!(checkpointer.writes(), 1);
     }
 
     /// A checkpoint that cannot be written leaves nothing marked.
@@ -2720,7 +2716,6 @@ mod tests {
             .expect("the task finishes once the stream is ready")
             .expect("the task does not panic");
 
-        assert_eq!(checkpointer.writes(), 0);
         assert!(checkpointer.stored().is_none());
     }
 
@@ -2737,7 +2732,6 @@ mod tests {
             .expect("the task finishes once the signal closes")
             .expect("the task does not panic");
 
-        assert_eq!(checkpointer.writes(), 0);
         assert!(checkpointer.stored().is_none());
     }
 
@@ -2756,9 +2750,8 @@ mod tests {
         };
 
         clear(&checkpointer).await;
-        assert_eq!(
-            checkpointer.writes(),
-            0,
+        assert!(
+            checkpointer.stored().is_none(),
             "nothing to clear without a checkpoint"
         );
 
@@ -2768,12 +2761,12 @@ mod tests {
         clear(&checkpointer).await;
         let stored = checkpointer.stored().expect("the checkpoint is rewritten");
         assert!(!super::super::checkpoint_primary_key::records_changes_loaded(&stored));
-        assert_eq!(checkpointer.writes(), 1);
+        assert_eq!(stored.fields(), schema.fields());
 
         clear(&checkpointer).await;
-        assert_eq!(
-            checkpointer.writes(),
-            1,
+        let unchanged = checkpointer.stored().expect("the checkpoint is kept");
+        assert!(
+            Arc::ptr_eq(&stored, &unchanged),
             "an unmarked checkpoint is left alone"
         );
     }
