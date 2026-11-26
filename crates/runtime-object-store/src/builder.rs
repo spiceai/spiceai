@@ -88,7 +88,11 @@ pub fn build_azure_object_store<S: ::std::hash::BuildHasher>(
     let mut builder = MicrosoftAzureBuilder::from_env()
         .with_http_connector(SpawnedReqwestConnector::new(io_runtime));
 
-    if let Some(sas) = params.get("sas_string") {
+    // A blank SAS would sign nothing: object_store sends every request without a credential.
+    if let Some(sas) = params
+        .get("sas_string")
+        .filter(|sas| !sas.trim().is_empty())
+    {
         builder = builder.with_config(AzureConfigKey::SasKey, sas);
     }
 
@@ -644,6 +648,30 @@ mod tests {
         );
         let seen = seen.lock().expect("the request log is not poisoned");
         assert_eq!(seen.as_slice(), ["sv=2019-12-12&sp=r&sig=sas-signature"]);
+    }
+
+    #[tokio::test]
+    async fn azure_builder_ignores_a_blank_sas() {
+        use object_store::ObjectStoreExt;
+
+        let (endpoint, seen) = query_recording_server().await;
+        let msi_endpoint = endpoint.replace("/account", "/msi-token");
+        let url = Url::parse("abfss://container@account.dfs.core.windows.net/").expect("valid url");
+        let mut params = sas_params(endpoint);
+        params.insert("sas_string".to_string(), " ".to_string());
+        params.insert("msi_endpoint".to_string(), msi_endpoint);
+
+        let store = build_azure_object_store(&url, &params, handle())
+            .expect("azure object store should build with a blank SAS");
+        let _ = store
+            .head(&object_store::path::Path::from("items.csv"))
+            .await
+            .expect_err("the managed identity endpoint answers 404");
+        let seen = seen.lock().expect("the request log is not poisoned");
+        assert!(
+            !seen.is_empty() && seen.iter().all(|query| query.contains("api-version")),
+            "only a managed identity token request is sent, no unsigned request: {seen:?}"
+        );
     }
 
     #[tokio::test]
