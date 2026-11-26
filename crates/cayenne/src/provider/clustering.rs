@@ -90,6 +90,7 @@ use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::projection::ProjectionExpr;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::projection::ProjectionExec;
+use range_rescale::Rescaler;
 
 /// Width, in bits, of the normalized coordinate each clustering column
 /// contributes to the curve. 64 bits captures the full precision of every
@@ -99,6 +100,7 @@ use datafusion_physical_plan::projection::ProjectionExec;
 const CURVE_BITS: u32 = u64::BITS;
 
 /// Largest normalized coordinate; the dense code range is `0..=MAX_CODE`.
+#[cfg(test)]
 const MAX_CODE: u64 = u64::MAX;
 
 /// Key bytes contributed per clustering column — the byte width of one
@@ -346,84 +348,113 @@ pub(crate) fn bound_key(scalar: &ScalarValue, column_type: &DataType) -> Option<
     column_order_keys(array.as_ref()).ok()?.first().copied()
 }
 
-/// Rescale an order-preserving key onto the dense `0..=MAX_CODE` coordinate
-/// space spanned by `[lo, hi]`, clamping values outside it.
-///
-/// Runs once per value per clustering column, so it is inlined: `lo`/`hi` are
-/// fixed for a whole promotion and the prologue below hoists out of the row
-/// loop once the call is inlined.
-#[inline]
+#[cfg(test)]
 fn normalize(key: u128, lo: u128, hi: u128) -> u64 {
-    let span = hi.saturating_sub(lo);
-    if span == 0 {
-        // A constant (or inverted) range carries no information to spread.
-        return 0;
-    }
-    let x = key.clamp(lo, hi) - lo;
-    // `x * MAX_CODE` has to stay inside `u128`, which needs `span < 2^CURVE_BITS`.
-    // When it does not, drop the low bits of `x` and `span` together: they sit
-    // below the resolution a CURVE_BITS-wide coordinate can represent anyway, and
-    // shifting both preserves the ratio.
-    let shift = (u128::BITS - span.leading_zeros()).saturating_sub(CURVE_BITS);
-    let (x, span) = (x >> shift, span >> shift);
-    u64::try_from(x * u128::from(MAX_CODE) / span).unwrap_or(MAX_CODE)
+    Rescaler::new(lo, hi).rescale(key)
 }
+
+/// Rows [`hilbert_transpose`] processes per block: small enough that one
+/// block of every axis stays in L1 while the 63 bit-plane passes run over it.
+const TRANSPOSE_BLOCK_ROWS: usize = 256;
 
 /// Skilling's in-place axes-to-transpose transform for the Hilbert curve
 /// (*Programming the Hilbert curve*, AIP Conf. Proc. 707, 2004).
 ///
-/// On entry `x` holds one normalized coordinate per dimension; on return `x[i]`
-/// holds every `i`-th bit of the Hilbert index, most significant first, so
-/// interleaving `x` MSB-first yields the index itself. In one dimension the
-/// transform is the identity, which keeps a single-column clustering key a plain
-/// ascending sort.
-fn hilbert_transpose(x: &mut [u64]) {
-    // `split_first_mut` gives the algorithm's `X[0]` accumulator and the rest
-    // without indexing. Its `i == 0` step reduces to the `head ^= p` below:
-    // the exchange branch would compute `t = (X[0] ^ X[0]) & p`, i.e. zero.
-    let Some((head, tail)) = x.split_first_mut() else {
+/// Each axis holds a column of normalized coordinates. On return axis `i`
+/// holds every `i`-th bit of each row's Hilbert index, most significant first.
+/// In one dimension the transform is the identity.
+///
+/// Transform independent rows in cache-sized blocks. Each inner loop has no
+/// data-dependent branches and can vectorize across rows. Exchanges still run
+/// in dimension order: every dimension observes the updated head coordinate.
+fn hilbert_transpose(coords: &mut [Vec<u64>]) {
+    let Some((head, tail)) = coords.split_first_mut() else {
         return;
     };
-    let top = 1u64 << (CURVE_BITS - 1);
-
-    // Undo the excess work: walk the bit planes from the top, reflecting and
-    // rotating the sub-cube each plane selects.
-    let mut q = top;
-    while q > 1 {
-        let p = q - 1;
-        if *head & q != 0 {
-            *head ^= p;
+    // In one dimension the transform is the identity, so skip the passes.
+    if tail.is_empty() {
+        return;
+    }
+    let mut last = vec![0; TRANSPOSE_BLOCK_ROWS];
+    for start in (0..head.len()).step_by(TRANSPOSE_BLOCK_ROWS) {
+        let end = (start + TRANSPOSE_BLOCK_ROWS).min(head.len());
+        let head = &mut head[start..end];
+        let mut q = 1u64 << (CURVE_BITS - 1);
+        while q > 1 {
+            let p = q - 1;
+            for h in head.iter_mut() {
+                *h ^= 0u64.wrapping_sub(u64::from(*h & q != 0)) & p;
+            }
+            for axis in tail.iter_mut() {
+                for (h, x) in head.iter_mut().zip(&mut axis[start..end]) {
+                    let mask = 0u64.wrapping_sub(u64::from(*x & q != 0));
+                    let exchange = (*h ^ *x) & p & !mask;
+                    *h ^= exchange ^ (mask & p);
+                    *x ^= exchange;
+                }
+            }
+            q >>= 1;
         }
-        for xi in tail.iter_mut() {
-            if *xi & q != 0 {
-                *head ^= p;
-            } else {
-                let t = (*head ^ *xi) & p;
-                *head ^= t;
-                *xi ^= t;
+        let last = &mut last[..end - start];
+        last.copy_from_slice(head);
+        for axis in tail.iter_mut() {
+            for (x, previous) in axis[start..end].iter_mut().zip(last.iter_mut()) {
+                *x ^= *previous;
+                *previous = *x;
             }
         }
-        q >>= 1;
-    }
-
-    // Gray-encode: each axis takes the running XOR of the ones before it.
-    let mut last = *head;
-    for xi in tail.iter_mut() {
-        *xi ^= last;
-        last = *xi;
-    }
-
-    let mut t = 0u64;
-    let mut q = top;
-    while q > 1 {
-        if last & q != 0 {
-            t ^= q - 1;
+        // XOR of the masks (q - 1) selected by the final axis is its suffix
+        // parity, excluding the least significant input bit.
+        for value in last.iter_mut() {
+            *value >>= 1;
+            for shift in [1, 2, 4, 8, 16, 32] {
+                *value ^= *value >> shift;
+            }
         }
-        q >>= 1;
+        for (h, t) in head.iter_mut().zip(last.iter()) {
+            *h ^= t;
+        }
+        for axis in tail.iter_mut() {
+            for (x, t) in axis[start..end].iter_mut().zip(last.iter()) {
+                *x ^= t;
+            }
+        }
     }
-    *head ^= t;
-    for xi in tail.iter_mut() {
-        *xi ^= t;
+}
+
+/// Spread a byte into every K-th bit, leaving room for the other axes.
+const fn spread_table<const K: usize>() -> [u64; 256] {
+    let mut table = [0; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        let mut bit = 0;
+        while bit < 8 {
+            table[byte] |= ((byte as u64 >> bit) & 1) << (bit * K);
+            bit += 1;
+        }
+        byte += 1;
+    }
+    table
+}
+
+/// Interleave the transposed axes most-significant-bit-first into `flat`:
+/// output bit `j` of a row takes bit `CURVE_BITS - 1 - j / K` of axis `j % K`,
+/// so lexicographic byte order over the packed rows equals Hilbert index order.
+/// Each input byte of every axis covers `K` output bytes, which the spread
+/// table fills in one lookup per axis. A spread byte spans `8 * K` bits of a
+/// `u64`, so `K` is at most 8.
+fn interleave<const K: usize>(coords: &[Vec<u64>], flat: &mut [u8]) {
+    const { assert!(K >= 1 && K <= 8, "a spread byte must fit in a u64") };
+    let table = spread_table::<K>();
+    for (r, out) in flat.chunks_exact_mut(8 * K).enumerate() {
+        for byte in 0..8 {
+            let mut packed = 0u64;
+            for (dim, axis) in coords.iter().enumerate() {
+                let value = axis[r].to_be_bytes()[byte];
+                packed |= table[usize::from(value)] << (K - 1 - dim);
+            }
+            out[byte * K..(byte + 1) * K].copy_from_slice(&packed.to_be_bytes()[8 - K..]);
+        }
     }
 }
 
@@ -475,39 +506,45 @@ pub fn cluster_keys(columns: &[ArrayRef], bounds: &[ColumnBounds]) -> DFResult<B
             .copied()
             .flatten()
             .unwrap_or((0, key_domain_max(c.data_type())));
-        coords.push(keys.iter().map(|&key| normalize(key, lo, hi)).collect());
+        // Rescales onto the dense `0..=u64::MAX` coordinate space; see
+        // `Rescaler` for the exact formula, including how ranges wider than
+        // `2^CURVE_BITS` drop their low bits.
+        let rescaler = Rescaler::new(lo, hi);
+        coords.push(keys.iter().map(|&key| rescaler.rescale(key)).collect());
     }
 
     let width = BYTES_PER_COLUMN * k;
     let mut flat = vec![0u8; width * n];
 
-    // The output is row-major while `coords` is column-major, so iterate the
-    // output row chunks and gather each row's coordinates across dimensions.
-    // `row` is reused across rows to avoid a per-row heap allocation on
-    // multi-million-row cold rewrites.
-    let mut row = vec![0u64; k];
-    for (r, out) in flat.chunks_mut(width).enumerate() {
-        for (dim, x) in row.iter_mut().enumerate() {
-            *x = coords[dim][r];
-        }
-        hilbert_transpose(&mut row);
-        // Interleave most-significant-bit-first: output bit `j` takes bit
-        // `CURVE_BITS - 1 - j / k` of dimension `j % k`. Lexicographic byte
-        // order over the packed output then equals Hilbert index order.
-        let mut j = 0usize;
-        for round in 0..CURVE_BITS {
-            let shift = CURVE_BITS - 1 - round;
-            for x in &row {
-                if (x >> shift) & 1 == 1 {
-                    out[j / 8] |= 1 << (7 - (j % 8));
+    hilbert_transpose(&mut coords);
+    match k {
+        1 => interleave::<1>(&coords, &mut flat),
+        2 => interleave::<2>(&coords, &mut flat),
+        3 => interleave::<3>(&coords, &mut flat),
+        4 => interleave::<4>(&coords, &mut flat),
+        5 => interleave::<5>(&coords, &mut flat),
+        6 => interleave::<6>(&coords, &mut flat),
+        7 => interleave::<7>(&coords, &mut flat),
+        8 => interleave::<8>(&coords, &mut flat),
+        _ => {
+            for (r, out) in flat.chunks_mut(width).enumerate() {
+                let mut j = 0;
+                for shift in (0..CURVE_BITS).rev() {
+                    for axis in &coords {
+                        if (axis[r] >> shift) & 1 == 1 {
+                            out[j / 8] |= 1 << (7 - (j % 8));
+                        }
+                        j += 1;
+                    }
                 }
-                j += 1;
             }
         }
     }
-
-    Ok(BinaryArray::from_iter_values(
-        (0..n).map(|r| &flat[r * width..(r + 1) * width]),
+    let offsets = arrow::buffer::OffsetBuffer::from_lengths(std::iter::repeat_n(width, n));
+    Ok(BinaryArray::new(
+        offsets,
+        arrow::buffer::Buffer::from_vec(flat),
+        None,
     ))
 }
 
@@ -687,6 +724,253 @@ pub fn strip_cluster_key_column(
 mod tests {
     use super::*;
     use arrow::array::{Decimal128Array, Int64Array, StringArray, UInt64Array};
+
+    const DIFFERENTIAL_SEED: u64 = 0x69e2_113a_b47d_908f;
+
+    fn random(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    fn random_wide(state: &mut u64) -> u128 {
+        (u128::from(random(state)) << 64) | u128::from(random(state))
+    }
+
+    #[test]
+    fn clustering_normalize_differential() {
+        eprintln!("seed={DIFFERENTIAL_SEED:#x}");
+        let mut state = DIFFERENTIAL_SEED;
+        let mut ranges = vec![(0, 0), (1, 0), (0, u128::MAX), (0, u128::from(u64::MAX))];
+        for bit in 0..128 {
+            let power = 1u128 << bit;
+            for span in [power - 1, power, power.saturating_add(1)] {
+                ranges.push((0, span));
+                ranges.push((u128::MAX - span, u128::MAX));
+            }
+        }
+        for _ in 0..2000 {
+            let lo = random_wide(&mut state);
+            let span = random_wide(&mut state);
+            ranges.push((lo, lo.saturating_add(span)));
+            ranges.push((lo, lo.saturating_add(u128::from(random(&mut state)))));
+        }
+        for (lo, hi) in ranges {
+            let mut values = vec![
+                0,
+                1,
+                u128::MAX,
+                lo,
+                hi,
+                lo.saturating_sub(1),
+                hi.saturating_add(1),
+                hi.saturating_sub(1),
+                u128::from(u64::MAX - 1),
+                u128::from(u64::MAX),
+                u128::from(u64::MAX) + 1,
+                lo.saturating_add(u128::from(u64::MAX - 1)),
+                lo.saturating_add(u128::from(u64::MAX)),
+            ];
+            for bit in 0..128 {
+                let power = 1u128 << bit;
+                for delta in [power - 1, power, power.saturating_add(1)] {
+                    values.push(lo.saturating_add(delta));
+                }
+            }
+            values.extend((0..32).map(|_| random_wide(&mut state)));
+            if hi > lo {
+                values.extend((0..32).map(|_| lo + random_wide(&mut state) % (hi - lo)));
+            }
+            for key in values {
+                assert_eq!(
+                    normalize(key, lo, hi),
+                    reference::normalize(key, lo, hi),
+                    "seed={DIFFERENTIAL_SEED:#x}, key={key}, lo={lo}, hi={hi}"
+                );
+            }
+        }
+    }
+
+    fn differential_arrays(n: usize, state: &mut u64) -> Vec<ArrayRef> {
+        use arrow::array::{BooleanArray, Float64Array};
+        use arrow_schema::TimeUnit;
+        let signed: ArrayRef = Arc::new(Int64Array::from_iter((0..n).map(|i| {
+            let value = match i % 11 {
+                0 => i64::MIN,
+                1 => i64::MAX,
+                2 => -128,
+                3 => 127,
+                4 => 0,
+                5 => random(state).cast_signed() % 127,
+                _ => random(state).cast_signed(),
+            };
+            (i % 13 != 0).then_some(value)
+        })));
+        let unsigned: ArrayRef = Arc::new(UInt64Array::from_iter((0..n).map(|i| {
+            (i % 13 != 0).then(|| match i % 11 {
+                0 => 0,
+                1 => u64::MAX,
+                2 => 255,
+                3 => random(state) % 256,
+                4 => 1,
+                _ => random(state),
+            })
+        })));
+        let mut arrays = vec![Arc::clone(&signed), Arc::clone(&unsigned)];
+        for ty in [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Date32,
+            DataType::Date64,
+            DataType::Time32(TimeUnit::Second),
+            DataType::Time32(TimeUnit::Millisecond),
+            DataType::Time64(TimeUnit::Microsecond),
+            DataType::Time64(TimeUnit::Nanosecond),
+            DataType::Timestamp(TimeUnit::Second, None),
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            DataType::Duration(TimeUnit::Second),
+            DataType::Duration(TimeUnit::Millisecond),
+            DataType::Duration(TimeUnit::Microsecond),
+            DataType::Duration(TimeUnit::Nanosecond),
+        ] {
+            if matches!(ty, DataType::Int8 | DataType::Int16 | DataType::Int32) {
+                arrays.push(cast(signed.as_ref(), &ty).expect("signed cast"));
+                continue;
+            }
+            let storage = match ty {
+                DataType::Date32 | DataType::Time32(_) => {
+                    cast(signed.as_ref(), &DataType::Int32).expect("32-bit storage")
+                }
+                _ => Arc::clone(&signed),
+            };
+            arrays.push(arrow::array::make_array(
+                storage
+                    .to_data()
+                    .into_builder()
+                    .data_type(ty)
+                    .build()
+                    .expect("temporal data"),
+            ));
+        }
+        for ty in [DataType::UInt8, DataType::UInt16, DataType::UInt32] {
+            arrays.push(cast(unsigned.as_ref(), &ty).expect("unsigned cast"));
+        }
+        let floats: ArrayRef = Arc::new(Float64Array::from_iter(
+            (0..n).map(|i| (i % 13 != 0).then(|| f64::from_bits(random(state)))),
+        ));
+        for ty in [DataType::Float16, DataType::Float32, DataType::Float64] {
+            arrays.push(cast(floats.as_ref(), &ty).expect("float cast"));
+        }
+        arrays.push(Arc::new(BooleanArray::from_iter(
+            (0..n).map(|i| (i % 13 != 0).then(|| random(state) & 1 != 0)),
+        )));
+        arrays.push(Arc::new(Decimal128Array::from_iter((0..n).map(|i| {
+            (i % 13 != 0).then(|| match i % 11 {
+                0 => i128::MIN,
+                1 => i128::MAX,
+                _ => random_wide(state).cast_signed(),
+            })
+        }))));
+        let strings: ArrayRef = Arc::new(StringArray::from_iter((0..n).map(|i| {
+            (i % 13 != 0).then(|| match i % 7 {
+                0 => String::new(),
+                1 => "\0".into(),
+                2 => "é🦀".into(),
+                _ => format!("{:032x}", random_wide(state)),
+            })
+        })));
+        for ty in [
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Utf8View,
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::BinaryView,
+        ] {
+            arrays.push(cast(strings.as_ref(), &ty).expect("string cast"));
+        }
+        arrays
+    }
+
+    #[test]
+    fn clustering_randomized_differential() {
+        eprintln!("seed={DIFFERENTIAL_SEED:#x}");
+        let mut state = DIFFERENTIAL_SEED;
+        for batch in 0..14 {
+            let n = [0, 1, 7, 255, 256, 257, 519][batch % 7];
+            let arrays: Vec<_> = differential_arrays(n, &mut state)
+                .into_iter()
+                .map(|array| {
+                    if batch % 2 == 0 && n > 0 {
+                        array.slice(1, n - 1)
+                    } else {
+                        array
+                    }
+                })
+                .collect();
+            // Rotate every supported type through every dimensionality and
+            // exercise bounds independently for each dimension.
+            for first in 0..arrays.len() {
+                // 1..=8 cover the spread-table interleave; 9 takes the
+                // bitwise fallback.
+                for k in 1..=9 {
+                    let columns: Vec<_> = (0..k)
+                        .map(|d| Arc::clone(&arrays[(first + d) % arrays.len()]))
+                        .collect();
+                    for mode in 0..7 {
+                        let bounds: Vec<_> = if mode == 0 {
+                            vec![]
+                        } else {
+                            columns
+                                .iter()
+                                .enumerate()
+                                .map(|(dim, column)| {
+                                    let keys =
+                                        column_order_keys(column.as_ref()).expect("order keys");
+                                    let lo = keys.iter().copied().min().unwrap_or(0);
+                                    let hi = keys.iter().copied().max().unwrap_or(0);
+                                    match (mode + dim) % 6 {
+                                        0 => None,
+                                        1 => Some((lo, hi)),
+                                        2 => Some((lo + (hi - lo) / 3, hi - (hi - lo) / 3)),
+                                        3 => Some((hi, hi)),
+                                        4 => Some((hi, lo)),
+                                        _ => Some((0, random_wide(&mut state))),
+                                    }
+                                })
+                                .collect()
+                        };
+                        let actual = cluster_keys(&columns, &bounds).expect("keys");
+                        let expected =
+                            reference::cluster_keys(&columns, &bounds).expect("reference keys");
+                        assert_eq!(
+                            actual, expected,
+                            "seed={DIFFERENTIAL_SEED:#x}, batch={batch}, first={first}, k={k}, mode={mode}"
+                        );
+                    }
+                }
+            }
+        }
+        // Dimensions outside the specialized interleavers use the same layout.
+        for k in 6..=9 {
+            let columns: Vec<ArrayRef> = (0..k)
+                .map(|_| {
+                    Arc::new(UInt64Array::from_iter_values(
+                        (0..300).map(|_| random(&mut state)),
+                    )) as ArrayRef
+                })
+                .collect();
+            assert_eq!(
+                cluster_keys(&columns, &[]).expect("keys"),
+                reference::cluster_keys(&columns, &[]).expect("reference keys"),
+                "seed={DIFFERENTIAL_SEED:#x}, k={k}"
+            );
+        }
+    }
 
     /// Bounds that make [`normalize`] the identity, so a `UInt64` column's
     /// values *are* its curve coordinates and a test can address curve cells
@@ -1121,5 +1405,148 @@ mod tests {
             RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("augmented batch");
         let stripped = strip_cluster_key_column(&augmented, &schema).expect("strip");
         assert_eq!(stripped, batch);
+    }
+}
+
+#[cfg(test)]
+mod reference {
+    use super::*;
+
+    /// Rescale an order-preserving key onto the dense `0..=MAX_CODE` coordinate
+    /// space spanned by `[lo, hi]`, clamping values outside it.
+    ///
+    /// Runs once per value per clustering column, so it is inlined: `lo`/`hi` are
+    /// fixed for a whole promotion and the prologue below hoists out of the row
+    /// loop once the call is inlined.
+    #[inline]
+    pub(super) fn normalize(key: u128, lo: u128, hi: u128) -> u64 {
+        let span = hi.saturating_sub(lo);
+        if span == 0 {
+            // A constant (or inverted) range carries no information to spread.
+            return 0;
+        }
+        let x = key.clamp(lo, hi) - lo;
+        // `x * MAX_CODE` has to stay inside `u128`, which needs `span < 2^CURVE_BITS`.
+        // When it does not, drop the low bits of `x` and `span` together: they sit
+        // below the resolution a CURVE_BITS-wide coordinate can represent anyway, and
+        // shifting both preserves the ratio.
+        let shift = span.bit_width().saturating_sub(CURVE_BITS);
+        let (x, span) = (x >> shift, span >> shift);
+        u64::try_from(x * u128::from(MAX_CODE) / span).unwrap_or(MAX_CODE)
+    }
+
+    fn hilbert_transpose(x: &mut [u64]) {
+        // `split_first_mut` gives the algorithm's `X[0]` accumulator and the rest
+        // without indexing. Its `i == 0` step reduces to the `head ^= p` below:
+        // the exchange branch would compute `t = (X[0] ^ X[0]) & p`, i.e. zero.
+        let Some((head, tail)) = x.split_first_mut() else {
+            return;
+        };
+        let top = 1u64 << (CURVE_BITS - 1);
+
+        // Undo the excess work: walk the bit planes from the top, reflecting and
+        // rotating the sub-cube each plane selects.
+        let mut q = top;
+        while q > 1 {
+            let p = q - 1;
+            if *head & q != 0 {
+                *head ^= p;
+            }
+            for xi in tail.iter_mut() {
+                if *xi & q != 0 {
+                    *head ^= p;
+                } else {
+                    let t = (*head ^ *xi) & p;
+                    *head ^= t;
+                    *xi ^= t;
+                }
+            }
+            q >>= 1;
+        }
+
+        // Gray-encode: each axis takes the running XOR of the ones before it.
+        let mut last = *head;
+        for xi in tail.iter_mut() {
+            *xi ^= last;
+            last = *xi;
+        }
+
+        let mut t = 0u64;
+        let mut q = top;
+        while q > 1 {
+            if last & q != 0 {
+                t ^= q - 1;
+            }
+            q >>= 1;
+        }
+        *head ^= t;
+        for xi in tail.iter_mut() {
+            *xi ^= t;
+        }
+    }
+
+    pub fn cluster_keys(columns: &[ArrayRef], bounds: &[ColumnBounds]) -> DFResult<BinaryArray> {
+        let k = columns.len();
+        if k == 0 {
+            return Err(DataFusionError::Internal(
+                "cluster_keys requires at least one clustering column".to_string(),
+            ));
+        }
+        if !bounds.is_empty() && bounds.len() != k {
+            return Err(DataFusionError::Internal(format!(
+                "cluster_keys got {} bounds for {k} clustering columns",
+                bounds.len()
+            )));
+        }
+        let n = columns[0].len();
+
+        // Per-column normalized coordinates, column-major (`[dim][row]`).
+        let mut coords: Vec<Vec<u64>> = Vec::with_capacity(k);
+        for (dim, c) in columns.iter().enumerate() {
+            if c.len() != n {
+                return Err(DataFusionError::Internal(
+                    "cluster_keys columns must all have the same length".to_string(),
+                ));
+            }
+            let keys = column_order_keys(c.as_ref())?;
+            let (lo, hi) = bounds
+                .get(dim)
+                .copied()
+                .flatten()
+                .unwrap_or((0, key_domain_max(c.data_type())));
+            coords.push(keys.iter().map(|&key| normalize(key, lo, hi)).collect());
+        }
+
+        let width = BYTES_PER_COLUMN * k;
+        let mut flat = vec![0u8; width * n];
+
+        // The output is row-major while `coords` is column-major, so iterate the
+        // output row chunks and gather each row's coordinates across dimensions.
+        // `row` is reused across rows to avoid a per-row heap allocation on
+        // multi-million-row cold rewrites.
+        let mut row = vec![0u64; k];
+        for (r, out) in flat.chunks_mut(width).enumerate() {
+            for (dim, x) in row.iter_mut().enumerate() {
+                *x = coords[dim][r];
+            }
+            hilbert_transpose(&mut row);
+            // Interleave most-significant-bit-first: output bit `j` takes bit
+            // `CURVE_BITS - 1 - j / k` of dimension `j % k`. Lexicographic byte
+            // order over the packed output then equals Hilbert index order.
+            let mut j = 0usize;
+            for round in 0..CURVE_BITS {
+                let shift = CURVE_BITS - 1 - round;
+                for x in &row {
+                    if (x >> shift) & 1 == 1 {
+                        out[j / 8] |= 1 << (7 - (j % 8));
+                    }
+                    j += 1;
+                }
+            }
+        }
+
+        Ok(BinaryArray::from_iter_values(
+            (0..n).map(|r| &flat[r * width..(r + 1) * width]),
+        ))
     }
 }

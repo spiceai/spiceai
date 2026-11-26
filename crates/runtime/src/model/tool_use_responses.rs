@@ -204,6 +204,10 @@ impl ToolUsingResponses {
             .cloned()
     }
 
+    #[expect(
+        clippy::manual_assert,
+        reason = "if cfg!(...) is intentionally conditional on feature flag"
+    )]
     async fn call_tool(&self, tool_call: &FunctionToolCall) -> ToolOutcome {
         let FunctionToolCall {
             name,
@@ -211,46 +215,43 @@ impl ToolUsingResponses {
             id,
             ..
         } = tool_call;
-        match self.as_spiced_tool(name) {
-            Some(t) => match with_budget(self.result_budget, t.call(arguments)).await {
-                Ok(v) => {
-                    tracing::info!(
-                        target: "task_history",
-                        progress = Progress::log()
-                            .id(id.clone())
-                            .title(format!("'{name}' tool completed successfully"))
-                            .json_content(v.clone())
-                            .to_jsonl(),
-                    );
-                    ToolOutcome::Completed(v)
-                }
-                Err(e) => {
-                    tracing::info!(
-                        target: "task_history",
-                        progress = Progress::error()
-                            .id(id.clone())
-                            .title(format!("'{name}' tool completed unsuccessfully"))
-                            .content(e.to_string())
-                            .to_jsonl(),
-                    );
-                    ToolOutcome::Failed(format!(
-                        "Failed to call the tool {}. An error occurred: {e}",
-                        t.name()
-                    ))
-                }
-            },
-            None => {
-                // All calls to `call_tool` should have previously checked that `tool_call` has an associated tool.
-                if cfg!(feature = "dev") {
-                    panic!(
-                        "Tool '{name}' was provided to LLM, but now no longer exists. This should not be possible."
-                    );
-                } else {
-                    tracing::warn!(
-                        "Tool '{name}' was provided to LLM, but now no longer exists. This should not be possible.",
-                    );
-                    ToolOutcome::Completed(Value::Null)
-                }
+        let Some(t) = self.as_spiced_tool(name) else {
+            // All calls to `call_tool` should have previously checked that `tool_call` has an associated tool.
+            if cfg!(feature = "dev") {
+                panic!(
+                    "Tool '{name}' was provided to LLM, but now no longer exists. This should not be possible."
+                );
+            }
+            tracing::warn!(
+                "Tool '{name}' was provided to LLM, but now no longer exists. This should not be possible.",
+            );
+            return ToolOutcome::Completed(Value::Null);
+        };
+        match with_budget(self.result_budget, t.call(arguments)).await {
+            Ok(v) => {
+                tracing::info!(
+                    target: "task_history",
+                    progress = Progress::log()
+                        .id(id.clone())
+                        .title(format!("'{name}' tool completed successfully"))
+                        .json_content(v.clone())
+                        .to_jsonl(),
+                );
+                ToolOutcome::Completed(v)
+            }
+            Err(e) => {
+                tracing::info!(
+                    target: "task_history",
+                    progress = Progress::error()
+                        .id(id.clone())
+                        .title(format!("'{name}' tool completed unsuccessfully"))
+                        .content(e.to_string())
+                        .to_jsonl(),
+                );
+                ToolOutcome::Failed(format!(
+                    "Failed to call the tool {}. An error occurred: {e}",
+                    t.name()
+                ))
             }
         }
     }
@@ -1246,7 +1247,11 @@ mod tests {
             None
         }
 
-        async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             // Spice's own lookup of the datasets for the system prompt (it asks for a `limit`) is
             // not a call the model made, and its answer here is no page, so no list is added.
             if !arg.contains("\"limit\"") {
@@ -1273,10 +1278,11 @@ mod tests {
             None
         }
 
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(
                 json!({"datasets": [{"table": "spice.public.taxi_trips"}], "total": 1, "has_more": false}),
             )
@@ -1433,10 +1439,11 @@ mod tests {
             None
         }
 
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Err("no such table".into())
         }
     }

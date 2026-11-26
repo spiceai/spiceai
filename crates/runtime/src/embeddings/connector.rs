@@ -222,7 +222,7 @@ impl EmbeddingConnector {
         // this wrapper sits between a (possibly multiplexed) source and the
         // accelerator, so it must build the deferred rows before augmenting them.
         // Offload the synchronous build so a large burst can't stall this worker.
-        let (change_committer, batch, is_dataset_ready, history_unavailable) =
+        let (change_committer, batch, is_dataset_ready, history_unavailable, snapshot_rows) =
             envelope.into_parts_offloaded().await?;
         let data_batch = batch.data_batch();
 
@@ -258,6 +258,7 @@ impl EmbeddingConnector {
             new_change_batch,
             is_dataset_ready,
             history_unavailable,
+            snapshot_rows,
         ))
     }
 }
@@ -317,6 +318,10 @@ impl DataConnector for EmbeddingConnector {
 
     fn initialization(&self) -> ComponentInitialization {
         self.inner_connector.initialization()
+    }
+
+    fn user_token_client_id(&self) -> Option<&str> {
+        self.inner_connector.user_token_client_id()
     }
 
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {

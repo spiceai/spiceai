@@ -1138,12 +1138,7 @@ fn accelerator_is_ephemeral(
         // `memory_mode` branch), so nothing about it survives a restart. Only its
         // file modes (local disk or S3 Express One Zone, both of which require a
         // file mode) persist independently of this process.
-        Engine::Sqlite | Engine::Cayenne => {
-            matches!(acceleration.mode, Mode::Memory | Mode::FileCreate)
-        }
-        // External storage (another Postgres) persists independently of this
-        // process.
-        Engine::PostgreSQL => false,
+        Engine::Cayenne => matches!(acceleration.mode, Mode::Memory | Mode::FileCreate),
     }
 }
 
@@ -1431,21 +1426,11 @@ const CDC_DOCS: &str = "https://spiceai.org/docs/features/cdc/postgres-replicati
 /// replica identity that makes Postgres send that key's columns with every
 /// UPDATE and DELETE.
 pub(crate) fn missing_primary_key_message(dataset: &DatasetSpec) -> String {
-    use runtime_component::dataset::acceleration::Engine;
     let (schema_name, table_name) = split_schema_table(&dataset.from);
-    let engine = dataset
-        .acceleration
-        .as_ref()
-        .map(|a| a.engine.to_unpartitioned())
-        .unwrap_or_default();
-    let on_conflict_note = match engine {
-        Engine::Cayenne | Engine::Arrow | Engine::PartitionedArrow => "",
-        _ => " with a matching `acceleration.on_conflict` upsert entry",
-    };
     format!(
         "Table `{schema_name}.{table_name}` has no primary key, and `refresh_mode: changes` needs \
          one to apply UPDATE and DELETE events. Set `acceleration.primary_key` to the columns \
-         that identify a row{on_conflict_note}. Postgres sends those columns with every \
+         that identify a row. Postgres sends those columns with every \
          change only under `REPLICA IDENTITY FULL` (run \
          `ALTER TABLE {schema_name}.{table_name} REPLICA IDENTITY FULL;`) or \
          `REPLICA IDENTITY USING INDEX` on a unique index over them. See: {CDC_DOCS}"
@@ -1614,22 +1599,10 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
         assert!(!ephemeral(Engine::Cayenne, Mode::File));
         assert!(!ephemeral(Engine::Cayenne, Mode::FileUpdate));
 
-        assert!(ephemeral(Engine::Sqlite, Mode::Memory), "sqlite memory");
-        assert!(
-            ephemeral(Engine::Sqlite, Mode::FileCreate),
-            "sqlite file_create"
-        );
-        assert!(!ephemeral(Engine::Sqlite, Mode::File), "sqlite file");
-        assert!(
-            !ephemeral(Engine::Sqlite, Mode::FileUpdate),
-            "sqlite file_update"
-        );
-
         // Arrow is in-memory whatever `mode` says; Postgres is external storage.
         for mode in [Mode::Memory, Mode::File, Mode::FileCreate, Mode::FileUpdate] {
             assert!(ephemeral(Engine::Arrow, mode), "arrow {mode}");
             assert!(ephemeral(Engine::PartitionedArrow, mode), "arrow {mode}");
-            assert!(!ephemeral(Engine::PostgreSQL, mode), "postgres {mode}");
         }
     }
 

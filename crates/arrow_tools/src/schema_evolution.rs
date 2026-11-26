@@ -1198,7 +1198,7 @@ mod tests {
             assert_eq!(plan.added_columns.len(), 1);
             assert_eq!(plan.added_columns[0].name(), "c");
             assert!(plan.widened_columns.is_empty());
-            assert!(plan.relaxed_nullability.is_empty());
+            assert_eq!(plan.relaxed_nullability, [] as [String; 0]);
             let names: Vec<&str> = plan
                 .evolved_schema
                 .fields()
@@ -1266,7 +1266,7 @@ mod tests {
             assert!(!plan.is_additive_only());
             assert_eq!(plan.relaxed_nullability, ["a".to_string()]);
             assert!(plan.widened_columns.is_empty());
-            assert!(plan.added_columns.is_empty());
+            assert_eq!(plan.added_columns, [] as [Arc<Field>; 0]);
             assert!(plan.evolved_schema.field(0).is_nullable());
         }
 
@@ -1276,7 +1276,7 @@ mod tests {
             let incoming = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
             let plan = expect_widening(classify(&current, &incoming, &NO_CONSTRAINTS));
             assert_eq!(plan.widened_columns.len(), 1);
-            assert!(plan.relaxed_nullability.is_empty());
+            assert_eq!(plan.relaxed_nullability, [] as [String; 0]);
             assert_eq!(plan.evolved_schema.field(0).data_type(), &DataType::Int64);
             assert!(
                 plan.evolved_schema.field(0).is_nullable(),

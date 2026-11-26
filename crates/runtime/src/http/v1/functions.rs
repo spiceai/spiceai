@@ -95,7 +95,7 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
             kind: decl.kind.as_str().to_string(),
             volatility: crate::datafusion::udf::effective_user_function_volatility(decl)
                 .to_string(),
-            from: decl.from.clone(),
+            from: crate::datafusion::udf::user_function_display_from(decl),
             description: decl.description.clone(),
         })
         .collect();
@@ -130,13 +130,15 @@ mod tests {
         let (status, functions) = list_json(rt).await;
 
         assert_eq!(status, StatusCode::OK);
-        assert!(functions.is_empty());
+        assert_eq!(functions, [] as [ListFunctionElement; 0]);
     }
 
     #[tokio::test]
     async fn list_filters_to_enabled_registered_functions() {
         let mut remote_function = test_function("Remote_Fn", true);
-        remote_function.from = "https://example.com/udf".to_string();
+        // Listed without the credentials its URL carries, and otherwise as written.
+        remote_function.from =
+            "https://alice:hunter2@example.com/udf?token=abc123&region=us".to_string();
         remote_function.volatility = FunctionVolatility::Immutable;
 
         let rt = test_runtime(
@@ -172,7 +174,7 @@ mod tests {
                     name: "Remote_Fn".to_string(),
                     kind: "scalar".to_string(),
                     volatility: "stable".to_string(),
-                    from: "https://example.com/udf".to_string(),
+                    from: "https://example.com/udf?token=***&region=us".to_string(),
                     description: Some("Remote_Fn description".to_string()),
                 },
                 ListFunctionElement {
@@ -230,6 +232,7 @@ mod tests {
             depends_on: vec![],
             metrics: None,
             as_tool: false,
+            build: None,
         }
     }
 

@@ -825,7 +825,7 @@ fn snapshot_boundary_envelope(
     let schema_mismatch = |e: crate::cdc::ChangeBatchError| Error::SchemaMismatch {
         message: e.to_string(),
     };
-    let (_, batch, _, _) = crate::cdc::build_heartbeat_envelope(schema, None, false)
+    let (_, batch, _, _, _) = crate::cdc::build_heartbeat_envelope(schema, None, false)
         .map_err(schema_mismatch)?
         .into_parts()
         .map_err(schema_mismatch)?;
@@ -839,6 +839,7 @@ fn snapshot_boundary_envelope(
         // Readiness stays lag-based: a member still loading is not ready.
         false,
         history_unavailable,
+        false,
     ))
 }
 
@@ -999,7 +1000,6 @@ impl SharedSource {
 /// Entry point: subscribe one dataset to its shared dump source. Mirrors the
 /// per-dataset lazy contract — setup runs on first poll, errors surface through
 /// the stream.
-#[must_use]
 pub fn subscribe(input: ReplicationStreamInput) -> ChangesStream {
     Box::pin(
         stream::once(async move { subscribe_inner(input).await }).flat_map(|result| match result {

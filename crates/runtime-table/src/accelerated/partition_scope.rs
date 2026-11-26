@@ -243,7 +243,6 @@ fn with_record(
 /// would let later changes acknowledge its source position, so it would never
 /// apply. The source's own errors pass through unchanged: a source may continue
 /// after them.
-#[must_use]
 pub fn scope_changes(stream: ChangesStream, scope: Arc<PartitionScope>) -> ChangesStream {
     let mut scoped = stream
         .then(move |item| {
@@ -272,7 +271,8 @@ async fn scope_envelope(
     envelope: ChangeEnvelope,
     scope: Arc<PartitionScope>,
 ) -> Result<ChangeEnvelope, StreamError> {
-    let (committer, unscoped, ready, history_unavailable) = envelope.into_parts_offloaded().await?;
+    let (committer, unscoped, ready, history_unavailable, snapshot_rows) =
+        envelope.into_parts_offloaded().await?;
     // The reload that follows new filters waits only for the changes the consume
     // loop has received, so a change scoped under replaced filters is scoped
     // again. The comparison runs in the poll that hands the change to the loop.
@@ -291,6 +291,7 @@ async fn scope_envelope(
         batch,
         ready,
         history_unavailable,
+        snapshot_rows,
     ))
 }
 
@@ -352,7 +353,7 @@ mod tests {
     }
 
     fn envelope(rows: &[(&str, i64, &str)]) -> ChangeEnvelope {
-        ChangeEnvelope::from_parts(Box::new(NoOpCommitter), batch(rows), false, false)
+        ChangeEnvelope::from_parts(Box::new(NoOpCommitter), batch(rows), false, false, false)
     }
 
     fn ops_and_ids(batch: &ChangeBatch) -> Vec<(String, i64)> {
@@ -476,7 +477,7 @@ mod tests {
         let Some(Ok(envelope)) = scoped.next().await else {
             panic!("the change must be delivered");
         };
-        let (_, batch, _, _) = envelope.into_parts().expect("parts");
+        let (_, batch, _, _, _) = envelope.into_parts().expect("parts");
         assert_eq!(
             ops_and_ids(&batch),
             vec![("r".to_string(), 2)],

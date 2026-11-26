@@ -213,7 +213,7 @@ pub trait MetadataCatalog: Send + Sync {
     async fn clear_insert_records(&self, table_id: &str) -> CatalogResult<()>;
 
     // Snapshot sequences (drives protected-snapshot filtering)
-    async fn set_snapshot_sequence(&self, table_id: &str, snapshot_id: &str, seq: i64) -> CatalogResult<()>;
+    async fn set_snapshot_sequence(&self, table_id: &str, snapshot_id: &str, seq: i64, files: Option<&[SnapshotFile]>) -> CatalogResult<()>;
     async fn get_all_snapshot_sequences(&self, table_id: &str) -> CatalogResult<HashMap<String, i64>>;
     async fn clear_snapshot_sequence(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()>;
 

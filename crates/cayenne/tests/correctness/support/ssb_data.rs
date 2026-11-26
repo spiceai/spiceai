@@ -40,11 +40,10 @@ pub const SSB_TABLES: &[&str] = &["lineorder", "customer", "supplier", "part", "
 /// calibrated against.
 pub fn ensure_ssb_fixture(out_dir: &Path, scale: i64) {
     let revision = super::generator_revision(include_str!("ssb_data.rs"));
-    if super::fixture_is_current(out_dir, &revision) {
-        return;
-    }
-    write_ssb_parquet(out_dir, scale);
-    super::mark_fixture_complete(out_dir, &revision);
+    super::ensure_fixture(out_dir, &revision, |dir| {
+        write_ssb_parquet(dir, scale);
+        true
+    });
 }
 
 pub fn write_ssb_parquet(out_dir: &Path, scale: i64) {

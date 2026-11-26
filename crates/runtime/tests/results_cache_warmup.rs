@@ -39,7 +39,7 @@ fn lookup_dataset(dir: &std::path::Path) -> Dataset {
     let mut dataset = Dataset::new(format!("file://{}", csv.display()), "lookup");
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("arrow".to_string()),
+        engine: Some("cayenne".to_string()),
         mode: Mode::Memory,
         refresh_mode: Some(RefreshMode::Full),
         ..Acceleration::default()

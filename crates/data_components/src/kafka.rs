@@ -277,23 +277,87 @@ struct KafkaConsumerContext {
     metrics: Arc<KafkaMetrics>,
     /// The dataset this consumer reads for, named in the lines it logs.
     dataset: String,
+    /// Where each partition starts when it is assigned. Set at construction so it is in
+    /// place before `subscribe()` can trigger a rebalance.
+    start_offsets: std::sync::Mutex<StartOffsets>,
+}
+
+/// Where a partition starts reading when it is assigned to a consumer, in place of the
+/// group-committed offset.
+enum StartOffsets {
     /// The offset to resume each `(topic, partition)` from, restored from the sidecar.
-    /// Populated at construction so it is in place before `subscribe()` can trigger a
-    /// rebalance. The first assignment of a partition takes its entry; a later
-    /// assignment of it starts from the group-committed offset.
-    restore_offsets: std::sync::Mutex<HashMap<(String, i32), i64>>,
+    /// The first assignment of a partition takes its entry and commits it; a partition
+    /// with no entry starts from the group-committed offset.
+    Restore(HashMap<(String, i32), i64>),
+    /// Each partition starts after the last offset this consumer stored for it, or at
+    /// the beginning of its topic if it has stored none. The group-committed offset is
+    /// never used: it can be one an earlier run left ahead of what this run has read,
+    /// and resuming there would skip the messages in between. Holds the next offset to
+    /// read of each partition this consumer has stored an offset for.
+    Stored(HashMap<(String, i32), i64>),
 }
 
 impl KafkaConsumerContext {
-    fn new(
-        metrics: Arc<KafkaMetrics>,
-        dataset: String,
-        restore_offsets: HashMap<(String, i32), i64>,
-    ) -> Self {
+    fn new(metrics: Arc<KafkaMetrics>, dataset: String, start_offsets: StartOffsets) -> Self {
         Self {
             metrics,
             dataset,
-            restore_offsets: std::sync::Mutex::new(restore_offsets),
+            start_offsets: std::sync::Mutex::new(start_offsets),
+        }
+    }
+
+    fn lock_start_offsets(&self) -> std::sync::MutexGuard<'_, StartOffsets> {
+        self.start_offsets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Sets the start offset of each partition of `assignment` that has one, and
+    /// returns the partitions resumed at a restored offset with their offsets.
+    fn apply_start_offsets(
+        &self,
+        assignment: &mut TopicPartitionList,
+    ) -> Option<TopicPartitionList> {
+        match &mut *self.lock_start_offsets() {
+            StartOffsets::Restore(restore) => self.apply_restore_offsets(restore, assignment),
+            StartOffsets::Stored(stored) => {
+                self.apply_stored_offsets(stored, assignment);
+                None
+            }
+        }
+    }
+
+    /// Sets each partition of `assignment` to start at its next offset in `stored`, or
+    /// at [`Offset::Beginning`] if it has none.
+    fn apply_stored_offsets(
+        &self,
+        stored: &HashMap<(String, i32), i64>,
+        assignment: &TopicPartitionList,
+    ) {
+        let dataset = &self.dataset;
+        for mut elem in assignment.elements() {
+            let key = (elem.topic().to_string(), elem.partition());
+            let offset = stored
+                .get(&key)
+                .map_or(Offset::Beginning, |&next| Offset::Offset(next));
+            if let Err(e) = elem.set_offset(offset) {
+                let (topic, partition) = key;
+                tracing::error!(
+                    "Failed to start dataset '{dataset}' at {offset:?} of Kafka topic '{topic}' partition {partition}, so it starts at the consumer group's committed offset and may not load the messages before it. Restart Spice to retry. See: https://spiceai.org/docs/components/data-connectors/kafka. Cause: {e}"
+                );
+            }
+        }
+    }
+
+    /// Records that this consumer stored `offset` for a partition, so a later
+    /// assignment of the partition starts after it.
+    fn record_stored_offset(&self, topic: &str, partition: i32, offset: i64) {
+        if let StartOffsets::Stored(stored) = &mut *self.lock_start_offsets() {
+            let next = offset.saturating_add(1);
+            stored
+                .entry((topic.to_string(), partition))
+                .and_modify(|current| *current = (*current).max(next))
+                .or_insert(next);
         }
     }
 
@@ -309,12 +373,9 @@ impl KafkaConsumerContext {
     /// messages a second time.
     fn apply_restore_offsets(
         &self,
+        restore: &mut HashMap<(String, i32), i64>,
         assignment: &mut TopicPartitionList,
     ) -> Option<TopicPartitionList> {
-        let mut restore = self
-            .restore_offsets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if restore.is_empty() {
             return None;
         }
@@ -420,8 +481,8 @@ impl rdkafka::ClientContext for KafkaConsumerContext {
 }
 
 impl rdkafka::consumer::ConsumerContext for KafkaConsumerContext {
-    /// The default rebalance, with the restored offsets set on an assignment before
-    /// it is applied (see [`KafkaConsumerContext::apply_restore_offsets`]).
+    /// The default rebalance, with the start offsets of the assigned partitions set
+    /// before the assignment is applied (see [`KafkaConsumerContext::apply_start_offsets`]).
     fn rebalance(
         &self,
         base_consumer: &BaseConsumer<Self>,
@@ -435,7 +496,7 @@ impl rdkafka::consumer::ConsumerContext for KafkaConsumerContext {
         );
         let result = match err {
             RDKafkaRespErr::RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS => {
-                let restored = self.apply_restore_offsets(tpl);
+                let restored = self.apply_start_offsets(tpl);
                 let assigned = if cooperative {
                     base_consumer.incremental_assign(tpl)
                 } else {
@@ -588,11 +649,14 @@ impl KafkaConsumer {
             dataset,
             group_id.into(),
             kafka_config,
-            Self::restore_map(restore_offsets),
+            StartOffsets::Restore(Self::restore_map(restore_offsets)),
             true,
         )
     }
 
+    /// Construct a consumer for a dataset with no stored offsets. Each partition starts
+    /// at the beginning of its topic, whatever the consumer group has committed, and
+    /// after a later assignment resumes after the last offset this consumer stored.
     pub fn create_for_dataset(
         dataset: &str,
         group_id: Option<String>,
@@ -602,7 +666,7 @@ impl KafkaConsumer {
             dataset,
             group_id.unwrap_or_else(|| Self::generate_group_id(dataset)),
             kafka_config,
-            HashMap::new(),
+            StartOffsets::Stored(HashMap::new()),
             true,
         )
     }
@@ -698,14 +762,20 @@ impl KafkaConsumer {
                 Err(e) => return Some(Err(Error::UnableToDeserializeJsonMessage { source: e })),
             };
 
-            Some(Ok(KafkaMessage::new(&self.consumer, msg, key, value)))
+            Some(Ok(KafkaMessage::new(msg, key, value)))
         })
     }
 
+    /// Stores `offset` as the last processed offset of a partition, to be committed by
+    /// [`KafkaConsumer::commit_stored_offsets`].
     pub fn store_offset(&self, topic: &str, partition: i32, offset: i64) -> Result<()> {
         self.consumer
             .store_offset(topic, partition, offset)
-            .context(UnableToCommitMessageSnafu)
+            .context(UnableToCommitMessageSnafu)?;
+        self.consumer
+            .context()
+            .record_stored_offset(topic, partition, offset);
+        Ok(())
     }
 
     pub fn commit_stored_offsets(&self) -> Result<()> {
@@ -889,7 +959,7 @@ impl KafkaConsumer {
         dataset: &str,
         group_id: String,
         kafka_config: &KafkaConfig,
-        restore_offsets: HashMap<(String, i32), i64>,
+        start_offsets: StartOffsets,
         report_partition_end: bool,
     ) -> Result<Self> {
         tracing::debug!("Using kafka group_id: {}", group_id);
@@ -969,7 +1039,7 @@ impl KafkaConsumer {
             .create_with_context(KafkaConsumerContext::new(
                 Arc::clone(&metrics),
                 dataset.to_string(),
-                restore_offsets,
+                start_offsets,
             ))
             .context(UnableToCreateConsumerSnafu)?;
 
@@ -1138,7 +1208,7 @@ impl KafkaConsumer {
             dataset,
             temp_group_id,
             &peek_config,
-            HashMap::new(),
+            StartOffsets::Restore(HashMap::new()),
             false,
         )?);
 
@@ -1235,25 +1305,14 @@ impl KafkaConsumer {
 }
 
 pub struct KafkaMessage<'a, K, V> {
-    consumer: &'a StreamConsumer<KafkaConsumerContext>,
     msg: BorrowedMessage<'a>,
     key: Option<K>,
     value: V,
 }
 
 impl<'a, K, V> KafkaMessage<'a, K, V> {
-    fn new(
-        consumer: &'a StreamConsumer<KafkaConsumerContext>,
-        msg: BorrowedMessage<'a>,
-        key: Option<K>,
-        value: V,
-    ) -> Self {
-        Self {
-            consumer,
-            msg,
-            key,
-            value,
-        }
+    fn new(msg: BorrowedMessage<'a>, key: Option<K>, value: V) -> Self {
+        Self { msg, key, value }
     }
 
     pub fn key(&self) -> Option<&K> {
@@ -1274,17 +1333,6 @@ impl<'a, K, V> KafkaMessage<'a, K, V> {
 
     pub fn offset(&self) -> i64 {
         self.msg.offset()
-    }
-
-    pub fn mark_processed(&self) -> Result<()> {
-        self.consumer
-            .store_offset_from_message(&self.msg)
-            .context(UnableToCommitMessageSnafu)
-    }
-
-    /// Consume the message and return owned key/value data.
-    pub fn into_key_value(self) -> (Option<K>, V) {
-        (self.key, self.value)
     }
 }
 
@@ -1425,7 +1473,6 @@ impl Kafka {
         self
     }
 
-    #[must_use]
     pub fn stream_changes(&self) -> ChangesStream {
         let schema = Arc::clone(&self.schema);
         let flatten_json = self.flatten_json.clone();
@@ -1860,6 +1907,50 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use serde_json::json;
     use std::sync::Arc;
+
+    fn assignment(partitions: &[i32]) -> TopicPartitionList {
+        let mut tpl = TopicPartitionList::new();
+        for &partition in partitions {
+            tpl.add_partition("t", partition);
+        }
+        tpl
+    }
+
+    fn offsets(tpl: &TopicPartitionList) -> Vec<(i32, Offset)> {
+        tpl.elements()
+            .iter()
+            .map(|e| (e.partition(), e.offset()))
+            .collect()
+    }
+
+    /// A partition this consumer has stored no offset for starts at the beginning,
+    /// and one it has stored an offset for resumes after it, so a re-assignment
+    /// neither skips messages nor re-reads the ones this run already processed.
+    #[test]
+    fn stored_offsets_set_start_of_reassigned_partitions() {
+        let context = KafkaConsumerContext::new(
+            Arc::new(KafkaMetrics::new()),
+            "ds".to_string(),
+            StartOffsets::Stored(HashMap::new()),
+        );
+
+        let mut first = assignment(&[0, 1]);
+        assert!(context.apply_start_offsets(&mut first).is_none());
+        assert_eq!(
+            offsets(&first),
+            vec![(0, Offset::Beginning), (1, Offset::Beginning)]
+        );
+
+        context.record_stored_offset("t", 0, 9);
+        context.record_stored_offset("t", 0, 4);
+
+        let mut second = assignment(&[0, 1]);
+        assert!(context.apply_start_offsets(&mut second).is_none());
+        assert_eq!(
+            offsets(&second),
+            vec![(0, Offset::Offset(10)), (1, Offset::Beginning)]
+        );
+    }
 
     fn test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![

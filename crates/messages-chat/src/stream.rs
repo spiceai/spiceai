@@ -440,7 +440,6 @@ impl State {
 
 /// `chunks`, a chat completion's stream, as a Message's stream of events, with the model's
 /// reasoning as `thinking` asks. An error ends it.
-#[must_use]
 pub fn message_stream(
     chunks: ChatCompletionResponseStream,
     model: String,

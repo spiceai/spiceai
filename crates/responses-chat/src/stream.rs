@@ -769,7 +769,6 @@ struct State {
 /// `chunks`, a chat completion's stream, as the stream of events of the Response to the
 /// request of `context`. Every item is `Ok`: a failure is the `response.failed` event, after
 /// which the stream ends.
-#[must_use]
 pub fn response_stream(
     chunks: ChatCompletionResponseStream,
     context: ResponseContext,

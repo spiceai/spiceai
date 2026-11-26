@@ -238,6 +238,7 @@ pub struct ValueDeserializer {
 
 impl ValueDeserializer {
     /// Create a new deserializer from an owned Value.
+    #[must_use]
     pub fn new(value: Value) -> Self {
         Self { value }
     }
@@ -832,7 +833,7 @@ mod tests {
     #[test]
     fn test_parse_yaml_multi_empty() {
         let values = parse_yaml_multi("").expect("empty YAML is valid");
-        assert!(values.is_empty());
+        assert_eq!(values, [] as [Value; 0]);
     }
 
     #[test]

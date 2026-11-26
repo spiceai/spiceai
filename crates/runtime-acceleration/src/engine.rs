@@ -17,7 +17,10 @@ use std::fmt::Display;
 /// that sets one fails with [`removed_engine_message`], which names the fix, rather than
 /// with the unknown-engine error. Spice never switches such an acceleration to Cayenne on
 /// its own: rebuilding it would discard data its source may not have.
-const REMOVED_ENGINES: &[&str] = &["duckdb", "turso"];
+const REMOVED_ENGINES: &[&str] = &["duckdb", "postgres", "sqlite", "turso"];
+
+/// Other spellings of a removed engine, each mapped to the name its removal message uses.
+const REMOVED_ENGINE_ALIASES: &[(&str, &str)] = &[("postgresql", "postgres")];
 
 /// Where the migration from a removed engine to Cayenne is documented.
 pub const CAYENNE_MIGRATION_DOCS: &str =
@@ -41,8 +44,6 @@ pub fn removed_engine_message(engine: &str) -> String {
 pub enum Engine {
     Arrow,
     PartitionedArrow,
-    Sqlite,
-    PostgreSQL,
     #[default]
     Cayenne,
 }
@@ -62,8 +63,6 @@ impl Display for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Engine::Arrow | Engine::PartitionedArrow => write!(f, "arrow"),
-            Engine::Sqlite => write!(f, "sqlite"),
-            Engine::PostgreSQL => write!(f, "postgres"),
             Engine::Cayenne => write!(f, "cayenne"),
         }
     }
@@ -77,10 +76,14 @@ impl TryFrom<&str> for Engine {
         if let Some(removed) = REMOVED_ENGINES.iter().find(|removed| **removed == name) {
             return AcceleratorEngineRemovedSnafu { name: *removed }.fail();
         }
+        if let Some((_, removed)) = REMOVED_ENGINE_ALIASES
+            .iter()
+            .find(|(alias, _)| *alias == name)
+        {
+            return AcceleratorEngineRemovedSnafu { name: *removed }.fail();
+        }
         match name.as_str() {
             "arrow" => Ok(Engine::Arrow),
-            "sqlite" => Ok(Engine::Sqlite),
-            "postgres" | "postgresql" => Ok(Engine::PostgreSQL),
             "cayenne" | "vortex" => Ok(Engine::Cayenne),
             _ => AcceleratorEngineNotAvailableSnafu {
                 name: engine.to_string(),
@@ -111,6 +114,13 @@ mod tests {
             ("duckdb", "duckdb"),
             ("DuckDB", "duckdb"),
             ("DUCKDB", "duckdb"),
+            ("postgres", "postgres"),
+            ("Postgres", "postgres"),
+            ("postgresql", "postgres"),
+            ("PostgreSQL", "postgres"),
+            ("sqlite", "sqlite"),
+            ("SQLite", "sqlite"),
+            ("SQLITE", "sqlite"),
         ] {
             let err = Engine::try_from(spelling).expect_err("the engine is removed");
             assert_eq!(
@@ -128,7 +138,7 @@ mod tests {
         let err = Engine::try_from("nosuchengine").expect_err("unknown engine");
         assert_eq!(
             err.to_string(),
-            "Unknown acceleration engine 'nosuchengine'. Valid engines are: arrow, sqlite, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
+            "Unknown acceleration engine 'nosuchengine'. Valid engines are: arrow, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
         );
     }
 }

@@ -20,11 +20,6 @@ limitations under the License.
 //! It uses file-local row positions tracked via `RoaringBitmap` for efficient
 //! row exclusion during Vortex scans.
 
-// `vortex::arrow::IntoArrowArray::into_arrow_preferred` is deprecated in favour of
-// `execute_arrow(ctx)`; migrating requires threading a Vortex session through the delete path,
-// which is deferred. Use `expect` (not `allow`) so it resurfaces once that migration lands.
-#![expect(deprecated)]
-
 use super::super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
 use super::{CayenneDeletionSink, DeleteScanTable, PreparedDeletionCache, PreparedDeletionPublish};
 use crate::provider::Error;
@@ -49,7 +44,8 @@ use std::collections::HashMap;
 use object_store::path::Path as ObjectStorePath;
 use std::sync::{Arc, LazyLock};
 use vortex::VortexSessionDefault;
-use vortex::arrow::IntoArrowArray;
+use vortex::array::VortexSessionExecute;
+use vortex::arrow::ArrowSessionExt;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::layout::layouts::row_idx::row_idx;
 use vortex_datafusion::DefaultExpressionConvertor;
@@ -58,6 +54,16 @@ use vortex_session::VortexSession;
 
 static MAX_CONCURRENT_FILE_SCANS: LazyLock<usize> =
     LazyLock::new(|| cpu_budget::cpu_budget().cayenne_max_concurrent_file_scans());
+
+/// Export a chunk of a Vortex file read to Arrow.
+fn chunk_to_arrow(
+    vortex_session: &VortexSession,
+    chunk: vortex::array::ArrayRef,
+) -> vortex::error::VortexResult<arrow::array::ArrayRef> {
+    vortex_session
+        .arrow()
+        .execute_arrow(chunk, None, &mut vortex_session.create_execution_ctx())
+}
 
 impl CayenneDeletionSink {
     /// Delete filtered rows using Vortex-native streaming scan with per-file deletion tracking.
@@ -431,7 +437,7 @@ impl CayenneDeletionSink {
 
             // The chunk contains row indices as U64 primitive array
             // Convert Vortex array directly to Arrow array (not RecordBatch)
-            let arrow_array = chunk.into_arrow_preferred().map_err(|e| Error::Vortex {
+            let arrow_array = chunk_to_arrow(vortex_session, chunk).map_err(|e| Error::Vortex {
                 operation: "convert vortex chunk to arrow array",
                 table: table_name.clone(),
                 source: Box::new(e),
@@ -637,7 +643,7 @@ impl CayenneDeletionSink {
                 table: table_name.clone(),
                 source: Box::new(e),
             })?;
-            let arrow_array = chunk.into_arrow_preferred().map_err(|e| Error::Vortex {
+            let arrow_array = chunk_to_arrow(vortex_session, chunk).map_err(|e| Error::Vortex {
                 operation: "convert vortex chunk to arrow for filtered deletion",
                 table: table_name.clone(),
                 source: Box::new(e),
@@ -787,7 +793,7 @@ impl CayenneDeletionSink {
                 source: Box::new(e),
             })?;
 
-            let arrow_array = chunk.into_arrow_preferred().map_err(|e| Error::Vortex {
+            let arrow_array = chunk_to_arrow(vortex_session, chunk).map_err(|e| Error::Vortex {
                 operation: "convert vortex chunk to arrow for key-match",
                 table: table_name.clone(),
                 source: Box::new(e),
@@ -933,11 +939,12 @@ impl CayenneDeletionSink {
                 table: table_name.clone(),
                 source: Box::new(e),
             })?;
-            let arrow_array = chunk.into_arrow_preferred().map_err(|e| Error::Vortex {
-                operation: "convert vortex chunk to arrow for position read-back",
-                table: table_name.clone(),
-                source: Box::new(e),
-            })?;
+            let arrow_array =
+                chunk_to_arrow(&vortex_session, chunk).map_err(|e| Error::Vortex {
+                    operation: "convert vortex chunk to arrow for position read-back",
+                    table: table_name.clone(),
+                    source: Box::new(e),
+                })?;
             if arrow_array.is_empty() {
                 continue;
             }
@@ -1445,7 +1452,7 @@ fn try_decompose_struct_eq(
 /// Depth is O(log N) instead of O(N) from a linear fold, avoiding stack overflow.
 fn balanced_or(mut exprs: Vec<vortex::expr::Expression>) -> vortex::expr::Expression {
     use vortex::expr::or;
-    debug_assert!(!exprs.is_empty());
+    debug_assert_ne!(exprs, [] as [vortex::expr::Expression; 0]);
     while exprs.len() > 1 {
         let mut next = Vec::with_capacity(exprs.len().div_ceil(2));
         let mut i = 0;

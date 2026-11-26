@@ -1,0 +1,133 @@
+name: task-history-context
+tags: [long]
+description: >
+  runtime.task_history.captured_context shapes every task that records a
+  prompt, a search query or tool arguments, including the ai() SQL function and
+  rerank(), not only the chat, NSQL and tool endpoints. Under `redacted` each of
+  those rows stores `[redacted]`, and a value the caller sent survives only in
+  the SQL text of the queries that carried it, which captured_context does not
+  cover. Under the default, `truncated`, an ai() prompt over 4,096 characters
+  is cut there and marked, and SQL text is stored whole. A mock server stands
+  in for the model.
+
+sources:
+  api: { kind: mock-http }
+  lake: { kind: files }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: task-history-context
+  runtime:
+    # The tools endpoint needs a key.
+    auth:
+      api-key:
+        enabled: true
+        keys: [context-key]
+    task_history:
+      captured_context: redacted
+  models:
+    - from: openai:gpt-4o-mini
+      name: mock
+      params:
+        endpoint: ${sources.api.url}/v1
+        openai_api_key: test
+  datasets:
+    - from: 'file://${sources.lake.path}/docs/'
+      name: docs
+      params: { file_format: parquet }
+
+defaults:
+  api-key: context-key
+
+steps:
+  # Every completion answers with a listwise ranking, which rerank() reads and
+  # ai() returns as text. ai() asks for a stream and everything else for one
+  # JSON body, with the same headers, so each step that calls the model first
+  # adds the answer it needs: the route added last wins.
+  - source-exec:
+      api:
+        - &json |
+          path: /v1/chat/completions
+          method: POST
+          status: 200
+          headers: { content-type: application/json }
+          body: '{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"[{\"id\": 1, \"score\": 0.9}]"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}'
+  - generate:
+      lake:
+        table: docs
+        rows: 3
+        seed: 7
+        format: parquet
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: doc, text: [10, 20] }
+  - start: {}
+
+  # Under `redacted`: a chat, the sql tool, rerank() and ai(), each carrying a marker.
+  - http: { method: POST, path: /v1/chat/completions, headers: { content-type: application/json }, body: '{"model":"mock","messages":[{"role":"user","content":"marker-chat"}]}' }
+    expect: { status: 200 }
+  - http: { method: POST, path: /v1/tools/sql, headers: { content-type: application/json }, body: '{"query": "SELECT ''marker-tool'' AS x"}' }
+    expect: { status: 200 }
+  - query: SELECT id FROM rerank(docs, model => 'mock', query => 'marker-rerank', document => 'doc')
+    expect: { rows: [['1'], ['2'], ['3']] }
+  - source-exec:
+      api:
+        - &stream |
+          path: /v1/chat/completions
+          method: POST
+          status: 200
+          headers: { content-type: text/event-stream }
+          body: |+
+            data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"[{\"id\": 1, \"score\": 0.9}]"},"finish_reason":null}]}
+
+            data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+            data: [DONE]
+
+  - query: SELECT ai('marker-ai', 'mock') AS answer
+    expect: { rows: [['[{"id": 1, "score": 0.9}]']] }
+
+  # Each content task is recorded, and stores `[redacted]`.
+  - query: >-
+      SELECT task, input FROM runtime.task_history
+      WHERE task IN ('ai_chat', 'tool_use::sql', 'ai', 'rerank')
+    expect:
+      rows:
+        - ['ai', '[redacted]']
+        - ['ai_chat', '[redacted]']
+        - ['rerank', '[redacted]']
+        - ['tool_use::sql', '[redacted]']
+    eventually: 60s
+  # The markers survive only in SQL text: the statements that carried them.
+  - query: >-
+      SELECT task, input FROM runtime.task_history
+      WHERE input LIKE '%marker-%' OR captured_output LIKE '%marker-%'
+    expect:
+      rows:
+        - ['sql_query', "SELECT 'marker-tool' AS x"]
+        - ['sql_query', "SELECT ai('marker-ai', 'mock') AS answer"]
+        - ['sql_query', "SELECT id FROM rerank(docs, model => 'mock', query => 'marker-rerank', document => 'doc')"]
+
+  # The default, `truncated`: an ai() prompt is cut at 4,096 characters and
+  # marked; the SQL text that carried it is stored whole. The model's health
+  # check at start asks for one JSON body.
+  - source-exec: { api: [*json] }
+  - restart:
+      patch:
+        spicepod:
+          runtime:
+            task_history: { captured_context: null }
+  - source-exec: { api: [*stream] }
+  - query: SELECT ai(repeat('p', 5000), 'mock') AS answer
+    expect: { rows: [['[{"id": 1, "score": 0.9}]']] }
+  - query: >-
+      SELECT task, length(input) AS chars, ends_with(input, '...[truncated]') AS marked,
+      starts_with(input, 'ai(''ppp') AS prompt_prefix
+      FROM runtime.task_history WHERE task = 'ai'
+    expect: { rows: [['ai', '4110', 'true', 'true']] }
+    eventually: 60s
+  - query: >-
+      SELECT task, input FROM runtime.task_history
+      WHERE task = 'sql_query' AND input LIKE '%repeat(%'
+    expect: { rows: [['sql_query', "SELECT ai(repeat('p', 5000), 'mock') AS answer"]] }

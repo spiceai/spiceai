@@ -15,11 +15,13 @@ limitations under the License.
 */
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     fmt::{self, Display, Formatter},
+    sync::Arc,
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A representation of a Debezium Change Event Key.
 #[derive(Serialize, Deserialize)]
@@ -75,9 +77,53 @@ impl ChangeEventKey {
 /// (declared dataset columns) for row conversion.
 #[derive(Serialize, Deserialize)]
 pub struct ChangeEvent {
-    #[serde(default)]
-    pub schema: Option<Schema>,
+    /// Shared by consecutive events with an identical schema; see
+    /// [`deserialize_shared_schema`].
+    #[serde(
+        default,
+        deserialize_with = "deserialize_shared_schema",
+        serialize_with = "serialize_shared_schema"
+    )]
+    pub schema: Option<Arc<Schema>>,
     pub payload: Payload,
+}
+
+thread_local! {
+    static LAST_SCHEMA: RefCell<Option<Arc<Schema>>> = const { RefCell::new(None) };
+}
+
+/// Debezium repeats the full schema in every message. An event whose schema
+/// equals the last one deserialized on this thread shares that allocation, so a
+/// batch holds one copy per distinct schema and decoders can resolve
+/// per-schema facts once per batch with [`Arc::ptr_eq`].
+fn deserialize_shared_schema<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Arc<Schema>>, D::Error> {
+    let Some(schema) = Option::<Schema>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    Ok(Some(LAST_SCHEMA.with(|last| {
+        let mut last = last.borrow_mut();
+        match last.as_ref() {
+            Some(shared) if **shared == schema => Arc::clone(shared),
+            _ => {
+                let schema = Arc::new(schema);
+                *last = Some(Arc::clone(&schema));
+                schema
+            }
+        }
+    })))
+}
+
+#[expect(
+    clippy::ref_option,
+    reason = "serde's `serialize_with` passes the field by reference"
+)]
+fn serialize_shared_schema<S: Serializer>(
+    schema: &Option<Arc<Schema>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    schema.as_deref().serialize(serializer)
 }
 
 impl ChangeEvent {
@@ -105,18 +151,20 @@ impl ChangeEvent {
 
     #[must_use]
     pub fn get_schema_fields(&self) -> Option<Vec<&Field>> {
-        self.schema.as_ref().and_then(|schema| {
-            schema
-                .fields
-                .iter()
-                .find(|field| field.field.as_ref().is_some_and(|field| field == "after"))
-                .and_then(|field| {
-                    field
-                        .fields
-                        .as_ref()
-                        .map(|fields| fields.as_slice().iter().collect())
-                })
-        })
+        self.row_fields().map(|fields| fields.iter().collect())
+    }
+
+    /// The fields of the row (`after`) struct in the embedded schema, or `None`
+    /// for a schemaless event.
+    #[must_use]
+    pub fn row_fields(&self) -> Option<&[Field]> {
+        self.schema
+            .as_ref()?
+            .fields
+            .iter()
+            .find(|field| field.field.as_deref() == Some("after"))?
+            .fields
+            .as_deref()
     }
 }
 
@@ -191,7 +239,7 @@ pub struct Source {
     pub table: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq)]
 pub struct Schema {
     #[serde(rename = "type")]
     pub schema_type: String,
@@ -203,7 +251,7 @@ pub struct Schema {
     pub name: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Field {
     #[serde(rename = "type")]
     pub field_type: String,
@@ -215,6 +263,10 @@ pub struct Field {
     pub version: Option<i64>,
     pub parameters: Option<HashMap<String, String>>,
     pub items: Option<Box<Field>>,
+    /// The column's default, as Debezium declares it in the event schema
+    /// (encoded like the column's values). Absent for a column without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -420,6 +472,46 @@ mod tests {
         assert_eq!(names, vec!["id", "name"]);
     }
 
+    /// Events with an identical schema share one allocation; an event with a
+    /// different schema gets its own.
+    #[test]
+    fn events_share_an_identical_schema_and_only_that() {
+        let parse = |json: &str| ChangeEvent::from_bytes(json.as_bytes()).expect("envelope parses");
+        let first = parse(&envelope_json(
+            "c",
+            serde_json::Value::Null,
+            serde_json::json!({"id": 1}),
+        ));
+        let second = parse(&envelope_json(
+            "c",
+            serde_json::Value::Null,
+            serde_json::json!({"id": 2}),
+        ));
+        let mut changed: serde_json::Value = serde_json::from_str(&envelope_json(
+            "c",
+            serde_json::Value::Null,
+            serde_json::json!({"id": 3}),
+        ))
+        .expect("envelope is JSON");
+        changed["schema"]["fields"][1]["fields"][1]["field"] = serde_json::json!("title");
+        let third = parse(&changed.to_string());
+
+        let schema =
+            |event: &ChangeEvent| std::sync::Arc::clone(event.schema.as_ref().expect("schema"));
+        assert!(std::sync::Arc::ptr_eq(&schema(&first), &schema(&second)));
+        assert!(!std::sync::Arc::ptr_eq(&schema(&second), &schema(&third)));
+        let names = |event: &ChangeEvent| -> Vec<String> {
+            event
+                .row_fields()
+                .expect("after fields")
+                .iter()
+                .filter_map(|f| f.field.clone())
+                .collect()
+        };
+        assert_eq!(names(&second), vec!["id", "name"]);
+        assert_eq!(names(&third), vec!["id", "title"]);
+    }
+
     #[test]
     fn get_schema_fields_is_none_for_a_schemaless_event() {
         let value = serde_json::json!({"before": null, "after": {"id": 1}, "op": "c"});
@@ -460,7 +552,7 @@ mod tests {
         .to_string();
 
         let key = ChangeEventKey::from_bytes(key_json.as_bytes()).expect("key parses");
-        assert!(key.get_primary_key().is_empty());
+        assert_eq!(key.get_primary_key(), [] as [String; 0]);
     }
 
     #[test]

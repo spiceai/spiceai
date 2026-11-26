@@ -1,0 +1,53 @@
+name: append-upsert-same-time
+description: >
+  An append refresh into an acceleration that upserts on a primary key keeps the
+  newest version of a key when a second version arrives with the same time
+  (#15542). Each append refresh reads the rows at the stored maximum time again;
+  Cayenne orders versions by time and keeps the latest one, so refreshes with
+  nothing new leave it in place. The removed SQLite engine alternated between the
+  two versions here.
+sources:
+  src: { kind: postgres }
+variants:
+  cayenne: {}
+  cayenne-memory: { datasets: { events: { acceleration: { mode: memory } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: append-upsert-same-time
+  datasets:
+    - from: postgres:public.events
+      name: events
+      params: ${sources.src.params}
+      time_column: ts
+      time_format: iso8601
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: append
+        refresh_check_interval: 1h
+        primary_key: id
+        on_conflict: { id: upsert }
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE events (id int, ts text, v text);
+        INSERT INTO events VALUES (1, '2031-05-01T10:00:05Z', 'old'), (2, '2031-05-01T10:00:00Z', 'other');
+  - start: {}
+  - query: SELECT id, ts, v FROM events ORDER BY id
+    expect: { rows: [["1", "2031-05-01T10:00:05Z", "old"], ["2", "2031-05-01T10:00:00Z", "other"]] }
+  # A second version of key 1 at the same time as the stored one.
+  - source-exec: { src: "INSERT INTO events VALUES (1, '2031-05-01T10:00:05Z', 'new')" }
+  - refresh: events
+  - query: SELECT id, ts, v FROM events ORDER BY id
+    expect: { rows: [["1", "2031-05-01T10:00:05Z", "new"], ["2", "2031-05-01T10:00:00Z", "other"]] }
+  # Refreshes with nothing new keep it.
+  - refresh: events
+  - query: SELECT id, ts, v FROM events ORDER BY id
+    expect: { rows: [["1", "2031-05-01T10:00:05Z", "new"], ["2", "2031-05-01T10:00:00Z", "other"]] }
+  - refresh: events
+  - query: SELECT id, ts, v FROM events ORDER BY id
+    expect: { rows: [["1", "2031-05-01T10:00:05Z", "new"], ["2", "2031-05-01T10:00:00Z", "other"]] }

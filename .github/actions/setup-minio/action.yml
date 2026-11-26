@@ -32,8 +32,43 @@ runs:
         # Mirror of mc; dl.min.io currently serves an expired TLS cert.
         mc_url="https://public-data.spiceai.org/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z"
         tmp_mc="$(mktemp)"
+
+        # Retry only a failure of the network or the mirror, which says nothing
+        # about the change under test, as .github/scripts/mc_cp.sh does for
+        # `mc cp`. Any other error, such as a 404, fails at once. `curl --retry`
+        # alone does not retry a dropped connection (exit 56), and
+        # `--retry-all-errors` would retry a 404 as well.
+        download_mc_with_curl() {
+          local attempts=4 delay=5 attempt status code retry
+          for ((attempt = 1; ; attempt++)); do
+            status=0
+            code="$(curl --fail --silent --show-error --location --connect-timeout 30 --max-time 300 \
+              --write-out '%{http_code}' --output "$tmp_mc" "$mc_url")" || status=$?
+            [ "$status" -eq 0 ] && return 0
+            retry=false
+            case "$status" in
+              # Could not resolve or connect, partial body, timeout, TLS connect
+              # error, empty reply, send or receive failure, HTTP/2 stream error.
+              6 | 7 | 18 | 28 | 35 | 52 | 55 | 56 | 92) retry=true ;;
+              # --fail turns every HTTP error into 22; retry only a mirror-side one.
+              22) if [[ "$code" =~ ^(408|429|5[0-9][0-9])$ ]]; then retry=true; fi ;;
+            esac
+            if [ "$retry" != true ]; then
+              echo "::error::Downloading the MinIO client from $mc_url failed (curl exit $status, HTTP $code), which is not a network or mirror failure, so it was not retried."
+              return "$status"
+            fi
+            if [ "$attempt" -ge "$attempts" ]; then
+              echo "::error::Downloading the MinIO client from $mc_url failed $attempt times with a network or mirror error (last curl exit $status). The mirror may be down; re-run the job once it recovers."
+              return "$status"
+            fi
+            echo "::warning::Downloading the MinIO client failed with a network or mirror error (curl exit $status, attempt $attempt of $attempts); retrying in ${delay}s."
+            sleep "$delay"
+            delay=$((delay * 2))
+          done
+        }
+
         if command -v curl >/dev/null 2>&1; then
-          curl --fail --silent --show-error --location --output "$tmp_mc" "$mc_url"
+          download_mc_with_curl
         elif command -v wget >/dev/null 2>&1; then
           wget --quiet --output-document="$tmp_mc" "$mc_url"
         else
@@ -82,6 +117,13 @@ runs:
           exit 1
         fi
         if [[ -n "$MINIO_SESSION_TOKEN" ]]; then
+          # Appended to $GITHUB_ENV as NAME=value: a newline would inject more entries.
+          for value in "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" "${MINIO_SESSION_TOKEN}"; do
+            if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+              echo "::error::setup-minio: MinIO inputs must not contain a newline"
+              exit 1
+            fi
+          done
           echo "MC_HOST_spice-minio=${MINIO_ENDPOINT%%://*}://${MINIO_ACCESS_KEY}:${MINIO_SECRET_KEY}:${MINIO_SESSION_TOKEN}@${MINIO_ENDPOINT#*://}" >> "$GITHUB_ENV"
         else
           mc alias set spice-minio "$MINIO_ENDPOINT" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
@@ -103,6 +145,11 @@ runs:
           exit 1
         }
         if ($env:MINIO_SESSION_TOKEN) {
+          # Appended to $GITHUB_ENV as NAME=value: a newline would inject more entries.
+          if (@($env:MINIO_ENDPOINT, $env:MINIO_ACCESS_KEY, $env:MINIO_SECRET_KEY, $env:MINIO_SESSION_TOKEN) -match "[`r`n]") {
+            Write-Output "::error::setup-minio: MinIO inputs must not contain a newline"
+            exit 1
+          }
           $scheme, $hostPort = $env:MINIO_ENDPOINT -split '://', 2
           "MC_HOST_spice-minio=${scheme}://$($env:MINIO_ACCESS_KEY):$($env:MINIO_SECRET_KEY):$($env:MINIO_SESSION_TOKEN)@${hostPort}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
         } else {

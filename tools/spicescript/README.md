@@ -89,10 +89,14 @@ this run's other combinations have reserved does not count toward that.
 | `--from PATH` | Start every instance on this binary instead of the release its script's `from:` names (see [Upgrades](#upgrades)); each `upgrade` step moves it to the binary under test, over the same data. Combine it with `--matrix from=…` to run one base version. |
 | `--from-release FROM=VERSION` | Start the runs whose `from:` is `FROM` (such as `2.3.x`) on release `VERSION` (such as `2.3.2`) instead of the one it resolves to (see [Upgrades](#upgrades)). Repeat it for several. |
 | `--cluster` | Run every instance as a scheduler plus one executor over node mTLS. Scripts that can't run distributed (memory-mode Cayenne, DuckDB or SQLite accelerations) are skipped, as are instances whose `spiced-args` choose a `--role` other than `server`, such as `sidecar`; a `--role server` gives way to the scheduler role. |
+| `--executor-image IMAGE` | The image a script's `cluster: { containers: true }` runs each executor in, with the `spiced` under test mounted in (default `ubuntu:26.04`; also `SPICESCRIPT_EXECUTOR_IMAGE`). The default has only the base libraries a Linux `spiced` built with the default features needs; a build that links more, such as unixODBC with the `odbc` feature, needs an image that has them, or every executor exits at start with `error while loading shared libraries`. A local image is used as is; another is pulled. |
 | `--jobs N` | Run up to N `spiced` processes at once (default 1). Every instance of every matrix combination is a job of its own, taking a slot per process, executors and sidecar included, and freeing it when it finishes. A combination that stops and starts a source its instances share, or whose variants work together (`run-variants: side-by-side`), runs its instances a step at a time as one job; a script with `defaults.exclusive` runs alone. Scripts ask for slots longest first, from recorded durations. Each script's output is printed when it finishes, with progress lines and the slowest scripts at the end. |
+| `--only-tag TAG` | Select only scripts with any of these tags (see [`tags:`](#scripts)); repeat for several. Applies to explicit files too, before `--partition`. |
+| `--exclude-tag TAG` | Exclude scripts with any of these tags; repeat for several. Exclusion wins over `--only-tag`. Tag flags print the selected and total counts; selecting zero scripts is an error, but an empty partition share is allowed. |
+| `--runs-per-script N` | Run each selected script N times (default 1, at least 1), with fresh sources, namespaces, ports and work directories. Repetitions share the `--jobs` budget; exclusive scripts still run alone. Matrix combinations and selected variants run normally within each repetition, including comparisons and side-by-side execution. `--partition` selects scripts before repeating them. For N > 1, output identifies every repetition and ends with per-script pass rates and failure groups (including expected failures); pass rates and exit status use the expected-failures ledger independently for each repetition. `--log-capture` keeps each failing repetition separately, and `--results` adds repetition indices and script summaries. Cannot combine N > 1 with `--record-durations` or `--record-failures`, which would overwrite recordings. |
 | `--partition I/N` | Run only share I of N (1-based), for splitting a suite across CI jobs. Scripts go longest first, by recorded duration, to the share with the least work so far, so every job computes the same split and the shares take about as long. |
-| `--record-durations` | Write each script's run time to `recordings/durations.json` beside it. A script without a recorded duration is refused unless this is set, so a new script gets one when it's added. Record from a `--jobs 1` run. |
-| `--max-wait DURATION` | Cap every wait (`eventually`, readiness, refreshes) at this length. For known-failing scripts, which otherwise wait out every limit. |
+| `--record-durations` | Write each script's run time to `recordings/durations.json` beside it. A script without a recorded duration is refused unless this is set, so a new script gets one when it's added. Record from a `--jobs 1` run. CI shards by these times, so refresh them from CI's own runs with `python3 test/spicescript/update_durations.py`, which writes each script's median over the newest merge-queue and `trunk_tests.yml` runs. |
+| `--max-wait DURATION` | Cap every check's wait (`eventually`, refreshes) at this length. For known-failing scripts, which otherwise wait out every limit. Readiness after `start`, `restart` and `upgrade` keeps its own limit (`ready-timeout`, default 3 min): it is setup, and capping it only fails a start that is slow on a loaded host. |
 | `--matrix KEY=VALUE` | Choose which **runs** happen: only the matrix combinations with this value of a key under `matrix:` (as `${matrix.KEY}` prints it), such as `src=clickhouse`; repeat a key for several values. Scripts without the key or any of the values are skipped. Expected failures of the combinations left out are neither required to fail nor dropped by `--record-failures`. |
 | `--variant NAME` | Choose which **instances** start in each run: only this name under `variants:`, such as `cayenne`; repeat it for several. Scripts with none of them are skipped. Expected failures of the variants left out, and of comparisons between variants (the run compares a different set), are neither required to fail nor dropped by `--record-failures`. Neither option combines with `--record-durations`. |
 | `--work-dir DIR` | Where instances keep their spicepods, data and `spiced.log` (default `target/spicescript`). |
@@ -134,6 +138,7 @@ networks named after the dead runner's pid.
 
 ```yaml
 name: orders-cdc
+tags: [long]
 description: >
   What the script shows, in a sentence or two.
 sources:
@@ -162,6 +167,17 @@ steps:
     eventually: 60s
 ```
 
+`tags:` is optional. The one tag is `long`: the script is too slow for the
+run before every merge, for what it catches there, so the merge queue skips it
+(`--exclude-tag long`) and it runs after merge, on trunk, in
+`trunk_tests.yml`. A script without it runs before every merge. Leave a new
+script untagged unless it is slow; tag it `long` when its CI time is high and
+its failure history low. A PR that edits a `long` script runs it in the merge
+queue too; a PR that only changes its `tags:` line does not. Write the list on
+one line with plain names (`tags: [long]`), since CI selects those scripts by
+that line; a block list, a list over several lines, a quoted or escaped name,
+and unknown or duplicate tags are rejected.
+
 ### Sources
 
 | Kind | What it is |
@@ -176,7 +192,7 @@ steps:
 | `duckdb` | A DuckDB file per instance, written before `start` or while Spice is stopped. `${sources.<name>.params}` holds `duckdb_open`; `.path` is the file path and `.adbc_params` holds the DuckDB ADBC parameters. CLI and library are one DuckDB release (see **DuckDB releases**). |
 | `ducklake` | A DuckLake lake with its catalog in PostgreSQL, written with the CLI of one DuckDB release (see **DuckDB releases**). `version` is that release; the catalog runs the default PostgreSQL image. |
 | `docker` | Any image: `image`, `ports`, `env` (`${port.N}` is the host port of container port N), `command`, and `ready` (a shell command that succeeds once the container is ready). `source-exec` runs a shell command inside it and `source-query` returns the lines it prints. `host-network: true` lets the container reach `spiced` and the other sources on the host: on Linux it shares the host's network, elsewhere Docker routes to the host, and `${sources.<name>.host_from_container}` is the host's address from inside the container either way. Useful for services such as Debezium Server. |
-| `mock-http` | An HTTP server whose routes the script sets with `source-exec`: `path`, and optionally `method`, `query`, `headers-match`, `status`, `headers`, `body`, `delay-ms` and `times`; `reset` removes them all. `source-query` reads what it received: `count <path>`, `log <path>`, `header <path> <name>`. |
+| `mock-http` | An HTTP server whose routes the script sets with `source-exec`: `path`, and optionally `method`, `query`, `headers-match`, `status`, `headers`, `body`, `delay-ms`, `times`, `repeat` (the body is `body` that many times over, with any `{i}` in it replaced by each copy's index, so the copies differ as real records do) and `encoding: gzip` or `encoding: zstd` (the body is sent compressed, gzip at its best level or zstd at level 3, with `Content-Encoding`, for a response small on the wire that decodes to many times its size); `reset` removes them all. `source-query` reads what it received: `count <path>`, `log <path>`, `header <path> <name>`. |
 
 **DuckDB releases.** `spiced` reads `duckdb:` and `ducklake:` through the
 DuckDB library installed on the host, so each `duckdb` or `ducklake` source
@@ -260,11 +276,12 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 
 | Step | Does |
 | --- | --- |
-| `start: {}` | Start `spiced` and wait for `/v1/ready` and the Flight port (`ready-timeout:` to change the wait). Fails early if a dataset stays in `Error` while not ready. `{ ready: false }` waits only for HTTP, for datasets expected to fail. `patch:` (shaped like a variant) changes the spicepod for this and every later start. |
+| `start: {}` | Start `spiced` and wait for `/v1/ready` and the Flight port (`ready-timeout:` to change the wait). Fails early if a dataset stays in `Error` while not ready. `{ ready: false }` waits only for HTTP, for datasets expected to fail. `{ wait: false }` waits for nothing, for a `spiced` expected not to serve yet; a later `wait-ready` waits for it. `patch:` (shaped like a variant) changes the spicepod for this and every later start. |
 | `stop: {}` | SIGTERM, then SIGKILL after 45 s; fails if the shutdown wasn't clean. |
 | `kill-spiced: {}` | SIGKILL; `{ signal: STOP-then-KILL }` freezes it first. |
 | `restart: {}` | Stop (or `{ kill: KILL }`) and start again; takes `start`'s options. |
 | `upgrade: {}` | Like `restart`, but starts the binary under test (see [Upgrades](#upgrades)). |
+| `downgrade: {}` | Like `restart`, but starts the binary the instance started on, the release `from:` or `--from` names: a rollback after an `upgrade`. |
 | `wait-ready: { timeout }` | Wait for `/v1/ready`. |
 | `edit-spicepod: <patch>` | Rewrite the running instance's spicepod (for `--pods-watcher-enabled`). |
 | `start-source`, `stop-source`, `pause-source`, `unpause-source: <name>` | Control a source container; it keeps its host port across a stop. |
@@ -277,17 +294,18 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `spice-exec: <sql>` | Run a statement through `/v1/sql` (accepts `BEGIN; …; COMMIT;`); `expect-error`. |
 | `flight-put: { dataset, rows \| from-source }` | Write rows with Flight `DoPut`; `times: n` repeats it. |
 | `flight-exec: <sql>` | Flight SQL `ExecuteUpdate`; `count: n` affected rows. |
-| `http: { path, method, query, headers, body, api-key }` | One request; `query:` maps URL parameters, which are encoded and appended to `path`. `expect: { status, headers, lacks-headers, body-contains, body-matches, body-lacks, json }`; `json` checks the body as JSON (see [JSON responses](#json-responses)). |
+| `http: { path, method, query, headers, body, api-key }` | One request; `query:` maps URL parameters, which are encoded and appended to `path`. `expect: { status, headers, lacks-headers, body-contains, body-matches, body-lacks, json }`; `json` checks the body as JSON (see [JSON responses](#json-responses)). `expect: { refused: true }` requires that nothing accepts the connection. |
 | `spice: [args…]` | Run the `spice` CLI against the instance; `output-contains`, `expect-error`. |
 | `refresh: <dataset>` | Trigger a refresh and wait for it to finish; `expect-error`; `wait: false` only triggers it. |
 | `explain: <sql>` | `EXPLAIN` (`analyze: true`), requiring `contains:` fragments or the absence of `omits:` ones. |
 | `assert-status: { dataset, status, message-contains, ready, has, lacks }` | Check a dataset's status from `/v1/datasets`. |
 | `assert-log: { contains, lacks, count, clean, allow }` | Check the instance's `spiced.log` with regular expressions; `count: { <pattern>: N \| '>=N' }`. |
-| `assert-files: { contains, lacks, lacks-dirs }` | Check files under the instance's directory, by path relative to it (files only, not empty directories); `lacks-dirs` checks directories, empty ones included, as `<path>/`. |
+| `assert-files: { contains, lacks, lacks-dirs, unchanged-since }` | Check files under the instance's directory, by path relative to it (files only, not empty directories); `lacks-dirs` checks directories, empty ones included, as `<path>/`; `unchanged-since: <id>` requires every file a `mark-files: <id>` recorded to still be there with the same contents (files added since are allowed). |
 | `wipe-instance-dir: { keep }` | Delete everything `spiced` wrote in the instance's directory (`.spice/`, data and metastore files), as if the instance had lost its disk, keeping the spicepod, `spiced.log` and the `keep` paths (relative to the directory, such as a local state location). Refused while `spiced` or an executor runs; put `stop` or `kill-spiced` before it. |
 | `assert-objects: { source, prefix, contains, min, max }` | Require objects under a prefix of an object store or files source; `contains` counts only keys containing that text. `min` defaults to 1, or to 0 when `max` is given (`max: 0` requires none). |
 | `sample-objects: { source, prefix, contains, every, for, max-objects, max-bytes }` | Sample the count and total bytes of the objects under a prefix every `every` for `for` (at least six samples), as a series printed with the step. Fails when a sample is over `max-objects` or `max-bytes`, or when the series trends upward: the peak of its last third is more than a quarter (and at least one) above the peak of its middle third. Pair it with a `background` writer for a fixed-rate run. |
 | `mark-metrics: <id>` | Keep a `/metrics` scrape for a later `wait-metric … since:`. |
+| `mark-files: <id>` or `{ id, matching }` | Record the size and contents of every file under the instance's directory (but `spicepod.yaml` and `spiced.log`), or of those whose relative path matches a `matching` pattern, for a later `assert-files: { unchanged-since: <id> }`. Fails when it records nothing. |
 | `wait-metric: { name, labels, above \| below \| increases \| increased-by, since, timeout, drive }` | Wait for a series to meet a condition. `drive` writes new data each round while waiting, for conditions (such as a compaction) that need new data rather than time. |
 | `background: { id, query \| source-exec, concurrency, every, expect }` | Loop a query or a source write until `stop-background: <id>`. `expect: { column: value }` is an invariant every answer must keep. `${round}` counts iterations. |
 | `stop-background: { id, allow }` | Stop it; fails on any error not matching `allow`. Prints the iteration count, the P99 latency and the commonest allowed errors. |
@@ -655,7 +673,7 @@ Defaults (`defaults:`):
 - **Comparing variants:** `compare-variants: false` turns off agreement between variants; `compare-to: <variant>` compares every variant with one.
 - **Protocols and auth:** `also-http: true` also asks every query over HTTP JSON and requires the same answer; `also-async: true` also runs every query as a `/v1/queries` job (a distributed job on a cluster) and requires the same answer; `api-key`; `tls: { ca }`.
 - **Running spiced:** `spiced-args`, `executor-args`.
-- **Clusters:** `cluster: { executors, spare, containers }`, and `cluster-partition-by: { <dataset or *>: <column> }` for `--cluster` runs. `containers: true` runs each executor in a container of its own on the host's network (Linux only; elsewhere the script is skipped), with the work and script directories mounted. Behind a rootless Docker daemon, whose host network is not this machine's, the executors run on the bridge network instead: their ports and the script's object store sources are published on every interface, which reaches them at this machine's routable address as well as loopback, the nodes advertise that address, and the spicepod names the sources at it. Each object store then has a secret of its own. The spicepod of such a script may name only `rustfs`, `files` and `duckdb` sources; its other sources, such as an oracle, stay on loopback, and a spicepod that names one is refused. Each executor writes shuffle output to its own `/tmp`, so a stage reads another executor's output over the network, as on separate hosts; a spicepod that sets `runtime.query.temp_directory` to a shared path undoes this, since an executor reads a peer's shuffle file from disk wherever its path exists.
+- **Clusters:** `cluster: { executors, spare, containers }`, and `cluster-partition-by: { <dataset or *>: <column> }` for `--cluster` runs. `containers: true` runs each executor in a container of its own on the host's network (Linux only; elsewhere the script is skipped), with the work and script directories mounted, from `ubuntu:26.04` or the image `--executor-image` names. Behind a rootless Docker daemon, whose host network is not this machine's, the executors run on the bridge network instead: their ports and the script's object store sources are published on every interface, which reaches them at this machine's routable address as well as loopback, the nodes advertise that address, and the spicepod names the sources at it. Each object store then has a secret of its own. The spicepod of such a script may name only `rustfs`, `files` and `duckdb` sources; its other sources, such as an oracle, stay on loopback, and a spicepod that names one is refused. Each executor writes shuffle output to its own `/tmp`, so a stage reads another executor's output over the network, as on separate hosts; a spicepod that sets `runtime.query.temp_directory` to a shared path undoes this, since an executor reads a peer's shuffle file from disk wherever its path exists.
 - **Scheduling:**
   - `exclusive: true` runs the script alone, its instances one after another;
   - `run-variants: side-by-side` runs variants that work together (a snapshot writer and its reader) a step at a time, as one job.
@@ -755,10 +773,15 @@ runner loads them in bulk (`COPY` on PostgreSQL, multi-row `INSERT` elsewhere).
 - Wait on conditions (`eventually`, `wait-metric`, `drive`), never on `sleep`,
   unless time itself is under test.
 - Record the new script's duration (`--record-durations`) and commit
-  `recordings/durations.json` with it.
+  `recordings/durations.json` with it. Once CI has run it, the CI time can
+  replace the local one (`test/spicescript/update_durations.py`).
 - A script that reproduces an open bug goes in
   `test/spicescript/known-failing/<group>/`. It moves to `test/spicescript/`
-  once the bug is fixed.
+  once the bug is fixed. The merge queue runs a known-failing script only in
+  the PR that adds or changes it; the rest of `known-failing/` runs after
+  merge in `trunk_tests.yml`. A PR that fixes a bug without touching its
+  script learns from the next trunk tests run, so run the script yourself in that
+  PR.
 
 ## Expected failures
 
@@ -773,7 +796,9 @@ A run fails on:
 - a listed check that fails with another signature (an error became a wrong
   answer, a row count moved);
 - a listed check that passes: if it is fixed, re-record and move the script
-  out of `known-failing/`;
+  out of `known-failing/` (for a script in `known-failing/`, this shows up in
+  the post-merge run of `trunk_tests.yml`, unless the PR changes the
+  script);
 - an entry with no group.
 
 When a run fails before its steps (a source or instance that did not start),

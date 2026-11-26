@@ -23,7 +23,7 @@ limitations under the License.
 use super::column_stats::ColumnStatsAccumulator;
 use crate::bounded_fifo::BoundedFifoSet;
 use parking_lot::Mutex as ParkingMutex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -173,22 +173,46 @@ pub(crate) fn protected_snapshot_maintenance_trigger(
     }
 }
 
+/// The statistics and live-row deltas of the coalesced writes whose rows were
+/// published under one statistics epoch.
 #[derive(Default)]
-pub(crate) struct PostWriteMaintenanceState {
+pub(crate) struct QueuedStatistics {
     pub(crate) stats: Option<Arc<ColumnStatsAccumulator>>,
-    pub(crate) refresh_listing: bool,
-    /// Set when the writer wants retention filters applied. Coalesces — multiple
-    /// writes scheduling retention collapse to one scan per debounce window.
-    pub(crate) retention_requested: bool,
     /// Net change to the live row count across the coalesced writes
     /// (`inserted - superseded - deleted`). Accumulated alongside `stats` and
     /// applied as a [`RowCountUpdate::Delta`] when the stats are persisted.
     pub(crate) live_rows_delta: i64,
     /// How many separate deltas were folded into `live_rows_delta`, carried
     /// with the state so a drain can retire exactly the ones it persisted from
-    /// [`PostWriteMaintenance::outstanding_live_rows_deltas`]. Zero when no
-    /// delta has been queued since the last drain.
+    /// [`PostWriteMaintenance::outstanding_live_rows_deltas`].
     pub(crate) live_rows_delta_count: u64,
+}
+
+impl QueuedStatistics {
+    pub(crate) fn merge(&mut self, other: Self) {
+        if let Some(stats) = other.stats {
+            match &self.stats {
+                Some(existing) => existing.merge_from(&stats),
+                None => self.stats = Some(stats),
+            }
+        }
+        self.live_rows_delta = self.live_rows_delta.saturating_add(other.live_rows_delta);
+        self.live_rows_delta_count = self
+            .live_rows_delta_count
+            .saturating_add(other.live_rows_delta_count);
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct PostWriteMaintenanceState {
+    /// Queued statistics keyed by the statistics epoch their rows were
+    /// published under, so the ones an overwrite or a full rewrite has since
+    /// counted can be dropped without the ones it has not.
+    pub(crate) statistics: BTreeMap<u64, QueuedStatistics>,
+    pub(crate) refresh_listing: bool,
+    /// Set when the writer wants retention filters applied. Coalesces — multiple
+    /// writes scheduling retention collapse to one scan per debounce window.
+    pub(crate) retention_requested: bool,
     /// Set when a write wants the metastore WAL drained but has no other
     /// maintenance to contribute. Every pass ends in a WAL checkpoint, so this
     /// only has to keep the pass from being skipped as empty. Coalesces with the
@@ -198,10 +222,9 @@ pub(crate) struct PostWriteMaintenanceState {
 
 impl PostWriteMaintenanceState {
     pub(crate) fn is_empty(&self) -> bool {
-        self.stats.is_none()
+        self.statistics.is_empty()
             && !self.refresh_listing
             && !self.retention_requested
-            && self.live_rows_delta == 0
             && !self.wal_checkpoint_requested
     }
 }
@@ -332,9 +355,85 @@ pub(crate) struct PostWriteMaintenance {
     /// lets a writer mark its delta outstanding before the commit that publishes
     /// its rows and release it again if that commit never happens.
     outstanding_live_rows_deltas: Arc<AtomicU64>,
+    /// The epoch each write stamps its delta with when it makes its rows
+    /// visible. Advanced by an overwrite when it replaces the table's rows and
+    /// by a full rewrite when it captures its input, each while holding every
+    /// lock a write stamps under (`write_lock`, or the visibility lock), so a
+    /// delta stamped below an advance belongs to rows visible before it.
+    statistics_epoch: AtomicU64,
+    /// Deltas stamped below this epoch are already in the persisted count: an
+    /// overwrite or a full rewrite has written a count that includes or
+    /// replaces their rows. Raised under the statistics persistence lock and
+    /// the `state` lock, and read under either.
+    counted_below_epoch: AtomicU64,
 }
 
 impl PostWriteMaintenance {
+    /// The current statistics epoch. Every reader reads it under a lock held
+    /// by whatever advances it, so it needs no ordering of its own.
+    pub(crate) fn statistics_epoch(&self) -> u64 {
+        self.statistics_epoch.load(Ordering::Relaxed)
+    }
+
+    /// The epoch below which queued deltas are already in the persisted count.
+    pub(crate) fn counted_below_epoch(&self) -> u64 {
+        self.counted_below_epoch.load(Ordering::Relaxed)
+    }
+
+    /// Take the queued state.
+    pub(crate) fn take_state(&self) -> PostWriteMaintenanceState {
+        std::mem::take(&mut *self.state.lock())
+    }
+
+    /// Start a new statistics epoch for a full rewrite about to capture its
+    /// input, and return it. Call it holding `write_lock` and the visibility
+    /// lock until the capture is taken: every write stamped below the returned
+    /// epoch then has its rows in the input, and none stamped with it does.
+    /// Nothing is dropped until the rewrite writes its count and calls
+    /// [`Self::count_below_epoch`].
+    pub(crate) fn start_statistics_epoch_for_rewrite(&self) -> u64 {
+        let _state = self.state.lock();
+        self.statistics_epoch.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Start a new statistics epoch for an overwrite that has just replaced the
+    /// table's rows, dropping the queued statistics and live-row deltas.
+    ///
+    /// Every queued delta, and every delta stamped with an earlier epoch that
+    /// is queued later, describes rows the overwrite replaced; added to the
+    /// overwrite's count, it would count them again. Retention and listing
+    /// requests stay queued.
+    pub(crate) fn start_statistics_epoch_after_overwrite(&self) {
+        let discarded = {
+            let mut guard = self.state.lock();
+            let epoch = self.statistics_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+            self.count_below_epoch_locked(&mut guard, epoch)
+        };
+        self.retire_applied_live_rows_deltas(discarded);
+    }
+
+    /// Record that the persisted count includes the rows of every write
+    /// stamped below `epoch`, dropping their queued statistics and deltas.
+    /// Call it holding the statistics persistence lock, right after writing
+    /// that count. Deltas stamped later stay queued.
+    pub(crate) fn count_below_epoch(&self, epoch: u64) {
+        let discarded = self.count_below_epoch_locked(&mut self.state.lock(), epoch);
+        self.retire_applied_live_rows_deltas(discarded);
+    }
+
+    /// Raise the counted floor to `epoch` and drop the queued statistics below
+    /// it. Returns how many queued deltas were dropped; the caller retires
+    /// them once the `state` lock is released, since the persisted count now
+    /// includes them.
+    fn count_below_epoch_locked(&self, state: &mut PostWriteMaintenanceState, epoch: u64) -> u64 {
+        self.counted_below_epoch.fetch_max(epoch, Ordering::Relaxed);
+        let kept = state.statistics.split_off(&epoch);
+        std::mem::replace(&mut state.statistics, kept)
+            .into_values()
+            .map(|queued| queued.live_rows_delta_count)
+            .sum()
+    }
+
     /// Whether a live-row delta has been queued that the persisted `num_rows`
     /// does not yet include.
     ///
@@ -345,10 +444,9 @@ impl PostWriteMaintenance {
     /// it (resident inline rows, mem-tier tombstones) are cleared by a
     /// checkpoint that does not drain this queue.
     ///
-    /// Errs toward reporting drift. A compaction that re-baselines the count
-    /// from the corpus already covers a delta queued before it, but does not
-    /// drain the queue, so this keeps reporting until the maintenance pass
-    /// applies that delta — briefly conservative, and the safe direction.
+    /// Errs toward reporting drift: a delta stays outstanding until a persist
+    /// folds it into `num_rows`, or until an overwrite or a full rewrite writes
+    /// a count that already includes its rows and drops it.
     pub(crate) fn has_unapplied_live_rows_delta(&self) -> bool {
         self.outstanding_live_rows_deltas.load(Ordering::Acquire) > 0
     }
@@ -404,7 +502,7 @@ fn release_outstanding_live_rows_deltas(outstanding: &AtomicU64, count: u64) {
     if count == 0 {
         return;
     }
-    let _ = outstanding.fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+    let _ = outstanding.try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
         Some(remaining.saturating_sub(count))
     });
 }
@@ -437,12 +535,21 @@ impl OutstandingLiveRowsDelta {
     ///
     /// Call it as soon as the publish returns, since every suspension point
     /// between the publish and this call is a cancellation that loses the claim.
-    pub(crate) fn published(mut self) -> PublishedLiveRowsDelta {
+    ///
+    /// `statistics_epoch` is [`PostWriteMaintenance::statistics_epoch`] read
+    /// while the lock that made the rows visible was still held: the visibility
+    /// lock, or `write_lock` held from before the publish. An overwrite and a
+    /// full rewrite advance the epoch under both, so the stamp tells which
+    /// side of either the rows were published on.
+    pub(crate) fn published(mut self, statistics_epoch: u64) -> PublishedLiveRowsDelta {
         let outstanding = self
             .outstanding
             .take()
             .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
-        PublishedLiveRowsDelta { outstanding }
+        PublishedLiveRowsDelta {
+            outstanding,
+            statistics_epoch,
+        }
     }
 }
 
@@ -466,9 +573,27 @@ impl Drop for OutstandingLiveRowsDelta {
 #[must_use = "a published claim must be queued or released; dropping it holds the table on Inexact"]
 pub(crate) struct PublishedLiveRowsDelta {
     outstanding: Arc<AtomicU64>,
+    statistics_epoch: u64,
+}
+
+/// Keeps post-write maintenance from starting while held; see
+/// `CayenneTableProvider::hold_post_write_maintenance`.
+pub(crate) struct PostWriteMaintenanceHold {
+    pub(crate) maintenance: Arc<PostWriteMaintenance>,
+}
+
+impl Drop for PostWriteMaintenanceHold {
+    fn drop(&mut self) {
+        self.maintenance.scheduled.store(false, Ordering::Release);
+    }
 }
 
 impl PublishedLiveRowsDelta {
+    /// The statistics epoch the rows were published under.
+    pub(crate) fn statistics_epoch(&self) -> u64 {
+        self.statistics_epoch
+    }
+
     /// Hand the claim to the maintenance queue that will persist the delta.
     ///
     /// Nothing to do: the claim is already counted, and
@@ -563,7 +688,7 @@ mod post_write_maintenance_tests {
     fn a_queued_delta_stays_outstanding_until_it_is_applied() {
         let maintenance = PostWriteMaintenance::default();
 
-        maintenance.reserve_live_rows_delta().published().queue();
+        maintenance.reserve_live_rows_delta().published(0).queue();
         assert!(maintenance.has_unapplied_live_rows_delta());
 
         maintenance.retire_applied_live_rows_deltas(1);
@@ -576,8 +701,8 @@ mod post_write_maintenance_tests {
     fn one_drain_retires_every_delta_it_coalesced() {
         let maintenance = PostWriteMaintenance::default();
 
-        maintenance.reserve_live_rows_delta().published().queue();
-        maintenance.reserve_live_rows_delta().published().queue();
+        maintenance.reserve_live_rows_delta().published(0).queue();
+        maintenance.reserve_live_rows_delta().published(0).queue();
         assert!(maintenance.has_unapplied_live_rows_delta());
 
         maintenance.retire_applied_live_rows_deltas(2);
@@ -592,9 +717,9 @@ mod post_write_maintenance_tests {
     fn a_later_success_does_not_cover_an_abandoned_delta() {
         let maintenance = PostWriteMaintenance::default();
 
-        maintenance.reserve_live_rows_delta().published().queue();
+        maintenance.reserve_live_rows_delta().published(0).queue();
         // Its drain's persist failed, so nothing is retired for it.
-        maintenance.reserve_live_rows_delta().published().queue();
+        maintenance.reserve_live_rows_delta().published(0).queue();
         maintenance.retire_applied_live_rows_deltas(1);
 
         assert!(maintenance.has_unapplied_live_rows_delta());
@@ -607,8 +732,8 @@ mod post_write_maintenance_tests {
     fn out_of_order_drains_retire_the_same_total() {
         let maintenance = PostWriteMaintenance::default();
 
-        maintenance.reserve_live_rows_delta().published().queue();
-        maintenance.reserve_live_rows_delta().published().queue();
+        maintenance.reserve_live_rows_delta().published(0).queue();
+        maintenance.reserve_live_rows_delta().published(0).queue();
 
         maintenance.retire_applied_live_rows_deltas(1);
         assert!(maintenance.has_unapplied_live_rows_delta());
@@ -623,10 +748,10 @@ mod post_write_maintenance_tests {
     fn a_write_after_a_drain_re_arms_the_signal() {
         let maintenance = PostWriteMaintenance::default();
 
-        maintenance.reserve_live_rows_delta().published().queue();
+        maintenance.reserve_live_rows_delta().published(0).queue();
         maintenance.retire_applied_live_rows_deltas(1);
 
-        maintenance.reserve_live_rows_delta().published().queue();
+        maintenance.reserve_live_rows_delta().published(0).queue();
         assert!(maintenance.has_unapplied_live_rows_delta());
     }
 
@@ -643,7 +768,7 @@ mod post_write_maintenance_tests {
              the queueing",
         );
 
-        reserved.published().queue();
+        reserved.published(0).queue();
         assert!(
             maintenance.has_unapplied_live_rows_delta(),
             "queueing hands the reservation on; only a persist retires it",
@@ -676,7 +801,7 @@ mod post_write_maintenance_tests {
 
         assert!(maintenance.has_unapplied_live_rows_delta());
 
-        kept.published().queue();
+        kept.published(0).queue();
         maintenance.retire_applied_live_rows_deltas(1);
         assert!(!maintenance.has_unapplied_live_rows_delta());
     }
@@ -690,7 +815,7 @@ mod post_write_maintenance_tests {
     fn a_published_claim_survives_a_commit_that_never_queues_it() {
         let maintenance = PostWriteMaintenance::default();
 
-        drop(maintenance.reserve_live_rows_delta().published());
+        drop(maintenance.reserve_live_rows_delta().published(0));
 
         assert!(
             maintenance.has_unapplied_live_rows_delta(),
@@ -707,7 +832,7 @@ mod post_write_maintenance_tests {
     fn a_published_claim_for_an_unmoved_count_is_released() {
         let maintenance = PostWriteMaintenance::default();
 
-        maintenance.reserve_live_rows_delta().published().release();
+        maintenance.reserve_live_rows_delta().published(0).release();
 
         assert!(!maintenance.has_unapplied_live_rows_delta());
     }
@@ -719,7 +844,7 @@ mod post_write_maintenance_tests {
     fn retiring_more_than_is_outstanding_does_not_wrap() {
         let maintenance = PostWriteMaintenance::default();
 
-        maintenance.reserve_live_rows_delta().published().queue();
+        maintenance.reserve_live_rows_delta().published(0).queue();
         maintenance.retire_applied_live_rows_deltas(5);
 
         assert!(!maintenance.has_unapplied_live_rows_delta());

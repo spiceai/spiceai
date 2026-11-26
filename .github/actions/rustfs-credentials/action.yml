@@ -54,8 +54,13 @@ runs:
         fi
 
         # Bearer tokens go to curl on stdin, so neither is ever on a command line.
+        #
+        # Every request is bounded. Without `--max-time`, a server that accepts the
+        # connection and never answers holds curl, and with it the calling job, until the
+        # job's own bound cancels it, which for a build is hours. `--retry` treats a
+        # timeout as transient, so a stall costs at most four 30-second attempts per call.
         oidc_token="$(printf 'Authorization: Bearer %s\n' "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" |
-          curl -sSf --retry 3 -H @- --get --data-urlencode "audience=${AUDIENCE}" "${ACTIONS_ID_TOKEN_REQUEST_URL}" |
+          curl -sSf --retry 3 --connect-timeout 10 --max-time 30 -H @- --get --data-urlencode "audience=${AUDIENCE}" "${ACTIONS_ID_TOKEN_REQUEST_URL}" |
           jq -r '.value // empty')"
         if [[ -z "${oidc_token}" ]]; then
           echo "::error::GitHub returned no OIDC token."
@@ -63,7 +68,7 @@ runs:
         fi
         echo "::add-mask::${oidc_token}"
 
-        response="$(printf '%s' "${oidc_token}" | curl -sS --retry 3 -X POST "${ENDPOINT%/}/" \
+        response="$(printf '%s' "${oidc_token}" | curl -sS --retry 3 --connect-timeout 10 --max-time 30 -X POST "${ENDPOINT%/}/" \
           -H 'Content-Type: application/x-www-form-urlencoded' \
           --data-urlencode 'Action=AssumeRoleWithWebIdentity' \
           --data-urlencode 'Version=2011-06-15' \

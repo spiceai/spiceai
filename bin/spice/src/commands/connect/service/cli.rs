@@ -121,8 +121,9 @@ pub async fn execute(
 
     let backend = backend();
     let action = command.as_str();
+    let state_dir = runtime_cloud_connect::state_dir::state_dir(config_dir);
     let mutation_lock = Some(
-        runtime_cloud_connect::MutationLock::acquire(config_dir, action)
+        runtime_cloud_connect::MutationLock::acquire(&state_dir, action)
             .await
             .map_err(|source| Error::CloudConnectIo {
                 message: format!("acquire Cloud Connect state for service {action}: {source}"),
@@ -155,7 +156,7 @@ pub async fn execute(
         None
     };
     let (service_config_dir, identity_config_dir) = locked_dirs.as_ref().map_or(
-        (config_dir, config_dir),
+        (config_dir, state_dir.as_path()),
         |(service_config_dir, identity_config_dir)| {
             (service_config_dir.as_path(), identity_config_dir.as_path())
         },
@@ -168,8 +169,11 @@ pub async fn execute(
     // manifest can resolve to different directories in one install. Closing
     // that needs descriptor-relative reads through the whole state layer: #13291.
     let state_config_dir = match mutation_lock.as_ref() {
-        Some(lock) => super::PinnedConfigDir::for_lock(service_config_dir, lock)?,
-        None => super::PinnedConfigDir::unlocked(config_dir),
+        Some(lock) => super::PinnedConfigDir::for_lock(
+            runtime_cloud_connect::state_dir::state_dir(service_config_dir),
+            lock,
+        )?,
+        None => super::PinnedConfigDir::unlocked(state_dir.clone()),
     };
     match command {
         ServiceCommand::Install => {
@@ -233,7 +237,8 @@ pub(crate) fn print_local_logs(
     follow: bool,
 ) -> Result<bool> {
     let backend = backend();
-    let state = super::PinnedConfigDir::unlocked(config_dir);
+    let state =
+        super::PinnedConfigDir::unlocked(runtime_cloud_connect::state_dir::state_dir(config_dir));
     let Some(manifest) = super::resolve_with_state(backend, instance_dir, &state, config_dir)?
     else {
         return Ok(false);
@@ -260,7 +265,8 @@ pub(crate) fn read_local_logs(
     number: u32,
 ) -> Result<Option<Vec<String>>> {
     let backend = backend();
-    let state = super::PinnedConfigDir::unlocked(config_dir);
+    let state =
+        super::PinnedConfigDir::unlocked(runtime_cloud_connect::state_dir::state_dir(config_dir));
     let Some(manifest) = super::resolve_with_state(backend, instance_dir, &state, config_dir)?
     else {
         return Ok(None);

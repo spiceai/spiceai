@@ -47,7 +47,7 @@ pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as Replication
 pub use pgwire_replication::{CaCertificate, PgOutputFormat};
 pub use retention::{SlotRemoval, SlotRetentionPosture};
 pub use slot::{SlotInfo, SlotSetupOutcome};
-pub use xid_registry::{XactStatus, XidEntry, XidRegistry};
+pub use xid_registry::{EchoKeys, EchoReadGuard, XactStatus, XidEntry, XidRegistry};
 
 /// Extracts a human-readable message from a `tokio_postgres::Error`.
 ///
@@ -120,6 +120,17 @@ pub enum Error {
 
     #[snafu(display("Bootstrap stream error: {}", pg_error_detail(source)))]
     Bootstrap { source: tokio_postgres::Error },
+
+    #[snafu(display("PostgreSQL snapshot reader task failed: {source}"))]
+    BootstrapReaderJoin { source: tokio::task::JoinError },
+
+    #[snafu(display("PostgreSQL snapshot reader ended without completing its scan"))]
+    BootstrapReaderMissing,
+
+    #[snafu(display(
+        "Failed to read the initial snapshot of table '{table}': the name now refers to a different table, because the table or its schema was renamed or replaced while the snapshot was read, so the snapshot was discarded"
+    ))]
+    BootstrapRelationChanged { table: String },
 
     #[snafu(display("Invalid Postgres LSN string `{lsn}`: expected `XXXXXXXX/YYYYYYYY`"))]
     InvalidLsn { lsn: String },
@@ -921,7 +932,6 @@ pub struct ReplicationStreamInput {
 /// Back-pressure: the returned stream waits for each envelope's `commit()` to
 /// complete before emitting the next one, so the accelerator's write throughput
 /// naturally paces the replication stream.
-#[must_use]
 pub fn start_replication_stream(input: ReplicationStreamInput) -> ChangesStream {
     // Uses the policy already set on `input` (the connector maps the dataset's
     // `on_schema_change`); construct with `policy: SchemaEvolutionPolicy::Block`
@@ -945,7 +955,6 @@ pub fn start_replication_stream(input: ReplicationStreamInput) -> ChangesStream 
 /// per-member [`schema_evolution::RelationSchemaTracker`] for all datasets,
 /// slot-sharing or not. `input.params.shared` governs only slot/publication
 /// naming, not which pump runs.
-#[must_use]
 pub fn start_replication_stream_with_policy(
     mut input: ReplicationStreamInput,
     policy: SchemaEvolutionPolicy,

@@ -561,7 +561,10 @@ mod tests {
     /// control per request: Claude 4 and later reject `temperature` and `top_p` set together.
     #[test]
     fn forwarded_sampling_controls_are_read_from_the_converted_request() {
-        assert!(forwarded_sampling_controls(&params_for(|_| {})).is_empty());
+        assert_eq!(
+            forwarded_sampling_controls(&params_for(|_| {})),
+            [] as [&str; 0]
+        );
         assert_eq!(
             forwarded_sampling_controls(&params_for(|r| r.temperature = Some(0.2))),
             ["temperature"]

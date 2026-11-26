@@ -56,10 +56,13 @@ use uuid::Uuid;
 use vortex::array::stream::ArrayStreamAdapter;
 use vortex::arrow::ArrowSessionExt;
 use vortex::dtype::DType;
+use vortex::expr::stats::Stat;
+use vortex::file::VortexWriteOptions;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::file::WriteSummary;
 use vortex::io::VortexWrite;
 use vortex::io::object_store::ObjectStoreWrite;
+use vortex::layout::LayoutStrategy;
 use vortex::session::VortexSession;
 use vortex_utils::aliases::hash_set::HashSet;
 
@@ -427,10 +430,37 @@ struct ActiveFileWriter {
     task: JoinHandle<DFResult<WriteSummary>>,
 }
 
+/// What each Vortex file of a write is written with.
+#[derive(Clone)]
+pub(super) struct FileWriterConfig {
+    /// Converts batches to Vortex arrays and drives the writer.
+    pub(super) session: VortexSession,
+    /// Replaces the writer's default layout strategy when set.
+    pub(super) strategy: Option<Arc<dyn LayoutStrategy>>,
+}
+
+impl FileWriterConfig {
+    /// The options every file is written with.
+    ///
+    /// Each column records its default file statistics plus `Sum`, which Vortex leaves out by
+    /// default and Cayenne answers whole-table `SUM` and `AVG` from. A chunk whose sum overflows
+    /// leaves the file sum absent rather than wrong.
+    fn write_options(&self) -> VortexWriteOptions {
+        let options = self
+            .session
+            .write_options()
+            .with_additional_file_statistics(Stat::Sum.aggregate_fn().into_iter().collect());
+        match &self.strategy {
+            Some(strategy) => options.with_strategy(Arc::clone(strategy)),
+            None => options,
+        }
+    }
+}
+
 pub struct VortexSink {
     config: FileSinkConfig,
     schema: SchemaRef,
-    session: VortexSession,
+    writer: FileWriterConfig,
     target_file_size: Option<u64>,
     shard_spec: ShardSpec,
     write_observer: Option<Arc<dyn VortexWriteObserver>>,
@@ -440,7 +470,7 @@ impl VortexSink {
     pub(super) fn new(
         config: FileSinkConfig,
         schema: SchemaRef,
-        session: VortexSession,
+        writer: FileWriterConfig,
         target_file_size: Option<u64>,
         shard_spec: ShardSpec,
         write_observer: Option<Arc<dyn VortexWriteObserver>>,
@@ -448,7 +478,7 @@ impl VortexSink {
         Self {
             config,
             schema,
-            session,
+            writer,
             target_file_size,
             shard_spec,
             write_observer,
@@ -500,15 +530,15 @@ impl FileSink for VortexSink {
         mut file_stream_rx: DemuxedStreamReceiver,
         object_store: Arc<dyn ObjectStore>,
     ) -> DFResult<u64> {
-        let dtype = writer_dtype(&self.session, &get_writer_schema(&self.config))?;
+        let dtype = writer_dtype(&self.writer.session, &get_writer_schema(&self.config))?;
         let mut write_tasks: JoinSet<DFResult<u64>> = JoinSet::new();
 
         while let Some((path, mut rx)) = file_stream_rx.recv().await {
-            let session = self.session.clone();
+            let writer_config = self.writer.clone();
             let object_store = Arc::clone(&object_store);
             let dtype = dtype.clone();
             write_tasks.spawn(async move {
-                let mut writer = Some(start_file_writer(&session, object_store, path, dtype));
+                let mut writer = Some(start_file_writer(&writer_config, object_store, path, dtype));
                 let mut rows: u64 = 0;
                 while let Some(batch) = rx.recv().await {
                     rows = rows
@@ -589,7 +619,7 @@ impl DataSink for VortexSink {
             .runtime_env()
             .object_store(&self.config.object_store_url)?;
         let writer_schema = get_writer_schema(&self.config);
-        let dtype = writer_dtype(&self.session, &writer_schema)?;
+        let dtype = writer_dtype(&self.writer.session, &writer_schema)?;
         let write_id = Uuid::now_v7().simple().to_string();
         let base_output_path = self.base_output_path()?;
         let partition_column_names = self
@@ -600,7 +630,7 @@ impl DataSink for VortexSink {
             .collect::<Vec<_>>();
 
         let summaries = write_record_batch_stream_to_files(
-            self.session.clone(),
+            self.writer.clone(),
             object_store,
             dtype,
             data,
@@ -665,7 +695,7 @@ impl DataSink for VortexSink {
 /// `{write_id}_{file_index:05}.{extension}` scheme for a single shard, or
 /// `{write_id}_p{shard:03}_{file_index:05}.{extension}` when sharded.
 async fn write_record_batch_stream_to_files(
-    session: VortexSession,
+    writer: FileWriterConfig,
     object_store: Arc<dyn ObjectStore>,
     dtype: DType,
     mut data: SendableRecordBatchStream,
@@ -725,7 +755,7 @@ async fn write_record_batch_stream_to_files(
         let (tx, rx) = futures::channel::mpsc::channel::<RecordBatch>(1);
         senders.push(tx);
         handles.push(tokio::spawn(run_shard_writer(
-            session.clone(),
+            writer.clone(),
             Arc::clone(&object_store),
             dtype.clone(),
             rx,
@@ -1237,7 +1267,7 @@ fn run_order(columns: &[ArrowArrayRef]) -> DFResult<UInt32Array> {
 /// returning; the caller aggregates across shards.
 #[expect(clippy::too_many_arguments)]
 async fn run_shard_writer(
-    session: VortexSession,
+    writer: FileWriterConfig,
     object_store: Arc<dyn ObjectStore>,
     dtype: DType,
     mut receiver: futures::channel::mpsc::Receiver<RecordBatch>,
@@ -1292,7 +1322,7 @@ async fn run_shard_writer(
                     );
                     started_paths.lock().await.insert(file_path.clone());
                     active_writer = Some(start_file_writer(
-                        &session,
+                        &writer,
                         Arc::clone(&object_store),
                         file_path,
                         dtype.clone(),
@@ -1409,14 +1439,14 @@ fn writer_dtype(session: &VortexSession, schema: &Schema) -> DFResult<DType> {
 }
 
 fn start_file_writer(
-    session: &VortexSession,
+    writer: &FileWriterConfig,
     object_store: Arc<dyn ObjectStore>,
     path: Path,
     dtype: DType,
 ) -> ActiveFileWriter {
     // Use a small bounded channel to enforce backpressure and avoid unbounded buffering.
     let (sender, receiver) = futures::channel::mpsc::channel::<RecordBatch>(1);
-    let session = session.clone();
+    let writer = writer.clone();
     let path_for_task = path.clone();
 
     let task = tokio::spawn(async move {
@@ -1429,14 +1459,14 @@ fn start_file_writer(
                 )
             })?;
 
-        let array_session = session.clone();
+        let array_session = writer.session.clone();
         let stream = receiver.map(move |rb| {
             let schema = rb.schema();
             array_session.arrow().from_arrow_record_batch(rb, &schema)
         });
         let stream_adapter = ArrayStreamAdapter::new(dtype, stream);
 
-        let summary = session
+        let summary = writer
             .write_options()
             .write(&mut object_writer, stream_adapter)
             .await
@@ -1670,6 +1700,159 @@ mod tests {
     use crate::persistent::sink::run_sort_supports;
     use crate::persistent::sink::sort_scratch_bytes_per_row;
     use crate::persistent::sink::write_record_batch_stream_to_files;
+
+    /// A file the sink writes records each numeric column's sum in its statistics, exactly,
+    /// and a string column, which has no sum, keeps its bounds.
+    ///
+    /// Vortex leaves `Sum` out of a file's statistics by default; Cayenne answers
+    /// whole-table `SUM` and `AVG` from it, so every write asks for it.
+    #[tokio::test]
+    async fn a_written_file_records_its_column_sums() -> anyhow::Result<()> {
+        use datafusion_physical_plan::{StatisticsArgs, StatisticsContext};
+
+        let ctx = TestSessionContext::new(true);
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE sums (n BIGINT NOT NULL, s VARCHAR NOT NULL) \
+                 STORED AS vortex LOCATION '/sums/'",
+            )
+            .await?
+            .collect()
+            .await?;
+        ctx.session
+            .sql(
+                "INSERT INTO sums SELECT value AS n, CAST(value AS VARCHAR) AS s \
+                 FROM generate_series(1, 20000)",
+            )
+            .await?
+            .collect()
+            .await?;
+
+        let provider = ctx.session.table_provider("sums").await?;
+        let plan = provider.scan(&ctx.session.state(), None, &[], None).await?;
+        let stats = StatisticsContext::new().compute(&*plan, &StatisticsArgs::new())?;
+        assert_eq!(
+            stats.column_statistics[0].sum_value,
+            datafusion_common::stats::Precision::Exact(ScalarValue::Int64(Some(
+                20_000 * 20_001 / 2
+            ))),
+            "the file's statistics carry the column's exact sum"
+        );
+        assert!(
+            stats.column_statistics[1].max_value.get_value().is_some(),
+            "the string column keeps its bounds"
+        );
+        Ok(())
+    }
+
+    /// The rows `sql` returns, rendered, or the error it fails with.
+    async fn rendered_answer(ctx: &TestSessionContext, sql: &str) -> String {
+        match async { ctx.session.sql(sql).await?.collect().await }.await {
+            Ok(batches) => datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+                .map_or_else(|e| format!("FORMAT ERROR {e}"), |t| t.to_string()),
+            Err(e) => format!("ERROR {e}"),
+        }
+    }
+
+    /// The sum a scan of the vortex table `table` reports for its first column.
+    async fn reported_sum(
+        ctx: &TestSessionContext,
+        table: &str,
+    ) -> anyhow::Result<datafusion_common::stats::Precision<ScalarValue>> {
+        use datafusion_physical_plan::{StatisticsArgs, StatisticsContext};
+
+        let provider = ctx.session.table_provider(table).await?;
+        let plan = provider.scan(&ctx.session.state(), None, &[], None).await?;
+        let stats = StatisticsContext::new().compute(&*plan, &StatisticsArgs::new())?;
+        Ok(stats.column_statistics[0].sum_value.clone())
+    }
+
+    /// A column sum that overflows `BIGINT` is never reported as exact: not for a file whose
+    /// own rows overflow it (`own`), nor for two files whose sums fit alone and overflow
+    /// together (`pair`), right after the write or once the footers are read back from
+    /// storage. Two files whose sums fit together (`fits`) do report their exact sum, so the
+    /// `pair` check is not passing on sums that are never combined. `DataFusion` answers
+    /// `SUM` from an exact sum, so `SUM` and `AVG` over each table have to answer as they do
+    /// over the same rows in memory.
+    #[tokio::test]
+    async fn an_overflowing_column_sum_is_never_reported_exact() -> anyhow::Result<()> {
+        use datafusion_common::stats::Precision;
+        use object_store::{ObjectStore as _, ObjectStoreExt as _};
+
+        const COLUMNS: &str = "(n BIGINT NOT NULL)";
+        // One statement per file.
+        let tables: [(&str, &[&str]); 3] = [
+            ("own", &["(9223372036854775807), (1)"]),
+            ("pair", &["(9223372036854775000)", "(1000)"]),
+            ("fits", &["(5)", "(7)"]),
+        ];
+        let create = |session: &TestSessionContext, table: &str| {
+            let sql = format!(
+                "CREATE EXTERNAL TABLE {table} {COLUMNS} STORED AS vortex LOCATION '/{table}/'"
+            );
+            let session = session.session.clone();
+            async move { session.sql(&sql).await?.collect().await }
+        };
+        let ctx = TestSessionContext::new(true);
+        for (table, files) in tables {
+            create(&ctx, table).await?;
+            ctx.session
+                .sql(&format!("CREATE TABLE m_{table} {COLUMNS}"))
+                .await?
+                .collect()
+                .await?;
+            for values in files {
+                for target in [table.to_string(), format!("m_{table}")] {
+                    ctx.session
+                        .sql(&format!("INSERT INTO {target} VALUES {values}"))
+                        .await?
+                        .collect()
+                        .await?;
+                }
+            }
+        }
+
+        // The same files, read back from storage in a session that has not cached them.
+        let reopened = TestSessionContext::new(true);
+        let mut listing = ctx.store.list(None);
+        while let Some(meta) = futures::StreamExt::next(&mut listing).await {
+            let meta = meta?;
+            let bytes = ctx.store.get(&meta.location).await?.bytes().await?;
+            reopened.store.put(&meta.location, bytes.into()).await?;
+        }
+        for (table, _) in tables {
+            create(&reopened, table).await?;
+        }
+
+        for (table, _) in tables {
+            for (stage, session) in [("after the write", &ctx), ("read back", &reopened)] {
+                let sum = reported_sum(session, table).await?;
+                if table == "fits" {
+                    assert_eq!(
+                        sum,
+                        Precision::Exact(ScalarValue::Int64(Some(12))),
+                        "{stage}: {table}"
+                    );
+                } else {
+                    assert!(
+                        !matches!(sum, Precision::Exact(_)),
+                        "{stage}: {table}: an overflowing sum is reported as {sum:?}"
+                    );
+                }
+            }
+            for aggregate in ["SUM(n)", "AVG(n)"] {
+                let oracle =
+                    rendered_answer(&ctx, &format!("SELECT {aggregate} AS x FROM m_{table}")).await;
+                for (stage, session) in [("after the write", &ctx), ("read back", &reopened)] {
+                    let observed =
+                        rendered_answer(session, &format!("SELECT {aggregate} AS x FROM {table}"))
+                            .await;
+                    assert_eq!(observed, oracle, "{stage}: {table}: {aggregate}");
+                }
+            }
+        }
+        Ok(())
+    }
 
     fn split_path(
         base_path: &object_store::path::Path,
@@ -3082,7 +3265,10 @@ mod tests {
         let base = ListingTableUrl::parse("file:///table/")
             .expect("file:///table/ should parse as a listing url");
         write_record_batch_stream_to_files(
-            session,
+            super::FileWriterConfig {
+                session,
+                strategy: None,
+            },
             store,
             dtype,
             data,
@@ -3441,7 +3627,7 @@ mod tests {
 
         // The run is consumed: finishing again emits nothing.
         sorter.finish()?;
-        assert!(drain(&mut sorter)?.is_empty());
+        assert_eq!(drain(&mut sorter)?, [] as [RecordBatch; 0]);
         Ok(())
     }
 
@@ -3454,7 +3640,7 @@ mod tests {
         let mut sorter = run_sorter(u64::try_from(budget)?, &pool);
 
         sorter.push(one_col_batch(&schema, (100..200).rev().collect()))?;
-        assert!(drain(&mut sorter)?.is_empty());
+        assert_eq!(drain(&mut sorter)?, [] as [RecordBatch; 0]);
         sorter.push(one_col_batch(&schema, (0..100).rev().collect()))?;
         let out = drain(&mut sorter)?;
         assert_eq!(
@@ -3478,7 +3664,7 @@ mod tests {
         let keys: Vec<i64> = (0..total).map(|i| (i * 7919) % total).collect();
         for chunk in keys.chunks(keys.len().div_ceil(64)) {
             sorter.push(one_col_batch(&schema, chunk.to_vec()))?;
-            assert!(drain(&mut sorter)?.is_empty());
+            assert_eq!(drain(&mut sorter)?, [] as [RecordBatch; 0]);
         }
         sorter.finish()?;
         let out = drain(&mut sorter)?;
@@ -3509,7 +3695,7 @@ mod tests {
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(one_batch * 3 / 2));
         let mut sorter = run_sorter(u64::MAX, &pool);
         sorter.push(first)?;
-        assert!(drain(&mut sorter)?.is_empty());
+        assert_eq!(drain(&mut sorter)?, [] as [RecordBatch; 0]);
         sorter.push(second)?;
         let out = drain(&mut sorter)?;
         assert_eq!(
@@ -3528,7 +3714,7 @@ mod tests {
             vec![Some(6), Some(4), Some(5)]
         );
         sorter.finish()?;
-        assert!(drain(&mut sorter)?.is_empty());
+        assert_eq!(drain(&mut sorter)?, [] as [RecordBatch; 0]);
         Ok(())
     }
 

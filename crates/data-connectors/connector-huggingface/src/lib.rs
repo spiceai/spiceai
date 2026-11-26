@@ -44,6 +44,7 @@ use datafusion::datasource::file_format::{
 };
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use object_store::ObjectStore;
@@ -269,7 +270,13 @@ impl HuggingFace {
     }
 
     /// The dataset's table: the files `from` selects, read at the commit each scan resolves.
-    async fn table(&self, dataset: &DatasetSpec) -> DataConnectorResult<Arc<dyn TableProvider>> {
+    /// The table for `dataset`; its schema is inferred under `memory_pool`, the runtime's
+    /// query memory pool.
+    async fn table(
+        &self,
+        dataset: &DatasetSpec,
+        memory_pool: &Arc<dyn MemoryPool>,
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let location = Self::location(dataset)?;
         // Resolving the revision first checks that the dataset exists and can be read, and
         // pins the schema to one commit.
@@ -342,6 +349,7 @@ impl HuggingFace {
                 listing_url.as_ref(),
                 &extension,
                 Arc::clone(&file_format),
+                memory_pool,
             )
             .await?;
 
@@ -876,10 +884,16 @@ impl DataConnector for HuggingFace {
 
     async fn read_provider(
         &self,
-        _context: &dyn ConnectorContext,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        self.table(dataset).await
+        let memory_pool = Arc::clone(
+            &context
+                .datafusion_session_context()
+                .runtime_env()
+                .memory_pool,
+        );
+        self.table(dataset, &memory_pool).await
     }
 
     async fn metadata_provider(

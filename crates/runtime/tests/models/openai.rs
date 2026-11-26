@@ -826,7 +826,7 @@ async fn openai_test_responses_api_streaming() -> Result<(), anyhow::Error> {
             }
 
             // Check that we received a non-empty response
-            assert!(!final_response.is_empty());
+            assert_ne!(final_response, "");
             // Check that we didn't fail at any point while streaming
             assert!(!failure);
             // Check that we received more than 1 delta, indicating streaming

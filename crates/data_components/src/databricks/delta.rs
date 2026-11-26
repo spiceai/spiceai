@@ -46,6 +46,31 @@ pub enum Error {
         "Failed to find the Databricks table '{table_reference}'. Verify the table exists, and try again."
     ))]
     TableDoesNotExist { table_reference: TableReference },
+    #[snafu(display(
+        "Failed to read the Databricks table '{table_reference}': {reason}. Point the table at object storage, and try again. See: https://spiceai.org/docs/components/data-connectors/databricks"
+    ))]
+    UnsupportedStorageLocation {
+        table_reference: TableReference,
+        reason: String,
+    },
+}
+
+/// Returns the table's storage location, refusing one that is absent or outside
+/// object storage. The location comes from Unity Catalog, not from the Spicepod.
+fn object_storage_location(
+    table: &UCTable,
+    table_reference: TableReference,
+) -> Result<String, Error> {
+    if let Some(reason) = table.unsupported_storage_location_reason() {
+        return Err(Error::UnsupportedStorageLocation {
+            table_reference,
+            reason,
+        });
+    }
+    table
+        .storage_location
+        .clone()
+        .ok_or(Error::TableDoesNotHaveStorageLocation { table_reference })
 }
 
 impl DatabricksDelta {
@@ -84,9 +109,9 @@ impl DatabricksDelta {
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let table = self.get_uc_table(&table_reference).await?;
-        let Some(table_uri) = table.storage_location.clone() else {
-            return Err(Error::TableDoesNotHaveStorageLocation { table_reference }.into());
-        };
+        // Checked before vending, because a table that cannot be vended falls back to
+        // `DeltaTable::open`, which would open any location.
+        let table_uri = object_storage_location(&table, table_reference)?;
 
         if let Some(client) = &self.credential_vending_client {
             let aws_region = self
@@ -117,7 +142,9 @@ impl DatabricksDelta {
             }
         }
 
-        let delta_table = DeltaTable::from(table_uri, storage_options, &self.io_runtime).boxed()?;
+        let delta_table = DeltaTable::open(table_uri, storage_options, &self.io_runtime)
+            .await
+            .boxed()?;
 
         Ok(Arc::new(delta_table) as Arc<dyn TableProvider>)
     }
@@ -154,9 +181,7 @@ impl DatabricksDelta {
         table_reference: TableReference,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let table = self.get_uc_table(&table_reference).await?;
-        table
-            .storage_location
-            .ok_or_else(|| Error::TableDoesNotHaveStorageLocation { table_reference }.into())
+        Ok(object_storage_location(&table, table_reference)?)
     }
 }
 
@@ -167,5 +192,137 @@ impl Read for DatabricksDelta {
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         self.get_delta_table(table_reference).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::parquet::arrow::ArrowWriter;
+    use std::path::Path;
+    use token_provider::StaticTokenProvider;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Writes a readable Delta table with one `value` row at `dir`.
+    fn write_delta_table(dir: &Path) {
+        std::fs::create_dir_all(dir.join("_delta_log")).expect("create _delta_log");
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["LOCAL_FILE_ROW"]))],
+        )
+        .expect("batch builds");
+        let data_file = dir.join("part-0.parquet");
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(&data_file).expect("create data file"),
+            schema,
+            None,
+        )
+        .expect("parquet writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close parquet file");
+        let size = std::fs::metadata(&data_file).expect("data file").len();
+        let commit = [
+            serde_json::json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+            serde_json::json!({"metaData": {
+                "id": "00000000-0000-0000-0000-000000000000",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": r#"{"type":"struct","fields":[{"name":"value","type":"string","nullable":true,"metadata":{}}]}"#,
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 0
+            }}),
+            serde_json::json!({"add": {
+                "path": "part-0.parquet",
+                "partitionValues": {},
+                "size": size,
+                "modificationTime": 0,
+                "dataChange": true
+            }}),
+        ]
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(dir.join("_delta_log/00000000000000000000.json"), commit)
+            .expect("write commit");
+    }
+
+    async fn mock_table(server: &MockServer, name: &str, storage_location: &str) {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/2.1/unity-catalog/tables/cat.sch.{name}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": name,
+                "catalog_name": "cat",
+                "schema_name": "sch",
+                "table_type": "EXTERNAL",
+                "data_source_format": "DELTA",
+                "storage_location": storage_location,
+                "table_id": format!("{name}-id"),
+            })))
+            .mount(server)
+            .await;
+    }
+
+    fn databricks_delta(server: &MockServer) -> DatabricksDelta {
+        DatabricksDelta::new(
+            Endpoint(server.uri()),
+            HashMap::new(),
+            Arc::new(StaticTokenProvider::new(SecretString::from("token"))),
+            Handle::current(),
+        )
+    }
+
+    fn refusal(table: &str, scheme: &str) -> String {
+        format!(
+            "Failed to read the Databricks table 'cat.sch.{table}': its storage location uses the '{scheme}' scheme, and catalog tables are only read from object storage (s3, s3a, abfss, abfs, az, azure, wasbs, wasb, gs). Point the table at object storage, and try again. See: https://spiceai.org/docs/components/data-connectors/databricks"
+        )
+    }
+
+    #[tokio::test]
+    async fn refuses_a_storage_location_outside_object_storage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_delta_table(dir.path());
+        let local = url::Url::from_directory_path(dir.path())
+            .expect("absolute path")
+            .to_string();
+        let server = MockServer::start().await;
+        mock_table(&server, "local", &local).await;
+        mock_table(&server, "remote", "s3://bucket/tables/remote/").await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.1/unity-catalog/temporary-table-credentials"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let static_credentials = databricks_delta(&server);
+        let vended = databricks_delta(&server).with_credential_vending(Arc::new(
+            UnityCatalog::new(Endpoint(server.uri()), None, None).expect("client"),
+        ));
+        for delta in [&static_credentials, &vended] {
+            let error = delta
+                .table_provider(TableReference::parse_str("cat.sch.local"))
+                .await
+                .expect_err("a table stored on the Spice host must not be read");
+            assert_eq!(error.to_string(), refusal("local", "file"));
+            let error = delta
+                .resolve_table_uri(TableReference::parse_str("cat.sch.local"))
+                .await
+                .expect_err("a table stored on the Spice host must not be resolved");
+            assert_eq!(error.to_string(), refusal("local", "file"));
+            assert_eq!(
+                delta
+                    .resolve_table_uri(TableReference::parse_str("cat.sch.remote"))
+                    .await
+                    .expect("a table stored in object storage resolves"),
+                "s3://bucket/tables/remote/"
+            );
+        }
     }
 }
