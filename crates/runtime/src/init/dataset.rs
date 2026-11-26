@@ -2694,8 +2694,8 @@ impl Runtime {
             });
 
             // The schedule waits only for the initial load to end, so a scheduled refresh
-            // can still recover a dataset whose initial load failed. A reload or removal of
-            // the dataset during the load cancels the wait.
+            // can still recover a dataset whose initial load failed. Removing the dataset's
+            // schedule during the load cancels the wait.
             let runtime = ds.runtime();
             let runtime_status = Arc::clone(&self.status);
             let waiter = self.register_dataset_schedule_waiter(&ds.name);

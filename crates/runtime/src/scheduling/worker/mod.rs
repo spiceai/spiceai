@@ -155,8 +155,7 @@ impl ScheduledTask for WorkerSqlTask {
             let sql = Arc::clone(&self.sql);
             let runtime = Arc::clone(&self.runtime);
 
-            // A component in `Error` must not hold the worker back: it may never load.
-            if !runtime.status.is_ready_allowing_unhealthy() {
+            if !runtime.status.is_ready_for_scheduled_work() {
                 if self.skipped.swap(true, Ordering::Relaxed) {
                     tracing::debug!("Worker '{worker_name}' skipped a scheduled run: the runtime is not ready.");
                 } else {
