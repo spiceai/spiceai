@@ -783,7 +783,8 @@ fn build_mysql_opts(params: &Parameters) -> Result<Opts, String> {
 /// The server and database a dataset reads, named as the Spicepod names their
 /// discrete settings: `connection_string` overrides them, as for the connection.
 pub(crate) fn source_identity(params: &Parameters) -> Result<Vec<(String, String)>, String> {
-    let (host, port, db) = if let Some(connection_string) = optional_string(params, "connection_string")
+    let (host, port, db) = if let Some(connection_string) =
+        optional_string(params, "connection_string")
     {
         let opts = Opts::from_url(&connection_string)
             .map_err(|e| format!("invalid `{}`: {e}", params.user_param("connection_string")))?;

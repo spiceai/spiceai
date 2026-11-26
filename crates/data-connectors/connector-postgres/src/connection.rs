@@ -557,7 +557,6 @@ mod tests {
     }
 
     fn source_identity(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        use data_connector_api::DataConnectorFactory;
         crate::PostgresFactory::new_arc()
             .source_identity(&params_with_pairs(pairs))
             .expect("resolves")

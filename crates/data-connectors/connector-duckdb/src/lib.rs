@@ -307,7 +307,10 @@ impl DataConnectorFactory for DuckDBFactory {
         &self,
         params: &runtime_parameters::Parameters,
     ) -> Result<Option<Vec<(String, String)>>, String> {
-        Ok(Some(data_connector_api::source_identity_of(params, &["open"])))
+        Ok(Some(data_connector_api::source_identity_of(
+            params,
+            &["open"],
+        )))
     }
 }
 

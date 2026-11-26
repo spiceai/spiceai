@@ -1355,11 +1355,11 @@ fn requires_rebuild(error: &(dyn std::error::Error + 'static)) -> bool {
 /// The source `declared` describes, for app `app`: its `from`, the connection
 /// settings that identify it, and the source of each table it reads.
 fn source_definition(
-    app: String,
+    app: &str,
     declared: &runtime_acceleration::SourceDefinition,
 ) -> cayenne::DatasetDefinition {
     use secrecy::ExposeSecret;
-    let mut definition = cayenne::DatasetDefinition::new(app.clone())
+    let mut definition = cayenne::DatasetDefinition::new(app)
         .with_setting("from", &declared.from)
         .with_connection(declared.connection.iter().map(|setting| {
             (
@@ -1369,7 +1369,7 @@ fn source_definition(
             )
         }));
     for (table, read) in &declared.reads {
-        definition = definition.with_read(table, &source_definition(app.clone(), read));
+        definition = definition.with_read(table, &source_definition(app, read));
     }
     definition
 }
@@ -3013,7 +3013,7 @@ impl CayenneAccelerator {
             })
             .unwrap_or_default();
         Ok(Some(
-            source_definition(source.app().name.clone(), &declared)
+            source_definition(&source.app().name, &declared)
                 .with_key(primary_keys, on_conflict)
                 .with_list_setting("partition_by", &partition_by),
         ))
@@ -3134,8 +3134,8 @@ impl CayenneAccelerator {
         if !memory_mode && Self::vnext_enabled(source)? {
             vortex_config.definition =
                 Self::dataset_definition(source, &primary_keys, on_conflict.as_ref())
-            .await?
-            .map(Arc::new);
+                    .await?
+                    .map(Arc::new);
         }
 
         // Build S3 object store if using S3 Express One Zone storage. Memory mode

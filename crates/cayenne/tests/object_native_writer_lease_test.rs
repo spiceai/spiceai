@@ -640,14 +640,20 @@ async fn an_instance_refused_its_copy_hands_back_a_lease_it_won_meanwhile() {
         ),
         "{error}"
     );
-    assert!(!error.contains("db-a") && !error.contains("db-b"), "{error}");
+    assert!(
+        !error.contains("db-a") && !error.contains("db-b"),
+        "{error}"
+    );
 
     // The takeover lands, and B learns it holds the lease.
     b.requests.deliver(held).await.expect("the takeover lands");
     b.requests.respond(held).expect("B reads its answer");
     let deadline = Instant::now() + LEASE * 2;
     while Instant::now() < deadline {
-        assert!(!b.writes_dataset(), "B became the writer of a copy it does not serve");
+        assert!(
+            !b.writes_dataset(),
+            "B became the writer of a copy it does not serve"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
@@ -667,14 +673,19 @@ async fn an_instance_refused_its_copy_hands_back_a_lease_it_won_meanwhile() {
 async fn a_replica_waits_for_the_writer_to_record_a_definition() {
     let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let a = Instance::start(&objects, "a", LEASE).await;
-    a.load_defined(None).await.expect("A creates a copy with no definition");
+    a.load_defined(None)
+        .await
+        .expect("A creates a copy with no definition");
     let b = Arc::new(Instance::start(&objects, "b", LEASE).await);
     let waiting = {
         let b = Arc::clone(&b);
         tokio::spawn(async move { b.load_defined(Some(defined_at("store", "db-b"))).await })
     };
     tokio::time::sleep(LEASE / 2).await;
-    assert!(!waiting.is_finished(), "B served a copy with no recorded definition");
+    assert!(
+        !waiting.is_finished(),
+        "B served a copy with no recorded definition"
+    );
 
     a.load_defined(Some(defined_at("shop", "db-a")))
         .await
@@ -683,5 +694,8 @@ async fn a_replica_waits_for_the_writer_to_record_a_definition() {
         .await
         .expect("join")
         .expect_err("B is refused once the definition is recorded");
-    assert!(error.contains("was built from a different definition"), "{error}");
+    assert!(
+        error.contains("was built from a different definition"),
+        "{error}"
+    );
 }

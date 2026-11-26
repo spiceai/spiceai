@@ -153,9 +153,22 @@ impl DatasetDefinition {
         primary_key: &[String],
         on_conflict: Option<&datafusion_table_providers::util::on_conflict::OnConflict>,
     ) -> Self {
+        // An upsert on the primary key is recorded as such, not by its columns, so a
+        // new key is named once, as `primary_key`, as a single instance names it.
         let on_conflict =
-            crate::provider::table::upsert_on_primary_key(primary_key, on_conflict.cloned())
-                .map(|on_conflict| on_conflict.to_string());
+            crate::provider::table::upsert_on_primary_key(primary_key, on_conflict.cloned()).map(
+                |on_conflict| match &on_conflict {
+                    datafusion_table_providers::util::on_conflict::OnConflict::Upsert(columns)
+                        if !primary_key.is_empty()
+                            && columns.iter().eq(primary_key
+                                .iter()
+                                .map(String::as_str)) =>
+                    {
+                        "upsert on the primary key".to_string()
+                    }
+                    other => other.to_string(),
+                },
+            );
         self.with_list_setting("primary_key", primary_key)
             .with_optional_setting("on_conflict", on_conflict.as_deref())
     }
@@ -166,8 +179,10 @@ impl DatasetDefinition {
         let mut hasher = blake3::Hasher::new_derive_key(READ_CONTEXT);
         update_framed(&mut hasher, table.as_bytes());
         hasher.update(&definition.id());
-        self.settings
-            .insert(format!("{READ_PREFIX}{table}"), *hasher.finalize().as_bytes());
+        self.settings.insert(
+            format!("{READ_PREFIX}{table}"),
+            *hasher.finalize().as_bytes(),
+        );
         self
     }
 
@@ -421,7 +436,7 @@ mod tests {
             .iter()
             .find(|setting| setting.name == "pg_pass")
             .expect("named");
-        assert!(pass.digest.is_empty());
+        assert_eq!(pass.digest, [] as [u8; 0]);
         let host = record
             .connection_settings
             .iter()
@@ -469,8 +484,13 @@ mod tests {
         // Unset and empty are different values.
         let unset = DatasetDefinition::new("shop").with_optional_setting("on_conflict", None);
         let empty = DatasetDefinition::new("shop").with_optional_setting("on_conflict", Some(""));
-        assert_eq!(changes(&unset, &empty), vec!["`on_conflict` changed".to_string()]);
-        let key = a.clone().with_list_setting("primary_key", &["id", "region"]);
+        assert_eq!(
+            changes(&unset, &empty),
+            vec!["`on_conflict` changed".to_string()]
+        );
+        let key = a
+            .clone()
+            .with_list_setting("primary_key", &["id", "region"]);
         assert_eq!(changes(&a, &key), vec!["`primary_key` changed".to_string()]);
         let added = a.clone().with_connection([
             ("pg_host", "db", false),
@@ -480,6 +500,36 @@ mod tests {
         assert_eq!(changes(&a, &added), vec!["`pg_sslmode` added".to_string()]);
         let removed = a.clone().with_connection([("pg_host", "db", false)]);
         assert_eq!(changes(&a, &removed), vec!["`pg_pass` removed".to_string()]);
+    }
+
+    /// A new primary key is named once, as `primary_key`: an upsert on the key is
+    /// recorded as such, not by the key's columns. Another conflict handling on
+    /// the same key is named as `on_conflict`.
+    #[test]
+    fn a_new_primary_key_is_named_once() {
+        use datafusion_table_providers::util::{
+            column_reference::ColumnReference, on_conflict::OnConflict,
+        };
+        let upsert = |key: &[&str]| {
+            OnConflict::Upsert(ColumnReference::new(
+                key.iter().map(ToString::to_string).collect(),
+            ))
+        };
+        let keyed = |key: &[&str], on_conflict: Option<&OnConflict>| {
+            let key: Vec<String> = key.iter().map(ToString::to_string).collect();
+            DatasetDefinition::new("shop").with_key(&key, on_conflict)
+        };
+        let by_id = keyed(&["id"], Some(&upsert(&["id"])));
+        let by_id_region = keyed(&["id", "region"], Some(&upsert(&["id", "region"])));
+        assert_eq!(
+            changes(&by_id, &by_id_region),
+            vec!["`primary_key` changed".to_string()]
+        );
+        let dropping = keyed(&["id"], Some(&OnConflict::DoNothingAll));
+        assert_eq!(
+            changes(&dropping, &keyed(&["id"], None)),
+            vec!["`on_conflict` changed".to_string()]
+        );
     }
 
     /// A view's definition holds those of the tables it reads: one SQL over two

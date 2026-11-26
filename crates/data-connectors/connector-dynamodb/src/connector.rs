@@ -266,7 +266,10 @@ impl DataConnectorFactory for DynamoDBFactory {
         &self,
         params: &runtime_parameters::Parameters,
     ) -> Result<Option<Vec<(String, String)>>, String> {
-        Ok(Some(data_connector_api::source_identity_of(params, &["aws_region", "endpoint_url"])))
+        Ok(Some(data_connector_api::source_identity_of(
+            params,
+            &["aws_region", "endpoint_url"],
+        )))
     }
 }
 

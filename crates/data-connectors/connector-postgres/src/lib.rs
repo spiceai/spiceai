@@ -416,7 +416,10 @@ impl DataConnectorFactory for PostgresFactory {
         let identity = connection::connection_identity_from_params(params)?;
         Ok(Some(vec![
             (params.user_param("host").to_string(), identity.host),
-            (params.user_param("port").to_string(), identity.port.to_string()),
+            (
+                params.user_param("port").to_string(),
+                identity.port.to_string(),
+            ),
             (params.user_param("db").to_string(), identity.database),
         ]))
     }
