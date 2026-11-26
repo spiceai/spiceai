@@ -173,7 +173,7 @@ class StoreTest(unittest.TestCase):
 
     def locate(self, github_ref, ref="refs/heads/trunk", spiced_commit="", event="push", base_ref=""):
         return self.run_step("locate", {"GITHUB_REF": github_ref, "REF": ref, "INPUT_SPICED_COMMIT": spiced_commit,
-                                        "GITHUB_EVENT_NAME": event, "GITHUB_BASE_REF": base_ref})
+                                        "RUN_EVENT": event, "PULL_REQUEST_BASE": base_ref if event == "pull_request" else ""})
 
     def store_prefix(self, github_ref, repository_id=REPOSITORY_ID):
         return self.run_script(self.prefix_steps["prefix"]["run"],
@@ -412,6 +412,20 @@ class SetupSpicedTest(StoreTest):
                 proc, located = self.locate(PULL_REQUEST, ref=RELEASE, event=event, base_ref=base_ref)
                 self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
                 self.assertEqual(located, {})
+
+    def test_the_pull_request_check_reads_the_event_not_the_environment(self):
+        env = yaml.safe_load((Path(__file__).resolve().parents[1] / "actions" / "setup-spiced" / "action.yml").read_text())
+        locate = next(s for s in env["runs"]["steps"] if s.get("id") == "locate")
+        self.assertEqual(locate["env"]["RUN_EVENT"], "${{ github.event_name }}")
+        self.assertEqual(locate["env"]["PULL_REQUEST_BASE"], "${{ github.event_name == 'pull_request' && github.base_ref || '' }}")
+        self.assertNotIn("GITHUB_BASE_REF", locate["run"])
+        self.assertNotIn("GITHUB_EVENT_NAME", locate["run"])
+        # GITHUB_* values a step could add to the environment change nothing.
+        proc, located = self.run_step("locate", {"GITHUB_REF": PULL_REQUEST, "REF": RELEASE, "INPUT_SPICED_COMMIT": "",
+                                                 "RUN_EVENT": "push", "PULL_REQUEST_BASE": "",
+                                                 "GITHUB_EVENT_NAME": "pull_request", "GITHUB_BASE_REF": "release/2.4"})
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(located, {})
 
     def test_release_24s_cold_start_reads_the_branchs_own_build(self):
         workflow = yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "testoperator_run_cold_start.yml").read_text())

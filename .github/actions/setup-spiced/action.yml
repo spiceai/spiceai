@@ -72,6 +72,9 @@ runs:
         REF: ${{ inputs.ref }}
         INPUT_SPICED_COMMIT: ${{ inputs.spiced_commit }}
         GH_TOKEN: ${{ inputs.token }}
+        # From the event itself, not the environment an earlier step can add to.
+        RUN_EVENT: ${{ github.event_name }}
+        PULL_REQUEST_BASE: ${{ github.event_name == 'pull_request' && github.base_ref || '' }}
       run: |
         set -euo pipefail
         # Trunk's commit history (no trees or blobs), fetched into a scratch repository and never
@@ -140,8 +143,8 @@ runs:
         # reads trunk's: the run is unprivileged (its credentials write only its own prefix, and its
         # CI role is the read-only one), and the build is one the base branch's own runs made.
         pull_request_base() {
-          [ "${GITHUB_EVENT_NAME:-}" = pull_request ] && [ -n "${GITHUB_BASE_REF:-}" ] &&
-            [ "$1" = "refs/heads/${GITHUB_BASE_REF}" ]
+          [ "${RUN_EVENT:-}" = pull_request ] && [ -n "${PULL_REQUEST_BASE:-}" ] &&
+            [ "$1" = "refs/heads/${PULL_REQUEST_BASE}" ]
         }
         if [ "$source_ref" != refs/heads/trunk ] && [ "$source_ref" != "$GITHUB_REF" ] && ! pull_request_base "$source_ref"; then
           echo "::error::This run, on $GITHUB_REF, runs only a spiced that trunk or this run's own ref built (or, for a pull request, its base branch), and $source_ref built this one. Run the workflow on that ref instead: its build runs only with that ref's own credentials."
