@@ -132,15 +132,18 @@ impl Source for Postgres {
             .with_context(|| {
                 format!("Postgres rejected oracle query (it must be one query): {sql}")
             })?;
-        let mut records = super::parse_csv(&text)?.into_iter();
-        let columns = records
-            .next()
-            .context("COPY printed no header")?
-            .into_iter()
-            .map(Option::unwrap_or_default)
-            .collect();
-        let rows = records.map(|row| row.into_iter().collect()).collect();
-        Ok(TextResult { columns, rows })
+        crate::compare::off_runtime(move || {
+            let mut records = super::parse_csv(&text)?.into_iter();
+            let columns = records
+                .next()
+                .context("COPY printed no header")?
+                .into_iter()
+                .map(Option::unwrap_or_default)
+                .collect();
+            let rows = records.map(|row| row.into_iter().collect()).collect();
+            Ok(TextResult { columns, rows })
+        })
+        .await
     }
 
     async fn apply(

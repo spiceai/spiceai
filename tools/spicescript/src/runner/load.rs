@@ -34,11 +34,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use arrow::array::RecordBatch;
 use flight_client::FlightClient;
-use serde_json::Value;
 
 use crate::compare;
+use crate::compare::Expected;
 use crate::script::{Expect, LoadEnd, LoadStep, Script, Step, Tier};
-use crate::source::TextResult;
 use crate::spiced::{FlightTarget, answer_with_schema};
 
 use super::{Instance, Sources, applies, namespace, note_broken, one_line, when_matches};
@@ -51,15 +50,6 @@ const RETRY_PAUSE: Duration = Duration::from_millis(100);
 /// Answers needed beyond a percentile for it to be reported: P99 needs
 /// 1,000 answers, P99.9 10,000.
 const BEYOND_PERCENTILE: usize = 10;
-
-/// What a query's answers are compared with, before it is typed.
-enum Expected {
-    /// The oracle's text answer.
-    Oracle(TextResult),
-    Rows(Vec<Vec<Value>>),
-    /// An earlier answer of the same instance (`same-as`).
-    SameAs(Vec<RecordBatch>),
-}
 
 /// One query of a running load.
 struct Query {
@@ -75,15 +65,9 @@ impl Query {
     /// `None` when `actual` is the expected answer, else what differs.
     fn mismatch(&self, label: &str, actual: &[RecordBatch]) -> Option<String> {
         let schema = actual.first().map(RecordBatch::schema)?;
-        let typed = self.typed.get_or_init(|| {
-            match &self.expected {
-                Expected::Oracle(text) => compare::type_oracle(text, &schema),
-                Expected::Rows(rows) => compare::literal_rows(rows, &schema),
-                Expected::SameAs(batches) => arrow::compute::concat_batches(&schema, batches)
-                    .context("the answer's schema changed since the earlier query"),
-            }
-            .map_err(|e| format!("{e:#}"))
-        });
+        let typed = self
+            .typed
+            .get_or_init(|| self.expected.typed(&schema).map_err(|e| format!("{e:#}")));
         let expected = match typed {
             Ok(expected) => expected,
             Err(e) => return Some(e.clone()),

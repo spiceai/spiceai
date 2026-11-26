@@ -514,6 +514,103 @@ fn shortened_batch(batch: &RecordBatch, width: usize) -> Result<RecordBatch, Arr
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
 }
 
+/// What an answer is compared with, before it is typed with the answer's
+/// schema.
+pub enum Expected {
+    /// The oracle's text answer.
+    Oracle(TextResult),
+    Rows(Vec<Vec<Value>>),
+    /// An earlier answer of the same instance (`same-as`).
+    SameAs(Vec<RecordBatch>),
+}
+
+impl Expected {
+    pub fn typed(&self, schema: &SchemaRef) -> Result<RecordBatch> {
+        match self {
+            Expected::Oracle(text) => type_oracle(text, schema),
+            Expected::Rows(rows) => literal_rows(rows, schema),
+            Expected::SameAs(batches) => arrow::compute::concat_batches(schema, batches)
+                .context("the answer's schema changed since the earlier query"),
+        }
+    }
+}
+
+/// Types `expected` with the schema of `actual` and runs [`compare`], off the
+/// async runtime.
+pub async fn check(
+    name: &str,
+    sql: &str,
+    actual: &[RecordBatch],
+    schema: &SchemaRef,
+    expected: Expected,
+    expect_empty: bool,
+) -> Result<Option<String>> {
+    let (name, sql, actual, schema) = (
+        name.to_owned(),
+        sql.to_owned(),
+        actual.to_vec(),
+        Arc::clone(schema),
+    );
+    off_runtime(move || {
+        let expected = expected.typed(&schema)?;
+        compare(&name, &sql, &actual, &[expected], expect_empty)
+    })
+    .await
+}
+
+/// [`compare`] off the async runtime.
+pub async fn compare_async(
+    name: &str,
+    sql: &str,
+    actual: &[RecordBatch],
+    expected: &[RecordBatch],
+    expect_empty: bool,
+) -> Result<Option<String>> {
+    compare_off_runtime(compare, name, sql, actual, expected, expect_empty).await
+}
+
+/// [`compare_protocol`] off the async runtime.
+pub async fn compare_protocol_async(
+    name: &str,
+    sql: &str,
+    actual: &[RecordBatch],
+    expected: &[RecordBatch],
+    expect_empty: bool,
+) -> Result<Option<String>> {
+    compare_off_runtime(compare_protocol, name, sql, actual, expected, expect_empty).await
+}
+
+type CompareFn = fn(&str, &str, &[RecordBatch], &[RecordBatch], bool) -> Result<Option<String>>;
+
+async fn compare_off_runtime(
+    compare: CompareFn,
+    name: &str,
+    sql: &str,
+    actual: &[RecordBatch],
+    expected: &[RecordBatch],
+    expect_empty: bool,
+) -> Result<Option<String>> {
+    let (name, sql, actual, expected) = (
+        name.to_owned(),
+        sql.to_owned(),
+        actual.to_vec(),
+        expected.to_vec(),
+    );
+    off_runtime(move || compare(&name, &sql, &actual, &expected, expect_empty)).await
+}
+
+/// Runs CPU-bound work on a blocking thread. Parsing, typing or comparing an
+/// answer of millions of rows takes seconds; on the async runtime it delays
+/// every other script's steps, and so the timing their checks depend on.
+/// Load clients and generated queries compare small answers and stay inline.
+pub async fn off_runtime<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .context("the comparison stopped before it finished")?
+}
+
 /// Protocols serialize the same result types, so equality is exact after
 /// normalizing row order and SQL's equivalent representations of zero.
 /// The ordinary comparator additionally checks explicit SQL sort contracts.

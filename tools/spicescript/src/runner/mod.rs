@@ -931,7 +931,8 @@ async fn run_combination(
                 script.defaults.compare_to.as_deref(),
                 report,
                 run_label,
-            )?;
+            )
+            .await?;
         } else if options.targets.len() > 1 {
             // Variants may differ from one another, but each answers the same
             // on every binary.
@@ -943,7 +944,7 @@ async fn run_combination(
                     .push(instance);
             }
             for group in by_variant.values() {
-                compare_instances(&steps, group, None, report, run_label)?;
+                compare_instances(&steps, group, None, report, run_label).await?;
             }
         }
         // Every process of every instance at once.
@@ -1926,7 +1927,7 @@ fn namespace(instance: &Instance, source: &str) -> Result<String> {
 }
 
 /// Every instance must have given the same final answer to every query.
-fn compare_instances(
+async fn compare_instances(
     steps: &[Step],
     instances: &[&Instance],
     compare_to: Option<&str>,
@@ -1958,7 +1959,9 @@ fn compare_instances(
         };
         let mut mismatches = String::new();
         for (label, answer) in rest {
-            if let Some(diff) = compare::compare(label, &q.sql, answer, base, q.expect_empty)? {
+            if let Some(diff) =
+                compare::compare_async(label, &q.sql, answer, base, q.expect_empty).await?
+            {
                 let _ = writeln!(mismatches, "{label} vs {base_label}: {diff}");
             }
         }

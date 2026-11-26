@@ -302,7 +302,8 @@ pub(super) async fn protocol_answers(
                     );
                 }
                 if let Some(diff) =
-                    compare::compare_protocol("protocols", sql, &answer, &other, expect_empty)?
+                    compare::compare_protocol_async("protocols", sql, &answer, &other, expect_empty)
+                        .await?
                 {
                     bail!("{baseline:?} and {protocol:?} differ: {diff}");
                 }
