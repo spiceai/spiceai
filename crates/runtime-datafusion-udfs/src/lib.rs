@@ -36,6 +36,7 @@ pub mod json_properties;
 pub mod json_tree;
 pub mod l2_distance;
 pub mod l2_norm;
+pub mod lateral;
 pub mod primitive_json_codec;
 pub mod timeseries;
 pub mod truncate;

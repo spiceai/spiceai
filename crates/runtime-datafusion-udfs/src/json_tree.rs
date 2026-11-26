@@ -56,14 +56,15 @@ use arrow::compute::kernels::cast::cast;
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::Result as DataFusionResult;
+use datafusion::catalog::{Session, TableFunctionArgs, TableFunctionImpl, TableProvider};
+use datafusion::common::{DFSchema, Result as DataFusionResult};
 use datafusion::datasource::TableType;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::table_function::TableFunctionBinding;
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion_datasource::memory::MemorySourceConfig;
@@ -72,6 +73,8 @@ use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Meter};
 use serde_json::Value;
+
+use crate::lateral::{NullRows, bind_per_row};
 
 pub const JSON_TREE_UDTF_NAME: &str = "json_tree";
 runtime_udfs_api::register_spice_function!(JSON_TREE_SPICE_FUNCTION, JSON_TREE_UDTF_NAME);
@@ -395,6 +398,22 @@ impl Debug for JsonTreeTableFunc {
 }
 
 impl TableFunctionImpl for JsonTreeTableFunc {
+    /// Walks the JSON of each row of a `LATERAL` input, as in
+    /// `FROM docs d CROSS JOIN LATERAL json_tree(d.body)`. A NULL document gives no rows.
+    fn bind_with_input(
+        &self,
+        args: TableFunctionArgs,
+        input: &DFSchema,
+    ) -> DataFusionResult<Option<TableFunctionBinding>> {
+        bind_per_row(
+            JSON_TREE_UDTF_NAME,
+            Arc::new(self.clone()),
+            &args,
+            input,
+            NullRows::Call,
+        )
+    }
+
     fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
         let (input, opts) = parse_udtf_args(exprs)?;
         let rows = input

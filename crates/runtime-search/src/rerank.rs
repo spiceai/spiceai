@@ -603,6 +603,7 @@ fn refusal_error(name: &str, via: RerankVia, refusal: &Refusal) -> DataFusionErr
 /// The UDTF scaffold. Analogous to [`VectorSearchTableFunc`] — holds a weak
 /// reference to the [`QueryEngine`] instance plus the model stores needed to
 /// resolve the requested reranker at scan time.
+#[derive(Clone)]
 pub struct RerankTableFunc {
     df: Weak<dyn QueryEngine>,
     df_ptr: u64,
@@ -644,6 +645,25 @@ impl RerankTableFunc {
 }
 
 impl TableFunctionImpl for RerankTableFunc {
+    /// Reranks once for each row of a `LATERAL` input whose arguments read its columns, as in
+    /// `rerank(docs, query => q.term, ...)`. A nested search call takes literal arguments only.
+    /// A row with a NULL argument gives no rows.
+    fn bind_with_input(
+        &self,
+        args: datafusion::catalog::TableFunctionArgs,
+        input: &datafusion::common::DFSchema,
+    ) -> datafusion::common::Result<
+        Option<datafusion::physical_plan::table_function::TableFunctionBinding>,
+    > {
+        runtime_datafusion_udfs::lateral::bind_per_row(
+            RERANK_UDTF_NAME,
+            Arc::new(self.clone()),
+            &args,
+            input,
+            runtime_datafusion_udfs::lateral::NullRows::Skip,
+        )
+    }
+
     #[expect(deprecated)] // DF54: TableFunctionImpl::call deferred (needs Session); see follow-up
     fn call(&self, args: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
         let parsed = RerankTableFuncArgs::from_udtf_args(args)?;

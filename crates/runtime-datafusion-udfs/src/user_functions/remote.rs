@@ -399,6 +399,23 @@ impl Debug for RemoteTableFunc {
 }
 
 impl TableFunctionImpl for RemoteTableFunc {
+    /// Runs the function once for each row of a `LATERAL` input whose arguments read its
+    /// columns. A NULL argument is passed as NULL, as in a call with a NULL literal.
+    fn bind_with_input(
+        &self,
+        args: datafusion::catalog::TableFunctionArgs,
+        input: &datafusion::common::DFSchema,
+    ) -> DataFusionResult<Option<datafusion::physical_plan::table_function::TableFunctionBinding>>
+    {
+        crate::lateral::bind_per_row(
+            &self.name,
+            Arc::new(self.clone()),
+            &args,
+            input,
+            crate::lateral::NullRows::Call,
+        )
+    }
+
     fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
         let (table_args, scalar_exprs) = split_table_and_scalar_exprs(
             &self.name,

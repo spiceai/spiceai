@@ -170,7 +170,7 @@ static VECTOR_SEARCH_DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| D
     related_udfs: Some(vec!["rrf".to_string(), "rerank".to_string()]),
 });
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VectorSearchTableFunc {
     // This needs to be a weak reference because the DataFusion instance contains the SessionContext which contains this UDTF.
     df: Weak<DataFusion>,
@@ -510,6 +510,25 @@ impl VectorSearchTableFunc {
 }
 
 impl TableFunctionImpl for VectorSearchTableFunc {
+    /// Runs the search once for each row of a `LATERAL` input whose query reads its columns,
+    /// as in `FROM q CROSS JOIN LATERAL vector_search(docs, q.term)`. A row with a NULL query
+    /// finds nothing.
+    fn bind_with_input(
+        &self,
+        args: datafusion::catalog::TableFunctionArgs,
+        input: &datafusion::common::DFSchema,
+    ) -> datafusion::common::Result<
+        Option<datafusion::physical_plan::table_function::TableFunctionBinding>,
+    > {
+        runtime_datafusion_udfs::lateral::bind_per_row(
+            VECTOR_SEARCH_UDTF_NAME,
+            Arc::new(self.clone()),
+            &args,
+            input,
+            runtime_datafusion_udfs::lateral::NullRows::Skip,
+        )
+    }
+
     fn call(&self, args: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
         let args = Self::parse_args(args)?;
         let df = self.df.upgrade().ok_or_else(|| {

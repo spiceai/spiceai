@@ -28,10 +28,11 @@ limitations under the License.
 //!  - `score` (f32): The similarity score of the row with the request `query`.
 
 use arrow_schema::DataType;
-use datafusion::common::exec_err;
+use datafusion::common::{DFSchema, exec_err};
 use datafusion::logical_expr::{ColumnarValue, DocSection, Documentation, Signature, Volatility};
+use datafusion::physical_plan::table_function::TableFunctionBinding;
 use datafusion::{
-    catalog::{TableFunctionImpl, TableProvider},
+    catalog::{TableFunctionArgs, TableFunctionImpl, TableProvider},
     common::Column,
     error::{DataFusionError, Result as DataFusionResult},
     prelude::Expr,
@@ -40,6 +41,7 @@ use datafusion::{
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 
 use futures::FutureExt;
+use runtime_datafusion_udfs::lateral::{NullRows, bind_per_row};
 use search::generation::text_search::index::FullTextDatabaseIndex;
 #[cfg(feature = "elasticsearch")]
 use search::index::compound::CompoundSearchIndex;
@@ -138,7 +140,7 @@ fn suggest_column(target: &str, candidates: &[String]) -> Option<String> {
     crate::udtf::closest_column(target, candidates)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TextSearchTableFunc<E: TableProviderExplorer> {
     df: Weak<dyn QueryEngine>,
     df_ptr: u64,
@@ -419,7 +421,24 @@ impl<E: TableProviderExplorer> TextSearchTableFunc<E> {
     }
 }
 
-impl<E: TableProviderExplorer + 'static> TableFunctionImpl for TextSearchTableFunc<E> {
+impl<E: TableProviderExplorer + Clone + 'static> TableFunctionImpl for TextSearchTableFunc<E> {
+    /// Runs the search once for each row of a `LATERAL` input whose query reads its columns,
+    /// as in `FROM q CROSS JOIN LATERAL text_search(docs, q.term)`. A row with a NULL query
+    /// finds nothing.
+    fn bind_with_input(
+        &self,
+        args: TableFunctionArgs,
+        input: &DFSchema,
+    ) -> DataFusionResult<Option<TableFunctionBinding>> {
+        bind_per_row(
+            TEXT_SEARCH_UDTF_NAME,
+            Arc::new(self.clone()),
+            &args,
+            input,
+            NullRows::Skip,
+        )
+    }
+
     fn call(&self, args: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
         let args = Self::parse_args(args)?;
 
