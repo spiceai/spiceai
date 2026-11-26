@@ -1,4 +1,5 @@
 name: time-columns-retention
+duration: 25s
 description: >
   Time retention on Cayenne for every `time_format` it accepts: after
   loading and after a refresh brings older rows back, the acceleration keeps

@@ -1,4 +1,5 @@
 name: config-errors
+duration: 7s
 description: >
   A dataset with a configuration or connection mistake is reported in Error
   with a message that names it and what is wrong — an unknown connector

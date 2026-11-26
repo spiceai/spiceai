@@ -1,4 +1,5 @@
 name: databricks-catalog
+duration: 30s
 requires-env:
   - DATABRICKS_HOST
   - DATABRICKS_OIDC_CLIENT_ID

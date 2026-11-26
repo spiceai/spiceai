@@ -1,4 +1,5 @@
 name: cayenne-vnext-nested-location
+duration: 5s
 description: >
   A state location inside another dataset's data directory survives that
   dataset's recreate. With `runtime.params.cayenne_vnext` on, dataset `b` is in

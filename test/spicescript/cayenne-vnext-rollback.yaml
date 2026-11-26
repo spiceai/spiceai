@@ -1,4 +1,5 @@
 name: cayenne-vnext-rollback
+duration: 27s
 description: >
   An upgrade into the object-native Cayenne metastore, a rollback, and an
   upgrade again, with a full acceleration and PostgreSQL and MySQL change

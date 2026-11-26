@@ -1,4 +1,5 @@
 name: databricks-static-token
+duration: 3s
 requires-env:
   - DATABRICKS_HOST
   - DATABRICKS_TOKEN

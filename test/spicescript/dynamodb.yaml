@@ -1,4 +1,5 @@
 name: dynamodb
+duration: 90s
 tags: [long]
 description: >
   The DynamoDB connector against LocalStack: a table answers the corpus as

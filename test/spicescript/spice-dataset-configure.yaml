@@ -1,4 +1,5 @@
 name: spice-dataset-configure
+duration: 3s
 tags: [macos-smoke]
 description: >
   `spice dataset configure` adds a dataset to an app the way the quickstarts

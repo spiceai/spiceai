@@ -1,4 +1,5 @@
 name: snapshots-cross-bucket-replication
+duration: 215s
 description: >
   A full-refresh writer and source-free snapshot reader, with two
   S3 buckets, sorted Cayenne tables, shared metadata directories, explicit keys,

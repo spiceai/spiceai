@@ -4,6 +4,7 @@
 # behind, so the key has two rows; and without a primary key, a DELETE that
 # deletes every row is refused.
 name: cayenne-writes-known
+duration: 107s
 description: >
   SQL writes to a Cayenne acceleration (`access: read_write`, `write_mode:
   acceleration`) leave it holding what PostgreSQL holds after the same writes

@@ -1,4 +1,5 @@
 name: mongodb-types-acceleration
+duration: 19s
 tags: [long]
 description: >
   A MongoDB collection with the common BSON types (ObjectId, Date, Decimal128,

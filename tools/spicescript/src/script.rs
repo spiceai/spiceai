@@ -89,13 +89,16 @@ pub struct Script {
     #[serde(skip)]
     pub steps: Vec<Step>,
     /// How long the script takes to run, every matrix combination included,
-    /// as recorded in `recordings/durations.json` beside it (see
-    /// [`Script::load`]). `--jobs` starts the longest scripts first.
-    #[serde(skip)]
+    /// recorded by `--record-durations` (see [`Script::load`]). `--partition`
+    /// deals scripts to shards by it and `--jobs` starts the longest first.
+    #[serde(default, with = "opt_duration")]
     pub duration: Option<Duration>,
-    /// The script file's name without `.yaml`: its key in the durations file.
+    /// The script file's name without `.yaml`.
     #[serde(skip)]
     pub file_stem: String,
+    /// The script file.
+    #[serde(skip)]
+    pub path: std::path::PathBuf,
     /// The directory the script is in; `corpus` and `slt` files are relative to it.
     #[serde(skip)]
     pub dir: std::path::PathBuf,
@@ -1032,9 +1035,9 @@ pub enum Timing {
 }
 
 impl Script {
-    /// Loads a script file. Its run time must be recorded in
-    /// `recordings/durations.json` beside it, unless `duration_optional` (a
-    /// run that records durations, which is how a new script gets one).
+    /// Loads a script file. It must record its run time (`duration`), unless
+    /// `duration_optional` (a run that records durations, which is how a new
+    /// script gets one).
     pub fn load(path: &Path, duration_optional: bool) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read script {}", path.display()))?;
@@ -1047,14 +1050,15 @@ impl Script {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        script.duration = read_durations(base)?
-            .get(&script.file_stem)
-            .map(|s| Duration::from_secs(*s));
+        script.path = path.to_path_buf();
+        if let Some(duration) = script.duration {
+            check_duration_line(&text, duration)
+                .with_context(|| format!("Invalid script {}", path.display()))?;
+        }
         ensure!(
             duration_optional || script.duration.is_some(),
-            "Script {} has no recorded duration in {}. Run it with --record-durations to record one.",
-            path.display(),
-            base.join(DURATIONS_FILE).display()
+            "Script {} has no recorded `duration`. Run it with --record-durations to record one.",
+            path.display()
         );
         Ok(script)
     }
@@ -1068,22 +1072,15 @@ impl Script {
             .collect()
     }
 
-    /// Records how long the scripts in `dir` took, by file name, in
-    /// `dir/recordings/durations.json`, keeping the entries of the others.
-    pub fn record_durations(dir: &Path, took: &[(String, Duration)]) -> Result<()> {
-        let mut all = read_durations(dir)?;
-        for (stem, duration) in took {
-            all.insert(
-                stem.clone(),
-                duration.as_secs() + u64::from(duration.subsec_nanos() > 0),
-            );
-        }
-        let path = dir.join(DURATIONS_FILE);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, serde_json::to_string_pretty(&all)? + "\n")
-            .with_context(|| format!("Failed to write {}", path.display()))
+    /// Records how long the script at `path` took, in whole seconds rounded
+    /// up, in its `duration` line.
+    pub fn record_duration(path: &Path, took: Duration) -> Result<()> {
+        let seconds = took.as_secs() + u64::from(took.subsec_nanos() > 0);
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read script {}", path.display()))?;
+        let text = set_duration(&text, seconds)
+            .with_context(|| format!("Failed to record the duration of {}", path.display()))?;
+        std::fs::write(path, text).with_context(|| format!("Failed to write {}", path.display()))
     }
 
     /// Keeps only the matrix values and variants `selection` names, and
@@ -3086,25 +3083,181 @@ mod opt_duration {
     }
 }
 
-/// Where a directory's scripts record their run times, in whole seconds by
-/// file name.
-pub const DURATIONS_FILE: &str = "recordings/durations.json";
-
-/// The recorded run times of the scripts in `dir`; none if it has no file.
-fn read_durations(dir: &Path) -> Result<std::collections::BTreeMap<String, u64>> {
-    let path = dir.join(DURATIONS_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => {
-            serde_json::from_str(&text).with_context(|| format!("Invalid {}", path.display()))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(std::collections::BTreeMap::new()),
-        Err(e) => Err(e).with_context(|| format!("Failed to read {}", path.display())),
+/// A script's `duration` is one line, `duration: 458s` (`  "duration": "458s",`
+/// in a JSON script), placed after `name`. `--record-durations` and
+/// `test/spicescript/update_durations.py` rewrite that line, and CI does not
+/// count a change to it alone as a changed script.
+fn duration_line(json: bool, seconds: u64) -> String {
+    if json {
+        format!("  \"duration\": \"{seconds}s\",")
+    } else {
+        format!("duration: {seconds}s")
     }
+}
+
+/// The value of `line` if it is a script's `duration` line.
+fn duration_value(json: bool, line: &str) -> Option<&str> {
+    if json {
+        line.strip_prefix("  \"duration\":")
+    } else {
+        line.strip_prefix("duration:")
+    }
+}
+
+/// The whole seconds a `duration` line's value records, as written by [`duration_line`].
+fn whole_seconds(json: bool, value: &str) -> Option<u64> {
+    let value = value.trim();
+    let value = if json {
+        value.strip_prefix('"')?.strip_suffix("\",")?
+    } else {
+        value
+    };
+    value.strip_suffix('s')?.parse().ok()
+}
+
+fn is_json(text: &str) -> bool {
+    text.trim_start().starts_with('{')
+}
+
+fn check_duration_line(text: &str, duration: Duration) -> Result<()> {
+    let json = is_json(text);
+    let lines: Vec<_> = text
+        .lines()
+        .filter_map(|line| duration_value(json, line))
+        .map(|value| whole_seconds(json, value))
+        .collect();
+    ensure!(
+        lines.as_slice() == [Some(duration.as_secs())] && duration.subsec_nanos() == 0,
+        "Write `duration` on one line in whole seconds, as `{}`: --record-durations and CI read and rewrite that line",
+        duration_line(json, 458)
+    );
+    Ok(())
+}
+
+/// `text` with its `duration` line recording `seconds`, added after `name`
+/// when it has none.
+fn set_duration(text: &str, seconds: u64) -> Result<String> {
+    let json = is_json(text);
+    let new = duration_line(json, seconds);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if let Some(i) = lines
+        .iter()
+        .position(|line| duration_value(json, line).is_some())
+    {
+        lines[i] = &new;
+    } else {
+        let name = if json { "  \"name\":" } else { "name:" };
+        let i = lines
+            .iter()
+            .position(|line| line.starts_with(name))
+            .with_context(|| format!("No `{name}` line to put `{new}` after"))?;
+        lines.insert(i + 1, &new);
+    }
+    let mut out = lines.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty directory holding the scripts `names`, for one test.
+    fn script_dir(test: &str, names: &[&str]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "spicescript-durations-{test}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the script directory");
+        for name in names {
+            std::fs::write(
+                dir.join(format!("{name}.yaml")),
+                format!("name: {name}\nspicepod: {{}}\nsteps: []"),
+            )
+            .expect("write the script");
+        }
+        dir
+    }
+
+    #[test]
+    fn a_duration_is_recorded_in_the_script_and_loaded_from_it() {
+        let dir = script_dir("round-trip", &["first"]);
+        let path = dir.join("first.yaml");
+        Script::record_duration(&path, Duration::from_millis(1200)).expect("record");
+        // A part of a second rounds up, and the line goes after `name`.
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "name: first\nduration: 2s\nspicepod: {}\nsteps: []"
+        );
+        Script::record_duration(&path, Duration::from_secs(7)).expect("record again");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "name: first\nduration: 7s\nspicepod: {}\nsteps: []"
+        );
+        let script = Script::load(&path, false).expect("load");
+        assert_eq!(script.duration, Some(Duration::from_secs(7)));
+        std::fs::remove_dir_all(&dir).expect("remove the script directory");
+    }
+
+    #[test]
+    fn a_json_script_records_its_duration_after_its_name() {
+        let text = "{\n  \"name\": \"j\",\n  \"spicepod\": {},\n  \"steps\": []\n}\n";
+        let recorded = set_duration(text, 4).expect("record");
+        assert_eq!(
+            recorded,
+            "{\n  \"name\": \"j\",\n  \"duration\": \"4s\",\n  \"spicepod\": {},\n  \"steps\": []\n}\n"
+        );
+        assert_eq!(
+            set_duration(&recorded, 9).expect("rewrite"),
+            recorded.replace("4s", "9s")
+        );
+        let script = Script::parse(&recorded).expect("parse");
+        assert_eq!(script.duration, Some(Duration::from_secs(4)));
+        check_duration_line(&recorded, Duration::from_secs(4)).expect("one line");
+    }
+
+    #[test]
+    fn a_script_without_a_duration_is_refused_unless_recording() {
+        let dir = script_dir("missing", &["first"]);
+        let path = dir.join("first.yaml");
+        let error = Script::load(&path, false).expect_err("first has no duration");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Script {} has no recorded `duration`. Run it with --record-durations to record one.",
+                path.display()
+            )
+        );
+        let script = Script::load(&path, true).expect("load while recording");
+        assert_eq!(script.duration, None);
+        std::fs::remove_dir_all(&dir).expect("remove the script directory");
+    }
+
+    #[test]
+    fn a_duration_must_be_one_line_of_whole_seconds() {
+        let dir = script_dir("invalid", &[]);
+        let path = dir.join("first.yaml");
+        for duration in ["1m", "\"7s\"", "7s # a comment"] {
+            std::fs::write(
+                &path,
+                format!("name: first\nduration: {duration}\nspicepod: {{}}\nsteps: []"),
+            )
+            .expect("write the script");
+            let error = Script::load(&path, false).expect_err(duration);
+            assert_eq!(
+                format!("{error:#}"),
+                format!(
+                    "Invalid script {}: Write `duration` on one line in whole seconds, as `duration: 458s`: --record-durations and CI read and rewrite that line",
+                    path.display()
+                ),
+                "{duration}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).expect("remove the script directory");
+    }
 
     #[test]
     fn tags_parse() {

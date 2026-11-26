@@ -1,7 +1,0 @@
-{
-  "anthropic-static-token": 3,
-  "databricks-catalog": 30,
-  "databricks-static-token": 3,
-  "huggingface": 26,
-  "openai-static-key": 4
-}
