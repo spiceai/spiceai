@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_openai::types::chat::{
     ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
@@ -129,6 +130,8 @@ pub struct WorkerSqlTask {
     runtime: Arc<Runtime>,
     worker_name: Arc<str>,
     sql: Arc<str>,
+    /// Whether the run before this one was skipped, so a run of skips warns once.
+    skipped: AtomicBool,
 }
 
 impl WorkerSqlTask {
@@ -137,6 +140,7 @@ impl WorkerSqlTask {
             runtime,
             worker_name,
             sql,
+            skipped: AtomicBool::new(false),
         }
     }
 }
@@ -151,10 +155,16 @@ impl ScheduledTask for WorkerSqlTask {
             let sql = Arc::clone(&self.sql);
             let runtime = Arc::clone(&self.runtime);
 
-            if !runtime.status.is_ready() {
-                tracing::debug!("Runtime is not ready, skipping worker SQL task execution for worker: {worker_name}");
+            // A component in `Error` must not hold the worker back: it may never load.
+            if !runtime.status.is_ready_allowing_unhealthy() {
+                if self.skipped.swap(true, Ordering::Relaxed) {
+                    tracing::debug!("Worker '{worker_name}' skipped a scheduled run: the runtime is not ready.");
+                } else {
+                    tracing::warn!("Worker '{worker_name}' skipped a scheduled run: the runtime is not ready. It runs at the first scheduled time after the runtime is ready.");
+                }
                 return Ok(());
             }
+            self.skipped.store(false, Ordering::Relaxed);
 
             if !runtime.workers.read().await.contains_key(worker_name.as_ref()) {
                 tracing::debug!("Worker not found for ScheduledTask: {worker_name}");
