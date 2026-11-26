@@ -127,85 +127,123 @@ class CleanMacWorkspaceTest(unittest.TestCase):
 
 
 class PushSnapChangesConfigTest(unittest.TestCase):
+    """The snapshot push builds and pushes its commit in a repository of its own, so nothing an
+    earlier job or a co-tenant put in the checkout's .git runs or redirects it."""
+
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.repo = self.tmp / "repo"
         self.repo.mkdir()
-        git(self.repo, "init", "-q")
+        git(self.repo, "init", "-q", "-b", "trunk")
         (self.repo / "a.snap").write_text("snapshot\n")
         git(self.repo, "add", "a.snap")
         git(self.repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "base")
+        self.base = git(self.repo, "rev-parse", "HEAD").strip()
+        # The repository the push goes to, and one a planted insteadOf would send it to.
+        self.server = self.tmp / "server"
+        (self.server / "owner").mkdir(parents=True)
+        git(self.tmp, "clone", "-q", "--bare", str(self.repo), str(self.server / "owner" / "repo.git"))
+        self.evil = self.tmp / "evil.git"
+        git(self.tmp, "init", "-q", "--bare", str(self.evil))
+        # As a checkout has it; the step does not read it.
+        git(self.repo, "remote", "add", "origin", f"file://{self.server}/owner/repo.git")
+        (self.repo / ".github" / "scripts").mkdir(parents=True)
+        (self.repo / ".github" / "scripts" / "approve_bot_pr_runs.sh").write_text("exit 0\n")
         (self.tmp / "temp").mkdir()
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
         self.calls = self.tmp / "calls"
         (self.bin / "gh").write_text(f'#!/bin/sh\necho "gh $*" >> "{self.calls}"\n')
         (self.bin / "gh").chmod(0o755)
+        self.marker = self.tmp / "ran"
 
-    def run_step(self):
+    def run_step(self, workspace=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "RUNNER_"))}
         env.update({"PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}", "RUNNER_TEMP": str(self.tmp / "temp"),
-                    "HOME": str(self.tmp), "GH_TOKEN": "t", "GITHUB_REPOSITORY": "spiceai/spiceai", "PR_TITLE": "x"})
+                    "HOME": str(self.tmp), "GH_TOKEN": "the-token", "GITHUB_REPOSITORY": "owner/repo",
+                    "GITHUB_SERVER_URL": f"file://{self.server}", "GITHUB_RUN_ID": "7", "GITHUB_JOB": "job",
+                    "GITHUB_REF_NAME": "trunk", "PR_TITLE": "x", "PR_DESCRIPTION": ""})
         return subprocess.run(["bash", "-e", "-c", step("push-snap-changes", "Upload snapshots to branch")],
-                              cwd=self.repo, env=env, capture_output=True, text=True, timeout=60)
+                              cwd=workspace or self.repo, env=env, capture_output=True, text=True, timeout=60)
 
-    def test_config_that_redirects_or_includes_is_refused_before_anything_runs(self):
-        for key, value in (("url.https://evil.invalid/.insteadOf", "https://github.com/"),
-                           ("url.https://evil.invalid/.pushInsteadOf", "https://github.com/"),
-                           ("core.hooksPath", str(self.tmp)),
-                           ("include.path", str(self.tmp / "other")),
-                           ("includeIf.gitdir:/.path", str(self.tmp / "other")),
-                           ("core.fsmonitor", "/tmp/x"),
-                           ("filter.x.clean", "/tmp/x"),
-                           ("gpg.program", "/tmp/x"),
-                           ("http.proxy", "http://127.0.0.1:9"),
-                           ("remote.origin.pushurl", "https://evil.invalid/x.git"),
-                           ("core.askPass", "/tmp/x"),
-                           ("core.worktree", "/tmp"),
-                           ("trace2.eventTarget", "/tmp/x")):
-            with self.subTest(key=key):
-                git(self.repo, "config", key, value)
-                proc = self.run_step()
-                git(self.repo, "config", "--unset", key)
-                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-                self.assertIn("not pushing", proc.stdout)
-                self.assertFalse(self.calls.exists())
+    def pushed(self, repository=None):
+        return git(repository or self.server / "owner" / "repo.git", "for-each-ref", "--format=%(refname)").split()
 
-    def test_config_in_the_worktree_config_file_is_refused_too(self):
-        # With extensions.worktreeConfig, git also reads .git/config.worktree, which
-        # `git config --local` does not list.
-        git(self.repo, "config", "core.repositoryformatversion", "1")
-        git(self.repo, "config", "extensions.worktreeConfig", "true")
-        for key, value in (("url.https://evil.invalid/.insteadOf", "https://github.com/"),
-                           ("core.fsmonitor", "/tmp/x"),
-                           ("include.path", str(self.tmp / "other"))):
-            with self.subTest(key=key):
-                git(self.repo, "config", "--worktree", key, value)
-                proc = self.run_step()
-                git(self.repo, "config", "--worktree", "--unset", key)
-                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-                self.assertIn("not pushing", proc.stdout)
-                self.assertFalse(self.calls.exists())
+    def plant(self, repo):
+        """Everything in a checkout's .git that could run a program or send the push elsewhere."""
+        program = self.tmp / "program"
+        program.write_text(f"#!/bin/sh\ntouch '{self.marker}'\ncat\n")
+        program.chmod(0o755)
+        hooks = self.tmp / "hooks"
+        hooks.mkdir(exist_ok=True)
+        for name in ("pre-commit", "post-commit", "pre-push", "reference-transaction"):
+            for directory in (hooks, repo / ".git" / "hooks"):
+                (directory / name).write_text(f"#!/bin/sh\ntouch '{self.marker}'\n")
+                (directory / name).chmod(0o755)
+        included = self.tmp / "included"
+        included.write_text(f"[hook \"inc\"]\n\tevent = pre-push\n\tcommand = {program}\n")
+        for key, value in (("core.hooksPath", str(hooks)), ("core.fsmonitor", str(program)),
+                           ("hook.planted.event", "pre-commit"), ("hook.planted.command", str(program)),
+                           ("filter.evil.clean", str(program)), ("filter.evil.required", "true"),
+                           ("diff.evil.command", str(program)), ("include.path", str(included)),
+                           ("core.repositoryformatversion", "1"), ("extensions.worktreeConfig", "true")):
+            git(repo, "config", key, value)
+        git(repo, "config", "--worktree", f"url.file://{self.evil}.insteadOf", f"file://{self.server}/owner/repo.git")
+        git(repo, "config", "--worktree", f"url.file://{self.evil}.pushInsteadOf", f"file://{self.server}/owner/repo.git")
+        (repo / ".gitattributes").write_text("*.snap filter=evil diff=evil\n")
 
-    def test_no_hook_runs_and_a_clean_checkout_proceeds(self):
-        marker = self.tmp / "hook-ran"
-        hook = self.repo / ".git" / "hooks" / "pre-commit"
-        hook.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
-        hook.chmod(0o755)
-        script = step("push-snap-changes", "Upload snapshots to branch")
-        self.assertIn("export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null", script)
-        self.assertLess(script.index("GIT_CONFIG_KEY_0=core.hooksPath"), script.index("git add"))
+    def test_nothing_in_the_checkouts_git_runs_or_redirects_the_push(self):
+        self.plant(self.repo)
+        (self.repo / "a.snap").write_text("updated\n")
+        proc = self.run_step()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(self.marker.exists(), "a program from the checkout's git config or hooks ran")
+        self.assertEqual(self.pushed(), ["refs/heads/snapshot-update/job-7", "refs/heads/trunk"])
+        self.assertEqual(self.pushed(self.evil), [])
+        server = self.server / "owner" / "repo.git"
+        self.assertEqual(git(server, "show", "snapshot-update/job-7:a.snap"), "updated\n")
+        self.assertEqual(git(server, "rev-parse", "snapshot-update/job-7^").strip(), self.base)
+        self.assertEqual(git(server, "log", "-1", "--format=%an <%ae>", "snapshot-update/job-7").strip(),
+                         "Spice Snapshot Update Bot <spiceaibot@spice.ai>")
+        # The token is in no file of the checkout's, and the checkout is left as it was.
+        for path in (self.repo / ".git").rglob("*"):
+            if path.is_file():
+                self.assertNotIn(b"the-token", path.read_bytes(), path)
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD").strip(), self.base)
+        self.assertIn("gh pr create", self.calls.read_text())
+
+    def test_hooks_defined_in_config_do_not_run(self):
+        # git 2.54's `hook.<name>.command` runs whatever core.hooksPath says.
+        program = self.tmp / "program"
+        program.write_text(f"#!/bin/sh\ntouch '{self.marker}'\n")
+        program.chmod(0o755)
+        for event in ("pre-commit", "commit-msg", "post-commit", "pre-push"):
+            git(self.repo, "config", "--add", f"hook.planted-{event}.event", event)
+            git(self.repo, "config", f"hook.planted-{event}.command", str(program))
+        (self.repo / "a.snap").write_text("updated\n")
+        proc = self.run_step()
+        self.assertFalse(self.marker.exists(), "a hook defined in the checkout's config ran")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("refs/heads/snapshot-update/job-7", self.pushed())
+
+    def test_a_shallow_checkout_pushes_its_snapshots(self):
+        shallow = self.tmp / "shallow"
+        git(self.tmp, "clone", "-q", "--depth", "1", f"file://{self.server}/owner/repo.git", str(shallow))
+        (shallow / ".github" / "scripts").mkdir(parents=True)
+        (shallow / ".github" / "scripts" / "approve_bot_pr_runs.sh").write_text("exit 0\n")
+        (shallow / "b.snap").write_text("new\n")
+        proc = self.run_step(shallow)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(git(self.server / "owner" / "repo.git", "show", "snapshot-update/job-7:b.snap"), "new\n")
+
+    def test_unchanged_snapshots_push_nothing(self):
+        (self.repo / "other.txt").write_text("not a snapshot\n")
         proc = self.run_step()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("No changes to commit", proc.stdout)
-        # The hooks setting the step exports wins over the repository's own.
-        env = {**os.environ, "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": "/dev/null"}
-        (self.repo / "f").write_text("x")
-        subprocess.run(["git", "add", "f"], cwd=self.repo, env=env, check=True)
-        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "x"],
-                       cwd=self.repo, env=env, check=True)
-        self.assertFalse(marker.exists())
+        self.assertEqual(self.pushed(), ["refs/heads/trunk"])
+        self.assertFalse(self.calls.exists())
 
 
 if __name__ == "__main__":

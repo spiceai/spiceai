@@ -22,25 +22,31 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        # git's own config file for this step, never the shared ~/.gitconfig or the system
-        # one: on a self-hosted Mac any job can write those, and a `url.<x>.insteadOf` there
-        # would send this push, token and all, elsewhere.
-        GIT_CONFIG_GLOBAL="$(mktemp "${RUNNER_TEMP:?RUNNER_TEMP is not set}/gitconfig.XXXXXX")"
-        export GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM=1
-        # The checkout's own config can redirect the push too, pull in another file, or run a
-        # program, and its hooks run in this step: anything that set them is not this action. So
-        # such config is refused, and no hook runs (core.hooksPath given through the environment
-        # overrides the repository's). Every file git reads for this checkout is checked, not just
-        # .git/config: with extensions.worktreeConfig it also reads config.worktree, and it
-        # follows includes.
-        if redirects="$(git config --name-only --get-regexp '^(url\..*|include\..*|includeif\..*|core\.(hookspath|fsmonitor|sshcommand|askpass|gitproxy|pager|editor|attributesfile|worktree|excludesfile)|trace2\..*|filter\..*|diff\.external|diff\..*\.(textconv|command)|gpg\..*|commit\.gpgsign|tag\.gpgsign|credential\..*|http\..*|remote\..*\.(pushurl|proxy|receivepack|uploadpack|vcs)|protocol\..*)$')"; then
-          echo "::error::The checkout's git config sets ${redirects//$'\n'/, }, which can send this push elsewhere or run other code; not pushing."
+        # The snapshot commit is made and pushed from a repository of this step's own, never from
+        # the checkout's: on a self-hosted Mac another job can write the checkout's .git, and git
+        # keeps adding config that runs a program (hooks, `hook.<name>.command`, fsmonitor,
+        # filters) or sends a push elsewhere (`url.<x>.insteadOf`). The step's repository borrows
+        # the checkout's objects, takes the tested commit from it, and has no config, hooks or
+        # attribute drivers of its own; git's global and system config are not read either.
+        export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+        workspace="$(pwd -P)"
+        checkout_git="$workspace/.git"
+        if [ ! -d "$checkout_git/objects" ]; then
+          echo "::error::$workspace has no .git directory to take the tested commit from; not pushing."
           exit 1
         fi
-        export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null
-
-        git add '*.snap'
-        if git diff --cached --quiet; then
+        # The only thing read from the checkout's repository: the commit it has checked out.
+        base="$(git --git-dir="$checkout_git" rev-parse --verify 'HEAD^{commit}')"
+        snap_git="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/snap-push.XXXXXX")"
+        git init -q --bare --template= "$snap_git"
+        printf '%s\n' "$checkout_git/objects" > "$snap_git/objects/info/alternates"
+        if [ -f "$checkout_git/shallow" ]; then
+          cp "$checkout_git/shallow" "$snap_git/shallow"
+        fi
+        export GIT_DIR="$snap_git" GIT_WORK_TREE="$workspace" GIT_INDEX_FILE="$snap_git/index"
+        git read-tree "$base"
+        git add -- '*.snap'
+        if git diff --cached --quiet "$base"; then
           echo "No changes to commit"
           exit 0
         fi
@@ -56,17 +62,25 @@ runs:
         # commits) instead of always diffing against trunk.
         BASE_BRANCH="${GITHUB_REF_NAME:-trunk}"
 
-        git config --global user.name 'Spice Snapshot Update Bot'
-        git config --global user.email 'spiceaibot@spice.ai'
-        AUTHENTICATED_REMOTE_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-        git remote set-url origin "${AUTHENTICATED_REMOTE_URL}"
-        git checkout -b "${BRANCH_NAME}"
-        git commit -m "${PR_TITLE}"
+        commit="$(GIT_AUTHOR_NAME='Spice Snapshot Update Bot' GIT_AUTHOR_EMAIL='spiceaibot@spice.ai' \
+          GIT_COMMITTER_NAME='Spice Snapshot Update Bot' GIT_COMMITTER_EMAIL='spiceaibot@spice.ai' \
+          git commit-tree "$(git write-tree)" -p "$base" -m "${PR_TITLE}")"
+
+        # The token reaches git as a header for each push, never in a file or a URL.
+        server="${GITHUB_SERVER_URL:-https://github.com}"
+        remote="$server/${GITHUB_REPOSITORY}.git"
+        auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+        echo "::add-mask::$auth"
         # Non-interactive: a credential helper on the runner can otherwise intercept
-        # this push and block on a prompt forever. See
+        # a push and block on a prompt forever. See
         # scripts/check_ci_git_push_noninteractive.py.
-        git -c credential.helper='' -c credential.interactive=false \
-          push origin "HEAD:${BRANCH_NAME}"
+        push() {
+          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$server/.extraheader" \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+            git -c credential.helper='' -c credential.interactive=false \
+              push "$remote" "$@"
+        }
+        push "${commit}:refs/heads/${BRANCH_NAME}"
 
         BODY="${PR_DESCRIPTION}"
         if [[ -z "${BODY}" ]]; then
@@ -78,7 +92,7 @@ runs:
         echo "Created snapshot update PR -> ${PR_URL}"
         gh pr merge --squash --auto "${BRANCH_NAME}" || echo "Auto-merge not available for this branch; PR created and requires manual merge."
         # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
-        bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
+        bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "${commit}"
 
         # Close any earlier open snapshot-update PR this job opened against the same
         # base with the same title: the one above supersedes it. Matching the base keeps
@@ -105,9 +119,8 @@ runs:
           echo "Closing superseded snapshot update PR #${OLD_PR_NUMBER}"
           gh pr close "${OLD_PR_NUMBER}" --comment "Superseded by ${PR_URL} (fresher snapshot diff against current ${BASE_BRANCH})." || true
           # `|| true` bounds the exit status, not the wall clock: the same credential
-          # helper can block this push too, so it needs the same guard.
-          git -c credential.helper='' -c credential.interactive=false \
-            push origin --delete "${OLD_BRANCH}" || true
+          # helper can block this push too, so it needs the same guard (in push above).
+          push --delete "${OLD_BRANCH}" || true
         done
       env:
         GH_TOKEN: ${{ inputs.token }}
