@@ -1,4 +1,5 @@
 name: groupby-join-key-dependency
+duration: 9s
 description: >
   Grouping a DISTINCT over a join by a column of each side counts every
   distinct pair, whichever side's primary key the pair includes.

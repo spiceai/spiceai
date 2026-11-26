@@ -1,0 +1,119 @@
+name: debezium-upgrade
+duration: 86s
+description: >
+  Debezium change capture (PostgreSQL through Kafka) resumes across an upgrade
+  in place from each of the last two releases: a `refresh_mode: changes`
+  acceleration applies every change made while the runtime was down, each
+  once, resuming from the offsets the release recorded. The messages the
+  release consumed are deleted from the topic before the upgrade, so a runtime
+  that read the topic from its start again would miss the snapshot's rows.
+  With the object-native metastore the acceleration loads from its source
+  instead, which holds only the changes the topic still retains (here, those
+  made while the runtime was down): the release's rows are gone, as the
+  upgrade documents.
+
+matrix:
+  from: [2.3.x, 2.4.x]
+from: '${matrix.from}'
+
+sources:
+  src: { kind: postgres }
+  kafka:
+    kind: docker
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.6
+    ports: [9092, 19092]
+    command: [redpanda, start, --smp, '1', --overprovisioned, --node-id, '0', --mode, dev-container,
+      --kafka-addr, 'internal://0.0.0.0:9092,external://0.0.0.0:19092,local://127.0.0.1:9093',
+      --advertise-kafka-addr, 'internal://host.docker.internal:${port.9092},external://127.0.0.1:${port.19092},local://127.0.0.1:9093']
+    ready: rpk cluster health | grep -E 'Healthy:.+true'
+  dbz:
+    kind: docker
+    image: quay.io/debezium/server:3.1
+    host-network: true
+    command: [sleep, infinity]
+    ready: 'true'
+
+variants:
+  sqlite: {}
+  object-native: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: debezium-upgrade
+  datasets:
+    - from: debezium:${sources.src.namespace}.public.t
+      name: t
+      params:
+        kafka_bootstrap_servers: 127.0.0.1:${sources.kafka.port.19092}
+        kafka_security_protocol: plaintext
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id bigint PRIMARY KEY, v text);
+        ALTER TABLE t REPLICA IDENTITY FULL;
+        INSERT INTO t SELECT g, 'v' || g FROM generate_series(1, 500) g;
+  # Debezium first, so the topic and its schema exist when spiced starts.
+  - source-exec:
+      dbz: >-
+        mkdir -p /tmp/${sources.src.namespace};
+        cd /debezium;
+        DEBEZIUM_SINK_TYPE=kafka
+        DEBEZIUM_SINK_KAFKA_PRODUCER_BOOTSTRAP_SERVERS=${sources.dbz.host_from_container}:${sources.kafka.port.9092}
+        DEBEZIUM_SINK_KAFKA_PRODUCER_KEY_SERIALIZER=org.apache.kafka.common.serialization.StringSerializer
+        DEBEZIUM_SINK_KAFKA_PRODUCER_VALUE_SERIALIZER=org.apache.kafka.common.serialization.StringSerializer
+        DEBEZIUM_SOURCE_CONNECTOR_CLASS=io.debezium.connector.postgresql.PostgresConnector
+        DEBEZIUM_SOURCE_OFFSET_STORAGE_FILE_FILENAME=/tmp/${sources.src.namespace}/offsets.dat
+        DEBEZIUM_SOURCE_OFFSET_FLUSH_INTERVAL_MS=0
+        DEBEZIUM_SOURCE_DATABASE_HOSTNAME=${sources.dbz.host_from_container}
+        DEBEZIUM_SOURCE_DATABASE_PORT=${sources.src.params.pg_port}
+        DEBEZIUM_SOURCE_DATABASE_USER=${sources.src.params.pg_user}
+        DEBEZIUM_SOURCE_DATABASE_PASSWORD=${sources.src.params.pg_pass}
+        DEBEZIUM_SOURCE_DATABASE_DBNAME=${sources.src.params.pg_db}
+        DEBEZIUM_SOURCE_TOPIC_PREFIX=${sources.src.namespace}
+        DEBEZIUM_SOURCE_TABLE_INCLUDE_LIST=public.t
+        DEBEZIUM_SOURCE_PLUGIN_NAME=pgoutput
+        DEBEZIUM_SOURCE_SLOT_NAME=dbz_${sources.src.namespace}
+        DEBEZIUM_SOURCE_PUBLICATION_NAME=dbz_${sources.src.namespace}
+        DEBEZIUM_FORMAT_VALUE=json
+        DEBEZIUM_FORMAT_KEY=json
+        QUARKUS_HTTP_PORT=${instance.port}
+        QUARKUS_LOG_FILE_ENABLE=false
+        nohup /debezium/run.sh > /proc/1/fd/1 2>&1 < /dev/null &
+  - source-query: { kafka: "rpk topic list | awk '{ print $1 }' | grep -cxE '${sources.src.namespace}[.]public[.]t'" }
+    expect: { rows: [['1']] }
+    eventually: 60s
+  - start: {}
+  - query: SELECT * FROM t
+    eventually: 120s
+  - source-exec: { src: "UPDATE t SET v = 'running' WHERE id % 7 = 0; DELETE FROM t WHERE id % 13 = 0" }
+  - query: SELECT * FROM t
+    eventually: 60s
+
+  # Down: the consumed messages leave the topic, and the source changes.
+  - stop: {}
+  - source-exec:
+      kafka: >-
+        t=${sources.src.namespace}.public.t;
+        for p in $(rpk topic describe -X brokers=127.0.0.1:9093 $t -p | awk 'NR > 1 { print $1 }'); do
+          end=$(rpk topic describe -X brokers=127.0.0.1:9093 $t -p | awk -v p=$p '$1 == p { print $NF }');
+          rpk topic trim-prefix -X brokers=127.0.0.1:9093 $t -p $p -o $end --no-confirm || exit 1;
+        done
+  - source-exec: { src: "UPDATE t SET v = 'while down' WHERE id BETWEEN 100 AND 150; DELETE FROM t WHERE id BETWEEN 400 AND 420; INSERT INTO t VALUES (1001, 'while down')" }
+  - upgrade: {}
+  - query: SELECT * FROM t
+    eventually: 120s
+    except: object-native
+  # Only the changes made while the runtime was down are still in the topic.
+  - query: SELECT * FROM t
+    oracle-sql: SELECT * FROM t WHERE id BETWEEN 100 AND 150 OR id = 1001
+    eventually: 120s
+    only: object-native
+  - query: SELECT count(*) - count(DISTINCT id) AS duplicates FROM t
+    expect: { rows: [['0']] }

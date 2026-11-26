@@ -1,4 +1,5 @@
 name: sql-surface-known
+duration: 1s
 tags: [long]
 description: >
   Generated documented-SQL cases with reproduced errors or schema mismatches.

@@ -43,6 +43,8 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use super::Op;
 
 type Predicate = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+/// Matches a request by its path and, for a put, its bytes.
+type RulePredicate = Arc<dyn Fn(&Path, Option<&PutPayload>) -> bool + Send + Sync>;
 /// Async work executed immediately before a held request reaches storage.
 pub type BeforeHook = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 type SharedUpload = Arc<AsyncMutex<Box<dyn MultipartUpload>>>;
@@ -57,7 +59,7 @@ pub enum Fault {
 
 struct Rule {
     op: Op,
-    predicate: Predicate,
+    predicate: RulePredicate,
     fault: Fault,
     repeat: bool,
 }
@@ -99,6 +101,8 @@ struct State {
     blocked: Vec<(Path, PutPayload, PutOptions)>,
     /// Plain GETs of matching paths wait here until the gate opens.
     read_gate: Option<Predicate>,
+    /// Whether conditional GETs (`If-None-Match` polls) wait at the gate too.
+    gate_polls: bool,
     /// GETs waiting at the gate now.
     gated: usize,
     /// How far the store's clock runs ahead of the inner store's, in
@@ -129,11 +133,16 @@ struct Shared {
 
 impl Shared {
     fn fault(&self, op: Op, path: &Path) -> Option<Fault> {
+        self.fault_for(op, path, None)
+    }
+
+    /// The fault of the first rule matching `op` on `path`, with `payload` for a put.
+    fn fault_for(&self, op: Op, path: &Path, payload: Option<&PutPayload>) -> Option<Fault> {
         let mut state = self.state.lock();
         let index = state
             .rules
             .iter()
-            .position(|r| r.op == op && (r.predicate)(path))?;
+            .position(|r| r.op == op && (r.predicate)(path, payload))?;
         let fault = state.rules[index].fault;
         if !state.rules[index].repeat {
             state.rules.remove(index);
@@ -246,7 +255,26 @@ impl FaultStore {
     ) {
         self.shared.state.lock().rules.push(Rule {
             op,
-            predicate: Arc::new(predicate),
+            predicate: Arc::new(move |path, _| predicate(path)),
+            fault,
+            repeat: false,
+        });
+    }
+
+    /// Arm one put (`Create`, `Cas` or `Put`) whose path and bytes match
+    /// `predicate`, so a test can pick a write by what it writes. Rules are
+    /// consumed in insertion order.
+    pub fn arm_put(
+        &self,
+        op: Op,
+        predicate: impl Fn(&Path, &PutPayload) -> bool + Send + Sync + 'static,
+        fault: Fault,
+    ) {
+        self.shared.state.lock().rules.push(Rule {
+            op,
+            predicate: Arc::new(move |path, payload| {
+                payload.is_some_and(|payload| predicate(path, payload))
+            }),
             fault,
             repeat: false,
         });
@@ -256,7 +284,7 @@ impl FaultStore {
     pub fn fail_while(&self, op: Op, predicate: impl Fn(&Path) -> bool + Send + Sync + 'static) {
         self.shared.state.lock().rules.push(Rule {
             op,
-            predicate: Arc::new(predicate),
+            predicate: Arc::new(move |path, _| predicate(path)),
             fault: Fault::Fail,
             repeat: true,
         });
@@ -336,9 +364,22 @@ impl FaultStore {
         self.shared.state.lock().read_gate = Some(Arc::new(predicate));
     }
 
+    /// Hold conditional GETs (`If-None-Match` polls) of matching paths before
+    /// I/O until [`Self::open_reads`], as [`Self::gate_reads`] holds plain ones,
+    /// so a poll can be caught in flight.
+    pub fn gate_polls(&self, predicate: impl Fn(&Path) -> bool + Send + Sync + 'static) {
+        let mut state = self.shared.state.lock();
+        state.read_gate = Some(Arc::new(predicate));
+        state.gate_polls = true;
+    }
+
     /// Release every GET held at the gate, and stop holding new ones.
     pub fn open_reads(&self) {
-        self.shared.state.lock().read_gate = None;
+        {
+            let mut state = self.shared.state.lock();
+            state.read_gate = None;
+            state.gate_polls = false;
+        }
         self.shared.reads_opened.notify_waiters();
     }
 
@@ -526,7 +567,10 @@ impl ObjectStore for FaultStore {
         payload: PutPayload,
         options: PutOptions,
     ) -> object_store::Result<PutResult> {
-        match self.shared.fault(put_op(&options.mode), path) {
+        match self
+            .shared
+            .fault_for(put_op(&options.mode), path, Some(&payload))
+        {
             Some(Fault::Fail) => {
                 self.shared
                     .state
@@ -558,7 +602,9 @@ impl ObjectStore for FaultStore {
         } else {
             Op::Get
         };
-        if op == Op::Get {
+        let gated =
+            op == Op::Get || (op == Op::GetConditional && self.shared.state.lock().gate_polls);
+        if gated {
             self.wait_at_gate(path).await;
         }
         if self.shared.fault(op, path).is_some() {

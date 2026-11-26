@@ -1,4 +1,5 @@
 name: cluster-http-caching
+duration: 7s
 description: >
   Known failing (#15539), on a cluster only (the same steps pass on one spiced:
   http-caching-keys.yaml). A Cayenne `refresh_mode: caching` dataset keeps

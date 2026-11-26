@@ -1,4 +1,5 @@
 name: cayenne-writes
+duration: 69s
 description: >
   SQL writes to a Cayenne acceleration (`access: read_write`, `write_mode:
   acceleration`) leave it holding what PostgreSQL holds after the same writes
@@ -15,6 +16,8 @@ description: >
 
 sources:
   src: { kind: postgres }
+  # The state location of the object-native-s3 variants.
+  lake: { kind: rustfs }
 
 matrix:
   policy: [upsert, drop, keep, none]
@@ -35,6 +38,25 @@ variants:
   drop-object-native: { when: { policy: drop, layout: plain }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } }, datasets: { ev: { acceleration: { primary_key: id, on_conflict: { id: drop } } } } }
   keep-object-native: { when: { policy: keep, layout: plain }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } }, datasets: { ev: { acceleration: { primary_key: id } } } }
   none-object-native: { when: { policy: none, layout: plain }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
+  # The same with the data in an S3 state location (`object-native-s3` in variants.yaml).
+  upsert-object-native-s3:
+    when: { policy: upsert, layout: plain }
+    spicepod: &s3
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state:
+          location: s3://${sources.lake.bucket}/state/
+          params:
+            s3_endpoint: ${sources.lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.lake.key}
+            s3_secret: ${sources.lake.secret}
+            allow_http: 'true'
+    datasets: { ev: { acceleration: { primary_key: id, on_conflict: { id: upsert } } } }
+  drop-object-native-s3: { when: { policy: drop, layout: plain }, spicepod: *s3, datasets: { ev: { acceleration: { primary_key: id, on_conflict: { id: drop } } } } }
+  keep-object-native-s3: { when: { policy: keep, layout: plain }, spicepod: *s3, datasets: { ev: { acceleration: { primary_key: id } } } }
+  none-object-native-s3: { when: { policy: none, layout: plain }, spicepod: *s3 }
 
 spicepod:
   version: v1
@@ -169,8 +191,8 @@ steps:
   - source-exec: { src: 'DELETE FROM model WHERE id > 2000 AND (v % 4 = 0 OR upper(name) = ''GAMMA'')' }
   - query: SELECT id, region, name, v, f, ts FROM ev
     oracle-sql: SELECT id, region, name, v, f, ts FROM model
-  # A condition the table cannot take as row filters (a subquery, or one no
-  # row can meet) is refused, and no row changes.
+  # A condition the table cannot take as row filters (a subquery) is refused,
+  # and no row changes.
   - spice-exec: 'DELETE FROM ev WHERE id IN (SELECT id FROM ev WHERE region = ''us'')'
     expect-error: 'restricted by a subquery'
   - spice-exec: 'DELETE FROM ev WHERE EXISTS (SELECT 1 FROM ev e WHERE e.id = ev.id AND e.region = ''eu'')'
@@ -179,8 +201,22 @@ steps:
     expect-error: 'restricted by a subquery'
   - spice-exec: 'EXPLAIN ANALYZE DELETE FROM ev WHERE id IN (SELECT id FROM ev WHERE region = ''us'')'
     expect-error: 'restricted by a subquery'
+  - query: SELECT id, region, name, v, f, ts FROM ev
+    oracle-sql: SELECT id, region, name, v, f, ts FROM model
+  # A condition no row can meet changes no row.
   - spice-exec: 'DELETE FROM ev WHERE 1 = 0'
-    expect-error: 'restricted by a condition that no row can satisfy'
+  - spice-exec: 'UPDATE ev SET v = 0 WHERE FALSE'
+  - query: SELECT id, region, name, v, f, ts FROM ev
+    oracle-sql: SELECT id, region, name, v, f, ts FROM model
+  # A condition or a new value that repeats an expression.
+  - spice-exec: 'UPDATE ev SET v = v * 2 WHERE v * 2 > 300 AND v * 2 < 700'
+  - source-exec: { src: 'UPDATE model SET v = v * 2 WHERE v * 2 > 300 AND v * 2 < 700' }
+  - spice-exec: 'UPDATE ev SET f = 0 WHERE f * 2 > 3 AND f * 2 < 10'
+  - source-exec: { src: 'UPDATE model SET f = 0 WHERE f * 2 > 3 AND f * 2 < 10' }
+  - spice-exec: 'UPDATE ev SET v = v * 2 + v * 2 WHERE id = 1'
+  - source-exec: { src: 'UPDATE model SET v = v * 2 + v * 2 WHERE id = 1' }
+  - spice-exec: 'DELETE FROM ev WHERE v * 2 > 700 AND v * 2 < 1300'
+  - source-exec: { src: 'DELETE FROM model WHERE v * 2 > 700 AND v * 2 < 1300' }
   - query: SELECT id, region, name, v, f, ts FROM ev
     oracle-sql: SELECT id, region, name, v, f, ts FROM model
   # Every row deleted, then one inserted.
@@ -222,3 +258,15 @@ steps:
   # Memory mode keeps nothing on disk.
   - assert-files: { lacks: '^\.spice/data/' }
     when: { mode: memory }
+  # Object-native data: a file acceleration's log is in the state location, and
+  # no data file is in the instance's directory; a memory one keeps nothing in
+  # the location. These few rows stay inline in the log, so there is no
+  # `data/` file to require.
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/ev-, contains: /head, min: 1 }
+    only: &s3-variants [upsert-object-native-s3, drop-object-native-s3, keep-object-native-s3, none-object-native-s3]
+    when: { mode: file }
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/, max: 0 }
+    only: *s3-variants
+    when: { mode: memory }
+  - assert-files: { lacks: ['(^|/)s3:', '\.vortex$', '\.arrow$'] }
+    only: *s3-variants

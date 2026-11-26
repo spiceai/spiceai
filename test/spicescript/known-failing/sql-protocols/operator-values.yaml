@@ -1,5 +1,6 @@
 {
   "name": "sql-operator-values-known",
+  "duration": "1s",
   "description": "Documented operator semantics checked against literal expected values over both protocols.",
   "spicepod": {
     "version": "v1",

@@ -20,13 +20,13 @@
 //! | Engine | Crate | Spice accelerator counterpart |
 //! |--------|-------|-------------------------------|
 //! | DuckDB | `duckdb-oracle` | (none) |
-//! | SQLite | `rusqlite` | `accelerator_sqlite` |
+//! | SQLite | `rusqlite` | (none — the SQLite accelerator was removed) |
 //! | chDB   | `chdb-rust` | (none — ClickHouse-compatible reference only) |
 //!
 //! Correctness matrix:
 //! 1. Standalone engines agree with each other on portable SQL (this module +
 //!    `result_correctness_standalone_engines_test`).
-//! 2. Spice accelerators (Cayenne, SQLite accel) match a
+//! 2. Spice accelerators (Cayenne) match a
 //!    standalone oracle on the same data/SQL (see cayenne `result_correctness_vs_*`
 //!    and runtime `acceleration/result_correctness`).
 

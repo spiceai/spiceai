@@ -1,4 +1,5 @@
 name: postgres-catalog
+duration: 64s
 tags: [long]
 description: >
   A PostgreSQL catalog registers exactly the tables its include and exclude

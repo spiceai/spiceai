@@ -16,7 +16,12 @@ limitations under the License.
 
 //! Metadata catalog operations for a domain.
 
-use super::{super::actions, Domain, invalid, publish::rewrite_inline, validate_uuid};
+use super::{
+    super::actions,
+    Domain, invalid,
+    publish::{rewrite_inline, snapshot_manifest_action},
+    validate_uuid,
+};
 use crate::{
     catalog::{
         CatalogError, CatalogResult, MemTierDurableCommit, MetadataCatalog, SnapshotSequenceCommit,
@@ -99,13 +104,25 @@ impl MetadataCatalog for Domain {
     async fn pending_write_back_count(&self, table_id: &str) -> CatalogResult<i64> {
         self.read().await?.reader.pending_write_back_count(table_id)
     }
+    fn data_write_gate(&self, _table_id: &str) -> crate::catalog::DataWriteGate {
+        self.data_writes.clone()
+    }
+    async fn follow_commits(&self, _table_id: &str) -> CatalogResult<u64> {
+        // Only a table that may not write asks: a replica's, or one opened
+        // before this instance last became the writer.
+        self.inner.take().await.follow().await
+    }
     async fn init(&self) -> CatalogResult<()> {
         self.read().await?;
         Ok(())
     }
     async fn shutdown(&self) -> CatalogResult<()> {
-        let mut inner = self.inner.take().await;
-        inner.flush().await?;
+        {
+            let mut inner = self.inner.take().await;
+            inner.flush().await?;
+        }
+        // Hand the writer lease back, so another instance takes over at once.
+        self.release_lease().await;
         Ok(())
     }
     async fn list_table_names(&self) -> CatalogResult<Vec<String>> {
@@ -510,16 +527,18 @@ impl MetadataCatalog for Domain {
         table_id: &str,
         snapshot_id: &str,
         sequence_number: i64,
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()> {
-        self.inner
-            .take()
-            .await
-            .commit(vec![actions::set_group(
+        let mut batch = vec![actions::set_group(table_id, snapshot_id, sequence_number)];
+        if let Some(files) = files {
+            batch.push(snapshot_manifest_action(
                 table_id,
                 snapshot_id,
-                sequence_number,
-            )])
-            .await
+                files,
+                false,
+            )?);
+        }
+        self.inner.take().await.commit(batch).await
     }
     async fn clear_snapshot_sequence(
         &self,
@@ -606,12 +625,16 @@ impl MetadataCatalog for Domain {
         old_snapshot_ids: &[String],
         new_snapshot_id: &str,
         new_sequence_number: i64,
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<bool> {
         validate_uuid("table_id", table_id)?;
         validate_uuid("new_snapshot_id", new_snapshot_id)?;
         for id in old_snapshot_ids {
             validate_uuid("old_snapshot_id", id)?;
         }
+        let manifest = files
+            .map(|files| snapshot_manifest_action(table_id, new_snapshot_id, files, false))
+            .transpose()?;
         let mut inner = self.inner.take().await;
         let table = inner.table(table_id)?;
         let unique: std::collections::BTreeSet<_> = old_snapshot_ids.iter().collect();
@@ -627,12 +650,12 @@ impl MetadataCatalog for Domain {
         // manifest rows: a scan that captured them as live before the in-memory
         // swap still reads them from those rows. The retirement sweep forgets
         // the rows together with the files, once no scan holds them.
-        inner
-            .commit(vec![
-                actions::remove_groups(table_id, proto::Select::Listed, old_snapshot_ids, true),
-                actions::set_group(table_id, new_snapshot_id, new_sequence_number),
-            ])
-            .await?;
+        let mut batch = vec![
+            actions::remove_groups(table_id, proto::Select::Listed, old_snapshot_ids, true),
+            actions::set_group(table_id, new_snapshot_id, new_sequence_number),
+        ];
+        batch.extend(manifest);
+        inner.commit(batch).await?;
         Ok(true)
     }
     async fn commit_overwrite(
@@ -641,11 +664,18 @@ impl MetadataCatalog for Domain {
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
         delete_files: &[crate::metadata::DeleteFile],
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()> {
         validate_uuid("table_id", table_id)?;
         validate_uuid("new_snapshot_id", new_snapshot_id)?;
+        let manifest = files
+            .map(|files| snapshot_manifest_action(table_id, new_snapshot_id, files, false))
+            .transpose()?;
         let mut inner = self.inner.take().await;
         let mut batch = actions::overwrite_clear(table_id, new_snapshot_id);
+        // After the flip, so the record checks the new snapshot's files against
+        // the files it retires.
+        batch.extend(manifest);
         if let Some(data) = inlined {
             batch.push(actions::add_inlined(
                 table_id,
@@ -760,18 +790,13 @@ impl MetadataCatalog for Domain {
         snapshot_id: &str,
         files: &[SnapshotFile],
     ) -> CatalogResult<()> {
-        if files
-            .iter()
-            .any(|f| f.table_id != table_id || f.snapshot_id != snapshot_id)
-        {
-            return Err(invalid("snapshot file identity does not match replacement"));
-        }
+        let manifest = snapshot_manifest_action(table_id, snapshot_id, files, false)?;
         self.inner
             .take()
             .await
             .commit(vec![
                 actions::remove_files(table_id, proto::Select::Listed, &[snapshot_id.to_string()]),
-                actions::add_files(table_id, snapshot_id, files, false),
+                manifest,
             ])
             .await
     }

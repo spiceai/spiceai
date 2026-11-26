@@ -1,4 +1,5 @@
 name: debezium-kafka-arrow
+duration: 49s
 description: >
   An Arrow acceleration in memory of a Debezium topic in Kafka (`from:
   debezium:`) starts and answers as PostgreSQL does after the snapshot and

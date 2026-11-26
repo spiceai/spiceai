@@ -840,6 +840,46 @@
       "kind": "error",
       "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"from\":\"mysql:orders\",\"name\":\"orders\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Ready\"},{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.co",
       "group": "cdc-mysql"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "sqlite-key",
+      "key": "restart: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"from\":\"mysql:orders\",\"name\":\"orders\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Ready\"},{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.co",
+      "group": "cdc-mysql"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "sqlite-position",
+      "key": "restart: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"from\":\"mysql:orders\",\"name\":\"orders\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Ready\"},{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.co",
+      "group": "cdc-mysql"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-key",
+      "key": "restart: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"from\":\"mysql:orders\",\"name\":\"orders\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Ready\"},{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.co",
+      "group": "cdc-mysql"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-position",
+      "key": "restart: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"from\":\"mysql:orders\",\"name\":\"orders\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Ready\"},{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.co",
+      "group": "cdc-mysql"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native",
+      "key": "restart: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"from\":\"mysql:orders\",\"name\":\"orders\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Ready\"},{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.co",
+      "group": "cdc-mysql"
     }
   ],
   "mysql-cdc-shared-binlog": [
@@ -1270,69 +1310,6 @@
   "postgres-cdc-parity": [
     {
       "run": "postgres-cdc-parity",
-      "who": "object-native-rustfs",
-      "key": "query: SELECT * FROM orders #6",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 18449, actual: 18818 }",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-s3-latency",
-      "key": "query: SELECT * FROM orders #6",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 18449, actual: 18818 }",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-rustfs",
-      "key": "query: SELECT o_status, count(*), sum(o_total), min(o_placed), max(o_updated) FROM orders GROUP BY o_status ORDER BY o_status NULLS LAST",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"5967\\\"\", actual: \"\\\"6086\\\"\" }",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-s3-latency",
-      "key": "query: SELECT o_status, count(*), sum(o_total), min(o_placed), max(o_updated) FROM orders GROUP BY o_status ORDER BY o_status NULLS LAST",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"5967\\\"\", actual: \"\\\"6086\\\"\" }",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-rustfs",
-      "key": "query: SELECT c.c_segment, count(*), sum(o.o_total) FROM orders o JOIN customers c ON o.o_custkey = c.c_id GROUP BY c.c_segment",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"5119\\\"\", actual: \"\\\"5214\\\"\" }",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-s3-latency",
-      "key": "query: SELECT c.c_segment, count(*), sum(o.o_total) FROM orders o JOIN customers c ON o.o_custkey = c.c_id GROUP BY c.c_segment",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"5119\\\"\", actual: \"\\\"5214\\\"\" }",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-s3-latency",
-      "key": "query: SELECT * FROM orders #8",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: RowCountMismatch { expected: 18449, actual: 18818 }",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-parity",
       "who": "object-native",
       "key": "query: SELECT * FROM orders #9",
       "kind": "error",
@@ -1381,15 +1358,6 @@
     },
     {
       "run": "postgres-cdc-parity",
-      "who": "object-native-s3-latency",
-      "key": "query: SELECT * FROM orders #10",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 18449, actual: 18818 }",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-parity",
       "who": "object-native",
       "key": "query: SELECT * FROM customers #8",
       "kind": "error",
@@ -1412,24 +1380,6 @@
       "key": "query: SELECT * FROM customers #8",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-s3-latency",
-      "key": "query: SELECT * FROM orders #11",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 18449, actual: 18818 }",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-s3-latency",
-      "key": "query: SELECT * FROM orders #12",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 18449, actual: 18818 }",
       "group": "cayenne",
       "may-pass": true
     },
@@ -1759,7 +1709,27 @@
     },
     {
       "run": "postgres-write-back-outage",
+      "who": "object-native",
+      "key": "query: SELECT count(*), sum(balance) FROM accounts #2",
+      "kind": "wrong-answer",
+      "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "pattern": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
       "who": "as-written",
+      "key": "query: SELECT * FROM accounts #2",
+      "kind": "wrong-answer",
+      "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "pattern": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
+      "who": "object-native",
       "key": "query: SELECT * FROM accounts #2",
       "kind": "wrong-answer",
       "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
@@ -1779,7 +1749,27 @@
     },
     {
       "run": "postgres-write-back-outage",
+      "who": "object-native",
+      "key": "query: SELECT * FROM accounts #3",
+      "kind": "wrong-answer",
+      "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "pattern": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
       "who": "as-written",
+      "key": "query: SELECT count(*), sum(balance) FROM accounts #3",
+      "kind": "wrong-answer",
+      "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "pattern": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
+      "who": "object-native",
       "key": "query: SELECT count(*), sum(balance) FROM accounts #3",
       "kind": "wrong-answer",
       "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
@@ -1802,7 +1792,8 @@
       "who": "object-native",
       "key": "query: SELECT * FROM accounts #4",
       "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"owner\", row_number: 47, expected: \"\\\"through spice\\\"\", actual: \"\\\"at the source\\\"\" }",
+      "signature": "((RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)|DataMismatch \\{ column: \"owner\", row_number: 47, expected: .*through spice.*, actual: .*at the source)",
+      "pattern": "((RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)|DataMismatch \\{ column: \"owner\", row_number: 47, expected: .*through spice.*, actual: .*at the source)",
       "group": "write-back",
       "may-pass": true
     },
@@ -2113,6 +2104,26 @@
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nInternal: Binder Error: No function matches the given name and argument types 'octet_length(VARCHAR)'. You might need to add explicit type casts.\\n\\tCandidate functions:\\n\\toctet_",
       "group": "duckdb"
+    }
+  ],
+  "readiness": [
+    {
+      "run": "readiness[engine=cayenne,ready_state=on_load]",
+      "who": "object-native",
+      "key": "assert-status: {\"dataset\":\"slow\",\"ready\":false}",
+      "kind": "status",
+      "signature": "expected ready=false, saw status=Ready ready=true message=",
+      "group": "other",
+      "may-pass": true
+    },
+    {
+      "run": "readiness[engine=cayenne,ready_state=on_load]",
+      "who": "object-native",
+      "key": "query: SELECT count(*) FROM slow",
+      "kind": "error",
+      "signature": "the query succeeded, but the script expected an error:",
+      "group": "other",
+      "may-pass": true
     }
   ],
   "schema-ddl": [

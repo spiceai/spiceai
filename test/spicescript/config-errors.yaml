@@ -1,4 +1,5 @@
 name: config-errors
+duration: 7s
 description: >
   A dataset with a configuration or connection mistake is reported in Error
   with a message that names it and what is wrong — an unknown connector
@@ -10,7 +11,7 @@ description: >
   enabled. A Cayenne dataset that still names the retired Turso
   metastore loads on the SQLite metastore it shares with a healthy one, and
   is warned once to drop the param. A dataset and a view that set the removed
-  `turso`, `duckdb` or `postgres` acceleration engine (`postgresql` too) each
+  `turso`, `duckdb`, `postgres` (`postgresql` too) or `sqlite` acceleration engine each
   fail to load with one error
   naming the fix, and are never switched to Cayenne, while the Cayenne
   datasets beside them answer. A dataset that still selects the removed
@@ -58,10 +59,12 @@ spicepod:
     - { from: 'postgres:public.t', name: duckdb_engine, params: '${sources.src.params}', acceleration: { enabled: true, engine: duckdb, mode: file } }
     - { from: 'postgres:public.t', name: postgres_engine, params: '${sources.src.params}', acceleration: { enabled: true, engine: postgres } }
     - { from: 'postgres:public.t', name: postgresql_engine, params: '${sources.src.params}', acceleration: { enabled: true, engine: postgresql } }
+    - { from: 'postgres:public.t', name: sqlite_engine, params: '${sources.src.params}', acceleration: { enabled: true, engine: sqlite, mode: file } }
   views:
     - { name: turso_view, sql: 'SELECT * FROM healthy', acceleration: { enabled: true, engine: turso } }
     - { name: duckdb_view, sql: 'SELECT * FROM healthy', acceleration: { enabled: true, engine: duckdb } }
     - { name: postgres_view, sql: 'SELECT * FROM healthy', acceleration: { enabled: true, engine: postgres } }
+    - { name: sqlite_view, sql: 'SELECT * FROM healthy', acceleration: { enabled: true, engine: sqlite } }
 steps:
   - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t VALUES (1, 'a')" }
   - start: { ready: false }
@@ -162,6 +165,19 @@ steps:
         "ERROR .*Failed to load view 'postgres_view': the acceleration engine `postgres` is no longer supported as of v2\\.5 and cannot be used\\. Set `acceleration\\.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots\\. See: https://spiceai\\.org/docs/components/data-accelerators/cayenne/migration view=\"postgres_view\"$": 1
         "ERROR .*postgres(ql)?_(engine|view)": 3
       lacks: ["deprecated .*postgres(ql)?_(engine|view)", "Unknown acceleration engine 'postgres"]
+  # The `sqlite` acceleration engine is removed the same way.
+  - query: SELECT * FROM sqlite_engine
+    expect-error: sqlite_engine
+  - query: SELECT * FROM sqlite_view
+    expect-error: sqlite_view
+  - query: SELECT * FROM healthy_cayenne
+    expect: { rows: [['1', a]] }
+  - assert-log:
+      count:
+        "ERROR .*Failed to load dataset 'sqlite_engine': the acceleration engine `sqlite` is no longer supported as of v2\\.5 and cannot be used\\. Set `acceleration\\.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots\\. See: https://spiceai\\.org/docs/components/data-accelerators/cayenne/migration dataset=\"sqlite_engine\"$": 1
+        "ERROR .*Failed to load view 'sqlite_view': the acceleration engine `sqlite` is no longer supported as of v2\\.5 and cannot be used\\. Set `acceleration\\.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots\\. See: https://spiceai\\.org/docs/components/data-accelerators/cayenne/migration view=\"sqlite_view\"$": 1
+        "ERROR .*sqlite_(engine|view)": 2
+      lacks: ["deprecated .*sqlite_(engine|view)", "Unknown acceleration engine 'sqlite'"]
   # The duckdb vector engine is removed: the dataset that selects it fails with
   # exactly one error, and the Cayenne dataset indexes its embeddings itself.
   - query: SELECT id FROM vector_search(cayenne_vectors, 'a') ORDER BY _score DESC, id

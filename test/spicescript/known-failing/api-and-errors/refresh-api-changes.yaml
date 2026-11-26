@@ -1,4 +1,5 @@
 name: refresh-api-changes
+duration: 8s
 description: >
   Known failing (#15546). A manual refresh of a `refresh_mode: changes` dataset is
   refused, as documented, but with 500 and "Manual refresh is not supported

@@ -42,6 +42,7 @@ limitations under the License.
 use crate::common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -51,7 +52,7 @@ use cayenne::maintained_aggregate::{
 };
 use cayenne::metadata::{CdcDurability, CreateTableOptions, VortexConfig};
 use cayenne::optimizer_rules::CayenneMaintainedAggregateRewriter;
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, SlotAdvancer};
+use cayenne::{CayenneTableProvider, MetadataCatalog, SlotAdvancer};
 use common::TestFixture;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::session_state::SessionStateBuilder;
@@ -183,7 +184,7 @@ async fn table_in_shape(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.join(name).to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(name),
         partition_column: None,
         vortex_config: VortexConfig {
             cdc_durability: CdcDurability::Memory,
@@ -196,9 +197,11 @@ async fn table_in_shape(
     };
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-            .with_maintained_aggregates(vec![unfiltered_sum_v_by_k()])
-            .create(options)
+        fixture
+            .data_store
+            .create_with(catalog, ctx.runtime_env(), options, |builder| {
+                builder.with_maintained_aggregates(vec![unfiltered_sum_v_by_k()])
+            })
             .await?,
     );
     table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
@@ -263,12 +266,21 @@ async fn unfiltered_view_answers_only_whole_table_queries(
     reference.register_table(&name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
     // The rewrite must still fire where it is sound, or the comparisons below
-    // would pass without ever exercising it.
+    // would pass without ever exercising it. A CDC write publishes its rows before
+    // a background applier folds them into the view, and until then the rewriter
+    // declines, so poll for the view to catch up.
     let unfiltered = format!("SELECT k, SUM(v) FROM {name} GROUP BY k");
-    assert!(
-        served_by_view(&rewriter, &unfiltered).await?,
-        "{shape:?}: the unfiltered query must be answered by the maintained view"
-    );
+    common::lookup_index::poll_until(
+        Duration::from_secs(30),
+        Duration::from_millis(10),
+        async || match served_by_view(&rewriter, &unfiltered).await {
+            Ok(true) => Ok(Ok(())),
+            Ok(false) => Err(()),
+            Err(error) => Ok(Err(error)),
+        },
+        |()| format!("{shape:?}: the unfiltered query must be answered by the maintained view"),
+    )
+    .await?;
     assert_eq!(
         sorted_rows(&rewriter, &unfiltered).await?,
         sorted_rows(&reference, &unfiltered).await?,
@@ -351,6 +363,6 @@ async fn file_only_impl(fixture: TestFixture) -> TestResult<()> {
     unfiltered_view_answers_only_whole_table_queries(fixture, Shape::FileOnly).await
 }
 
-test_with_backends!(ram_only_impl);
-test_with_backends!(file_and_ram_impl);
-test_with_backends!(file_only_impl);
+test_on_data_store!(ram_only_impl);
+test_on_data_store!(file_and_ram_impl);
+test_on_data_store!(file_only_impl);

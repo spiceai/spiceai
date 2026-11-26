@@ -1,4 +1,5 @@
 name: huggingface-gguf-default
+duration: 1s
 description: >
   A Hugging Face GGUF repository named with no `files` loads the quantization
   llama.cpp's `-hf` loads, `Q4_K_M`, and not the largest the machine holds:

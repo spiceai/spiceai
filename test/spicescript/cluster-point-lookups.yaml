@@ -1,4 +1,5 @@
 name: cluster-point-lookups
+duration: 56s
 description: >
   On a cluster of one executor, point lookups answer as PostgreSQL does:
   an equality on a primary key or, on a table without one, on any column;

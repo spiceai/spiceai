@@ -20,10 +20,8 @@ use std::sync::Arc;
 
 use datafusion_execution::{config::SessionConfig, runtime_env::RuntimeEnv};
 use tokio::sync::Semaphore;
-use vortex::VortexSessionDefault;
 use vortex::file::WriteStrategyBuilder;
 use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions, WriteShardConfig};
-use vortex_session::VortexSession;
 
 use super::tuning::{self, ActuatorValues, IngestStats, LiveActuators, TuningBounds};
 use crate::metadata::{DeletionMode, DeltaEncoding, StorageClass, VortexConfig};
@@ -391,13 +389,14 @@ impl CayenneContext {
         strategy: WriteStrategyBuilder,
         shard: Option<WriteShardConfig>,
     ) -> Arc<VortexFormat> {
-        let session = VortexSession::default().set(strategy);
         let mut options = Self::vortex_table_options(&self.config);
         // This format only writes files, so it has no use for a read-path cache.
         // Clearing the size keeps it from building a private one when no
         // process-wide segment cache is installed.
         options.segment_cache_size_bytes = None;
-        let format = VortexFormat::new_with_options(session, options);
+        let format =
+            VortexFormat::new_with_options(super::delta_encoding::write_session(), options)
+                .with_write_strategy(strategy);
         let format = match shard {
             Some(config) => format.with_write_shard(config),
             None => format,
@@ -414,15 +413,16 @@ impl CayenneContext {
         cold_target_file_size_mb: usize,
         shard: Option<WriteShardConfig>,
     ) -> Arc<VortexFormat> {
-        let session = VortexSession::default().set(
-            super::delta_encoding::full_strategy_builder_for(&self.config.compression_strategy),
-        );
         let mut options = Self::vortex_table_options(&self.config);
         options.target_file_size_mb = cold_target_file_size_mb;
         // Write-only format: it never scans, so drop the read-path cache size and
         // avoid building a private `SharedSegmentCache` per promotion.
         options.segment_cache_size_bytes = None;
-        let format = VortexFormat::new_with_options(session, options);
+        let format =
+            VortexFormat::new_with_options(super::delta_encoding::write_session(), options)
+                .with_write_strategy(super::delta_encoding::full_strategy_builder_for(
+                    &self.config.compression_strategy,
+                ));
         let format = match shard {
             Some(config) => format.with_write_shard(config),
             None => format,
@@ -1181,25 +1181,27 @@ impl CayenneContext {
     /// The format carries Vortex scan/write options, including the shared
     /// segment-cache capacity for scans created from this context.
     fn create_vortex_format(config: &VortexConfig) -> Arc<VortexFormat> {
-        // Create a Vortex session with default encodings. The session's write
-        // strategy is the table's FULL encoding tier: the BtrBlocks cascade by
-        // default, optionally extended with the Zstd string scheme when
-        // `cayenne_compression_strategy=zstd`, with string and binary data blocks
-        // capped (see `delta_encoding::full_strategy_builder_for`).
-        // Maintenance writes and full-level delta writes inherit it; light
-        // delta-encoding levels override it per write via
-        // `write_format_with_strategy` (see `provider::delta_encoding`).
-        let vortex_session = VortexSession::default().set(
-            super::delta_encoding::full_strategy_builder_for(&config.compression_strategy),
-        );
-
+        // A Vortex session with default encodings, writing with the table's FULL
+        // encoding tier: the BtrBlocks cascade by default, optionally extended
+        // with the Zstd string scheme when `cayenne_compression_strategy=zstd`,
+        // with string and binary data blocks capped (see
+        // `delta_encoding::full_strategy_builder_for`). Maintenance writes and
+        // full-level delta writes inherit it; light delta-encoding levels
+        // override it per write via `write_format_with_strategy` (see
+        // `provider::delta_encoding`).
+        //
         // Cayenne opts into the shared cache: its data files carry a uuid7 write
         // id beneath a uuid7 snapshot directory, so a path is written once and
         // never reused, and retirement invalidates it explicitly.
-        Arc::new(VortexFormat::new_with_process_segment_cache(
-            vortex_session,
-            Self::vortex_table_options(config),
-        ))
+        Arc::new(
+            VortexFormat::new_with_process_segment_cache(
+                super::delta_encoding::write_session(),
+                Self::vortex_table_options(config),
+            )
+            .with_write_strategy(super::delta_encoding::full_strategy_builder_for(
+                &config.compression_strategy,
+            )),
+        )
     }
 
     /// Table options shared by the base format and any per-write format
