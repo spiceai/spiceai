@@ -1317,12 +1317,14 @@ impl Runtime {
         Self::serving_wait_reason(ds)
     }
 
-    /// [`Self::waits_for_source_reason`], or for an eligible change stream whose
-    /// acceleration is not recorded as loaded, why it waits all the same.
+    /// [`Self::waits_for_source_reason`], or for an eligible change stream, that a
+    /// dataset reaching this point was not recorded as loaded: one that was is
+    /// served from its acceleration instead.
     fn serving_wait_reason(ds: &Dataset) -> Option<String> {
         Self::waits_for_source_reason(ds).or_else(|| {
             resumes_changes_after_restart(ds).then(|| {
-                "`refresh_mode: changes`, and its change stream has not finished loading the acceleration".to_string()
+                "`refresh_mode: changes`, and its acceleration is not recorded as loaded"
+                    .to_string()
             })
         })
     }
@@ -4007,9 +4009,6 @@ fn not_served_status(reason: &str, cause: &str) -> String {
     format!("Not served: waits for its source because it uses {reason}. Cause: {cause}")
 }
 
-/// Whether `ds` is a `refresh_mode: changes` dataset whose change stream resumes
-/// after a restart from a recorded position, so it is served from its existing
-/// acceleration at startup and starts its stream once the source answers.
 /// Whether `ds` is a `refresh_mode: changes` dataset of a connector that resumes
 /// its change stream after a restart.
 fn uses_resuming_change_stream(ds: &Dataset) -> bool {
@@ -4019,6 +4018,9 @@ fn uses_resuming_change_stream(ds: &Dataset) -> bool {
         && crate::dataconnector::connector_resumes_changes_after_restart(ds.source())
 }
 
+/// Whether `ds` is a `refresh_mode: changes` dataset whose change stream resumes
+/// after a restart from a recorded position, so it is served from its existing
+/// acceleration at startup and starts its stream once the source answers.
 pub(crate) fn resumes_changes_after_restart(ds: &Dataset) -> bool {
     ds.acceleration
         .as_ref()

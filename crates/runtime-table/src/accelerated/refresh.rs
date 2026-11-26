@@ -2059,7 +2059,7 @@ async fn clear_changes_loaded(
     };
     if let Err(error) = written {
         tracing::warn!(
-            "Dataset '{dataset_name}' could not update its acceleration checkpoint. Cause: {error}. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+            "Dataset '{dataset_name}' could not clear the record that its acceleration is loaded, so if its configuration later allows it, a restart may serve this acceleration before its source answers. Cause: {error}. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
         );
     }
 }

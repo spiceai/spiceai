@@ -292,8 +292,14 @@ impl DataConnector for ReconnectingConnector {
         let inner = Arc::clone(&self.inner);
         let dataset = dataset.clone();
         // The deferred federated table builds the real connector when it reaches the
-        // source. Nothing writes to the acceleration before then, so `acceleration`
-        // is still accurate.
+        // source. The dataset is served throughout, so an acceleration observed
+        // empty is reported as unproven: any load must then replace it atomically
+        // rather than fill it in place.
+        let acceleration = if acceleration.is_provably_empty() {
+            data_components::cdc::AccelerationContents::Unknown
+        } else {
+            acceleration
+        };
         let stream = futures::stream::once(async move {
             federated_table.table_provider().await;
             let reached = inner.get().map(Arc::clone);
