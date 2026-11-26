@@ -74,6 +74,11 @@ jobs:
           INPUT_SPICED_REF: ${{ github.event.inputs.spiced_ref || 'trunk' }}
         run: |
           set -euo pipefail
+          # An image tag, as docker accepts one; it goes to GITHUB_OUTPUT and into image references.
+          if [ -n "${CUSTOM_IMAGE_TAG}" ] && ! [[ "${CUSTOM_IMAGE_TAG}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::custom_image_tag must be an image tag (letters, digits, '_', '.' and '-', at most 128, not starting with '.' or '-')."
+            exit 1
+          fi
           spiced_ref="${INPUT_SPICED_REF}"
           spiced_sha="$(git rev-parse HEAD)"
           spiced_sha_short="${spiced_sha:0:12}"

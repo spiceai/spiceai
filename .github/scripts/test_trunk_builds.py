@@ -229,6 +229,31 @@ class ClusterImageTest(unittest.TestCase):
                     "FORCE_REBUILD": "false", "CUSTOM_IMAGE_TAG": "", "INPUT_SPICED_REF": "trunk"})
                 self.assertEqual(proc.returncode == 0, ok, proc.stdout + proc.stderr)
 
+    def test_a_custom_image_tag_is_an_image_tag(self):
+        steps = job_steps("testoperator_dispatch_cluster.yml", "resolve-image")
+        script = next(s for s in steps if s.get("id") == "resolve")["run"]
+        for tag, ok in (("trunk-0123456789ab", True), ("v2.4.3-models", True), ("x\nneed_build=true", False),
+                        ("a b", False), ("-x", False), ("a" * 129, False)):
+            with self.subTest(tag=tag), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                git(work, "init", "-q", "-b", "trunk")
+                git(work, "config", "user.email", "ci@example.invalid")
+                git(work, "config", "user.name", "ci")
+                (work / "f").write_text("x")
+                git(work, "add", "f")
+                git(work, "commit", "-qm", "x")
+                output = work / "out"
+                output.write_text("")
+                proc = subprocess.run(["bash", "-e", "-c", script], cwd=work, capture_output=True, text=True, env={
+                    "PATH": os.environ["PATH"], "GITHUB_REF": "refs/heads/feature", "GITHUB_REPOSITORY": "owner/repo",
+                    "GITHUB_OUTPUT": str(output), "FORCE_REBUILD": "false", "CUSTOM_IMAGE_TAG": tag,
+                    "INPUT_SPICED_REF": "trunk"})
+                self.assertEqual(proc.returncode == 0, ok, proc.stdout + proc.stderr)
+                if ok:
+                    self.assertIn(f"image_tag={tag}\n", output.read_text())
+                else:
+                    self.assertEqual(output.read_text(), "")
+
     def test_only_a_trunk_run_names_a_trunk_image(self):
         steps = job_steps("testoperator_dispatch_cluster.yml", "resolve-image")
         run = next(s for s in steps if s.get("id") == "resolve")["run"]
