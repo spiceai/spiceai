@@ -29,6 +29,7 @@
   "cluster-executors": 92,
   "cluster-literals": 49,
   "cluster-nan-literal": 48,
+  "cluster-point-lookups": 56,
   "cluster-scheduler-failover-empty": 102,
   "cluster-scheduler-restart": 95,
   "cluster-shuffle": 95,
