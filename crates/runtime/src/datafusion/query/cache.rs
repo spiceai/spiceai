@@ -780,7 +780,7 @@ impl Query {
     /// `None` when the request carries an owned Flight SQL session: those
     /// plans depend on that session's prepared statements and catalog
     /// snapshot, and must not be stored under the principal-only key.
-    pub(super) fn shared_plans_cache_key(
+    pub(crate) fn shared_plans_cache_key(
         df: &DataFusion,
         sql: &str,
         request_context: &RequestContext,

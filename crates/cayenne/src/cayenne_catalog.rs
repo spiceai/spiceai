@@ -1714,7 +1714,12 @@ impl CayenneCatalog {
                     );
                 }
 
-                if configuration_schemas_match(&stored_metadata.schema, &options.schema) {
+                if configuration_schemas_match(&stored_metadata.schema, &options.schema)
+                    || lacks_only_optional_trailing_columns(
+                        &stored_metadata.schema,
+                        &options.schema,
+                    )
+                {
                     return Ok(stored_metadata);
                 }
 
@@ -4087,6 +4092,7 @@ impl MetadataCatalog for CayenneCatalog {
         old_snapshot_ids: &[String],
         new_snapshot_id: &str,
         new_sequence_number: i64,
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<bool> {
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
         if max_attempts == 0 {
@@ -4102,8 +4108,12 @@ impl MetadataCatalog for CayenneCatalog {
                 }
             })?;
 
-            match self
-                .swap_protected_snapshots_in_txn(
+            let swapped = async {
+                if let Some(files) = files {
+                    self.replace_snapshot_files_in_txn(&mut *tx, table_id, new_snapshot_id, files)
+                        .await?;
+                }
+                self.swap_protected_snapshots_in_txn(
                     &mut *tx,
                     table_id,
                     old_snapshot_ids,
@@ -4111,9 +4121,12 @@ impl MetadataCatalog for CayenneCatalog {
                     new_sequence_number,
                 )
                 .await
-            {
+            }
+            .await;
+            match swapped {
                 // CAS guard failed — an input snapshot is no longer active.
-                // The transaction made no changes; nothing to commit.
+                // Nothing commits: dropping the transaction rolls back any
+                // manifest rows it wrote.
                 Ok(false) => return Ok(false),
                 Ok(true) => match tx.commit().await {
                     Ok(()) => return Ok(true),
@@ -6842,7 +6855,7 @@ fn configuration_schemas_match(left: &arrow_schema::Schema, right: &arrow_schema
                 | INFERRED_TABLE_BYTES_METADATA_KEY
         )
     };
-    left.fields() == right.fields()
+    fields_match_ignoring_optional_marker(left.fields(), right.fields())
         && left
             .metadata()
             .iter()
@@ -6851,6 +6864,53 @@ fn configuration_schemas_match(left: &arrow_schema::Schema, right: &arrow_schema
             .metadata()
             .iter()
             .all(|(key, value)| is_statistic(key) || left.metadata().get(key) == Some(value))
+}
+
+/// Whether two field lists are equal once the optional-trailing-column marker
+/// is ignored, so a table created with that marker matches whether or not the
+/// stored schema kept the field's metadata.
+fn fields_match_ignoring_optional_marker(
+    left: &arrow_schema::Fields,
+    right: &arrow_schema::Fields,
+) -> bool {
+    use arrow_tools::metadata_keys::OPTIONAL_TRAILING_COLUMN_METADATA_KEY;
+    let unmarked = |field: &arrow_schema::FieldRef| {
+        let mut metadata = field.metadata().clone();
+        metadata.remove(OPTIONAL_TRAILING_COLUMN_METADATA_KEY);
+        field.as_ref().clone().with_metadata(metadata)
+    };
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| left == right || unmarked(left) == unmarked(right))
+}
+
+/// Whether `requested` is `stored` with only optional trailing columns added:
+/// nullable fields marked with
+/// [`arrow_tools::metadata_keys::OPTIONAL_TRAILING_COLUMN_METADATA_KEY`],
+/// after every stored field. Such a table is opened with its stored schema and
+/// no schema change is reported; the caller works without those columns.
+fn lacks_only_optional_trailing_columns(
+    stored: &arrow_schema::Schema,
+    requested: &arrow_schema::Schema,
+) -> bool {
+    use arrow_tools::metadata_keys::OPTIONAL_TRAILING_COLUMN_METADATA_KEY;
+    let kept = stored.fields().len();
+    if requested.fields().len() <= kept {
+        return false;
+    }
+    let (head, tail) = requested.fields().split_at(kept);
+    tail.iter().all(|field| {
+        field.is_nullable()
+            && field
+                .metadata()
+                .get(OPTIONAL_TRAILING_COLUMN_METADATA_KEY)
+                .is_some_and(|value| value == "true")
+    }) && configuration_schemas_match(
+        stored,
+        &arrow_schema::Schema::new_with_metadata(head.to_vec(), requested.metadata().clone()),
+    )
 }
 
 /// One setting whose stored value differs from the requested one, named the way an
@@ -11084,7 +11144,13 @@ mod tests {
         }
 
         let swapped = catalog
-            .swap_protected_snapshots(&table_id, &[input_a.clone(), input_b.clone()], &p_new, 4)
+            .swap_protected_snapshots(
+                &table_id,
+                &[input_a.clone(), input_b.clone()],
+                &p_new,
+                4,
+                None,
+            )
             .await
             .expect("swap protected snapshots");
         assert!(
@@ -11379,7 +11445,13 @@ mod tests {
             .expect("seed roster row");
 
         let swapped = catalog
-            .swap_protected_snapshots(&table_id, &[input_a.clone(), input_b.clone()], &p_new, 4)
+            .swap_protected_snapshots(
+                &table_id,
+                &[input_a.clone(), input_b.clone()],
+                &p_new,
+                4,
+                None,
+            )
             .await
             .expect("swap protected snapshots");
         assert!(

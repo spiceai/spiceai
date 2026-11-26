@@ -16,7 +16,12 @@ limitations under the License.
 
 //! Metadata catalog operations for a domain.
 
-use super::{super::actions, Domain, invalid, publish::rewrite_inline, validate_uuid};
+use super::{
+    super::actions,
+    Domain, invalid,
+    publish::{rewrite_inline, snapshot_manifest_action},
+    validate_uuid,
+};
 use crate::{
     catalog::{
         CatalogError, CatalogResult, MemTierDurableCommit, MetadataCatalog, SnapshotSequenceCommit,
@@ -31,24 +36,6 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use cayenne_metastore_actions::{Action, Kind, ObjRef, proto};
 use std::collections::HashMap;
-
-/// The action that records `files` as manifest rows of `snapshot_id`, refusing a
-/// row of another table or snapshot.
-fn snapshot_manifest_action(
-    table_id: &str,
-    snapshot_id: &str,
-    files: &[SnapshotFile],
-) -> CatalogResult<Action> {
-    if files
-        .iter()
-        .any(|f| f.table_id != table_id || f.snapshot_id != snapshot_id)
-    {
-        return Err(invalid(format!(
-            "snapshot file identity does not match snapshot '{snapshot_id}' of table '{table_id}'"
-        )));
-    }
-    Ok(actions::add_files(table_id, snapshot_id, files, false))
-}
 
 #[async_trait]
 impl MetadataCatalog for Domain {
@@ -640,12 +627,16 @@ impl MetadataCatalog for Domain {
         old_snapshot_ids: &[String],
         new_snapshot_id: &str,
         new_sequence_number: i64,
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<bool> {
         validate_uuid("table_id", table_id)?;
         validate_uuid("new_snapshot_id", new_snapshot_id)?;
         for id in old_snapshot_ids {
             validate_uuid("old_snapshot_id", id)?;
         }
+        let manifest = files
+            .map(|files| snapshot_manifest_action(table_id, new_snapshot_id, files, false))
+            .transpose()?;
         let mut inner = self.inner.take().await;
         let table = inner.table(table_id)?;
         let unique: std::collections::BTreeSet<_> = old_snapshot_ids.iter().collect();
@@ -661,12 +652,12 @@ impl MetadataCatalog for Domain {
         // manifest rows: a scan that captured them as live before the in-memory
         // swap still reads them from those rows. The retirement sweep forgets
         // the rows together with the files, once no scan holds them.
-        inner
-            .commit(vec![
-                actions::remove_groups(table_id, proto::Select::Listed, old_snapshot_ids, true),
-                actions::set_group(table_id, new_snapshot_id, new_sequence_number),
-            ])
-            .await?;
+        let mut batch = vec![
+            actions::remove_groups(table_id, proto::Select::Listed, old_snapshot_ids, true),
+            actions::set_group(table_id, new_snapshot_id, new_sequence_number),
+        ];
+        batch.extend(manifest);
+        inner.commit(batch).await?;
         Ok(true)
     }
     async fn commit_overwrite(
@@ -680,7 +671,7 @@ impl MetadataCatalog for Domain {
         validate_uuid("table_id", table_id)?;
         validate_uuid("new_snapshot_id", new_snapshot_id)?;
         let manifest = files
-            .map(|files| snapshot_manifest_action(table_id, new_snapshot_id, files))
+            .map(|files| snapshot_manifest_action(table_id, new_snapshot_id, files, false))
             .transpose()?;
         let mut inner = self.inner.take().await;
         let mut batch = actions::overwrite_clear(table_id, new_snapshot_id);
@@ -801,7 +792,7 @@ impl MetadataCatalog for Domain {
         snapshot_id: &str,
         files: &[SnapshotFile],
     ) -> CatalogResult<()> {
-        let manifest = snapshot_manifest_action(table_id, snapshot_id, files)?;
+        let manifest = snapshot_manifest_action(table_id, snapshot_id, files, false)?;
         self.inner
             .take()
             .await

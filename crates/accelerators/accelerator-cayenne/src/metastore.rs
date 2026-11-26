@@ -532,6 +532,9 @@ impl CayenneAccelerator {
                 .await
                 .boxed()
                 .context(AccelerationInitializationFailedSnafu)?;
+                let prefix = object_store::path::Path::parse(&prefix)
+                    .boxed()
+                    .context(AccelerationInitializationFailedSnafu)?;
                 let data_store = runtime_state_location::metrics::metered(
                     Arc::clone(&store),
                     runtime_state_location::StateFeature::CayenneData,
@@ -550,9 +553,7 @@ impl CayenneAccelerator {
                             store,
                             runtime_state_location::StateFeature::CayenneMetastore,
                         ),
-                        object_store::path::Path::from(prefix)
-                            .join("v1")
-                            .join("catalog"),
+                        prefix.join("v1").join("catalog"),
                         &format!("{}/cayenne/v1", location.location.trim_end_matches('/')),
                         config,
                     )
@@ -848,7 +849,9 @@ impl CayenneAccelerator {
             .await
             .boxed()
             .context(AccelerationInitializationFailedSnafu)?;
-            let head = object_store::path::Path::from(prefix)
+            let head = object_store::path::Path::parse(&prefix)
+                .boxed()
+                .context(AccelerationInitializationFailedSnafu)?
                 .join("v1")
                 .join("catalog")
                 .join("head");
@@ -904,11 +907,12 @@ pub(super) fn location_datasets_url(
     location: &url::Url,
     datasets_prefix: &object_store::path::Path,
 ) -> Option<String> {
-    match (location.scheme(), location.host_str()) {
-        ("s3", Some(bucket)) => Some(format!("s3://{bucket}/{datasets_prefix}")),
-        ("file", None | Some("" | "localhost")) => Some(format!("file:///{datasets_prefix}")),
-        _ => None,
-    }
+    let root = match (location.scheme(), location.host_str()) {
+        ("s3", Some(bucket)) => url::Url::parse(&format!("s3://{bucket}/")).ok()?,
+        ("file", None | Some("" | "localhost")) => url::Url::parse("file:///").ok()?,
+        _ => return None,
+    };
+    cayenne::dataset_storage::url_of_object_key(&root, datasets_prefix).map(Into::into)
 }
 
 /// What `source` needs that data in the object-native location does not support yet;

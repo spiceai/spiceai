@@ -509,6 +509,7 @@ impl MetadataCatalog for ObjectNativeCatalog {
         old_snapshot_ids: &[String],
         new_snapshot_id: &str,
         new_sequence_number: i64,
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<bool> {
         self.for_table(table_id)
             .swap_protected_snapshots(
@@ -516,6 +517,7 @@ impl MetadataCatalog for ObjectNativeCatalog {
                 old_snapshot_ids,
                 new_snapshot_id,
                 new_sequence_number,
+                files,
             )
             .await
     }

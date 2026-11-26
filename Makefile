@@ -176,14 +176,6 @@ endif
 # silently never built it — selection looked complete while three lanes never
 # ran. See `crates/cayenne/tests/correctness/README.md`.
 #
-# Scoped to `cayenne` deliberately. `runtime/sqlite` would also unlock runtime's
-# accelerator-parity binary, but the feature flows through the
-# whole `--all` build: every runtime test binary the gate builds relinks with
-# them, and those link at hundreds of megabytes each. That is a
-# large, permanent cost on every sign-off and merge-queue run to gain two
-# micro-shape comparisons — the thinnest of the five lanes. It belongs in the
-# integration workflow, which already builds with `adbc,sqlite`.
-#
 # The chDB lane is deliberately not here. `chdb-rust` needs libchdb, which its
 # build script fetches over the network, so folding it into the gate would make
 # every sign-off depend on that fetch and on a machine that can link it. CI runs
@@ -372,11 +364,11 @@ test-integration:
 	# Test if .env file exists, and login to Spice if not
 	@test -f .env || (`spice login`)
 	# The `adbc::` tests need the SQLite ADBC driver; run them with `dbc install sqlite` and `-E 'test(/^adbc::/)'`, as integration_adbc.yml does.
-	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc,sqlite --no-capture -E 'not test(/^adbc::/)'
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc --no-capture -E 'not test(/^adbc::/)'
 
 .PHONY: test-integration-without-spiceai-dataset
 test-integration-without-spiceai-dataset:
-	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc,sqlite --no-capture -E 'not test(spiceai_integration_test) and not test(/^adbc::/)'
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc --no-capture -E 'not test(spiceai_integration_test) and not test(/^adbc::/)'
 
 .PHONY: test-integration-models
 test-integration-models:
@@ -514,7 +506,6 @@ check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features
 	cargo check $(CARGO_PROFILE) --no-default-features --features adbc
 	cargo check $(CARGO_PROFILE) --no-default-features --features postgres
-	cargo check $(CARGO_PROFILE) --no-default-features --features sqlite
 	cargo check $(CARGO_PROFILE) --no-default-features --features mysql
 	cargo check $(CARGO_PROFILE) --no-default-features --features keyring-secret-store
 	cargo check $(CARGO_PROFILE) --no-default-features --features flightsql
@@ -587,7 +578,7 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # accelerator and acceleration snapshots, which `default` does not. Recompute the difference
 # before relying on it rather than trusting a comment, from this list and the
 # `default = [...]` array in bin/spiced/Cargo.toml.
-SPICED_DATA_FEATURES := adbc,postgres,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb
+SPICED_DATA_FEATURES := adbc,postgres,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb
 
 .PHONY: install
 install: build

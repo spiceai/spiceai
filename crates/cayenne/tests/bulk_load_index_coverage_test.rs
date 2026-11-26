@@ -36,7 +36,7 @@ use std::sync::Arc;
 const BATCH_ROWS: i64 = 100_000;
 const BATCHES: i64 = 24;
 
-test_with_backends!(bulk_load_with_repeats_is_indexed_when_it_returns_impl);
+test_on_data_store!(bulk_load_with_repeats_is_indexed_when_it_returns_impl);
 
 async fn bulk_load_with_repeats_is_indexed_when_it_returns_impl(
     fixture: common::TestFixture,
