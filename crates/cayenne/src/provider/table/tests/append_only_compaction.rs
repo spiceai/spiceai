@@ -1084,3 +1084,63 @@ async fn a_late_append_during_compaction_is_carried_without_a_copy() {
         "committed, the append raced the pass, copies, the late file named in the new snapshot {named:?}, the unpicked files named, rows now and after a reopen"
     );
 }
+
+/// A flush writes the inline rows of the generation it read, never an older
+/// generation another reader stored into the shared inline cache meanwhile. Readers
+/// populate that cache concurrently and the last store wins, so a scan that began
+/// before an append can store its view after the flush populated the cache for the
+/// append. The flush then clears every inline row; had it flushed the older view,
+/// the append's rows would be in no file and no longer inline: acknowledged and
+/// gone. A lab arm lost one 1,000-record export this way, or in a race of this shape
+/// (`runs/ar6_stream_r1_20261126T015121Z`, cayenne-bench-runs).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flush_writes_the_inline_rows_it_read_not_an_older_view_another_reader_stored() {
+    const NAME: &str = "inline_flush_stale_view";
+    let schema = id_value_schema();
+    let ctx = SessionContext::new();
+    let (provider, _temp_dir) = create_cayenne_table_with_config(
+        NAME,
+        Arc::clone(&schema),
+        // Inlining on (an append below the row cap lands inline), no background pass.
+        VortexConfig {
+            compaction_background_interval_ms: 3_600_000,
+            ..VortexConfig::default()
+        },
+        Vec::new(),
+        ctx.runtime_env(),
+    )
+    .await;
+
+    // A: inline, then read, so the shared cache holds A's generation.
+    insert_batch(&provider, id_value_rows(&schema, 0, 100)).await;
+    assert_eq!(provider.cached_inlined_row_count(), 100, "precondition: A is inlined");
+    let read_a = provider.read_inlined_batches().await.expect("read A");
+    assert_eq!(read_a.iter().map(RecordBatch::num_rows).sum::<usize>(), 100);
+    let view_of_a = provider.inlined_cache.load_full();
+
+    // B: inline, acknowledged, a newer generation.
+    insert_batch(&provider, id_value_rows(&schema, 100, 100)).await;
+    assert_eq!(provider.cached_inlined_row_count(), 200, "precondition: B is inlined");
+
+    // A reader that built its view before B stores it after the flush populated the
+    // cache for B, before the flush takes the rows to write.
+    let cache = Arc::clone(&provider.inlined_cache);
+    *provider.test_after_inline_populate_hook.lock() = Some(Box::new(move || {
+        Box::pin(async move {
+            cache.store(view_of_a);
+        })
+    }));
+    provider
+        .checkpoint_inlined_data()
+        .await
+        .expect("flush the inline rows to a file");
+    assert_eq!(provider.cached_inlined_row_count(), 0, "the flush emptied the inline tier");
+
+    let expected: Vec<i64> = (0..200).collect();
+    assert_eq!(scan_sorted_ids(&provider).await, expected, "every acknowledged row, scanned");
+    assert_eq!(
+        ids_after_reopen(&provider, NAME).await,
+        expected,
+        "every acknowledged row, after a restart"
+    );
+}
