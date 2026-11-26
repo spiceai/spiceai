@@ -255,6 +255,13 @@ class PinnedToolsTest(unittest.TestCase):
         self.assertIn('builder.config("spark.jars", args.jars).getOrCreate()', script)
         self.assertLess(script.index("if args.jars:"), script.index("configure_spark_with_delta_pip(builder)"))
 
+    def test_snapshot_pushes_use_a_git_config_of_their_own(self):
+        run = step("push-snap-changes", "Upload snapshots to branch")["run"]
+        setup = run.index("export GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM=1")
+        self.assertIn('GIT_CONFIG_GLOBAL="$(mktemp "${RUNNER_TEMP:?RUNNER_TEMP is not set}/gitconfig.XXXXXX")"', run)
+        self.assertLess(setup, run.index("git config --global"))
+        self.assertLess(setup, run.index("push origin"))
+
     def test_only_setup_sccache_makes_sccache_the_rustc_wrapper(self):
         for path in sorted((ROOT / ".github").rglob("*.y*ml")):
             if path.parent.name == "setup-sccache":
@@ -321,6 +328,13 @@ class PinnedToolsTest(unittest.TestCase):
                 (bin_dir,) = self.path_dirs()
                 self.assertTrue(bin_dir.is_relative_to(self.runner_temp), bin_dir)
                 self.assertIn(f"path={bin_dir / 'gh'}", (self.tmp / "github_output").read_text())
+                # gh runs with an empty config directory of the job's own, never ~/.config/gh.
+                config = Path(next(line.split("=", 1)[1] for line in (self.tmp / "github_env").read_text().splitlines()
+                                   if line.startswith("GH_CONFIG_DIR=")))
+                self.assertTrue(config.is_relative_to(self.runner_temp), config)
+                self.assertTrue(config.is_dir())
+                self.assertEqual(list(config.iterdir()), [])
+                (self.tmp / "github_env").write_text("")
                 self.assertEqual(self.calls(), ["pinned-gh --version"])
         self.assertNotIn("command -v gh", step("install-gh-cli", "Install the GitHub CLI")["run"])
         r = self.run_step("install-gh-cli", "Install the GitHub CLI", {"FAKE_UNAME_S": "Windows_NT"})

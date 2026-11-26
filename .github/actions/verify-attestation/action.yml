@@ -47,6 +47,7 @@ runs:
       shell: bash
       env:
         GH_BIN: ${{ steps.gh.outputs.path }}
+        GH_CONFIG_DIR: ${{ steps.gh.outputs.config-dir }}
         FILE: ${{ inputs.file }}
         IMAGE: ${{ inputs.image }}
         SIGNER_WORKFLOW: ${{ inputs.signer-workflow }}
@@ -72,7 +73,7 @@ runs:
           exit 1
         fi
         GH_BIN="${GH_BIN:-}"
-        if [ -z "$GH_BIN" ] || [ ! -x "$GH_BIN" ]; then
+        if [ -z "$GH_BIN" ] || [ ! -x "$GH_BIN" ] || [ -z "${GH_CONFIG_DIR:-}" ] || [ ! -d "$GH_CONFIG_DIR" ]; then
           echo "::error::The pinned GitHub CLI (gh) is not installed, so $FILE's attestation cannot be verified; not running it."
           exit 1
         fi

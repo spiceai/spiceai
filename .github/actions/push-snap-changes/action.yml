@@ -22,6 +22,11 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        # git's own config file for this step, never the shared ~/.gitconfig or the system
+        # one: on a self-hosted Mac any job can write those, and a `url.<x>.insteadOf` there
+        # would send this push, token and all, elsewhere.
+        GIT_CONFIG_GLOBAL="$(mktemp "${RUNNER_TEMP:?RUNNER_TEMP is not set}/gitconfig.XXXXXX")"
+        export GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM=1
 
         git add '*.snap'
         if git diff --cached --quiet; then

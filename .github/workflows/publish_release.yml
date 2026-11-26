@@ -194,6 +194,8 @@ jobs:
       - name: Open the pull request that records the release
         env:
           GH_TOKEN: ${{ github.token }}
+          # Never fall back to an interactive prompt; fail fast if the push is refused.
+          GIT_TERMINAL_PROMPT: '0'
         run: |
           set -euo pipefail
           python3 .github/scripts/record_release_digests.py --tag "$RELEASE_TAG" --sums "$RUNNER_TEMP/release/SHA256SUMS"
@@ -207,7 +209,8 @@ jobs:
           git switch -c "$branch"
           git add .github/release-digests.json
           git commit -q -m "ci: record $RELEASE_TAG's spiced digests"
-          git push -q "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/$branch"
+          git -c credential.helper='' -c credential.interactive=false \
+            push -q "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/$branch"
           gh pr create --repo "$GITHUB_REPOSITORY" --base trunk --head "$branch" \
             --title "ci: record $RELEASE_TAG's spiced digests" \
             --body "Records the spiced archive digests of $RELEASE_TAG from its attested SHA256SUMS in .github/release-digests.json, so trunk's upgrade scripts and benchmarks can run it. Opened by publish_release run $GITHUB_RUN_ID."

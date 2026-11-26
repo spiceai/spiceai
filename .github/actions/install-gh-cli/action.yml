@@ -10,6 +10,9 @@ outputs:
   path:
     description: The installed gh binary.
     value: ${{ steps.install.outputs.path }}
+  config-dir:
+    description: The empty config directory gh runs with (GH_CONFIG_DIR).
+    value: ${{ steps.install.outputs.config-dir }}
 
 runs:
   using: 'composite'
@@ -43,6 +46,12 @@ runs:
         fi
         install -m 0755 "${found[0]}" "$dir/bin/gh"
         rm -rf "$dir/archive" "$dir/src"
+        # A config directory of the job's own, empty: gh reads settings such as
+        # `http_unix_socket` from ~/.config/gh otherwise, which every job on a self-hosted
+        # Mac can write, and would send its token wherever that names.
+        mkdir -m 0700 "$dir/config"
         echo "$dir/bin" >> "$GITHUB_PATH"
+        echo "GH_CONFIG_DIR=$dir/config" >> "$GITHUB_ENV"
         echo "path=$dir/bin/gh" >> "$GITHUB_OUTPUT"
+        echo "config-dir=$dir/config" >> "$GITHUB_OUTPUT"
         "$dir/bin/gh" --version | head -1

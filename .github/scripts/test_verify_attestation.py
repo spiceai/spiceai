@@ -54,6 +54,7 @@ class VerifyAttestationTest(unittest.TestCase):
         env = {
             "PATH": os.environ["PATH"],
             "GH_BIN": str(self.bin / "gh"),
+            "GH_CONFIG_DIR": str(self.dir),
             "FILE": "" if image and file is None else str(file or self.file),
             "IMAGE": image,
             "SIGNER_WORKFLOW": signer,
@@ -129,9 +130,10 @@ class VerifyAttestationTest(unittest.TestCase):
     def test_a_runner_without_the_pinned_gh_fails_closed_and_says_why(self):
         empty = self.dir / "empty"
         empty.mkdir()
-        for gh_bin in ("", str(empty / "gh")):
-            with self.subTest(gh_bin=gh_bin):
-                env = {"PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}", "GH_BIN": gh_bin, "FILE": str(self.file),
+        for gh_bin, config in (("", str(self.dir)), (str(empty / "gh"), str(self.dir)), (str(self.bin / "gh"), "")):
+            with self.subTest(gh_bin=gh_bin, config=config):
+                env = {"PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}", "GH_BIN": gh_bin,
+                       "GH_CONFIG_DIR": config, "FILE": str(self.file),
                        "SIGNER_WORKFLOW": ".github/workflows/build_release.yml", "GITHUB_REPOSITORY": "spiceai/spiceai",
                        "GH_TOKEN": "a-token", "SOURCE_COMMIT": ""}
                 proc = subprocess.run(["/bin/bash", str(self.script)], env=env, capture_output=True, text=True, timeout=30)
