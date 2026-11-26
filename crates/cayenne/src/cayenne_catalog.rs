@@ -3817,7 +3817,35 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         snapshot_id: &str,
         sequence_number: i64,
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()> {
+        if let Some(files) = files {
+            let mut tx =
+                self.begin_transaction()
+                    .await
+                    .map_err(|e| CatalogError::InvalidOperation {
+                        message: "Failed to set snapshot sequence".to_string(),
+                        source: Box::new(e),
+                    })?;
+            self.replace_snapshot_files_in_txn(&mut *tx, table_id, snapshot_id, files)
+                .await?;
+            tx.execute(ExecuteParams {
+                sql: SNAPSHOT_SEQUENCE_UPSERT_SQL,
+                params: vec![
+                    MetastoreValue::Text(table_id.to_string()),
+                    MetastoreValue::Text(snapshot_id.to_string()),
+                    MetastoreValue::Integer(sequence_number),
+                ],
+            })
+            .await?;
+            return tx
+                .commit()
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to set snapshot sequence".to_string(),
+                    source: Box::new(e),
+                });
+        }
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: SNAPSHOT_SEQUENCE_UPSERT_SQL,
@@ -7567,11 +7595,11 @@ mod tests {
         );
 
         catalog
-            .set_snapshot_sequence(&table_id, &snapshot_id, 5)
+            .set_snapshot_sequence(&table_id, &snapshot_id, 5, None)
             .await
             .expect("first sequence upsert");
         catalog
-            .set_snapshot_sequence(&table_id, &snapshot_id, 9)
+            .set_snapshot_sequence(&table_id, &snapshot_id, 9, None)
             .await
             .expect("second sequence upsert");
         assert_eq!(
@@ -7581,6 +7609,50 @@ mod tests {
                 .expect("read sequence"),
             Some(9)
         );
+
+        // Named files commit with the sequence.
+        let file = SnapshotFile {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.clone(),
+            file_path: "b.vortex".to_string(),
+            row_count: 3,
+            file_size_bytes: 30,
+            min_sequence: 11,
+            max_sequence: 11,
+            digest: None,
+        };
+        catalog
+            .set_snapshot_sequence(
+                &table_id,
+                &snapshot_id,
+                11,
+                Some(std::slice::from_ref(&file)),
+            )
+            .await
+            .expect("sequence with files");
+        assert_eq!(
+            catalog
+                .get_snapshot_sequence(&table_id, &snapshot_id)
+                .await
+                .expect("read sequence"),
+            Some(11)
+        );
+        let named: Vec<(String, i64, i64, i64, i64)> = catalog
+            .get_snapshot_files(&table_id, &snapshot_id)
+            .await
+            .expect("read manifest")
+            .into_iter()
+            .map(|f| {
+                (
+                    f.file_path,
+                    f.row_count,
+                    f.file_size_bytes,
+                    f.min_sequence,
+                    f.max_sequence,
+                )
+            })
+            .collect();
+        assert_eq!(named, vec![("b.vortex".to_string(), 3, 30, 11, 11)]);
     }
 
     /// Both manifest rewrites write the whole manifest in one batch; every row
@@ -10248,15 +10320,15 @@ mod tests {
                 .expect("Failed to create table");
 
             catalog
-                .set_snapshot_sequence(&table_id, &snapshot_1, 10)
+                .set_snapshot_sequence(&table_id, &snapshot_1, 10, None)
                 .await
                 .expect("Failed to set snapshot seq");
             catalog
-                .set_snapshot_sequence(&table_id, &snapshot_2, 20)
+                .set_snapshot_sequence(&table_id, &snapshot_2, 20, None)
                 .await
                 .expect("Failed to set snapshot seq");
             catalog
-                .set_snapshot_sequence(&table_id, &snapshot_3, 30)
+                .set_snapshot_sequence(&table_id, &snapshot_3, 30, None)
                 .await
                 .expect("Failed to set snapshot seq");
 
@@ -10877,7 +10949,7 @@ mod tests {
         let protected_snapshot_id = uuid::Uuid::now_v7().to_string();
         let dead_snapshot_id = uuid::Uuid::now_v7().to_string();
         catalog
-            .set_snapshot_sequence(&table_id, &protected_snapshot_id, 7)
+            .set_snapshot_sequence(&table_id, &protected_snapshot_id, 7, None)
             .await
             .expect("register the protected snapshot");
 
@@ -11131,7 +11203,7 @@ mod tests {
         // `p_new` is placed on the roster by the swap itself, so it is not seeded here.
         for (snapshot_id, seq) in [(&input_a, 1), (&input_b, 2), (&survivor, 3)] {
             catalog
-                .set_snapshot_sequence(&table_id, snapshot_id, seq)
+                .set_snapshot_sequence(&table_id, snapshot_id, seq, None)
                 .await
                 .expect("seed roster row");
         }
@@ -11433,7 +11505,7 @@ mod tests {
             .await
             .expect("seed stats-cache row");
         catalog
-            .set_snapshot_sequence(&table_id, &input_a, 1)
+            .set_snapshot_sequence(&table_id, &input_a, 1, None)
             .await
             .expect("seed roster row");
 
@@ -11783,7 +11855,7 @@ mod tests {
         for (idx, id) in folded.iter().chain(std::iter::once(&late)).enumerate() {
             let seq = i64::try_from(idx).expect("test index fits in i64") + 1;
             catalog
-                .set_snapshot_sequence(&table_id, id, seq)
+                .set_snapshot_sequence(&table_id, id, seq, None)
                 .await
                 .expect("Failed to register protected snapshot");
         }
@@ -13818,7 +13890,7 @@ mod tests {
         let table = catalog.get_table("protected").await.expect("get table");
         let protected_id = "protected-snapshot";
         catalog
-            .set_snapshot_sequence(&table.table_id, protected_id, 7)
+            .set_snapshot_sequence(&table.table_id, protected_id, 7, None)
             .await
             .expect("register the protected snapshot");
         catalog
