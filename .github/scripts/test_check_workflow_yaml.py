@@ -605,12 +605,33 @@ class CheckCiRoleJobsTest(unittest.TestCase):
             problems = self.problems(steps + verify)
             self.assertEqual(len(problems), 1, problems)
             self.assertIn("on no `env` value", problems[0])
-        with self.subTest(case="verify gated on the role and an input"):
+        with self.subTest(case="verify gated on the role and an input its download also needs"):
+            download = (
+                "      - name: Download\n        if: inputs.x == 'true'\n"
+                "        run: bash .github/scripts/mc_cp.sh \"spice-minio/build/${CI_STORE_PREFIX?}x\" ./x\n"
+            )
             verify = (
                 "      - name: Verify\n        if: steps.ci-role.outputs.full == 'true' && inputs.x == 'true'\n"
                 f"        uses: {check_workflow_yaml.VERIFY_ACTION}\n"
             )
-            self.assertEqual(self.problems(steps + verify), [])
+            self.assertEqual(self.problems(steps + download + verify), [])
+        with self.subTest(case="verify skipped by a condition its download does not have"):
+            download = (
+                "      - name: Download\n"
+                "        run: bash .github/scripts/mc_cp.sh \"spice-minio/build/${CI_STORE_PREFIX?}x\" ./x\n"
+            )
+            for extra in ("inputs.x == 'true'", "inputs.skip != 'true'", "always()"):
+                verify = (
+                    f"      - name: Verify\n        if: steps.ci-role.outputs.full == 'true' && {extra}\n"
+                    f"        uses: {check_workflow_yaml.VERIFY_ACTION}\n"
+                )
+                self.assertEqual(len(self.problems(steps + download + verify)), 1, extra)
+        with self.subTest(case="verify that a top-level || can skip"):
+            verify = (
+                "      - name: Verify\n        if: steps.ci-role.outputs.full == 'true' || inputs.x == 'true'\n"
+                f"        uses: {check_workflow_yaml.VERIFY_ACTION}\n"
+            )
+            self.assertEqual(len(self.problems(steps + verify)), 1)
         with self.subTest(case="verify gated on a trunk run and a step output"):
             verify = (
                 "      - name: Verify\n        if: github.ref == 'refs/heads/trunk' && steps.x.outputs.image != ''\n"
@@ -735,8 +756,12 @@ class CheckShareOffTrunkTest(unittest.TestCase):
         "      - run: cargo build\n"
     )
 
-    def problems(self, cond):
+    ROLE = "      - uses: $/.github/actions/ci-role\n        id: ci-role\n{images}"
+
+    def problems(self, cond, role=None):
         text = self.DOC.replace("{cond}", cond)
+        if role is not None:
+            text = text.replace("    steps:\n", "    steps:\n" + self.ROLE.replace("{images}", role), 1)
         return [p for p in check_workflow_yaml.check_workflow(text) if "macOS share" in p]
 
     def test_the_share_is_kept_off_trunk(self):
@@ -744,9 +769,25 @@ class CheckShareOffTrunkTest(unittest.TestCase):
             with self.subTest(cond=cond):
                 self.assertEqual(len(self.problems(cond)), 1)
         for cond in ("        if: env.HAS_SPICEIO_SECRET == 'true' && github.ref != 'refs/heads/trunk'\n",
-                     "        if: steps.ci-role.outputs.full != 'true'\n"):
+                     "        if: ${{ github.ref != 'refs/heads/trunk' && (runner.os == 'macOS' || false) }}\n"):
             with self.subTest(cond=cond):
                 self.assertEqual(self.problems(cond), [])
+
+    def test_the_guard_must_hold_whatever_else_the_condition_says(self):
+        quoted = "steps.x.outputs.y == 'github.ref != ''refs/heads/trunk'''"
+        for cond in ("        if: always() || github.ref != 'refs/heads/trunk'\n",
+                     "        if: github.ref != 'refs/heads/trunk' || true\n",
+                     "        if: (github.ref != 'refs/heads/trunk' || always())\n",
+                     "        if: github.ref != 'refs/heads/trunk-x'\n",
+                     f'        if: "{quoted}"\n'):
+            with self.subTest(cond=cond):
+                self.assertEqual(len(self.problems(cond)), 1)
+
+    def test_a_role_choice_keeps_it_off_trunk_only_when_it_chooses_for_builds(self):
+        cond = "        if: steps.ci-role.outputs.full != 'true'\n"
+        self.assertEqual(len(self.problems(cond)), 1)
+        self.assertEqual(self.problems(cond, role="        with:\n          builds: x\n"), [])
+        self.assertEqual(len(self.problems(cond, role="        with:\n          images: x\n")), 1)
 
 
 class CheckAppStoreCredentialsTest(unittest.TestCase):

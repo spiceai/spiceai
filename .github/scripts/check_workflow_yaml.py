@@ -354,9 +354,11 @@ def check_ci_role_jobs(document: dict) -> list[str]:
                 "(`steps.ci-role.outputs.full == 'true' && secrets.<ROLE> || secrets.CI_AWS_PULL_REQUEST_ROLE_ARN`) "
                 "or as a test that it is set (`secrets.<ROLE> != ''`)"
             )
+        downloaded_if: list[str] = []
         for position, step in enumerate(steps, start=1):
             label = step.get("name") or f"step {position}"
             if STORE_DOWNLOAD.search(str(step.get("run", ""))):
+                downloaded_if = _conjuncts(step.get("if", "")) or []
                 rest = steps[position:]
                 while rest and (
                     "actions/download-artifact" in str(rest[0].get("uses", ""))
@@ -377,10 +379,15 @@ def check_ci_role_jobs(document: dict) -> list[str]:
                     "so with the full roles it would run a spiced nobody checked"
                 )
             condition = str(step.get("if", "")).strip()
+            conjuncts = _conjuncts(condition)
             if step.get("uses") == VERIFY_ACTION and step.get("if") is not None and (
-                not re.match(
-                    r"(?:\$\{\{\s*)?(?:steps\.ci-role\.outputs\.full\s*==\s*'true'|github\.ref\s*==\s*'refs/heads/trunk')\s*(?:&&|\}\}|$)",
-                    condition,
+                conjuncts is None
+                or conjuncts[0] not in ("steps.ci-role.outputs.full == 'true'", "github.ref == 'refs/heads/trunk'")
+                # Past the gate, only a test that a step produced something to verify, or a condition
+                # the download it verifies also runs only under.
+                or not all(
+                    re.fullmatch(r"steps\.[\w-]+\.outputs\.[\w-]+ != ''", c) or c in downloaded_if
+                    for c in conjuncts[1:]
                 )
                 or re.search(r"(?<![\w.-])env\s*[.\[]", condition)
             ):
@@ -416,6 +423,48 @@ SHARED_BUILD_CACHES = ("$/.github/actions/setup-sccache", "spiceai/spiceio/.gith
 OFF_TRUNK = re.compile(r"github\.ref\s*!=\s*'refs/heads/trunk'")
 
 
+def _split_top_level(condition: str, operator: str) -> list[str]:
+    """`condition`'s operands of `operator` (`&&` or `||`) outside parentheses and string literals."""
+    parts, depth, start, i, in_string = [], 0, 0, 0, False
+    while i < len(condition):
+        c = condition[i]
+        if in_string:
+            if c == "'" and condition[i + 1 : i + 2] == "'":
+                i += 2
+                continue
+            in_string = c != "'"
+        elif c == "'":
+            in_string = True
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif depth == 0 and condition.startswith(operator, i):
+            parts.append(condition[start:i].strip())
+            i += len(operator)
+            start = i
+            continue
+        i += 1
+    parts.append(condition[start:].strip())
+    return parts
+
+
+def _conjuncts(condition: object) -> list[str] | None:
+    """The top-level `&&` operands of an `if:`, or None when a top-level `||` could make it true alone."""
+    text = str(condition or "").strip()
+    match = re.fullmatch(r"\$\{\{(.*)\}\}", text, re.S)
+    text = (match.group(1) if match else text).strip()
+    if len(_split_top_level(text, "||")) > 1:
+        return None
+    return [re.sub(r"\s+", " ", part) for part in _split_top_level(text, "&&")]
+
+
+def _requires(condition: object, required: str) -> bool:
+    """Whether `condition` holds only when `required` (one comparison) does: it is a top-level conjunct."""
+    conjuncts = _conjuncts(condition)
+    return conjuncts is not None and re.sub(r"\s+", " ", required) in conjuncts
+
+
 def _steps(job: object) -> list[dict]:
     return [s for s in (job.get("steps") or []) if isinstance(s, dict)] if isinstance(job, dict) else []
 
@@ -426,15 +475,29 @@ SPICEIO_SETUP = "spiceai/spiceio/.github/actions/setup"
 NOT_FULL_ROLE = re.compile(r"steps\.ci-role\.outputs\.full\s*!=\s*'true'")
 
 
+def _chooses_a_role_for_builds_only(job: object) -> bool:
+    """Whether the job's first step is ci-role without `images`, so `full != 'true'` holds off trunk only."""
+    steps = _steps(job)
+    return bool(steps) and steps[0].get("uses") == "$/.github/actions/ci-role" and not (
+        (steps[0].get("with") or {}).get("images")
+    )
+
+
 def check_share_off_trunk(jobs: dict) -> list[str]:
-    """Report a step that sets up the macOS share without keeping it off trunk."""
+    """Report a step that sets up the macOS share without keeping it off trunk.
+
+    The guard must be a top-level `&&` operand of the step's `if:`, with no top-level `||`, so
+    nothing else in the condition can make it true on trunk.
+    """
     problems = []
     for name, job in jobs.items():
         for position, step in enumerate(_steps(job), start=1):
             if not str(step.get("uses", "")).startswith(SPICEIO_SETUP):
                 continue
-            condition = str(step.get("if", ""))
-            if OFF_TRUNK.search(condition) or NOT_FULL_ROLE.search(condition):
+            condition = step.get("if", "")
+            if _requires(condition, "github.ref != 'refs/heads/trunk'") or (
+                _requires(condition, "steps.ci-role.outputs.full != 'true'") and _chooses_a_role_for_builds_only(job)
+            ):
                 continue
             label = step.get("name") or f"step {position}"
             problems.append(
@@ -536,7 +599,7 @@ def check_attested_builds(jobs: dict) -> list[str]:
     for name, why in attested.items():
         for position, step in enumerate(_steps(jobs.get(name)), start=1):
             uses = str(step.get("uses", ""))
-            if uses.startswith(SHARED_BUILD_CACHES) and not OFF_TRUNK.search(str(step.get("if", ""))):
+            if uses.startswith(SHARED_BUILD_CACHES) and not _requires(step.get("if", ""), "github.ref != 'refs/heads/trunk'"):
                 label = step.get("name") or f"step {position}"
                 problems.append(
                     f"{why}, but step `{label}` of `{name}` sets up a shared build cache without "
