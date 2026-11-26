@@ -208,6 +208,54 @@ impl std::fmt::Debug for RowNotShown {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+impl Error {
+    /// A stable, payload-free name for this decode failure.
+    ///
+    /// Log this, never [`Display`], when a change event is skipped: several
+    /// variants embed the row or a field value in their message.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::MissingParametersForDecimal => "missing_parameters_for_decimal",
+            Self::MissingPrecisionForDecimal => "missing_precision_for_decimal",
+            Self::UnableToParsePrecision { .. } => "unable_to_parse_precision",
+            Self::UnableToParseScale { .. } => "unable_to_parse_scale",
+            Self::MissingScaleForDecimal => "missing_scale_for_decimal",
+            Self::MissingItemsForArray => "missing_items_for_array",
+            Self::MissingFieldName => "missing_field_name",
+            Self::MissingFieldInValue { .. } => "missing_required_field",
+            Self::MissingStructBuilder { .. } => "missing_struct_builder",
+            Self::DowncastBuilder => "downcast_builder",
+            Self::InvalidChangeEventSchema { .. } => "invalid_change_event_schema",
+            Self::UnableToDecodeBase64 { .. } => "unable_to_decode_base64",
+            Self::Decimal128BytesNot16Bytes { .. } => "decimal128_bytes_not_16_bytes",
+            Self::UnableToConvertToI64 => "unable_to_convert_to_i64",
+            Self::UnableToConvertToF64 => "unable_to_convert_to_f64",
+            Self::TimestampOutOfRange { .. } => "timestamp_out_of_range",
+            Self::InvalidTimestampValue { .. } => "invalid_timestamp_value",
+            Self::NotATimestamp { .. } => "not_a_timestamp",
+            Self::UnknownTimestampUnit { .. } => "unknown_timestamp_unit",
+            Self::DataTypeNotSupported { .. } => "data_type_not_supported",
+            Self::ListDataTypeNotSupported { .. } => "list_data_type_not_supported",
+            Self::DebeziumFieldNotSupported { .. } => "debezium_field_not_supported",
+            Self::UnableToParseTimestamp { .. } => "unable_to_parse_timestamp",
+            Self::DeleteOpWithoutBeforeField => "delete_op_without_before_field",
+            Self::UpdateOpWithoutBeforeField => "update_op_without_before_field",
+            Self::InvalidDecimalJson { .. } => "invalid_decimal_json",
+            Self::VariableScaleDecimalParsingOverflow => "variable_scale_decimal_parsing_overflow",
+            Self::MissingScaleForVariableScaleDecimal => "missing_scale_for_variable_scale_decimal",
+            Self::MissingValueForVariableScaleDecimal => "missing_value_for_variable_scale_decimal",
+            Self::UnsupportedTypeForVariableScaleDecimal { .. } => {
+                "unsupported_type_for_variable_scale_decimal"
+            }
+            Self::NonIntegerScaleForVariableScaleDecimal => {
+                "non_integer_scale_for_variable_scale_decimal"
+            }
+            Self::DecimalPrecisionExceeded { .. } => "decimal_precision_exceeded",
+        }
+    }
+}
+
 pub fn convert_fields_to_arrow_schema(fields: Vec<&ChangeEventField>) -> Result<Schema> {
     let arrow_fields = fields
         .into_iter()
@@ -1279,6 +1327,12 @@ mod tests {
         assert!(
             matches!(&err, Error::MissingFieldInValue { field_name, .. } if field_name == "status"),
             "the missing non-nullable `status` column must be named, got: {err:?}"
+        );
+        assert_eq!(err.kind(), "missing_required_field");
+        assert!(
+            !err.kind().contains("42"),
+            "kind must not carry the row or field values, got: {}",
+            err.kind()
         );
     }
 

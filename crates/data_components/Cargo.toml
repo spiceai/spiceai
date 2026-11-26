@@ -91,6 +91,8 @@ rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex.workspace = true
 reqwest.workspace = true
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
+runtime-metrics = { path = "../runtime-metrics" }
+runtime-status = { path = "../runtime-status" }
 runtime-object-store = { path = "../runtime-object-store" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-udfs-api = { path = "../runtime-udfs-api" }
