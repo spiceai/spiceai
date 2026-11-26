@@ -60,6 +60,7 @@ mod cte_materialization_query_test;
 mod data_file_lifecycle_test;
 mod data_inlining_test;
 mod datafusion_dynamic_filter_backports_test;
+mod datalake_merge_protected_snapshot_test;
 mod deletion_mode_harness;
 mod deletion_strategy_detection_test;
 mod deletion_strategy_test;

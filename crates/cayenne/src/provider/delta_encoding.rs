@@ -192,6 +192,9 @@ pub(crate) struct WritePolicy {
     pub(crate) fan_out: crate::provider::table::EncodeFanOut,
     pub(crate) encode_budget: EncodeBudgetUse,
     pub(crate) routing: ShardRouting,
+    /// Encode shards this write may run at most, whatever the table's write
+    /// concurrency asks for. `None` leaves the fan-out to the table.
+    pub(crate) max_shards: Option<usize>,
 }
 
 /// How a sharded write assigns its input to the shard encoders.
@@ -213,6 +216,7 @@ impl WritePolicy {
         fan_out: crate::provider::table::EncodeFanOut::Sized,
         encode_budget: EncodeBudgetUse::Shared,
         routing: ShardRouting::Key,
+        max_shards: None,
     };
 
     /// A load into an empty table, routed in whole batches. It writes the
@@ -232,6 +236,7 @@ impl WritePolicy {
         fan_out: crate::provider::table::EncodeFanOut::Sized,
         encode_budget: EncodeBudgetUse::Shared,
         routing: ShardRouting::Key,
+        max_shards: None,
     };
 
     /// A maintenance rewrite that must emit ONE sequence of files, whatever the
@@ -241,6 +246,7 @@ impl WritePolicy {
         fan_out: crate::provider::table::EncodeFanOut::Serial,
         encode_budget: EncodeBudgetUse::Shared,
         routing: ShardRouting::Key,
+        max_shards: None,
     };
 
     /// This policy, with an encode that takes no permit from the global budget.
