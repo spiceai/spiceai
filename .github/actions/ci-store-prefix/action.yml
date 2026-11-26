@@ -1,12 +1,21 @@
 name: CI store prefix
 description: >-
-  The segment this run nests its CI object store keys under, right after the granted prefix:
-  `artifacts/<segment>`. Only a run on trunk uses the shared keys (an empty segment). Any other
-  run, this release branch's included, uses `untrusted/<repository id>/<github.ref>/`, the only
-  keys the store lets it write; the repository id keeps two repositories' refs apart. Sets
-  CI_STORE_PREFIX for the rest of the job and outputs it. build_and_release.yml takes the segment
-  from here for every spiced and spice upload, and setup-spiced reads a build where the ref that
-  built it stored it.
+  The segment this run nests its keys under in the CI object store, right after each granted
+  prefix: `sccache/<segment>`, `artifacts/<segment>`, `build/test_binaries/<segment>`, and
+  `benchmarks/{cold_start,cayenne-cold-sf10,cayenne-cold-sf1000}/<segment>`. Only a run on trunk
+  uses the shared keys (an empty segment). Any other run, this release branch's included, uses
+  `untrusted/<repository id>/<github.ref>/`, the only keys the store lets it write, and reads its
+  own writes there; the repository id keeps two repositories' refs apart. Sets CI_STORE_PREFIX
+  for the rest of the job and outputs it. Every writer takes the segment from here, and so does
+  every reader of the run's own writes; setup-spiced reads a build where the ref that built it
+  stored it. Given `spicepod`, it also rewrites that file's `s3://benchmarks/<fixed prefix>/`
+  locations to the run's own, so spiced reads and writes where this run may.
+
+inputs:
+  spicepod:
+    description: A spicepod file whose fixed `s3://benchmarks/...` locations to rewrite in place.
+    required: false
+    default: ''
 
 outputs:
   prefix:
@@ -19,11 +28,19 @@ runs:
     - name: Choose the CI store prefix
       id: prefix
       shell: bash
+      env:
+        SPICEPOD: ${{ inputs.spicepod }}
       run: |
         set -euo pipefail
         case "$GITHUB_REF" in
           refs/heads/trunk) prefix='' ;;
           refs/*)
+            # The ref becomes part of keys, TOML strings and s3:// URLs, where `#`, `"` or `&` would
+            # cut it short or change it, so only a plain ref is used.
+            if ! [[ "$GITHUB_REF" =~ ^refs/[A-Za-z0-9._/-]+$ ]] || [[ "$GITHUB_REF" == *..* || "$GITHUB_REF" == *//* || "$GITHUB_REF" == */ ]]; then
+              echo "::error::GITHUB_REF '$GITHUB_REF' is not a plain ref (letters, digits, '.', '_', '-' and '/'); the CI store keys a run by its ref."
+              exit 1
+            fi
             if ! [[ "${GITHUB_REPOSITORY_ID:-}" =~ ^[0-9]+$ ]]; then
               echo "::error::GITHUB_REPOSITORY_ID is '${GITHUB_REPOSITORY_ID:-}', not a repository id; cannot choose the CI store prefix."
               exit 1
@@ -38,3 +55,17 @@ runs:
         echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
         echo "CI_STORE_PREFIX=$prefix" >> "$GITHUB_ENV"
         echo "CI store prefix: '${prefix}'"
+        if [ -n "$SPICEPOD" ] && [ -n "$prefix" ]; then
+          # A literal replacement, not sed: a ref may hold `&`, `#` or `\`. bash 5.2 reads `&` in
+          # a replacement as the match unless patsub_replacement is off; bash 3.2 has no such option.
+          shopt -u patsub_replacement 2>/dev/null || true
+          content="$(cat "$SPICEPOD"; printf x)"
+          content="${content%x}"
+          for fixed in cold_start cayenne-cold-sf10 cayenne-cold-sf1000; do
+            from="s3://benchmarks/${fixed}/"
+            to="s3://benchmarks/${fixed}/${prefix}"
+            content="${content//"$from"/$to}"
+          done
+          printf '%s' "$content" > "$SPICEPOD"
+          grep -n 's3://benchmarks/' "$SPICEPOD" || true
+        fi

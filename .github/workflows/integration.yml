@@ -333,6 +333,10 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
+      # This run's test archive is under its CI store prefix (.github/actions/ci-store-prefix).
+      - name: Choose the CI store prefix
+        uses: ./.github/actions/ci-store-prefix
+
       - name: Upload test archives to local MinIO
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         env:
@@ -340,7 +344,7 @@ jobs:
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to upload integration test archives}"
-          mc cp ./integration_tests.tar.zst "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}"
+          mc cp ./integration_tests.tar.zst "spice-minio/build/test_binaries/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/test_binaries/}"
 
       - name: Upload test archive (artifact fallback)
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS != 'true'
@@ -424,6 +428,10 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
+      # This run's test archive is under its CI store prefix (.github/actions/ci-store-prefix).
+      - name: Choose the CI store prefix
+        uses: ./.github/actions/ci-store-prefix
+
       - name: Download test archive from local MinIO
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         env:
@@ -432,7 +440,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download integration test archive}"
           mkdir -p ./integration_tests
-          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          mc cp "spice-minio/build/test_binaries/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/test_binaries/}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download test archive
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS != 'true'
@@ -688,6 +696,10 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
+      # This run's test archive is under its CI store prefix (.github/actions/ci-store-prefix).
+      - name: Choose the CI store prefix
+        uses: ./.github/actions/ci-store-prefix
+
       - name: Download test archive from local MinIO
         if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
@@ -696,7 +708,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download integration test archive}"
           mkdir -p ./integration_tests
-          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          mc cp "spice-minio/build/test_binaries/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/test_binaries/}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -1065,6 +1077,10 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
+      # This run's test archive is under its CI store prefix (.github/actions/ci-store-prefix).
+      - name: Choose the CI store prefix
+        uses: ./.github/actions/ci-store-prefix
+
       - name: Download GitHub test archive from local MinIO
         if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
@@ -1073,7 +1089,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download GitHub test archive}"
           mkdir -p ./integration_tests
-          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          mc cp "spice-minio/build/test_binaries/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/test_binaries/}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download GitHub test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -1183,6 +1199,10 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
+      # This run's test archive is under its CI store prefix (.github/actions/ci-store-prefix).
+      - name: Choose the CI store prefix
+        uses: ./.github/actions/ci-store-prefix
+
       - name: Download test archive from local MinIO
         if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
@@ -1191,7 +1211,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download the test archive}"
           mkdir -p ./integration_tests
-          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          mc cp "spice-minio/build/test_binaries/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/test_binaries/}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -1323,6 +1343,10 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
+      # This run's test archive is under its CI store prefix (.github/actions/ci-store-prefix).
+      - name: Choose the CI store prefix
+        uses: ./.github/actions/ci-store-prefix
+
       - name: Download AWS SDK test archive from local MinIO
         if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
@@ -1331,7 +1355,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download AWS SDK test archive}"
           mkdir -p ./integration_tests
-          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          mc cp "spice-minio/build/test_binaries/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/test_binaries/}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download AWS SDK test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -1410,6 +1434,10 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
+      # This run's test archive is under its CI store prefix (.github/actions/ci-store-prefix).
+      - name: Choose the CI store prefix
+        uses: ./.github/actions/ci-store-prefix
+
       - name: Download AWS SDK credential bridge test archive from local MinIO
         if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
@@ -1418,7 +1446,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download AWS SDK credential bridge test archive}"
           mkdir -p ./integration_tests
-          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          mc cp "spice-minio/build/test_binaries/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/test_binaries/}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download AWS SDK credential bridge test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -1487,6 +1515,10 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
+      # This run's test archive is under its CI store prefix (.github/actions/ci-store-prefix).
+      - name: Choose the CI store prefix
+        uses: ./.github/actions/ci-store-prefix
+
       - name: Download snapshot refresh test archive from local MinIO
         if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
@@ -1495,7 +1527,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download snapshot refresh test archive}"
           mkdir -p ./integration_tests
-          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          mc cp "spice-minio/build/test_binaries/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/test_binaries/}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download snapshot refresh test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -1566,6 +1598,10 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
+      # This run's test archive is under its CI store prefix (.github/actions/ci-store-prefix).
+      - name: Choose the CI store prefix
+        uses: ./.github/actions/ci-store-prefix
+
       - name: Download data components test archive from local MinIO
         if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
@@ -1574,7 +1610,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download data components test archive}"
           mkdir -p ./integration_tests
-          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          mc cp "spice-minio/build/test_binaries/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/test_binaries/}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download data components test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -1635,6 +1671,10 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
+      # This run's test archive is under its CI store prefix (.github/actions/ci-store-prefix).
+      - name: Choose the CI store prefix
+        uses: ./.github/actions/ci-store-prefix
+
       - name: Download partition table test archive from local MinIO
         if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
@@ -1643,7 +1683,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download partition table test archive}"
           mkdir -p ./integration_tests
-          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          mc cp "spice-minio/build/test_binaries/${CI_STORE_PREFIX?}${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://build/test_binaries/}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download partition table test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'

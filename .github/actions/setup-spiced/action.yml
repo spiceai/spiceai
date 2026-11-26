@@ -6,6 +6,8 @@ description: 'composite action'
 # shared keys, another ref's, this release branch's included, under
 # `artifacts/untrusted/<repository id>/<ref>/`. So the place to read is the build's ref, never the
 # reader's: trunk's builds, and a `spiced_commit` on trunk, are read at trunk's keys from any ref.
+# Another ref's build runs only in a run of that same ref, whose store credentials write only that
+# ref's keys.
 #
 # Requires the MinIO CLI to be installed and configured to use this action
 inputs:
@@ -13,7 +15,7 @@ inputs:
     description: 'spiced build commit'
     required: false
   ref: # optionally override the branch to fetch latest 10 commits from
-    description: 'target ref'
+    description: 'target ref: trunk, or the ref this run is on'
     required: false
     default: 'refs/heads/trunk'
   with_odbc: # whether to download the ODBC-enabled binary
@@ -60,7 +62,9 @@ runs:
 
     # Which ref built the spiced to read, and so where it is stored: trunk for the latest build of
     # trunk and for a `spiced_commit` on trunk; otherwise `ref`, or this run's own ref when `ref`
-    # is trunk. Outputs `ref` and `prefix` (empty for trunk).
+    # is trunk. That ref must be trunk or this run's own: a ref's build runs only in a run of that
+    # ref, whose credentials write only that ref's keys. Outputs `ref` and `prefix` (empty for
+    # trunk).
     - name: Locate spiced's build
       id: locate
       shell: bash
@@ -68,6 +72,9 @@ runs:
         REF: ${{ inputs.ref }}
         INPUT_SPICED_COMMIT: ${{ inputs.spiced_commit }}
         GH_TOKEN: ${{ inputs.token }}
+        # From the event itself, not the environment an earlier step can add to.
+        RUN_EVENT: ${{ github.event_name }}
+        PULL_REQUEST_BASE: ${{ github.event_name == 'pull_request' && github.base_ref || '' }}
       run: |
         set -euo pipefail
         # Trunk's commit history (no trees or blobs), fetched into a scratch repository and never
@@ -121,11 +128,26 @@ runs:
           source_ref=refs/heads/trunk
         elif [ "$REF" != refs/heads/trunk ]; then
           source_ref="$REF"
-        else
+        elif [ "$GITHUB_REF" != refs/heads/trunk ]; then
           source_ref="$GITHUB_REF"
+        else
+          # Trunk's keys hold no build of a commit trunk lacks.
+          echo "::error::This run, on refs/heads/trunk, runs only a spiced that trunk or this run's own ref built, and $INPUT_SPICED_COMMIT is not on trunk. Run the workflow on the ref that built it."
+          exit 1
         fi
         if ! plain_ref "$source_ref"; then
           echo "::error::setup-spiced: '$source_ref' is not a plain ref."
+          exit 1
+        fi
+        # A pull request's run may also read its base branch's builds, as a pull request into trunk
+        # reads trunk's: the run is unprivileged (its credentials write only its own prefix, and its
+        # CI role is the read-only one), and the build is one the base branch's own runs made.
+        pull_request_base() {
+          [ "${RUN_EVENT:-}" = pull_request ] && [ -n "${PULL_REQUEST_BASE:-}" ] &&
+            [ "$1" = "refs/heads/${PULL_REQUEST_BASE}" ]
+        }
+        if [ "$source_ref" != refs/heads/trunk ] && [ "$source_ref" != "$GITHUB_REF" ] && ! pull_request_base "$source_ref"; then
+          echo "::error::This run, on $GITHUB_REF, runs only a spiced that trunk or this run's own ref built (or, for a pull request, its base branch), and $source_ref built this one. Run the workflow on that ref instead: its build runs only with that ref's own credentials."
           exit 1
         fi
         case "$source_ref" in
@@ -174,7 +196,7 @@ runs:
           fi
         done
 
-        echo "Could not find any recently built spiced commit in MinIO for $PLATFORM"
+        echo "::error::No spiced build of $REF's last 10 commits is stored for $PLATFORM, under artifacts/${SOURCE_PREFIX}spiced/. A run reads only builds of trunk, its own ref, or a pull request's base branch: run build_and_release.yml on $REF first, or run this workflow on a ref that has a build."
         exit 1
 
     - name: Find the latest built spiced commit (Windows)
@@ -211,7 +233,7 @@ runs:
           }
         }
 
-        Write-Host "Could not find any recently built spiced commit in MinIO for $platform"
+        Write-Host "::error::No spiced build of $($env:REF)'s last 10 commits is stored for $platform, under artifacts/$($env:SOURCE_PREFIX)spiced/. A run reads only builds of trunk, its own ref, or a pull request's base branch: run build_and_release.yml on $($env:REF) first, or run this workflow on a ref that has a build."
         exit 1
 
     - name: Set SPICED_COMMIT from workflow input (Linux/macOS)

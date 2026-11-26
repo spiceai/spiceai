@@ -26,9 +26,15 @@ inputs:
       step sets.
     required: false
 
+# Only a run on trunk reads and writes the cache's shared keys. Any other run, this release
+# branch's included, keeps its cache under `sccache/untrusted/<repository id>/<ref>/`
+# (.github/actions/ci-store-prefix), the only keys the CI object store lets it write.
 runs:
   using: 'composite'
   steps:
+    - name: Choose the CI store prefix
+      uses: ./.github/actions/ci-store-prefix
+
     - name: Set sccache environment variables
       if: inputs.minio_endpoint != '' || (runner.os == 'macOS' && inputs.spiceio_endpoint != '')
       shell: bash
@@ -126,7 +132,7 @@ runs:
         echo "SCCACHE_CACHE_SIZE=4T" >> $GITHUB_ENV
         : "${SCCACHE_CONF:=${RUNNER_TEMP}/sccache/config}"
         mkdir -p "$(dirname "${SCCACHE_CONF}")"
-        printf '[cache.s3]\nbucket = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = false\nregion = "us-east-1"\n' "${{ inputs.minio_endpoint }}" > "${SCCACHE_CONF}"
+        printf '[cache.s3]\nbucket = "sccache"\nkey_prefix = "%s"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = false\nregion = "us-east-1"\n' "${CI_STORE_PREFIX%/}" "${{ inputs.minio_endpoint }}" > "${SCCACHE_CONF}"
 
     - name: Set up sccache (macOS)
       if: runner.os == 'macOS' && (inputs.minio_endpoint != '' || inputs.spiceio_endpoint != '')
@@ -160,7 +166,7 @@ runs:
 
         : "${SCCACHE_CONF:=${RUNNER_TEMP}/sccache/config}"
         mkdir -p "$(dirname "${SCCACHE_CONF}")"
-        printf '[cache.s3]\nbucket = "sccache"\nkey_prefix = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = %s\nregion = "%s"\n' "$SCCACHE_ENDPOINT" "$SCCACHE_NO_CREDS" "$SCCACHE_REGION" > "${SCCACHE_CONF}"
+        printf '[cache.s3]\nbucket = "sccache"\nkey_prefix = "%ssccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = %s\nregion = "%s"\n' "${CI_STORE_PREFIX}" "$SCCACHE_ENDPOINT" "$SCCACHE_NO_CREDS" "$SCCACHE_REGION" > "${SCCACHE_CONF}"
 
     - name: Set up sccache (Windows)
       if: runner.os == 'Windows' && inputs.minio_endpoint != ''
@@ -192,7 +198,7 @@ runs:
         }
         $configDir = Split-Path $configPath -Parent
         New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-        $config = "[cache.s3]`nbucket = `"sccache`"`nendpoint = `"${{ inputs.minio_endpoint }}`"`nuse_ssl = false`nserver_side_encryption = false`nno_credentials = false`nregion = `"us-east-1`""
+        $config = "[cache.s3]`nbucket = `"sccache`"`nkey_prefix = `"$($env:CI_STORE_PREFIX.TrimEnd('/'))`"`nendpoint = `"${{ inputs.minio_endpoint }}`"`nuse_ssl = false`nserver_side_encryption = false`nno_credentials = false`nregion = `"us-east-1`""
         $config | Out-File -FilePath $configPath -Encoding utf8
 
     - name: Confirm the compiler cache answers before wrapping rustc
