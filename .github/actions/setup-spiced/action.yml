@@ -196,7 +196,7 @@ runs:
           fi
         done
 
-        echo "Could not find any recently built spiced commit in MinIO for $PLATFORM"
+        echo "::error::No spiced build of $REF's last 10 commits is stored for $PLATFORM, under artifacts/${SOURCE_PREFIX}spiced/. A run reads only builds of trunk, its own ref, or a pull request's base branch: run build_and_release.yml on $REF first, or run this workflow on a ref that has a build."
         exit 1
 
     - name: Find the latest built spiced commit (Windows)
@@ -233,7 +233,7 @@ runs:
           }
         }
 
-        Write-Host "Could not find any recently built spiced commit in MinIO for $platform"
+        Write-Host "::error::No spiced build of $($env:REF)'s last 10 commits is stored for $platform, under artifacts/$($env:SOURCE_PREFIX)spiced/. A run reads only builds of trunk, its own ref, or a pull request's base branch: run build_and_release.yml on $($env:REF) first, or run this workflow on a ref that has a build."
         exit 1
 
     - name: Set SPICED_COMMIT from workflow input (Linux/macOS)

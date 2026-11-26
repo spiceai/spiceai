@@ -451,6 +451,18 @@ class SetupSpicedTest(StoreTest):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(found["SPICED_COMMIT"], self.release_parent)
 
+    def test_no_build_of_the_ref_says_which_ref_and_where(self):
+        # A ref with no build of its own, such as a feature branch's dispatch of cold-start, fails
+        # with the ref and the prefix it searched, not by testing trunk's runtime instead.
+        prefix = f"untrusted/{REPOSITORY_ID}/{RELEASE}/"
+        self.stored.write_text(self.key("", self.release) + "\n")
+        proc, found = self.run_step(FIND, {"REF": RELEASE, "SOURCE_PREFIX": prefix})
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertNotIn("SPICED_COMMIT", found)
+        self.assertIn(f"::error::No spiced build of {RELEASE}'s last 10 commits is stored", proc.stdout)
+        self.assertIn(f"under artifacts/{prefix}spiced/", proc.stdout)
+        self.assertIn(f"run build_and_release.yml on {RELEASE} first", proc.stdout)
+
     def test_a_bare_branch_name_is_that_branch(self):
         proc, located = self.locate(PULL_REQUEST, ref="trunk")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
