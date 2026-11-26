@@ -22,6 +22,7 @@ on:
       - '.github/scripts/test_docker_pull.py'
       - '.github/scripts/test_setup_spiced.py'
       - '.github/scripts/test_testoperator_dispatch.py'
+      - '.github/scripts/test_ci_store_prefix.py'
   push:
     branches:
       - trunk
@@ -36,6 +37,7 @@ on:
       - '.github/scripts/test_docker_pull.py'
       - '.github/scripts/test_setup_spiced.py'
       - '.github/scripts/test_testoperator_dispatch.py'
+      - '.github/scripts/test_ci_store_prefix.py'
   workflow_dispatch:
 
 concurrency:
@@ -77,6 +79,7 @@ jobs:
           python .github/scripts/test_docker_pull.py -v
           python .github/scripts/test_setup_spiced.py -v
           python .github/scripts/test_testoperator_dispatch.py -v
+          python .github/scripts/test_ci_store_prefix.py -v
 
       - name: Validate GitHub Actions definitions
         run: python .github/scripts/check_workflow_yaml.py

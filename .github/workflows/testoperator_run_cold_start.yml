@@ -156,6 +156,12 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
+      # The fixture's location for this run, in the spicepod (.github/actions/ci-store-prefix).
+      - name: Choose the CI store prefix
+        uses: ./.github/actions/ci-store-prefix
+        with:
+          spicepod: test/spicepods/cold_start/${{ matrix.spicepod }}
+
       - name: Run the cold-start test (candidate ${{ steps.setup-spiced.outputs.SPICED_COMMIT }} vs ${{ steps.baseline.outputs.version }})
         run: |
           testoperator run cold-start \

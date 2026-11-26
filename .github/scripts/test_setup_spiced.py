@@ -176,7 +176,7 @@ class StoreTest(unittest.TestCase):
 
     def store_prefix(self, github_ref, repository_id=REPOSITORY_ID):
         return self.run_script(self.prefix_steps["prefix"]["run"],
-                               {"GITHUB_REF": github_ref, "GITHUB_REPOSITORY_ID": repository_id})
+                               {"GITHUB_REF": github_ref, "GITHUB_REPOSITORY_ID": repository_id, "SPICEPOD": ""})
 
     def uploads(self):
         return [s for s in self.build["steps"] if s.get("uses") == "./.github/actions/upload-to-minio"]
@@ -280,7 +280,7 @@ class ToolBuildsStoreUnderThePrefixTest(unittest.TestCase):
     """The testoperator and spicepod-validator binaries the release leg's jobs build and reuse."""
 
     def test_each_tool_build_reads_and_writes_under_the_runs_prefix(self):
-        for name in ("build-testoperator", "build-spicepod-validator"):
+        for name in ("build-testoperator", "build-spicepod-validator", "build-spidapter"):
             with self.subTest(action=name):
                 steps = yaml.safe_load((GITHUB_DIR / "actions" / name / "action.yml").read_text())["runs"]["steps"]
                 self.assertEqual(steps[0].get("uses"), "./.github/actions/ci-store-prefix")
@@ -310,6 +310,44 @@ class MssqlBenchImageTest(unittest.TestCase):
         first = build["jobs"]["build"]["steps"][0]
         self.assertEqual(first["name"], "Refuse a run off trunk")
         self.assertIn('[ "$GITHUB_REF" != refs/heads/trunk ]', first["run"])
+
+
+class StoreWritersUseThePrefixTest(unittest.TestCase):
+    """This branch's other writers to the store's shared prefixes, which refuse its writes."""
+
+    def test_the_integration_test_archive_is_under_the_runs_prefix(self):
+        workflow = yaml.safe_load((GITHUB_DIR / "workflows" / "integration.yml").read_text())
+        jobs_using = 0
+        for name, job in workflow["jobs"].items():
+            steps = job.get("steps") or []
+            runs = [str(step.get("run", "")) for step in steps]
+            using = [i for i, run in enumerate(runs) if "INTEGRATION_TESTS_ARCHIVE_S3_URI" in run]
+            if not using:
+                continue
+            jobs_using += 1
+            with self.subTest(job=name):
+                uses = [step.get("uses") for step in steps]
+                self.assertIn("./.github/actions/ci-store-prefix", uses)
+                self.assertLess(uses.index("./.github/actions/ci-store-prefix"), using[0])
+                for i in using:
+                    self.assertIn("spice-minio/build/test_binaries/${CI_STORE_PREFIX?}", runs[i])
+                    self.assertNotIn("spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}", runs[i])
+        self.assertGreater(jobs_using, 1)
+
+    def test_the_compiler_cache_keys_are_under_the_runs_prefix(self):
+        steps = yaml.safe_load((GITHUB_DIR / "actions" / "setup-sccache" / "action.yml").read_text())["runs"]["steps"]
+        self.assertEqual(steps[0].get("uses"), "./.github/actions/ci-store-prefix")
+        configs = [line for step in steps for line in str(step.get("run", "")).splitlines() if "[cache.s3]" in line]
+        self.assertEqual(len(configs), 3)
+        for line in configs:
+            self.assertIn("key_prefix", line)
+            self.assertIn("CI_STORE_PREFIX", line)
+
+    def test_the_cold_start_fixture_is_seeded_and_read_under_the_runs_prefix(self):
+        steps = yaml.safe_load((GITHUB_DIR / "actions" / "seed-cold-start-fixture" / "action.yml").read_text())["runs"]["steps"]
+        self.assertEqual(steps[0].get("uses"), "./.github/actions/ci-store-prefix")
+        text = (GITHUB_DIR / "workflows" / "e2e_test_ci.yml").read_text()
+        self.assertIn("spice-minio/benchmarks/cold_start/${CI_STORE_PREFIX?}audit_events_3m/_SEEDED", text)
 
 
 class SetupSpicedTest(StoreTest):
