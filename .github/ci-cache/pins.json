@@ -83,5 +83,13 @@
   "athena-odbc": {
     "url": "https://downloads.athena.us-east-1.amazonaws.com/drivers/ODBC/v2.0.3.0/Linux/AmazonAthenaODBC-2.0.3.0.rpm",
     "sha256": "6b4b306f5ebb67ecebdd8a98808a7e33a60bb01f40dcf12c41685ac1b95e37bc"
+  },
+  "awscli": {
+    "url": "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.40.1.zip",
+    "sha256": "fddb097a8ea197dc9beed9e4426ef99aded612a52df64581e079b6e8817e1d24"
+  },
+  "duckdb-cli": {
+    "url": "https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip",
+    "sha256": "08c0ca117111fcede14239d0093792352befdc174218c344d232c13279643d05"
   }
 }

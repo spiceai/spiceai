@@ -286,7 +286,8 @@ jobs:
         if: env.CB_COMPUTE == 'ec2'
         run: |
           if ! command -v aws &> /dev/null; then
-            curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+            # The AWS CLI release pinned in .github/ci-cache/pins.json, checked against its SHA-256.
+            bash .github/scripts/fetch_pinned.sh awscli /tmp/awscliv2.zip
             unzip -q /tmp/awscliv2.zip -d /tmp
             sudo /tmp/aws/install
             rm -rf /tmp/awscliv2.zip /tmp/aws

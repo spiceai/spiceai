@@ -113,6 +113,18 @@ entry itself as `(Get-Content … | ConvertFrom-Json).'<name>'`, names its targe
   Neither vendor publishes a checksum for these releases, so each pin is the SHA-256 of a
   download from the release's own versioned URL (for Athena, the download's MD5 also matches
   the S3 ETag the server reports).
+- **`awscli`**: AWS CLI v2 2.40.1 for Linux x86_64, from its versioned URL
+  (`awscli-exe-linux-x86_64-<version>.zip`), for `setup-spicescript`, `spicescript_dispatch.yml`
+  and `testoperator_run_cluster_bench_aws.yml`, which used to install whatever the unversioned
+  URL served. 2.40.1 was the newest release at least two weeks old when it was pinned. The
+  zip's `.sig` verifies with the AWS CLI team's key (fingerprint
+  `FB5D B77F D5C1 18B8 0511 ADA8 A631 0ACC 4672 475C`, as AWS's install guide lists it); to
+  bump it, verify the new zip the same way, in a throwaway `GNUPGHOME`, and pin its SHA-256.
+- **`duckdb-cli`**: the DuckDB CLI v1.5.5 zip for Linux x86_64 that `setup-spicescript` and
+  `spicescript_dispatch.yml` install. DuckDB publishes no checksum files; the pin is the
+  digest GitHub records for the release asset, checked against a download.
+  `test/tpc-bench/Makefile` pins the v2.0.0 CLI archives its TPC-H generator downloads in
+  its own `case` arms the same way, and `check_ci_cache_pins.py` requires a SHA-256 in each.
 
 ## How the cache is filled
 

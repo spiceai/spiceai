@@ -206,15 +206,16 @@ jobs:
         run: |
           command -v unzip >/dev/null || { sudo apt-get update && sudo apt-get install -y unzip; }
           if ! command -v aws >/dev/null; then
-            curl -fsSL -o "$RUNNER_TEMP/awscliv2.zip" https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+            # The AWS CLI release pinned in .github/ci-cache/pins.json, checked against its SHA-256.
+            bash .github/scripts/fetch_pinned.sh awscli "$RUNNER_TEMP/awscliv2.zip"
             unzip -q "$RUNNER_TEMP/awscliv2.zip" -d "$RUNNER_TEMP"
             sudo "$RUNNER_TEMP/aws/install"
           fi
 
       - name: Install DuckDB CLI
         run: |
-          curl -fsSL -o "$RUNNER_TEMP/duckdb.zip" \
-            https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip
+          # DuckDB CLI v1.5.5, pinned in .github/ci-cache/pins.json and checked against its SHA-256.
+          bash .github/scripts/fetch_pinned.sh duckdb-cli "$RUNNER_TEMP/duckdb.zip"
           unzip -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
           echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
 

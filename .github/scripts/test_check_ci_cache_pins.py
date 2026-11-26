@@ -24,6 +24,7 @@ FILES = [
     ".github/actions/setup-nextest/action.yml",
     "Dockerfile-cuda",
     "rust-toolchain.toml",
+    "test/tpc-bench/Makefile",
 ]
 sys.path.insert(0, str(ROOT / ".github" / "scripts"))
 from check_ci_cache_pins import FETCHED_PINS  # noqa: E402
@@ -265,6 +266,35 @@ class CheckCiCachePinsTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn(".github/actions/setup-odbc/action.yml does not download athena-odbc", result.stdout)
         self.assertNotIn("does not download simba-spark-odbc", result.stdout)
+
+
+    def test_the_spicescript_tools_are_fetched_through_their_pins(self):
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("awscli, duckdb-cli", result.stdout)
+        for user in FETCHED_PINS["awscli"]:
+            with self.subTest(user=user):
+                self.setUp()
+                path = self.tmp / user
+                path.write_text(path.read_text().replace("fetch_pinned.sh awscli", "curl -o awscli.zip"))
+                path.write_text(path.read_text().replace('fetch_pinned.sh" awscli', 'curl" -o'))
+                result = self.run_check()
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"{user} does not download awscli through", result.stdout)
+
+    def test_the_tpc_bench_duckdb_download_is_checked_against_its_pins(self):
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        path = self.tmp / "test/tpc-bench/Makefile"
+        text = path.read_text()
+        path.write_text(text.replace("ASSET=duckdb-cli-linux-arm64.tar.gz; SHA256=", "ASSET=duckdb-cli-linux-arm64.tar.gz; X="))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("downloads duckdb-cli-linux-arm64.tar.gz with no `SHA256=<sha256>` beside it", result.stdout)
+        path.write_text(text.replace('"$$GOT" != "$$SHA256"', '"$$GOT" != "$$GOT"'))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("no longer compares the DuckDB CLI it downloads", result.stdout)
 
 
 if __name__ == "__main__":

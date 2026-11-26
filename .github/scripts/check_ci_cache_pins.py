@@ -50,6 +50,12 @@ FETCHED_PINS = {
     "oracle-instantclient": (".github/actions/setup-oracle-odpi/action.yml",),
     "simba-spark-odbc": (".github/actions/setup-odbc/action.yml",),
     "athena-odbc": (".github/actions/setup-odbc/action.yml",),
+    "awscli": (
+        ".github/actions/setup-spicescript/action.yml",
+        ".github/workflows/spicescript_dispatch.yml",
+        ".github/workflows/testoperator_run_cluster_bench_aws.yml",
+    ),
+    "duckdb-cli": (".github/actions/setup-spicescript/action.yml", ".github/workflows/spicescript_dispatch.yml"),
 }
 # A call in a shell script: `fetch_pinned.sh" NAME DEST [TARGET]`, with TARGET a literal or a
 # variable such as "$target".
@@ -61,6 +67,10 @@ FETCH_CALL = re.compile(
 # the target it checks as `$target = 'TARGET'`.
 PWSH_PIN = re.compile(r"ConvertFrom-Json\s*\)\s*\.\s*'([A-Za-z0-9_.-]+)'")
 PWSH_TARGET = re.compile(r"\$target\s*=\s*'([^'\n]+)'")
+# test/tpc-bench/Makefile downloads the DuckDB CLI its TPC-H generator runs, and pins each
+# release asset in the `case` arm that picks it: `ASSET=<file>; SHA256=<sha256> ;;`.
+TPC_BENCH_MAKEFILE = ROOT / "test" / "tpc-bench" / "Makefile"
+MAKEFILE_ASSET = re.compile(r"ASSET=([A-Za-z0-9_.-]+)(?:;\s*SHA256=([0-9a-f]{64}))?")
 SHELL_VARIABLE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
 
 
@@ -128,6 +138,7 @@ def main() -> int:
 
     for name, users in FETCHED_PINS.items():
         errors.extend(fetched_pin_errors(pins, name, users))
+    errors.extend(tpc_bench_duckdb_errors())
 
     for error in errors:
         print(f"::error file={PINS_PATH.relative_to(ROOT)}::{error}")
@@ -198,6 +209,23 @@ def fetched_pin_errors(pins: dict, name: str, users: tuple) -> list:
                 )
             elif not isinstance(hashes, dict) and target:
                 errors.append(f"{user} asks for {name} for {target}, but {name} pins one file for no target.")
+    return errors
+
+
+def tpc_bench_duckdb_errors() -> list:
+    """Every DuckDB CLI asset test/tpc-bench/Makefile downloads has a SHA-256 it is checked against."""
+    where = TPC_BENCH_MAKEFILE.relative_to(ROOT)
+    text = TPC_BENCH_MAKEFILE.read_text()
+    arms = MAKEFILE_ASSET.findall(text)
+    if not arms:
+        return [f"Found no `ASSET=<file>; SHA256=<sha256> ;;` arm in {where}; update this check with the Makefile."]
+    errors = [
+        f"{where} downloads {asset} with no `SHA256=<sha256>` beside it in its `case` arm, so nothing checks it."
+        for asset, sha256 in arms
+        if not sha256
+    ]
+    if '"$$GOT" != "$$SHA256"' not in text:
+        errors.append(f"{where} no longer compares the DuckDB CLI it downloads (GOT) with its pinned SHA256.")
     return errors
 
 
