@@ -7002,8 +7002,8 @@ impl DataFusion {
 
         let ctx = Arc::clone(&self.ctx);
         let df_ref = Arc::clone(self);
-        let dependent_table_names = view::get_dependent_table_names(&statements[0]);
         let status = self.runtime_status();
+        let dependent_table_names = view::get_view_dependencies(&statements[0], &status);
 
         let table = view.name.clone();
         tracing::debug!("Creating view {table} with dependent tables {dependent_table_names:?}");

@@ -175,8 +175,9 @@ fn view_reads(state: &datafusion::execution::SessionState, sql: &str) -> Option<
     let statement = statements.pop_front()?;
     let mut tables = state.resolve_table_references(&statement).ok()?;
     // The planner does not look up a table function's table arguments, e.g. the
-    // `docs` of `text_search(docs, 'fox')`, as tables.
-    tables.extend(view::get_dependent_table_names(&statement));
+    // `docs` of `text_search(docs, 'fox')`, as tables. A column argument only
+    // matches a table of the same name.
+    tables.extend(view::table_function_arguments(&statement));
     Some(
         tables
             .into_iter()
@@ -564,8 +565,10 @@ impl Runtime {
                         return None;
                     }
 
-                    // Extract dependencies from the validated statement
-                    let dependencies = view::get_dependent_table_names(&statement);
+                    // Extract dependencies from the validated statement. Ordering keeps
+                    // only the views, so a table function's column arguments drop out.
+                    let mut dependencies = view::get_dependent_table_names(&statement);
+                    dependencies.extend(view::table_function_arguments(&statement));
 
                     // What the acceleration block asks for and the runtime will not do as
                     // written — settings `enabled: false` discards (#13514), the deprecated
