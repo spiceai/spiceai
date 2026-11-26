@@ -5883,7 +5883,14 @@ mod tests {
                 panic!("expected a parquet file format");
             };
             let provider = connector
-                .create_listing_table(&dataset, &url, &extension, file_format)
+                .create_listing_table(
+                    &dataset,
+                    &url,
+                    &extension,
+                    file_format,
+                    &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                        as Arc<dyn MemoryPool>),
+                )
                 .await
                 .expect("create_listing_table production path");
 
