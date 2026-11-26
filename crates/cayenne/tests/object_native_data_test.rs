@@ -2597,6 +2597,93 @@ async fn the_catalog_recognizes_its_datasets_data_in_both_recorded_forms() {
     }
 }
 
+/// A location whose path needs percent-encoding is opened by its configured
+/// string, with its keys decoded once (`state dir`, `state-dir`, `state%20dir`):
+/// the catalog recognizes its datasets' data by any URL spelling of those keys,
+/// only under that location, and never under the keys another decoding gives.
+#[tokio::test]
+async fn the_catalog_recognizes_its_datasets_data_under_a_percent_encoded_location() {
+    let cases = [
+        (
+            "state dir",
+            "s3://bucket/state dir/cayenne/v1",
+            vec![
+                (
+                    "s3://bucket/state%20dir/cayenne/v1/datasets/orders-1/data",
+                    true,
+                ),
+                (
+                    "s3://bucket/state dir/cayenne/v1/datasets/orders-1/data",
+                    true,
+                ),
+                ("datasets/orders-1/data", true),
+                (
+                    "s3://other/state%20dir/cayenne/v1/datasets/orders-1/data",
+                    false,
+                ),
+                (
+                    "s3://bucket/state%2520dir/cayenne/v1/datasets/orders-1/data",
+                    false,
+                ),
+            ],
+        ),
+        (
+            "state-dir",
+            "s3://bucket/state%2Ddir/cayenne/v1",
+            vec![
+                (
+                    "s3://bucket/state-dir/cayenne/v1/datasets/orders-1/data",
+                    true,
+                ),
+                (
+                    "s3://bucket/state%2ddir/cayenne/v1/datasets/orders-1/data",
+                    true,
+                ),
+                (
+                    "s3://bucket/%73tate-dir/cayenne/v1/datasets/orders-1/data",
+                    true,
+                ),
+                (
+                    "s3://bucket/state%252Ddir/cayenne/v1/datasets/orders-1/data",
+                    false,
+                ),
+            ],
+        ),
+        (
+            "state%20dir",
+            "s3://bucket/state%2520dir/cayenne/v1",
+            vec![
+                (
+                    "s3://bucket/state%2520dir/cayenne/v1/datasets/orders-1/data",
+                    true,
+                ),
+                (
+                    "s3://bucket/state%20dir/cayenne/v1/datasets/orders-1/data",
+                    false,
+                ),
+            ],
+        ),
+    ];
+    for (folder, location, paths) in cases {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = ObjectNativeCatalog::open_or_create_at(
+            Arc::clone(&store),
+            Path::parse(format!("{folder}/cayenne/v1/catalog")).expect("catalog prefix"),
+            location,
+        )
+        .await
+        .expect("open the catalog");
+        catalog.init().await.expect("init");
+        for (path, expected) in paths {
+            assert_eq!(
+                catalog.holds_data_at(path),
+                expected,
+                "opened at {location}: holds_data_at({path})"
+            );
+        }
+    }
+}
+
 /// The deletion vectors of a dataset whose data is in the location, as objects.
 async fn deletion_vector_objects(bucket: &InMemory, prefix: &str) -> usize {
     let metas: Vec<ObjectMeta> = bucket
@@ -2618,12 +2705,27 @@ async fn deletion_vector_objects(bucket: &InMemory, prefix: &str) -> usize {
 /// deletion vector, and the updates hit the same keys again and again, so the
 /// deletion index stays as small as the table and its own triggers never fire; one
 /// vector a commit would pile up unless the vectors themselves bring on the rewrite
-/// that applies them, and that rewrite deletes their objects.
+/// that applies them. That rewrite retires them, and the retirement sweep deletes
+/// their objects once the retention has passed; each cycle ends the retention of
+/// what is retired so far, so the objects counted are the live vectors and those
+/// retired within the cycle.
+///
+/// The count is a sawtooth: two vectors a cycle until the rewrite's trigger, then
+/// back down to what was written while the rewrite ran. Rewrites are paced to a
+/// tenth of the time, so how far a tooth climbs past the trigger depends on how
+/// long the previous rewrite took, which a busy machine stretches; the peaks are
+/// bounded but say nothing about a trend. The floor the count falls back to does:
+/// it rises only when rewrites leave vectors behind, and the count stays up once
+/// the stream stops only when rewrites no longer run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deletion_vectors_stay_bounded_under_a_steady_change_stream() {
     const KEYS: i64 = 4_000;
     const CYCLES: usize = 300;
     const BOUND: usize = 200;
+    // `DELETION_VECTOR_RECLAIM_TRIGGER`: the key deletion vectors at which a rewrite is due.
+    const RECLAIM_TRIGGER: usize = 64;
+    // Eight cycles of vectors: what one slow rewrite may leave beyond the floor.
+    const FLOOR_SLACK: usize = 16;
     let name = "dv_churn";
     let (setup, catalog) = KeyedSetup::new(name).await;
     let store = setup.store(None);
@@ -2687,7 +2789,23 @@ async fn deletion_vectors_stay_bounded_under_a_steady_change_stream() {
         }
         table.checkpoint_mem_tier().await.expect("checkpoint");
         tokio::time::sleep(Duration::from_millis(20)).await;
+        // The first sweep observes what is retired so far, the second deletes it.
+        table.sweep_retired_files_now().await;
+        table.elapse_data_file_retention();
+        table.sweep_retired_files_now().await;
         samples.push(deletion_vector_objects(&setup.bucket, &setup.data_prefix).await);
+    }
+    // Once the stream stops, a due rewrite still runs, and the sweep that follows
+    // takes the count below its trigger; the pace delays the rewrite by at most
+    // nine times the previous one.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut after_stream = deletion_vector_objects(&setup.bucket, &setup.data_prefix).await;
+    while after_stream >= RECLAIM_TRIGGER && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        table.sweep_retired_files_now().await;
+        table.elapse_data_file_retention();
+        table.sweep_retired_files_now().await;
+        after_stream = deletion_vector_objects(&setup.bucket, &setup.data_prefix).await;
     }
     table.drain_in_flight_maintenance().await.expect("drain");
     let expected: Vec<(i64, i64)> = model.into_iter().collect();
@@ -2698,8 +2816,9 @@ async fn deletion_vectors_stay_bounded_under_a_steady_change_stream() {
     let reopened = sorted_rows(&reopened_ctx, name).await;
 
     let third = samples.len() / 3;
-    let middle_peak = samples[third..2 * third].iter().copied().max().unwrap_or(0);
-    let last_peak = samples[2 * third..].iter().copied().max().unwrap_or(0);
+    let peak = samples.iter().copied().max().unwrap_or(0);
+    let middle_floor = samples[third..2 * third].iter().copied().min().unwrap_or(0);
+    let last_floor = samples[2 * third..].iter().copied().min().unwrap_or(0);
     let every_tenth: Vec<usize> = samples.iter().copied().step_by(10).collect();
     assert!(
         live == expected && reopened == expected,
@@ -2709,8 +2828,8 @@ async fn deletion_vectors_stay_bounded_under_a_steady_change_stream() {
         expected.len()
     );
     assert!(
-        last_peak <= BOUND && last_peak <= middle_peak + middle_peak / 4 + 1,
-        "deletion vectors stay under {BOUND} with no upward trend: middle-third peak {middle_peak}, last-third peak {last_peak}, every tenth cycle {every_tenth:?}"
+        peak <= BOUND && last_floor <= middle_floor + FLOOR_SLACK && after_stream < RECLAIM_TRIGGER,
+        "deletion vectors stay under {BOUND} with no upward trend: peak {peak}, middle-third floor {middle_floor}, last-third floor {last_floor}, {after_stream} once the stream stopped, every tenth cycle {every_tenth:?}"
     );
 }
 

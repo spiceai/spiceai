@@ -145,6 +145,19 @@ async fn reopen(
         .expect("reopen")
 }
 
+/// Reopen the table as the runtime does when it replaces a dataset: quiesce the
+/// old instance first. Its maintenance holds its own `compaction_lock`, so a pass
+/// it spawned after a write would otherwise commit under the new instance's
+/// passes and make them abort.
+async fn hand_over(
+    old: CayenneTableProvider,
+    catalog: &Arc<dyn MetadataCatalog>,
+    runtime_env: &Arc<RuntimeEnv>,
+) -> CayenneTableProvider {
+    old.quiesce().await;
+    reopen(catalog, runtime_env).await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn streaming_append_resolves_copies_through_reopen_and_compaction() {
     for mode in [DeletionMode::Key, DeletionMode::Position] {
@@ -177,19 +190,19 @@ async fn streaming_append_resolves_copies_through_reopen_and_compaction() {
             assert_eq!(actual, expected, "{label} {stage}");
         };
         check("after append", visible(&provider).await);
-        let provider = reopen(&catalog, &runtime_env).await;
+        let provider = hand_over(provider, &catalog, &runtime_env).await;
         check("after reopen", visible(&provider).await);
         provider
             .compact_protected_snapshots_subset(8)
             .await
             .expect("merge");
         check("after protected merge", visible(&provider).await);
-        provider
-            .sort_and_rewrite_data(64 * 1024 * 1024)
-            .await
-            .expect("rewrite");
+        assert!(
+            provider.force_full_compaction().await.expect("rewrite"),
+            "the full compaction must commit"
+        );
         check("after full rewrite", visible(&provider).await);
-        let provider = reopen(&catalog, &runtime_env).await;
+        let provider = hand_over(provider, &catalog, &runtime_env).await;
         check("after second reopen", visible(&provider).await);
     }
 }
@@ -263,19 +276,19 @@ async fn streaming_append_into_a_drop_table_keeps_the_last_copy() {
             7,
         );
         assert_eq!(visible(&provider).await, expected);
-        let provider = reopen(&catalog, &runtime_env).await;
+        let provider = hand_over(provider, &catalog, &runtime_env).await;
         assert_eq!(visible(&provider).await, expected);
         provider
             .compact_protected_snapshots_subset(8)
             .await
             .expect("merge");
         assert_eq!(visible(&provider).await, expected);
-        provider
-            .sort_and_rewrite_data(64 * 1024 * 1024)
-            .await
-            .expect("rewrite");
+        assert!(
+            provider.force_full_compaction().await.expect("rewrite"),
+            "the full compaction must commit"
+        );
         assert_eq!(visible(&provider).await, expected);
-        let provider = reopen(&catalog, &runtime_env).await;
+        let provider = hand_over(provider, &catalog, &runtime_env).await;
         assert_eq!(visible(&provider).await, expected);
     }
 }
@@ -325,7 +338,7 @@ async fn overwrite_resolves_copies_across_batches_through_its_lifecycle() {
             visible(&provider).await,
             provider.protected_snapshot_ids().len(),
         );
-        let provider = reopen(&catalog, &runtime_env).await;
+        let provider = hand_over(provider, &catalog, &runtime_env).await;
         check(
             "after reopen",
             visible(&provider).await,
@@ -340,16 +353,19 @@ async fn overwrite_resolves_copies_across_batches_through_its_lifecycle() {
             visible(&provider).await,
             provider.protected_snapshot_ids().len(),
         );
-        provider
-            .sort_and_rewrite_data(64 * 1024 * 1024)
-            .await
-            .expect("full rewrite");
+        assert!(
+            provider
+                .force_full_compaction()
+                .await
+                .expect("full rewrite"),
+            "the full compaction must commit"
+        );
         check(
             "after full rewrite",
             visible(&provider).await,
             provider.protected_snapshot_ids().len(),
         );
-        let provider = reopen(&catalog, &runtime_env).await;
+        let provider = hand_over(provider, &catalog, &runtime_env).await;
         check(
             "after second reopen",
             visible(&provider).await,
@@ -681,6 +697,13 @@ async fn an_overwrite_repeating_keys_publishes_one_snapshot() {
 /// A superseded copy's values never reach an aggregate, whether it reads the
 /// rows or the table's statistics. A key-deletion table keeps its statistics
 /// exact, since its superseded copies leave its files.
+///
+/// The counts are answered from statistics in a key-deletion table, right after
+/// the write and once it is reopened. The string `MIN`/`MAX` scan in both: the
+/// files' Vortex footers record a string column's bounds byte-bounded and so
+/// inexact, and the statistics Cayenne persists from them stay inexact. The
+/// check that they scan fails if those bounds become exact, which is the cue to
+/// expect statistics for them too.
 #[tokio::test(flavor = "multi_thread")]
 async fn aggregates_after_an_overwrite_repeating_keys_ignore_superseded_copies() {
     let mut failures = Vec::new();
@@ -696,10 +719,18 @@ async fn aggregates_after_an_overwrite_repeating_keys_ignore_superseded_copies()
         )
         .await
         .expect("overwrite repeating keys");
-        for (stage, provider) in [
-            ("after overwrite", provider.clone_for_write()),
-            ("after reopen", reopen(&catalog, &runtime_env).await),
-        ] {
+        for stage in ["after overwrite", "after reopen"] {
+            // The reopen reads the statistics the write's maintenance persists, so it
+            // waits for that maintenance rather than racing it.
+            let provider = if stage == "after overwrite" {
+                provider.clone_for_write()
+            } else {
+                provider
+                    .flush_pending_maintenance()
+                    .await
+                    .expect("flush the write's maintenance");
+                reopen(&catalog, &runtime_env).await
+            };
             let ctx = SessionContext::new();
             ctx.register_table("t", Arc::new(provider))
                 .expect("register");
@@ -718,9 +749,46 @@ async fn aggregates_after_an_overwrite_repeating_keys_ignore_superseded_copies()
             .expect("format")
             .to_string();
             let from_statistics = plan.contains("PlaceholderRowExec");
-            if mode == DeletionMode::Key && !from_statistics {
+            if from_statistics {
                 failures.push(format!(
-                    "{mode:?} {stage}: scanned instead of using statistics"
+                    "{mode:?} {stage}: answered the string MIN/MAX from statistics, so their \
+                     bounds are exact; expect statistics for them here"
+                ));
+            }
+            let counts = ctx
+                .sql("SELECT COUNT(*), COUNT(value) FROM t")
+                .await
+                .expect("count query");
+            let count_plan = arrow::util::pretty::pretty_format_batches(
+                &counts
+                    .clone()
+                    .explain(false, false)
+                    .expect("explain counts")
+                    .collect()
+                    .await
+                    .expect("count plan"),
+            )
+            .expect("format counts")
+            .to_string();
+            if mode == DeletionMode::Key && !count_plan.contains("PlaceholderRowExec") {
+                failures.push(format!(
+                    "{mode:?} {stage}: scanned for the counts instead of using statistics"
+                ));
+            }
+            let count_row = &counts.collect().await.expect("collect counts")[0];
+            let counted = (
+                count_row
+                    .column(0)
+                    .as_primitive::<arrow::datatypes::Int64Type>()
+                    .value(0),
+                count_row
+                    .column(1)
+                    .as_primitive::<arrow::datatypes::Int64Type>()
+                    .value(0),
+            );
+            if counted != (4, 4) {
+                failures.push(format!(
+                    "{mode:?} {stage}: counts {counted:?}, expected (4, 4)"
                 ));
             }
             let batches = df.collect().await.expect("collect");
@@ -740,6 +808,164 @@ async fn aggregates_after_an_overwrite_repeating_keys_ignore_superseded_copies()
             if observed != expected {
                 failures.push(format!(
                     "{mode:?} {stage}: {observed:?}, expected {expected:?}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// `SUM` and `AVG` are never answered from a sum that overflowed. Two appends whose ids fit
+/// `BIGINT` alone and overflow it together leave no exact sum, right after the writes and
+/// once the table is reopened from the statistics Cayenne persisted, so both aggregates scan
+/// and answer as `DataFusion` does over the same rows in memory.
+#[tokio::test(flavor = "multi_thread")]
+async fn sum_and_avg_never_use_a_sum_that_overflowed() {
+    async fn answer(ctx: &SessionContext, sql: &str) -> (String, bool) {
+        let df = ctx.sql(sql).await.expect("plan");
+        let plan = arrow::util::pretty::pretty_format_batches(
+            &df.clone()
+                .explain(false, false)
+                .expect("explain")
+                .collect()
+                .await
+                .expect("plan"),
+        )
+        .expect("format")
+        .to_string();
+        let rows = match df.collect().await {
+            Ok(batches) => arrow::util::pretty::pretty_format_batches(&batches)
+                .expect("format")
+                .to_string(),
+            Err(error) => format!("ERROR {error}"),
+        };
+        (rows, plan.contains("PlaceholderRowExec"))
+    }
+
+    let rows = [(9_223_372_036_854_775_000, "a"), (1_000, "b")];
+    let oracle = SessionContext::new();
+    oracle
+        .register_batch("t", batch(&rows))
+        .expect("register the in-memory rows");
+
+    let mut failures = Vec::new();
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, catalog, runtime_env, _dir) = table(mode).await;
+        for row in rows {
+            write(&provider, InsertOp::Append, vec![batch(&[row])])
+                .await
+                .expect("append");
+        }
+        for stage in ["after the writes", "after reopen"] {
+            let provider = if stage == "after the writes" {
+                provider.clone_for_write()
+            } else {
+                provider
+                    .flush_pending_maintenance()
+                    .await
+                    .expect("flush the writes' maintenance");
+                reopen(&catalog, &runtime_env).await
+            };
+            let ctx = SessionContext::new();
+            ctx.register_table("t", Arc::new(provider))
+                .expect("register");
+            for sql in ["SELECT SUM(id) AS x FROM t", "SELECT AVG(id) AS x FROM t"] {
+                let (observed, from_statistics) = answer(&ctx, sql).await;
+                let (expected, _) = answer(&oracle, sql).await;
+                if from_statistics {
+                    failures.push(format!(
+                        "{mode:?} {stage}: {sql} was answered from statistics"
+                    ));
+                }
+                if observed != expected {
+                    failures.push(format!(
+                        "{mode:?} {stage}: {sql} returned\n{observed}\nexpected\n{expected}"
+                    ));
+                }
+            }
+        }
+    }
+
+    // The control: two appends whose sum fits are answered from statistics once the table is
+    // reopened, so the check above sees the path it guards.
+    let (provider, catalog, runtime_env, _dir) = table(DeletionMode::Key).await;
+    for row in [(1, "a"), (2, "b")] {
+        write(&provider, InsertOp::Append, vec![batch(&[row])])
+            .await
+            .expect("append");
+    }
+    provider
+        .flush_pending_maintenance()
+        .await
+        .expect("flush the writes' maintenance");
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::new(reopen(&catalog, &runtime_env).await))
+        .expect("register");
+    let (sum, from_statistics) = answer(&ctx, "SELECT SUM(id) AS x FROM t").await;
+    if !from_statistics || !sum.contains("| 3 ") {
+        failures.push(format!(
+            "control: a sum that fits was not answered from statistics as 3: {sum}"
+        ));
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// `MIN` and `MAX` of strings longer than the footer's 64-byte bound return the whole value,
+/// right after the write and after a restart. The footer records a string column's bounds
+/// cut to 64 bytes and inexact. The per-file statistics a scan persists from the footer must
+/// keep them inexact: read back as exact, they answered both from the cut bounds after the
+/// table was reopened.
+#[tokio::test(flavor = "multi_thread")]
+async fn string_min_max_past_the_footer_bound_return_the_whole_value() {
+    let lowest = format!("a{}", "b".repeat(120));
+    let highest = format!("z{}", "y".repeat(120));
+    let mut failures = Vec::new();
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        let (provider, catalog, runtime_env, _dir) = table(mode).await;
+        write(
+            &provider,
+            InsertOp::Overwrite,
+            vec![batch(&[
+                (1, lowest.as_str()),
+                (2, "m"),
+                (3, highest.as_str()),
+            ])],
+        )
+        .await
+        .expect("overwrite");
+        // The first query after the write persists the files' statistics; the reopen reads
+        // them back.
+        for stage in ["after the write", "after reopen"] {
+            let provider = if stage == "after the write" {
+                provider.clone_for_write()
+            } else {
+                provider
+                    .flush_pending_maintenance()
+                    .await
+                    .expect("flush the write's maintenance");
+                reopen(&catalog, &runtime_env).await
+            };
+            let ctx = SessionContext::new();
+            ctx.register_table("t", Arc::new(provider))
+                .expect("register");
+            let batches = ctx
+                .sql("SELECT MIN(value), MAX(value) FROM t")
+                .await
+                .expect("query")
+                .collect()
+                .await
+                .expect("collect");
+            let observed = (
+                batches[0].column(0).as_string::<i32>().value(0).to_string(),
+                batches[0].column(1).as_string::<i32>().value(0).to_string(),
+            );
+            if observed != (lowest.clone(), highest.clone()) {
+                failures.push(format!(
+                    "{mode:?} {stage}: MIN has {} bytes and MAX {}, expected {} and {}",
+                    observed.0.len(),
+                    observed.1.len(),
+                    lowest.len(),
+                    highest.len()
                 ));
             }
         }

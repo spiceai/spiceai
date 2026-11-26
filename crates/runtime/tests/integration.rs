@@ -48,27 +48,18 @@ use tracing_subscriber::EnvFilter;
 #[test]
 fn accelerator_crates_register_their_engines() {
     let engines = data_accelerator_api::registered_engine_names();
-    #[cfg(feature = "postgres-accel")]
-    assert!(
-        engines.iter().any(|engine| engine == "postgres"),
-        "the postgres accelerator is not registered in this test binary; linked engines: {engines:?}"
-    );
-    #[cfg(feature = "sqlite")]
-    assert!(
-        engines.iter().any(|engine| engine == "sqlite"),
-        "the sqlite accelerator is not registered in this test binary; linked engines: {engines:?}"
-    );
     assert!(
         engines.iter().any(|engine| engine == "cayenne"),
         "the cayenne accelerator is not registered in this test binary; linked engines: {engines:?}"
     );
-    let _ = &engines;
 }
 
 mod abfs;
 mod acceleration;
 #[cfg(feature = "adbc")]
 mod adbc;
+#[cfg(not(windows))]
+mod append_coalescing;
 mod cache;
 mod catalog;
 mod cayenne;
@@ -101,6 +92,8 @@ mod ducklake;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 mod endpoint_auth;
+#[cfg(any(feature = "postgres", feature = "adbc"))]
+mod federation_differential;
 mod file;
 mod flight;
 mod gcs;
@@ -165,7 +158,7 @@ mod s3_location_pruning;
 #[cfg(not(windows))]
 mod s3_missing_source;
 mod s3_parquet_overwrite;
-#[cfg(any(feature = "postgres", feature = "sqlite"))]
+#[cfg(feature = "postgres")]
 mod schema_evolution;
 #[cfg(feature = "sharepoint")]
 mod sharepoint;
@@ -181,12 +174,8 @@ mod source_unavailable;
 #[cfg(feature = "spark")]
 mod spark;
 mod spiceai;
-#[cfg(feature = "sqlite")]
-mod sqlite;
 mod tls;
 mod tls_reload;
-#[cfg(feature = "postgres-accel")]
-mod tpcds_postgres;
 mod utils;
 mod view;
 

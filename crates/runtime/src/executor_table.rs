@@ -39,6 +39,12 @@ limitations under the License.
 //! remote schema round-trip is needed, and the wrapped [`FlightSQLTable`]
 //! pushes the dimension's own filters/projection into the peer `SELECT` for
 //! free.
+//!
+//! The function connects to the endpoint it is given with this node's cluster
+//! identity, so it resolves only in the SQL the scheduler sends this executor
+//! (or, in a cluster without mTLS, that any node sends it): anywhere else — user
+//! SQL on any node, or SQL another executor sends — it is refused before any
+//! connection is made.
 
 use std::sync::{Arc, Weak};
 
@@ -59,7 +65,9 @@ use tonic::transport::{ClientTlsConfig, Endpoint};
 use cayenne::catalog_provider::CayenneSchemaProvider;
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
 
+use crate::cluster::peer::ClusterPeerRole;
 use crate::datafusion::DataFusion;
+use runtime_request_context::RequestContext;
 
 /// UDTF name for `executor_table`.
 pub const EXECUTOR_TABLE_UDTF_NAME: &str = "executor_table";
@@ -125,6 +133,20 @@ fn build_peer_client(
 
 impl TableFunctionImpl for ExecutorTableFunc {
     fn call(&self, args: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
+        // SAFETY: a table function is called while the SQL that names it is
+        // planned, inside the request that SQL arrived in; outside any request
+        // this is the internal context, which is refused below.
+        let context = unsafe { RequestContext::current_sync() };
+        let from_scheduler = matches!(
+            crate::cluster::peer::cluster_peer_role(&context),
+            Some(ClusterPeerRole::Scheduler | ClusterPeerRole::Unauthenticated)
+        );
+        if !from_scheduler {
+            return Err(DataFusionError::Plan(format!(
+                "{EXECUTOR_TABLE_UDTF_NAME}() is not available: it is used only in the queries the cluster scheduler sends to executors"
+            )));
+        }
+
         let endpoint = literal_string(args.first(), "executor endpoint")?;
         let table_str = literal_string(args.get(1), "table name")?;
         let table_ref = TableReference::parse_str(&table_str);

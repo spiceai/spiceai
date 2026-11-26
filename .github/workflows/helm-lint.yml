@@ -58,3 +58,6 @@ jobs:
 
       - name: Lint Helm chart
         run: helm lint deploy/chart/
+
+      - name: Render the chart's test cases
+        run: sh deploy/chart/tests/run.sh

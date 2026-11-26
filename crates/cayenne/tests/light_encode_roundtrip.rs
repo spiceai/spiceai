@@ -20,9 +20,8 @@ limitations under the License.
 //! led to the #11826 revert (#11910).
 //!
 //! Writes a multi-chunk, CH-benCH-`customer`-shaped dataset through the exact
-//! light delta-encoding scheme sets from
-//! `cayenne::provider::delta_encoding::strategy_builder_for_level` (mirrored
-//! here because that fn is `pub(crate)`), reads the file back through the
+//! light delta-encoding scheme sets of
+//! `cayenne::provider::delta_encoding::strategy_builder_for_level`, reads the file back through the
 //! default session (the production read path registers no write strategy), and
 //! compares cell-for-cell against the input.
 //!
@@ -57,54 +56,9 @@ use vortex::array::stream::ArrayStreamAdapter;
 use vortex::arrow::ArrowSessionExt;
 use vortex::buffer::ByteBufferMut;
 use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder};
-use vortex_btrblocks::schemes::{float, integer, string};
-use vortex_btrblocks::{BtrBlocksCompressorBuilder, Scheme, SchemeExt};
 use vortex_session::VortexSession;
 
-// ---------------------------------------------------------------------------
-// Scheme sets — MUST mirror crates/cayenne/src/provider/delta_encoding.rs
-// ---------------------------------------------------------------------------
-
-fn builder_with_schemes(schemes: &[&'static dyn Scheme]) -> BtrBlocksCompressorBuilder {
-    schemes
-        .iter()
-        .fold(BtrBlocksCompressorBuilder::empty(), |builder, &scheme| {
-            builder.with_new_scheme(scheme)
-        })
-}
-
-/// Mirror of `delta_encoding::strategy_builder_for_level` (`pub(crate)` there).
-fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuilder> {
-    if level >= 7 {
-        return None;
-    }
-    let builder = match level {
-        0 => BtrBlocksCompressorBuilder::empty(),
-        1 => builder_with_schemes(&[
-            &integer::SparseScheme,
-            &float::NullDominatedSparseScheme,
-            &string::NullDominatedSparseScheme,
-        ]),
-        2 => builder_with_schemes(&[&string::ZstdScheme]),
-        3 => builder_with_schemes(&[
-            &integer::SparseScheme,
-            &integer::IntDictScheme,
-            &integer::FoRScheme,
-            &integer::BitPackingScheme,
-            &integer::ZigZagScheme,
-            &integer::RunEndScheme,
-            &integer::SequenceScheme,
-            &float::NullDominatedSparseScheme,
-            &float::FloatDictScheme,
-            &float::FloatRLEScheme,
-            &string::NullDominatedSparseScheme,
-            &string::StringDictScheme,
-            &string::ZstdScheme,
-        ]),
-        _ => BtrBlocksCompressorBuilder::default().exclude_schemes([string::FSSTScheme.id()]),
-    };
-    Some(WriteStrategyBuilder::default().with_btrblocks_builder(builder))
-}
+use cayenne::provider::delta_encoding::strategy_builder_for_level;
 
 // ---------------------------------------------------------------------------
 // Deterministic data generation
@@ -337,10 +291,7 @@ async fn roundtrip(
     schema: &SchemaRef,
     batches: &[RecordBatch],
 ) {
-    let mut session = VortexSession::default();
-    if let Some(s) = strategy {
-        session = session.set(s);
-    }
+    let session = VortexSession::default();
 
     let arrow = session.arrow();
     let dtype = arrow
@@ -356,8 +307,11 @@ async fn roundtrip(
 
     let mut buf = ByteBufferMut::empty();
     let encode_start = std::time::Instant::now();
-    session
-        .write_options()
+    let mut options = session.write_options();
+    if let Some(strategy) = strategy {
+        options = options.with_strategy(strategy.build());
+    }
+    options
         .write(&mut buf, adapter)
         .await
         .expect("vortex write must succeed");

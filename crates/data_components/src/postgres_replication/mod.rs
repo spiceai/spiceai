@@ -121,6 +121,17 @@ pub enum Error {
     #[snafu(display("Bootstrap stream error: {}", pg_error_detail(source)))]
     Bootstrap { source: tokio_postgres::Error },
 
+    #[snafu(display("PostgreSQL snapshot reader task failed: {source}"))]
+    BootstrapReaderJoin { source: tokio::task::JoinError },
+
+    #[snafu(display("PostgreSQL snapshot reader ended without completing its scan"))]
+    BootstrapReaderMissing,
+
+    #[snafu(display(
+        "Failed to read the initial snapshot of table '{table}': the name now refers to a different table, because the table or its schema was renamed or replaced while the snapshot was read, so the snapshot was discarded"
+    ))]
+    BootstrapRelationChanged { table: String },
+
     #[snafu(display("Invalid Postgres LSN string `{lsn}`: expected `XXXXXXXX/YYYYYYYY`"))]
     InvalidLsn { lsn: String },
 

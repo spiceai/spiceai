@@ -1237,12 +1237,10 @@ mod tests {
 
     /// Sorted rows as text, with `None` for NULL, so two engines' answers compare
     /// as multisets.
-    #[cfg(feature = "sqlite")]
     type Rows = Vec<Vec<Option<String>>>;
 
     /// What `DataFusion` returns for `plan`: the oracle the unparsed SQL is held
     /// to. Executing a plan shares no code with unparsing it.
-    #[cfg(feature = "sqlite")]
     async fn datafusion_rows(plan: &LogicalPlan) -> Rows {
         use datafusion::arrow::array::{Array, AsArray};
         use datafusion::arrow::compute::cast;
@@ -1278,7 +1276,6 @@ mod tests {
     }
 
     /// What `SQLite` returns for `sql` over `tables`, each `name(id TEXT)`.
-    #[cfg(feature = "sqlite")]
     fn sqlite_rows(tables: &[(&str, &[&str])], sql: &str) -> Rows {
         let conn = rusqlite::Connection::open_in_memory().expect("open SQLite");
         for (name, ids) in tables {
@@ -1308,7 +1305,6 @@ mod tests {
 
     /// Unparses `plan` for `SQLite`, runs it over `tables`, and demands the rows
     /// `DataFusion` returns for the plan itself.
-    #[cfg(feature = "sqlite")]
     async fn assert_sqlite_returns_the_plans_rows(
         shape: &str,
         plan: &LogicalPlan,
@@ -1370,7 +1366,6 @@ mod tests {
                 nested(id_table_where("b", b, "1"), JoinType::Left),
             ),
         ];
-        #[cfg(feature = "sqlite")]
         {
             let tables = [("a", a), ("b", b), ("c", c)];
             for (shape, plan) in &shapes {
@@ -1437,7 +1432,6 @@ mod tests {
                 ),
             ),
         ];
-        #[cfg(feature = "sqlite")]
         {
             let tables = [("b", b), ("c", c)];
             for (shape, plan) in &shapes {
@@ -4112,7 +4106,6 @@ mod tests {
             "a date literal must not be cast to DATE for SQLite, which reads it as a number: {sql}"
         );
 
-        #[cfg(feature = "sqlite")]
         {
             let conn = rusqlite::Connection::open_in_memory().expect("open SQLite");
             conn.execute_batch(

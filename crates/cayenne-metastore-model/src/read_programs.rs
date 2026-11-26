@@ -56,6 +56,89 @@ enum Program {
     },
     Append(Vec<(Key, Image)>),
 }
+impl Predicate {
+    fn text(&self) -> String {
+        if self.equals == 4 {
+            format!("t{}", self.table)
+        } else {
+            format!("t{} WHERE c{} = {}", self.table, self.column, self.equals)
+        }
+    }
+}
+/// A program as SQL-like text for the Explorer.
+fn program_text(p: &Program) -> String {
+    match p {
+        Program::Transaction(statements) => format!(
+            "BEGIN; {}; COMMIT",
+            statements
+                .iter()
+                .map(program_text)
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+        Program::Update {
+            predicate,
+            column,
+            limit,
+        } => format!(
+            "UPDATE {} SET c{column} = c{column} + 1 (fails if any c{column} would exceed {limit})",
+            predicate.text()
+        ),
+        Program::Delete(predicate) => format!("DELETE FROM {}", predicate.text()),
+        Program::InsertSelect {
+            predicate,
+            target,
+            key_offset,
+        } => format!(
+            "INSERT INTO t{target} SELECT * FROM {} AT KEY (key + {key_offset}) MOD 3 (fails if a destination row exists)",
+            predicate.text()
+        ),
+        Program::Aggregate { table, target, cap } => format!(
+            "INSERT t{t}.k{k} = [1, 0] IF t{t}.k{k} IS ABSENT AND SUM(t{table}.c0) + 1 <= {cap}",
+            t = target.0,
+            k = target.1
+        ),
+        Program::Absent { lookup, target } => format!(
+            "IF t{}.k{} IS ABSENT SET t{}.k{} = [1, 1]",
+            lookup.0, lookup.1, target.0, target.1
+        ),
+        Program::Blind(writes) => format!(
+            "blind write {}",
+            writes
+                .iter()
+                .map(|((t, k), v)| format!(
+                    "t{t}.k{k}={}",
+                    v.map_or("delete".into(), |v| format!("{v:?}"))
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Program::Insert { target, value } => {
+            format!(
+                "INSERT t{}.k{} = {value:?} (fails if the row exists)",
+                target.0, target.1
+            )
+        }
+        Program::Append(rows) => format!(
+            "append {} (fails if any row exists)",
+            rows.iter()
+                .map(|((t, k), v)| format!("t{t}.k{k}={v:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+fn rows_text(rows: &Rows) -> String {
+    let mut out = vec![];
+    for (t, table) in rows.iter().enumerate() {
+        for (k, row) in table.iter().enumerate() {
+            if let Some(image) = row {
+                out.push(format!("t{t}.k{k}={image:?}"));
+            }
+        }
+    }
+    out.join(" ")
+}
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Mutation {
     key: Key,
@@ -995,6 +1078,95 @@ impl Model for Protocol {
         }
         Some(next)
     }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Start(w) => format!("writer {w} takes a snapshot and plans its program"),
+            Action::TransactionStatement(w) => {
+                format!("writer {w} runs its next transaction statement")
+            }
+            Action::Choose(w, c) => format!("writer {w} chooses program {c}"),
+            Action::Next(w) => format!("writer {w} moves to its next statement"),
+            Action::Cas(w) => format!("writer {w} publishes (CAS on its base)"),
+            Action::Retry(w) => {
+                format!("writer {w} validates against the winners and retries or re-plans")
+            }
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        let mut lines = vec![format!(
+            "rows now: {}",
+            s.versions.last().map(rows_text).unwrap_or_default()
+        )];
+        for (i, w) in s.writers.iter().enumerate() {
+            lines.push(format!(
+                "writer {i}: {} | phase {}, snapshot {}, base {}, attempts {}",
+                program_text(&w.program),
+                w.phase,
+                w.snapshot,
+                w.base,
+                w.attempts
+            ));
+        }
+        lines.push(format!("commits: {}", s.log.len()));
+        lines.push(crate::explorer::flags(&[
+            ("re-planned", s.replanned),
+            ("retried", s.retried),
+            ("transactions interleaved", s.transaction_interleaved),
+        ]));
+        Some(crate::explorer::summary(&lines))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{Event, Timeline, Tone, state_and_trace, steps};
+        let last = path.last_state().clone();
+        let n = last.writers.len();
+        let mut boxes: Vec<(String, Vec<String>, crate::explorer::Tone)> = vec![(
+            format!("HEAD (commit {})", last.log.len()),
+            vec![last.versions.last().map(rows_text).unwrap_or_default()],
+            Tone::Live,
+        )];
+        for (i, w) in last.writers.iter().enumerate() {
+            boxes.push((
+                format!("WRITER {i}"),
+                vec![
+                    program_text(&w.program),
+                    format!(
+                        "snapshot {}, base {}, attempts {}",
+                        w.snapshot, w.base, w.attempts
+                    ),
+                ],
+                Tone::Actor,
+            ));
+        }
+        let mut lanes: Vec<String> = (0..n).map(|i| format!("writer {i}")).collect();
+        lanes.push("head".into());
+        let mut events = vec![];
+        for (before, action, after) in steps(path) {
+            let label = self.format_action(&action);
+            let event = match action {
+                Action::Cas(w) => {
+                    let ok = after.log.len() > before.log.len();
+                    Event::on(
+                        w,
+                        if ok {
+                            "publish lands".to_string()
+                        } else {
+                            "publish refused: head moved".into()
+                        },
+                    )
+                    .to(n)
+                    .tone(if ok { Tone::Live } else { Tone::Gone })
+                }
+                Action::Start(w)
+                | Action::TransactionStatement(w)
+                | Action::Choose(w, _)
+                | Action::Next(w) => Event::on(w, label).tone(Tone::Staged),
+                Action::Retry(w) => Event::on(w, label).tone(Tone::Actor),
+            };
+            events.push(event.breaking(&crate::explorer::broken(self, &before, &after)));
+        }
+        Some(state_and_trace(&boxes, &Timeline { lanes, events }))
+    }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
             Property::always("commit-order program serializability", |_, s: &State| {
@@ -1244,6 +1416,15 @@ impl Model for PredicateProgress {
         }
         Some(n)
     }
+    fn format_action(&self, action: &ProgressAction) -> String {
+        match action {
+            ProgressAction::Ingest => "ingest changes the row the predicate reads".into(),
+            ProgressAction::Validate => {
+                "the writer validates its predicate against the new head".into()
+            }
+            ProgressAction::Publish => "the writer publishes".into(),
+        }
+    }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
             Property::eventually(
@@ -1267,5 +1448,95 @@ impl Model for PredicateProgress {
                 }
             }),
         ]
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::{Program, program_text};
+
+    /// Every program's label names what `execute` does, including when the
+    /// statement fails.
+    #[test]
+    fn every_label_matches_execute() {
+        let p = super::Predicate {
+            table: 0,
+            column: 1,
+            equals: 2,
+        };
+        let cases = [
+            (Program::Delete(p.clone()), "DELETE FROM t0 WHERE c1 = 2"),
+            (
+                Program::InsertSelect {
+                    predicate: p.clone(),
+                    target: 1,
+                    key_offset: 1,
+                },
+                "INSERT INTO t1 SELECT * FROM t0 WHERE c1 = 2 AT KEY (key + 1) MOD 3 (fails if a destination row exists)",
+            ),
+            (
+                Program::Absent {
+                    lookup: (0, 1),
+                    target: (1, 2),
+                },
+                "IF t0.k1 IS ABSENT SET t1.k2 = [1, 1]",
+            ),
+            (
+                Program::Blind(vec![((0, 1), Some([1, 2])), ((1, 0), None)]),
+                "blind write t0.k1=[1, 2], t1.k0=delete",
+            ),
+            (
+                Program::Insert {
+                    target: (0, 1),
+                    value: [1, 2],
+                },
+                "INSERT t0.k1 = [1, 2] (fails if the row exists)",
+            ),
+            (
+                Program::Append(vec![((0, 1), [1, 2])]),
+                "append t0.k1=[1, 2] (fails if any row exists)",
+            ),
+            (
+                Program::Transaction(vec![Program::Delete(p)]),
+                "BEGIN; DELETE FROM t0 WHERE c1 = 2; COMMIT",
+            ),
+        ];
+        for (program, label) in cases {
+            assert_eq!(program_text(&program), label);
+        }
+    }
+
+    /// The label describes what the model executes: each matching row's column
+    /// incremented, the whole statement failing if any result exceeds the limit.
+    #[test]
+    fn update_label_names_the_increment_and_the_ceiling() {
+        let text = program_text(&Program::Update {
+            predicate: super::Predicate {
+                table: 0,
+                column: 1,
+                equals: 2,
+            },
+            column: 0,
+            limit: 2,
+        });
+        assert_eq!(
+            text,
+            "UPDATE t0 WHERE c1 = 2 SET c0 = c0 + 1 (fails if any c0 would exceed 2)"
+        );
+    }
+
+    /// The label describes what the model executes: a fixed insert gated on
+    /// the target being absent and `SUM(c0) + 1` staying within the cap.
+    #[test]
+    fn aggregate_label_names_the_sum_gate_and_the_insert() {
+        let text = program_text(&Program::Aggregate {
+            table: 0,
+            target: (1, 2),
+            cap: 2,
+        });
+        assert_eq!(
+            text,
+            "INSERT t1.k2 = [1, 0] IF t1.k2 IS ABSENT AND SUM(t0.c0) + 1 <= 2"
+        );
     }
 }

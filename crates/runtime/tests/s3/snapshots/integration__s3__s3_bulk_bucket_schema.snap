@@ -2,23 +2,26 @@
 source: crates/runtime/tests/s3/mod.rs
 expression: schema
 ---
-+-----------------+-------------------+-------------+
-| column_name     | data_type         | is_nullable |
-+-----------------+-------------------+-------------+
-| L_ORDERKEY      | Decimal128(38, 0) | NO          |
-| L_PARTKEY       | Decimal128(38, 0) | NO          |
-| L_SUPPKEY       | Decimal128(38, 0) | NO          |
-| L_LINENUMBER    | Decimal128(38, 0) | NO          |
-| L_QUANTITY      | Decimal128(12, 2) | NO          |
-| L_EXTENDEDPRICE | Decimal128(12, 2) | NO          |
-| L_DISCOUNT      | Decimal128(12, 2) | NO          |
-| L_TAX           | Decimal128(12, 2) | NO          |
-| L_RETURNFLAG    | LargeUtf8         | NO          |
-| L_LINESTATUS    | LargeUtf8         | NO          |
-| L_SHIPDATE      | Date32            | NO          |
-| L_COMMITDATE    | Date32            | NO          |
-| L_RECEIPTDATE   | Date32            | NO          |
-| L_SHIPINSTRUCT  | LargeUtf8         | NO          |
-| L_SHIPMODE      | LargeUtf8         | NO          |
-| L_COMMENT       | LargeUtf8         | NO          |
-+-----------------+-------------------+-------------+
++-----------------------+---------------+-------------+
+| column_name           | data_type     | is_nullable |
++-----------------------+---------------+-------------+
+| VendorID              | Int32         | YES         |
+| tpep_pickup_datetime  | Timestamp(µs) | YES         |
+| tpep_dropoff_datetime | Timestamp(µs) | YES         |
+| passenger_count       | Float64       | YES         |
+| trip_distance         | Float64       | YES         |
+| RatecodeID            | Float64       | YES         |
+| store_and_fwd_flag    | LargeUtf8     | YES         |
+| PULocationID          | Int32         | YES         |
+| DOLocationID          | Int32         | YES         |
+| payment_type          | Int64         | YES         |
+| fare_amount           | Float64       | YES         |
+| extra                 | Float64       | YES         |
+| mta_tax               | Float64       | YES         |
+| tip_amount            | Float64       | YES         |
+| tolls_amount          | Float64       | YES         |
+| improvement_surcharge | Float64       | YES         |
+| total_amount          | Float64       | YES         |
+| congestion_surcharge  | Float64       | YES         |
+| Airport_fee           | Float64       | YES         |
++-----------------------+---------------+-------------+

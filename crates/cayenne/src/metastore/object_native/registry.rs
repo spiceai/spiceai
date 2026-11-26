@@ -19,6 +19,7 @@ limitations under the License.
 use super::{Domain, NativeCatalogConfig, OpenSummary, ValueChange, invalid, position};
 use crate::{
     catalog::{CatalogError, CatalogResult, MetadataCatalog},
+    dataset_storage::{object_key_of_url, url_of_object_key},
     metadata::CreateTableOptions,
 };
 use cayenne_metastore_actions::proto;
@@ -37,6 +38,9 @@ pub(super) const REGISTRY: &str = "cayenne:datasets";
 /// The object in a dropped dataset's folder whose time is when it was dropped.
 pub(super) const DROPPED: &str = "dropped";
 
+/// The registry's bookkeeping key holding [`ObjectNativeCatalog::location_id`].
+const LOCATION_ID_KEY: &str = "spice_sys_location_id";
+
 /// The name registry and every dataset's log.
 pub struct ObjectNativeCatalog {
     pub(super) store: Arc<dyn ObjectStore>,
@@ -53,6 +57,8 @@ pub struct ObjectNativeCatalog {
     pub(super) datasets: Path,
     pub(super) transactions: Path,
     routes: RwLock<Routes>,
+    /// [`Self::location_id`], once read: it never changes after it is recorded.
+    location_id: std::sync::OnceLock<String>,
     /// Serializes creating and dropping datasets, and deleting a dropped
     /// dataset's folder.
     pub(super) ddl: Arc<tokio::sync::Mutex<()>>,
@@ -104,6 +110,24 @@ fn sibling(prefix: &Path, name: &str) -> Path {
     Path::from_iter(parts).join(name)
 }
 
+/// Keep `domain`'s writer lease, under [`super::Access::Leased`], for as long
+/// as the catalog holds the log: renew it, or take over once it lapses.
+fn keep_lease_while_open(domain: &Arc<Domain>) {
+    let Some(every) = domain.lease_interval() else {
+        return;
+    };
+    let domain = Arc::downgrade(domain);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(every).await;
+            let Some(domain) = domain.upgrade() else {
+                break;
+            };
+            domain.keep_lease().await;
+        }
+    });
+}
+
 /// A folder name a person browsing the bucket can match to its dataset.
 fn slug(name: &str) -> String {
     let slug: String = name
@@ -122,14 +146,6 @@ fn slug(name: &str) -> String {
     } else {
         slug
     }
-}
-
-/// When the `UUIDv7` that ends `name` (a transaction id or a dataset folder) was
-/// made, or `None` when `name` does not end in one.
-pub(super) fn created_at(name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    let id = name.get(name.len().checked_sub(36)?..)?;
-    let (seconds, nanos) = uuid::Uuid::parse_str(id).ok()?.get_timestamp()?.to_unix();
-    chrono::DateTime::from_timestamp(i64::try_from(seconds).ok()?, nanos)
 }
 
 /// Delete every object under `prefix`.
@@ -254,6 +270,7 @@ impl ObjectNativeCatalog {
         let datasets = sibling(&prefix, "datasets");
         let transactions = sibling(&prefix, "transactions");
         let registry = Arc::new(registry);
+        keep_lease_while_open(&registry);
         let mut routes = Routes::default();
         routes.refresh(&registry, registry.tables().await);
         let entries = registry.positions_under(REGISTRY).await;
@@ -270,8 +287,15 @@ impl ObjectNativeCatalog {
                     Err(object_store::Error::NotFound { .. }) => return Ok((name, None)),
                     Err(error) => return Err(invalid(error)),
                 }
-                let mut domain =
-                    Domain::open_with_config(store, prefix, config, false, anchor, &name).await?;
+                let mut domain = Domain::open_with_config(
+                    store,
+                    prefix,
+                    config,
+                    config.commit_each_change,
+                    anchor,
+                    &name,
+                )
+                .await?;
                 domain.folder = folder;
                 Ok::<_, CatalogError>((name, Some(domain)))
             }
@@ -284,10 +308,14 @@ impl ObjectNativeCatalog {
                 continue;
             };
             let domain = Arc::new(domain);
+            keep_lease_while_open(&domain);
             routes.refresh(&domain, domain.tables().await);
             routes.datasets.insert(name, domain);
         }
-        registry.commit_actions(stale).await?;
+        // Only the instance that writes the registry removes its stale entries.
+        if registry.data_writes.allows() {
+            registry.commit_actions(stale).await?;
+        }
         let catalog = Self {
             store,
             data_store: None,
@@ -297,6 +325,7 @@ impl ObjectNativeCatalog {
             datasets,
             transactions,
             routes: RwLock::new(routes),
+            location_id: std::sync::OnceLock::new(),
             ddl: Arc::new(tokio::sync::Mutex::new(())),
             dropping: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             deletion_holds: parking_lot::Mutex::new(HashMap::new()),
@@ -383,6 +412,11 @@ impl ObjectNativeCatalog {
         options: CreateTableOptions,
     ) -> CatalogResult<String> {
         let name = options.table_name.clone();
+        // Another instance writes the registry: it creates the dataset when it
+        // loads it, and this instance opens what it created.
+        if !self.registry.data_writes.allows() && !self.routes.read().by_name.contains_key(&name) {
+            self.wait_for_registration(&name).await?;
+        }
         let (existing, parent) = {
             let routes = self.routes.read();
             let parent = routes
@@ -409,13 +443,14 @@ impl ObjectNativeCatalog {
             Arc::clone(&self.store),
             self.datasets.clone().join(folder.as_str()),
             self.config,
-            false,
+            self.config.commit_each_change,
             self.anchor.clone(),
             &name,
         )
         .await?;
         domain.folder.clone_from(&folder);
         let domain = Arc::new(domain);
+        keep_lease_while_open(&domain);
         let id = domain.create_table(options).await?;
         // The dataset's bookkeeping kept while it had no log moves to its log,
         // which commits before the registry names it: a crash between leaves a
@@ -447,8 +482,11 @@ impl ObjectNativeCatalog {
     }
 
     /// Dropping a dataset removes its name from the registry, which ends its
-    /// log; its bookkeeping values move to the registry, where they were kept
-    /// before datasets had logs, so they outlive the table as they did then.
+    /// log, and forgets its bookkeeping (load record, append cursor and every
+    /// source position) in the same commit: the next dataset created under the
+    /// name starts empty, so its source must not resume from where this one
+    /// stopped. Values the registry holds for the name while no log has it are
+    /// forgotten with them.
     pub(super) async fn drop_dataset(&self, name: &str) -> CatalogResult<bool> {
         let (domain, own) = {
             let routes = self.routes.read();
@@ -483,11 +521,11 @@ impl ObjectNativeCatalog {
                 .map_err(invalid)?;
             let mut unregister = vec![position(REGISTRY, name, None)];
             unregister.extend(
-                domain
+                self.registry
                     .positions_of(name)
                     .await
                     .into_iter()
-                    .map(|((source, partition), value)| position(&source, &partition, Some(value))),
+                    .map(|((source, partition), _)| position(&source, &partition, None)),
             );
             self.registry.commit_actions(unregister).await?;
             {
@@ -603,8 +641,13 @@ fn location_anchor(location: &str, prefix: &Path) -> Option<Arc<str>> {
     }
     let folder: Vec<_> = prefix.parts().collect();
     let folder = Path::from_iter(folder[..folder.len().checked_sub(1)?].iter().cloned());
-    (url.path().trim_matches('/') == folder.as_ref())
-        .then(|| Arc::from(location.trim_end_matches('/')))
+    if object_key_of_url(&url).ok()? != folder {
+        return None;
+    }
+    // Rebuilt from its keys, so a location that spells an escape differently
+    // (`state%2Ddir`) is encoded as the data paths it is compared with are.
+    let anchor = url_of_object_key(&url, &folder)?;
+    Some(Arc::from(anchor.as_str().trim_end_matches('/')))
 }
 
 /// A new folder for dataset `name`: its slug and a fresh `UUIDv7`. A caller that
@@ -659,6 +702,11 @@ impl ObjectNativeCatalog {
         tracing::info!(
             "{verb} the Cayenne object-native metastore at '{location}': {datasets} datasets with {tables} tables, plus {replayed} commits after their checkpoints, writing as lease {lease}"
         );
+        // The instance that writes the registry records the location's identity
+        // now, so the others can read it whether or not this one ever asks.
+        if catalog.registry.data_writes.allows() {
+            catalog.location_id().await?;
+        }
         Ok(catalog)
     }
     async fn open_at(
@@ -697,6 +745,118 @@ impl ObjectNativeCatalog {
     pub fn data_store(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(self.data_store.as_ref().unwrap_or(&self.store))
     }
+    /// Open the logs of datasets the registry names that this catalog has not
+    /// opened yet: datasets another instance created since this one opened.
+    async fn open_new_dataset_logs(&self) -> CatalogResult<()> {
+        for (name, folder) in self.registry.positions_under(REGISTRY).await {
+            if self.routes.read().datasets.contains_key(&name) {
+                continue;
+            }
+            let folder = String::from_utf8(folder).map_err(invalid)?;
+            let prefix = self.datasets.clone().join(folder.as_str());
+            match self.store.head(&prefix.clone().join("head")).await {
+                Ok(_) => {}
+                // Registered, and its log not created yet.
+                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(error) => return Err(invalid(error)),
+            }
+            let mut domain = Domain::open_with_config(
+                Arc::clone(&self.store),
+                prefix,
+                self.config,
+                self.config.commit_each_change,
+                self.anchor.clone(),
+                &name,
+            )
+            .await?;
+            domain.folder = folder;
+            let domain = Arc::new(domain);
+            keep_lease_while_open(&domain);
+            let tables = domain.tables().await;
+            let mut routes = self.routes.write();
+            routes.refresh(&domain, tables);
+            routes.datasets.insert(name, domain);
+        }
+        Ok(())
+    }
+
+    /// Wait until the instance that writes the registry has registered dataset
+    /// `name`, following the registry and opening the logs of the datasets it
+    /// gains; or until this instance writes the registry itself, which then
+    /// creates the dataset. Two instances started together on an empty location
+    /// both load the dataset, and only the one writing the registry creates it.
+    async fn wait_for_registration(&self, name: &str) -> CatalogResult<()> {
+        let lease = match self.config.access {
+            super::Access::Leased(settings) => settings.duration,
+            super::Access::Writer | super::Access::Replica => {
+                super::LeaseSettings::default().duration
+            }
+        };
+        let deadline = tokio::time::Instant::now() + lease * 4;
+        loop {
+            if self.registry.data_writes.allows() {
+                return Ok(());
+            }
+            self.registry.follow_commits("").await?;
+            self.open_new_dataset_logs().await?;
+            if self.routes.read().by_name.contains_key(name) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(invalid(format!(
+                    "Dataset '{name}' (cayenne) is not in the shared state location yet, and another Spice instance writes the location, so this instance waits for that instance to create it rather than create a second copy. Load the dataset on the instance that writes the location, or retry once it has."
+                )));
+            }
+            tokio::time::sleep((lease / 6).max(std::time::Duration::from_millis(50))).await;
+        }
+    }
+
+    /// This location's identity: a UUID recorded once in the registry by the
+    /// instance that writes it, the first time it is asked. Every instance on
+    /// the location reads the same one, whatever URL or endpoint it reaches the
+    /// location by, and another location never does, so a change source's
+    /// consumer named for it is shared by exactly the instances that share the
+    /// acceleration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read or written, or on an
+    /// instance that does not write the registry while the instance that does
+    /// has not recorded the identity yet.
+    pub async fn location_id(&self) -> CatalogResult<String> {
+        if let Some(id) = self.location_id.get() {
+            return Ok(id.clone());
+        }
+        let recorded = self
+            .registry
+            .sidecar_value_or_record(LOCATION_ID_KEY, || {
+                uuid::Uuid::now_v7().to_string().into_bytes()
+            })
+            .await?;
+        let Some(bytes) = recorded else {
+            return Err(crate::catalog::CatalogError::InvalidOperationNoSource {
+                message: "The state location has no identity yet: the Spice instance that writes it records one when it starts. Retry once that instance is running.".to_string(),
+            });
+        };
+        let id = String::from_utf8(bytes).map_err(|error| {
+            crate::catalog::CatalogError::InvalidOperationNoSource {
+                message: format!("The state location's recorded identity is not text: {error}"),
+            }
+        })?;
+        Ok(self.location_id.get_or_init(|| id).clone())
+    }
+
+    /// Follow whether this instance writes dataset `name`: `true` while it
+    /// does, changing when another instance takes it over or this one does.
+    /// `None` when no log holds the dataset.
+    #[must_use]
+    pub fn writer_watch(&self, name: &str) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.routes
+            .read()
+            .datasets
+            .get(name)
+            .map(|domain| domain.data_writes.watch())
+    }
     /// The prefix of the dataset folders (`…/cayenne/v1/datasets`) in [`Self::store`].
     #[must_use]
     pub fn datasets_prefix(&self) -> &Path {
@@ -706,9 +866,9 @@ impl ObjectNativeCatalog {
     /// `…/<datasets>/<folder>/data` in this catalog's location whose folder is one
     /// [`new_dataset_folder`] makes for `name`.
     pub(super) fn folder_named_by(&self, name: &str, base_path: &str) -> Option<String> {
-        let url = url::Url::parse(base_path).ok()?;
-        let path = url.path().trim_matches('/');
-        let rest = path
+        let key = object_key_of_url(&url::Url::parse(base_path).ok()?).ok()?;
+        let rest = key
+            .as_ref()
             .strip_prefix(self.datasets.as_ref())?
             .strip_prefix('/')?;
         let folder = rest.strip_suffix("/data")?;
@@ -761,33 +921,34 @@ impl ObjectNativeCatalog {
     /// `datasets/<folder>/data`.
     #[must_use]
     pub fn holds_data_at(&self, path: &str) -> bool {
-        let in_datasets = match url::Url::parse(path) {
-            Ok(url) => {
-                // Opened at a location URL: the data must be under that URL, not
-                // under the same key prefix of another bucket.
-                if let Some(anchor) = self.anchor.as_deref()
-                    && !path
-                        .strip_prefix(anchor)
-                        .is_some_and(|rest| rest.starts_with('/'))
-                {
-                    return false;
-                }
-                url.path()
-                    .trim_matches('/')
-                    .strip_prefix(self.datasets.as_ref())
-                    .and_then(|rest| rest.strip_prefix('/'))
-                    .map(str::to_string)
-            }
-            Err(_) => path
+        let Ok(url) = url::Url::parse(path) else {
+            return path
                 .trim_matches('/')
                 .strip_prefix("datasets/")
-                .map(str::to_string),
+                .and_then(|rest| rest.split_once('/'))
+                .is_some_and(|(folder, rest)| {
+                    !folder.is_empty() && (rest == "data" || rest.starts_with("data/"))
+                });
         };
-        in_datasets
-            .as_deref()
-            .and_then(|rest| rest.split_once('/'))
-            .is_some_and(|(folder, rest)| {
-                !folder.is_empty() && (rest == "data" || rest.starts_with("data/"))
+        let Ok(key) = object_key_of_url(&url) else {
+            return false;
+        };
+        // Opened at a location URL: the data must be under that URL, not under
+        // the same key prefix of another bucket. Both are compared as encoded
+        // from their keys.
+        if let Some(anchor) = self.anchor.as_deref()
+            && !url_of_object_key(&url, &key).is_some_and(|canonical| {
+                canonical
+                    .as_str()
+                    .strip_prefix(anchor)
+                    .is_some_and(|rest| rest.starts_with('/'))
             })
+        {
+            return false;
+        }
+        // `<folder>/data[/…]` under the datasets prefix.
+        key.prefix_match(&self.datasets).is_some_and(|mut rest| {
+            rest.next().is_some() && rest.next().is_some_and(|part| part.as_ref() == "data")
+        })
     }
 }

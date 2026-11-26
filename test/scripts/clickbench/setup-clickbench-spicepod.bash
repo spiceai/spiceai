@@ -3,12 +3,12 @@ set -e
 set -o pipefail
 
 # Initialize variables
-engine=arrow
+engine=cayenne
 
 # Function to display usage
 usage() {
     echo "Usage: $0 [-engine acceleration_engine]"
-    echo "  --engine Acceleration Engine: arrow or cayenne (default: arrow)"
+    echo "  --engine Acceleration Engine: cayenne (default: cayenne)"
 }
 
 # Parse command-line options
@@ -26,11 +26,11 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
-# Each engine below writes its own dataset; any other value would write a Spicepod with none.
+# Reject unsupported engines before creating benchmark data or the Spicepod.
 case "$engine" in
-    arrow | cayenne ) ;;
+    cayenne ) ;;
     * )
-        echo "error: Unsupported engine: $engine (expected arrow or cayenne)" 1>&2
+        echo "error: Unsupported engine: $engine (expected cayenne)" 1>&2
         usage
         exit 1
         ;;
@@ -76,17 +76,6 @@ echo "kind: Spicepod" >> spicepod.yaml
 echo "name: $dbname" >> spicepod.yaml
 
 echo "datasets:" >> spicepod.yaml
-
-# Load clickbench data into Arrow Accelerator
-if [ "$engine" = "arrow" ]; then
-echo "  - from: duckdb:hits" >> spicepod.yaml
-echo "    name: hits" >> spicepod.yaml
-echo "    params:" >> spicepod.yaml
-echo "      duckdb_open: $dbname" >> spicepod.yaml
-echo "    acceleration:" >> spicepod.yaml
-echo "      enabled: true" >> spicepod.yaml
-echo "      engine: arrow" >> spicepod.yaml
-fi
 
 # Load clickbench data into Cayenne Accelerator
 if [ "$engine" = "cayenne" ]; then

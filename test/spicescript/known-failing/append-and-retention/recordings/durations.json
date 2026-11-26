@@ -3,7 +3,6 @@
   "append-negative-epoch": 6,
   "append-null-time": 5,
   "append-same-time": 7,
-  "append-upsert-same-time": 7,
   "retention-epoch-formats": 89,
   "retention-sql-after-append-refresh": 5,
   "retention-sql-filtered-read": 5

@@ -21,11 +21,12 @@ limitations under the License.
 //! the sweeps. This is the shape a crash between an upload and its commit leaves
 //! behind once files are written at their final keys.
 //!
-//! The dataset's store follows `CAYENNE_TEST_DATA_STORE`: `local` is a local
-//! directory (through `LocalConditionalPut`), `memory` an in-memory store, and
-//! `fault` the in-memory store under `FaultStore` with no faults armed. A
-//! control on the trunk path (SQLite metastore, data files in a local
-//! directory) shows the planted file is valid data that a listing does adopt.
+//! The dataset is in an object-native test fixture, whose store follows
+//! `CAYENNE_TEST_DATA_STORE` (`memory`, `fault`, `local-location` or `rustfs`;
+//! unset is `memory`), and the planted file is written through that store's
+//! `ObjectStore` API. A control on the trunk path (SQLite metastore, data files
+//! in a local directory) shows the planted file is valid data that a listing
+//! does adopt.
 
 use std::fmt::{self, Display, Formatter};
 use std::ops::Range;
@@ -36,9 +37,8 @@ use std::time::{Duration, Instant};
 use arrow::array::Int64Array;
 use async_trait::async_trait;
 use bytes::Bytes;
-use cayenne::metadata::{CreateTableOptions, ObjectStoreConfig, VortexConfig};
-use cayenne::metastore::object_native::{ObjectNativeCatalog, new_dataset_folder};
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::metadata::{CreateTableOptions, VortexConfig};
+use cayenne::{CayenneTableProvider, MetadataCatalog};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
@@ -49,12 +49,9 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
 };
-use object_store_sim::fault::FaultStore;
 
 use crate::common;
 
-const CATALOG: &str = "state/cayenne/v1/catalog";
-const LOCATION: &str = "s3://bucket/state/cayenne/v1";
 const ORPHAN_FIRST: i64 = 1_000_001;
 const ORPHAN_LAST: i64 = 1_001_000;
 
@@ -232,121 +229,82 @@ fn expected_sum(first: i64, last: i64) -> i64 {
     (first..=last).map(|id| id * 10).sum()
 }
 
-/// A dataset in the object-native location, over the store
-/// `CAYENNE_TEST_DATA_STORE` names.
+/// A dataset in the object-native location of a fixture on the store
+/// `CAYENNE_TEST_DATA_STORE` names, with every request of Cayenne's counted.
 struct Rig {
     label: String,
-    /// The bottom store, read and written by the test outside Cayenne.
+    /// The fixture's store without the counting wrapper, read and written by
+    /// the test outside Cayenne.
     raw: Arc<dyn ObjectStore>,
     counting: Arc<CountingStore>,
-    /// The store the catalog and the tables use.
-    store: Arc<dyn ObjectStore>,
+    fixture: common::TestFixture,
     catalog: parking_lot::RwLock<Arc<dyn MetadataCatalog>>,
-    datasets_prefix: String,
-    _dir: Option<tempfile::TempDir>,
 }
 
 struct Table {
     name: String,
+    /// The key prefix of the table's data files in `Rig::raw`.
     data_prefix: String,
-    data_url: String,
     provider: Arc<CayenneTableProvider>,
     ctx: SessionContext,
 }
 
 impl Rig {
     async fn new() -> Self {
-        let kind = std::env::var("CAYENNE_TEST_DATA_STORE").unwrap_or_else(|_| "local".into());
-        let (raw, dir): (Arc<dyn ObjectStore>, Option<tempfile::TempDir>) = match kind.as_str() {
-            // `local-location` runs on the same local directory store: this rig
-            // addresses its objects by `s3://` URLs, so its keys stay relative.
-            "" | "local" | "local-location" => {
-                let dir = tempfile::tempdir().expect("temp dir");
-                let store =
-                    object_store_occ::local_conditional_put::LocalConditionalPut::new(dir.path())
-                        .expect("local store");
-                (Arc::new(store), Some(dir))
-            }
-            "memory" | "fault" => (Arc::new(object_store::memory::InMemory::new()), None),
-            other => panic!(
-                "CAYENNE_TEST_DATA_STORE is '{other}'; this test runs on 'local', 'local-location', 'memory' or 'fault'"
-            ),
-        };
-        let counting = Arc::new(CountingStore::new(Arc::clone(&raw)));
-        let store: Arc<dyn ObjectStore> = if kind == "fault" {
-            Arc::new(FaultStore::new(
-                Arc::clone(&counting) as Arc<dyn ObjectStore>
-            ))
-        } else {
-            Arc::clone(&counting) as Arc<dyn ObjectStore>
-        };
-        let catalog = Self::open_catalog(&store).await;
-        let datasets_prefix = catalog.datasets_prefix().to_string();
+        let kind = std::env::var("CAYENNE_TEST_DATA_STORE").unwrap_or_default();
+        let mut counting = None;
+        let (fixture, raw) = common::TestFixture::object_native_through(|store| {
+            let wrapper = Arc::new(CountingStore::new(store));
+            counting = Some(Arc::clone(&wrapper));
+            wrapper
+        })
+        .await
+        .expect("object-native fixture");
+        let counting = counting.expect("the fixture wraps its store");
+        let catalog = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
         Self {
             label: format!(
                 "placed[{}]",
                 if kind.is_empty() {
-                    "local"
+                    "memory"
                 } else {
                     kind.as_str()
                 }
             ),
             raw,
             counting,
-            store,
-            catalog: parking_lot::RwLock::new(Arc::new(catalog)),
-            datasets_prefix,
-            _dir: dir,
+            fixture,
+            catalog: parking_lot::RwLock::new(catalog),
         }
-    }
-
-    async fn open_catalog(store: &Arc<dyn ObjectStore>) -> ObjectNativeCatalog {
-        let catalog = ObjectNativeCatalog::open_or_create_at(
-            Arc::clone(store),
-            Path::from(CATALOG),
-            LOCATION,
-        )
-        .await
-        .expect("open the object-native catalog");
-        catalog.init().await.expect("init");
-        catalog
     }
 
     fn catalog(&self) -> Arc<dyn MetadataCatalog> {
         Arc::clone(&self.catalog.read())
     }
 
-    fn builder(
-        &self,
-        catalog: Arc<dyn MetadataCatalog>,
-        ctx: &SessionContext,
-        data_url: &str,
-    ) -> CayenneTableProviderBuilder {
-        crate::common::table_builder_on_store(
-            catalog,
-            ctx.runtime_env(),
-            ObjectStoreConfig {
-                url: url::Url::parse(data_url).expect("data url"),
-                store: Arc::clone(&self.store),
-            },
-        )
-    }
-
     async fn create(&self, name: &str, compaction_trigger_files: usize) -> Table {
-        let data_prefix = format!("{}/{}/data", self.datasets_prefix, new_dataset_folder(name));
-        let data_url = format!("s3://bucket/{data_prefix}");
+        let base_path = self.fixture.data_store.base_path(name);
+        let data_prefix =
+            Path::from_url_path(url::Url::parse(&base_path).expect("data url").path())
+                .expect("data prefix")
+                .to_string();
         let ctx = SessionContext::new();
         let provider = Arc::new(
-            self.builder(self.catalog(), &ctx, &data_url)
-                .create(CreateTableOptions {
-                    table_name: name.to_string(),
-                    schema: schema(),
-                    primary_key: vec![],
-                    on_conflict: None,
-                    base_path: data_url.clone(),
-                    partition_column: None,
-                    vortex_config: vortex_config(compaction_trigger_files),
-                })
+            self.fixture
+                .data_store
+                .create(
+                    self.catalog(),
+                    ctx.runtime_env(),
+                    CreateTableOptions {
+                        table_name: name.to_string(),
+                        schema: schema(),
+                        primary_key: vec![],
+                        on_conflict: None,
+                        base_path,
+                        partition_column: None,
+                        vortex_config: vortex_config(compaction_trigger_files),
+                    },
+                )
                 .await
                 .expect("create the table"),
         );
@@ -355,7 +313,6 @@ impl Rig {
         Table {
             name: name.to_string(),
             data_prefix,
-            data_url,
             provider,
             ctx,
         }
@@ -367,7 +324,6 @@ impl Rig {
         let Table {
             name,
             data_prefix,
-            data_url,
             provider,
             ctx,
         } = table;
@@ -376,12 +332,16 @@ impl Rig {
             .await
             .expect("drain maintenance");
         drop((provider, ctx));
-        let catalog: Arc<dyn MetadataCatalog> = Arc::new(Self::open_catalog(&self.store).await);
+        let catalog: Arc<dyn MetadataCatalog> =
+            common::fixture_catalog(self.fixture.connection_string())
+                .await
+                .expect("reopen the object-native catalog");
         *self.catalog.write() = Arc::clone(&catalog);
         let ctx = SessionContext::new();
         let provider = Arc::new(
-            self.builder(catalog, &ctx, &data_url)
-                .open(&name)
+            self.fixture
+                .data_store
+                .open(catalog, ctx.runtime_env(), &name)
                 .await
                 .expect("reopen the table"),
         );
@@ -393,7 +353,6 @@ impl Rig {
         Table {
             name,
             data_prefix,
-            data_url,
             provider,
             ctx,
         }
@@ -876,7 +835,6 @@ async fn control_the_listing_path_adopts_a_planted_file() {
     let table = Table {
         name: "control".to_string(),
         data_prefix: String::new(),
-        data_url: String::new(),
         provider: Arc::clone(&provider),
         ctx,
     };
@@ -906,7 +864,6 @@ async fn control_the_listing_path_adopts_a_planted_file() {
     let donor_table = Table {
         name: "control_donor".to_string(),
         data_prefix: String::new(),
-        data_url: String::new(),
         provider: Arc::clone(&donor),
         ctx: donor_ctx,
     };

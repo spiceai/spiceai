@@ -581,7 +581,10 @@ mod tests {
             UnnestBehavior::Custom(stamp_repo),
         )
         .with_schema(Some(schema))
-        .build(reqwest::Client::new())
+        .build(
+            reqwest::Client::builder(),
+            std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+        )
         .expect("client to build");
 
         let health_check = GraphQLQuery::try_from(Arc::<str>::from(
@@ -615,7 +618,10 @@ mod tests {
         )
         .with_json_pointer(Some("/data/view/nodes"))
         .with_schema(Some(Arc::clone(&schema)))
-        .build(reqwest::Client::new())
+        .build(
+            reqwest::Client::builder(),
+            std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+        )
         .expect("client to build");
 
         let provider = GraphQLTableProviderBuilder::new(client)
@@ -670,7 +676,10 @@ mod tests {
             UnnestBehavior::Depth(0),
         )
         .with_schema(Some(Arc::clone(&schema)))
-        .build(reqwest::Client::new())
+        .build(
+            reqwest::Client::builder(),
+            std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+        )
         .expect("configured client");
         let provider = GraphQLTableProviderBuilder::new(client)
             .build(query)
@@ -694,7 +703,10 @@ mod tests {
             Url::parse(&server.uri()).expect("fixture URL"),
             UnnestBehavior::Depth(0),
         )
-        .build(reqwest::Client::new())
+        .build(
+            reqwest::Client::builder(),
+            std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+        )
         .expect("inferred client");
         let inferred = GraphQLTableProviderBuilder::new(client)
             .build(query)
@@ -732,7 +744,10 @@ mod tests {
         )
         .with_json_pointer(Some("/data/view/nodes"))
         .with_schema(Some(schema))
-        .build(reqwest::Client::new())
+        .build(
+            reqwest::Client::builder(),
+            std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+        )
         .expect("client to build");
 
         let provider = GraphQLTableProviderBuilder::new(client)
@@ -770,7 +785,12 @@ mod tests {
             )
             .with_json_pointer(Some("/data/view/nodes"))
             .with_schema(Some(Arc::clone(&schema)))
-            .build(reqwest::Client::new())
+            .build(
+                reqwest::Client::builder(),
+                std::sync::Arc::new(
+                    datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                ),
+            )
             .expect("client to build");
 
             GraphQLTableProviderBuilder::new(client)
@@ -809,7 +829,10 @@ mod tests {
             UnnestBehavior::Depth(0),
         )
         .with_json_pointer(Some("/data/view"))
-        .build(reqwest::Client::new())
+        .build(
+            reqwest::Client::builder(),
+            std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+        )
         .expect("client to build");
 
         let mut query = GraphQLQuery::try_from(Arc::<str>::from("query { view { nodes { id } } }"))
