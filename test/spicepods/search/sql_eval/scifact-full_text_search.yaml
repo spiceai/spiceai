@@ -1,0 +1,32 @@
+version: v1
+kind: Spicepod
+name: scifact-full_text_search
+
+# Full-text search on SciFact, evaluated in SQL. After the runtime is ready:
+#
+#   SELECT * FROM retrieval_metrics ORDER BY k;   -- mean metrics at k = 1..10
+#   SELECT * FROM query_metrics WHERE k = 10;     -- one row per judged query
+
+metadata:
+  benchmark_dataset: scifact_retrieval
+
+runtime:
+  functions:
+    enabled: true
+
+dependencies:
+  - search/offline-evals
+  - mteb/scifact
+
+functions:
+  # The search to evaluate: the top 10 corpus rows for one query, best first.
+  - name: search_pipeline
+    from: sql
+    kind: table
+    volatility: stable
+    signature:
+      args: [{ name: query, type: utf8 }]
+      returns:
+        - { name: _id, type: largeutf8 }
+        - { name: _score, type: float64 }
+    body: SELECT _id, _score FROM text_search(corpus, query, limit => 10)
