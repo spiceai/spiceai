@@ -55,9 +55,9 @@ use crate::{
 /// and `read_provider` fails instead.
 ///
 /// It can also be slow (building its connector waits `build_delay_ms` first, and every
-/// `read_provider` waits `read_delay_ms`), counts every build and read it is asked
-/// for, and can report a primary key on `id`, the way `DynamoDB` reports its key
-/// schema.
+/// `read_provider` waits `read_delay_ms`; with [`Self::read_lazily`], every scan waits
+/// `scan_delay_ms`), counts every build, read and lazy scan it is asked for, and can
+/// report a primary key on `id`, the way `DynamoDB` reports its key schema.
 pub(crate) struct UnreachableSource {
     pub(crate) prefix: &'static str,
     up: AtomicBool,
@@ -75,6 +75,8 @@ pub(crate) struct UnreachableSource {
     dynamic_reads: AtomicBool,
     fail_scans: AtomicBool,
     failed_scans: AtomicUsize,
+    scan_delay_ms: AtomicU64,
+    scans: AtomicUsize,
 }
 
 impl UnreachableSource {
@@ -96,6 +98,8 @@ impl UnreachableSource {
             dynamic_reads: AtomicBool::new(false),
             fail_scans: AtomicBool::new(false),
             failed_scans: AtomicUsize::new(0),
+            scan_delay_ms: AtomicU64::new(0),
+            scans: AtomicUsize::new(0),
         })
     }
 
@@ -150,6 +154,18 @@ impl UnreachableSource {
             u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
             Ordering::SeqCst,
         );
+    }
+
+    fn set_scan_delay(&self, delay: Duration) {
+        self.scan_delay_ms.store(
+            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// How many times a lazily read provider was scanned (counted as each scan starts).
+    fn scans(&self) -> usize {
+        self.scans.load(Ordering::SeqCst)
     }
 
     /// How many times a connector was built (counted as each build starts).
@@ -269,6 +285,11 @@ impl TableProvider for DynamicSourceTable {
         filters: &[datafusion::logical_expr::Expr],
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.source.scans.fetch_add(1, Ordering::SeqCst);
+        let delay = self.source.scan_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         if self.source.fail_scans.load(Ordering::SeqCst) {
             self.source.failed_scans.fetch_add(1, Ordering::SeqCst);
             return Err(datafusion::error::DataFusionError::Execution(
@@ -652,6 +673,74 @@ async fn a_dataset_changed_while_its_source_is_down_loads_once_the_source_is_rea
     assert!(
         queryable,
         "the dataset must load once its source is reachable; status {:?}",
+        dataset_status(&rt, "orders")
+    );
+
+    loader.abort();
+    rt.shutdown().await;
+    Ok(())
+}
+
+/// A `refresh_cron` removed while the dataset's initial load runs stays removed: the load
+/// that the reload replaced must not create a schedule from the earlier definition.
+#[tokio::test]
+async fn a_refresh_cron_removed_during_the_initial_load_stays_removed() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let source = UnreachableSource::new("cron-removed-during-load", 3);
+    source.read_lazily();
+    source.set_scan_delay(Duration::from_secs(2));
+    source.register().await;
+    source.bring_up();
+
+    let app = |refresh_cron: Option<&str>| {
+        let mut dataset = SpicepodDataset::new(format!("{}://orders", source.prefix), "orders");
+        dataset.acceleration = Some(spicepod::acceleration::Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode: spicepod::acceleration::Mode::Memory,
+            refresh_cron: refresh_cron.map(str::to_string),
+            ..Default::default()
+        });
+        AppBuilder::new("source_unavailable")
+            .with_dataset(dataset)
+            .build()
+    };
+    configure_test_datafusion();
+    let rt = Arc::new(
+        Runtime::builder()
+            .with_app(app(Some("* * * * * *")))
+            .build()
+            .await,
+    );
+    let loader = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        async move { rt.load_components().await }
+    });
+    let loading = wait_until_true(Duration::from_secs(10), || async { source.scans() > 0 }).await;
+    assert!(loading, "the initial load must start");
+
+    // The replaced load ends while the reload's own load still runs, so only the removal
+    // at the start of the reload can stop the replaced load from creating its schedule.
+    source.set_scan_delay(Duration::from_secs(4));
+    assert!(Arc::clone(&rt).apply_app(Arc::new(app(None))).await);
+    let reloaded = wait_until_true(Duration::from_secs(30), || async {
+        source.scans() >= 2 && matches!(dataset_status(&rt, "orders"), Some(ComponentStatus::Ready))
+    })
+    .await;
+    assert!(
+        reloaded,
+        "the reloaded dataset must load; status {:?}",
+        dataset_status(&rt, "orders")
+    );
+    let scans_after_reload = source.scans();
+    // Longer than a scan plus a cron tick: a schedule of the replaced definition would
+    // start another refresh in this time.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(
+        source.scans(),
+        scans_after_reload,
+        "no scheduled refresh may run after `refresh_cron` is removed; status {:?}",
         dataset_status(&rt, "orders")
     );
 
