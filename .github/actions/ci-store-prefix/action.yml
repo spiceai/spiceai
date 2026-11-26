@@ -35,6 +35,12 @@ runs:
         case "$GITHUB_REF" in
           refs/heads/trunk) prefix='' ;;
           refs/*)
+            # The ref becomes part of keys, TOML strings and s3:// URLs, where `#`, `"` or `&` would
+            # cut it short or change it, so only a plain ref is used.
+            if ! [[ "$GITHUB_REF" =~ ^refs/[A-Za-z0-9._/-]+$ ]] || [[ "$GITHUB_REF" == *..* || "$GITHUB_REF" == *//* || "$GITHUB_REF" == */ ]]; then
+              echo "::error::GITHUB_REF '$GITHUB_REF' is not a plain ref (letters, digits, '.', '_', '-' and '/'); the CI store keys a run by its ref."
+              exit 1
+            fi
             if ! [[ "${GITHUB_REPOSITORY_ID:-}" =~ ^[0-9]+$ ]]; then
               echo "::error::GITHUB_REPOSITORY_ID is '${GITHUB_REPOSITORY_ID:-}', not a repository id; cannot choose the CI store prefix."
               exit 1

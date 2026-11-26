@@ -343,11 +343,14 @@ class StoreWritersUseThePrefixTest(unittest.TestCase):
             self.assertIn("key_prefix", line)
             self.assertIn("CI_STORE_PREFIX", line)
 
-    def test_the_cold_start_fixture_is_seeded_and_read_under_the_runs_prefix(self):
+    def test_the_cold_start_fixture_is_seeded_under_the_runs_prefix_and_trunks_copy_is_read(self):
         steps = yaml.safe_load((GITHUB_DIR / "actions" / "seed-cold-start-fixture" / "action.yml").read_text())["runs"]["steps"]
         self.assertEqual(steps[0].get("uses"), "./.github/actions/ci-store-prefix")
-        text = (GITHUB_DIR / "workflows" / "e2e_test_ci.yml").read_text()
-        self.assertIn("spice-minio/benchmarks/cold_start/${CI_STORE_PREFIX?}audit_events_3m/_SEEDED", text)
+        # The E2E job only reads the fixture, and a merge-queue ref is new for every entry, so it
+        # reads trunk's copy, which no run off trunk can write.
+        job = yaml.safe_load((GITHUB_DIR / "workflows" / "e2e_test_ci.yml").read_text())["jobs"]["test_cold_start_unkeyed_append"]
+        self.assertNotIn("./.github/actions/ci-store-prefix", [step.get("uses") for step in job["steps"]])
+        self.assertIn("spice-minio/benchmarks/cold_start/audit_events_3m/_SEEDED", yaml.safe_dump(job, width=10**6))
 
 
 class SetupSpicedTest(StoreTest):

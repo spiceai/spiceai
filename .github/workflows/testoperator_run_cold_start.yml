@@ -59,7 +59,7 @@ jobs:
     # The only writer of the fixture: two concurrent first seeds would interleave
     # their Delta logs under one prefix.
     concurrency:
-      group: cold-start-fixture-seed
+      group: cold-start-fixture-seed-${{ github.ref }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -85,10 +85,20 @@ class CiStorePrefixTest(unittest.TestCase):
             .replace("s3://benchmarks/cayenne-cold-sf1000/", "s3://benchmarks/cayenne-cold-sf1000/untrusted/394089041/refs/pull/7/merge/"),
         )
 
-    def test_a_ref_with_replacement_characters_is_written_literally(self):
+    def test_only_a_plain_ref_keys_the_store(self):
+        # `#` would cut an s3:// URL short and `"` a TOML string, so such a ref is refused, and the
+        # spicepod is left as it was.
+        for ref in ("refs/heads/a&b#c\\d", 'refs/heads/a"b', "refs/heads/a..b", "refs/heads/a//b", "refs/heads/a/"):
+            with self.subTest(ref=ref):
+                pod = self.dir / "spicepod.yaml"
+                pod.write_text(SPICEPOD)
+                proc, _, _ = self.prefix(ref, str(pod))
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("is not a plain ref", proc.stdout)
+                self.assertEqual(pod.read_text(), SPICEPOD)
         pod = self.dir / "spicepod.yaml"
         pod.write_text(SPICEPOD)
-        ref = "refs/heads/a&b#c\\d"
+        ref = "refs/heads/gh-readonly-queue/trunk/pr-7-0123abc"
         self.assertEqual(self.prefix(ref, str(pod))[0].returncode, 0)
         self.assertIn(f"s3://benchmarks/cold_start/untrusted/394089041/{ref}/audit_events_3m/", pod.read_text())
         self.assertIn("s3://benchmarks/cayenne-datalake/123/", pod.read_text())
