@@ -291,10 +291,10 @@ async fn run(cli: Cli) -> Result<bool> {
                 (spec.clone(), "exact")
             } else {
                 if list.is_none() {
-                    list = Some(release::Releases::load().await?);
+                    list = Some(release::Releases::load()?);
                 }
                 let list = list.as_ref().context("release list was just loaded")?;
-                (list.resolve(&spec)?, "newest published")
+                (list.resolve(&spec)?, "newest recorded")
             };
             let binary = if let Some(binary) = fetched.get(&version) {
                 binary.clone()

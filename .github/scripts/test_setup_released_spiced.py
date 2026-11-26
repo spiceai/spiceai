@@ -76,7 +76,7 @@ class SetupReleasedSpicedTest(unittest.TestCase):
         (self.dir / "routes").write_text("".join(f"{url}\t{path}\n" for url, path in routes.items()))
         (self.dir / "digests.json").write_text(json.dumps({"releases": digests or {}}))
 
-    def find(self, tag, with_odbc="false"):
+    def find(self, tag, with_odbc="false", github_ref="refs/pull/1/merge", full_role=""):
         (self.dir / "step.sh").write_text(self.steps["find"]["run"])
         output = self.dir / "github_output"
         output.write_text("")
@@ -86,6 +86,8 @@ class SetupReleasedSpicedTest(unittest.TestCase):
             "RUNNER_TEMP": str(self.dir),
             "GITHUB_OUTPUT": str(output),
             "GITHUB_REPOSITORY": "owner/repo",
+            "GITHUB_REF": github_ref,
+            "CI_ROLE_FULL": full_role,
             "GH_TOKEN": "a-token",
             "RELEASE": tag,
             "SPICEPOD_FILE": str(self.dir / "spicepod.yaml"),
@@ -119,7 +121,7 @@ class SetupReleasedSpicedTest(unittest.TestCase):
         self.serve("v2.4.9")
         proc, found = self.find("v2.4.9")
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        self.assertIn("cannot be verified; not running it", proc.stdout)
+        self.assertIn("publishes no SHA256SUMS, so its spiced cannot be verified", proc.stdout)
         self.assertEqual(found, {})
 
     def test_a_release_with_sha256sums_is_checked_against_it_and_its_attestations(self):
@@ -128,6 +130,13 @@ class SetupReleasedSpicedTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(found["attested"], "true")
         self.assertIn("matches the SHA256SUMS of v2.5.0", proc.stdout)
+        # On trunk, or with the full CI roles, only a recorded release runs.
+        for github_ref, full_role in (("refs/heads/trunk", ""), ("refs/pull/1/merge", "true")):
+            with self.subTest(github_ref=github_ref, full_role=full_role):
+                proc, found = self.find("v2.5.0", github_ref=github_ref, full_role=full_role)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("runs only a recorded release", proc.stdout)
+                self.assertEqual(found, {})
         for name in ("Verify SHA256SUMS's build attestation", "Verify the archive's build attestation"):
             with self.subTest(step=name):
                 step = self.steps[name]
@@ -138,11 +147,22 @@ class SetupReleasedSpicedTest(unittest.TestCase):
         order = list(self.steps)
         self.assertLess(order.index("Verify the archive's build attestation"), order.index("Install the released spiced"))
 
+    def test_a_recorded_release_with_sha256sums_needs_both_to_agree(self):
+        self.serve("v2.5.0", sums=f"{self.digest}  {ASSET}\n", digests={"v2.5.0": {ASSET: self.digest}})
+        proc, found = self.find("v2.5.0", github_ref="refs/heads/trunk")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(found["attested"], "true")
+        self.assertIn("matches .github/release-digests.json and the SHA256SUMS of v2.5.0", proc.stdout)
+        self.serve("v2.5.0", sums=f"{'b' * 64}  {ASSET}\n", digests={"v2.5.0": {ASSET: self.digest}})
+        proc, found = self.find("v2.5.0", github_ref="refs/heads/trunk")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("but its SHA256SUMS lists", proc.stdout)
+
     def test_sha256sums_that_does_not_list_the_archive_is_refused(self):
         self.serve("v2.5.0", sums=f"{self.digest}  spice_linux_x86_64.tar.gz\n")
         proc, _ = self.find("v2.5.0")
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        self.assertIn("cannot be verified", proc.stdout)
+        self.assertIn("does not list", proc.stdout)
 
     def test_a_value_that_is_not_a_release_tag_is_refused(self):
         for tag in ("release/2.4", "v2.4.3/../../x", "v2.4", "trunk"):

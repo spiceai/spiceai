@@ -16,25 +16,28 @@ limitations under the License.
 
 //! Resolves script base releases and caches their OSS binaries.
 //!
-//! A release's `spiced` runs only once its archive is verified: against the
-//! digest `.github/release-digests.json` records for a release published
-//! before SHA256SUMS, or else against the release's SHA256SUMS, with the
-//! archive and SHA256SUMS each carrying a build attestation from
-//! `build_release.yml` on a release branch. A cached archive is verified the
-//! same way each time it is used, and `spiced` is unpacked from it afresh.
+//! The releases a script can start on are the ones `.github/release-digests.json`
+//! records, a file only a reviewed trunk change edits: `X.Y.x` resolves among
+//! them, and each one's `spiced` archive must match its recorded digest. A
+//! release that also publishes SHA256SUMS is checked against it too, and
+//! SHA256SUMS and the archive must each carry a build attestation from
+//! `build_release.yml` on a release branch, for the commit its tag names. Off
+//! trunk, outside a job with the full CI roles, an exact release that is not
+//! recorded may run on SHA256SUMS and the attestations alone. A cached archive
+//! is verified the same way each time it is used, and `spiced` is unpacked from
+//! it afresh.
 
 use std::{
     collections::BTreeMap,
     io::Read,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-/// The reviewed digests of the releases published before SHA256SUMS.
+/// The digests of the recorded releases, reviewed on trunk.
 const RELEASE_DIGESTS: &str = include_str!("../../../.github/release-digests.json");
 
 /// The signer a release file's attestation must name: `build_release.yml` on a
@@ -122,140 +125,26 @@ pub struct BaseRelease {
     pub binary: PathBuf,
 }
 
-/// The published OSS releases `X.Y.x` resolves among, as read from GitHub
-/// and cached in `~/.cache/spicescript/releases.json` for [`LIST_TTL`].
-#[derive(Serialize, Deserialize)]
+/// The recorded releases `X.Y.x` resolves among: those
+/// `.github/release-digests.json` records a `spiced` archive for this host.
 pub struct Releases {
-    /// When the list was read from GitHub (RFC 3339).
-    fetched_at: String,
-    /// What each `X.Y.x` resolves to: the newest published X.Y release with
-    /// a `spiced` build for this host.
+    /// What each `X.Y.x` resolves to: the newest recorded X.Y release.
     newest: BTreeMap<String, String>,
 }
 
-/// How long a cached release list is used before GitHub is asked again.
-const LIST_TTL: Duration = Duration::from_hours(1);
-
-const RELEASES_URL: &str = "https://api.github.com/repos/spiceai/spiceai/releases";
-
-#[derive(Deserialize)]
-struct GithubRelease {
-    tag_name: String,
-    draft: bool,
-    prerelease: bool,
-    assets: Vec<GithubAsset>,
-}
-
-impl GithubRelease {
-    fn has(&self, name: &str) -> bool {
-        self.assets.iter().any(|a| a.name == name)
-    }
-}
-
-#[derive(Deserialize)]
-struct GithubAsset {
-    name: String,
-}
-
 impl Releases {
-    /// The cached list while it is fresh, else the list from GitHub. When
-    /// GitHub can't be reached, a stale cached list is used with a warning.
-    pub async fn load() -> Result<Self> {
-        let path = cache_dir()?.join("releases.json");
-        let mut cached = tokio::fs::read_to_string(&path)
-            .await
-            .ok()
-            .and_then(|text| serde_json::from_str::<Self>(&text).ok());
-        if let Some(fresh) = cached.take_if(|c| c.age().is_some_and(|age| age < LIST_TTL)) {
-            return Ok(fresh);
-        }
-        match Self::from_github().await {
-            Ok(releases) => {
-                let partial = path.with_extension(format!("json.partial-{}", std::process::id()));
-                tokio::fs::create_dir_all(cache_dir()?).await?;
-                tokio::fs::write(&partial, serde_json::to_string_pretty(&releases)? + "\n").await?;
-                tokio::fs::rename(&partial, &path).await?;
-                println!("Spice releases read from GitHub into {}", path.display());
-                Ok(releases)
-            }
-            Err(e) => {
-                let cached = cached.with_context(|| {
-                    format!("Failed to list Spice releases on GitHub to resolve `from: X.Y.x`, and none are cached in {}. Pass --from-release X.Y.x=X.Y.Z or --from PATH. Cause: {e:#}", path.display())
-                })?;
-                println!(
-                    "warning: failed to list Spice releases on GitHub, so `from: X.Y.x` resolves with the list read at {} from {}. Cause: {e:#}",
-                    cached.fetched_at,
-                    path.display()
-                );
-                Ok(cached)
-            }
-        }
-    }
-
-    fn age(&self) -> Option<Duration> {
-        let fetched = chrono::DateTime::parse_from_rfc3339(&self.fetched_at).ok()?;
-        (chrono::Utc::now() - fetched.with_timezone(&chrono::Utc))
-            .to_std()
-            .ok()
-    }
-
-    async fn from_github() -> Result<Self> {
-        let token = ["GITHUB_TOKEN", "GH_TOKEN"]
-            .into_iter()
-            .find_map(|name| std::env::var(name).ok().filter(|t| !t.is_empty()));
-        let client = reqwest::Client::new();
-        let mut releases = Vec::new();
-        // GitHub returns at most 100 releases a page, newest first.
-        for page in 1..=20 {
-            let mut request = client
-                .get(RELEASES_URL)
-                .query(&[("per_page", "100"), ("page", &page.to_string())])
-                .header(reqwest::header::USER_AGENT, "spicescript")
-                .header(reqwest::header::ACCEPT, "application/vnd.github+json");
-            if let Some(token) = &token {
-                request = request.bearer_auth(token);
-            }
-            let response = request.send().await?;
-            let status = response.status();
-            ensure!(
-                status.is_success(),
-                "GET {RELEASES_URL} returned {status}{}",
-                if token.is_none() {
-                    "; set GITHUB_TOKEN to raise GitHub's rate limit"
-                } else {
-                    ""
-                }
-            );
-            let page: Vec<GithubRelease> = response.json().await?;
-            let last = page.len() < 100;
-            releases.extend(page);
-            if last {
-                break;
-            }
-        }
+    /// The recorded releases, read from `.github/release-digests.json`.
+    pub fn load() -> Result<Self> {
+        let digests: ReleaseDigests = serde_json::from_str(RELEASE_DIGESTS)
+            .context("Failed to read .github/release-digests.json")?;
         let asset = host_asset()?;
-        let published: Vec<&GithubRelease> = releases
+        let versions = digests
+            .releases
             .iter()
-            .filter(|r| !r.draft && !r.prerelease && r.has(&asset))
-            .collect();
-        // Only a release whose spiced can be verified is a base release.
-        let mut verifiable = Vec::new();
-        for release in published {
-            let Some(version) = release.tag_name.strip_prefix('v') else {
-                continue;
-            };
-            if release.has(SUMS) || pinned_digest(version, &asset)?.is_some() {
-                verifiable.push(version);
-            } else if Version::parse(version).is_ok_and(|v| v.patch.is_some()) {
-                println!(
-                    "warning: release {} has no SHA256SUMS and no digest in .github/release-digests.json, so `X.Y.x` never resolves to it",
-                    release.tag_name
-                );
-            }
-        }
+            .filter(|(_, assets)| assets.contains_key(&asset))
+            .filter_map(|(tag, _)| tag.strip_prefix('v'));
         Ok(Self {
-            fetched_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            newest: newest_per_minor(verifiable.into_iter()),
+            newest: newest_per_minor(versions),
         })
     }
 
@@ -267,8 +156,8 @@ impl Releases {
         }
         self.newest.get(spec).cloned().with_context(|| {
             format!(
-                "no published {}.{} release on GitHub (as of {}) has a spiced build for this host; pass --from-release {spec}=X.Y.Z or --from PATH",
-                version.major, version.minor, self.fetched_at
+                "no {}.{} release with a spiced build for this host is recorded in .github/release-digests.json; record it with a trunk change, or pass --from-release {spec}=X.Y.Z or --from PATH",
+                version.major, version.minor
             )
         })
     }
@@ -405,44 +294,136 @@ pub const CURL_RELEASE_RETRY: [&str; 5] = [
     "300",
 ];
 
-/// What a release's archive must be: its SHA-256, and whether its build
-/// attestation must also verify (a release with SHA256SUMS).
+/// What a release's archive must be: its SHA-256, and for a release with
+/// SHA256SUMS, the commit its tag names, which the archive's build attestation
+/// must record.
+#[derive(Debug)]
 struct Expected {
     sha256: String,
-    attested: bool,
+    attested_commit: Option<String>,
 }
 
-/// The pinned digest of a release published before SHA256SUMS, or else the
-/// digest its SHA256SUMS lists, once SHA256SUMS's own attestation verifies.
+/// Whether this run trusts only the recorded digests: a GitHub Actions run on
+/// trunk, or one with the full CI roles (`CI_ROLE_FULL`).
+fn recorded_only() -> bool {
+    let var = |name: &str| std::env::var(name).ok();
+    recorded_only_for(
+        var("GITHUB_ACTIONS").as_deref(),
+        var("GITHUB_REF").as_deref(),
+        var("CI_ROLE_FULL").as_deref(),
+    )
+}
+
+fn recorded_only_for(
+    actions: Option<&str>,
+    git_ref: Option<&str>,
+    full_role: Option<&str>,
+) -> bool {
+    actions == Some("true") && (git_ref == Some("refs/heads/trunk") || full_role == Some("true"))
+}
+
+/// The recorded digest of the archive, checked against the release's
+/// SHA256SUMS and its attestation when it publishes one. A release that is not
+/// recorded is refused on trunk and with the full CI roles; elsewhere its
+/// attested SHA256SUMS decides.
 async fn expected_digest(version: &str, asset: &str, work: &Path) -> Result<Expected> {
-    if let Some(sha256) = pinned_digest(version, asset)? {
-        return Ok(Expected {
-            sha256,
-            attested: false,
-        });
+    let pinned = pinned_digest(version, asset)?;
+    if pinned.is_none() && recorded_only() {
+        bail!(
+            "v{version} is not recorded in .github/release-digests.json, and a run on trunk or with the full CI roles runs only a recorded release; record it with a trunk change"
+        );
     }
     let sums = work.join(SUMS);
+    let from_sums = if download_sums(version, &sums).await? {
+        let commit = tag_commit(version).await?;
+        verify_attestation(&sums, &commit).await?;
+        let text = tokio::fs::read_to_string(&sums).await?;
+        let digest = sums_digest(&text, asset)
+            .with_context(|| format!("the {SUMS} of v{version} does not list {asset}"))?;
+        Some((digest, commit))
+    } else {
+        None
+    };
+    decide(version, asset, pinned, from_sums)
+}
+
+/// The recorded digest wins; SHA256SUMS, when the release has one, must agree
+/// with it, and its attestation's commit is then required of the archive too.
+fn decide(
+    version: &str,
+    asset: &str,
+    pinned: Option<String>,
+    from_sums: Option<(String, String)>,
+) -> Result<Expected> {
+    match (pinned, from_sums) {
+        (Some(pinned), None) => Ok(Expected {
+            sha256: pinned,
+            attested_commit: None,
+        }),
+        (Some(pinned), Some((listed, commit))) => {
+            ensure!(
+                pinned == listed,
+                "v{version} {asset} is recorded as {pinned} in .github/release-digests.json, but its {SUMS} lists {listed}"
+            );
+            Ok(Expected {
+                sha256: pinned,
+                attested_commit: Some(commit),
+            })
+        }
+        (None, Some((listed, commit))) => Ok(Expected {
+            sha256: listed,
+            attested_commit: Some(commit),
+        }),
+        (None, None) => bail!(
+            "v{version} is not recorded in .github/release-digests.json and publishes no {SUMS}, so its spiced cannot be verified"
+        ),
+    }
+}
+
+/// Downloads the release's SHA256SUMS: whether it has one (a 404 means none).
+async fn download_sums(version: &str, sums: &Path) -> Result<bool> {
     let url = format!("https://github.com/spiceai/spiceai/releases/download/v{version}/{SUMS}");
-    let status = tokio::process::Command::new("curl")
+    let output = tokio::process::Command::new("curl")
         .args(CURL_RELEASE_RETRY)
-        .args(["-fsSL", "-o"])
-        .arg(&sums)
+        .args(["-sSL", "-w", "%{http_code}", "-o"])
+        .arg(sums)
         .arg(&url)
-        .status()
+        .output()
         .await
         .context("Failed to run curl")?;
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "200" if output.status.success() => Ok(true),
+        "404" => Ok(false),
+        code => bail!(
+            "Failed to download {url} (HTTP {code}): {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+/// The commit the release tag `v{version}` names, read by the tag's full name.
+async fn tag_commit(version: &str) -> Result<String> {
+    let output = tokio::process::Command::new("gh")
+        .args([
+            "api",
+            &format!("repos/spiceai/spiceai/commits/refs/tags/v{version}"),
+            "--jq",
+            ".sha",
+        ])
+        .output()
+        .await
+        .context(
+            "Failed to run gh, which reads the commit a release tag names; install the GitHub CLI",
+        )?;
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
     ensure!(
-        status.success(),
-        "v{version} has no digest in .github/release-digests.json and its {SUMS} could not be downloaded from {url}, so its spiced cannot be verified"
+        output.status.success()
+            && commit.len() == 40
+            && commit.bytes().all(|b| b.is_ascii_hexdigit()),
+        "Failed to read the commit v{version} names: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
     );
-    verify_attestation(&sums).await?;
-    let text = tokio::fs::read_to_string(&sums).await?;
-    let sha256 =
-        sums_digest(&text, asset).with_context(|| format!("{url} does not list {asset}"))?;
-    Ok(Expected {
-        sha256,
-        attested: true,
-    })
+    Ok(commit)
 }
 
 /// The digest a SHA256SUMS file lists for `asset` (`<digest>  <name>` or
@@ -457,8 +438,8 @@ fn sums_digest(text: &str, asset: &str) -> Option<String> {
 }
 
 /// Fails unless the file carries a build attestation from `build_release.yml`
-/// on a release branch, on a GitHub-hosted runner.
-async fn verify_attestation(file: &Path) -> Result<()> {
+/// on a release branch, on a GitHub-hosted runner, for `commit`.
+async fn verify_attestation(file: &Path, commit: &str) -> Result<()> {
     let output = tokio::process::Command::new("gh")
         .args(["attestation", "verify"])
         .arg(file)
@@ -468,6 +449,8 @@ async fn verify_attestation(file: &Path) -> Result<()> {
             "--cert-identity-regex",
             RELEASE_SIGNER,
             "--deny-self-hosted-runners",
+            "--source-digest",
+            commit,
         ])
         .output()
         .await
@@ -507,8 +490,8 @@ async fn check_archive(archive: &Path, expected: &Expected) -> Result<()> {
         archive.display(),
         expected.sha256
     );
-    if expected.attested {
-        verify_attestation(archive).await?;
+    if let Some(commit) = &expected.attested_commit {
+        verify_attestation(archive, commit).await?;
     }
     Ok(())
 }
@@ -620,14 +603,14 @@ mod tests {
         );
         let good = Expected {
             sha256: actual.clone(),
-            attested: false,
+            attested_commit: None,
         };
         check_archive(&archive, &good)
             .await
             .expect("the expected digest");
         let bad = Expected {
             sha256: "0".repeat(64),
-            attested: false,
+            attested_commit: None,
         };
         let error = check_archive(&archive, &bad)
             .await
@@ -643,7 +626,6 @@ mod tests {
     #[test]
     fn minor_lines_resolve_to_the_highest_numeric_patch() {
         let releases = Releases {
-            fetched_at: "2026-10-28T00:00:00Z".to_string(),
             newest: newest_per_minor(
                 [
                     "2.3.9",
@@ -669,7 +651,80 @@ mod tests {
                 .resolve("2.5.x")
                 .expect_err("only a release candidate")
                 .to_string(),
-            "no published 2.5 release on GitHub (as of 2026-10-28T00:00:00Z) has a spiced build for this host; pass --from-release 2.5.x=X.Y.Z or --from PATH"
+            "no 2.5 release with a spiced build for this host is recorded in .github/release-digests.json; record it with a trunk change, or pass --from-release 2.5.x=X.Y.Z or --from PATH"
         );
+    }
+
+    #[test]
+    fn x_y_x_resolves_only_among_recorded_releases() {
+        let releases = Releases::load().expect("the recorded releases");
+        assert_eq!(releases.resolve("2.4.x").expect("2.4 recorded"), "2.4.3");
+        assert_eq!(releases.resolve("2.3.x").expect("2.3 recorded"), "2.3.4");
+        releases
+            .resolve("2.2.x")
+            .expect_err("no 2.2 release is recorded");
+    }
+
+    #[test]
+    fn only_a_ci_run_off_trunk_without_the_full_roles_may_run_an_unrecorded_release() {
+        assert!(recorded_only_for(
+            Some("true"),
+            Some("refs/heads/trunk"),
+            None
+        ));
+        assert!(recorded_only_for(
+            Some("true"),
+            Some("refs/pull/1/merge"),
+            Some("true")
+        ));
+        assert!(!recorded_only_for(
+            Some("true"),
+            Some("refs/pull/1/merge"),
+            None
+        ));
+        assert!(!recorded_only_for(
+            Some("true"),
+            Some("refs/heads/release/2.4"),
+            Some("false")
+        ));
+        assert!(!recorded_only_for(None, Some("refs/heads/trunk"), None));
+    }
+
+    #[test]
+    fn the_recorded_digest_wins_and_sha256sums_must_agree_with_it() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let commit = "c".repeat(40);
+        let asset = "spiced_linux_x86_64.tar.gz";
+        let pinned = decide("2.4.3", asset, Some(a.clone()), None).expect("recorded");
+        assert_eq!(
+            (pinned.sha256.as_str(), pinned.attested_commit),
+            (a.as_str(), None)
+        );
+        let both = decide(
+            "2.5.0",
+            asset,
+            Some(a.clone()),
+            Some((a.clone(), commit.clone())),
+        )
+        .expect("agree");
+        assert_eq!(
+            (both.sha256.as_str(), both.attested_commit.as_deref()),
+            (a.as_str(), Some(commit.as_str()))
+        );
+        let error = decide("2.5.0", asset, Some(a), Some((b.clone(), commit.clone())))
+            .expect_err("disagree")
+            .to_string();
+        assert!(
+            error.contains("is recorded as") && error.contains(&b),
+            "{error}"
+        );
+        let sums =
+            decide("2.5.1", asset, None, Some((b.clone(), commit.clone()))).expect("attested sums");
+        assert_eq!(
+            (sums.sha256.as_str(), sums.attested_commit.as_deref()),
+            (b.as_str(), Some(commit.as_str()))
+        );
+        decide("2.5.2", asset, None, None).expect_err("neither");
     }
 }
