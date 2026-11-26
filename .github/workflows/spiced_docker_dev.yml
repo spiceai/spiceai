@@ -459,23 +459,23 @@ jobs:
           echo "IMAGE_TAG=${IMAGE_TAG}"
           echo "REL_VERSION=${REL_VERSION}"
 
-          sources=""
+          sources=()
 
           if [ -f /tmp/image-amd64.tar ]; then
             echo "Loading AMD64 image"
             docker load -i /tmp/image-amd64.tar
             docker push localhost:5000/spiceai:dev-amd64
-            sources="$sources localhost:5000/spiceai:dev-amd64"
+            sources+=(localhost:5000/spiceai:dev-amd64)
           fi
 
           if [ -f /tmp/image-arm64.tar ]; then
             echo "Loading ARM64 image"
             docker load -i /tmp/image-arm64.tar
             docker push localhost:5000/spiceai:dev-arm64
-            sources="$sources localhost:5000/spiceai:dev-arm64"
+            sources+=(localhost:5000/spiceai:dev-arm64)
           fi
 
-          if [ -z "$sources" ]; then
+          if [ "${#sources[@]}" -eq 0 ]; then
             echo "No images to publish!"
             exit 1
           fi
@@ -485,7 +485,7 @@ jobs:
           # name that digest once pushed: any workflow of this repository can push a tag there,
           # so a digest read back from the tag alone could be another run's image.
           echo "Creating the multi-arch manifest"
-          docker buildx imagetools create -t localhost:5000/spiceai:dev-index $sources
+          docker buildx imagetools create -t localhost:5000/spiceai:dev-index "${sources[@]}"
           digest="$(docker buildx imagetools inspect localhost:5000/spiceai:dev-index --format '{{json .Manifest}}' | jq -r .digest)"
           if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "::error::Could not read the digest of the manifest this job built."
