@@ -478,8 +478,11 @@ NOT_FULL_ROLE = re.compile(r"steps\.ci-role\.outputs\.full\s*!=\s*'true'")
 def _chooses_a_role_for_builds_only(job: object) -> bool:
     """Whether the job's first step is ci-role without `images`, so `full != 'true'` holds off trunk only."""
     steps = _steps(job)
-    return bool(steps) and steps[0].get("uses") == "$/.github/actions/ci-role" and not (
-        (steps[0].get("with") or {}).get("images")
+    return (
+        bool(steps)
+        and steps[0].get("uses") == "$/.github/actions/ci-role"
+        and steps[0].get("id") == "ci-role"
+        and not (steps[0].get("with") or {}).get("images")
     )
 
 

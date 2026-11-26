@@ -788,6 +788,10 @@ class CheckShareOffTrunkTest(unittest.TestCase):
         self.assertEqual(len(self.problems(cond)), 1)
         self.assertEqual(self.problems(cond, role="        with:\n          builds: x\n"), [])
         self.assertEqual(len(self.problems(cond, role="        with:\n          images: x\n")), 1)
+        other = self.DOC.replace("{cond}", cond).replace(
+            "    steps:\n", "    steps:\n      - uses: $/.github/actions/ci-role\n        id: role\n", 1
+        )
+        self.assertEqual(len([p for p in check_workflow_yaml.check_workflow(other) if "macOS share" in p]), 1)
 
 
 class CheckAppStoreCredentialsTest(unittest.TestCase):
