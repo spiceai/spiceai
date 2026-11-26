@@ -323,6 +323,7 @@ async fn fetch_into(
         tokio::fs::remove_file(&dir).await?;
     }
     tokio::fs::create_dir_all(&dir).await?;
+    remove_stale_scratch(&dir).await;
     let kept_matches = kept.is_file()
         && !kept.is_symlink()
         && sha256_file(&kept).is_ok_and(|actual| actual == archive.sha256);
@@ -331,6 +332,8 @@ async fn fetch_into(
         let downloaded = download.0.join(&archive.asset);
         let status = tokio::process::Command::new("curl")
             .args(crate::release::CURL_RELEASE_RETRY)
+            // `--retry-max-time` bounds the retries, not one stalled transfer.
+            .args(["--max-time", &DOWNLOAD_MAX.as_secs().to_string()])
             .args(["-fsSL", "-o"])
             .arg(&downloaded)
             .arg(url)
@@ -376,6 +379,33 @@ async fn fetch_into(
     // A rename, so a process already running the file it replaces keeps it.
     tokio::fs::rename(&file, &target).await?;
     Ok(target)
+}
+
+/// The longest one download of a release may take (curl's `--max-time`).
+const DOWNLOAD_MAX: std::time::Duration = std::time::Duration::from_mins(30);
+
+/// Removes the download and unpack directories ([`Scratch`]) in `dir` that a
+/// process killed while fetching left behind. Only those older than four
+/// times the longest a download may take: a live one is never that old, since
+/// its curl would have given up and its process removed it.
+async fn remove_stale_scratch(dir: &std::path::Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let stale = (name.starts_with(".download-") || name.starts_with(".unpack-"))
+            && entry
+                .metadata()
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > DOWNLOAD_MAX * 4);
+        if stale {
+            let _ = tokio::fs::remove_dir_all(entry.path()).await;
+        }
+    }
 }
 
 /// `sql` as a COPY to standard output in the convention PostgreSQL's COPY uses
@@ -473,8 +503,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        Archive, Part, VERSIONS_JSON, archive, copy_to_stdout, fetch_into, parse, releases,
-        sha256_file,
+        Archive, DOWNLOAD_MAX, Part, VERSIONS_JSON, archive, copy_to_stdout, fetch_into, parse,
+        releases, remove_stale_scratch, sha256_file,
     };
 
     const PLATFORMS: [&str; 3] = ["linux-amd64", "linux-arm64", "osx-universal"];
@@ -674,6 +704,35 @@ mod tests {
                 .contains("but test/duckdb_versions.json records"),
             "{refused:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_killed_fetchs_scratch_directories_are_removed_once_stale() {
+        let dir = TestDir::new("stale");
+        let release = dir.0.join("duckdb-9.9.9");
+        let made = |name: &str, age: std::time::Duration| {
+            let path = release.join(name);
+            std::fs::create_dir_all(&path).expect("directory");
+            let modified = std::time::SystemTime::now() - age;
+            std::fs::File::open(&path)
+                .and_then(|handle| handle.set_modified(modified))
+                .expect("set its time");
+            path
+        };
+        let stale = DOWNLOAD_MAX * 5;
+        let old_download = made(".download-1-0", stale);
+        let old_unpack = made(".unpack-2-0", stale);
+        // Still in use: not older than a download may take.
+        let live = made(".download-3-0", DOWNLOAD_MAX);
+        // Not a fetch's scratch directory.
+        let other = made("other", stale);
+        std::fs::write(release.join("duckdb"), "the CLI").expect("file");
+
+        remove_stale_scratch(&release).await;
+
+        assert!(!old_download.exists() && !old_unpack.exists());
+        assert!(live.exists() && other.exists());
+        assert_eq!(read(&release.join("duckdb")), "the CLI");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 name: count-distinct-nested
+duration: 6s
 description: >
   Several COUNT(DISTINCT …) in one query, one of them over a list or a
   struct, count 50,000 distinct nested values under a 512 MiB

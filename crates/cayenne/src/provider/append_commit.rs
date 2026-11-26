@@ -142,17 +142,21 @@ impl PreparedResolvedAppend {
             tombstone.published = true;
         }
         let sequence = prepared.snapshot_sequence;
-        self.table
-            .record_new_protected_snapshot_files(&self.snapshot_id, sequence)
+        // Named in the record that makes the snapshot live, so no crash leaves
+        // its files named but never live.
+        let manifest = self
+            .table
+            .new_protected_snapshot_manifest(&self.snapshot_id, sequence)
             .await
             .map_err(Failure::discard)?;
         let reserved_delta = self.table.reserve_live_rows_delta();
-        commit_metadata(catalog, &mut prepared).await?;
+        commit_metadata(catalog, &mut prepared, &manifest).await?;
+        self.table.uncommitted_files().forget(&self.snapshot_id);
 
         let cas_start = Instant::now();
         self.table.publish_prepared_on_conflict_deletions(prepared);
         self.table.feed_staged_ivm_under_fence(None);
-        let published_delta = reserved_delta.published();
+        let published_delta = reserved_delta.published(self.table.statistics_epoch());
         let retention = self.table.has_retention_delete_filters();
         let delta = i64::try_from(self.rows)
             .unwrap_or(i64::MAX)
@@ -194,9 +198,17 @@ async fn commit_tables_at_acknowledgement(
 async fn commit_metadata(
     catalog: &dyn MetadataCatalog,
     prepared: &mut PreparedOnConflictDeletionPublish,
+    files: &[crate::metadata::SnapshotFile],
 ) -> std::result::Result<(), Failure> {
     for attempt in 1..=DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS {
-        let publications: Vec<_> = prepared.catalog_publication().into_iter().collect();
+        let publications: Vec<_> = prepared
+            .catalog_publication()
+            .into_iter()
+            .map(|mut publication| {
+                publication.files = files;
+                publication
+            })
+            .collect();
         // The append is acknowledged when this returns, so its metastore change
         // commits now rather than waiting in a buffering catalog.
         let committed = match catalog.commit_publications(&publications).await {

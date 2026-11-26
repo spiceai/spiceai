@@ -120,7 +120,6 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
    - **Data Accelerators**
      - [ ] [DuckDB Accelerator](https://github.com/spiceai/cookbook/blob/trunk/duckdb/accelerator/README.md)
      - [ ] [PostgreSQL Accelerator](https://github.com/spiceai/cookbook/blob/trunk/postgres/accelerator/README.md)
-     - [ ] [SQLite Accelerator](https://github.com/spiceai/cookbook/blob/trunk/sqlite/accelerator/README.md)
      - [ ] [Arrow Accelerator](https://github.com/spiceai/cookbook/blob/trunk/arrow/README.md)
      - [ ] [Caching Accelerator](https://github.com/spiceai/cookbook/blob/trunk/caching/accelerator/README.md)
      - [ ] Update accelerator status per [Accelerator RC Criteria](https://github.com/spiceai/spiceai/blob/trunk/docs/criteria/accelerators/rc.md)
@@ -265,7 +264,7 @@ In these steps, `{version}` is the version in `version.txt` on the release branc
   - [ ] Monitor the [publish_release run](https://github.com/spiceai/spiceai/actions/workflows/publish_release.yml) for the Docker image builds. When they finish, approve the two Docker image publish jobs. They push the `{version}` and `{version}-cuda` image tags, and move `latest` and `latest-cuda` automatically when the release is the latest release.
   - [ ] Check the [Docker Hub](https://hub.docker.com/r/spiceai/spiceai/tags) and [GHCR](https://github.com/spiceai/spiceai/pkgs/container/spiceai) image tags.
   - If a job fails, re-run the failed jobs of the same run.
-- [ ] **Latest release only:** Pin `v{version}` on install.spiceai.org. Follow "Updating the scripts" in the install.spiceai.org Worker's README, and merge the pull request once its `install-scripts` check passes. Until then, the `Check install.spiceai.org` job of the publish_release run warns with the pin to make.
+- [ ] **Latest release only:** Pin `v{version}` on install.spiceai.org. Follow "Updating the scripts" in the install.spiceai.org Worker's README, and merge the pull request once its checks pass. Merging starts the Worker's deploy, which waits for a second person to approve it ("Deploying" in the same README); the pin is live once that deploy finishes. Until then, the `Check install.spiceai.org` job of the publish_release run warns with the pin to make.
 - [ ] Ensure all newly released SDKs (mentioned in release notes) are published
 - [ ] Publish [spiceai/skills](https://github.com/spiceai/skills) GitHub Release for this runtime version (bump `.claude-plugin/plugin.json` + `marketplace.json` version to match runtime; tag `vX.Y.Z`; confirm [Release Plugin](https://github.com/spiceai/skills/actions/workflows/release.yml) uploaded the zip asset)
 - [ ] Update the [Helm chart](https://github.com/spiceai/spiceai/blob/trunk/deploy/chart) (chart version e.g. `1.8.3` & image.tag e.g. `1.8.3-models`) in the release branch (not in trunk).

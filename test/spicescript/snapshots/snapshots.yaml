@@ -1,4 +1,5 @@
 name: snapshots
+duration: 5s
 description: >
   A Cayenne acceleration with snapshots enabled writes a snapshot after each
   refresh; started on empty local storage with its source down, it bootstraps from the newest snapshot and

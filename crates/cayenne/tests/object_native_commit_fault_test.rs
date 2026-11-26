@@ -1670,7 +1670,7 @@ async fn retired_files_are_answered_from_committed_state_only() {
     cayenne::catalog::with_deferred_commits(async {
         assert!(
             catalog
-                .swap_protected_snapshots(&orders, std::slice::from_ref(&first), &merged, 6)
+                .swap_protected_snapshots(&orders, std::slice::from_ref(&first), &merged, 6, None)
                 .await
                 .expect("merge"),
             "the merge replaces the protected snapshot"

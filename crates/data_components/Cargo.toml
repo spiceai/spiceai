@@ -53,6 +53,7 @@ duration-parse = { path = "../duration-parse" }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
 moka.workspace = true
+opentelemetry.workspace = true
 globset.workspace = true
 hash-index = { path = "../hash-index", features = ["metrics"] }
 http-body-limit = { path = "../http-body-limit" }
@@ -96,7 +97,6 @@ runtime-udfs-api = { path = "../runtime-udfs-api" }
 runtime-request-context = { path = "../runtime-request-context", features = [
   "datafusion",
 ] }
-rusqlite = { workspace = true, optional = true }
 elasticsearch = { path = "../elasticsearch", optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 s3_vectors_metadata_filter = { path = "../s3_vectors_metadata_filter", optional = true }
@@ -173,11 +173,6 @@ postgres = [
 s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter"]
 snowflake = ["dep:snowflake-api", "db_connection_pool/snowflake"]
 spark_connect = ["dep:spark-connect-rs"]
-sqlite = [
-    "dep:rusqlite",
-    "datafusion-table-providers/sqlite",
-    "datafusion-table-providers/sqlite-federation",
-]
 
 [dev-dependencies]
 arrow = { workspace = true, features = ["prettyprint"] }
@@ -191,6 +186,7 @@ iceberg-storage-opendal.workspace = true
 iceberg_test_utils = { workspace = true, features = ["tests"] }
 insta.workspace = true
 object_store = { workspace = true }
+rusqlite = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

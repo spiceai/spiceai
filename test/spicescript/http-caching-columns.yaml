@@ -1,4 +1,5 @@
 name: http-caching-columns
+duration: 7s
 description: >
   Cayenne `refresh_mode: caching` over an HTTP API whose JSON responses are
   decomposed into named columns: reads of one request that differ only in

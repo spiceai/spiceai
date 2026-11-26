@@ -183,7 +183,12 @@ jobs:
         run: |
           DATABRICKS_TOKEN="$(bash .github/scripts/databricks_oidc_token.sh)"
           export DATABRICKS_TOKEN
+          # --require-all-env: this job is meant to hold every live script's
+          # credentials, so a script whose `requires-env` finds one unset (a
+          # secret gone, a token step skipped) fails the job rather than
+          # quietly testing less.
           "${{ steps.spicescript.outputs.path }}" --jobs 3 \
+            --require-all-env \
             --spiced "$(command -v spiced)" \
             --work-dir "$RUNNER_TEMP/spicescript" \
             --results "$RUNNER_TEMP/spicescript-results.json" \

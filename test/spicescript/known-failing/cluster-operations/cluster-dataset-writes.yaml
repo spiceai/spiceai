@@ -1,6 +1,7 @@
 # Known failing (#15539): on a cluster, INSERT INTO a write-mode
 # Cayenne acceleration is acknowledged but the rows never appear in queries.
 name: cluster-dataset-writes
+duration: 40s
 description: >
   On a cluster scheduler with one executor, SQL writes to a Cayenne
   acceleration (`access: read_write`, `write_mode: acceleration`) leave it

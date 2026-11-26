@@ -20,17 +20,14 @@ limitations under the License.
 //! `PostgreSQL` (the oracle, which shares no code with Spice), against the
 //! federated datasets, whose plans Spice rewrites and sends to `PostgreSQL`,
 //! and against accelerations of the same tables, loaded with
-//! `refresh_mode: full` after the connector converts the rows: Arrow
-//! partitioned by `grp`, Cayenne `mode: memory`, Cayenne `mode: file` with its
-//! defaults, which keeps a load this small as rows inlined in its metastore,
-//! Cayenne `mode: file` with inlining turned off, which writes and reads Vortex
-//! files, and, with the `sqlite` feature, `SQLite` `mode: memory` and
-//! `mode: file`. Spice sends each query over a `SQLite` acceleration to `SQLite`
-//! as SQL in `SQLite`'s dialect, so those sides check that translation, and
-//! must read nothing but `SQLite`. The Cayenne sides read the rows
-//! back through Cayenne's own scan, with filters and projections pushed into
-//! it, so a value Cayenne stores, encodes, or prunes wrongly shows up as a row
-//! that differs from `PostgreSQL`'s. Every side answers each query three
+//! `refresh_mode: full` after the connector converts the rows: Cayenne
+//! `mode: memory`, Cayenne `mode: file` with its defaults, which keeps a load
+//! this small as rows inlined in its metastore, Cayenne `mode: file` with
+//! inlining turned off, which writes and reads Vortex files, and Cayenne
+//! `mode: file` partitioned by `grp`. The Cayenne sides
+//! read the rows back through Cayenne's own scan, with filters and projections
+//! pushed into it, so a value Cayenne stores, encodes, or prunes wrongly shows
+//! up as a row that differs from `PostgreSQL`'s. Every side answers each query three
 //! ways a user can send it: in-process, over HTTP `/v1/sql`, and over Flight
 //! SQL, so a value the JSON or Flight encoder changes on its way out differs
 //! from `PostgreSQL`'s too, and each way's `EXPLAIN` must show the path its
@@ -69,8 +66,8 @@ use crate::{
     acceleration::has_vortex_file,
     configure_test_datafusion,
     federation_differential::{
-        Case, PlanCheck, Row, agreement, check_cayenne_sources, check_federated, check_sources,
-        empty, operators, ordered, physical_plan, render, rows, spice_rows,
+        Case, PlanCheck, Row, agreement, check_cayenne_sources, check_federated, empty, operators,
+        ordered, physical_plan, render, rows, spice_rows,
     },
     init_tracing,
     postgres::common::{self, get_pg_params},
@@ -113,7 +110,7 @@ const SEED: &[&str] = &[
        (NULL, 'nowhere'), (7, 'unused')",
 ];
 
-/// The scans that send SQL to `PostgreSQL`, or to a `SQLite` acceleration.
+/// The scans that send SQL to `PostgreSQL`.
 const REMOTE_SCANS: [&str; 2] = ["VirtualExecutionPlan", "SqlExec"];
 
 fn cases() -> Vec<Case> {
@@ -262,16 +259,9 @@ enum Kind {
     /// [`Kind::CayenneFile`] with `inline_max_rows: 0`, so the load is written
     /// to Vortex files and every scan reads them.
     CayenneVortex,
-    /// An Arrow acceleration with `partition_by: grp`, loaded once with
-    /// `refresh_mode: full`: one in-memory table per `grp` value, NULL included.
-    PartitionedArrow,
-    /// A `SQLite` acceleration held in memory, loaded once with
-    /// `refresh_mode: full`. Spice sends each query over it to `SQLite` as SQL.
-    #[cfg(feature = "sqlite")]
-    SqliteMemory,
-    /// [`Kind::SqliteMemory`] in a database file on disk.
-    #[cfg(feature = "sqlite")]
-    SqliteFile,
+    /// [`Kind::CayenneFile`] with `partition_by: grp`: one Cayenne table per
+    /// `grp` value, NULL included. Cayenne refuses `partition_by` in memory mode.
+    CayennePartitioned,
 }
 
 /// Where a `mode: file` acceleration of dataset `name` keeps its data.
@@ -279,8 +269,10 @@ fn data_dir(dir: &Path, name: &str) -> PathBuf {
     dir.join(name).join("data")
 }
 
-/// `dir` holds a `mode: file` acceleration's data and metastore, one
-/// directory per dataset `name`.
+/// `dir` holds the `mode: file` accelerations: each dataset's data under its
+/// own `name`, and one metastore for all of them, since one `spiced` process
+/// keeps a single Cayenne catalog (`spiced` refuses datasets that resolve to
+/// different `cayenne_metadata_dir`s).
 fn dataset(port: usize, table: &str, name: &str, kind: Kind, dir: &Path) -> Dataset {
     let mut ds = Dataset::new(format!("postgres:{table}"), name.to_string());
     ds.params = Some(Params::from_string_map(
@@ -301,7 +293,7 @@ fn dataset(port: usize, table: &str, name: &str, kind: Kind, dir: &Path) -> Data
             mode: Mode::Memory,
             ..full
         }),
-        Kind::CayenneFile | Kind::CayenneVortex => {
+        Kind::CayenneFile | Kind::CayenneVortex | Kind::CayennePartitioned => {
             let mut params = HashMap::from([
                 (
                     "cayenne_file_path".to_string(),
@@ -309,43 +301,28 @@ fn dataset(port: usize, table: &str, name: &str, kind: Kind, dir: &Path) -> Data
                 ),
                 (
                     "cayenne_metadata_dir".to_string(),
-                    dir.join(name).join("metadata").display().to_string(),
+                    dir.join("metadata").display().to_string(),
                 ),
             ]);
             if kind == Kind::CayenneVortex {
                 params.insert("cayenne_inline_max_rows".to_string(), "0".to_string());
             }
+            let partition_by = if kind == Kind::CayennePartitioned {
+                vec![PartitionedBy {
+                    name: "grp".to_string(),
+                    expression: "grp".to_string(),
+                }]
+            } else {
+                Vec::new()
+            };
             Some(Acceleration {
                 engine: Some("cayenne".to_string()),
                 mode: Mode::File,
                 params: Some(Params::from_string_map(params)),
+                partition_by,
                 ..full
             })
         }
-        Kind::PartitionedArrow => Some(Acceleration {
-            engine: Some("arrow".to_string()),
-            partition_by: vec![PartitionedBy {
-                name: "grp".to_string(),
-                expression: "grp".to_string(),
-            }],
-            ..full
-        }),
-        #[cfg(feature = "sqlite")]
-        Kind::SqliteMemory => Some(Acceleration {
-            engine: Some("sqlite".to_string()),
-            mode: Mode::Memory,
-            ..full
-        }),
-        #[cfg(feature = "sqlite")]
-        Kind::SqliteFile => Some(Acceleration {
-            engine: Some("sqlite".to_string()),
-            mode: Mode::File,
-            params: Some(Params::from_string_map(HashMap::from([(
-                "sqlite_file".to_string(),
-                dir.join(format!("{name}.db")).display().to_string(),
-            )]))),
-            ..full
-        }),
     };
     ds
 }
@@ -402,24 +379,10 @@ const SUBJECTS: &[Subject] = &[
         kind: Kind::CayenneVortex,
     },
     Subject {
-        name: "partitioned arrow",
-        items: "parrow_items",
-        regions: "parrow_regions",
-        kind: Kind::PartitionedArrow,
-    },
-    #[cfg(feature = "sqlite")]
-    Subject {
-        name: "sqlite memory",
-        items: "smem_items",
-        regions: "smem_regions",
-        kind: Kind::SqliteMemory,
-    },
-    #[cfg(feature = "sqlite")]
-    Subject {
-        name: "sqlite file",
-        items: "sfile_items",
-        regions: "sfile_regions",
-        kind: Kind::SqliteFile,
+        name: "cayenne partitioned",
+        items: "cpart_items",
+        regions: "cpart_regions",
+        kind: Kind::CayennePartitioned,
     },
 ];
 
@@ -438,17 +401,6 @@ async fn surface_rows(
 struct Compared {
     cells: usize,
     all_remote: bool,
-}
-
-/// Checks that every source of the physical plan in `plan` is SQL sent to the
-/// `SQLite` acceleration, so a `SQLite` side answers from `SQLite`.
-#[cfg(feature = "sqlite")]
-fn check_sqlite_sources(plan: &[Row]) -> Result<(), String> {
-    check_sources(
-        plan,
-        |leaf, _| REMOTE_SCANS.contains(&leaf.name) && leaf.line.contains("name=sqlite"),
-        "the SQLite acceleration",
-    )
 }
 
 async fn compare_case(
@@ -483,12 +435,10 @@ async fn compare_case(
             Kind::Federated => {
                 Some(&|plan| check_federated(plan, &REMOTE_SCANS, "PostgreSQL", case.kept_local))
             }
-            Kind::CayenneMemory | Kind::CayenneFile | Kind::CayenneVortex => {
-                Some(&check_cayenne_sources)
-            }
-            Kind::PartitionedArrow => None,
-            #[cfg(feature = "sqlite")]
-            Kind::SqliteMemory | Kind::SqliteFile => Some(&check_sqlite_sources),
+            Kind::CayenneMemory
+            | Kind::CayenneFile
+            | Kind::CayenneVortex
+            | Kind::CayennePartitioned => Some(&check_cayenne_sources),
         };
         for surface in SURFACES {
             let name = format!("{} over {}", subject.name, surface.label());
@@ -585,9 +535,9 @@ async fn federated_and_accelerated_postgres_answers_match_postgres() -> Result<(
                 }
             }
 
-            // The partitioned Arrow side must scan one table per `grp` value,
+            // The partitioned Cayenne side must scan one table per `grp` value,
             // so the partitioned layout is exercised.
-            for subject in SUBJECTS.iter().filter(|s| s.kind == Kind::PartitionedArrow) {
+            for subject in SUBJECTS.iter().filter(|s| s.kind == Kind::CayennePartitioned) {
                 let plan = spice_rows(&rt, &format!("EXPLAIN SELECT id FROM {}", subject.items))
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;

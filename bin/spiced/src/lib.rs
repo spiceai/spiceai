@@ -107,8 +107,6 @@ use connector_spark as _;
 // Same force-linkage for accelerator engines, which self-register via
 // `register_data_accelerator!` into a linkme slice of their own.
 use accelerator_cayenne as _;
-#[cfg(feature = "sqlite")]
-use accelerator_sqlite as _;
 use connector_spiceai as _;
 // The llama.cpp engine registers itself for GGUF models through `llms::register_local_chat_engine!`.
 #[cfg(feature = "llamacpp")]

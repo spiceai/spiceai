@@ -82,7 +82,6 @@ jobs:
           [
             { engine: arrow, mode: memory },
             { engine: cayenne, mode: memory },
-            { engine: sqlite, mode: memory },
           ]
         target:
           - name: 'Linux x64'

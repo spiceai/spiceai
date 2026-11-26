@@ -1,4 +1,5 @@
 name: cluster-failed-dataset-empties-others
+duration: 39s
 description: >
   Known failing (#15539): wrong results, on a cluster only. One dataset that cannot
   load (its source table does not exist) keeps the executor from ever

@@ -206,11 +206,16 @@ impl ObjectNativeLocation {
         })
     }
 
+    /// The key prefix of the catalog's head log in `store`.
+    fn catalog_prefix(&self) -> object_store::path::Path {
+        object_store::path::Path::from(format!("{}/cayenne/v1/catalog", self.state_prefix))
+    }
+
     /// Open the catalog, creating it on first use, as the runtime opens it.
     async fn open(&self) -> Result<ObjectNativeCatalog, Box<dyn std::error::Error>> {
         let catalog = ObjectNativeCatalog::open_or_create_at_with_config(
             Arc::clone(&self.store),
-            object_store::path::Path::from(format!("{}/cayenne/v1/catalog", self.state_prefix)),
+            self.catalog_prefix(),
             &format!("{}/cayenne/v1", self.state_url),
             harness_native_config(),
         )
@@ -888,6 +893,32 @@ impl TestFixture {
         self.temp_dir.path().join("test.db")
     }
 
+    /// The head commit of `dataset`'s log on an object-native fixture; `None` on
+    /// the SQLite backend.
+    /// # Errors
+    /// The catalog or the dataset's log could not be read.
+    pub async fn object_native_head_commit(
+        &self,
+        dataset: &str,
+    ) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+        let Some(location) = OBJECT_NATIVE_LOCATIONS
+            .lock()
+            .get(self.db_path().to_string_lossy().as_ref())
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let log = cayenne::metastore::object_native::dataset_log_at(
+            Arc::clone(&location.store),
+            &location.catalog_prefix(),
+            dataset,
+        )
+        .await?
+        .ok_or_else(|| format!("dataset '{dataset}' has no log"))?;
+        let (reader, _) = object_store_occ::headlog::Reader::open(location.store, log).await?;
+        Ok(Some(reader.state().head.commit))
+    }
+
     /// Connection string for this fixture's catalog, which [`fixture_catalog`]
     /// reopens. Tests that simulate a restart (reopen the catalog) use this
     /// rather than building their own.
@@ -955,14 +986,12 @@ pub fn require_process_per_test(why: &str) {
 /// | `mutation_property_test::prop_sequential_cold_impl` | Cold tier, which object-native data does not support. |
 /// | `mutation_property_test::prop_sequential_cold_upsert_replay_impl` | As above. |
 /// | `scan_view_retention_test::scan_view_selection_during_retention` | Holds a scan's planning on retention's unlink of a data file; a table in the object-native location keeps a retired file for `DATA_FILE_RETENTION`, so the delete unlinks nothing. |
-/// | `stats_edge_cases_test::test_stats_correct_after_overwrite` | Open defect on the local-location store: under concurrent load, the table statistics after `INSERT OVERWRITE` can keep the pre-overwrite row count. |
 /// | `file_based_retention_delete_test` (all but `test_loader_errors_on_missing_needed_dv_impl`) | File-based retention (whole-file deletes) runs only for local data files; a table in an object store deletes the expired rows through deletion vectors, so the file counts, deleted-row counts and orphaned deletion vectors these tests assert differ. The two list-files cache tests also need a listing the table never makes. |
 /// | `file_scan_statistics_source_test::concurrent_cold_scans_share_one_footer_read_and_upsert_per_file` | Counts footer reads through the session's `file://` store and upserts through SQLite triggers. |
 /// | `file_scan_statistics_source_test::scan_file_statistics_counters_match_the_store_and_the_metastore` | As above. |
 /// | `integration_test::test_cayenne_catalog_persistence_impl` | Reopens a SQLite catalog file. |
 /// | `listing_cache_retention_race_test` (all) | Races a snapshot-directory listing through the list-files cache; a table in the object-native location never lists its files. |
 /// | `mem_tier_overwrite_retention_test::a_waiting_publish_does_not_hold_back_the_other_partitions_impl` | Commits partitions' overwrites in one SQLite metastore transaction; the object-native metastore does not hold partitioned tables. |
-/// | `orphan_dv_compaction_test::bake_publication_schedules_orphan_dv_cleanup_impl` | On the object-native stores, the deletion vectors the sweep after a seq-prefix bake drops from the catalog stay in the store once the data-file retention ends, while the same check after a protected-subset merge passes; the cause is not yet known. |
 /// | `orphan_dv_compaction_test::provider_open_replays_an_orphan_backlog_left_by_a_crash_impl` | Writes deletion vectors and their catalog rows by hand at a local path. |
 /// | `orphan_dv_compaction_test::scheduled_cleanup_waits_for_the_orphan_threshold_impl` | As above. |
 /// | `orphan_dv_compaction_test::scheduled_cleanup_keeps_a_deletion_vector_the_cold_tier_needs_impl` | Cold tier, which object-native data does not support. |
