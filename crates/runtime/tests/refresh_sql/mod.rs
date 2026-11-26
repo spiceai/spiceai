@@ -31,8 +31,6 @@ use crate::{
     utils::{register_test_connectors, runtime_ready_check, test_request_context, wait_until_true},
 };
 
-mod refresh_max_timestamp_df;
-
 fn make_spiceai_dataset(path: &str, name: &str, refresh_sql: String) -> Dataset {
     let mut ds = Dataset::new(format!("spice.ai/{path}"), name.to_string());
     ds.acceleration = Some(Acceleration {

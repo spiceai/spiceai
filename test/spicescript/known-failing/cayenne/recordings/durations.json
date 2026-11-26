@@ -1,10 +1,10 @@
 {
-  "cayenne-decimal-int-filter": 4,
   "cayenne-file-durability-date-key": 76,
   "cayenne-partition-key-move": 67,
   "cayenne-partitioned-append-key-only": 35,
   "cayenne-torn-reads": 77,
   "cayenne-writes-known": 107,
+  "location-special-characters": 91,
   "maintained-aggregates-served": 12,
   "memory-limit-spill": 106,
   "postgres-cdc-kill-during-compaction": 540

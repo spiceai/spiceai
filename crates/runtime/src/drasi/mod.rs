@@ -388,7 +388,7 @@ pub(crate) async fn forward_change_envelope(
     // Materialize a deferred batch here, off this async worker — the same
     // trade-off the index decorator makes, for the same reason: a large deferred
     // burst would otherwise stall the stream while it is built.
-    let (committer, batch, is_dataset_ready, history_unavailable) =
+    let (committer, batch, is_dataset_ready, history_unavailable, snapshot_rows) =
         envelope.into_parts_offloaded().await?;
 
     let data = batch.data_batch();
@@ -452,6 +452,7 @@ pub(crate) async fn forward_change_envelope(
         batch,
         is_dataset_ready,
         history_unavailable,
+        snapshot_rows,
     ))
 }
 

@@ -1,17 +1,16 @@
 name: append-upsert-same-time
 description: >
-  Known failing (#15542): an append refresh into an acceleration that upserts on a
-  primary key alternates between two versions of a key that share one time. The
-  source holds both versions; each append refresh reads the rows at the stored
-  maximum time again and drops only the stored copy, so the version left over
-  overwrites it, and the next refresh with nothing new swaps them back. SQLite
-  shows it; Cayenne keeps the latest version, ordering versions by time.
+  An append refresh into an acceleration that upserts on a primary key keeps the
+  newest version of a key when a second version arrives with the same time
+  (#15542). Each append refresh reads the rows at the stored maximum time again;
+  Cayenne orders versions by time and keeps the latest one, so refreshes with
+  nothing new leave it in place. The removed SQLite engine alternated between the
+  two versions here.
 sources:
   src: { kind: postgres }
 variants:
   cayenne: {}
   cayenne-memory: { datasets: { events: { acceleration: { mode: memory } } } }
-  sqlite: { datasets: { events: { acceleration: { engine: sqlite, mode: memory } } } }
   # The spicepod as written, with the prototype object-native Cayenne metastore.
   object-native: object-native
 spicepod:
@@ -32,9 +31,6 @@ spicepod:
         refresh_check_interval: 1h
         primary_key: id
         on_conflict: { id: upsert }
-defaults:
-  # The engines differ by design here, so agreement between them proves nothing.
-  compare-variants: false
 steps:
   - source-exec:
       src: |

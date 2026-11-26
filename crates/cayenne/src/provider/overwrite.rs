@@ -621,12 +621,18 @@ impl CayenneTableProvider {
     ///
     /// Acquires the per-table write lock for the duration of the prepared
     /// state, so concurrent writes (inserts, overwrites, sort rewrites) block
-    /// until this handle is finished or rolled back.
+    /// until this handle is finished or rolled back. The lock is taken once
+    /// every append staged before this call has published or been abandoned:
+    /// a keyed change-stream append publishes without the write lock, so one
+    /// published after the overwrite would land on the replacement with
+    /// deletes resolved against the replaced snapshot, and an unkeyed one
+    /// would find its target snapshot gone.
     ///
     /// # Errors
     ///
-    /// Returns an error if the snapshot directory cannot be created, the
-    /// stream write fails, or directory sync fails.
+    /// Returns an error if the appends staged before this call have not
+    /// published within the drain timeout, the snapshot directory cannot be
+    /// created, the stream write fails, or directory sync fails.
     pub async fn begin_overwrite(
         &self,
         data: SendableRecordBatchStream,
@@ -637,7 +643,9 @@ impl CayenneTableProvider {
         // in the inline tier below ignores the plan.
         let routing = self.overwrite_range_plan(target_partitions).await;
 
-        let write_guard = self.write_lock_arc().lock_owned().await;
+        let write_guard = self
+            .lock_write_after_staged_appends("the full refresh or INSERT OVERWRITE")
+            .await?;
         // Also hold `mem_checkpoint_lock` until the overwrite is published or
         // rolled back. A checkpoint or seal of the in-memory CDC tier takes only
         // this lock at one shard, and the rows it would make durable are rows this

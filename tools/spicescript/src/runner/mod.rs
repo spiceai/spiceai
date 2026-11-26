@@ -390,6 +390,9 @@ pub struct Options {
     pub pki: PathBuf,
     /// `--log-capture`: where a script with a failure leaves its logs.
     pub log_capture: Option<PathBuf>,
+    /// `--executor-image`: the image cluster executors run in under
+    /// `defaults.cluster.containers`.
+    pub executor_image: String,
 }
 
 /// A failed check: where it ran, which step, and what went wrong.
@@ -553,9 +556,10 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(45);
 /// `STOP_TIMEOUT`; at the end of a script it only costs time.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The image cluster executors run in under `defaults.cluster.containers`:
-/// a Linux `spiced` needs nothing beyond its base libraries.
-const EXECUTOR_IMAGE: &str = "ubuntu:26.04";
+/// The image cluster executors run in under `defaults.cluster.containers`
+/// unless `--executor-image` names another: a Linux `spiced` built with the
+/// default features needs nothing beyond its base libraries.
+pub const DEFAULT_EXECUTOR_IMAGE: &str = "ubuntu:26.04";
 
 /// The partition assignment interval a cluster runs with (see
 /// `make_cluster_ready`).
@@ -1373,7 +1377,7 @@ async fn create_instances(
                     let work_dir = std::path::absolute(&options.work_dir)?;
                     let script_dir = std::path::absolute(&script.dir)?;
                     executor.set_container(ContainerRun {
-                        image: EXECUTOR_IMAGE.to_string(),
+                        image: options.executor_image.clone(),
                         name: format!("spicescript-{}-{run_id}-{index}-{name}", std::process::id())
                             .replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "-"),
                         volumes: vec![

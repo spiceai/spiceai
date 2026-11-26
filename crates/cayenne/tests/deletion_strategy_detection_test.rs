@@ -31,10 +31,7 @@ use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
 
 use arrow::datatypes::{DataType, Field, Schema};
 
-use cayenne::{
-    CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog,
-    metadata::CreateTableOptions,
-};
+use cayenne::{CayenneTableProvider, MetadataCatalog, metadata::CreateTableOptions};
 
 use common::TestFixture;
 
@@ -74,14 +71,16 @@ async fn test_detects_int64_pk_strategy_impl(fixture: TestFixture) -> TestResult
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: None, // Single Int64 PK -> Int64Pk strategy
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("int64_pk_table"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(get_catalog(&fixture), table_options, ctx.runtime_env())
+        fixture
+            .data_store
+            .create(get_catalog(&fixture), ctx.runtime_env(), table_options)
             .await?,
     );
 
@@ -136,7 +135,7 @@ async fn test_detects_int64_pk_strategy_impl(fixture: TestFixture) -> TestResult
     Ok(())
 }
 
-test_with_backends!(test_detects_int64_pk_strategy_impl);
+test_on_data_store!(test_detects_int64_pk_strategy_impl);
 
 /// Test that `RowConverter`-based strategy is selected for String primary key.
 async fn test_detects_rowconverter_strategy_for_string_pk_impl(
@@ -152,14 +151,16 @@ async fn test_detects_rowconverter_strategy_for_string_pk_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["code".to_string()],
         on_conflict: None, // String PK -> RowConverter strategy
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("string_pk_table"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(get_catalog(&fixture), table_options, ctx.runtime_env())
+        fixture
+            .data_store
+            .create(get_catalog(&fixture), ctx.runtime_env(), table_options)
             .await?,
     );
 
@@ -213,7 +214,7 @@ async fn test_detects_rowconverter_strategy_for_string_pk_impl(
     Ok(())
 }
 
-test_with_backends!(test_detects_rowconverter_strategy_for_string_pk_impl);
+test_on_data_store!(test_detects_rowconverter_strategy_for_string_pk_impl);
 
 /// Test that `RowConverter`-based strategy is selected for composite primary key.
 async fn test_detects_rowconverter_strategy_for_composite_pk_impl(
@@ -230,14 +231,16 @@ async fn test_detects_rowconverter_strategy_for_composite_pk_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["region".to_string(), "id".to_string()],
         on_conflict: None, // Composite PK -> RowConverter
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("composite_pk_table"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(get_catalog(&fixture), table_options, ctx.runtime_env())
+        fixture
+            .data_store
+            .create(get_catalog(&fixture), ctx.runtime_env(), table_options)
             .await?,
     );
 
@@ -292,7 +295,7 @@ async fn test_detects_rowconverter_strategy_for_composite_pk_impl(
     Ok(())
 }
 
-test_with_backends!(test_detects_rowconverter_strategy_for_composite_pk_impl);
+test_on_data_store!(test_detects_rowconverter_strategy_for_composite_pk_impl);
 
 /// Test that `PositionBased` strategy is selected for tables without primary key.
 async fn test_detects_position_based_strategy_impl(fixture: TestFixture) -> TestResult<()> {
@@ -306,14 +309,16 @@ async fn test_detects_position_based_strategy_impl(fixture: TestFixture) -> Test
         schema: Arc::clone(&schema),
         primary_key: vec![],
         on_conflict: None, // No PK -> PositionBased strategy
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("no_pk_table"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(get_catalog(&fixture), table_options, ctx.runtime_env())
+        fixture
+            .data_store
+            .create(get_catalog(&fixture), ctx.runtime_env(), table_options)
             .await?,
     );
 
@@ -362,7 +367,7 @@ async fn test_detects_position_based_strategy_impl(fixture: TestFixture) -> Test
     Ok(())
 }
 
-test_with_backends!(test_detects_position_based_strategy_impl);
+test_on_data_store!(test_detects_position_based_strategy_impl);
 
 /// Test that Int32 primary key uses `RowConverter` strategy (not `Int64Pk`).
 async fn test_int32_pk_uses_rowconverter_impl(fixture: TestFixture) -> TestResult<()> {
@@ -376,14 +381,16 @@ async fn test_int32_pk_uses_rowconverter_impl(fixture: TestFixture) -> TestResul
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: None, // Int32 PK -> RowConverter (not Int64Pk)
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("int32_pk_table"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(get_catalog(&fixture), table_options, ctx.runtime_env())
+        fixture
+            .data_store
+            .create(get_catalog(&fixture), ctx.runtime_env(), table_options)
             .await?,
     );
 
@@ -437,7 +444,7 @@ async fn test_int32_pk_uses_rowconverter_impl(fixture: TestFixture) -> TestResul
     Ok(())
 }
 
-test_with_backends!(test_int32_pk_uses_rowconverter_impl);
+test_on_data_store!(test_int32_pk_uses_rowconverter_impl);
 
 // =============================================================================
 // Test Strategy Persistence and Reopen
@@ -455,14 +462,16 @@ async fn test_strategy_persists_on_reopen_int64pk_impl(fixture: TestFixture) -> 
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("persist_int64pk"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(get_catalog(&fixture), table_options, ctx.runtime_env())
+        fixture
+            .data_store
+            .create(get_catalog(&fixture), ctx.runtime_env(), table_options)
             .await?,
     );
 
@@ -483,8 +492,9 @@ async fn test_strategy_persists_on_reopen_int64pk_impl(fixture: TestFixture) -> 
     // Reopen table
     let ctx2 = SessionContext::new();
     let table2 = Arc::new(
-        CayenneTableProviderBuilder::new(get_catalog(&fixture), ctx2.runtime_env())
-            .open("persist_int64pk")
+        fixture
+            .data_store
+            .open(get_catalog(&fixture), ctx2.runtime_env(), "persist_int64pk")
             .await?,
     );
 
@@ -514,7 +524,7 @@ async fn test_strategy_persists_on_reopen_int64pk_impl(fixture: TestFixture) -> 
     Ok(())
 }
 
-test_with_backends!(test_strategy_persists_on_reopen_int64pk_impl);
+test_on_data_store!(test_strategy_persists_on_reopen_int64pk_impl);
 
 /// Verify that `PositionBased` strategy persists on table reopen.
 async fn test_strategy_persists_on_reopen_position_based_impl(
@@ -530,14 +540,16 @@ async fn test_strategy_persists_on_reopen_position_based_impl(
         schema: Arc::clone(&schema),
         primary_key: vec![],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("persist_position"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(get_catalog(&fixture), table_options, ctx.runtime_env())
+        fixture
+            .data_store
+            .create(get_catalog(&fixture), ctx.runtime_env(), table_options)
             .await?,
     );
 
@@ -559,8 +571,13 @@ async fn test_strategy_persists_on_reopen_position_based_impl(
     // Reopen and delete more
     let ctx2 = SessionContext::new();
     let table2 = Arc::new(
-        CayenneTableProviderBuilder::new(get_catalog(&fixture), ctx2.runtime_env())
-            .open("persist_position")
+        fixture
+            .data_store
+            .open(
+                get_catalog(&fixture),
+                ctx2.runtime_env(),
+                "persist_position",
+            )
             .await?,
     );
     let filter2 = col("value").eq(lit(1i64));
@@ -587,7 +604,7 @@ async fn test_strategy_persists_on_reopen_position_based_impl(
     Ok(())
 }
 
-test_with_backends!(test_strategy_persists_on_reopen_position_based_impl);
+test_on_data_store!(test_strategy_persists_on_reopen_position_based_impl);
 
 // =============================================================================
 // Test Cross-Strategy Scenarios
@@ -603,20 +620,22 @@ async fn test_multiple_strategies_same_session_impl(fixture: TestFixture) -> Tes
         Field::new("data", DataType::Utf8, false),
     ]));
     let table1 = Arc::new(
-        CayenneTableProvider::create_table(
-            get_catalog(&fixture),
-            CreateTableOptions {
-                table_name: "t1_int64".to_string(),
-                schema: Arc::clone(&schema1),
-                primary_key: vec!["id".to_string()],
-                on_conflict: None,
-                base_path: fixture.data_path.to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config: cayenne::metadata::VortexConfig::default(),
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                get_catalog(&fixture),
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: "t1_int64".to_string(),
+                    schema: Arc::clone(&schema1),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path("t1_int64"),
+                    partition_column: None,
+                    vortex_config: cayenne::metadata::VortexConfig::default(),
+                },
+            )
+            .await?,
     );
     let batch1 = RecordBatch::try_new(
         Arc::clone(&schema1),
@@ -633,20 +652,22 @@ async fn test_multiple_strategies_same_session_impl(fixture: TestFixture) -> Tes
         Field::new("value", DataType::Int64, false),
     ]));
     let table2 = Arc::new(
-        CayenneTableProvider::create_table(
-            get_catalog(&fixture),
-            CreateTableOptions {
-                table_name: "t2_string".to_string(),
-                schema: Arc::clone(&schema2),
-                primary_key: vec!["key".to_string()],
-                on_conflict: None,
-                base_path: fixture.data_path.to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config: cayenne::metadata::VortexConfig::default(),
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                get_catalog(&fixture),
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: "t2_string".to_string(),
+                    schema: Arc::clone(&schema2),
+                    primary_key: vec!["key".to_string()],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path("t2_string"),
+                    partition_column: None,
+                    vortex_config: cayenne::metadata::VortexConfig::default(),
+                },
+            )
+            .await?,
     );
     let batch2 = RecordBatch::try_new(
         Arc::clone(&schema2),
@@ -663,20 +684,22 @@ async fn test_multiple_strategies_same_session_impl(fixture: TestFixture) -> Tes
         Field::new("amount", DataType::Int64, false),
     ]));
     let table3 = Arc::new(
-        CayenneTableProvider::create_table(
-            get_catalog(&fixture),
-            CreateTableOptions {
-                table_name: "t3_no_pk".to_string(),
-                schema: Arc::clone(&schema3),
-                primary_key: vec![],
-                on_conflict: None,
-                base_path: fixture.data_path.to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config: cayenne::metadata::VortexConfig::default(),
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                get_catalog(&fixture),
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: "t3_no_pk".to_string(),
+                    schema: Arc::clone(&schema3),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path("t3_no_pk"),
+                    partition_column: None,
+                    vortex_config: cayenne::metadata::VortexConfig::default(),
+                },
+            )
+            .await?,
     );
     let batch3 = RecordBatch::try_new(
         Arc::clone(&schema3),
@@ -725,4 +748,4 @@ async fn test_multiple_strategies_same_session_impl(fixture: TestFixture) -> Tes
     Ok(())
 }
 
-test_with_backends!(test_multiple_strategies_same_session_impl);
+test_on_data_store!(test_multiple_strategies_same_session_impl);

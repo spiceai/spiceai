@@ -82,7 +82,7 @@ async fn delete_records(
 // Test 1: Delete then Insert DIFFERENT Key (DELETE + INSERT pattern)
 // Tests that DELETE doesn't affect subsequent INSERTs of different keys
 // =============================================================================
-test_with_backends!(test_delete_then_insert_different_key_impl);
+test_on_data_store!(test_delete_then_insert_different_key_impl);
 
 async fn test_delete_then_insert_different_key_impl(
     fixture: common::TestFixture,
@@ -98,15 +98,17 @@ async fn test_delete_then_insert_different_key_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: None, // No on-conflict config
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("delete_insert"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
 
     ctx.register_table(
@@ -163,7 +165,7 @@ async fn test_delete_then_insert_different_key_impl(
 // =============================================================================
 // Test 2: Single Upsert Operation
 // =============================================================================
-test_with_backends!(test_single_upsert_impl);
+test_on_data_store!(test_single_upsert_impl);
 
 async fn test_single_upsert_impl(
     fixture: common::TestFixture,
@@ -180,15 +182,17 @@ async fn test_single_upsert_impl(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("single_upsert"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
 
     ctx.register_table(
@@ -231,7 +235,7 @@ async fn test_single_upsert_impl(
 // =============================================================================
 // Test 3: A table created with DoNothing keeps the last version too
 // =============================================================================
-test_with_backends!(test_do_nothing_table_upserts_conflicts_impl);
+test_on_data_store!(test_do_nothing_table_upserts_conflicts_impl);
 
 async fn test_do_nothing_table_upserts_conflicts_impl(
     fixture: common::TestFixture,
@@ -248,15 +252,17 @@ async fn test_do_nothing_table_upserts_conflicts_impl(
         on_conflict: Some(OnConflict::DoNothing(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("do_nothing"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
 
     ctx.register_table(
@@ -309,7 +315,7 @@ async fn test_do_nothing_table_upserts_conflicts_impl(
 // =============================================================================
 // Test 4: On-Conflict with Composite Primary Key
 // =============================================================================
-test_with_backends!(test_upsert_composite_pk_impl);
+test_on_data_store!(test_upsert_composite_pk_impl);
 
 async fn test_upsert_composite_pk_impl(
     fixture: common::TestFixture,
@@ -328,15 +334,17 @@ async fn test_upsert_composite_pk_impl(
             "region".to_string(),
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("composite_upsert"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
 
     ctx.register_table(
@@ -381,7 +389,7 @@ async fn test_upsert_composite_pk_impl(
 // =============================================================================
 // Test 5: Upsert with Large Batch
 // =============================================================================
-test_with_backends!(test_upsert_large_batch_impl);
+test_on_data_store!(test_upsert_large_batch_impl);
 
 async fn test_upsert_large_batch_impl(
     fixture: common::TestFixture,
@@ -398,15 +406,17 @@ async fn test_upsert_large_batch_impl(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("large_batch"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
 
     ctx.register_table(
@@ -481,7 +491,7 @@ async fn test_upsert_large_batch_impl(
 // =============================================================================
 // Test 6: Delete Non-Existent Then Insert
 // =============================================================================
-test_with_backends!(test_delete_nonexistent_then_insert_impl);
+test_on_data_store!(test_delete_nonexistent_then_insert_impl);
 
 async fn test_delete_nonexistent_then_insert_impl(
     fixture: common::TestFixture,
@@ -496,15 +506,17 @@ async fn test_delete_nonexistent_then_insert_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: None, // No on-conflict config
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("delete_nonexistent"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
 
     ctx.register_table(
@@ -547,7 +559,7 @@ async fn test_delete_nonexistent_then_insert_impl(
 // =============================================================================
 // Test 7: String Primary Key Upsert
 // =============================================================================
-test_with_backends!(test_string_pk_upsert_impl);
+test_on_data_store!(test_string_pk_upsert_impl);
 
 async fn test_string_pk_upsert_impl(
     fixture: common::TestFixture,
@@ -564,15 +576,17 @@ async fn test_string_pk_upsert_impl(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "code".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("string_pk"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
 
     ctx.register_table(
@@ -615,7 +629,7 @@ async fn test_string_pk_upsert_impl(
 // =============================================================================
 // Test 8: Delete All Then Insert New Keys
 // =============================================================================
-test_with_backends!(test_delete_all_then_insert_new_keys_impl);
+test_on_data_store!(test_delete_all_then_insert_new_keys_impl);
 
 async fn test_delete_all_then_insert_new_keys_impl(
     fixture: common::TestFixture,
@@ -630,15 +644,17 @@ async fn test_delete_all_then_insert_new_keys_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: None, // No on-conflict - pure DELETE + INSERT
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("delete_all_insert"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
 
     ctx.register_table(
@@ -698,7 +714,7 @@ async fn test_delete_all_then_insert_new_keys_impl(
 // =============================================================================
 // Test 9: Mixed Non-Conflicting and Conflicting Keys in Single Batch
 // =============================================================================
-test_with_backends!(test_mixed_conflict_batch_impl);
+test_on_data_store!(test_mixed_conflict_batch_impl);
 
 async fn test_mixed_conflict_batch_impl(
     fixture: common::TestFixture,
@@ -715,15 +731,17 @@ async fn test_mixed_conflict_batch_impl(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("mixed_batch"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
 
     ctx.register_table(
@@ -788,7 +806,7 @@ async fn test_mixed_conflict_batch_impl(
 // =============================================================================
 // Test 10: Empty Batch Insert (no-op)
 // =============================================================================
-test_with_backends!(test_empty_batch_impl);
+test_on_data_store!(test_empty_batch_impl);
 
 async fn test_empty_batch_impl(
     fixture: common::TestFixture,
@@ -805,15 +823,17 @@ async fn test_empty_batch_impl(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("empty_batch"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
 
     ctx.register_table(
