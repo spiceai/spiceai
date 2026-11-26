@@ -2,7 +2,7 @@ name: snapshots-reader-removed-engine
 duration: 6s
 description: >
   A `file_format: snapshot` dataset whose snapshots a release published with
-  a removed engine, `turso` or `duckdb`, fails to load on a build that no
+  a removed engine, `turso`, `duckdb` or `sqlite`, fails to load on a build that no
   longer has it, with the fix and the migration guide in its status and one
   error line, while the rest of the Spicepod serves. Spice never rebuilds
   those snapshots into another engine on its own.
@@ -14,7 +14,7 @@ description: >
 from: 2.4.x
 
 matrix:
-  engine: [turso, duckdb]
+  engine: [turso, duckdb, sqlite]
 
 sources:
   src: { kind: postgres }
@@ -105,6 +105,12 @@ steps:
       message-contains: "/state/snapshots/' were created with the 'duckdb' engine, and the acceleration engine `duckdb` is no longer supported as of v2.5 and cannot be used. Set `acceleration.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots. See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration"
     eventually: 30s
     when: { engine: duckdb }
+  - assert-status:
+      dataset: t
+      status: Error
+      message-contains: "/state/snapshots/' were created with the 'sqlite' engine, and the acceleration engine `sqlite` is no longer supported as of v2.5 and cannot be used. Set `acceleration.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots. See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration"
+    eventually: 30s
+    when: { engine: sqlite }
   - query: SELECT * FROM t
     expect-error: "table 'spice.public.t' not found"
   # The refusal is permanent: one error line, not a retry loop, and not the
@@ -119,3 +125,8 @@ steps:
         "ERROR .*Failed to load dataset 't' from its snapshots, so it cannot be queried: the snapshots at 's3://[^/']+/state/snapshots/' were created with the 'duckdb' engine, and the acceleration engine `duckdb` is no longer supported as of v2.5 .*cayenne/migration$": 1
       lacks: ["a build that includes 'duckdb'", "loads the duckdb snapshots"]
     when: { engine: duckdb }
+  - assert-log:
+      count:
+        "ERROR .*Failed to load dataset 't' from its snapshots, so it cannot be queried: the snapshots at 's3://[^/']+/state/snapshots/' were created with the 'sqlite' engine, and the acceleration engine `sqlite` is no longer supported as of v2.5 .*cayenne/migration$": 1
+      lacks: ["a build that includes 'sqlite'", "loads the sqlite snapshots"]
+    when: { engine: sqlite }

@@ -2013,6 +2013,9 @@ async fn a_dropped_dataset_with_no_reader_is_deleted_after_the_grace() {
 enum Step {
     /// Merge the protected snapshots of a keyed table.
     Merge,
+    /// [`Self::Merge`] by the sequence-prefix bake, which also prunes the
+    /// deletes the merged snapshot has applied.
+    Bake,
     /// Replace an append-only table's rows.
     Overwrite,
     /// Append rows to an append-only table.
@@ -2026,7 +2029,10 @@ enum Step {
 
 impl Step {
     fn keyed(self) -> bool {
-        matches!(self, Self::Merge | Self::Upsert | Self::ChangeStreamUpsert)
+        matches!(
+            self,
+            Self::Merge | Self::Bake | Self::Upsert | Self::ChangeStreamUpsert
+        )
     }
 
     /// The settings a process runs the step with: a merge and an overwrite with
@@ -2034,7 +2040,7 @@ impl Step {
     /// parked, so the step's requests are its own.
     fn config(self) -> VortexConfig {
         match self {
-            Self::Merge | Self::Overwrite => armed(),
+            Self::Merge | Self::Bake | Self::Overwrite => armed(),
             Self::Append | Self::Upsert => parked(),
             Self::ChangeStreamUpsert => VortexConfig {
                 cdc_durability: CdcDurability::File,
@@ -2076,6 +2082,18 @@ impl Step {
         (location, process)
     }
 
+    /// The actions besides `AddFiles` of the record that makes the step's new
+    /// files live. An append adds its files to the current snapshot, which is
+    /// live already.
+    fn live_actions(self) -> &'static [&'static str] {
+        match self {
+            Self::Overwrite => &["RemoveGroups", "SetCurrentSnapshot"],
+            Self::Merge | Self::Bake => &["RemoveGroups", "SetGroup"],
+            Self::Upsert | Self::ChangeStreamUpsert => &["SetGroup"],
+            Self::Append => &[],
+        }
+    }
+
     fn before(self) -> Vec<(i64, i64)> {
         if self.keyed() {
             upserted(4)
@@ -2087,7 +2105,7 @@ impl Step {
     fn after(self) -> Vec<(i64, i64)> {
         match self {
             Self::Overwrite => (5_000..5_700).map(|id| (id, -id)).collect(),
-            Self::Merge => self.before(),
+            Self::Merge | Self::Bake => self.before(),
             Self::Append => {
                 let mut rows = self.before();
                 rows.extend((5_000..5_500).map(|id| (id, id)));
@@ -2103,6 +2121,10 @@ impl Step {
         let committed = match self {
             Self::Merge => table
                 .compact_protected_snapshots_subset(usize::MAX)
+                .await
+                .map_err(|error| error.to_string()),
+            Self::Bake => table
+                .bake_seq_prefix_protected_snapshots()
                 .await
                 .map_err(|error| error.to_string()),
             Self::Overwrite => common::write_batches(
@@ -2381,17 +2403,11 @@ async fn kill_at_every_request(step: Step) {
         );
         next.assert_named_files_stored(&location, &format!("{what}, after the orphan sweep"))
             .await;
-        // Only an overwrite names its files in the record that makes its
-        // snapshot current. A merge and a keyed write still name theirs a record
-        // before the one that makes the snapshot live, so a kill between the two
-        // strands them (#16709).
-        if matches!(step, Step::Overwrite) {
-            let stranded = next.rows_outside_live_snapshots().await;
-            assert!(
-                stranded.is_empty(),
-                "{what}: after every sweep the state still names files of snapshots the table does not serve: {stranded:?}"
-            );
-        }
+        let stranded = next.rows_outside_live_snapshots().await;
+        assert!(
+            stranded.is_empty(),
+            "{what}: after every sweep the state still names files of snapshots the table does not serve: {stranded:?}"
+        );
         let mut swept = next.rows("orders").await;
         swept.sort_unstable();
         assert_eq!(swept, rows, "{what}: the orphan sweep changed the rows");
@@ -2401,24 +2417,22 @@ async fn kill_at_every_request(step: Step) {
         "{step:?}: {} kill points: {killed} killed mid-step, {acknowledged} acknowledged before the kill, {unnamed_total} data files no commit names left in all",
         steps.len()
     );
-    if matches!(step, Step::Overwrite) {
-        // An overwrite names its files and makes its snapshot current in one
-        // record, so no crash leaves a snapshot named that never became live.
-        let with_files: Vec<&Vec<String>> = records
-            .iter()
-            .filter(|record| record.iter().any(|action| action == "AddFiles"))
-            .collect();
-        assert_eq!(
-            with_files.len(),
-            1,
-            "{step:?}: one record names the new snapshot's files: {records:?}"
+    // A step names its new files in the record that makes them live, so no
+    // crash leaves files named that never became live.
+    let with_files: Vec<&Vec<String>> = records
+        .iter()
+        .filter(|record| record.iter().any(|action| action == "AddFiles"))
+        .collect();
+    assert_eq!(
+        with_files.len(),
+        1,
+        "{step:?}: one record names the new snapshot's files: {records:?}"
+    );
+    for kind in step.live_actions() {
+        assert!(
+            with_files[0].iter().any(|action| action == kind),
+            "{step:?}: the record that names the files has no {kind}: {records:?}"
         );
-        for kind in ["RemoveGroups", "SetCurrentSnapshot"] {
-            assert!(
-                with_files[0].iter().any(|action| action == kind),
-                "{step:?}: the record that names the files has no {kind}: {records:?}"
-            );
-        }
     }
 }
 
@@ -2430,6 +2444,11 @@ async fn a_kill_at_any_storage_request_of_a_change_stream_upsert_is_all_or_nothi
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kill_at_any_storage_request_of_a_protected_merge_loses_nothing() {
     kill_at_every_request(Step::Merge).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_at_any_storage_request_of_a_sequence_prefix_bake_loses_nothing() {
+    kill_at_every_request(Step::Bake).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

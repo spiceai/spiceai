@@ -585,7 +585,15 @@ fn paginated_dataset(base_url: &str, name: &str, accelerated: bool) -> Dataset {
         .collect(),
     ));
     if accelerated {
-        dataset.acceleration = http_dataset(base_url, name, true).acceleration;
+        // Cayenne, regression test for #16676: it cached none of a paginated
+        // response.
+        dataset.acceleration =
+            http_dataset(base_url, name, true)
+                .acceleration
+                .map(|acceleration| Acceleration {
+                    engine: Some("cayenne".to_string()),
+                    ..acceleration
+                });
     }
     dataset
 }

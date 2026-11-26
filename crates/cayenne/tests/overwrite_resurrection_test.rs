@@ -39,7 +39,7 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::metadata::{CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::{CayenneTableProvider, MetadataCatalog};
 use common::TestFixture;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -106,15 +106,19 @@ async fn create_table_with(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(name),
         partition_column: None,
         vortex_config,
     };
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let table =
-        Arc::new(CayenneTableProvider::create_table(catalog, opts, ctx.runtime_env()).await?);
+    let table = Arc::new(
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), opts)
+            .await?,
+    );
     ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
     Ok((table, ctx))
 }
@@ -129,8 +133,9 @@ async fn reopen_table(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-            .open(name)
+        fixture
+            .data_store
+            .open(catalog, ctx.runtime_env(), name)
             .await?,
     );
     ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
@@ -277,8 +282,8 @@ async fn overwrite_resurrection_position_impl(fixture: TestFixture) -> TestResul
     run_all(fixture, Mode::Position).await
 }
 
-test_with_backends!(overwrite_resurrection_key_impl);
-test_with_backends!(overwrite_resurrection_position_impl);
+test_on_data_store!(overwrite_resurrection_key_impl);
+test_on_data_store!(overwrite_resurrection_position_impl);
 
 // ===========================================================================
 // Bloom existence-fallback variant
@@ -354,4 +359,4 @@ async fn reupsert_over_tombstone_survives_bloom_fallback_impl(
     Ok(())
 }
 
-test_with_backends!(reupsert_over_tombstone_survives_bloom_fallback_impl);
+test_on_data_store!(reupsert_over_tombstone_survives_bloom_fallback_impl);

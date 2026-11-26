@@ -8,7 +8,7 @@ query's `ORDER BY`** (see [Row order](#row-order)) between:
 
 1. **Standalone engines outside Spice** — raw embedded crates used as oracles  
    (`duckdb-oracle` via ADBC, `rusqlite`, `chdb-rust`)
-2. **Spice accelerators** — Cayenne, SQLite accelerator
+2. **Spice accelerators** — Cayenne
 
 They measure correctness only. Numeric compare uses existing float tolerance.
 
@@ -20,7 +20,6 @@ They measure correctness only. Numeric compare uses existing float tolerance.
 | `standalone-sqlite` | SQLite **outside** Spice | `rusqlite` (not Spice SQLite accel) |
 | `standalone-chdb` | chDB **outside** Spice | `chdb-rust` |
 | `spice-cayenne` | Cayenne accelerator | `CayenneTableProvider` |
-| `spice-sqlite-accel` | Spice SQLite accelerator | `accelerator_sqlite` |
 
 **DuckDB and chDB cannot both run** in one process; the chDB lane is a separate
 test binary from the `integration` binary that holds the DuckDB lanes.
@@ -32,7 +31,6 @@ test binary from the `integration` binary that holds the DuckDB lanes.
 standalone-duckdb          —            ✅ cayenne suite          —
 standalone-sqlite          ✅                 —                   —
 spice-cayenne              ✅                 ✅                   ✅
-spice-sqlite-accel         —                  ✅ (runtime)        —
 ```
 
 1. **Oracle baseline** — standalone DuckDB ↔ standalone SQLite agree on portable
@@ -172,8 +170,8 @@ cargo test -p cayenne --features result-correctness-chdb \
 # ceiling; the DuckDB and chDB lanes compare SF1.
 cargo test -p cayenne --test integration result_correctness_vs_sqlite_test:: -- --test-threads=1
 
-# Spice DuckDB / SQLite accelerators ↔ standalone oracles
-cargo test -p runtime --features duckdb,sqlite --test integration result_correctness:: -- --nocapture
+# Spicepod-built runtimes ↔ standalone oracles
+cargo test -p runtime --test integration result_correctness:: -- --nocapture
 ```
 
 ## What the gate runs

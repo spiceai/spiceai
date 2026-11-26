@@ -38,13 +38,13 @@ use arrow::array::{Int32Array, NullArray, StringViewBuilder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use cayenne::MetadataCatalog;
 use cayenne::metadata::CreateTableOptions;
-use cayenne::{CayenneTableProvider, MetadataCatalog};
 
 use datafusion::assert_batches_eq;
 use datafusion::prelude::SessionContext;
 
-test_with_backends!(test_vortex_highly_compressible_data_impl);
+test_on_data_store!(test_vortex_highly_compressible_data_impl);
 
 /// Validates support for highly compressed Vortex data where the file size is
 /// smaller than the row count (sub-1-byte-per-row). Writes a schema with a
@@ -68,15 +68,17 @@ async fn test_vortex_highly_compressible_data_impl(
         schema: Arc::clone(&schema),
         primary_key: vec![],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("compressible"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
 
     ctx.register_table(

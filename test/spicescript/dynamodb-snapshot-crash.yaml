@@ -26,7 +26,6 @@ sources:
 variants:
   cayenne: {}
   cayenne-object-native: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
-  sqlite: { datasets: { stall: { acceleration: { engine: sqlite } } } }
 
 spicepod:
   version: v1

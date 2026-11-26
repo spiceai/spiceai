@@ -23,8 +23,6 @@ limitations under the License.
 // `accelerator_crates_register_their_engines` guards the mechanism; this is where the
 // binaries that share these helpers get it.
 use accelerator_cayenne as _;
-#[cfg(feature = "sqlite")]
-use accelerator_sqlite as _;
 
 use std::{
     fmt::Display,
