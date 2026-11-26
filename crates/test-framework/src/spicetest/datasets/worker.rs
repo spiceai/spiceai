@@ -325,9 +325,10 @@ impl SpiceTestQueryWorker {
         tokio::spawn(async move {
             // Load test queries may be generated with multiple parameter sets, resulting in a large
             // set of queries. To respect duration limits, we group queries by name and run one
-            // group at a time, cycling through each group's parameter variations.
-            // If queries are unique, it will result in a single query set and will be the same as usual
-            let query_sets = build_unique_query_sets(&self.query_set)?;
+            // variation of each group per pass, cycling through the variations. Groups can have
+            // different sizes. If queries are unique, it will result in a single query set and
+            // will be the same as usual
+            let query_sets = build_unique_query_sets(&self.query_set);
 
             let query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>> = Arc::new(DashMap::new());
 
@@ -1290,14 +1291,12 @@ fn default_row_count_validation_skip_queries() -> HashSet<String> {
     .collect()
 }
 
-/// Build unique query sets by grouping queries by parameter index.
-/// Creates one query set per parameter variation, where each set contains
-/// one query of each type with the same parameter index.
-fn build_unique_query_sets(queries: &[Query]) -> Result<Vec<Vec<Query>>> {
-    use std::collections::HashMap;
-
-    // Group queries by name first
-    let mut groups: HashMap<Arc<str>, Vec<&Query>> = HashMap::new();
+/// Build unique query sets by grouping queries by name and position in the group.
+/// Set `n` holds the `n`th query of every group that has one.
+fn build_unique_query_sets(queries: &[Query]) -> Vec<Vec<Query>> {
+    // Group queries by name. A `BTreeMap` keeps the order of queries inside a set the same on
+    // every run.
+    let mut groups: BTreeMap<Arc<str>, Vec<&Query>> = BTreeMap::new();
     for query in queries {
         groups
             .entry(Arc::clone(&query.name))
@@ -1305,39 +1304,22 @@ fn build_unique_query_sets(queries: &[Query]) -> Result<Vec<Vec<Query>>> {
             .push(query);
     }
 
-    // Validate that all groups have the same size
-    let mut expected_size = None;
-    for (name, query_group) in &groups {
-        let group_size = query_group.len();
-        match expected_size {
-            None => expected_size = Some(group_size),
-            Some(expected) if expected != group_size => {
-                return Err(anyhow::anyhow!(
-                    "Uneven parameter groups detected: query '{name}' has {group_size} parameters, expected {expected}"
-                ));
-            }
-            _ => {}
-        }
-    }
+    // Groups can have different sizes (a `parameters_from` template returns as many rows as it
+    // has). Set `n` holds the `n`th query of every group that has one, so a small group drops out
+    // of the later sets.
+    let num_variations = groups.values().map(Vec::len).max().unwrap_or(0);
 
-    let num_variations = expected_size.unwrap_or(0);
-
-    // Create query sets by parameter index
     let mut result = Vec::with_capacity(num_variations);
-
     for param_index in 0..num_variations {
-        let mut query_set = Vec::with_capacity(groups.len());
-
-        for query_group in groups.values() {
-            if let Some(query) = query_group.get(param_index) {
-                query_set.push((*query).clone());
-            }
-        }
-
+        let query_set = groups
+            .values()
+            .filter_map(|query_group| query_group.get(param_index))
+            .map(|query| (*query).clone())
+            .collect();
         result.push(query_set);
     }
 
-    Ok(result)
+    result
 }
 
 #[cfg(test)]
@@ -1971,7 +1953,7 @@ mod tests {
             },
         ];
 
-        let result = build_unique_query_sets(&queries).expect("Should succeed");
+        let result = build_unique_query_sets(&queries);
 
         assert_eq!(
             result.len(),
@@ -2015,7 +1997,7 @@ mod tests {
             },
         ];
 
-        let result = build_unique_query_sets(&queries).expect("Should succeed");
+        let result = build_unique_query_sets(&queries);
 
         assert_eq!(
             result.len(),
@@ -2056,7 +2038,7 @@ mod tests {
             },
         ];
 
-        let result = build_unique_query_sets(&queries).expect("Should succeed");
+        let result = build_unique_query_sets(&queries);
 
         assert_eq!(result.len(), 1, "Should have one query set");
         assert_eq!(result[0].len(), 2, "Set should have both queries");
@@ -2064,5 +2046,93 @@ mod tests {
         // Verify we have both query names in the single set
         let names: Vec<&str> = result[0].iter().map(|q| q.name.as_ref()).collect();
         assert!(names.contains(&"query1") && names.contains(&"query2"));
+    }
+
+    #[test]
+    fn test_build_unique_query_sets_uneven_groups() {
+        let queries = vec![
+            template_row("big", 0),
+            template_row("big", 1),
+            template_row("big", 2),
+            template_row("small", 0),
+        ];
+
+        let result = build_unique_query_sets(&queries);
+
+        let names = |set: &Vec<Query>| set.iter().map(|q| q.name.to_string()).collect::<Vec<_>>();
+        assert_eq!(result.len(), 3, "one set for each query of the largest group");
+        assert_eq!(names(&result[0]), ["big", "small"]);
+        assert_eq!(names(&result[1]), ["big"]);
+        assert_eq!(names(&result[2]), ["big"]);
+    }
+
+    /// Returns `n + 1` rows for parameter row `n`, and one row for any other query.
+    #[derive(Clone)]
+    struct RowIndexExecutor;
+
+    #[async_trait::async_trait]
+    impl QueryExecutor for RowIndexExecutor {
+        async fn execute(
+            &self,
+            query: &Query,
+            _collect_batches: bool,
+        ) -> Result<crate::execution::ExecutionResult> {
+            let row_count = match query.parameter_rows {
+                crate::queries::ParameterRows::Row(n) => n + 1,
+                _ => 1,
+            };
+            Ok(crate::execution::ExecutionResult {
+                duration: std::time::Duration::from_millis(1),
+                row_count,
+                batches: None,
+            })
+        }
+
+        fn name(&self) -> &'static str {
+            "row-index"
+        }
+
+        fn supports_validation(&self) -> bool {
+            false
+        }
+
+        fn clone_box(&self) -> Box<dyn QueryExecutor> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn template_row(name: &str, row: usize) -> Query {
+        let mut query = Query::new(Arc::from(name), Arc::from("SELECT 1"), false);
+        query.parameters = Some(vec![ParameterValue::String(format!("p{row}").into())]);
+        query.parameter_rows = crate::queries::ParameterRows::Row(row);
+        query
+    }
+
+    /// Templates expand to different numbers of rows (301 union queries and one `term` query in
+    /// the search benchmark), so a `QuerySetCompleted` run must not require equal group sizes.
+    #[tokio::test]
+    async fn query_set_completed_accepts_uneven_parameter_groups() {
+        let queries = vec![
+            template_row("union", 0),
+            template_row("union", 1),
+            template_row("union", 2),
+            template_row("term", 0),
+        ];
+        let worker = SpiceTestQueryWorker::new(
+            0,
+            queries,
+            EndCondition::QuerySetCompleted(1),
+            "uneven".to_string(),
+            Box::new(RowIndexExecutor),
+        );
+
+        let result = worker
+            .start()
+            .await
+            .expect("worker task joins")
+            .expect("uneven parameter groups run to completion");
+
+        assert!(!result.connection_failed);
+        assert_eq!(result.query_durations.len(), 2);
     }
 }
