@@ -582,6 +582,7 @@ jobs:
           elif [ "${BY_DIGEST}" = true ]; then
             echo "::warning::ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} moved during the run; the app was deployed by ${VERIFIED}, the digest this run verified."
           else
+            [ -z "${moved:-}" ] || echo "Now: ${moved}"
             [ ! -s "${moves}" ] || { echo "The tag named, while the app ran:"; cat "${moves}"; }
             echo "::error::ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} did not name ${VERIFIED}, the digest this run verified, for the whole run, so the app may have run another image; its results are not this image's."
             exit 1
