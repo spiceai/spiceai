@@ -1,0 +1,40 @@
+name: CI store prefix
+description: >-
+  The segment this run nests its CI object store keys under, right after the granted prefix:
+  `artifacts/<segment>`. Only a run on trunk uses the shared keys (an empty segment). Any other
+  run, this release branch's included, uses `untrusted/<repository id>/<github.ref>/`, the only
+  keys the store lets it write; the repository id keeps two repositories' refs apart. Sets
+  CI_STORE_PREFIX for the rest of the job and outputs it. build_and_release.yml takes the segment
+  from here for every spiced and spice upload, and setup-spiced reads a build where the ref that
+  built it stored it.
+
+outputs:
+  prefix:
+    description: The prefix, empty on trunk.
+    value: ${{ steps.prefix.outputs.prefix }}
+
+runs:
+  using: composite
+  steps:
+    - name: Choose the CI store prefix
+      id: prefix
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "$GITHUB_REF" in
+          refs/heads/trunk) prefix='' ;;
+          refs/*)
+            if ! [[ "${GITHUB_REPOSITORY_ID:-}" =~ ^[0-9]+$ ]]; then
+              echo "::error::GITHUB_REPOSITORY_ID is '${GITHUB_REPOSITORY_ID:-}', not a repository id; cannot choose the CI store prefix."
+              exit 1
+            fi
+            prefix="untrusted/${GITHUB_REPOSITORY_ID}/${GITHUB_REF}/"
+            ;;
+          *)
+            echo "::error::GITHUB_REF is '$GITHUB_REF', not a ref; cannot choose the CI store prefix."
+            exit 1
+            ;;
+        esac
+        echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+        echo "CI_STORE_PREFIX=$prefix" >> "$GITHUB_ENV"
+        echo "CI store prefix: '${prefix}'"
