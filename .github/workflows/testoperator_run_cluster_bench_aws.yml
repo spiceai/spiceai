@@ -489,12 +489,17 @@ jobs:
             export SPIDAPTER_IMAGE_TAG="${CUSTOM_IMAGE_TAG}"
             ADAPTER_CHANNEL="internal"
           fi
-          # The tag must still name the digest this run verified when the app starts.
+          # Sent by tag, the tag must still name the digest this run verified when the app starts.
+          # Deployed by digest, the tag no longer decides what runs, so a moved tag is only noted.
           if [ -n "${SPIDAPTER_IMAGE_DIGEST}" ]; then
             now="$(bash .github/scripts/ghcr_digest.sh spiceai/spiceai-dev "${CUSTOM_IMAGE_TAG}")"
             if [ "${now}" != "${SPIDAPTER_IMAGE_DIGEST}" ]; then
-              echo "::error::ghcr.io/spiceai/spiceai-dev:${CUSTOM_IMAGE_TAG} names ${now} now, not ${SPIDAPTER_IMAGE_DIGEST}, the digest this run verified."
-              exit 1
+              if [ "${SPIDAPTER_IMAGE_BY_DIGEST}" = true ]; then
+                echo "::warning::ghcr.io/spiceai/spiceai-dev:${CUSTOM_IMAGE_TAG} names ${now} now; the app is deployed by ${SPIDAPTER_IMAGE_DIGEST}, the digest this run verified."
+              else
+                echo "::error::ghcr.io/spiceai/spiceai-dev:${CUSTOM_IMAGE_TAG} names ${now} now, not ${SPIDAPTER_IMAGE_DIGEST}, the digest this run verified."
+                exit 1
+              fi
             fi
             echo "Deploying by digest: ${SPIDAPTER_IMAGE_BY_DIGEST}"
           fi
@@ -553,10 +558,13 @@ jobs:
         env:
           IMAGE_TAG: ${{ env.CB_CUSTOM_IMAGE_TAG }}
           VERIFIED: ${{ steps.app-image.outputs.digest }}
+          BY_DIGEST: ${{ vars.CLUSTER_APP_IMAGE_BY_DIGEST == 'true' }}
         run: |
           set -euo pipefail
           now="$(bash .github/scripts/ghcr_digest.sh spiceai/spiceai-dev "${IMAGE_TAG}")"
-          if [ "${now}" != "${VERIFIED}" ]; then
+          if [ "${now}" != "${VERIFIED}" ] && [ "${BY_DIGEST}" = true ]; then
+            echo "::warning::ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} names ${now} now; the app was deployed by ${VERIFIED}, the digest this run verified."
+          elif [ "${now}" != "${VERIFIED}" ]; then
             echo "::error::ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} names ${now} now, not ${VERIFIED}, the digest this run verified, so the app may have run another image; its results are not this image's."
             exit 1
           fi

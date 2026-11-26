@@ -213,14 +213,18 @@ class ClusterImageTest(unittest.TestCase):
         after = steps[names.index("Check the cluster app image did not move")]
         self.assertGreater(names.index("Check the cluster app image did not move"), run_index)
         self.assertEqual(after["if"], "always() && steps.app-image.outputs.digest != ''")
-        for now, ok in (("sha256:" + "a" * 64, True), ("sha256:" + "b" * 64, False)):
-            with self.subTest(now=now), tempfile.TemporaryDirectory() as tmp:
+        for now, by_digest, ok in (("sha256:" + "a" * 64, "false", True), ("sha256:" + "b" * 64, "false", False),
+                                   ("sha256:" + "b" * 64, "true", True)):
+            with self.subTest(now=now, by_digest=by_digest), tempfile.TemporaryDirectory() as tmp:
                 work = Path(tmp)
                 (work / ".github" / "scripts").mkdir(parents=True)
                 (work / ".github" / "scripts" / "ghcr_digest.sh").write_text(f"echo {now}\n")
                 proc = subprocess.run(["bash", "-e", "-c", after["run"]], cwd=work, capture_output=True, text=True,
-                                      env={**os.environ, "IMAGE_TAG": "trunk-0123456789ab", "VERIFIED": "sha256:" + "a" * 64})
+                                      env={**os.environ, "IMAGE_TAG": "trunk-0123456789ab", "VERIFIED": "sha256:" + "a" * 64,
+                                           "BY_DIGEST": by_digest})
                 self.assertEqual(proc.returncode == 0, ok, proc.stdout + proc.stderr)
+                if by_digest == "true" and now.endswith("b"):
+                    self.assertIn("::warning::", proc.stdout)
 
     def test_a_trunk_run_takes_no_unverified_dev_channel_image(self):
         steps = job_steps("testoperator_run_cluster_bench_aws.yml", "run-cluster-bench")
