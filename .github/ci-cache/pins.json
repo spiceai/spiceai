@@ -107,5 +107,17 @@
       "macOS_amd64.zip": "a2f86418f4350ae6e9ec60d5000bdf7665728436946a97fc27fe50e6ae752682",
       "macOS_arm64.zip": "d700207eae9ae98fe2b89535c2c087c07823d4628c56364695a5a07ef311c062"
     }
+  },
+  "delta-spark-jar": {
+    "url": "https://repo1.maven.org/maven2/io/delta/delta-spark_2.12/3.3.2/delta-spark_2.12-3.3.2.jar",
+    "sha256": "4e92085d5d794cf949c50bb665b91384857cad58680c2d0bfc9c7ad353e98e85"
+  },
+  "delta-storage-jar": {
+    "url": "https://repo1.maven.org/maven2/io/delta/delta-storage/3.3.2/delta-storage-3.3.2.jar",
+    "sha256": "c096975a2ca97ccc9b4005aa5cce16c9ac3903139d340da6665b66ace67d7c36"
+  },
+  "antlr4-runtime-jar": {
+    "url": "https://repo1.maven.org/maven2/org/antlr/antlr4-runtime/4.9.3/antlr4-runtime-4.9.3.jar",
+    "sha256": "131a6594969bc4f321d652ea2a33bc0e378ca312685ef87791b2c60b29d01ea5"
   }
 }

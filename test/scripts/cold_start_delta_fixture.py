@@ -33,6 +33,11 @@ p.add_argument("--rows", type=int, required=True)
 p.add_argument("--commits", type=int, default=24)
 p.add_argument("--post-optimize-commits", type=int, default=8)
 p.add_argument("--delete-fraction", type=float, default=0.02)
+p.add_argument(
+    "--jars",
+    help="Comma-separated Delta jars to run with (CI passes its pinned, checked copies); without it, "
+    "Spark resolves delta-spark's jars from Maven Central as configure_spark_with_delta_pip asks",
+)
 args = p.parse_args()
 
 builder = (
@@ -45,7 +50,10 @@ builder = (
     .config("spark.sql.shuffle.partitions", "8")
     .config("spark.databricks.delta.properties.defaults.checkpointInterval", "10")
 )
-spark = configure_spark_with_delta_pip(builder).getOrCreate()
+if args.jars:
+    spark = builder.config("spark.jars", args.jars).getOrCreate()
+else:
+    spark = configure_spark_with_delta_pip(builder).getOrCreate()
 out = os.path.abspath(args.out)
 
 spark.sql(f"""

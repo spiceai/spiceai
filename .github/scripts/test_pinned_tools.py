@@ -244,6 +244,15 @@ class PinnedToolsTest(unittest.TestCase):
         self.assertIn("installed=false", (self.tmp / "github_output").read_text())
         self.assertEqual(self.calls(), [])
 
+    def test_the_cold_start_fixture_runs_the_pinned_delta_jars(self):
+        run = step("seed-cold-start-fixture", "Generate and upload the fixture")["run"]
+        for jar in ("delta-spark-jar", "delta-storage-jar", "antlr4-runtime-jar"):
+            self.assertIn(f'fetch_pinned.sh" {jar} "$jars/{jar}.jar"', run)
+        self.assertIn('--jars "$jars/delta-spark-jar.jar,$jars/delta-storage-jar.jar,$jars/antlr4-runtime-jar.jar"', run)
+        script = (ROOT / "test" / "scripts" / "cold_start_delta_fixture.py").read_text()
+        self.assertIn('builder.config("spark.jars", args.jars).getOrCreate()', script)
+        self.assertLess(script.index("if args.jars:"), script.index("configure_spark_with_delta_pip(builder)"))
+
     def test_only_setup_sccache_makes_sccache_the_rustc_wrapper(self):
         for path in sorted((ROOT / ".github").rglob("*.y*ml")):
             if path.parent.name == "setup-sccache":

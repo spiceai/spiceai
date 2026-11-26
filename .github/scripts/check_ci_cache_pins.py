@@ -56,6 +56,9 @@ FETCHED_PINS = {
     "awscli": (".github/actions/install-aws-cli/action.yml",),
     "duckdb-cli": (".github/actions/setup-spicescript/action.yml", ".github/workflows/spicescript_dispatch.yml"),
     "gh": (".github/actions/install-gh-cli/action.yml",),
+    "delta-spark-jar": (".github/actions/seed-cold-start-fixture/action.yml",),
+    "delta-storage-jar": (".github/actions/seed-cold-start-fixture/action.yml",),
+    "antlr4-runtime-jar": (".github/actions/seed-cold-start-fixture/action.yml",),
 }
 # Single-file pins a workflow writes out inline instead, with `sha256sum -c`: the file must
 # name the pin's URL and SHA-256 and check every download of that URL. Used where the

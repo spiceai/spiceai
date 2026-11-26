@@ -139,6 +139,11 @@ entry itself as `(Get-Content … | ConvertFrom-Json).'<name>'`, names its targe
   which runs the binary it installed by its path. The target names the asset, extension
   included. To bump it, pick the newest release at least two weeks old and take the four
   lines of its checksums file.
+- **`delta-spark-jar`, `delta-storage-jar`, `antlr4-runtime-jar`**: Delta 3.3.2's jars and
+  their one runtime dependency, which `seed-cold-start-fixture` gives Spark as `spark.jars`
+  instead of letting it resolve `io.delta:delta-spark_2.12:3.3.2` from Maven Central at run
+  time. Maven Central publishes SHA-1 sums beside each; the pins are the SHA-256 of downloads
+  that match them. To bump Delta, take the same three from its POM's runtime dependencies.
 - **`docker-apt-key`**: Docker's apt key (`download.docker.com/linux/ubuntu/gpg`), which the
   arm64 jobs of `spiced_docker_dev.yml`, `build_nightly.yml` and `spiced_docker.yml` install.
   It holds one key, `9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88`, the fingerprint

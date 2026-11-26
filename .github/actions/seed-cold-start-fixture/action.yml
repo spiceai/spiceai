@@ -59,8 +59,15 @@ runs:
         python -m pip install --require-hashes --only-binary=:all: -r "$requirements/cold_start_fixture_build.txt"
         python -m pip install --require-hashes --no-build-isolation --only-binary=:all: --no-binary=pyspark \
           -r "$requirements/cold_start_fixture.txt"
+        # Delta's jars, pinned in .github/ci-cache/pins.json and checked against their SHA-256s,
+        # instead of the ones Spark would resolve from Maven Central at run time.
+        jars="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/delta-jars.XXXXXX")"
+        bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" delta-spark-jar "$jars/delta-spark-jar.jar"
+        bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" delta-storage-jar "$jars/delta-storage-jar.jar"
+        bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" antlr4-runtime-jar "$jars/antlr4-runtime-jar.jar"
         python test/scripts/cold_start_delta_fixture.py --out "${RUNNER_TEMP}/cold_start_fixture" \
-          --rows 3000000 --commits 24 --post-optimize-commits 8
+          --rows 3000000 --commits 24 --post-optimize-commits 8 \
+          --jars "$jars/delta-spark-jar.jar,$jars/delta-storage-jar.jar,$jars/antlr4-runtime-jar.jar"
         mc rm --recursive --force "spice-minio/${INPUT_PREFIX}/" || true
         mc cp --recursive "${RUNNER_TEMP}/cold_start_fixture/" "spice-minio/${INPUT_PREFIX}/"
         echo "seeded by ${GITHUB_REPOSITORY}@${GITHUB_SHA} run ${GITHUB_RUN_ID}" \
