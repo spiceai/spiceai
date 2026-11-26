@@ -1911,7 +1911,8 @@ class CheckContainerImagesTest(unittest.TestCase):
 
     def test_docker_after_a_command_wrapper_is_read(self):
         for run in ("timeout 60 docker run --rm postgres:16 true", "env FOO=1 docker run postgres:16",
-                    "sudo -E env A=b timeout -k 5 60 docker pull postgres:16", "nice -n 5 docker run postgres:16"):
+                    "sudo -E env A=b timeout -k 5 60 docker pull postgres:16", "nice -n 5 docker run postgres:16",
+                    "sudo -u runner docker run postgres:16"):
             with self.subTest(run=run):
                 problems = _image_problems(_workflow_with_job(f"steps:\n  - run: {run}\n"))
                 self.assertEqual(len(problems), 1, problems)
@@ -2037,7 +2038,8 @@ class CheckHashedPythonInstallsTest(unittest.TestCase):
         self.assertEqual(self.problems("# pip install b", job), [])
         for run in ("pip -q install b", "python -m pip --disable-pip-version-check install b",
                     "pip3.12 install b", "pip install b  # --require-hashes",
-                    "pip install --index-url=https://x/--require-hashes b"):
+                    "pip install --index-url=https://x/--require-hashes b",
+                    "pip --index-url https://pypi.example/simple install b"):
             with self.subTest(run=run):
                 self.assertEqual(len(self.problems(run, job)), 1, run)
         self.assertEqual(

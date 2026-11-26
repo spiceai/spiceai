@@ -512,7 +512,7 @@ def check_share_off_trunk(jobs: dict) -> list[str]:
 
 
 # `pip`, `pip3`, `pip3.12` or `-m pip`, then any options before the `install` subcommand.
-PIP_INSTALL = re.compile(r"(?<![\w-])pip(?:3(?:\.\d+)?)?(?:\s+-[\w-]+(?:=\S+)?)*\s+install\b")
+PIP_INSTALL = re.compile(r"(?<![\w-])pip(?:3(?:\.\d+)?)?(?:\s+-[\w-]+(?:[= ](?!install\b)[^\s-]\S*)?)*\s+install\b")
 REQUIRE_HASHES = re.compile(r"(?:^|\s)--require-hashes(?:\s|$)")
 SECRET_OTHER_THAN_TOKEN = re.compile(r"\bsecrets\s*(?:\.\s*(?!GITHUB_TOKEN\b)[A-Za-z_]|\[)")
 
@@ -1702,6 +1702,8 @@ def docker_images(script: object) -> list[str]:
                 re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[j])
                 or tokens[j] in COMMAND_WRAPPERS
                 or (tokens[j].startswith("-") and any(w in tokens[:j] for w in COMMAND_WRAPPERS))
+                # An option's value of a wrapper: `sudo -u runner`, `nice -n 5`.
+                or (j > 0 and tokens[j - 1].startswith("-") and any(w in tokens[: j - 1] for w in COMMAND_WRAPPERS))
                 # A wrapper's numeric argument: `timeout 60`, `timeout -k 5 60`, `nice -n 5`.
                 or (re.fullmatch(r"\d+(?:\.\d+)?[smhd]?", tokens[j]) and any(w in tokens[:j] for w in COMMAND_WRAPPERS))
             ):
