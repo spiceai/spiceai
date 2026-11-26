@@ -33,6 +33,7 @@ use base64::prelude::*;
 use chrono::{DateTime, NaiveTime, Timelike, Utc};
 use serde_json::Value as Json;
 use snafu::prelude::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod changes;
@@ -171,26 +172,61 @@ pub fn to_struct_array(values: Vec<serde_json::Value>, schema: &Schema) -> Resul
     Ok(struct_builder.finish())
 }
 
+/// The value each column takes in a change event that does not carry it, by
+/// column name: the default Debezium declares for the column in the table's
+/// event schema.
+pub type ColumnDefaults = HashMap<String, serde_json::Value>;
+
+/// The declared non-null defaults of `fields`, a table's row schema.
+///
+/// `ALTER TABLE ... ADD COLUMN c ... NOT NULL DEFAULT d` rewrites no row, so a
+/// row unchanged since keeps a change event without `c`, while the table's
+/// schema, taken from the newest event, requires it. Postgres reads such a row
+/// with `d`; replaying its older event uses the same value.
+#[must_use]
+pub fn column_defaults(fields: &[ChangeEventField]) -> ColumnDefaults {
+    fields
+        .iter()
+        .filter_map(|field| {
+            let default = field.default.as_ref().filter(|d| !d.is_null())?;
+            Some((field.field.clone()?, default.clone()))
+        })
+        .collect()
+}
+
 pub fn append_value_to_struct_builder(
     value: serde_json::Value,
     builder: &mut StructBuilder,
+) -> Result<()> {
+    append_value_to_struct_builder_with_defaults(value, builder, &ColumnDefaults::new())
+}
+
+/// [`append_value_to_struct_builder`], where a required column the event does
+/// not carry takes its value from `defaults` (see [`column_defaults`]).
+pub fn append_value_to_struct_builder_with_defaults(
+    value: serde_json::Value,
+    builder: &mut StructBuilder,
+    defaults: &ColumnDefaults,
 ) -> Result<()> {
     builder.append(true);
     let null_value = serde_json::Value::Null;
 
     for (idx, field) in builder.fields().iter().enumerate() {
-        // If the field is missing from the message (e.g. due to schema evolution),
-        // append null for nullable fields instead of failing.
+        // A column missing from the message predates it (schema evolution):
+        // a nullable one is null, and a required one takes its declared default.
         let field_value = match value.get(field.name()) {
             Some(v) => v,
             None if field.is_nullable() => &null_value,
-            None => {
-                return MissingFieldInValueSnafu {
-                    field_name: field.name().clone(),
-                    value,
+            None => match defaults.get(field.name()) {
+                Some(default) => default,
+                None => {
+                    return MissingFieldInValueSnafu {
+                        field_name: field.name().clone(),
+                        value,
+                    }
+                    .fail();
                 }
-                .fail();
-            }
+            },
         };
 
         let field_builder = builder.field_builder_array(idx);
