@@ -29,7 +29,9 @@ FILES = [
 sys.path.insert(0, str(ROOT / ".github" / "scripts"))
 from check_ci_cache_pins import FETCHED_PINS  # noqa: E402
 
-FILES += sorted({user for users in FETCHED_PINS.values() for user in users})
+from check_ci_cache_pins import INLINE_PINS  # noqa: E402
+
+FILES += sorted({user for users in [*FETCHED_PINS.values(), *INLINE_PINS.values()] for user in users})
 
 
 class CheckCiCachePinsTest(unittest.TestCase):
@@ -295,6 +297,27 @@ class CheckCiCachePinsTest(unittest.TestCase):
         result = self.run_check()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("no longer compares the DuckDB CLI it downloads", result.stdout)
+
+
+    def test_the_gh_keyring_is_fetched_through_its_pin(self):
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("github-cli-keyring", result.stdout)
+        path = self.tmp / ".github/actions/push-snap-changes/action.yml"
+        path.write_text(path.read_text().replace('fetch_pinned.sh" github-cli-keyring "$out"', 'wget" -O"$out" x'))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("push-snap-changes/action.yml does not download github-cli-keyring", result.stdout)
+
+    def test_the_docker_apt_key_is_checked_inline_against_its_pin(self):
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("checked inline against pins.json: docker-apt-key", result.stdout)
+        self.edit_pins(lambda pins: pins["docker-apt-key"].update({"sha256": "2" * 64}))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        for user in INLINE_PINS["docker-apt-key"]:
+            self.assertIn(f"{user} downloads https://download.docker.com/linux/ubuntu/gpg 1 time(s) but checks 0", result.stdout)
 
 
 if __name__ == "__main__":

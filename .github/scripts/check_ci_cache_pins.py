@@ -56,12 +56,28 @@ FETCHED_PINS = {
         ".github/workflows/testoperator_run_cluster_bench_aws.yml",
     ),
     "duckdb-cli": (".github/actions/setup-spicescript/action.yml", ".github/workflows/spicescript_dispatch.yml"),
+    "github-cli-keyring": (
+        ".github/actions/push-snap-changes/action.yml",
+        ".github/workflows/testoperator_run_bench_aws.yml",
+        ".github/workflows/testoperator_run_schema_aws.yml",
+        ".github/workflows/testoperator_run_cluster_bench_aws.yml",
+    ),
+}
+# Single-file pins a workflow writes out inline instead, with `sha256sum -c`: the file must
+# name the pin's URL and SHA-256 and check every download of that URL. Used where the
+# checkout can be an older commit than the workflow, which may lack fetch_pinned.sh.
+INLINE_PINS = {
+    "docker-apt-key": (
+        ".github/workflows/spiced_docker_dev.yml",
+        ".github/workflows/build_nightly.yml",
+        ".github/workflows/spiced_docker.yml",
+    ),
 }
 # A call in a shell script: `fetch_pinned.sh" NAME DEST [TARGET]`, with TARGET a literal or a
 # variable such as "$target".
 FETCH_CALL = re.compile(
     r"""fetch_pinned\.sh["']?[ \t]+([A-Za-z0-9_.-]+)[ \t]+(?:"[^"\n]*"|'[^'\n]*'|[^\s;|&)]+)"""
-    r"""(?:[ \t]+(?:"([^"\n]*)"|'([^'\n]*)'|([^\s;|&)#]+)))?"""
+    r"""(?:[ \t]+(?:"([^"\n]*)"|'([^'\n]*)'|([^\s;|&)#\\]+)))?"""
 )
 # A PowerShell step reads the entry itself, as `(... | ConvertFrom-Json).'NAME'`, and names
 # the target it checks as `$target = 'TARGET'`.
@@ -138,6 +154,8 @@ def main() -> int:
 
     for name, users in FETCHED_PINS.items():
         errors.extend(fetched_pin_errors(pins, name, users))
+    for name, users in INLINE_PINS.items():
+        errors.extend(inline_pin_errors(pins, name, users))
     errors.extend(tpc_bench_duckdb_errors())
 
     for error in errors:
@@ -149,6 +167,7 @@ def main() -> int:
         )
         fetched = [f"{name} {pins[name]['version']}" if "version" in pins[name] else name for name in FETCHED_PINS]
         print(f"OK: fetched through fetch_pinned.sh, and pinned for every target asked for: {', '.join(fetched)}.")
+        print(f"OK: checked inline against pins.json: {', '.join(INLINE_PINS)}.")
     return 1 if errors else 0
 
 
@@ -209,6 +228,32 @@ def fetched_pin_errors(pins: dict, name: str, users: tuple) -> list:
                 )
             elif not isinstance(hashes, dict) and target:
                 errors.append(f"{user} asks for {name} for {target}, but {name} pins one file for no target.")
+    return errors
+
+
+def inline_pin_errors(pins: dict, name: str, users: tuple) -> list:
+    """A single-file pin a workflow checks inline: the same URL and SHA-256 as pins.json, with
+    one `sha256sum -c` of that SHA-256 for every download of the URL."""
+    pin = pins.get(name)
+    if not isinstance(pin, dict) or not isinstance(pin.get("sha256"), str) or not isinstance(pin.get("url"), str):
+        return [f"{PINS_PATH.relative_to(ROOT)} has no single-file {name} entry, which {', '.join(users)} check against."]
+    errors = []
+    url, sha256 = pin["url"], pin["sha256"]
+    if not SHA256.fullmatch(sha256):
+        errors.append(f"{name}.sha256 is not a lowercase hex SHA-256.")
+    if not url.startswith("https://"):
+        errors.append(f"{name}.url must be an https URL.")
+    for user in users:
+        text = (ROOT / user).read_text()
+        downloads = text.count(url)
+        checks = len(re.findall(rf'echo "{re.escape(sha256)}  [^"\n]*" \| sha256sum -c -', text))
+        if downloads == 0:
+            errors.append(f"{user} no longer downloads {url}; drop it from INLINE_PINS[{name!r}] or restore the download.")
+        elif checks < downloads:
+            errors.append(
+                f"{user} downloads {url} {downloads} time(s) but checks {checks} against {name}'s SHA-256 in "
+                f'{PINS_PATH.relative_to(ROOT)} (`echo "<sha256>  <file>" | sha256sum -c -`).'
+            )
     return errors
 
 

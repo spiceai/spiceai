@@ -125,6 +125,20 @@ entry itself as `(Get-Content … | ConvertFrom-Json).'<name>'`, names its targe
   digest GitHub records for the release asset, checked against a download.
   `test/tpc-bench/Makefile` pins the v2.0.0 CLI archives its TPC-H generator downloads in
   its own `case` arms the same way, and `check_ci_cache_pins.py` requires a SHA-256 in each.
+- **`github-cli-keyring`**: the apt keyring of GitHub CLI's package repository, which
+  `push-snap-changes` and the bench, schema and cluster bench workflows install before
+  `apt install gh`. The SHA-256 is the one GitHub publishes for the binary keyring in
+  `docs/install_linux.md` of `cli/cli`; the file holds the keys `2C61 0620 1985 B60E 6C7A C873
+  23F3 D4EA 7571 6059` and `7F38 BBB5 9D06 4DBC B3D8 4D72 5612 B364 6231 3325`, the
+  fingerprints that page lists, and the repository is signed by the second. When GitHub
+  changes the file, the install fails until the pin is updated from that page.
+- **`docker-apt-key`**: Docker's apt key (`download.docker.com/linux/ubuntu/gpg`), which the
+  arm64 jobs of `spiced_docker_dev.yml`, `build_nightly.yml` and `spiced_docker.yml` install.
+  It holds one key, `9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88`, the fingerprint
+  Docker's install guide gave for it. Those workflows check it inline with `sha256sum -c`
+  rather than through `fetch_pinned.sh`, because `spiced_docker_dev.yml` builds a commit that
+  can predate the script; `check_ci_cache_pins.py` keeps the inline SHA-256 equal to the pin
+  (`INLINE_PINS`).
 
 ## How the cache is filled
 

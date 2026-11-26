@@ -91,5 +91,13 @@
   "duckdb-cli": {
     "url": "https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip",
     "sha256": "08c0ca117111fcede14239d0093792352befdc174218c344d232c13279643d05"
+  },
+  "github-cli-keyring": {
+    "url": "https://cli.github.com/packages/githubcli-archive-keyring.gpg",
+    "sha256": "6084d5d7bd8e288441e0e94fc6275570895da18e6751f70f057485dc2d1a811b"
+  },
+  "docker-apt-key": {
+    "url": "https://download.docker.com/linux/ubuntu/gpg",
+    "sha256": "1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570"
   }
 }

@@ -19,9 +19,9 @@ runs:
       shell: bash
       run: |
         if ! command -v gh &> /dev/null; then
-          (type -p wget >/dev/null || (sudo apt update && sudo apt install wget -y)) \
-            && sudo mkdir -p -m 755 /etc/apt/keyrings \
-            && out=$(mktemp) && wget -nv -O"$out" https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+          # The keyring's SHA-256 is pinned in .github/ci-cache/pins.json, as GitHub publishes it.
+          sudo mkdir -p -m 755 /etc/apt/keyrings \
+            && out=$(mktemp) && bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" github-cli-keyring "$out" \
             && cat "$out" | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
             && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
             && sudo mkdir -p -m 755 /etc/apt/sources.list.d \
