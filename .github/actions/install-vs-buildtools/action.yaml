@@ -23,7 +23,7 @@ runs:
         Add-Content $env:GITHUB_PATH "C:\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
       shell: pwsh
 
-    - name: Install extra build tools (perl, protoc)
+    - name: Install extra build tools (perl)
       shell: pwsh
       run: |
         # use choco to install. GitHub's Windows images ship Chocolatey; a runner without it
@@ -33,5 +33,5 @@ runs:
           exit 1
         }
         choco install strawberryperl -y
-        choco install protoc -y
+        # protoc comes from install-protoc, pinned in .github/ci-cache/pins.json.
         echo "C:\Strawberry\perl\bin" >> $env:GITHUB_PATH

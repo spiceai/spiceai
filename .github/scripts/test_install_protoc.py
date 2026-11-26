@@ -173,6 +173,18 @@ class InstallProtocTest(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(self.installed(), [])
 
+    def test_the_unzip_helper_reads_no_module_from_the_working_directory(self):
+        self.assertIn('python3 -I - "${zip}" "${dest}"', unix_step())
+        self.assertNotRegex(unix_step(), r"python3 - ")
+
+    def test_no_other_action_installs_an_unpinned_protoc(self):
+        actions = ROOT / ".github" / "actions"
+        for path in sorted(actions.glob("*/action.y*ml")):
+            if path.parent.name == "install-protoc":
+                continue
+            with self.subTest(action=path.parent.name):
+                self.assertNotRegex(path.read_text(), r"(choco|brew|apt-get|apt) install[^\n]*\bprotoc\b")
+
 
 if __name__ == "__main__":
     unittest.main()

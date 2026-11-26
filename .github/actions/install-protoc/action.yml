@@ -62,7 +62,8 @@ runs:
           local zip="$1"
           local dest="$2"
           if command -v python3 &>/dev/null; then
-            python3 - "${zip}" "${dest}" <<'PY'
+            # -I: no module from the working directory can stand in for zipfile.
+            python3 -I - "${zip}" "${dest}" <<'PY'
         import sys, zipfile
         with zipfile.ZipFile(sys.argv[1]) as zf:
             zf.extractall(sys.argv[2])
