@@ -24,8 +24,15 @@ extern "C" {
 #endif
 
 // Converts a JSON schema to a GBNF grammar whose start rule is `root`. Returns the grammar,
-// or NULL with the reason in `*error`; free either string with spice_string_free.
+// or NULL with the reason in `*error`; free either string with spice_string_free. A schema
+// whose lower bound on a count or a value exceeds its upper bound (`minItems` above
+// `maxItems`, and the like) is refused before conversion, and the grammar must parse.
 char * spice_json_schema_to_grammar(const char * schema, char ** error);
+
+// Whether llama.cpp parses the GBNF `grammar` without a vocabulary, so one that names a
+// token by its text (`<think>`) fails; one by its id (`<[42]>`) parses. Returns 1, or 0 with the reason in `*error`; free
+// it with spice_string_free.
+int spice_grammar_check(const char * grammar, char ** error);
 
 void spice_string_free(char * text);
 
