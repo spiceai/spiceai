@@ -164,6 +164,8 @@ jobs:
   record-digests:
     name: Record v${{ inputs.release_version }} for trunk's checks
     needs: [resolve, publish]
+    # A release candidate (`X.Y.Z-rc.N`) is never recorded: no check runs one.
+    if: ${{ !contains(inputs.release_version, '-') }}
     runs-on: ubuntu-24.04
     environment: secret-free
     timeout-minutes: 10

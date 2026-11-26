@@ -76,6 +76,13 @@ class PublishReleaseRecordsTest(unittest.TestCase):
         self.assertIn("record_release_digests.py", run)
         self.assertIn("--base trunk", run)
 
+    def test_a_release_candidates_publish_records_nothing(self):
+        import yaml
+
+        workflow = Path(__file__).resolve().parents[1] / "workflows" / "publish_release.yml"
+        job = yaml.safe_load(workflow.read_text())["jobs"]["record-digests"]
+        self.assertEqual(job.get("if"), "${{ !contains(inputs.release_version, '-') }}")
+
 
 if __name__ == "__main__":
     unittest.main()
