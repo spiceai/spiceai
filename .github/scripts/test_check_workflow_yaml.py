@@ -1380,6 +1380,7 @@ def _workflow_running_the_runtime(
             "    runs-on: spiceai-macos\n    steps:\n",
             (
                 "      - name: Set up spiceio\n"
+                "        if: github.ref != 'refs/heads/trunk'\n"
                 "        uses: spiceai/spiceio/.github/actions/setup@0870da5\n"
                 if with_cache_setup
                 else ""
@@ -1469,6 +1470,7 @@ class CheckCacheEndpointIsolationTest(unittest.TestCase):
             "---\non:\n  workflow_dispatch:\n\njobs:\n  test-models:\n"
             "    runs-on: spiceai-macos\n    steps:\n"
             "      - name: Set up spiceio\n"
+            "        if: github.ref != 'refs/heads/trunk'\n"
             "        uses: spiceai/spiceio/.github/actions/setup@0870da5\n"
             "      - name: Note\n        run: |\n"
             "          # cargo nextest run happens in the next job\n"
@@ -1482,6 +1484,7 @@ class CheckCacheEndpointIsolationTest(unittest.TestCase):
             "---\non:\n  workflow_dispatch:\n\njobs:\n  test-models:\n"
             "    runs-on: spiceai-macos\n    steps:\n"
             "      - name: Set up spiceio\n"
+            "        if: github.ref != 'refs/heads/trunk'\n"
             "        uses: spiceai/spiceio/.github/actions/setup@0870da5\n"
             "      - name: Run OpenAI integration test\n        run: |\n"
             "          cargo nextest run -- openai_test\n"
@@ -1495,6 +1498,7 @@ class CheckCacheEndpointIsolationTest(unittest.TestCase):
             "---\non:\n  workflow_dispatch:\n\njobs:\n  test-models:\n"
             "    runs-on: spiceai-macos\n    steps:\n"
             "      - name: Set up spiceio\n"
+            "        if: github.ref != 'refs/heads/trunk'\n"
             "        uses: spiceai/spiceio/.github/actions/setup@0870da5\n"
             "      - name: Run OpenAI integration test\n        run: |\n"
             '          if [ "$CI" = "false" ]; then\n'
@@ -1520,6 +1524,7 @@ class CheckCacheEndpointIsolationTest(unittest.TestCase):
             "      - name: Run OpenAI integration test\n        run: |\n"
             "          cargo nextest run -- openai_test\n"
             "      - name: Set up spiceio\n"
+            "        if: github.ref != 'refs/heads/trunk'\n"
             "        uses: spiceai/spiceio/.github/actions/setup@0870da5\n"
         )
         self.assertEqual(check_workflow_yaml.check_workflow(workflow), [])
