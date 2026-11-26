@@ -1,10 +1,15 @@
 name: cayenne-vnext-recreate
-duration: 11s
+duration: 7s
 description: >
-  Upgrades two Cayenne datasets from SQLite to `runtime.params.cayenne_vnext`
-  with a `mode: file_create` start, then recreates one of them. Each recreate
-  reloads only the dataset being recreated: the other keeps its data, and the
-  object-native metastore is created once and never deleted.
+  Three Cayenne datasets on SQLite move to `runtime.params.cayenne_vnext`,
+  where each loads from its source into the object-native metastore while its
+  SQLite copy is kept. A `mode: file_create` start then recreates one of them:
+  only that one reloads, the others keep their data, the object-native
+  metastore is created once and never deleted, and no SQLite copy is touched.
+  With the flag off again, recreating the dataset named `cayenne`, whose data
+  is at the default `.spice/data/cayenne/` where the object-native metastore of
+  the default location also is, replaces only its own SQLite tables: the
+  object-native metastore and the datasets in it survive.
 
 sources:
   src: { kind: postgres }
@@ -26,6 +31,12 @@ spicepod:
       name: b_ds
       params: ${sources.src.params}
       acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
+    # 2000 rows, more than the metastore keeps inline, so its SQLite copy has
+    # data files in `.spice/data/cayenne/`.
+    - from: postgres:public.b_ds
+      name: cayenne
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
 
 defaults:
   expect: { oracle: src }
@@ -38,43 +49,32 @@ steps:
         CREATE TABLE b_ds (id integer PRIMARY KEY, v text);
         INSERT INTO b_ds SELECT i, 'b' || i FROM generate_series(1, 2000) AS i;
 
-  # Flag off: both datasets are on SQLite.
+  # Flag off: the datasets are on SQLite.
   - start: {}
   - query: SELECT * FROM a_ds
   - query: SELECT * FROM b_ds
-  - assert-files: { contains: ['(^|/)\.spice/data/metadata/cayenne\.db$', '(^|/)\.spice/data/b_ds/.*\.vortex$'], lacks: ['(^|/)cayenne/v1/catalog/head$'] }
+  - query: SELECT * FROM cayenne
+    oracle-sql: SELECT * FROM b_ds
+  - assert-files: { contains: ['(^|/)\.spice/data/metadata/cayenne\.db$', '(^|/)\.spice/data/b_ds/.*\.vortex$', '(^|/)\.spice/data/cayenne/[0-9a-f-]+/.*\.vortex$'], lacks: ['(^|/)cayenne/v1/catalog/head$'] }
 
-  # Flag on: both datasets are refused with the fix, and their data is kept.
-  - restart:
-      ready: false
-      patch: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
-  - assert-status: { dataset: a_ds, status: Error, message-contains: "Dataset 'a_ds' is accelerated in the SQLite Cayenne metastore, but `runtime.params.cayenne_vnext` is enabled" }
-    eventually: 60s
-  - assert-status: { dataset: b_ds, status: Error, message-contains: "or start it once with `acceleration.mode: file_create`" }
-    eventually: 60s
-  - assert-files: { contains: ['(^|/)\.spice/data/b_ds/.*\.vortex$'] }
-
-  # Upgrade: one `mode: file_create` start reloads both from the source into
-  # the object-native metastore.
+  # Flag on: each dataset loads from its source into the object-native
+  # metastore (with the changes the SQLite copies do not have), and the SQLite
+  # copies are left as they were.
+  - stop: {}
+  - mark-files: { id: sqlite-copies, matching: ['^\.spice/data/(a_ds|b_ds)/', '^\.spice/data/cayenne/[0-9a-f-]+/', '^\.spice/data/metadata/cayenne\.db'] }
   - source-exec: { src: "UPDATE a_ds SET v = 'moved' WHERE id % 3 = 0; UPDATE b_ds SET v = 'moved' WHERE id % 7 = 0" }
   - restart:
-      patch: { datasets: { a_ds: { acceleration: { mode: file_create } }, b_ds: { acceleration: { mode: file_create } } } }
-  - query: SELECT * FROM a_ds
-    eventually: 60s
-  - query: SELECT * FROM b_ds
-    eventually: 60s
-  - assert-files: { contains: ['(^|/)\.spice/data/cayenne/v1/catalog/head$', '(^|/)\.spice/data/cayenne/v1/datasets/b_ds-[^/]+/data/.*\.vortex$'], lacks: ['(^|/)\.spice/data/b_ds/.*\.vortex$'] }
-  - assert-log: { count: { 'Created the Cayenne object-native metastore': 1, 'Deleted the acceleration data directory': 2 } }
-
-  # Back to `mode: file`: the restart reopens the metastore and keeps the data.
-  - restart:
-      patch: { datasets: { a_ds: { acceleration: { mode: file } }, b_ds: { acceleration: { mode: file } } } }
+      patch: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
   - query: SELECT * FROM a_ds
     eventually: 60s
   - query: SELECT * FROM b_ds
     id: b_upgraded
     eventually: 60s
-  - assert-log: { count: { 'Created the Cayenne object-native metastore': 1, 'Opened the Cayenne object-native metastore': '>=1' } }
+  - query: SELECT * FROM cayenne
+    oracle-sql: SELECT * FROM b_ds
+    eventually: 60s
+  - assert-files: { unchanged-since: sqlite-copies, contains: ['(^|/)\.spice/data/cayenne/v1/catalog/head$', '(^|/)\.spice/data/cayenne/v1/datasets/b_ds-[^/]+/data/.*\.vortex$'] }
+  - assert-log: { count: { 'Created the Cayenne object-native metastore': 1 }, lacks: ['Deleted the acceleration data directory'] }
 
   # Recreate a_ds only: a_ds reloads, b_ds keeps its data, the metastore is
   # not recreated, and no local directory is deleted.
@@ -85,8 +85,40 @@ steps:
     eventually: 60s
   - query: SELECT * FROM b_ds
     expect: { same-as: b_upgraded }
-  - assert-log: { count: { 'Created the Cayenne object-native metastore': 1, 'Deleted the acceleration data directory': 2 } }
+  - assert-log: { count: { 'Created the Cayenne object-native metastore': 1 }, lacks: ['Deleted the acceleration data directory'] }
 
-  # b_ds still refreshes from its source.
+  # Back to `mode: file`: the restart reopens the metastore and keeps the data.
+  - restart:
+      patch: { datasets: { a_ds: { acceleration: { mode: file } } } }
+  - query: SELECT * FROM a_ds
+    eventually: 60s
+  - query: SELECT * FROM b_ds
+    expect: { same-as: b_upgraded }
+  - assert-log: { count: { 'Created the Cayenne object-native metastore': 1, 'Opened the Cayenne object-native metastore': '>=1' } }
+  - stop: {}
+  - assert-files: { unchanged-since: sqlite-copies }
+
+  # Flag off, and `cayenne` recreated on SQLite: its SQLite tables, which share
+  # `.spice/data/cayenne/` with the object-native metastore, are replaced, and
+  # the object-native metastore and the datasets in it are kept. The others are
+  # served from their SQLite copies.
+  - restart:
+      patch:
+        spicepod: { runtime: { params: { cayenne_vnext: disabled } } }
+        datasets: { cayenne: { acceleration: { mode: file_create } } }
+  - query: SELECT * FROM cayenne
+    oracle-sql: SELECT * FROM b_ds
+    eventually: 60s
+  - assert-files: { contains: ['(^|/)\.spice/data/cayenne/v1/catalog/head$', '(^|/)\.spice/data/cayenne/v1/datasets/b_ds-[^/]+/data/.*\.vortex$'] }
+
+  # Flag on again: b_ds is served from its object-native copy, which the
+  # recreate on SQLite did not touch.
+  - restart:
+      patch:
+        spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+        datasets: { cayenne: { acceleration: { mode: file } } }
+  - query: SELECT * FROM b_ds
+    expect: { same-as: b_upgraded }
   - refresh: b_ds
   - query: SELECT * FROM b_ds
+    eventually: 60s

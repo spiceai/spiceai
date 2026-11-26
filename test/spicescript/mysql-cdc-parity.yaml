@@ -69,41 +69,43 @@ defaults:
 
 steps:
   - source-exec:
-      src: |
-        SET SESSION cte_max_recursion_depth = 1000000;
-        CREATE TABLE customers (
-          c_id      INT PRIMARY KEY,
-          c_name    VARCHAR(64) NOT NULL,
-          c_segment VARCHAR(16),
-          c_balance DECIMAL(15, 2),
-          c_active  TINYINT(1),
-          c_since   DATE
-        );
-        CREATE TABLE orders (
-          o_id      BIGINT PRIMARY KEY,
-          o_custkey INT,
-          o_status  CHAR(1),
-          o_total   DECIMAL(15, 2),
-          o_qty     SMALLINT,
-          o_weight  DOUBLE,
-          o_note    TEXT,
-          o_placed  DATETIME(6),
-          o_updated TIMESTAMP(6) NULL,
-          o_payload VARBINARY(16)
-        );
-        INSERT INTO customers
-          WITH RECURSIVE seq (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 500)
-          SELECT i, CONCAT('Customer#', i), ELT(1 + i % 4, 'AUTO', 'BUILDING', 'FURNITURE', NULL),
-                 (i * 37 % 10000) / 7.0, i % 3 <> 0, DATE '2020-01-01' + INTERVAL i DAY
-          FROM seq;
-        INSERT INTO orders
-          WITH RECURSIVE seq (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 20000)
-          SELECT i, 1 + i % 500, ELT(1 + i % 3, 'O', 'F', 'P'), (i * 7919 % 1000000) / 100.0,
-                 i % 50, i * 0.125, CASE WHEN i % 10 = 0 THEN NULL ELSE CONCAT('note ', i) END,
-                 TIMESTAMP '2024-01-01 00:00:00' + INTERVAL (i * 37) MINUTE,
-                 TIMESTAMP '2024-01-01 00:00:00.123456' + INTERVAL (i * 41) SECOND,
-                 UNHEX(LPAD(HEX(i), 8, '0'))
-          FROM seq;
+      src:
+        - |
+          CREATE TABLE customers (
+            c_id      INT PRIMARY KEY,
+            c_name    VARCHAR(64) NOT NULL,
+            c_segment VARCHAR(16),
+            c_balance DECIMAL(15, 2),
+            c_active  TINYINT(1),
+            c_since   DATE
+          );
+          CREATE TABLE orders (
+            o_id      BIGINT PRIMARY KEY,
+            o_custkey INT,
+            o_status  CHAR(1),
+            o_total   DECIMAL(15, 2),
+            o_qty     SMALLINT,
+            o_weight  DOUBLE,
+            o_note    TEXT,
+            o_placed  DATETIME(6),
+            o_updated TIMESTAMP(6) NULL,
+            o_payload VARBINARY(16)
+          );
+          INSERT INTO customers
+            WITH RECURSIVE seq (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 500)
+            SELECT i, CONCAT('Customer#', i), ELT(1 + i % 4, 'AUTO', 'BUILDING', 'FURNITURE', NULL),
+                   (i * 37 % 10000) / 7.0, i % 3 <> 0, DATE '2020-01-01' + INTERVAL i DAY
+            FROM seq;
+        - &fill-orders |
+          SET SESSION cte_max_recursion_depth = 1000000;
+          INSERT INTO orders
+            WITH RECURSIVE seq (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 20000)
+            SELECT i, 1 + i % 500, ELT(1 + i % 3, 'O', 'F', 'P'), (i * 7919 % 1000000) / 100.0,
+                   i % 50, i * 0.125, CASE WHEN i % 10 = 0 THEN NULL ELSE CONCAT('note ', i) END,
+                   TIMESTAMP '2024-01-01 00:00:00' + INTERVAL (i * 37) MINUTE,
+                   TIMESTAMP '2024-01-01 00:00:00.123456' + INTERVAL (i * 41) SECOND,
+                   UNHEX(LPAD(HEX(i), 8, '0'))
+            FROM seq;
 
   - start: {}
   - query: SELECT * FROM orders
@@ -253,18 +255,30 @@ steps:
 
   # Readers while the change stream writes (#16132): with the data in an
   # object-store location, with or without 20 ms of latency, no query fails,
-  # and the table still matches the source afterwards.
+  # every read sees all 20,000 rows, and the table matches the source
+  # afterwards. orders is filled again first, so each write updates about
+  # 1,500 rows, 5 times a second.
+  - source-exec:
+      src: [DELETE FROM orders, *fill-orders]
+    only: &object-native-data-in-store [object-native-s3, object-native-s3-latency]
+  - query: SELECT count(*) FROM orders
+    expect: { rows: [['20000']] }
+    eventually: 90s
+    only: *object-native-data-in-store
   - background:
       id: cdc-writes
       source-exec: { src: "UPDATE orders SET o_total = o_total + 1 WHERE o_id % 13 = ${round} % 13" }
       every: 200ms
-    only: &object-native-data-in-store [object-native-s3, object-native-s3-latency]
+    only: *object-native-data-in-store
   - background:
       id: readers
-      query: SELECT count(*), sum(o_total) FROM orders
+      query: SELECT count(*) AS n, sum(o_total) FROM orders
       concurrency: 4
+      expect: { n: '20000' }
     only: *object-native-data-in-store
-  - sleep: 30s
+  - query: SELECT count(*) AS n FROM orders
+    expect: { rows: [['20000']] }
+    consistently: 30s
     only: *object-native-data-in-store
   - stop-background: { id: cdc-writes }
     only: *object-native-data-in-store
@@ -286,3 +300,17 @@ steps:
   - query: SELECT * FROM orders
     eventually: 30s
     only: *object-native-data-in-store
+
+  # Replication of both tables resumes after a restart past the compatible
+  # ALTER above. Run last: a restart that does not become ready skips the rest
+  # of its instance. The columns are named because an acceleration loaded again
+  # from the source (cayenne-memory) takes the source's new column.
+  - restart: {}
+  - source-exec:
+      src:
+        - UPDATE customers SET c_balance = c_balance + 1 WHERE c_id = 502
+        - "INSERT INTO orders (o_id, o_custkey, o_status) VALUES (3000000, 502, 'R')"
+  - query: SELECT c_id, c_name, c_segment, c_balance, c_active, c_since FROM customers
+    eventually: 60s
+  - query: SELECT * FROM orders
+    eventually: 60s
