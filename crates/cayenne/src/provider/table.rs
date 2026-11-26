@@ -74818,9 +74818,10 @@ mod tests {
         }
     }
 
-    /// A pipelined staged append that published its rows before an overwrite
-    /// and queues its delta after it must not add the replaced rows to the
-    /// overwrite's count.
+    /// An overwrite that starts while a pipelined staged append has published
+    /// its rows but not finished waits for the append, whose delta is then
+    /// queued before the overwrite's reset. The overwrite must discard that
+    /// delta rather than add the replaced rows to its count.
     #[tokio::test]
     async fn overwrite_discards_the_delta_of_a_staged_append_published_before_it() {
         let ctx = SessionContext::new();
@@ -74844,8 +74845,17 @@ mod tests {
                 .await
                 .expect("the append publishes its rows")
                 .expect("the append reports its publish");
-            overwrite_with_rows(&provider, 2).await;
-            release.send(()).expect("release the append");
+            let release_once_waiting = async {
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while !provider.append_admission_held_exclusively() {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("the overwrite waits for the staged append");
+                release.send(()).expect("release the append");
+            };
+            tokio::join!(overwrite_with_rows(&provider, 2), release_once_waiting);
         };
         let (finished, ()) = tokio::join!(staged.finish(), race);
         assert_eq!(finished.expect("the append finishes"), 3);
