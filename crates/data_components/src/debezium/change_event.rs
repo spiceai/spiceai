@@ -215,6 +215,10 @@ pub struct Field {
     pub version: Option<i64>,
     pub parameters: Option<HashMap<String, String>>,
     pub items: Option<Box<Field>>,
+    /// The column's default, as Debezium declares it in the event schema
+    /// (encoded like the column's values). Absent for a column without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
 }
 
 #[cfg(test)]

@@ -22,7 +22,7 @@ use crate::kafka::{
 use crate::{
     cdc::{self, ChangeEnvelope, ChangesStream},
     debezium::{
-        arrow::changes,
+        arrow::{ColumnDefaults, changes},
         change_event::{ChangeEvent, ChangeEventKey},
     },
     kafka::{Error, KafkaConsumer},
@@ -51,6 +51,8 @@ pub struct DebeziumKafka {
     /// JSON-nesting / declared-schema projection applied to each change row's
     /// `before`/`after` payload before Arrow conversion. `None` ⇒ passthrough.
     projection: Option<SchemaProjection>,
+    /// The value a required column takes in an event that predates it.
+    column_defaults: Arc<ColumnDefaults>,
 }
 
 impl std::fmt::Debug for DebeziumKafka {
@@ -99,7 +101,19 @@ impl DebeziumKafka {
             batching,
             offset_commit_hook: None,
             projection,
+            column_defaults: Arc::new(ColumnDefaults::new()),
         }
+    }
+
+    /// Gives a required column an event does not carry the column's default
+    /// from the table's event schema (see [`column_defaults`]), instead of
+    /// failing the batch that holds the event.
+    ///
+    /// [`column_defaults`]: crate::debezium::arrow::column_defaults
+    #[must_use]
+    pub fn with_column_defaults(mut self, column_defaults: ColumnDefaults) -> Self {
+        self.column_defaults = Arc::new(column_defaults);
+        self
     }
 
     #[must_use]
@@ -124,6 +138,7 @@ impl DebeziumKafka {
         let metrics = Arc::clone(self.consumer.metrics());
         let offset_commit_hook = self.offset_commit_hook.clone();
         let projection = self.projection.clone();
+        let column_defaults = Arc::clone(&self.column_defaults);
         let inner = self
             .consumer
             .stream_json::<ChangeEventKey, ChangeEvent>()
@@ -162,10 +177,15 @@ impl DebeziumKafka {
                     })
                     .max();
 
-                let rb =
-                    changes::vector_to_change_batch(&schema, &pk, &changes, projection.as_ref())
-                        .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?
-                        .with_source_commit_ts_ms(source_commit_ts_ms);
+                let rb = changes::vector_to_change_batch_with_defaults(
+                    &schema,
+                    &pk,
+                    &changes,
+                    projection.as_ref(),
+                    &column_defaults,
+                )
+                .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?
+                .with_source_commit_ts_ms(source_commit_ts_ms);
 
                 let committer = MessageBatchCommitter::from_messages(consumer, &messages)
                     .with_offset_commit_hook(offset_commit_hook.clone());
