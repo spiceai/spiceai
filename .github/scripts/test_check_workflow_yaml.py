@@ -1827,6 +1827,7 @@ class CheckContainerImagesTest(unittest.TestCase):
             "docker image pull -q postgres:16",
             "if ! docker run -d \\\n  --name db \\\n  -p 1:2 \\\n  postgres:16 --flag; then\n  exit 1\nfi",
             "out=$(docker run --rm postgres:16 echo hi)",
+            'id="$(docker run -d postgres:16)"',
             "true && docker run postgres:16",
         ]
         for script in scripts:

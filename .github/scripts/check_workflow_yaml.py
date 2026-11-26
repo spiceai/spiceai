@@ -1322,8 +1322,10 @@ def check_cache_endpoint_isolation(jobs: dict) -> list[str]:
 # Container images. A tag is a name the registry can point at other bytes at any time, so a
 # job that starts `postgres:16` runs whatever the registry serves under it that day, with
 # the job's credentials beside it. A digest names the bytes. The exception is an image the
-# job built itself and pushed to a registry on the runner (`localhost:5000/…`, the local
-# registry the image workflows start): its digest does not exist until the job builds it.
+# job built itself and pushed to a registry on the runner, such as the `localhost:5000`
+# registry the image workflows start: its digest does not exist until the job builds it. It
+# is told apart by its registry host, `localhost` or `127.0.0.1` (with any port), which no
+# image from elsewhere can have.
 #
 # What is read: `jobs.<job>.services.<name>.image`, `jobs.<job>.container` (or its `image`),
 # `uses: docker://…` steps, and in every `run:` script of a workflow or composite action, the
@@ -1339,10 +1341,11 @@ def check_cache_endpoint_isolation(jobs: dict) -> list[str]:
 #
 # What it does not catch: an image a script under .github/scripts, a Makefile, a compose
 # file, a Helm chart or test code starts (including through .github/scripts/docker_pull.sh,
-# whose arguments are not read); `docker` run through a variable, function or alias; `docker
-# compose`, `docker build` base images and buildx driver images; an image named in an
-# expression without a `/`, `:` or `@` (`'redis'`); and options it does not know to take a
-# value, which can make it read the option's value as the image (and report it).
+# whose arguments are not read); `docker` run through a variable, function or alias, inside
+# backticks, or in a quoted `sh -c` string; `docker compose`, `docker build` base images and
+# buildx driver images; an image named in an expression without a `/`, `:` or `@`
+# (`'redis'`); and options it does not know to take a value, which can make it read the
+# option's value as the image (and report it, so it fails closed).
 DOCKER_IMAGE_COMMANDS = {("run",), ("create",), ("pull",), ("container", "run"), ("container", "create"), ("image", "pull")}
 # Options of `docker run`/`create`/`pull` that take no value; every other option does,
 # unless it is written `--name=value` or as a cluster of these short flags (`-dit`).
@@ -1460,10 +1463,15 @@ def docker_images(script: object) -> list[str]:
     if not isinstance(script, str):
         return []
     images = []
-    for line in _logical_lines(script):
+    lines = _logical_lines(script)
+    while lines:
+        line = lines.pop(0)
         if "docker" not in line:
             continue
         tokens = _tokens(line)
+        # A command substitution inside quotes (`id="$(docker run …)"`) is one shell word;
+        # its command is read as a line of its own.
+        lines.extend(token.split("$(", 1)[1].rstrip(")") for token in tokens if "$(" in token)
         for i, token in enumerate(tokens):
             if token != "docker":
                 continue
