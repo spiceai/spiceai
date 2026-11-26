@@ -54,13 +54,18 @@ pub enum Error {
     ))]
     InvalidMcpArgs { source: shell_words::ParseError },
 
+    /// The URLs are shown without their credentials; the message is logged and kept as the
+    /// tool's status.
     #[snafu(display(
-        "Failed to load tool '{tool}': MCP server URL '{url}' uses plaintext HTTP to a host that is not loopback, which would send the tool's credentials and results unencrypted. Use https://, or set `mcp_transport_security: allow_plaintext` on the tool if the network already encrypts this connection. See: {MCP_DOCS}"
+        "Failed to load tool '{tool}': MCP server URL '{}' uses plaintext HTTP to a host that is not loopback, which would send the tool's credentials and results unencrypted. Use https://, or set `mcp_transport_security: allow_plaintext` on the tool if the network already encrypts this connection. See: {MCP_DOCS}",
+        redact::redact_url_credentials(url)
     ))]
     PlaintextToRemoteHost { tool: String, url: String },
 
     #[snafu(display(
-        "Failed to load tool '{tool}': MCP server URL '{url}' uses plaintext HTTP to a host that is not loopback ({wildcard} is not a loopback address), which would send the tool's credentials and results unencrypted. Use {local_url} for a local server, https:// for a remote one, or set `mcp_transport_security: allow_plaintext` on the tool if the network already encrypts this connection. See: {MCP_DOCS}"
+        "Failed to load tool '{tool}': MCP server URL '{}' uses plaintext HTTP to a host that is not loopback ({wildcard} is not a loopback address), which would send the tool's credentials and results unencrypted. Use {} for a local server, https:// for a remote one, or set `mcp_transport_security: allow_plaintext` on the tool if the network already encrypts this connection. See: {MCP_DOCS}",
+        redact::redact_url_credentials(url),
+        redact::redact_url_credentials(local_url)
     ))]
     PlaintextToWildcard {
         tool: String,
@@ -581,6 +586,29 @@ mod tests {
             message.contains("(:: is not a loopback address)")
                 && message.contains("Use http://[::1]:8090/v1/mcp for a local server"),
             "{message}"
+        );
+    }
+
+    /// The refusal is logged and kept as the tool's status, so a token in the URL's query must
+    /// not appear in it, nor in the loopback URL it suggests
+    /// (`test/spicescript/secret-redaction.yaml`).
+    #[test]
+    fn plaintext_mcp_refusal_hides_the_urls_query_credentials() {
+        let message = http_config("http://tools.example.com/sse?token=TOOL-TOKEN-11", &[])
+            .err()
+            .expect("a remote plaintext URL is refused")
+            .to_string();
+        assert_eq!(
+            message,
+            "Failed to load tool 'remote_tools': MCP server URL 'http://tools.example.com/sse?token=***' uses plaintext HTTP to a host that is not loopback, which would send the tool's credentials and results unencrypted. Use https://, or set `mcp_transport_security: allow_plaintext` on the tool if the network already encrypts this connection. See: https://spiceai.org/docs/components/tools/mcp"
+        );
+        let message = http_config("http://0.0.0.0:8090/sse?token=TOOL-TOKEN-12", &[])
+            .err()
+            .expect("the wildcard address is not loopback")
+            .to_string();
+        assert_eq!(
+            message,
+            "Failed to load tool 'remote_tools': MCP server URL 'http://0.0.0.0:8090/sse?token=***' uses plaintext HTTP to a host that is not loopback (0.0.0.0 is not a loopback address), which would send the tool's credentials and results unencrypted. Use http://127.0.0.1:8090/sse?token=*** for a local server, https:// for a remote one, or set `mcp_transport_security: allow_plaintext` on the tool if the network already encrypts this connection. See: https://spiceai.org/docs/components/tools/mcp"
         );
     }
 
