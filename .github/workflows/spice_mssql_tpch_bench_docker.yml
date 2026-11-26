@@ -81,8 +81,15 @@ jobs:
       - name: Install necessary tools
         run: |
           sudo add-apt-repository ppa:ubuntu-toolchain-r/ppa -y && sudo apt-get update && sudo apt-get install -y make flex bison byacc git g++-9 gcc-9
-          curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
-          sudo add-apt-repository "$(wget -qO- https://packages.microsoft.com/config/ubuntu/20.04/prod.list)" -y
+          # Microsoft's apt key, checked against the SHA-256 pinned as microsoft-apt-key in
+          # .github/ci-cache/pins.json before apt trusts it, and trusted for its own repository only:
+          # this job publishes the image the benchmark jobs run.
+          microsoft_key="$(mktemp)"
+          curl -fsSL --retry 3 -o "$microsoft_key" https://packages.microsoft.com/keys/microsoft.asc
+          echo "2fa9c05d591a1582a9aba276272478c262e95ad00acf60eaee1644d93941e3c6  $microsoft_key" | sha256sum -c -
+          sudo mkdir -m 0755 -p /etc/apt/keyrings
+          sudo gpg --dearmor --yes -o /etc/apt/keyrings/microsoft-sqlcmd.gpg "$microsoft_key"
+          echo "deb [arch=amd64,armhf,arm64 signed-by=/etc/apt/keyrings/microsoft-sqlcmd.gpg] https://packages.microsoft.com/ubuntu/20.04/prod focal main" | sudo tee /etc/apt/sources.list.d/microsoft-sqlcmd.list > /dev/null
           sudo apt-get update
           sudo apt-get install sqlcmd -y
 

@@ -69,10 +69,6 @@ workflows:
         - 'google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093'
         - 'spiceai/spiceio@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc'
         - 'swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0'
-    '.github/workflows/e2e_test_ci_aws.yml':
-        - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
-        - 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333'
-        - 'aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd'
     '.github/workflows/e2e_test_release_install.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4'

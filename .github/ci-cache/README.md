@@ -151,6 +151,12 @@ entry itself as `(Get-Content … | ConvertFrom-Json).'<name>'`, names its targe
   rather than through `fetch_pinned.sh`, because `spiced_docker_dev.yml` builds a commit that
   can predate the script; `check_ci_cache_pins.py` keeps the inline SHA-256 equal to the pin
   (`INLINE_PINS`).
+- **`microsoft-apt-key`**: Microsoft's apt key (`packages.microsoft.com/keys/microsoft.asc`), which
+  `spice_mssql_tpch_bench_docker.yml` installs to get `sqlcmd` while it builds the MSSQL bench
+  image. It holds one key, `BC52 8686 B50D 79E3 39D3 721C EB3E 94AD BE12 29CF`, Microsoft's
+  release-signing key, and apt trusts it only for that one repository (`signed-by`). The
+  workflow checks it inline, as for `docker-apt-key`, and `check_ci_cache_pins.py` keeps the two
+  SHA-256s equal.
 
 ## How the cache is filled
 

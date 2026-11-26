@@ -69,6 +69,7 @@ INLINE_PINS = {
         ".github/workflows/build_nightly.yml",
         ".github/workflows/spiced_docker.yml",
     ),
+    "microsoft-apt-key": (".github/workflows/spice_mssql_tpch_bench_docker.yml",),
 }
 # A call in a shell script: `fetch_pinned.sh" NAME DEST [TARGET]`, with TARGET a literal or a
 # variable such as "$target".

@@ -280,10 +280,10 @@ BUILD_INPUTS = {
 # This repository's reusable workflow at trunk, as CI role jobs are called.
 TRUNK_CALL = re.compile(r"spiceai/spiceai/\.github/workflows/([\w.-]+\.ya?ml)@trunk")
 LOCAL_CALL = re.compile(r"\./\.github/workflows/([\w.-]+\.ya?ml)")
-# The two callers whose runs are required merge-queue checks. A `@trunk` call there would
-# test trunk's copy of the called jobs, never the pull request's, so they call theirs with
-# `./`. A queue run gets the read-only role; only their trunk runs get the full roles.
-LOCAL_CI_ROLE_CALLERS = {"e2e_test_ci.yml": "e2e_test_ci_aws.yml", "integration.yml": "integration_aws.yml"}
+# The caller whose runs are a required merge-queue check. A `@trunk` call there would test
+# trunk's copy of the called jobs, never the pull request's, so it calls its own with `./`. A
+# queue run gets the read-only role; only its trunk runs get the full roles.
+LOCAL_CI_ROLE_CALLERS = {"integration.yml": "integration_aws.yml"}
 
 
 def _triggers(document: dict) -> object:
@@ -781,12 +781,14 @@ def check_mac_store_credentials(jobs: dict) -> list[str]:
 
 
 def check_ci_role_calls(workflows: dict[str, dict]) -> list[str]:
-    """Report a call to a CI role workflow that is not at trunk, or one that names it wrongly.
+    """Report a call to a CI role workflow that is not at trunk, or one that names it wrongly,
+    and a CI role workflow that only a call can start but nothing here calls.
 
     `workflows` maps each file name under `.github/workflows/` to its parsed document.
     """
     reusable = {name for name, document in workflows.items() if ci_role_jobs(document)}
     problems = []
+    called_here = set()
     for caller, document in sorted(workflows.items()):
         jobs = document.get("jobs")
         if not isinstance(jobs, dict):
@@ -797,6 +799,9 @@ def check_ci_role_calls(workflows: dict[str, dict]) -> list[str]:
                 continue
             trunk, local = TRUNK_CALL.fullmatch(uses), LOCAL_CALL.fullmatch(uses)
             target = (trunk or local).group(1) if (trunk or local) else None
+            # A call at another ref still calls it (and is reported below).
+            any_ref = re.fullmatch(r"spiceai/spiceai/\.github/workflows/([\w.-]+\.ya?ml)@.+", uses)
+            called_here.add(target or (any_ref.group(1) if any_ref else None))
             where = f"{caller}: job `{job_name}`"
             if trunk and target not in workflows:
                 problems.append(f"{where} calls `{uses}`, but there is no .github/workflows/{target}")
@@ -831,6 +836,14 @@ def check_ci_role_calls(workflows: dict[str, dict]) -> list[str]:
             for key, value in sorted(declared.items()):
                 if isinstance(value, dict) and value.get("required") and key not in given:
                     problems.append(f"{where} does not pass `{key}`, which {target} requires")
+    # A role workflow left behind when its caller's job went away still holds a role.
+    for name in sorted(reusable - called_here):
+        triggers = _triggers(workflows[name])
+        if isinstance(triggers, dict) and set(triggers) == {"workflow_call"}:
+            problems.append(
+                f"{name} assumes a CI AWS role and only a call can start it, but no workflow here calls it; "
+                "delete it, its actions.lock entry and any caller mapping"
+            )
     return problems
 
 

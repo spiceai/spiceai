@@ -239,8 +239,11 @@ otherwise. The CLI and library are downloaded once into `~/.cache/spicescript/du
 Each archive is checked against the SHA-256 `test/duckdb_versions.json` records for it
 (`cli_sha256` and `sha256`, by platform) before anything is unpacked from it, and is kept
 beside what was taken from it; a later run hashes the kept archive again and takes the
-file from it afresh, so a changed file or archive in the cache is never run. A release
-or platform with no recorded checksum is refused.
+file from it afresh, so a file or archive changed in the cache between runs is never run.
+That does not cover a change made while a run is using the file: another job on the same
+host, as the same user, can still replace it then. A release or platform with no recorded
+checksum is refused. Download and unpack directories that a killed run left behind are
+removed once they are older than four times the longest a download may take.
 `SPICESCRIPT_DUCKDB_CLI` (`duckdb` sources), `SPICESCRIPT_DUCKLAKE_DUCKDB`
 (`ducklake` sources) and `SPICESCRIPT_DUCKDB_LIBRARY` name local builds
 instead.

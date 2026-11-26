@@ -329,6 +329,16 @@ class CheckCiCachePinsTest(unittest.TestCase):
             self.assertIn(f"{user} downloads https://download.docker.com/linux/ubuntu/gpg 1 time(s) but checks 0", result.stdout)
 
 
+    def test_the_microsoft_apt_key_is_checked_inline_against_its_pin(self):
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("microsoft-apt-key", result.stdout)
+        self.edit_pins(lambda pins: pins["microsoft-apt-key"].update({"sha256": "2" * 64}))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(".github/workflows/spice_mssql_tpch_bench_docker.yml downloads "
+                      "https://packages.microsoft.com/keys/microsoft.asc 1 time(s) but checks 0", result.stdout)
+
     def test_every_requirement_is_pinned_and_hashed_and_installed_with_require_hashes(self):
         result = self.run_check()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

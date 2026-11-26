@@ -225,6 +225,9 @@ class CiRoleTest(unittest.TestCase):
                            "GH_TOKEN": "a-token"}
                     proc = subprocess.run([sandbox, "-p", profile, str(old_bash), "-e", str(self.script)], env=env,
                                           cwd="/", capture_output=True, text=True, timeout=60)
+                    # Inside another sandbox, macOS refuses a nested one.
+                    if proc.returncode == 71 and "sandbox_apply" in proc.stderr:
+                        self.skipTest("sandbox-exec cannot apply a profile inside another sandbox")
                     self.assertEqual(proc.returncode, code, proc.stdout + proc.stderr)
                     self.assertNotIn("CI_ROLE_FULL=true", env_file.read_text())
                     if full is not None:

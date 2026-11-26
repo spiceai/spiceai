@@ -968,6 +968,17 @@ class CheckCiRoleCallsTest(unittest.TestCase):
              "job `call` passes input `typo`, which x_aws.yml does not declare"],
         )
 
+    def test_a_role_workflow_nothing_calls_is_reported(self):
+        # Left behind when its caller's job went away, it still holds a role.
+        problems = self.problems({"x_aws.yml": self.REUSABLE})
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("x_aws.yml assumes a CI AWS role and only a call can start it, but no workflow here calls it",
+                      problems[0])
+        # One that can also be started some other way is not.
+        dispatchable = yaml.safe_load(yaml.safe_dump(self.REUSABLE))
+        dispatchable[True]["workflow_dispatch"] = None
+        self.assertEqual(self.problems({"x_aws.yml": dispatchable}), [])
+
     def test_a_call_at_trunk_to_a_missing_file_is_reported(self):
         problems = self.problems({"x.yml": self.caller("spiceai/spiceai/.github/workflows/gone.yml@trunk")})
         self.assertEqual(len(problems), 1)

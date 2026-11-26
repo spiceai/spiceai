@@ -98,6 +98,10 @@
     "url": "https://download.docker.com/linux/ubuntu/gpg",
     "sha256": "1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570"
   },
+  "microsoft-apt-key": {
+    "url": "https://packages.microsoft.com/keys/microsoft.asc",
+    "sha256": "2fa9c05d591a1582a9aba276272478c262e95ad00acf60eaee1644d93941e3c6"
+  },
   "gh": {
     "version": "2.103.3",
     "url": "https://github.com/cli/cli/releases/download/v{version}/gh_{version}_{target}",
