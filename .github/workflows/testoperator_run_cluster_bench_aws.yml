@@ -513,7 +513,7 @@ jobs:
           watcher=""
           if [ -n "${SPIDAPTER_IMAGE_DIGEST}" ] && [ "${SPIDAPTER_IMAGE_BY_DIGEST}" != true ]; then
             bash .github/scripts/image_tag_watch.sh watch spiceai/spiceai-dev "${CUSTOM_IMAGE_TAG}" \
-              "${SPIDAPTER_IMAGE_DIGEST}" "${RUNNER_TEMP}/cluster-app-image-moves" &
+              "${SPIDAPTER_IMAGE_DIGEST}" "${RUNNER_TEMP}/cluster-app-image-moves" >/dev/null 2>&1 &
             watcher=$!
             trap '[ -z "${watcher}" ] || kill "${watcher}" 2>/dev/null || true' EXIT
           fi
