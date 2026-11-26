@@ -28,7 +28,9 @@ limitations under the License.
 //!
 //! Before the real connector exists, each synchronous capability method answers
 //! with the trait's default, and the registration hooks do nothing. That is only
-//! correct for the datasets `Runtime::serves_existing_acceleration` admits.
+//! correct for the datasets `Runtime::serves_existing_acceleration` admits. A
+//! resuming `refresh_mode: changes` dataset reports a change stream at once and
+//! starts the real one once the source is reached.
 
 use std::{any::Any, sync::Arc};
 
@@ -36,9 +38,11 @@ use async_trait::async_trait;
 use datafusion::{
     common::TableReference, datasource::TableProvider, execution::runtime_env::RuntimeEnv,
 };
+use futures::StreamExt;
 use futures::future::BoxFuture;
 use tokio::sync::{Mutex, OnceCell};
 
+use super::parameters::RuntimeConnectorContext;
 use super::{ConnectorComponent, ConnectorContext, DataConnector, DataConnectorError};
 use crate::component::ComponentInitialization;
 use crate::component::dataset::DatasetSpec;
@@ -106,7 +110,10 @@ pub struct ReconnectingConnector {
     /// The connector name from the dataset's `from:`, for errors.
     source_name: String,
     build: ConnectorBuilder,
-    inner: OnceCell<Arc<dyn DataConnector>>,
+    inner: Arc<OnceCell<Arc<dyn DataConnector>>>,
+    /// Set for a `refresh_mode: changes` dataset whose stream resumes after a
+    /// restart: its change stream is started once the real connector exists.
+    resuming_changes: Option<Arc<crate::component::dataset::Dataset>>,
     /// Object stores the runtime asked to register before the real connector existed,
     /// replayed after construction and retained until registration succeeds.
     pending_object_stores: Mutex<Vec<(DatasetSpec, Arc<RuntimeEnv>)>>,
@@ -118,9 +125,18 @@ impl ReconnectingConnector {
         Self {
             source_name: source_name.into(),
             build,
-            inner: OnceCell::new(),
+            inner: Arc::new(OnceCell::new()),
+            resuming_changes: None,
             pending_object_stores: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Reports a change stream before the real connector is built, and starts the
+    /// real connector's stream for `dataset` once it is.
+    #[must_use]
+    pub fn resuming_changes(mut self, dataset: Arc<crate::component::dataset::Dataset>) -> Self {
+        self.resuming_changes = Some(dataset);
+        self
     }
 
     /// Whether the real connector has been built.
@@ -249,8 +265,10 @@ impl DataConnector for ReconnectingConnector {
     }
 
     fn supports_changes_stream(&self) -> bool {
-        self.built()
-            .is_some_and(|inner| inner.supports_changes_stream())
+        match self.built() {
+            Some(inner) => inner.supports_changes_stream(),
+            None => self.resuming_changes.is_some(),
+        }
     }
 
     fn supports_partitioned_changes(&self) -> bool {
@@ -265,14 +283,56 @@ impl DataConnector for ReconnectingConnector {
         dataset: &DatasetSpec,
         acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
-        match self.built() {
-            Some(inner) => {
-                inner
-                    .changes_stream(context, federated_table, dataset, acceleration)
-                    .await
-            }
-            None => None,
+        if let Some(inner) = self.built() {
+            return inner
+                .changes_stream(context, federated_table, dataset, acceleration)
+                .await;
         }
+        let resuming = Arc::clone(self.resuming_changes.as_ref()?);
+        let inner = Arc::clone(&self.inner);
+        let dataset = dataset.clone();
+        // The deferred federated table builds the real connector when it reaches the
+        // source. Nothing writes to the acceleration before then, so `acceleration`
+        // is still accurate.
+        let stream = futures::stream::once(async move {
+            federated_table.table_provider().await;
+            let reached = inner.get().map(Arc::clone);
+            let stream = match &reached {
+                Some(inner) => {
+                    inner
+                        .changes_stream(
+                            &RuntimeConnectorContext::for_dataset(&resuming),
+                            federated_table,
+                            &dataset,
+                            acceleration,
+                        )
+                        .await
+                }
+                None => None,
+            };
+            stream.unwrap_or_else(|| {
+                let status = resuming.runtime().status();
+                if !status.is_shutdown() {
+                    let cause = if reached.is_some() {
+                        "its connector did not start a change stream"
+                    } else {
+                        "the connection to its source was abandoned"
+                    };
+                    let message = format!(
+                        "Dataset '{}' did not start its change stream because {cause}, so it is served from its acceleration without applying new changes. Restart the runtime to retry. See: https://spiceai.org/docs/features/data-acceleration/data-refresh",
+                        dataset.name
+                    );
+                    tracing::warn!("{message}");
+                    status.update_dataset(
+                        &dataset.name,
+                        crate::status::ComponentStatus::error_with_message(message),
+                    );
+                }
+                futures::stream::empty().boxed()
+            })
+        })
+        .flatten();
+        Some(stream.boxed())
     }
 
     fn supports_append_stream(&self) -> bool {

@@ -4389,6 +4389,10 @@ impl DataFusion {
         // acceleration — empty on a first start — already holds the whole dataset, and a scan
         // must not fail while a refresh that reads no rows runs. A snapshot refresh is the
         // exception, since its rows do arrive by refresh.
+        // Executor-scoped datasets arrive with `partition_by` cleared, so check the
+        // partition filters too.
+        let resumes_changes = initial_partition_filters.is_none()
+            && crate::init::dataset::resumes_changes_after_restart(dataset);
         let mut initial_load_complete = matches!(refresh_mode, RefreshMode::Caching)
             || (source.as_any().is::<SinkConnector>()
                 && !matches!(refresh_mode, RefreshMode::Snapshot));
@@ -4403,12 +4407,15 @@ impl DataFusion {
             .await
             && checkpoint.exists().await
         {
-            // For CDC we let connector/stream to decide when dataset is ready.
+            // For CDC the change stream decides when the dataset is ready, except when a
+            // resuming stream's dataset is served from its acceleration: then it is ready
+            // now and catches up in the background.
             //
             // A dataset that reads snapshots (`file_format: snapshot`) is ready only once it
             // has restored a snapshot in this process: a copy left from an earlier run can be
             // arbitrarily old, or from a location the dataset no longer reads.
-            let delay_initial_ready = matches!(refresh_mode, RefreshMode::Changes)
+            let delay_initial_ready = (matches!(refresh_mode, RefreshMode::Changes)
+                && !(source_table_provider.awaits_source() && resumes_changes))
                 || (dataset.is_snapshot_source()
                     && bootstrap_status.loaded_snapshot_id().is_none());
 
@@ -4877,6 +4884,10 @@ impl DataFusion {
         }
 
         if refresh_mode == RefreshMode::Changes {
+            if resumes_changes {
+                accelerated_table_builder.checkpoint_when_changes_ready();
+            }
+
             // Make the dataset's `on_schema_change` policy + constraint columns
             // available to the CDC apply loop before the changes stream starts.
             // Connectors (e.g. Debezium) may have pre-installed a default; this
@@ -4901,6 +4912,15 @@ impl DataFusion {
             // executor no longer serves, so the source rebuilds it instead of
             // resuming on them.
             if partition_scope.is_some() && acceleration == AccelerationContents::NonEmpty {
+                acceleration = AccelerationContents::Unknown;
+            }
+            // A dataset served from its acceleration is queried while it loads, so an
+            // acceleration observed empty is reported as unproven: any load must then
+            // replace it atomically rather than fill it in place.
+            if resumes_changes
+                && source_table_provider.awaits_source()
+                && acceleration.is_provably_empty()
+            {
                 acceleration = AccelerationContents::Unknown;
             }
 
@@ -6916,7 +6936,7 @@ impl DataFusion {
         spec.metadata.clone_from(&view.metadata);
         spec.columns.clone_from(&view.columns);
         let served_schema =
-            runtime_table::accelerated::checkpoint_primary_key::without_acceleration_primary_key(
+            runtime_table::accelerated::checkpoint_primary_key::without_acceleration_checkpoint_metadata(
                 Arc::clone(&checkpoint_schema),
             );
         let source = crate::view::ViewRefreshSource::new_arc(

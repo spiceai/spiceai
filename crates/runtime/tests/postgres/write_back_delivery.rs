@@ -591,13 +591,17 @@ async fn a_changes_dataset_loads_only_with_a_primary_key() -> Result<(), anyhow:
             })
             .await;
             let status = rt.status().get_dataset_statuses().get(&name).cloned();
-            anyhow::ensure!(refused, "the keyless dataset should fail to load, got {status:?}");
+            anyhow::ensure!(
+                refused,
+                "the keyless dataset should fail to load, got {status:?}"
+            );
             let Some(ComponentStatus::Error(Some(message))) = status else {
                 anyhow::bail!("expected an error message, got {status:?}");
             };
             assert_eq!(
                 message,
-                "Not served: waits for its source because it uses `refresh_mode: changes`. \
+                "Not served: waits for its source because it uses `refresh_mode: changes`, and its \
+                 acceleration is not recorded as loaded. \
                  Cause: Cannot setup the dataset cdc_keyless (postgres) with an invalid configuration. \
                  Table `public.cdc_keyless` has no primary key, and `refresh_mode: changes` needs \
                  one to apply UPDATE and DELETE events. Set `acceleration.primary_key` to the \

@@ -442,6 +442,22 @@ impl FederatedTable {
         Self::Deferred(deferred)
     }
 
+    /// [`Self::new_deferred`] for a CDC dataset served from its acceleration. It
+    /// resolves once the source is reached, even if the source schema differs,
+    /// because the change stream applies `on_schema_change` itself.
+    #[must_use]
+    pub fn new_deferred_for_change_stream(
+        dataset: Arc<DatasetSpec>,
+        source: Arc<dyn RefreshSource>,
+        checkpoint_schema: SchemaRef,
+        shutdown_token: CancellationToken,
+    ) -> Self {
+        let mut deferred =
+            Self::spawn_deferred(dataset, source, checkpoint_schema, shutdown_token, false);
+        deferred.awaits_source = true;
+        Self::Deferred(deferred)
+    }
+
     /// Waits until the source has been reached: at once for an immediate table; for a
     /// deferred one, the first time its background task reads the source, whether or
     /// not the schema it reports matches the acceleration's (the dataset then serves
@@ -594,10 +610,25 @@ impl FederatedTable {
         schema: SchemaRef,
         shutdown_token: CancellationToken,
     ) -> DeferredTableProvider {
+        Self::spawn_deferred(dataset, source, schema, shutdown_token, true)
+    }
+
+    /// A deferred provider whose background task retries the source until it is
+    /// reached and, when `holds_schema_difference`, until its schema matches
+    /// `schema`.
+    fn spawn_deferred(
+        dataset: Arc<DatasetSpec>,
+        source: Arc<dyn RefreshSource>,
+        schema: SchemaRef,
+        shutdown_token: CancellationToken,
+        holds_schema_difference: bool,
+    ) -> DeferredTableProvider {
         let constraints =
             crate::accelerated::checkpoint_primary_key::acceleration_primary_key(&schema);
         let schema =
-            crate::accelerated::checkpoint_primary_key::without_acceleration_primary_key(schema);
+            crate::accelerated::checkpoint_primary_key::without_acceleration_checkpoint_metadata(
+                schema,
+            );
         let dataset_name = dataset.name.clone();
         let dataset_name_str = dataset_name.to_string();
         let accelerated_schema = Arc::clone(&schema);
@@ -615,8 +646,9 @@ impl FederatedTable {
                         source_reached_tx.send_replace(true);
                         let federated_schema = table_provider.schema();
 
-                        if let Some(differences) =
-                            schema_difference(&accelerated_schema, &federated_schema)
+                        if holds_schema_difference
+                            && let Some(differences) =
+                                schema_difference(&accelerated_schema, &federated_schema)
                         {
                             let error = DataConnectorError::SchemaMismatch {
                                 dataset_name: dataset_name.to_string(),

@@ -527,6 +527,7 @@ pub struct Builder {
     retention: Option<Retention>,
     zero_results_action: ZeroResultsAction,
     refresh_on_startup: RefreshOnStartup,
+    checkpoint_when_changes_ready: bool,
     ready_state: ReadyState,
     caching: Option<Arc<Caching>>,
     changes_stream: Option<ChangesStream>,
@@ -607,6 +608,7 @@ impl Builder {
             retention: None,
             zero_results_action: ZeroResultsAction::default(),
             refresh_on_startup: RefreshOnStartup::default(),
+            checkpoint_when_changes_ready: false,
             ready_state: ReadyState::default(),
             caching: None,
             changes_stream: None,
@@ -707,6 +709,12 @@ impl Builder {
 
     pub fn refresh_on_startup(&mut self, refresh_on_startup: RefreshOnStartup) -> &mut Self {
         self.refresh_on_startup = refresh_on_startup;
+        self
+    }
+
+    /// Record the dataset checkpoint once the change stream first reports ready.
+    pub fn checkpoint_when_changes_ready(&mut self) -> &mut Self {
+        self.checkpoint_when_changes_ready = true;
         self
     }
 
@@ -1266,6 +1274,7 @@ impl Builder {
         refresher.in_flight_revalidations(Arc::clone(&in_flight_revalidations));
         refresher.checkpointer(self.checkpointer);
         refresher.refresh_on_startup(self.refresh_on_startup);
+        refresher.checkpoint_when_changes_ready(self.checkpoint_when_changes_ready);
         refresher.set_initial_load_completed(self.initial_load_complete);
         refresher.disable_federation(self.disable_federation);
         refresher.with_metrics(self.metrics);

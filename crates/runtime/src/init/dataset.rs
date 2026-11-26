@@ -49,7 +49,9 @@ use crate::{
     UnknownDataConnectorSnafu,
     component::dataset::{
         Dataset,
-        acceleration::{Acceleration, DurableWriteBackKey, Engine, Mode, RefreshMode},
+        acceleration::{
+            Acceleration, DurableWriteBackKey, Engine, Mode, RefreshMode, ZeroResultsAction,
+        },
         builder::DatasetBuilder,
     },
     component::{
@@ -995,7 +997,7 @@ impl Runtime {
         // once when its first attempt fails. Not before: a source that is reached only
         // when it is read (HTTP, S3) can fail after the dataset is already served
         // from its acceleration, and then it does not wait.
-        let waits_for_source = parking_lot::Mutex::new(match Self::waits_for_source_reason(&ds) {
+        let waits_for_source = parking_lot::Mutex::new(match Self::serving_wait_reason(&ds) {
             Some(reason)
                 if !bootstrap_status.is_pending()
                     && crate::dataconnector::sink::recorded_checkpoint_schema(&ds)
@@ -1180,7 +1182,13 @@ impl Runtime {
             let ds = Arc::clone(&ds_for_build);
             Box::pin(async move { ds.runtime().build_dataset_connector(Arc::clone(&ds)).await })
         });
-        Arc::new(ReconnectingConnector::new(ds.source(), build))
+        let connector = ReconnectingConnector::new(ds.source(), build);
+        let connector = if resumes_changes_after_restart(ds) {
+            connector.resuming_changes(Arc::clone(ds))
+        } else {
+            connector
+        };
+        Arc::new(connector)
     }
 
     /// Whether `ds` is served from its existing acceleration as soon as it loads,
@@ -1201,8 +1209,8 @@ impl Runtime {
     ///
     /// Only datasets whose startup the source does not otherwise shape qualify:
     /// read-only (the write path binds the source when the table is built), not
-    /// `changes` (CDC keeps no dataset checkpoint to serve from; see #14611) or
-    /// `caching` (which is ready immediately and serves its cache on its own), not
+    /// `changes` unless its change stream [resumes after a restart](resumes_changes_after_restart),
+    /// not `caching` (which is ready immediately and serves its cache on its own), not
     /// `append` without a `time_column` (which takes the connector's append stream
     /// when the table is built), no embedding or full-text search columns (whose
     /// search indexes wrap the source's provider, so search would fail until the
@@ -1218,7 +1226,7 @@ impl Runtime {
     ///
     /// This runs before the connector exists, so the refresh mode is resolved the way
     /// `DataConnector::resolve_refresh_mode` does by default.
-    fn may_serve_existing_acceleration(ds: &Dataset) -> bool {
+    pub(crate) fn may_serve_existing_acceleration(ds: &Dataset) -> bool {
         ds.acceleration.as_ref().is_some_and(|a| a.enabled)
             && Self::waits_for_source_reason(ds).is_none()
     }
@@ -1275,8 +1283,13 @@ impl Runtime {
             "`mode: file_create`".to_string()
         } else if ds.source() == crate::dataconnector::file::FILE_DATACONNECTOR {
             "the `file` connector".to_string()
-        } else if refresh_mode == RefreshMode::Changes {
-            "`refresh_mode: changes`".to_string()
+        } else if refresh_mode == RefreshMode::Changes
+            && let Some(reason) = changes_wait_reason(
+                crate::dataconnector::connector_resumes_changes_after_restart(ds.source()),
+                acceleration,
+            )
+        {
+            reason.to_string()
         } else if refresh_mode == RefreshMode::Caching {
             "`refresh_mode: caching`".to_string()
         } else if refresh_mode == RefreshMode::Append && ds.time_column.is_none() {
@@ -1301,7 +1314,19 @@ impl Runtime {
         if !ds.is_file_accelerated() {
             return None;
         }
-        Self::waits_for_source_reason(ds)
+        Self::serving_wait_reason(ds)
+    }
+
+    /// [`Self::waits_for_source_reason`], or for an eligible change stream, that a
+    /// dataset reaching this point was not recorded as loaded: one that was is
+    /// served from its acceleration instead.
+    fn serving_wait_reason(ds: &Dataset) -> Option<String> {
+        Self::waits_for_source_reason(ds).or_else(|| {
+            resumes_changes_after_restart(ds).then(|| {
+                "`refresh_mode: changes`, and its acceleration is not recorded as loaded"
+                    .to_string()
+            })
+        })
     }
 
     /// Registers `ds` against its existing acceleration without waiting for the
@@ -1343,12 +1368,21 @@ impl Runtime {
                 },
             )
         };
-        let federated_table = FederatedTable::new_deferred(
-            Arc::new(ds.spec.clone()),
-            refresh_source,
-            checkpoint_schema,
-            self.status.shutdown_token(),
-        );
+        let federated_table = if resumes_changes_after_restart(&ds) {
+            FederatedTable::new_deferred_for_change_stream(
+                Arc::new(ds.spec.clone()),
+                refresh_source,
+                checkpoint_schema,
+                self.status.shutdown_token(),
+            )
+        } else {
+            FederatedTable::new_deferred(
+                Arc::new(ds.spec.clone()),
+                refresh_source,
+                checkpoint_schema,
+                self.status.shutdown_token(),
+            )
+        };
         if resolved_refresh_mode != RefreshMode::Snapshot {
             reason.log_serving_from_acceleration(&ds.name);
         }
@@ -1363,6 +1397,16 @@ impl Runtime {
     /// checkpoint records the key.
     async fn existing_acceleration_schema(ds: &Dataset) -> Option<arrow_schema::SchemaRef> {
         let schema = crate::dataconnector::sink::recorded_checkpoint_schema(ds).await?;
+        // For a connector that resumes its change stream, only a marked checkpoint
+        // of an eligible dataset shows the acceleration is loaded.
+        if uses_resuming_change_stream(ds)
+            && !(resumes_changes_after_restart(ds)
+                && runtime_table::accelerated::checkpoint_primary_key::records_changes_loaded(
+                    &schema,
+                ))
+        {
+            return None;
+        }
         if records_acceleration_primary_key(&schema) {
             return Some(schema);
         }
@@ -3965,6 +4009,51 @@ fn not_served_status(reason: &str, cause: &str) -> String {
     format!("Not served: waits for its source because it uses {reason}. Cause: {cause}")
 }
 
+/// Whether `ds` is a `refresh_mode: changes` dataset of a connector that resumes
+/// its change stream after a restart.
+fn uses_resuming_change_stream(ds: &Dataset) -> bool {
+    ds.acceleration
+        .as_ref()
+        .is_some_and(|acceleration| acceleration.refresh_mode == Some(RefreshMode::Changes))
+        && crate::dataconnector::connector_resumes_changes_after_restart(ds.source())
+}
+
+/// Whether `ds` is a `refresh_mode: changes` dataset whose change stream resumes
+/// after a restart from a recorded position, so it is served from its existing
+/// acceleration at startup and starts its stream once the source answers.
+pub(crate) fn resumes_changes_after_restart(ds: &Dataset) -> bool {
+    ds.acceleration
+        .as_ref()
+        .is_some_and(|acceleration| acceleration.refresh_mode == Some(RefreshMode::Changes))
+        && Runtime::may_serve_existing_acceleration(ds)
+}
+
+/// Why a `refresh_mode: changes` dataset waits for its source instead of being
+/// served from its existing acceleration, or `None` when it is served.
+///
+/// A partitioned stream is scoped when the table is built, snapshot checkpoints
+/// can precede a complete load, and `use_source` reads a source whose schema may
+/// differ from the acceleration's.
+fn changes_wait_reason(
+    connector_resumes: bool,
+    acceleration: &Acceleration,
+) -> Option<&'static str> {
+    if !connector_resumes {
+        Some("`refresh_mode: changes`")
+    } else if !acceleration.partition_by.is_empty() {
+        Some("`refresh_mode: changes` with `partition_by`")
+    } else if !matches!(
+        acceleration.snapshot_behavior,
+        runtime_acceleration::snapshot::SnapshotBehavior::Disabled
+    ) {
+        Some("`refresh_mode: changes` with `snapshots`")
+    } else if acceleration.on_zero_results == ZeroResultsAction::UseSource {
+        Some("`refresh_mode: changes` with `on_zero_results: use_source`")
+    } else {
+        None
+    }
+}
+
 /// Whether a dataset's `drasi:` block is live.
 fn is_drasi_forwarding(drasi: &spicepod::drasi::Drasi) -> bool {
     drasi.forwarding == spicepod::drasi::DrasiForwarding::Enabled
@@ -4101,6 +4190,60 @@ mod tests {
             ),
             "Dataset 'orders' waits for its source before serving because it uses `refresh_mode: changes`. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
         );
+    }
+
+    /// Each wait reason is named, in order; an eligible dataset does not wait.
+    #[tokio::test]
+    async fn a_changes_dataset_waits_for_its_source_only_for_a_named_reason() {
+        use runtime_acceleration::snapshot::SnapshotBehavior;
+
+        let eligible = super::Acceleration::default();
+        let partitioned = super::Acceleration {
+            partition_by: vec![spicepod::partitioning::PartitionedBy {
+                name: "bucket".to_string(),
+                expression: "bucket(4, id)".to_string(),
+            }],
+            ..super::Acceleration::default()
+        };
+        let snapshots = super::Acceleration {
+            snapshot_behavior: SnapshotBehavior::BootstrapOnly(
+                std::sync::Arc::new(spicepod::component::snapshot::Snapshots::default()),
+                std::sync::Weak::new(),
+                tokio::runtime::Handle::current(),
+            ),
+            ..super::Acceleration::default()
+        };
+        let use_source = super::Acceleration {
+            on_zero_results: super::ZeroResultsAction::UseSource,
+            ..super::Acceleration::default()
+        };
+
+        for (connector_resumes, acceleration, expected) in [
+            (true, &eligible, None),
+            (false, &eligible, Some("`refresh_mode: changes`")),
+            (false, &partitioned, Some("`refresh_mode: changes`")),
+            (
+                true,
+                &partitioned,
+                Some("`refresh_mode: changes` with `partition_by`"),
+            ),
+            (
+                true,
+                &snapshots,
+                Some("`refresh_mode: changes` with `snapshots`"),
+            ),
+            (
+                true,
+                &use_source,
+                Some("`refresh_mode: changes` with `on_zero_results: use_source`"),
+            ),
+        ] {
+            assert_eq!(
+                super::changes_wait_reason(connector_resumes, acceleration),
+                expected,
+                "connector_resumes={connector_resumes}, acceleration={acceleration:?}"
+            );
+        }
     }
 
     #[test]

@@ -95,8 +95,10 @@ pub fn build_changes_stream(
     position_store: Arc<dyn PositionStore>,
     federated_table: Arc<dyn FederatedTableProvider>,
     metrics: Arc<ReplicationMetricsCollector>,
+    acceleration: data_components::cdc::AccelerationContents,
 ) -> ChangesStream {
     let dataset_name = dataset.name.to_string();
+    let acceleration_may_hold_rows = !acceleration.is_provably_empty();
     // Under `block` the acceleration never evolves, so the stream keeps the
     // registered types and its batches keep one schema; every other policy
     // receives a widened column type as a schema change to act on.
@@ -280,6 +282,7 @@ pub fn build_changes_stream(
             schema_json,
             metrics,
             column_type_changes,
+            acceleration_may_hold_rows,
         };
 
         let mut inner = start_replication_stream(input);

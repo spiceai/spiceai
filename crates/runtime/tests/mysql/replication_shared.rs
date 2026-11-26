@@ -126,6 +126,7 @@ fn stream_input(
         schema_json: Some(schema_json),
         metrics: ReplicationMetricsCollector::new(),
         column_type_changes: ColumnTypeChanges::Keep,
+        acceleration_may_hold_rows: false,
     }
 }
 

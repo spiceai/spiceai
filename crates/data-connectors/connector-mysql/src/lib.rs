@@ -207,8 +207,10 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description(
             "For `refresh_mode: changes`, the dataset is marked Ready once its replication lag \
              (now minus the newest applied commit's binlog-header timestamp) falls below this. It \
-             stays not-ready while snapshotting or draining a backlog on resume, so it never serves \
-             stale data. Default: 2s.",
+             stays not-ready while snapshotting or draining a backlog, except that an eligible file \
+             acceleration already loaded by an earlier run is served at startup and catches up \
+             in the background (see the data refresh docs for which datasets qualify); monitor `dataset_acceleration_cdc_applied_commit_unix_time_ms` for \
+             freshness. Default: 2s.",
         )
         .default("2s")
         .help_link(MYSQL_DOCS),
@@ -220,6 +222,11 @@ const RESERVED_KEYWORDS: &[&str] = &["PARTITION"];
 impl DataConnectorFactory for MySQLFactory {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    /// The binlog position of a file acceleration is stored in its sidecar.
+    fn resumes_changes_after_restart(&self) -> bool {
+        true
     }
 
     fn create<'a>(
@@ -603,7 +610,7 @@ impl DataConnector for MySQL {
         context: &dyn ConnectorContext,
         federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
         dataset: &DatasetSpec,
-        _acceleration: data_components::cdc::AccelerationContents,
+        acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
         let position_store = replication::resolve_position_store(context, dataset).await;
         Some(replication::build_changes_stream(
@@ -612,6 +619,7 @@ impl DataConnector for MySQL {
             position_store,
             federated_table,
             Arc::clone(&self.replication_metrics),
+            acceleration,
         ))
     }
 

@@ -1,0 +1,132 @@
+name: mysql-cdc-served-while-source-down
+description: >
+  A MySQL `refresh_mode: changes` dataset whose acceleration is already on disk
+  is served from that acceleration when the runtime restarts while MySQL is
+  stopped or frozen, as a `refresh_mode: full` dataset is. Once MySQL answers,
+  replication resumes from the recorded GTID position and applies every change
+  made during the outage.
+
+sources:
+  my: { kind: mysql }
+
+matrix:
+  engine: [cayenne]
+
+variants:
+  as-written: {}
+  object-native: object-native
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mysql-cdc-served-while-source-down
+  datasets:
+    - from: mysql:busy
+      name: busy
+      params: ${sources.my.params}
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file, refresh_mode: changes, primary_key: id }
+    - from: mysql:idle
+      name: idle
+      params: ${sources.my.params}
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file, refresh_mode: changes, primary_key: id }
+
+defaults:
+  expect: { oracle: my }
+  # Logs when a change stream records its acceleration as loaded, which a
+  # restart without the source needs.
+  spiced-args: [-v]
+
+steps:
+  - source-exec:
+      my: |
+        CREATE TABLE busy (id int PRIMARY KEY, v varchar(50), n decimal(12, 2));
+        INSERT INTO busy SELECT n, CONCAT('v', n), n * 1.5 FROM (WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 1000) SELECT n FROM s) s;
+        CREATE TABLE idle (id int PRIMARY KEY, v varchar(50));
+        INSERT INTO idle VALUES (1, 'a'), (2, 'b'), (3, 'c');
+  - start: {}
+  - query: SELECT * FROM busy
+    oracle-sql: SELECT * FROM busy
+    eventually: 60s
+    id: busy-loaded
+  - query: SELECT * FROM idle
+    oracle-sql: SELECT * FROM idle
+    eventually: 60s
+    id: idle-loaded
+  - assert-log: { count: { "Dataset 'busy' recorded its acceleration as loaded": '>=1', "Dataset 'idle' recorded its acceleration as loaded": '>=1' } }
+    eventually: 30s
+
+  # Restart with MySQL stopped: served from the acceleration.
+  - kill-spiced: {}
+  - stop-source: my
+  - start: { ready: false }
+  - query: SELECT * FROM busy
+    expect: { same-as: busy-loaded }
+    eventually: 30s
+  - query: SELECT * FROM idle
+    expect: { same-as: idle-loaded }
+    eventually: 30s
+  - assert-status: { dataset: busy, ready: true }
+    eventually: 30s
+
+  # MySQL returns with changes made while it was unreachable to Spice.
+  - start-source: my
+  - source-exec:
+      my: |
+        UPDATE busy SET v = 'after outage' WHERE id % 7 = 0;
+        DELETE FROM busy WHERE id > 990;
+        INSERT INTO idle VALUES (4, 'd');
+  - query: SELECT * FROM busy
+    oracle-sql: SELECT * FROM busy
+    eventually: 90s
+    id: busy-caught-up
+  - query: SELECT * FROM idle
+    oracle-sql: SELECT * FROM idle
+    eventually: 90s
+    id: idle-caught-up
+  - assert-log: { lacks: 'rebuilt the acceleration from the source' }
+  - assert-log: { count: { "Dataset 'busy' recorded its acceleration as loaded": '>=2', "Dataset 'idle' recorded its acceleration as loaded": '>=2' } }
+    eventually: 30s
+
+  # Restart with MySQL frozen: served from the acceleration. A graceful stop
+  # makes the applied changes durable, so the restart serves them.
+  - stop: {}
+  - pause-source: my
+  - start: { ready: false }
+  - query: SELECT * FROM busy
+    expect: { same-as: busy-caught-up }
+    eventually: 30s
+  - query: SELECT * FROM idle
+    expect: { same-as: idle-caught-up }
+    eventually: 30s
+  - assert-status: { dataset: busy, ready: true }
+    eventually: 30s
+  - unpause-source: my
+  - source-exec: { my: "INSERT INTO busy VALUES (5000, 'after freeze', 0)" }
+  - query: SELECT * FROM busy
+    oracle-sql: SELECT * FROM busy
+    eventually: 60s
+
+  # Each row once.
+  - query: SELECT count(*) - count(DISTINCT id) AS duplicates FROM busy
+    expect: { rows: [['0']] }
+
+  # A column added at the source while the runtime is down: the change stream
+  # starts, refuses to resume across the layout change and says how to rebuild,
+  # while the acceleration stays served. Rebuilding catches up with the source.
+  - query: SELECT id, v, n FROM busy
+    oracle-sql: SELECT id, v, n FROM busy
+    eventually: 60s
+    id: before-alter
+  - stop: {}
+  - source-exec: { my: "ALTER TABLE busy ADD COLUMN extra int" }
+  - start: { ready: false }
+  - assert-status: { dataset: busy, status: Error, message-contains: mysql_replication_invalid_checkpoint_behavior }
+    eventually: 30s
+  - query: SELECT id, v, n FROM busy
+    expect: { same-as: before-alter }
+  - restart:
+      patch: { datasets: { busy: { params: { mysql_replication_invalid_checkpoint_behavior: restart } } } }
+  - source-exec: { my: "INSERT INTO busy VALUES (6000, 'after alter', 2, 7); UPDATE busy SET v = 'altered' WHERE id = 1" }
+  - query: SELECT id, v, n FROM busy
+    oracle-sql: SELECT id, v, n FROM busy
+    eventually: 60s

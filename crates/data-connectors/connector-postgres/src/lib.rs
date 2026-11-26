@@ -267,7 +267,11 @@ const PARAMETERS: &[ParameterSpec] = &[
             "For `refresh_mode: changes`, the dataset is marked Ready once its \
              replication lag (now minus the newest applied commit's source time) \
              falls below this. It stays not-ready while snapshotting or draining a \
-             backlog on resume, so it never serves stale data. Default: 2s.",
+             backlog, except that an eligible file acceleration already loaded by an \
+             earlier run is served at startup and catches up in the background (see the \
+             data refresh docs for which datasets qualify); monitor \
+             `dataset_acceleration_cdc_applied_commit_unix_time_ms` for freshness. \
+             Default: 2s.",
         )
         .default("2s"),
     ParameterSpec::component("replication_bootstrap_batch_size")
@@ -292,6 +296,11 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for PostgresFactory {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    /// The replication slot keeps the position on the source.
+    fn resumes_changes_after_restart(&self) -> bool {
+        true
     }
 
     fn create<'a>(

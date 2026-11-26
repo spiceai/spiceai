@@ -151,6 +151,20 @@ pub async fn register_all() {
     }
 }
 
+/// Whether the connector `name` resumes its change stream after a restart. Read
+/// from the linked connectors because the startup checks cannot await the registry.
+#[must_use]
+pub fn connector_resumes_changes_after_restart(name: &str) -> bool {
+    static RESUMING: LazyLock<std::collections::HashSet<&'static str>> = LazyLock::new(|| {
+        DATA_CONNECTOR_REGISTRATIONS
+            .iter()
+            .filter(|registration| (registration.constructor)().resumes_changes_after_restart())
+            .map(|registration| registration.name)
+            .collect()
+    });
+    RESUMING.contains(name)
+}
+
 /// Names of every registered data connector. Useful for generating helpful
 /// "did you mean?" suggestions when a user references an unknown connector.
 pub async fn registered_connector_names() -> Vec<String> {

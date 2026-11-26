@@ -1056,6 +1056,7 @@ async fn attach_member(
         schema_json,
         metrics,
         column_type_changes,
+        acceleration_may_hold_rows,
     } = input;
     let member_key: MemberKey = (database.clone(), table.clone());
     let connection = source.key.label();
@@ -1148,6 +1149,7 @@ async fn attach_member(
         &database,
         &table,
         use_gtid,
+        acceleration_may_hold_rows,
     )
     .await?;
     if let Err(e) = conn.disconnect().await {
@@ -1227,7 +1229,7 @@ async fn attach_member(
             tracing::warn!(
                 dataset = %dataset_name,
                 connection = %source.key.label(),
-                "the persisted binlog position for this dataset is unusable and its acceleration survives restarts, so it will be rebuilt from the source before changes are applied"
+                "Dataset '{dataset_name}' does not resume from a recorded binlog position and its acceleration may already hold rows, so it will be rebuilt from the source before changes are applied"
             );
             // No snapshot runs on this path — the consumer's rebuild replaces it
             // — so the gauge's "finished, or skipped" state is reached here.
@@ -1238,9 +1240,9 @@ async fn attach_member(
         MemberStart::Snapshot => {
             // Clear whatever a crashed earlier load left behind, so the snapshot
             // is a full replace rather than an upsert over rows the source no
-            // longer has. Reached only when nothing was ever persisted for this
-            // member, so there is no completed load to preserve; an acceleration
-            // that has one takes the `Rebuild` arm above.
+            // longer has. Reached only when nothing was persisted for this member
+            // and the acceleration was observed empty; any other acceleration takes
+            // the `Rebuild` arm above.
             let truncate = super::truncate_envelope(&schema, &primary_keys, &column_map)?;
             // Built before the snapshot input takes ownership of `dataset_name`.
             //
@@ -1340,13 +1342,13 @@ fn file_checkpoint_verdict(persisted_file_present: bool) -> CheckpointVerdict {
 enum MemberStart {
     /// Resume from the persisted position; nothing to load.
     Stream,
-    /// Snapshot into an acceleration with no completed load behind it: no
-    /// position was ever persisted for this member.
+    /// Snapshot into an acceleration observed empty, with no position persisted
+    /// for this member.
     Snapshot,
-    /// A position was persisted but cannot be resumed from, so the acceleration
-    /// holds rows whose explanation is gone from the source's binary log. Only
-    /// re-reading the table can correct them, and the consumer owns the
-    /// accelerator so it can do that as one atomic replacement — see
+    /// No position can be resumed from and the acceleration may hold rows: the
+    /// persisted position is unusable, or none was recorded. Only re-reading the
+    /// table can correct those rows, and the consumer owns the accelerator so it
+    /// can do that as one atomic replacement — see
     /// [`crate::cdc::ChangeEnvelope::history_unavailable`].
     Rebuild,
 }
@@ -1414,15 +1416,21 @@ impl MemberStart {
 /// Neither route uses the snapshot path: a rebuild is a single zero-row signal
 /// the consumer answers with an atomic replacement ([`MemberStart::Rebuild`]).
 ///
+/// An acceleration with no recorded position that was not observed empty is
+/// rebuilt too: it may be served while it loads, and a snapshot would empty it.
+///
 /// Pure so the ordering is unit-testable without a live `MySQL`.
 fn start_without_usable_position(
     snapshot_mode: InitialSnapshotMode,
     has_recorded_position: bool,
+    acceleration_may_hold_rows: bool,
 ) -> MemberStart {
     if has_recorded_position {
         MemberStart::Rebuild
     } else if snapshot_mode == InitialSnapshotMode::Disabled {
         MemberStart::Stream
+    } else if acceleration_may_hold_rows {
+        MemberStart::Rebuild
     } else {
         MemberStart::Snapshot
     }
@@ -1449,6 +1457,7 @@ async fn resolve_start_position(
     database: &str,
     table: &str,
     use_gtid: bool,
+    acceleration_may_hold_rows: bool,
 ) -> Result<(BinlogPosition, GtidSet, MemberStart)> {
     let persisted = position_store
         .load()
@@ -1578,7 +1587,11 @@ async fn resolve_start_position(
             GtidSet::new(),
         )
     };
-    let start = start_without_usable_position(params.snapshot_mode, has_recorded_position);
+    let start = start_without_usable_position(
+        params.snapshot_mode,
+        has_recorded_position,
+        acceleration_may_hold_rows,
+    );
     if start.persists_head_before_loading() {
         let initial = PersistedPosition {
             position: head.clone(),
@@ -3448,7 +3461,7 @@ mod tests {
             InitialSnapshotMode::Disabled,
         ] {
             assert_eq!(
-                start_without_usable_position(mode, true),
+                start_without_usable_position(mode, true, false),
                 MemberStart::Rebuild,
                 "a recorded position that will not be resumed from must be rebuilt under \
                  initial_snapshot: {mode:?}"
@@ -3463,16 +3476,32 @@ mod tests {
         // followed. `disabled` must not be turned into a re-read of the whole
         // table on every cold start.
         assert_eq!(
-            start_without_usable_position(InitialSnapshotMode::Disabled, false),
+            start_without_usable_position(InitialSnapshotMode::Disabled, false, false),
             MemberStart::Stream
         );
         assert_eq!(
-            start_without_usable_position(InitialSnapshotMode::Auto, false),
+            start_without_usable_position(InitialSnapshotMode::Auto, false, false),
             MemberStart::Snapshot
         );
         assert_eq!(
-            start_without_usable_position(InitialSnapshotMode::Always, false),
+            start_without_usable_position(InitialSnapshotMode::Always, false, false),
             MemberStart::Snapshot
+        );
+    }
+
+    #[test]
+    fn rows_held_without_a_recorded_position_are_replaced_rather_than_emptied() {
+        // An acceleration not observed empty is rebuilt; `disabled` still streams.
+        for mode in [InitialSnapshotMode::Auto, InitialSnapshotMode::Always] {
+            assert_eq!(
+                start_without_usable_position(mode, false, true),
+                MemberStart::Rebuild,
+                "initial_snapshot: {mode:?}"
+            );
+        }
+        assert_eq!(
+            start_without_usable_position(InitialSnapshotMode::Disabled, false, true),
+            MemberStart::Stream
         );
     }
 

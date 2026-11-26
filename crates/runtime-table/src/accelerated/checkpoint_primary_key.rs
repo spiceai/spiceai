@@ -34,7 +34,9 @@ use arrow::datatypes::{Schema, SchemaRef};
 use datafusion::common::{Constraint, Constraints};
 use datafusion::datasource::TableProvider;
 
-use arrow_tools::metadata_keys::ACCELERATION_PRIMARY_KEY_METADATA_KEY;
+use arrow_tools::metadata_keys::{
+    ACCELERATION_CHANGES_LOADED_METADATA_KEY, ACCELERATION_PRIMARY_KEY_METADATA_KEY,
+};
 use search::generation::util::get_primary_keys;
 
 /// `schema` with the primary key `accelerator` was built with recorded in its
@@ -86,21 +88,44 @@ pub fn records_acceleration_primary_key(checkpoint_schema: &Schema) -> bool {
         .contains_key(ACCELERATION_PRIMARY_KEY_METADATA_KEY)
 }
 
-/// `schema` without the recorded primary key.
+/// `schema` marked as written by a change stream that has loaded the
+/// acceleration (see [`ACCELERATION_CHANGES_LOADED_METADATA_KEY`]).
+#[must_use]
+pub fn with_changes_loaded(schema: &Schema) -> SchemaRef {
+    let mut metadata = schema.metadata().clone();
+    metadata.insert(
+        ACCELERATION_CHANGES_LOADED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    Arc::new(schema.clone().with_metadata(metadata))
+}
+
+/// Whether `checkpoint_schema` was written by a change stream that had loaded
+/// the acceleration.
+#[must_use]
+pub fn records_changes_loaded(checkpoint_schema: &Schema) -> bool {
+    checkpoint_schema
+        .metadata()
+        .contains_key(ACCELERATION_CHANGES_LOADED_METADATA_KEY)
+}
+
+/// `schema` without what the checkpoint records about the acceleration: its
+/// primary key and whether a change stream loaded it.
 ///
-/// The key describes the acceleration, not the data: it must not reach a
+/// These describe the acceleration, not the data: they must not reach a
 /// registered table's schema, where schema-level metadata is merged into query
 /// output schemas and compared against the accelerator's stored schema.
 #[must_use]
-pub fn without_acceleration_primary_key(schema: SchemaRef) -> SchemaRef {
-    if !schema
-        .metadata()
-        .contains_key(ACCELERATION_PRIMARY_KEY_METADATA_KEY)
+pub fn without_acceleration_checkpoint_metadata(schema: SchemaRef) -> SchemaRef {
+    let metadata = schema.metadata();
+    if !metadata.contains_key(ACCELERATION_PRIMARY_KEY_METADATA_KEY)
+        && !metadata.contains_key(ACCELERATION_CHANGES_LOADED_METADATA_KEY)
     {
         return schema;
     }
-    let mut metadata = schema.metadata().clone();
+    let mut metadata = metadata.clone();
     metadata.remove(ACCELERATION_PRIMARY_KEY_METADATA_KEY);
+    metadata.remove(ACCELERATION_CHANGES_LOADED_METADATA_KEY);
     Arc::new(schema.as_ref().clone().with_metadata(metadata))
 }
 
@@ -113,10 +138,13 @@ mod tests {
     use datafusion::datasource::{MemTable, TableProvider};
 
     use super::{
-        acceleration_primary_key, records_acceleration_primary_key, with_acceleration_primary_key,
-        without_acceleration_primary_key,
+        acceleration_primary_key, records_acceleration_primary_key, records_changes_loaded,
+        with_acceleration_primary_key, with_changes_loaded,
+        without_acceleration_checkpoint_metadata,
     };
-    use arrow_tools::metadata_keys::ACCELERATION_PRIMARY_KEY_METADATA_KEY;
+    use arrow_tools::metadata_keys::{
+        ACCELERATION_CHANGES_LOADED_METADATA_KEY, ACCELERATION_PRIMARY_KEY_METADATA_KEY,
+    };
 
     fn accelerator_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -208,7 +236,7 @@ mod tests {
             &keyed,
         );
 
-        let registered = without_acceleration_primary_key(recorded);
+        let registered = without_acceleration_checkpoint_metadata(recorded);
 
         assert!(
             !registered
@@ -222,5 +250,28 @@ mod tests {
                 .map(String::as_str),
             Some("kept")
         );
+    }
+
+    #[test]
+    fn a_change_stream_checkpoint_is_marked_and_the_mark_never_reaches_a_registered_schema() {
+        let keyed = accelerator(Some(Constraints::new_unverified(vec![
+            Constraint::PrimaryKey(vec![2]),
+        ])));
+        let recorded = with_acceleration_primary_key(accelerator_schema(), &keyed);
+        assert!(!records_changes_loaded(&recorded));
+
+        let marked = with_changes_loaded(&recorded);
+        assert!(records_changes_loaded(&marked));
+        assert_eq!(
+            marked
+                .metadata()
+                .get(ACCELERATION_CHANGES_LOADED_METADATA_KEY)
+                .map(String::as_str),
+            Some("true")
+        );
+
+        let registered = without_acceleration_checkpoint_metadata(marked);
+        assert_eq!(registered.metadata(), &std::collections::HashMap::new());
+        assert_eq!(registered.fields(), accelerator_schema().fields());
     }
 }

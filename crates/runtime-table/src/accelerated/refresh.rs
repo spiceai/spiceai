@@ -927,10 +927,16 @@ pub struct Refresher {
     refresh_task_runner: Option<RefreshTaskRunner>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     refresh_on_startup: RefreshOnStartup,
+    /// Whether a change stream records the dataset checkpoint when it first
+    /// reports the dataset ready.
+    checkpoint_when_changes_ready: bool,
     synchronize_with: Option<SynchronizedTable>,
     snapshot_config: Option<SnapshotCreationConfig>,
     snapshot_refresh_state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
     snapshot_task: Option<tokio::task::JoinHandle<()>>,
+    /// Records the dataset checkpoint once a change stream first reports the
+    /// dataset ready.
+    ready_checkpoint_task: Option<tokio::task::JoinHandle<()>>,
     initial_snapshot: Option<InitialSnapshot>,
 
     initial_load_completed: Arc<AtomicBool>,
@@ -1013,6 +1019,7 @@ impl Refresher {
             refresh_task_runner: None,
             checkpointer: None,
             refresh_on_startup: RefreshOnStartup::default(),
+            checkpoint_when_changes_ready: false,
             synchronize_with: None,
             initial_load_completed: Arc::new(AtomicBool::new(false)),
             disable_federation: false,
@@ -1021,6 +1028,7 @@ impl Refresher {
             snapshot_config: None,
             snapshot_refresh_state: None,
             snapshot_task: None,
+            ready_checkpoint_task: None,
             initial_snapshot: None,
             metrics: None,
             cpu_runtime,
@@ -1085,6 +1093,11 @@ impl Refresher {
 
     pub fn refresh_on_startup(&mut self, refresh_on_startup: RefreshOnStartup) -> &mut Self {
         self.refresh_on_startup = refresh_on_startup;
+        self
+    }
+
+    pub fn checkpoint_when_changes_ready(&mut self, enabled: bool) -> &mut Self {
+        self.checkpoint_when_changes_ready = enabled;
         self
     }
 
@@ -1393,9 +1406,13 @@ impl Refresher {
         // a refresh writes the checkpoint of a dataset that neither creates snapshots
         // (whose interval checkpoints without refreshing) nor was restored from one
         // (whose checkpoint is the snapshot's); for those, the last refresh is
-        // reported once one completes.
+        // reported once one completes. A change stream's checkpoint is not a refresh.
         if self.snapshot_config.is_none()
             && !self.bootstrap_status.is_bootstrapped()
+            && !matches!(
+                acceleration_refresh_mode,
+                AccelerationRefreshMode::Changes(..)
+            )
             && let Some(checkpointer) = &self.checkpointer
             && let Ok(Some(last_refresh)) = checkpointer.last_checkpoint_time().await
         {
@@ -1478,6 +1495,30 @@ impl Refresher {
                     }
                 };
                 self.snapshot_task = snapshot_task;
+
+                // Once the change stream first reports ready and its changes are flushed,
+                // a marked checkpoint lets a later start serve the acceleration before the
+                // source answers. Datasets not served that way clear a stale mark.
+                self.ready_checkpoint_task = match checkpointer {
+                    Some(checkpointer) if self.checkpoint_when_changes_ready => {
+                        self.refresh_completion.clone().map(|completion| {
+                            tokio::spawn(record_changes_loaded(
+                                checkpointer,
+                                completion,
+                                self.change_sink.clone(),
+                                Arc::clone(&checkpoint_schema),
+                                Arc::clone(&self.accelerator_write_mutex),
+                                dataset_name.clone(),
+                                Arc::clone(&self.runtime_status),
+                            ))
+                        })
+                    }
+                    Some(checkpointer) => Some(tokio::spawn(clear_changes_loaded(
+                        checkpointer,
+                        dataset_name.clone(),
+                    ))),
+                    None => None,
+                };
 
                 return Ok(Some(self.start_changes_stream(
                     stream,
@@ -1857,7 +1898,7 @@ impl Refresher {
 
     /// Transfer every nested worker to the table generation's drain owner.
     pub(crate) fn take_background_tasks(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
-        let mut tasks = Vec::with_capacity(2);
+        let mut tasks = Vec::with_capacity(3);
         if let Some(task) = self
             .refresh_task_runner
             .as_mut()
@@ -1866,6 +1907,9 @@ impl Refresher {
             tasks.push(task);
         }
         if let Some(task) = self.snapshot_task.take() {
+            tasks.push(task);
+        }
+        if let Some(task) = self.ready_checkpoint_task.take() {
             tasks.push(task);
         }
         tasks
@@ -1940,12 +1984,92 @@ impl Refresher {
     }
 }
 
+/// Whether `checkpointer` holds a checkpoint marked as written by a change stream
+/// that had loaded the acceleration.
+async fn records_changes_loaded(checkpointer: &Arc<dyn DatasetCheckpointer>) -> bool {
+    checkpointer
+        .get_schema()
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|schema| super::checkpoint_primary_key::records_changes_loaded(&schema))
+}
+
+/// Records the dataset checkpoint, marked as loaded by its change stream, once the
+/// stream first reports the dataset ready and its changes are flushed.
+fn record_changes_loaded(
+    checkpointer: Arc<dyn DatasetCheckpointer>,
+    completion: RefreshCompletion,
+    change_sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+    checkpoint_schema: Arc<Schema>,
+    accelerator_write_mutex: Arc<Mutex<()>>,
+    dataset_name: TableReference,
+    runtime_status: Arc<status::RuntimeStatus>,
+) -> impl Future<Output = ()> + Send + 'static {
+    let ready = completion.any();
+    async move {
+        if !ready.wait().await.is_answered() || completion.closed_without_a_refresh() {
+            return;
+        }
+        // A mark from an earlier run stays valid if this write fails.
+        let marked_before = records_changes_loaded(&checkpointer).await;
+        let report = |cause: &dyn std::fmt::Display| {
+            if marked_before || runtime_status.is_shutdown() {
+                tracing::debug!(
+                    "Dataset '{dataset_name}' did not update the record that its acceleration is loaded; the earlier record stays. Cause: {cause}"
+                );
+            } else {
+                tracing::warn!(
+                    "Dataset '{dataset_name}' could not record its acceleration as loaded, so the next start waits for its source before serving it. Cause: {cause}. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+                );
+            }
+        };
+        if let Some(sink) = &change_sink
+            && let Err(error) = sink.flush().await
+        {
+            report(&error);
+            return;
+        }
+        let checkpoint_schema =
+            super::checkpoint_primary_key::with_changes_loaded(&checkpoint_schema);
+        let written = {
+            let _guard = accelerator_write_mutex.lock().await;
+            checkpointer.checkpoint(&checkpoint_schema, None).await
+        };
+        match written {
+            Ok(()) => tracing::info!(
+                "Dataset '{dataset_name}' recorded its acceleration as loaded, so a later start serves it while its source is unavailable."
+            ),
+            Err(error) => report(&error),
+        }
+    }
+}
+
+/// Deletes a checkpoint marked as loaded by a change stream, so the dataset starts
+/// as a change stream that never wrote one.
+async fn clear_changes_loaded(
+    checkpointer: Arc<dyn DatasetCheckpointer>,
+    dataset_name: TableReference,
+) {
+    if !records_changes_loaded(&checkpointer).await {
+        return;
+    }
+    if let Err(error) = checkpointer.delete().await {
+        tracing::warn!(
+            "Dataset '{dataset_name}' could not clear the record that its acceleration is loaded, so if its configuration later allows it, a restart may serve this acceleration before its source answers. Cause: {error}. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+        );
+    }
+}
+
 impl Drop for Refresher {
     fn drop(&mut self) {
         if let Some(mut refresh_task_runner) = self.refresh_task_runner.take() {
             refresh_task_runner.abort();
         }
         if let Some(task) = self.snapshot_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.ready_checkpoint_task.take() {
             task.abort();
         }
     }
@@ -2458,6 +2582,184 @@ mod tests {
         async fn delete(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
+    }
+
+    /// Stores the schema of the last checkpoint.
+    #[derive(Default)]
+    struct StoringCheckpointer {
+        schema: parking_lot::Mutex<Option<SchemaRef>>,
+        fails: AtomicBool,
+    }
+
+    impl StoringCheckpointer {
+        fn stored(&self) -> Option<SchemaRef> {
+            self.schema.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl DatasetCheckpointer for StoringCheckpointer {
+        async fn exists(&self) -> bool {
+            self.schema.lock().is_some()
+        }
+
+        async fn checkpoint(
+            &self,
+            schema: &SchemaRef,
+            _refresh_sql: Option<&str>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if self.fails.load(Ordering::Acquire) {
+                return Err("the checkpoint store is unavailable".into());
+            }
+            *self.schema.lock() = Some(Arc::clone(schema));
+            Ok(())
+        }
+
+        async fn get_schema(
+            &self,
+        ) -> Result<Option<SchemaRef>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.stored())
+        }
+
+        async fn set_schema(
+            &self,
+            schema: &SchemaRef,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            *self.schema.lock() = Some(Arc::clone(schema));
+            Ok(())
+        }
+
+        async fn last_checkpoint_time(
+            &self,
+        ) -> Result<Option<SystemTime>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(None)
+        }
+
+        async fn get_refresh_sql(
+            &self,
+        ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(None)
+        }
+
+        async fn delete(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            *self.schema.lock() = None;
+            Ok(())
+        }
+    }
+
+    fn changes_checkpoint_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Utf8, true),
+        ]))
+    }
+
+    fn record_changes_loaded_task(
+        checkpointer: &Arc<StoringCheckpointer>,
+        completion: &RefreshCompletion,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(record_changes_loaded(
+            Arc::clone(checkpointer) as Arc<dyn DatasetCheckpointer>,
+            completion.clone(),
+            None,
+            changes_checkpoint_schema(),
+            Arc::new(Mutex::new(())),
+            TableReference::bare("orders"),
+            status::RuntimeStatus::new(),
+        ))
+    }
+
+    /// The loaded mark is written only after the change stream reports ready.
+    #[tokio::test]
+    async fn a_change_stream_records_its_acceleration_as_loaded_only_once_ready() {
+        let checkpointer = Arc::new(StoringCheckpointer::default());
+        let completion = RefreshCompletion::new();
+        let task = record_changes_loaded_task(&checkpointer, &completion);
+
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task.is_finished(),
+            "the task must wait for the ready signal"
+        );
+        assert!(
+            checkpointer.stored().is_none(),
+            "no checkpoint before ready"
+        );
+
+        completion.record_untriggered();
+        timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the task finishes once the stream is ready")
+            .expect("the task does not panic");
+
+        let stored = checkpointer.stored().expect("a checkpoint after ready");
+        assert!(super::super::checkpoint_primary_key::records_changes_loaded(&stored));
+        assert_eq!(stored.fields(), changes_checkpoint_schema().fields());
+    }
+
+    /// A checkpoint that cannot be written leaves nothing marked.
+    #[tokio::test]
+    async fn a_failed_checkpoint_write_marks_nothing() {
+        let checkpointer = Arc::new(StoringCheckpointer::default());
+        checkpointer.fails.store(true, Ordering::Release);
+        let completion = RefreshCompletion::new();
+        let task = record_changes_loaded_task(&checkpointer, &completion);
+
+        completion.record_untriggered();
+        timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the task finishes once the stream is ready")
+            .expect("the task does not panic");
+
+        assert!(checkpointer.stored().is_none());
+    }
+
+    /// A table that will never refresh here (a cluster scheduler's) records nothing.
+    #[tokio::test]
+    async fn a_change_stream_that_never_loads_records_no_checkpoint() {
+        let checkpointer = Arc::new(StoringCheckpointer::default());
+        let completion = RefreshCompletion::new();
+        let task = record_changes_loaded_task(&checkpointer, &completion);
+
+        completion.close();
+        timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the task finishes once the signal closes")
+            .expect("the task does not panic");
+
+        assert!(checkpointer.stored().is_none());
+    }
+
+    /// A marked checkpoint is deleted; an unmarked one is left alone.
+    #[tokio::test]
+    async fn a_dataset_not_served_from_its_acceleration_clears_the_loaded_mark() {
+        let schema = changes_checkpoint_schema();
+        let checkpointer = Arc::new(StoringCheckpointer::default());
+        let clear = |checkpointer: &Arc<StoringCheckpointer>| {
+            clear_changes_loaded(
+                Arc::clone(checkpointer) as Arc<dyn DatasetCheckpointer>,
+                TableReference::bare("orders"),
+            )
+        };
+
+        *checkpointer.schema.lock() = Some(
+            super::super::checkpoint_primary_key::with_changes_loaded(&schema),
+        );
+        clear(&checkpointer).await;
+        assert!(
+            checkpointer.stored().is_none(),
+            "a marked checkpoint is deleted"
+        );
+
+        *checkpointer.schema.lock() = Some(Arc::clone(&schema));
+        clear(&checkpointer).await;
+        let unchanged = checkpointer.stored().expect("the checkpoint is kept");
+        assert!(
+            Arc::ptr_eq(&schema, &unchanged),
+            "an unmarked checkpoint is left alone"
+        );
     }
 
     /// Regression test for #14178. Results-cache warmup polls

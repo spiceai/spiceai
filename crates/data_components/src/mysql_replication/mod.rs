@@ -567,6 +567,9 @@ pub struct ReplicationStreamInput {
     pub metrics: Arc<ReplicationMetricsCollector>,
     /// What the stream does when a source `ALTER` widens a column's type.
     pub column_type_changes: ColumnTypeChanges,
+    /// Whether the acceleration may hold rows (it was not observed empty). Without a
+    /// recorded position, such an acceleration is rebuilt atomically, not truncated.
+    pub acceleration_may_hold_rows: bool,
 }
 
 /// What a replication stream does when a source `ALTER` changes a column's
