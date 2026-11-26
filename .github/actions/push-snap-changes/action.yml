@@ -30,8 +30,10 @@ runs:
         # The checkout's own config can redirect the push too, pull in another file, or run a
         # program, and its hooks run in this step: anything that set them is not this action. So
         # such config is refused, and no hook runs (core.hooksPath given through the environment
-        # overrides the repository's).
-        if redirects="$(git config --local --name-only --get-regexp '^(url\..*|include\..*|includeif\..*|core\.(hookspath|fsmonitor|sshcommand|askpass|gitproxy|pager|editor|attributesfile|worktree|excludesfile)|trace2\..*|filter\..*|diff\.external|diff\..*\.(textconv|command)|gpg\..*|commit\.gpgsign|tag\.gpgsign|credential\..*|http\..*|remote\..*\.(pushurl|proxy|receivepack|uploadpack|vcs)|protocol\..*)$')"; then
+        # overrides the repository's). Every file git reads for this checkout is checked, not just
+        # .git/config: with extensions.worktreeConfig it also reads config.worktree, and it
+        # follows includes.
+        if redirects="$(git config --name-only --get-regexp '^(url\..*|include\..*|includeif\..*|core\.(hookspath|fsmonitor|sshcommand|askpass|gitproxy|pager|editor|attributesfile|worktree|excludesfile)|trace2\..*|filter\..*|diff\.external|diff\..*\.(textconv|command)|gpg\..*|commit\.gpgsign|tag\.gpgsign|credential\..*|http\..*|remote\..*\.(pushurl|proxy|receivepack|uploadpack|vcs)|protocol\..*)$')"; then
           echo "::error::The checkout's git config sets ${redirects//$'\n'/, }, which can send this push elsewhere or run other code; not pushing."
           exit 1
         fi

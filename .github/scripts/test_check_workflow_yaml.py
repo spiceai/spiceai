@@ -882,6 +882,14 @@ class CheckMacWorkspaceTest(unittest.TestCase):
                 self.assertEqual(len(self.problems(runner, self.CHECKOUT)), 1)
                 self.assertEqual(self.problems(runner, self.CLEAN + self.CHECKOUT), [])
 
+    def test_a_runs_on_mapping_is_read_by_its_labels_and_group(self):
+        for runner in ("{labels: [self-hosted, macOS]}", "{labels: macOS}", "{group: anything}",
+                       "{group: g, labels: [linux]}", "{labels: [spiceai-macos-large]}"):
+            with self.subTest(runner=runner):
+                self.assertEqual(len(self.problems(runner, self.CHECKOUT)), 1)
+                self.assertEqual(self.problems(runner, self.CLEAN + self.CHECKOUT), [])
+        self.assertEqual(self.problems("{labels: [ubuntu-24.04]}", self.CHECKOUT), [])
+
     def test_other_runners_need_nothing(self):
         for runner in ("ubuntu-24.04", "macos-14", "spiceai-dev-runners", "[ubuntu-24.04]"):
             with self.subTest(runner=runner):

@@ -57,13 +57,14 @@ runs:
         GH_TOKEN: ${{ inputs.token }}
       run: |
         set -euo pipefail
-        full=true
+        # The full roles are granted only at the end, once every check below has run on trunk
+        # and found nothing: a check that does not run leaves the read-only role.
+        full=false
+        reason=""
+        checked=0
         case "$GITHUB_REF" in
           refs/heads/trunk) ;;
-          *)
-            full=false
-            reason="$GITHUB_REF is not trunk"
-            ;;
+          *) reason="$GITHUB_REF is not trunk" ;;
         esac
 
         # Trunk's commit history (no trees or blobs), fetched once into a scratch repository
@@ -99,21 +100,34 @@ runs:
           GIT_NO_LAZY_FETCH=1 git --git-dir "$git_dir" merge-base --is-ancestor "$1" refs/remotes/origin/trunk 2>/dev/null
         }
 
+        # Each list is split into its lines here, in this shell, with no here-string, pipe or
+        # temporary file: a Mac's /bin/bash 3.2 skips a loop whose here-string file it cannot
+        # make, and carries on.
+        old_ifs="$IFS"
+        IFS=$'\n'
+        set -f
+        # shellcheck disable=SC2206 # split on newlines only, with globbing off
+        images=($IMAGES)
+        # shellcheck disable=SC2206 # split on newlines only, with globbing off
+        builds=($BUILDS)
+        IFS="$old_ifs"
+        set +f
+
         # An image tag can be published from any branch, so no image counts as trunk's.
-        if [ "$full" = true ]; then
-          while IFS= read -r line || [ -n "$line" ]; do
+        if [ -z "$reason" ]; then
+          for line in ${images[@]+"${images[@]}"}; do
             [ -n "${line//[[:space:]]/}" ] || continue
             name="${line%%=*}"
             value="${line#*=}"
             [ -n "$value" ] || continue
-            full=false
             reason="$name is $value, an image, which names no trunk commit"
             break
-          done <<<"$IMAGES"
+          done
+          checked=$((checked + 1))
         fi
 
-        if [ "$full" = true ]; then
-          while IFS= read -r line || [ -n "$line" ]; do
+        if [ -z "$reason" ]; then
+          for line in ${builds[@]+"${builds[@]}"}; do
             [ -n "${line//[[:space:]]/}" ] || continue
             name="${line%%=*}"
             value="${line#*=}"
@@ -128,7 +142,14 @@ runs:
             # itself: refuse it rather than run it with the read-only one.
             echo "::error::$name is $value, which is not trunk or a commit on trunk. A trunk run runs only trunk's builds; dispatch from the branch that holds it instead."
             exit 1
-          done <<<"$BUILDS"
+          done
+          checked=$((checked + 1))
+        fi
+
+        if [ -z "$reason" ] && [ "$checked" = 2 ]; then
+          full=true
+        elif [ -z "$reason" ]; then
+          reason="the checks of this job's images and builds did not all run"
         fi
 
         if [ "$full" = false ] && [ "$PULL_REQUEST_ROLE_SET" != true ]; then

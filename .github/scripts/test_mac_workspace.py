@@ -172,6 +172,22 @@ class PushSnapChangesConfigTest(unittest.TestCase):
                 self.assertIn("not pushing", proc.stdout)
                 self.assertFalse(self.calls.exists())
 
+    def test_config_in_the_worktree_config_file_is_refused_too(self):
+        # With extensions.worktreeConfig, git also reads .git/config.worktree, which
+        # `git config --local` does not list.
+        git(self.repo, "config", "core.repositoryformatversion", "1")
+        git(self.repo, "config", "extensions.worktreeConfig", "true")
+        for key, value in (("url.https://evil.invalid/.insteadOf", "https://github.com/"),
+                           ("core.fsmonitor", "/tmp/x"),
+                           ("include.path", str(self.tmp / "other"))):
+            with self.subTest(key=key):
+                git(self.repo, "config", "--worktree", key, value)
+                proc = self.run_step()
+                git(self.repo, "config", "--worktree", "--unset", key)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("not pushing", proc.stdout)
+                self.assertFalse(self.calls.exists())
+
     def test_no_hook_runs_and_a_clean_checkout_proceeds(self):
         marker = self.tmp / "hook-ran"
         hook = self.repo / ".git" / "hooks" / "pre-commit"

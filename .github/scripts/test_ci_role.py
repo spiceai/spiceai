@@ -8,6 +8,7 @@ step's `full` output, what it adds to GITHUB_ENV, and how it ends.
 """
 
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -192,6 +193,42 @@ class CiRoleTest(unittest.TestCase):
         )
         self.assertEqual((proc.returncode, output), (1, ""))
         self.assertIn("::error::Could not fetch trunk", proc.stdout)
+
+    def test_no_check_is_skipped_for_want_of_a_temporary_file(self):
+        # A Mac's /bin/bash 3.2 writes a here-string to a temporary file, skips the loop when it
+        # cannot, and carries on: the lists are split with no here-string, pipe or file.
+        script = self.script.read_text()
+        for construct in ("<<<", "<(", "| while"):
+            self.assertNotIn(construct, script)
+        self.assertLess(script.index("full=false"), script.index("images=("))
+        self.assertEqual(script.count("full=true"), 1)
+        sandbox, old_bash = shutil.which("sandbox-exec"), Path("/bin/bash")
+        if not sandbox or not old_bash.exists():
+            self.skipTest("needs macOS's sandbox-exec and /bin/bash to make temporary files fail")
+        # The run's own directory stays writable; the temporary directories bash tries, and the
+        # working directory it falls back to (/), do not.
+        with tempfile.TemporaryDirectory() as run:
+            profile = ('(version 1)(allow default)'
+                       '(deny file-write* (subpath "/private/tmp") (subpath "/private/var/tmp")'
+                       ' (subpath "/private/var/folders") (subpath "/usr/tmp"))'
+                       f'(allow file-write* (subpath "{Path(run).resolve()}"))')
+            for images, builds, full, code in (("ec2_images=spiceai/spiceai:2.3.2", "", "false", 0),
+                                               ("", f"spiced_commit={self.feature}", None, 1)):
+                with self.subTest(images=images, builds=builds):
+                    out, env_file = Path(run) / "output", Path(run) / "env"
+                    out.write_text("")
+                    env_file.write_text("")
+                    env = {"PATH": os.environ["PATH"], "HOME": run, "GITHUB_EVENT_NAME": "push",
+                           "GITHUB_REF": "refs/heads/trunk", "GITHUB_SERVER_URL": self.server,
+                           "GITHUB_REPOSITORY": "owner/repo", "GITHUB_OUTPUT": str(out), "GITHUB_ENV": str(env_file),
+                           "RUNNER_TEMP": run, "PULL_REQUEST_ROLE_SET": "true", "BUILDS": builds, "IMAGES": images,
+                           "GH_TOKEN": "a-token"}
+                    proc = subprocess.run([sandbox, "-p", profile, str(old_bash), "-e", str(self.script)], env=env,
+                                          cwd="/", capture_output=True, text=True, timeout=60)
+                    self.assertEqual(proc.returncode, code, proc.stdout + proc.stderr)
+                    self.assertNotIn("CI_ROLE_FULL=true", env_file.read_text())
+                    if full is not None:
+                        self.assertEqual(out.read_text(), f"full={full}\n")
 
     def test_builds_are_not_checked_off_trunk(self):
         # The run already gets the read-only role, so nothing is fetched.
