@@ -1,4 +1,5 @@
 name: refresh-api-sql
+duration: 11s
 description: >
   The refresh API on Cayenne, full and append: a POST with its own
   `refresh_sql` refreshes with it once and the next plain refresh uses the

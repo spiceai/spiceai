@@ -1,4 +1,5 @@
 name: mysql-string-length
+duration: 17s
 tags: [long]
 description: >
   String length counts Unicode characters, including through aliases and

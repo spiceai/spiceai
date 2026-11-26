@@ -1,4 +1,5 @@
 name: kafka-partitions
+duration: 20s
 tags: [long]
 description: >
   A Kafka topic spread over three partitions loads every message with the

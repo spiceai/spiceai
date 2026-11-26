@@ -1,4 +1,5 @@
 name: pods-watcher-start-auth
+duration: 4s
 description: >
   A runtime started with the spicepod watched, whose spicepod does not load,
   serves nothing until it does, and then authenticates callers as that

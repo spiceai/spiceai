@@ -1,4 +1,5 @@
 name: mysql-cdc-kill-during-compaction
+duration: 161s
 tags: [long]
 description: >
   spiced killed while Cayenne compacts a table fed by MySQL binlog CDC loses and

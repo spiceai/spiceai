@@ -1,4 +1,5 @@
 name: append-embeddings
+duration: 11s
 tags: [long]
 description: >
   Append refresh on a day-granular time column re-reads the rows on the latest

@@ -1,4 +1,5 @@
 name: location-special-characters
+duration: 91s
 description: >
   A Cayenne file acceleration with its data files in `runtime.state.location`
   (#16131), where the location's path has a character an object key keeps but

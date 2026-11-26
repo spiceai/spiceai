@@ -4,6 +4,7 @@
 # least 90 seconds (it is within 30 s when caching_ttl is 30s), and when it is
 # enforced it evicts the newest entry rather than the oldest.
 name: http-caching-known
+duration: 61s
 description: >
   A filter on the response that leaves a cached entry no rows asks the origin
   rather than answering empty; caching_max_items holds a Cayenne caching

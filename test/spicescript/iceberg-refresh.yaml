@@ -1,4 +1,5 @@
 name: iceberg-refresh
+duration: 60s
 tags: [long]
 description: >
   An Iceberg table behind a REST catalog answers through Spice like DuckDB

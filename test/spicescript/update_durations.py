@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # Copyright 2024-2026 The Spice.ai OSS Authors
 # Licensed under the Apache License, Version 2.0: https://www.apache.org/licenses/LICENSE-2.0
-"""Rewrite recordings/durations.json from the script times of recent CI runs.
+"""Rewrite the scripts' recorded durations from the script times of recent CI runs.
 
 `--partition` deals scripts to CI shards by these durations, so they should be
 the times the scripts take on the CI runners, at the `--jobs` CI uses, not on a
 developer's machine. This reads the `spicescript-results-*` artifacts of the
 given runs (by default the newest successful E2E Test CI merge-queue runs and
-trunk tests runs), takes each script's median, and writes it beside the
-script. A script no run reached keeps its recorded duration.
+trunk tests runs), takes each script's median, and writes it to the script's
+`duration` line. A script no run reached keeps its recorded duration.
 
     python3 test/spicescript/update_durations.py            # newest runs
     python3 test/spicescript/update_durations.py 123 456    # these runs
@@ -20,12 +20,16 @@ import collections
 import json
 import math
 from pathlib import Path
+import re
 import statistics
 import subprocess
 import tempfile
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DURATIONS_FILE = Path("recordings/durations.json")
+# A script's duration is one line after its name, `duration: 458s`, or
+# `  "duration": "458s",` in a JSON script; the runner requires that form.
+YAML_LINE = re.compile(r"^duration: *\d+s *$", re.M)
+JSON_LINE = re.compile(r'^  "duration": *"\d+s",$', re.M)
 # The workflows whose runs carry spicescript results, and the event of the runs to read.
 SOURCES = [("e2e_test_ci.yml", "merge_group"), ("trunk_tests.yml", "schedule")]
 
@@ -48,6 +52,38 @@ def medians(result_files):
             if script["outcome"] == "passed":
                 times[script["file"]].append(script["seconds"])
     return {file: math.ceil(statistics.median(seconds)) for file, seconds in times.items()}
+
+
+def set_duration(text, seconds):
+    """`text` with its `duration` line recording `seconds`; unchanged if it has none."""
+    if text.lstrip().startswith("{"):
+        return JSON_LINE.sub(f'  "duration": "{seconds}s",', text, count=1)
+    return YAML_LINE.sub(f"duration: {seconds}s", text, count=1)
+
+
+def get_duration_line(text):
+    """The script's `duration` line, or None."""
+    m = (JSON_LINE if text.lstrip().startswith("{") else YAML_LINE).search(text)
+    return m.group(0) if m else None
+
+
+def write_durations(root, measured):
+    """Writes each measured script's seconds to its `duration` line under `root`; returns how many changed.
+
+    Only a script that already records a duration is rewritten: the runner
+    records a new script's first one (`--record-durations`).
+    """
+    changed = 0
+    for file, seconds in sorted(measured.items()):
+        path = root / file
+        if not path.exists():
+            continue
+        text = path.read_text()
+        new = set_duration(text, seconds)
+        if new != text:
+            path.write_text(new)
+            changed += 1
+    return changed
 
 
 def recent_runs(repo, per_source):
@@ -89,21 +125,7 @@ def main():
             print(f"run {run}: read")
         measured = medians(files)
 
-    by_dir = collections.defaultdict(dict)
-    for file, seconds in measured.items():
-        file = Path(file)
-        by_dir[file.parent][file.stem] = seconds
-    changed = 0
-    for directory, in_dir in sorted(by_dir.items()):
-        path = REPO_ROOT / directory / DURATIONS_FILE
-        if not path.exists():
-            print(f"skipping {directory}: it has no {DURATIONS_FILE}")
-            continue
-        recorded = json.loads(path.read_text())
-        updated = {**recorded, **{k: v for k, v in in_dir.items() if k in recorded}}
-        if updated != recorded:
-            changed += sum(updated[k] != recorded[k] for k in recorded)
-            path.write_text(json.dumps(dict(sorted(updated.items())), indent=2) + "\n")
+    changed = write_durations(REPO_ROOT, measured)
     print(f"{len(measured)} scripts measured over {len(runs)} runs; {changed} durations changed")
 
 
