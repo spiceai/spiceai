@@ -1,0 +1,97 @@
+name: location-special-characters
+description: >
+  A Cayenne file acceleration with its data files in `runtime.state.location`
+  (#16131), where the location's path has a character an object key keeps but
+  `object_store` escapes when it builds a path from a string: a literal `%`
+  (written `state%2520dir/`, a folder named `state%20dir`) or a `~`. The dataset
+  should load, take an append and serve it after a restart, with its objects
+  under the path as written. It fails to load: its first data-file write goes to
+  the escaped key (`state%2520dir/…`, `state%7Edir/…`), outside the dataset's
+  data path, so the dataset's store refuses it.
+
+sources:
+  src: { kind: postgres }
+  # The state location of the s3 variants.
+  lake: { kind: rustfs }
+
+variants:
+  s3-percent:
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state:
+          location: s3://${sources.lake.bucket}/state%2520dir/
+          params:
+            s3_endpoint: ${sources.lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.lake.key}
+            s3_secret: ${sources.lake.secret}
+            allow_http: 'true'
+  local-percent:
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state: { location: 'file://${instance.dir}/state%2520dir/' }
+  s3-tilde:
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state:
+          location: s3://${sources.lake.bucket}/state~dir/
+          params:
+            s3_endpoint: ${sources.lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.lake.key}
+            s3_secret: ${sources.lake.secret}
+            allow_http: 'true'
+  local-tilde:
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state: { location: 'file://${instance.dir}/state~dir/' }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: location-special-characters
+  datasets:
+    - from: postgres:public.facts
+      name: facts
+      params: ${sources.src.params}
+      time_column: ts
+      time_format: timestamptz
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: append }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE facts (id int NOT NULL, ts timestamptz NOT NULL, v int NOT NULL);
+        INSERT INTO facts SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i * 10 FROM generate_series(1, 2000) i;
+  - start: {}
+  - query: SELECT * FROM facts
+    eventually: 30s
+
+  - assert-objects: { source: lake, prefix: state%20dir/cayenne/v1/datasets/facts-, contains: .vortex, min: 1 }
+    only: s3-percent
+  - assert-objects: { source: lake, prefix: state%2520dir/, max: 0 }
+    only: s3-percent
+  - assert-files: { contains: ['^state%20dir/cayenne/v1/datasets/facts-[^/]+/data/.+\.vortex$'], lacks: ['^state dir/', '^state%2520dir/'] }
+    only: local-percent
+  - assert-objects: { source: lake, prefix: state~dir/cayenne/v1/datasets/facts-, contains: .vortex, min: 1 }
+    only: s3-tilde
+  - assert-objects: { source: lake, prefix: state%7Edir/, max: 0 }
+    only: s3-tilde
+  - assert-files: { contains: ['^state~dir/cayenne/v1/datasets/facts-[^/]+/data/.+\.vortex$'], lacks: ['^state%7Edir/'] }
+    only: local-tilde
+
+  - source-exec: { src: "INSERT INTO facts SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i * 10 FROM generate_series(2001, 3000) i" }
+  - refresh: facts
+  - query: SELECT count(*) AS n, sum(v) AS s FROM facts
+  - restart: {}
+  - query: SELECT * FROM facts
+    eventually: 30s
