@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for docker_pull.sh, run against a stub `docker` that replays scripted results."""
 
+import json
 import os
 import stat
 import subprocess
@@ -125,6 +126,85 @@ class DockerPullTest(unittest.TestCase):
         proc, calls = self.run_pull([], [])
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(calls, [])
+
+
+class IntegrationPrePullTest(unittest.TestCase):
+    """The integration workflows pre-pull each test image by the digest the tests run it by."""
+
+    ROOT = Path(__file__).resolve().parents[2]
+
+    def step(self, workflow, job, name):
+        import yaml
+
+        document = yaml.safe_load((self.ROOT / ".github" / "workflows" / workflow).read_text())
+        (step,) = [s for s in document["jobs"][job]["steps"] if s.get("name") == name]
+        return step
+
+    def run_step(self, step, env=None, images=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = Path(tmp)
+            (tree / ".github" / "scripts").mkdir(parents=True)
+            (tree / "test").mkdir()
+            calls = tree / "calls"
+            stub = tree / ".github" / "scripts" / "docker_pull.sh"
+            stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" >> "{calls}"\n')
+            for name in ("source_versions.json", "container_images.json"):
+                (tree / "test" / name).write_text((self.ROOT / "test" / name).read_text())
+            if images is not None:
+                (tree / "test" / "container_images.json").write_text(json.dumps(images))
+            script = step["run"]
+            self.assertNotIn("${{", script)
+            result = subprocess.run(
+                [self.bash(), "-e", "-c", script], cwd=tree, env={**os.environ, **(env or {})}, capture_output=True, text=True
+            )
+            return result, calls.read_text().splitlines() if calls.exists() else []
+
+    def bash(self):
+        """A bash with `mapfile` (4.0 or later), as the Linux runners have."""
+        for candidate in ("bash", "/opt/homebrew/bin/bash", "/usr/local/bin/bash"):
+            try:
+                if subprocess.run([candidate, "-c", "type mapfile"], capture_output=True).returncode == 0:
+                    return candidate
+            except FileNotFoundError:
+                continue
+        self.skipTest("no bash 4 or later here")
+
+    def pinned(self):
+        return json.loads((self.ROOT / "test" / "container_images.json").read_text())
+
+    def test_the_default_lines_and_oracle_are_pulled_by_their_pinned_digests(self):
+        step = self.step("integration_aws.yml", "test-partitions", "Pull database images")
+        result, pulled = self.run_step(step)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        images = self.pinned()["images"]
+        self.assertTrue(pulled)
+        self.assertIn("docker.io/gvenzl/oracle-free:23.26.4@" + images["docker.io/gvenzl/oracle-free:23.26.4"], pulled)
+        for ref in pulled:
+            tag, _, digest = ref.partition("@")
+            self.assertEqual(images.get(tag), digest, ref)
+
+    def test_an_image_the_map_does_not_pin_fails_before_any_pull(self):
+        step = self.step("integration_aws.yml", "test-partitions", "Pull database images")
+        images = self.pinned()
+        images["images"].pop("docker.io/gvenzl/oracle-free:23.26.4")
+        result, pulled = self.run_step(step, images=images)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(pulled, [])
+        self.assertIn("pins no digest for docker.io/gvenzl/oracle-free:23.26.4", result.stdout)
+
+    def test_an_older_line_is_pulled_by_its_pinned_digest(self):
+        step = self.step("integration.yml", "source-versions", "Pull ${{ matrix.source }} ${{ matrix.version }}")
+        versions = json.loads((self.ROOT / "test" / "source_versions.json").read_text())
+        images = self.pinned()["images"]
+        for source, entry in versions.items():
+            if source == "description":
+                continue
+            for version in entry["versions"]:
+                with self.subTest(source=source, version=version["version"]):
+                    result, pulled = self.run_step(step, {"SOURCE": source, "VERSION": version["version"]})
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    tag = f"{entry['image']}:{version['version']}"
+                    self.assertEqual(pulled, [f"{tag}@{images[tag]}"])
 
 
 if __name__ == "__main__":

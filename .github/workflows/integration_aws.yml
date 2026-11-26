@@ -195,10 +195,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Each source's default release line (the newest in test/source_versions.json).
+          # Each source's default release line (the newest in test/source_versions.json), and
+          # the Oracle image, by the digest test/container_images.json pins for each: the tests
+          # run only that digest, so pulling the tag alone would pull nothing they run.
           list="$(jq -r 'to_entries[] | select(.key != "description") | "\(.value.image):\(.value.versions[-1].version)"' test/source_versions.json)"
-          mapfile -t images <<<"${list}"
-          bash .github/scripts/docker_pull.sh "${images[@]}" docker.io/gvenzl/oracle-free:latest
+          mapfile -t tags <<<"${list}"
+          images=()
+          for tag in "${tags[@]}" docker.io/gvenzl/oracle-free:23.26.4; do
+            digest="$(jq -r --arg tag "$tag" '.images[$tag] // empty' test/container_images.json)"
+            [ -n "$digest" ] || { echo "::error::test/container_images.json pins no digest for $tag; record it with .github/scripts/pin_container_images.py --write $tag"; exit 1; }
+            images+=("$tag@$digest")
+          done
+          bash .github/scripts/docker_pull.sh "${images[@]}"
 
       - name: Set up Spice.ai API Key
         if: inputs.needs_check_changes_relevant_changes == 'true'

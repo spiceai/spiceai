@@ -113,6 +113,8 @@ jobs:
             code_changes:
               - 'test/source_versions.json'
               - 'crates/test-framework/src/source_versions.rs'
+              - 'test/container_images.json'
+              - 'crates/container-images/**'
               - '.github/workflows/integration.yml'
               - '.github/scripts/docker_pull.sh'
               - '.github/scripts/mc_cp.sh'
@@ -509,7 +511,10 @@ jobs:
         run: |
           set -euo pipefail
           image="$(jq -r --arg source "${SOURCE}" '.[$source].image' test/source_versions.json)"
-          bash .github/scripts/docker_pull.sh "${image}:${VERSION}"
+          # By the digest test/container_images.json pins, the only one the tests run.
+          digest="$(jq -r --arg tag "${image}:${VERSION}" '.images[$tag] // empty' test/container_images.json)"
+          [ -n "$digest" ] || { echo "::error::test/container_images.json pins no digest for ${image}:${VERSION}; record it with .github/scripts/pin_container_images.py --write ${image}:${VERSION}"; exit 1; }
+          bash .github/scripts/docker_pull.sh "${image}:${VERSION}@${digest}"
 
       - name: Run ${{ matrix.source }} ${{ matrix.version }} tests
         timeout-minutes: 45
