@@ -235,7 +235,7 @@ jobs:
         uses: $/.github/actions/setup-nextest
 
       - name: Set up spiceio
-        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true' && github.ref != 'refs/heads/trunk'
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
@@ -533,7 +533,7 @@ jobs:
         uses: $/.github/actions/setup-nextest
 
       - name: Set up spiceio
-        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true' && github.ref != 'refs/heads/trunk'
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
@@ -650,7 +650,7 @@ jobs:
         uses: $/.github/actions/setup-rust
 
       - name: Set up spiceio
-        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true' && github.ref != 'refs/heads/trunk'
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
@@ -704,7 +704,7 @@ jobs:
         run: rm -rf "${{ runner.temp }}/spiceio-bin"
 
       - name: Set up spiceio for build archive
-        if: env.HAS_SPICEIO_SECRET == 'true'
+        if: env.HAS_SPICEIO_SECRET == 'true' && github.ref != 'refs/heads/trunk'
         id: setup-spiceio-build
         uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:

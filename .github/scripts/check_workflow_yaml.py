@@ -404,6 +404,31 @@ def _steps(job: object) -> list[dict]:
     return [s for s in (job.get("steps") or []) if isinstance(s, dict)] if isinstance(job, dict) else []
 
 
+# The macOS SMB share serves the compiler cache to every ref's macOS jobs, so a trunk build, whose
+# output trunk-credentialed and full-role jobs run, never mounts it.
+SPICEIO_SETUP = "spiceai/spiceio/.github/actions/setup"
+NOT_FULL_ROLE = re.compile(r"steps\.ci-role\.outputs\.full\s*!=\s*'true'")
+
+
+def check_share_off_trunk(jobs: dict) -> list[str]:
+    """Report a step that sets up the macOS share without keeping it off trunk."""
+    problems = []
+    for name, job in jobs.items():
+        for position, step in enumerate(_steps(job), start=1):
+            if not str(step.get("uses", "")).startswith(SPICEIO_SETUP):
+                continue
+            condition = str(step.get("if", ""))
+            if OFF_TRUNK.search(condition) or NOT_FULL_ROLE.search(condition):
+                continue
+            label = step.get("name") or f"step {position}"
+            problems.append(
+                f"job `{name}` step `{label}` sets up the macOS share without "
+                "`github.ref != 'refs/heads/trunk'` in its `if:`; any ref's jobs write it, so a trunk "
+                "build must not compile through it"
+            )
+    return problems
+
+
 def check_attested_builds(jobs: dict) -> list[str]:
     """Report a build whose output is attested and that sets up a shared build cache on trunk.
 
@@ -689,6 +714,7 @@ def check_workflow(text: str) -> list[str]:
         problems.extend(check_untrusted_expansions(document, jobs))
         problems.extend(check_ci_role_jobs(document))
         problems.extend(check_attested_builds(jobs))
+        problems.extend(check_share_off_trunk(jobs))
         problems.extend(check_app_store_credentials(jobs))
         problems.extend(check_download_execution(jobs))
 

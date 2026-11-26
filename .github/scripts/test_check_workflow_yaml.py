@@ -713,6 +713,27 @@ class CheckAttestedBuildsTest(unittest.TestCase):
                     self.assertNotIn("id-token", job.get("permissions") or {})
 
 
+class CheckShareOffTrunkTest(unittest.TestCase):
+    DOC = (
+        "on: push\njobs:\n  build:\n    runs-on: spiceai-macos\n    steps:\n"
+        "      - name: Set up spiceio\n{cond}        uses: spiceai/spiceio/.github/actions/setup@0870da5\n"
+        "      - run: cargo build\n"
+    )
+
+    def problems(self, cond):
+        text = self.DOC.replace("{cond}", cond)
+        return [p for p in check_workflow_yaml.check_workflow(text) if "macOS share" in p]
+
+    def test_the_share_is_kept_off_trunk(self):
+        for cond in ("", "        if: env.HAS_SPICEIO_SECRET == 'true'\n"):
+            with self.subTest(cond=cond):
+                self.assertEqual(len(self.problems(cond)), 1)
+        for cond in ("        if: env.HAS_SPICEIO_SECRET == 'true' && github.ref != 'refs/heads/trunk'\n",
+                     "        if: steps.ci-role.outputs.full != 'true'\n"):
+            with self.subTest(cond=cond):
+                self.assertEqual(self.problems(cond), [])
+
+
 class CheckAppStoreCredentialsTest(unittest.TestCase):
     DOC = (
         "on: workflow_dispatch\njobs:\n  bench:\n    runs-on: ubuntu-24.04\n    steps:\n"
