@@ -59,8 +59,10 @@ jobs:
           echo "Spicepod file found at ${SPICEPOD_PATH}"
 
       # This job runs on a self-hosted Mac, whose own mc and other tools any job on that host can
-      # replace, so its store credentials only read: its builds, the compiler cache and the
-      # benchmark data (.github/store-policies/nas-bench-read-only.json). Nothing here writes the store.
+      # replace, so the store credentials it hands out only read: its builds, the compiler cache and
+      # the benchmark data (.github/store-policies/nas-bench-read-only.json). A replaced tool can
+      # still ask for this job's OIDC token itself; only the store's trust for this workflow, or a
+      # runner of its own, closes that.
       - name: Get read-only RustFS credentials
         id: rustfs
         uses: $/.github/actions/rustfs-credentials
