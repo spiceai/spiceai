@@ -1,4 +1,5 @@
 name: full-refresh-chaos
+duration: 458s
 tags: [long]
 description: >
   A Cayenne acceleration refreshed in full never serves a partial table

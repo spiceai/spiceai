@@ -344,7 +344,6 @@ When upgrading, ensure all these tests pass. If adding a new patch to a fork, ad
 | -------------------- | -------------------------------- | ------------------------------- |
 | PostgreSQL connector | `crates/runtime/tests/postgres/` | PostgreSQL table provider works |
 | MySQL connector      | `crates/runtime/tests/mysql/`    | MySQL table provider works      |
-| SQLite connector     | `crates/runtime/tests/sqlite/`   | SQLite table provider works     |
 | DuckDB connector     | `crates/runtime/tests/duckdb/`   | DuckDB table provider works     |
 
 ### Vortex (`spiceai/vortex`)
@@ -402,7 +401,6 @@ When upgrading, ensure all these tests pass. If adding a new patch to a fork, ad
 
 | Patch/Feature      | Test Location                   | What It Verifies              |
 | ------------------ | ------------------------------- | ----------------------------- |
-| SQLite accelerator | `crates/runtime/tests/sqlite/`  | SQLite as acceleration engine |
 | Cayenne metastore  | `crates/runtime/tests/cayenne/` | SQLite metadata storage       |
 
 ### Candle (`spiceai/candle`)

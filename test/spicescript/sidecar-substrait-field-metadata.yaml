@@ -6,6 +6,7 @@
 # result schema differs from the planned schema", most visibly lookups that
 # return the column they filter on.
 name: sidecar-substrait-field-metadata
+duration: 6s
 description: >
   Through a sidecar, point lookups and filters that also return the column
   they filter on answer as PostgreSQL does, as they do on the upstream.

@@ -1,4 +1,5 @@
 name: retention-fallback
+duration: 6s
 description: >
   With `on_zero_results: use_source`, a row retention removed from the
   acceleration does not come back from the source, while a row the

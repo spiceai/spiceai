@@ -2597,6 +2597,93 @@ async fn the_catalog_recognizes_its_datasets_data_in_both_recorded_forms() {
     }
 }
 
+/// A location whose path needs percent-encoding is opened by its configured
+/// string, with its keys decoded once (`state dir`, `state-dir`, `state%20dir`):
+/// the catalog recognizes its datasets' data by any URL spelling of those keys,
+/// only under that location, and never under the keys another decoding gives.
+#[tokio::test]
+async fn the_catalog_recognizes_its_datasets_data_under_a_percent_encoded_location() {
+    let cases = [
+        (
+            "state dir",
+            "s3://bucket/state dir/cayenne/v1",
+            vec![
+                (
+                    "s3://bucket/state%20dir/cayenne/v1/datasets/orders-1/data",
+                    true,
+                ),
+                (
+                    "s3://bucket/state dir/cayenne/v1/datasets/orders-1/data",
+                    true,
+                ),
+                ("datasets/orders-1/data", true),
+                (
+                    "s3://other/state%20dir/cayenne/v1/datasets/orders-1/data",
+                    false,
+                ),
+                (
+                    "s3://bucket/state%2520dir/cayenne/v1/datasets/orders-1/data",
+                    false,
+                ),
+            ],
+        ),
+        (
+            "state-dir",
+            "s3://bucket/state%2Ddir/cayenne/v1",
+            vec![
+                (
+                    "s3://bucket/state-dir/cayenne/v1/datasets/orders-1/data",
+                    true,
+                ),
+                (
+                    "s3://bucket/state%2ddir/cayenne/v1/datasets/orders-1/data",
+                    true,
+                ),
+                (
+                    "s3://bucket/%73tate-dir/cayenne/v1/datasets/orders-1/data",
+                    true,
+                ),
+                (
+                    "s3://bucket/state%252Ddir/cayenne/v1/datasets/orders-1/data",
+                    false,
+                ),
+            ],
+        ),
+        (
+            "state%20dir",
+            "s3://bucket/state%2520dir/cayenne/v1",
+            vec![
+                (
+                    "s3://bucket/state%2520dir/cayenne/v1/datasets/orders-1/data",
+                    true,
+                ),
+                (
+                    "s3://bucket/state%20dir/cayenne/v1/datasets/orders-1/data",
+                    false,
+                ),
+            ],
+        ),
+    ];
+    for (folder, location, paths) in cases {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = ObjectNativeCatalog::open_or_create_at(
+            Arc::clone(&store),
+            Path::parse(format!("{folder}/cayenne/v1/catalog")).expect("catalog prefix"),
+            location,
+        )
+        .await
+        .expect("open the catalog");
+        catalog.init().await.expect("init");
+        for (path, expected) in paths {
+            assert_eq!(
+                catalog.holds_data_at(path),
+                expected,
+                "opened at {location}: holds_data_at({path})"
+            );
+        }
+    }
+}
+
 /// The deletion vectors of a dataset whose data is in the location, as objects.
 async fn deletion_vector_objects(bucket: &InMemory, prefix: &str) -> usize {
     let metas: Vec<ObjectMeta> = bucket

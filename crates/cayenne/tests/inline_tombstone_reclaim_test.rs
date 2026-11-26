@@ -47,8 +47,8 @@ use datafusion_table_providers::util::{
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-test_with_backends!(inline_tombstones_drain_when_corpus_is_empty);
-test_with_backends!(file_backed_upserts_reclaim_inline_tombstones);
+test_on_data_store!(inline_tombstones_drain_when_corpus_is_empty);
+test_on_data_store!(file_backed_upserts_reclaim_inline_tombstones);
 
 /// Tombstone budget for the reclamation test, in metastore bytes — the shipped
 /// default is megabytes.
@@ -90,7 +90,7 @@ async fn create_file_backed_upsert_table(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(name),
         partition_column: None,
         vortex_config: VortexConfig {
             inline_max_rows: 0,
@@ -101,12 +101,14 @@ async fn create_file_backed_upsert_table(
     };
 
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
-            options,
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+                options,
+            )
+            .await?,
     );
     ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
     Ok((table, ctx))

@@ -2114,7 +2114,7 @@ async fn an_auto_table_is_sized_by_its_live_snapshots_not_the_storage_figures() 
     write(&provider, &keys, 100).await;
     let table_id = provider.table_metadata.table_id.clone();
     catalog
-        .set_snapshot_sequence(&table_id, "replaced-protected-snapshot", 1)
+        .set_snapshot_sequence(&table_id, "replaced-protected-snapshot", 1, None)
         .await
         .expect("register the replaced snapshot");
     catalog

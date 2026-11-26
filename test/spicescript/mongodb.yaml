@@ -1,4 +1,5 @@
 name: mongodb
+duration: 28s
 tags: [long]
 description: >
   The MongoDB connector against a replica set: a collection answers the

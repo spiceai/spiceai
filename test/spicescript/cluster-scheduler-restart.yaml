@@ -1,4 +1,5 @@
 name: cluster-scheduler-restart
+duration: 95s
 tags: [long]
 description: >
   A cluster scheduler killed and started again at once, on the same

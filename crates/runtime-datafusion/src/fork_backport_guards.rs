@@ -1462,3 +1462,43 @@ async fn a_correlated_count_without_group_by_keeps_the_rows_with_no_match() {
         );
     }
 }
+
+/// spiceai/datafusion#312. `ANY`/`ALL` over an aggregate without `GROUP BY`
+/// compares with its one row, which an outer row with no inner row still has
+/// (`max` NULL, `count` 0).
+#[tokio::test(flavor = "multi_thread")]
+async fn any_all_over_an_aggregate_without_group_by_compares_with_its_row() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &[
+            "CREATE TABLE set_cmp_agg_outer(k INT, v INT) AS VALUES (1, 10), (2, 20), (3, 40)",
+            "CREATE TABLE set_cmp_agg_inner(k INT, v INT) AS VALUES (1, 5), (1, 10), (2, 30)",
+        ],
+    )
+    .await;
+    for (sql, expected) in [
+        (
+            "SELECT k FROM set_cmp_agg_outer o WHERE o.v > ALL (SELECT max(i.v) FROM set_cmp_agg_inner i WHERE i.k = o.k)",
+            &[][..],
+        ),
+        (
+            "SELECT k FROM set_cmp_agg_outer o WHERE NOT (o.v < ANY (SELECT max(i.v) FROM set_cmp_agg_inner i WHERE i.k = o.k))",
+            &["1"][..],
+        ),
+        (
+            "SELECT k FROM set_cmp_agg_outer o WHERE o.v - 40 = ANY (SELECT count(*) FROM set_cmp_agg_inner i WHERE i.k = o.k)",
+            &["3"][..],
+        ),
+        (
+            "SELECT k, o.v >= ALL (SELECT max(i.v) FROM set_cmp_agg_inner i WHERE i.k = o.k) FROM set_cmp_agg_outer o",
+            &["1,true", "2,false", "3,NULL"][..],
+        ),
+    ] {
+        assert_eq!(
+            sorted_answer(&ctx, sql).await,
+            Ok(sorted(expected)),
+            "{sql}"
+        );
+    }
+}

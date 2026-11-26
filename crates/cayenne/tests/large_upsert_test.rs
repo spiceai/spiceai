@@ -34,8 +34,8 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use cayenne::MetadataCatalog;
 use cayenne::metadata::CreateTableOptions;
-use cayenne::{CayenneTableProvider, MetadataCatalog};
 
 use datafusion::prelude::SessionContext;
 
@@ -43,8 +43,8 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
 
-test_with_backends!(test_large_upsert_exceeds_sqlite_param_limit);
-test_with_backends!(test_large_sharded_upsert_preserves_pk_and_row_count);
+test_on_data_store!(test_large_upsert_exceeds_sqlite_param_limit);
+test_on_data_store!(test_large_sharded_upsert_preserves_pk_and_row_count);
 
 async fn test_large_upsert_exceeds_sqlite_param_limit(
     fixture: common::TestFixture,
@@ -67,15 +67,17 @@ async fn test_large_upsert_exceeds_sqlite_param_limit(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("large_upsert"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
 
     ctx.register_table(
@@ -168,15 +170,17 @@ async fn test_large_sharded_upsert_preserves_pk_and_row_count(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("large_sharded_upsert"),
         partition_column: None,
         vortex_config,
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
 
     ctx.register_table(

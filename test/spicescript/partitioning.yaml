@@ -1,4 +1,5 @@
 name: partitioning
+duration: 20s
 tags: [long]
 description: >
   Partitioned accelerations answer as PostgreSQL does, and scan less for a

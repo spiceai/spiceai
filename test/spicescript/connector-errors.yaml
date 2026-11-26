@@ -1,4 +1,5 @@
 name: connector-errors
+duration: 82s
 tags: [long]
 description: >
   Beyond PostgreSQL (config-errors.yaml), a dataset whose source cannot be

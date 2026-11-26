@@ -1,0 +1,271 @@
+# Regression test for #16625.
+name: postgres-cdc-replay-after-reconnect
+duration: 669s
+tags: [long]
+description: >
+  Spice re-establishes a PostgreSQL replication connection when it drops, and
+  when a dataset on a shared slot finishes its initial snapshot or a rebuild
+  from the source, as one does after spiced is killed during its initial
+  snapshot. The source then sends again every change since the slot's last
+  acknowledged position, including changes file-mode Cayenne CDC accelerations
+  (refresh_mode: changes) have applied but not yet checkpointed. Those must not
+  undo later changes: a key inserted, updated and deleted at the source stays
+  deleted, and a row updated many times keeps its last value, also after a
+  restart.
+
+sources:
+  src: { kind: postgres }
+  # Embeddings for `g` and `h`. A request whose inputs contain SNAP or HOLD waits
+  # while /tmp/hold-<namespace>-SNAP or /tmp/hold-<namespace>-HOLD exists;
+  # each instance calls the container under its own namespace, the first path
+  # segment.
+  emb:
+    kind: docker
+    image: docker.io/library/python:3.12-slim
+    ports: [8000]
+    command:
+      - python
+      - -c
+      - |
+        import json, os, time
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+
+            def do_POST(self):
+                request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                namespace = self.path.strip("/").split("/")[0]
+                inputs = request["input"]
+                if isinstance(inputs, str):
+                    inputs = [inputs]
+                for token in ("SNAP", "HOLD"):
+                    if any(token in t for t in inputs):
+                        while os.path.exists("/tmp/hold-" + namespace + "-" + token):
+                            time.sleep(0.1)
+                body = json.dumps({
+                    "object": "list",
+                    "data": [{"object": "embedding", "index": i, "embedding": [float(len(t)), 1.0]} for i, t in enumerate(inputs)],
+                    "model": request["model"],
+                    "usage": {"prompt_tokens": 0, "total_tokens": 0},
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        ThreadingHTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
+    ready: python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/')"
+
+# What makes Spice reconnect while `v` and `g` hold changes they have applied
+# but not acknowledged. `h` is added to their slot after they have loaded, and
+# reads its initial snapshot while they follow the source.
+#   connection-lost         the replication connection is terminated at the
+#                           source.
+#   snapshot-done           `h` finishes its initial snapshot (no kill).
+#   kill-in-snapshot        spiced is killed during `h`'s initial snapshot. `h`
+#                           has no recorded position after the restart, so it
+#                           is rebuilt from the source, and finishes that.
+#   kill-in-rebuild         as kill-in-snapshot, and spiced is killed again
+#                           during the rebuild; the next start rebuilds `h`
+#                           again.
+#   kill-after-checkpoint   as kill-in-snapshot, and spiced is killed once `v`
+#                           and `g` have checkpointed after the rebuild, so a
+#                           wrong row would already be durable.
+# The kills land in `h`'s snapshot, its rebuild, and its catch-up after the
+# rebuild; each phase is checked before the kill.
+matrix:
+  reconnect: [connection-lost, snapshot-done, kill-in-snapshot, kill-in-rebuild, kill-after-checkpoint]
+
+# The spicepod as written (the SQLite Cayenne metastore), and the same with
+# the prototype object-native metastore.
+variants:
+  as-written: {}
+  object-native:
+    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-cdc-replay-after-reconnect
+  runtime:
+    caching:
+      sql_results: { enabled: false }
+  embeddings:
+    - from: openai:held
+      name: emb
+      params:
+        endpoint: http://127.0.0.1:${sources.emb.port.8000}/${sources.emb.namespace}/v1
+        openai_api_key: test
+  datasets:
+    - from: postgres:public.v
+      name: v
+      params:
+        $merge: ${sources.src.params}
+        pg_replication_slot: ${sources.src.namespace}_shared
+      acceleration: &cdc
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: id
+        # Checkpoint, and so acknowledge the source, once a minute rather than
+        # every second: what a dataset applies below stays unacknowledged until
+        # Spice reconnects, and is acknowledged only after it reconnects.
+        params: { cayenne_cdc_mem_tier_checkpoint_interval_ms: '60000' }
+    # Its changes wait while HOLD is held, which holds up whatever the source
+    # sends after them on the shared connection.
+    - from: postgres:public.g
+      name: g
+      params:
+        $merge: ${sources.src.params}
+        pg_replication_slot: ${sources.src.namespace}_shared
+      acceleration: *cdc
+      columns:
+        - name: t
+          embeddings: [{ from: emb }]
+    # Its initial snapshot and its rebuilds wait while SNAP is held.
+    - from: postgres:public.h
+      name: h
+      params:
+        $merge: ${sources.src.params}
+        pg_replication_slot: ${sources.src.namespace}_shared
+      acceleration: *cdc
+      columns:
+        - name: t
+          embeddings: [{ from: emb }]
+
+defaults:
+  expect: { oracle: src }
+  # Each variant writes to its own source database; each is checked against it.
+  compare-variants: false
+
+steps:
+  # `h`'s 2,000 SNAP rows (16 MiB) are more than its apply loop gathers ahead,
+  # so while their embeddings wait, its snapshot or rebuild does not finish.
+  - source-exec:
+      src: |
+        CREATE TABLE v (id bigint PRIMARY KEY, n bigint NOT NULL);
+        INSERT INTO v SELECT i, 0 FROM generate_series(1, 1000) i;
+        CREATE TABLE g (id bigint PRIMARY KEY, t text NOT NULL);
+        INSERT INTO g VALUES (0, 'start');
+        CREATE TABLE h (id bigint PRIMARY KEY, t text NOT NULL);
+        INSERT INTO h SELECT i, 'SNAP ' || i || ' ' || repeat('s', 8000) FROM generate_series(1, 2000) i;
+
+  # `v` and `g` load and record their positions; `h` is not accelerated yet.
+  - start: { patch: { datasets: { h: { acceleration: { enabled: false } } } } }
+  - query: SELECT id, n FROM v
+    eventually: 60s
+  - query: SELECT id, t FROM g
+    eventually: 60s
+  - stop: {}
+
+  # `h` joins their slot and reads its initial snapshot; `v` and `g` resume.
+  - source-exec: { emb: "touch /tmp/hold-${sources.emb.namespace}-SNAP" }
+    when: &held { reconnect: [snapshot-done, kill-in-snapshot, kill-in-rebuild, kill-after-checkpoint] }
+  - start: { ready: false, patch: { datasets: { h: { acceleration: { enabled: true } } } } }
+  - assert-log:
+      contains: "Dataset 'h' will have its acceleration created by reading the source"
+    eventually: 30s
+  - assert-status: { dataset: h, ready: false }
+    when: *held
+  - wait-ready: { timeout: 120s }
+    when: { reconnect: connection-lost }
+
+  # Killed during `h`'s snapshot: the restart rebuilds `h` from the source, and
+  # that rebuild waits on the SNAP rows.
+  - kill-spiced: {}
+    when: &killed { reconnect: [kill-in-snapshot, kill-in-rebuild, kill-after-checkpoint] }
+  - start: { ready: false }
+    when: *killed
+  - assert-log:
+      count: { "Dataset 'h' will have its acceleration rebuilt from the source before changes are applied, which re-reads the whole table: it has no recorded position": 1 }
+    eventually: 30s
+    when: *killed
+  # Killed again during that rebuild: the next start rebuilds `h` again.
+  - kill-spiced: {}
+    when: { reconnect: kill-in-rebuild }
+  - start: { ready: false }
+    when: { reconnect: kill-in-rebuild }
+  - assert-log:
+      count: { "Dataset 'h' will have its acceleration rebuilt from the source before changes are applied, which re-reads the whole table: it has no recorded position": 2 }
+    eventually: 30s
+    when: { reconnect: kill-in-rebuild }
+  # `v` and `g` resumed every time.
+  - assert-log:
+      lacks: ["Dataset 'v' will have its acceleration rebuilt", "Dataset 'g' will have its acceleration rebuilt"]
+  - query: SELECT id, n FROM v
+    eventually: 60s
+
+  # Insert, update and delete key 5000 of `v`, with 1,500 commits of a 64 KiB
+  # row to `g` between the update and the delete: about 96 MiB, more than `g`
+  # takes in while its embeddings wait below (its apply loop gathers up to
+  # 8 MiB of changes and its queue holds 32 MiB more). If the source sent these
+  # again, `v`'s copy of the delete would wait behind them, past `v`'s next
+  # checkpoint.
+  - source-exec: { src: "INSERT INTO v VALUES (5000, 1)" }
+  - source-exec: { src: "UPDATE v SET n = 2 WHERE id = 5000" }
+  - source-exec:
+      src: |
+        DO $$
+        BEGIN
+          FOR i IN 1..1500 LOOP
+            UPDATE g SET t = 'HOLD ' || i || ' ' || repeat('g', 65536) WHERE id = 0;
+            COMMIT;
+          END LOOP;
+        END $$;
+  - source-exec: { src: "UPDATE g SET t = 'last' WHERE id = 0" }
+  - source-exec: { src: "DELETE FROM v WHERE id = 5000" }
+  # `v` and `g` have applied every change, and acknowledged none of them.
+  - query: SELECT id, n FROM v WHERE id = 5000
+    expect-empty: true
+    eventually: 15s
+  - query: SELECT id, rtrim(substr(t, 1, 12), ' g') AS t, length(t) AS len FROM g WHERE id = 0
+    eventually: 30s
+
+  # Hold `g`'s embeddings, then make Spice reconnect.
+  - source-exec: { emb: "touch /tmp/hold-${sources.emb.namespace}-HOLD" }
+  - source-exec: { src: "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type = 'walsender' AND datname = current_database()" }
+    when: { reconnect: connection-lost }
+  - assert-log: { contains: 'shared replication connection resumed' }
+    eventually: 15s
+    when: { reconnect: connection-lost }
+  - source-exec: { emb: "rm -f /tmp/hold-${sources.emb.namespace}-SNAP" }
+    when: *held
+  - assert-log: { contains: 'Dataset h: rebuilt the acceleration from the source; resuming change streaming' }
+    eventually: 60s
+    when: *killed
+  # `v`'s and `g`'s next checkpoints, after Spice reconnected, acknowledge what
+  # they applied before it.
+  - wait-metric: { name: cayenne_mem_tier_checkpoint_tick_total, labels: { table: v }, increases: true, timeout: 90s }
+  - wait-metric: { name: cayenne_mem_tier_checkpoint_tick_total, labels: { table: g }, increases: true, timeout: 90s }
+  # Killed after `v` checkpoints.
+  - kill-spiced: {}
+    when: { reconnect: kill-after-checkpoint }
+  - source-exec: { emb: "rm -f /tmp/hold-${sources.emb.namespace}-HOLD" }
+  - start: {}
+    when: { reconnect: kill-after-checkpoint }
+  - wait-ready: { timeout: 120s }
+
+  # Key 5000 stays deleted, and `g` keeps its last update.
+  - query: SELECT id, n FROM v WHERE id = 5000
+    expect-empty: true
+    eventually: 30s
+  - query: SELECT id, n FROM v
+    eventually: 30s
+  - query: SELECT id, rtrim(substr(t, 1, 12), ' g') AS t, length(t) AS len FROM g WHERE id = 0
+    eventually: 30s
+  - query: SELECT count(*) AS n FROM h
+    eventually: 30s
+  # The same after a restart, which resumes from the acknowledged position.
+  - restart: {}
+  - query: SELECT id, n FROM v WHERE id = 5000
+    expect-empty: true
+    eventually: 30s
+  - query: SELECT id, n FROM v
+    eventually: 30s
+  - query: SELECT id, rtrim(substr(t, 1, 12), ' g') AS t, length(t) AS len FROM g WHERE id = 0
+    eventually: 30s

@@ -1023,12 +1023,12 @@ mod tests {
         let added = app::AppBuilder::new("pod")
             .with_dataset(accelerated_dataset("orders", "duckdb"))
             .with_dataset(accelerated_dataset("events", "cayenne"))
-            .with_dataset(accelerated_dataset("customers", "sqlite"))
+            .with_dataset(accelerated_dataset("customers", "arrow"))
             .build();
         let warning = reload_deprecated_engines_warning(&current, &added)
-            .expect("the reload adds a sqlite dataset");
+            .expect("the reload adds an arrow dataset");
         assert!(
-            warning.contains("`sqlite` (dataset 'customers')"),
+            warning.contains("`arrow` (dataset 'customers')"),
             "{warning}"
         );
         assert!(

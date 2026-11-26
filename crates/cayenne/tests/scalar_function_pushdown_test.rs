@@ -32,14 +32,14 @@ use arrow::record_batch::RecordBatch;
 
 use cayenne::metadata::CreateTableOptions;
 
-use cayenne::{CayenneTableProvider, MetadataCatalog};
+use cayenne::MetadataCatalog;
 
 use datafusion::prelude::*;
 
 use std::sync::Arc;
 
 // Generate test variants for each backend
-test_with_backends!(test_scalar_function_in_order_by_impl);
+test_on_data_store!(test_scalar_function_in_order_by_impl);
 
 /// Regression test for issue #8770: "Unsupported `ScalarFunctionExpr`: `to_timestamp`"
 ///
@@ -54,7 +54,6 @@ async fn test_scalar_function_in_order_by_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let data_path = &fixture.data_path;
     let backend_name = fixture.backend_type.name();
 
     println!("✓ Catalog initialized with {backend_name} backend");
@@ -75,14 +74,16 @@ async fn test_scalar_function_in_order_by_impl(
         schema: Arc::clone(&schema),
         primary_key: vec![],
         on_conflict: None,
-        base_path: data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("hits"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog, ctx.runtime_env(), table_options)
+        .await?;
     println!("✓ Table created");
 
     // Register with DataFusion context
