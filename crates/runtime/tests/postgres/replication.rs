@@ -616,6 +616,191 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Two replicas that both find no publication race into `CREATE PUBLICATION`.
+/// While the winner's transaction is still open, the loser blocks on the
+/// publication name's unique index and, once the winner commits, fails with
+/// SQLSTATE 23505 on `pg_publication_pubname_index` rather than 42710. That
+/// replica's setup must still succeed, add its own table to the publication the
+/// winner created for a different one, and turn on `publish_via_partition_root`,
+/// which this winner (an older build, say) left off.
+#[tokio::test(flavor = "multi_thread")]
+async fn setup_survives_losing_a_concurrent_publication_create() -> Result<(), anyhow::Error> {
+    const PUBLICATION: &str = "spice_itest_pub_race";
+    const SLOT: &str = "spice_itest_slot_race";
+
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = container.host_port(5432)?;
+    let source = setup_source_table(port).await?;
+    source
+        .simple_query("CREATE TABLE public.repl_race_other (id int PRIMARY KEY)")
+        .await?;
+
+    // The winner: creates the publication for another table, without
+    // `publish_via_partition_root`, and holds its transaction open, so its
+    // catalog row is inserted but not committed.
+    let winner = connect(port).await?;
+    winner
+        .batch_execute(&format!(
+            "BEGIN; CREATE PUBLICATION {PUBLICATION} FOR TABLE public.repl_race_other"
+        ))
+        .await?;
+
+    // The loser: Spice's setup for `repl_users` sees no committed publication
+    // and goes on to create it.
+    let params = params_for(port, SLOT, PUBLICATION);
+    let setup = tokio::spawn(async move {
+        data_components::postgres_replication::slot::setup_slot_and_publication(
+            &params,
+            "public",
+            "repl_users",
+        )
+        .await
+    });
+
+    // Its `CREATE PUBLICATION` must be waiting on the winner's row, or this
+    // test is not exercising the race.
+    assert!(
+        wait_until_blocked(&source, &format!("CREATE PUBLICATION \"{PUBLICATION}\"%")).await,
+        "Spice's CREATE PUBLICATION never waited on the concurrent one, so the race was not reproduced"
+    );
+
+    winner.batch_execute("COMMIT").await?;
+
+    let slot = setup.await?;
+    assert!(
+        slot.is_ok(),
+        "setup after losing the CREATE PUBLICATION race must succeed, got: {:?}",
+        slot.err()
+    );
+
+    let tables: Vec<String> = source
+        .query(
+            "SELECT tablename::text FROM pg_publication_tables \
+             WHERE pubname = $1 ORDER BY tablename",
+            &[&PUBLICATION],
+        )
+        .await?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(tables, ["repl_race_other", "repl_users"]);
+    assert!(
+        publishes_via_partition_root(&source, PUBLICATION).await?,
+        "setup after losing the race must turn on publish_via_partition_root"
+    );
+
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    Ok(())
+}
+
+/// Two replicas that both find an existing publication without
+/// `publish_via_partition_root` both run the `ALTER` that turns it on. The one
+/// that loses fails with `tuple concurrently updated` (SQLSTATE XX000); its
+/// setup must still succeed, since the option it wanted is now set.
+#[tokio::test(flavor = "multi_thread")]
+async fn setup_survives_losing_a_concurrent_publish_via_partition_root_repair()
+-> Result<(), anyhow::Error> {
+    const PUBLICATION: &str = "spice_itest_pub_repair_race";
+    const SLOT: &str = "spice_itest_slot_repair_race";
+
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = container.host_port(5432)?;
+    let source = setup_source_table(port).await?;
+    source
+        .simple_query(&format!(
+            "CREATE PUBLICATION {PUBLICATION} FOR TABLE public.repl_users"
+        ))
+        .await?;
+
+    // The winner: turns the option on and holds its transaction open.
+    let winner = connect(port).await?;
+    winner
+        .batch_execute(&format!(
+            "BEGIN; ALTER PUBLICATION {PUBLICATION} SET (publish_via_partition_root = true)"
+        ))
+        .await?;
+
+    // The loser: Spice's setup still sees the option off and runs the same ALTER.
+    let params = params_for(port, SLOT, PUBLICATION);
+    let setup = tokio::spawn(async move {
+        data_components::postgres_replication::slot::setup_slot_and_publication(
+            &params,
+            "public",
+            "repl_users",
+        )
+        .await
+    });
+    assert!(
+        wait_until_blocked(
+            &source,
+            &format!("ALTER PUBLICATION \"{PUBLICATION}\" SET%")
+        )
+        .await,
+        "Spice's ALTER PUBLICATION never waited on the concurrent one, so the race was not reproduced"
+    );
+
+    winner.batch_execute("COMMIT").await?;
+
+    let slot = setup.await?;
+    assert!(
+        slot.is_ok(),
+        "setup after losing the publish_via_partition_root race must succeed, got: {:?}",
+        slot.err()
+    );
+    assert!(publishes_via_partition_root(&source, PUBLICATION).await?);
+
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    Ok(())
+}
+
+async fn connect(port: u16) -> Result<tokio_postgres::Client, anyhow::Error> {
+    let (client, connection) = tokio_postgres::Config::new()
+        .host("localhost")
+        .port(port)
+        .user("postgres")
+        .password(common::PG_PASSWORD)
+        .dbname("postgres")
+        .connect(NoTls)
+        .await?;
+    tokio::spawn(async move {
+        let _: Result<(), tokio_postgres::Error> = connection.await;
+    });
+    Ok(client)
+}
+
+/// Whether a session running a statement that matches `query_like` is waiting
+/// on a lock, polled for up to 30 seconds.
+async fn wait_until_blocked(source: &tokio_postgres::Client, query_like: &str) -> bool {
+    crate::utils::wait_until_true(Duration::from_secs(30), || async {
+        source
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE wait_event_type = 'Lock' AND query LIKE $1",
+                &[&query_like],
+            )
+            .await
+            .is_ok_and(|row| row.get::<_, i64>(0) == 1)
+    })
+    .await
+}
+
+async fn publishes_via_partition_root(
+    source: &tokio_postgres::Client,
+    publication: &str,
+) -> Result<bool, anyhow::Error> {
+    Ok(source
+        .query_one(
+            "SELECT pubviaroot FROM pg_publication WHERE pubname = $1",
+            &[&publication],
+        )
+        .await?
+        .get(0))
+}
+
 /// JSON, JSONB and text retain `PostgreSQL`'s text representation through both
 /// snapshot reads and binary pgoutput changes.
 #[tokio::test(flavor = "multi_thread")]
