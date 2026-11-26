@@ -451,7 +451,7 @@ jobs:
 
   # The metastore model's `all` set with its controls, and the object-native
   # data-path suites on every store at full depth (cayenne_object_native.yml).
-  # Pull requests and the merge queue run its quick set.
+  # The merge queue runs its quick set.
   cayenne-object-native:
     name: Cayenne object-native
     needs: resolve
@@ -459,10 +459,8 @@ jobs:
     with:
       ref: ${{ needs.resolve.outputs.sha }}
       set: all
-    # The called jobs' own permissions: its path filter reads pull requests.
     permissions:
       contents: read
-      pull-requests: read
 
   # The nextest tests that sign-off and the merge queue skip: the SF1
   # result-correctness lanes, which compare Cayenne with standalone DuckDB and
