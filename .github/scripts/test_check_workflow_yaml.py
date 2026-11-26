@@ -1897,6 +1897,89 @@ class CheckContainerImagesTest(unittest.TestCase):
                         )
 
 
+class CheckHashedPythonInstallsTest(unittest.TestCase):
+    """A job that holds a credential, and every composite action, installs only hashed requirements."""
+
+    WORKFLOW = (
+        "on:\n  push:\n{top}jobs:\n  j:\n    runs-on: ubuntu-24.04\n{job}    steps:\n"
+        "      - name: Install\n        run: |\n          {run}\n"
+    )
+
+    def problems(self, run, job="", top=""):
+        text = self.WORKFLOW.format(run=run, job=job, top=top)
+        return [p for p in check_workflow_yaml.check_workflow(text) if "--require-hashes" in p]
+
+    def test_an_unhashed_install_in_a_credentialed_job_is_reported(self):
+        for job, why in (
+            ("    environment: ci\n    permissions:\n      contents: read\n", "runs in the `ci` environment"),
+            ("    environment: secret-free\n    permissions:\n      contents: write\n", "has `contents: write`"),
+            ("    environment: secret-free\n    permissions:\n      id-token: write\n", "has `id-token: write`"),
+            ("    environment: secret-free\n    permissions: write-all\n", "has `permissions: write-all`"),
+            (
+                "    environment: secret-free\n    permissions:\n      contents: read\n"
+                "    env:\n      KEY: ${{ secrets.API_KEY }}\n",
+                "reads a secret",
+            ),
+            ("    environment: secret-free\n", "has no job-level `permissions:`"),
+        ):
+            with self.subTest(job=job):
+                (problem,) = self.problems("python -m pip install duckdb", job)
+                self.assertIn("job `j` step `Install` runs `python -m pip install duckdb`", problem)
+                self.assertIn(why, problem)
+
+    def test_each_command_of_a_line_is_read(self):
+        job = "    environment: ci\n    permissions:\n      contents: read\n"
+        self.assertEqual(len(self.problems("pip install --require-hashes -r a.txt && pip3 install b", job)), 1)
+        self.assertEqual(len(self.problems("pip install \\\n            b", job)), 1)
+        self.assertEqual(self.problems("# pip install b", job), [])
+
+    def test_a_hashed_install_or_a_read_only_job_is_accepted(self):
+        self.assertEqual(
+            self.problems("pip install --require-hashes --only-binary=:all: -r r.txt", "    environment: ci\n"), []
+        )
+        read_only = "    environment: secret-free\n    permissions:\n      contents: read\n"
+        self.assertEqual(self.problems("pip install pyyaml", read_only), [])
+        self.assertEqual(
+            self.problems(
+                "pip install pyyaml",
+                "    environment: secret-free\n    env:\n      T: ${{ secrets.GITHUB_TOKEN }}\n",
+                "permissions:\n  contents: read\n",
+            ),
+            [],
+        )
+
+    def test_a_composite_action_must_install_hashed_requirements(self):
+        action = (
+            "name: a\ndescription: d\nruns:\n  using: composite\n  steps:\n"
+            "    - name: Install\n      shell: bash\n      run: {run}\n"
+        )
+        (problem,) = [
+            p for p in check_workflow_yaml.check_action(action.format(run="pip install x")) if "--require-hashes" in p
+        ]
+        self.assertIn("step `Install` runs `pip install x`", problem)
+        self.assertEqual(
+            [
+                p
+                for p in check_workflow_yaml.check_action(action.format(run="pip install --require-hashes -r r.txt"))
+                if "--require-hashes" in p
+            ],
+            [],
+        )
+
+    def test_the_schema_workflows_unhashed_install_was_reported(self):
+        old = subprocess.run(
+            ["git", "show", "b250c8199e:.github/workflows/generate_json_schema.yml"],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).resolve().parents[2],
+        )
+        if old.returncode != 0:
+            self.skipTest("the commit before the change is not in this checkout")
+        problems = [p for p in check_workflow_yaml.check_workflow(old.stdout) if "--require-hashes" in p]
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("`contents: write`", problems[0])
+
+
 class RepositoryTest(unittest.TestCase):
     def test_this_repositorys_definitions_are_all_well_formed(self):
         """Regression test for #12181: cargo_deny_advisories.yml must parse."""

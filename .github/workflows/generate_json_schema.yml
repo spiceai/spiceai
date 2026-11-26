@@ -117,7 +117,8 @@ jobs:
         run: |
           set +e
           python3 -m venv .venv
-          .venv/bin/python -m pip install check-jsonschema
+          # Every package at the version and hashes .github/requirements/check_jsonschema.txt pins.
+          .venv/bin/python -m pip install --require-hashes --only-binary=:all: -r .github/requirements/check_jsonschema.txt
 
           echo "## Schema Validation Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY

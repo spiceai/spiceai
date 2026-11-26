@@ -59,6 +59,11 @@
 # (`name[:tag]@sha256:<digest>`): a job's `services:` and `container:`, a `uses: docker://`
 # step, and the image of a `docker run`, `docker create` or `docker pull` in a `run:` script
 # (see `check_container_images`).
+#
+# And a job that holds a credential (an environment other than `secret-free`, a write or
+# `id-token` permission, or a secret other than GITHUB_TOKEN), and every composite action,
+# installs Python packages only from a hashed requirements file (`pip install
+# --require-hashes -r`), so what it runs is exactly the files those hashes name.
 """Validate the repository's GitHub Actions workflow and composite action YAML."""
 
 from __future__ import annotations
@@ -440,6 +445,79 @@ def check_share_off_trunk(jobs: dict) -> list[str]:
     return problems
 
 
+PIP_INSTALL = re.compile(r"(?<![\w-])(?:pip3?|pip3\.\d+)\s+install\b")
+SECRET_OTHER_THAN_TOKEN = re.compile(r"\bsecrets\s*(?:\.\s*(?!GITHUB_TOKEN\b)[A-Za-z_]|\[)")
+
+
+def _pip_installs_without_hashes(script: str) -> list[str]:
+    """The `pip install` commands in a script that do not pass --require-hashes."""
+    text = re.sub(r"^[ \t]*#[^\n]*\n", "", script, flags=re.M).replace("\\\n", " ")
+    found = []
+    for line in text.splitlines():
+        for command in re.split(r"&&|\|\||;|\|", line):
+            if PIP_INSTALL.search(command) and "--require-hashes" not in command:
+                found.append(command.strip())
+    return found
+
+
+def _job_credentials(job: dict) -> str | None:
+    """What credential a job holds, or None when it holds none but a read-only token."""
+    environment = job.get("environment")
+    if isinstance(environment, dict):
+        environment = environment.get("name")
+    if environment is not None and str(environment) != "secret-free":
+        return f"runs in the `{environment}` environment"
+    permissions = job.get("permissions")
+    if permissions in ("write-all", "read-all"):
+        return None if permissions == "read-all" else "has `permissions: write-all`"
+    if not isinstance(permissions, dict):
+        return "has no job-level `permissions:`, so it gets the workflow's"
+    for scope, level in permissions.items():
+        if str(level) == "write":
+            return f"has `{scope}: write`"
+    if SECRET_OTHER_THAN_TOKEN.search(json.dumps(job, default=str)):
+        return "reads a secret"
+    return None
+
+
+def check_hashed_python_installs(jobs: dict, workflow_permissions: object) -> list[str]:
+    """Report a `pip install` without --require-hashes in a job that holds a credential."""
+    problems = []
+    for name, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        scoped = dict(job)
+        if "permissions" not in scoped and workflow_permissions is not None:
+            scoped["permissions"] = workflow_permissions
+        why = None
+        for position, step in enumerate(_steps(job), start=1):
+            for command in _pip_installs_without_hashes(str(step.get("run", ""))):
+                why = why or _job_credentials(scoped)
+                if why is None:
+                    break
+                label = step.get("name") or f"step {position}"
+                problems.append(
+                    f"job `{name}` step `{label}` runs `{command[:80]}` without --require-hashes, and the job "
+                    f"{why}; install from a hashed requirements file under .github/requirements/ instead"
+                )
+    return problems
+
+
+def _action_python_installs(steps: object) -> list[str]:
+    """Report a `pip install` without --require-hashes in a composite action, which any job may call."""
+    problems = []
+    for position, step in enumerate(steps if isinstance(steps, list) else [], start=1):
+        if not isinstance(step, dict):
+            continue
+        for command in _pip_installs_without_hashes(str(step.get("run", ""))):
+            label = step.get("name") or f"step {position}"
+            problems.append(
+                f"step `{label}` runs `{command[:80]}` without --require-hashes; a composite action can run in a "
+                "job that holds credentials, so install from a hashed requirements file under .github/requirements/"
+            )
+    return problems
+
+
 def check_attested_builds(jobs: dict) -> list[str]:
     """Report a build whose output is attested and that sets up a shared build cache on trunk.
 
@@ -729,6 +807,7 @@ def check_workflow(text: str) -> list[str]:
         problems.extend(check_app_store_credentials(jobs))
         problems.extend(check_download_execution(jobs))
         problems.extend(check_container_images(document))
+        problems.extend(check_hashed_python_installs(jobs, document.get("permissions")))
 
     return problems
 
@@ -1632,6 +1711,7 @@ def check_action(text: str) -> list[str]:
         + _step_download_executions(runs.get("steps") if isinstance(runs, dict) else None, "")
         + check_own_prefix_spiced_reads(runs.get("steps") if isinstance(runs, dict) else None, "")
         + _steps_image_problems(runs.get("steps") if isinstance(runs, dict) else None, "", [])
+        + _action_python_installs(runs.get("steps") if isinstance(runs, dict) else None)
     )
 
 

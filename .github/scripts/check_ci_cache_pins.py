@@ -95,6 +95,7 @@ REQUIREMENTS = {
     ".github/requirements/hf_cli.txt": (".github/workflows/hf_cache_differential.yml",),
     ".github/requirements/bigquery_gate.txt": (".github/workflows/e2e_test_ci.yml",),
     "test/object_store_occ/requirements.txt": (".github/workflows/object_store_wal.yml",),
+    ".github/requirements/check_jsonschema.txt": (".github/workflows/generate_json_schema.yml",),
 }
 # The DuckLake bootstrap writes a catalog spiced reads with the DuckDB release
 # test/duckdb_versions.json lists last, so it must pin that duckdb.
