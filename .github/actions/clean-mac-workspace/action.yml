@@ -29,6 +29,10 @@ runs:
         # modes), so the workspace is moved aside whole, which needs only its own flags, ACL and
         # mode cleared, and a new one is made. A link left as the workspace is moved aside itself,
         # never followed. What was moved aside is never used, and removing it is best-effort.
+        parent="$(dirname "$workspace")"
+        chflags nouchg,nouappnd "$parent" 2>/dev/null || true
+        chmod -N "$parent" 2>/dev/null || true
+        chmod u+rwx "$parent" 2>/dev/null || true
         chflags -h nouchg,nouappnd "$workspace" 2>/dev/null || true
         chmod -h -N "$workspace" 2>/dev/null || true
         [ -L "$workspace" ] || chmod u+rwx "$workspace" 2>/dev/null || true

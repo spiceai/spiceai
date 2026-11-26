@@ -91,6 +91,15 @@ class CleanMacWorkspaceTest(unittest.TestCase):
         self.assertTrue(self.workspace.is_dir())
         self.assertEqual(list(self.workspace.iterdir()), [])
 
+    def test_a_locked_parent_directory_cannot_block_the_next_job(self):
+        parent = self.workspace.parent
+        parent.chmod(0o555)
+        if sys.platform == "darwin":
+            subprocess.run(["chflags", "uchg", str(parent)], check=True)
+        proc = self.run_step()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(list(self.workspace.iterdir()), [])
+
     def test_a_link_left_as_the_workspace_is_moved_aside_not_followed(self):
         target = self.tmp / "target"
         target.mkdir()
@@ -152,7 +161,9 @@ class PushSnapChangesConfigTest(unittest.TestCase):
                            ("gpg.program", "/tmp/x"),
                            ("http.proxy", "http://127.0.0.1:9"),
                            ("remote.origin.pushurl", "https://evil.invalid/x.git"),
-                           ("core.askPass", "/tmp/x")):
+                           ("core.askPass", "/tmp/x"),
+                           ("core.worktree", "/tmp"),
+                           ("trace2.eventTarget", "/tmp/x")):
             with self.subTest(key=key):
                 git(self.repo, "config", key, value)
                 proc = self.run_step()
