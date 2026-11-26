@@ -797,7 +797,8 @@ impl SpiceObjectStoreRegistry {
         // Rewrite the URL Scheme
         url.set_scheme("abfss").map_err(|()| {
             DataFusionError::Configuration(format!(
-                "Unable to set scheme to abfss for URL: {url:?}"
+                "Unable to set scheme to abfss for URL: {}",
+                shown_url(&url)
             ))
         })?;
 
@@ -869,7 +870,8 @@ impl SpiceObjectStoreRegistry {
         }
 
         Err(DataFusionError::Execution(format!(
-            "No object store available for: {url:?}"
+            "No object store available for: {}",
+            shown_url(url)
         )))
     }
 }
@@ -934,6 +936,16 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
         }
         Ok(store)
     }
+}
+
+/// The URL for an error message: without its fragment, query and password, which can hold
+/// the store's credentials.
+fn shown_url(url: &Url) -> Url {
+    let mut shown = url.clone();
+    shown.set_fragment(None);
+    shown.set_query(None);
+    let _ = shown.set_password(None);
+    shown
 }
 
 /// True when the fragment sets `allow_http` to false, after the same form
@@ -1137,6 +1149,22 @@ mod tests {
             .await
             .expect_err("the server answers 404")
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_store_error_leaves_out_the_url_credentials() {
+        let url = Url::parse(
+            "s3a://user:url-password@bucket/tables/t/?sig=query-secret#key=AKIAEXAMPLE&secret=fragment-secret",
+        )
+        .expect("valid URL");
+        let err = SpiceObjectStoreRegistry::new(Handle::current())
+            .get_store(&url)
+            .expect_err("the registry has no s3a store")
+            .to_string();
+        assert!(
+            err.ends_with("No object store available for: s3a://user@bucket/tables/t/"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
