@@ -974,6 +974,12 @@ class CheckCiRoleCallsTest(unittest.TestCase):
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("x_aws.yml assumes a CI AWS role and only a call can start it, but no workflow here calls it",
                       problems[0])
+        # However its `on:` is written.
+        for written in ("workflow_call", ["workflow_call"]):
+            with self.subTest(on=written):
+                document = yaml.safe_load(yaml.safe_dump(self.REUSABLE))
+                document[True] = written
+                self.assertEqual(len(self.problems({"x_aws.yml": document})), 1)
         # One that can also be started some other way is not.
         dispatchable = yaml.safe_load(yaml.safe_dump(self.REUSABLE))
         dispatchable[True]["workflow_dispatch"] = None

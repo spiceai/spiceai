@@ -839,7 +839,8 @@ def check_ci_role_calls(workflows: dict[str, dict]) -> list[str]:
     # A role workflow left behind when its caller's job went away still holds a role.
     for name in sorted(reusable - called_here):
         triggers = _triggers(workflows[name])
-        if isinstance(triggers, dict) and set(triggers) == {"workflow_call"}:
+        events = set(triggers) if isinstance(triggers, (dict, list)) else {triggers}
+        if events == {"workflow_call"}:
             problems.append(
                 f"{name} assumes a CI AWS role and only a call can start it, but no workflow here calls it; "
                 "delete it, its actions.lock entry and any caller mapping"

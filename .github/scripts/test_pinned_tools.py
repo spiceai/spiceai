@@ -257,10 +257,13 @@ class PinnedToolsTest(unittest.TestCase):
 
     def test_snapshot_pushes_use_a_git_config_of_their_own(self):
         run = step("push-snap-changes", "Upload snapshots to branch")["run"]
-        setup = run.index("export GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM=1")
-        self.assertIn('GIT_CONFIG_GLOBAL="$(mktemp "${RUNNER_TEMP:?RUNNER_TEMP is not set}/gitconfig.XXXXXX")"', run)
-        self.assertLess(setup, run.index("git config --global"))
-        self.assertLess(setup, run.index("push origin"))
+        # No git config but git's defaults: not the host's, and not the checkout's (its commit is
+        # made in a repository of the step's own; test_mac_workspace.py runs it).
+        setup = run.index("export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1")
+        self.assertLess(setup, run.index("git --git-dir"))
+        self.assertLess(setup, run.index("git init -q --bare --template="))
+        self.assertNotIn("git config", run)
+        self.assertNotIn("push origin", run)
 
     def test_only_setup_sccache_makes_sccache_the_rustc_wrapper(self):
         for path in sorted((ROOT / ".github").rglob("*.y*ml")):
