@@ -11,8 +11,10 @@
 
 import os
 import re
+import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -201,6 +203,22 @@ class ClusterImageTest(unittest.TestCase):
         self.assertEqual(verify["with"]["image"], "${{ steps.app-image.outputs.image }}")
         self.assertEqual(verify["with"]["signer-workflow"], ".github/workflows/spiced_docker_dev.yml")
 
+    def run_check_step(self, step, now, by_digest, moves=""):
+        """Run a cluster image check step with a stand-in image_tag_watch.sh answering for `now`."""
+        verified = "sha256:" + "a" * 64
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / ".github" / "scripts").mkdir(parents=True)
+            (work / ".github" / "scripts" / "image_tag_watch.sh").write_text(
+                f'[ "$4" = "{now}" ] && exit 0\necho "ghcr.io/$2:$3 names {now}, not $4."\nexit 1\n'
+            )
+            (work / "temp").mkdir()
+            if moves:
+                (work / "temp" / "cluster-app-image-moves").write_text(moves)
+            return subprocess.run(["bash", "-e", "-c", step["run"]], cwd=work, capture_output=True, text=True,
+                                  env={**os.environ, "IMAGE_TAG": "trunk-0123456789ab", "VERIFIED": verified,
+                                       "BY_DIGEST": by_digest, "RUNNER_TEMP": str(work / "temp")})
+
     def test_the_app_is_given_the_verified_digest_and_the_tag_must_keep_naming_it(self):
         steps = job_steps("testoperator_run_cluster_bench_aws.yml", "run-cluster-bench")
         names = [s.get("name") or "" for s in steps]
@@ -208,23 +226,62 @@ class ClusterImageTest(unittest.TestCase):
         run = steps[run_index]
         self.assertEqual(run["env"]["SPIDAPTER_IMAGE_DIGEST"], "${{ steps.app-image.outputs.digest }}")
         self.assertEqual(run["env"]["SPIDAPTER_IMAGE_BY_DIGEST"], "${{ vars.CLUSTER_APP_IMAGE_BY_DIGEST == 'true' }}")
-        self.assertIn('ghcr_digest.sh spiceai/spiceai-dev "${CUSTOM_IMAGE_TAG}"', run["run"])
-        self.assertLess(run["run"].index("ghcr_digest.sh"), run["run"].index("run_bench federated-direct "))
+        # Sent by tag, the tag is watched for the whole run.
+        self.assertIn('[ "${SPIDAPTER_IMAGE_BY_DIGEST}" != true ]', run["run"])
+        self.assertLess(run["run"].index("image_tag_watch.sh watch"), run["run"].index("run_bench federated-direct "))
+        before = steps[names.index("Check the cluster app image before the app starts")]
         after = steps[names.index("Check the cluster app image did not move")]
-        self.assertGreater(names.index("Check the cluster app image did not move"), run_index)
+        self.assertLess(names.index(before["name"]), run_index)
+        self.assertGreater(names.index(after["name"]), run_index)
+        self.assertEqual(before["if"], "steps.app-image.outputs.digest != ''")
         self.assertEqual(after["if"], "always() && steps.app-image.outputs.digest != ''")
-        for now, by_digest, ok in (("sha256:" + "a" * 64, "false", True), ("sha256:" + "b" * 64, "false", False),
-                                   ("sha256:" + "b" * 64, "true", True)):
-            with self.subTest(now=now, by_digest=by_digest), tempfile.TemporaryDirectory() as tmp:
-                work = Path(tmp)
-                (work / ".github" / "scripts").mkdir(parents=True)
-                (work / ".github" / "scripts" / "ghcr_digest.sh").write_text(f"echo {now}\n")
-                proc = subprocess.run(["bash", "-e", "-c", after["run"]], cwd=work, capture_output=True, text=True,
-                                      env={**os.environ, "IMAGE_TAG": "trunk-0123456789ab", "VERIFIED": "sha256:" + "a" * 64,
-                                           "BY_DIGEST": by_digest})
-                self.assertEqual(proc.returncode == 0, ok, proc.stdout + proc.stderr)
-                if by_digest == "true" and now.endswith("b"):
-                    self.assertIn("::warning::", proc.stdout)
+        same, other = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+        for step in (before, after):
+            for now, by_digest, ok in ((same, "false", True), (other, "false", False), (other, "true", True)):
+                with self.subTest(step=step["name"], now=now, by_digest=by_digest):
+                    proc = self.run_check_step(step, now, by_digest)
+                    self.assertEqual(proc.returncode == 0, ok, proc.stdout + proc.stderr)
+                    if by_digest == "true" and now == other:
+                        self.assertIn("::warning::", proc.stdout)
+        # A move the watcher saw fails the run even when the tag was pushed back before the end.
+        proc = self.run_check_step(after, same, "false", moves="2026-11-25T00:00:00Z " + other + "\n")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(other, proc.stdout)
+
+    def test_image_tag_watch_checks_once_and_logs_every_move_while_it_runs(self):
+        script = Path(__file__).with_name("image_tag_watch.sh")
+        same, other = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            shutil.copy(script, work / "image_tag_watch.sh")
+            answers = work / "answers"
+            # Each read takes the next answer: the tag moves away and back.
+            (work / "ghcr_digest.sh").write_text(
+                f'line="$(head -n 1 "{answers}")"; tail -n +2 "{answers}" > "{answers}.n"; mv "{answers}.n" "{answers}"\n'
+                f'echo "${{line:-{same}}}"\n'
+            )
+            answers.write_text(same + "\n")
+            check = ["bash", str(work / "image_tag_watch.sh"), "check", "spiceai/spiceai-dev", "trunk-x", same]
+            self.assertEqual(subprocess.run(check, capture_output=True, text=True).returncode, 0)
+            answers.write_text(other + "\n")
+            proc = subprocess.run(check, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn(f"names {other}, not {same}", proc.stdout)
+            log = work / "moves"
+            answers.write_text(f"{same}\n{other}\n{same}\n")
+            watcher = subprocess.Popen(["bash", str(work / "image_tag_watch.sh"), "watch", "spiceai/spiceai-dev",
+                                        "trunk-x", same, str(log), "1"])
+            try:
+                deadline = time.time() + 15
+                while time.time() < deadline and not (log.exists() and log.read_text()):
+                    time.sleep(0.2)
+            finally:
+                watcher.kill()
+                watcher.wait()
+            self.assertIn(other, log.read_text())
+            bad = subprocess.run(["bash", str(work / "image_tag_watch.sh"), "check", "r/x", "t", "sha256:short"],
+                                 capture_output=True, text=True)
+            self.assertEqual(bad.returncode, 2)
 
     def test_a_trunk_run_takes_no_unverified_dev_channel_image(self):
         steps = job_steps("testoperator_run_cluster_bench_aws.yml", "run-cluster-bench")

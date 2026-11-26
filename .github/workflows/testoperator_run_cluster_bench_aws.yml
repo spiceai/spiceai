@@ -381,6 +381,25 @@ jobs:
           session-policy: benchmark-data-read-only
           export-env: 'false'
 
+      # Sent by tag, the tag must still name the digest this run verified when the app starts.
+      # Deployed by digest, the tag no longer decides what runs, so a moved tag is only noted.
+      - name: Check the cluster app image before the app starts
+        if: steps.app-image.outputs.digest != ''
+        env:
+          IMAGE_TAG: ${{ env.CB_CUSTOM_IMAGE_TAG }}
+          VERIFIED: ${{ steps.app-image.outputs.digest }}
+          BY_DIGEST: ${{ vars.CLUSTER_APP_IMAGE_BY_DIGEST == 'true' }}
+        run: |
+          set -euo pipefail
+          if moved="$(bash .github/scripts/image_tag_watch.sh check spiceai/spiceai-dev "${IMAGE_TAG}" "${VERIFIED}")"; then
+            echo "ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} names ${VERIFIED}, the digest this run verified."
+          elif [ "${BY_DIGEST}" = true ]; then
+            echo "::warning::${moved} The app is deployed by the verified digest."
+          else
+            echo "::error::${moved} That is not the image this run verified."
+            exit 1
+          fi
+
       - name: Run the cluster benchmark - ${{ env.CB_SPICEPOD_PATH }}
         env:
           SPICEAI_API_KEY: ${{ env.SPICEAI_API_KEY }}
@@ -489,20 +508,16 @@ jobs:
             export SPIDAPTER_IMAGE_TAG="${CUSTOM_IMAGE_TAG}"
             ADAPTER_CHANNEL="internal"
           fi
-          # Sent by tag, the tag must still name the digest this run verified when the app starts.
-          # Deployed by digest, the tag no longer decides what runs, so a moved tag is only noted.
-          if [ -n "${SPIDAPTER_IMAGE_DIGEST}" ]; then
-            now="$(bash .github/scripts/ghcr_digest.sh spiceai/spiceai-dev "${CUSTOM_IMAGE_TAG}")"
-            if [ "${now}" != "${SPIDAPTER_IMAGE_DIGEST}" ]; then
-              if [ "${SPIDAPTER_IMAGE_BY_DIGEST}" = true ]; then
-                echo "::warning::ghcr.io/spiceai/spiceai-dev:${CUSTOM_IMAGE_TAG} names ${now} now; the app is deployed by ${SPIDAPTER_IMAGE_DIGEST}, the digest this run verified."
-              else
-                echo "::error::ghcr.io/spiceai/spiceai-dev:${CUSTOM_IMAGE_TAG} names ${now} now, not ${SPIDAPTER_IMAGE_DIGEST}, the digest this run verified."
-                exit 1
-              fi
-            fi
-            echo "Deploying by digest: ${SPIDAPTER_IMAGE_BY_DIGEST}"
+          # Sent by tag, the app pulls whatever the tag names whenever it or an executor starts, so
+          # the tag is watched for the whole run; the check after the run fails on any move seen.
+          watcher=""
+          if [ -n "${SPIDAPTER_IMAGE_DIGEST}" ] && [ "${SPIDAPTER_IMAGE_BY_DIGEST}" != true ]; then
+            bash .github/scripts/image_tag_watch.sh watch spiceai/spiceai-dev "${CUSTOM_IMAGE_TAG}" \
+              "${SPIDAPTER_IMAGE_DIGEST}" "${RUNNER_TEMP}/cluster-app-image-moves" &
+            watcher=$!
+            trap '[ -z "${watcher}" ] || kill "${watcher}" 2>/dev/null || true' EXIT
           fi
+          echo "Deploying by digest: ${SPIDAPTER_IMAGE_BY_DIGEST}"
           # spidapter reads the channel from the SPIDAPTER_CHANNEL env var (applied
           # to the SCP compute config in stdio_server). The `stdio` subcommand no
           # longer accepts a --channel flag.
@@ -561,14 +576,16 @@ jobs:
           BY_DIGEST: ${{ vars.CLUSTER_APP_IMAGE_BY_DIGEST == 'true' }}
         run: |
           set -euo pipefail
-          now="$(bash .github/scripts/ghcr_digest.sh spiceai/spiceai-dev "${IMAGE_TAG}")"
-          if [ "${now}" != "${VERIFIED}" ] && [ "${BY_DIGEST}" = true ]; then
-            echo "::warning::ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} names ${now} now; the app was deployed by ${VERIFIED}, the digest this run verified."
-          elif [ "${now}" != "${VERIFIED}" ]; then
-            echo "::error::ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} names ${now} now, not ${VERIFIED}, the digest this run verified, so the app may have run another image; its results are not this image's."
+          moves="${RUNNER_TEMP}/cluster-app-image-moves"
+          if moved="$(bash .github/scripts/image_tag_watch.sh check spiceai/spiceai-dev "${IMAGE_TAG}" "${VERIFIED}")" && [ ! -s "${moves}" ]; then
+            echo "ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} named ${VERIFIED}, the digest this run verified, for the whole run."
+          elif [ "${BY_DIGEST}" = true ]; then
+            echo "::warning::ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} moved during the run; the app was deployed by ${VERIFIED}, the digest this run verified."
+          else
+            [ ! -s "${moves}" ] || { echo "The tag named, while the app ran:"; cat "${moves}"; }
+            echo "::error::ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} did not name ${VERIFIED}, the digest this run verified, for the whole run, so the app may have run another image; its results are not this image's."
             exit 1
           fi
-          echo "ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} still names ${VERIFIED}."
 
       - name: Re-authorize for cleanup
         if: always() && env.CB_COMPUTE == 'ec2'
