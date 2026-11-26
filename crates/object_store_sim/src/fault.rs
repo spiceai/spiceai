@@ -43,6 +43,8 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use super::Op;
 
 type Predicate = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+/// Matches a request by its path and, for a put, its bytes.
+type RulePredicate = Arc<dyn Fn(&Path, Option<&PutPayload>) -> bool + Send + Sync>;
 /// Async work executed immediately before a held request reaches storage.
 pub type BeforeHook = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 type SharedUpload = Arc<AsyncMutex<Box<dyn MultipartUpload>>>;
@@ -57,7 +59,7 @@ pub enum Fault {
 
 struct Rule {
     op: Op,
-    predicate: Predicate,
+    predicate: RulePredicate,
     fault: Fault,
     repeat: bool,
 }
@@ -131,11 +133,16 @@ struct Shared {
 
 impl Shared {
     fn fault(&self, op: Op, path: &Path) -> Option<Fault> {
+        self.fault_for(op, path, None)
+    }
+
+    /// The fault of the first rule matching `op` on `path`, with `payload` for a put.
+    fn fault_for(&self, op: Op, path: &Path, payload: Option<&PutPayload>) -> Option<Fault> {
         let mut state = self.state.lock();
         let index = state
             .rules
             .iter()
-            .position(|r| r.op == op && (r.predicate)(path))?;
+            .position(|r| r.op == op && (r.predicate)(path, payload))?;
         let fault = state.rules[index].fault;
         if !state.rules[index].repeat {
             state.rules.remove(index);
@@ -248,7 +255,26 @@ impl FaultStore {
     ) {
         self.shared.state.lock().rules.push(Rule {
             op,
-            predicate: Arc::new(predicate),
+            predicate: Arc::new(move |path, _| predicate(path)),
+            fault,
+            repeat: false,
+        });
+    }
+
+    /// Arm one put (`Create`, `Cas` or `Put`) whose path and bytes match
+    /// `predicate`, so a test can pick a write by what it writes. Rules are
+    /// consumed in insertion order.
+    pub fn arm_put(
+        &self,
+        op: Op,
+        predicate: impl Fn(&Path, &PutPayload) -> bool + Send + Sync + 'static,
+        fault: Fault,
+    ) {
+        self.shared.state.lock().rules.push(Rule {
+            op,
+            predicate: Arc::new(move |path, payload| {
+                payload.is_some_and(|payload| predicate(path, payload))
+            }),
             fault,
             repeat: false,
         });
@@ -258,7 +284,7 @@ impl FaultStore {
     pub fn fail_while(&self, op: Op, predicate: impl Fn(&Path) -> bool + Send + Sync + 'static) {
         self.shared.state.lock().rules.push(Rule {
             op,
-            predicate: Arc::new(predicate),
+            predicate: Arc::new(move |path, _| predicate(path)),
             fault: Fault::Fail,
             repeat: true,
         });
@@ -541,7 +567,10 @@ impl ObjectStore for FaultStore {
         payload: PutPayload,
         options: PutOptions,
     ) -> object_store::Result<PutResult> {
-        match self.shared.fault(put_op(&options.mode), path) {
+        match self
+            .shared
+            .fault_for(put_op(&options.mode), path, Some(&payload))
+        {
             Some(Fault::Fail) => {
                 self.shared
                     .state
