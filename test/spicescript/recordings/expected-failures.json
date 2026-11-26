@@ -2106,6 +2106,26 @@
       "group": "duckdb"
     }
   ],
+  "readiness": [
+    {
+      "run": "readiness[engine=cayenne,ready_state=on_load]",
+      "who": "object-native",
+      "key": "assert-status: {\"dataset\":\"slow\",\"ready\":false}",
+      "kind": "status",
+      "signature": "expected ready=false, saw status=Ready ready=true message=",
+      "group": "other",
+      "may-pass": true
+    },
+    {
+      "run": "readiness[engine=cayenne,ready_state=on_load]",
+      "who": "object-native",
+      "key": "query: SELECT count(*) FROM slow",
+      "kind": "error",
+      "signature": "the query succeeded, but the script expected an error:",
+      "group": "other",
+      "may-pass": true
+    }
+  ],
   "schema-ddl": [
     {
       "run": "schema-ddl[engine=duckdb]",
