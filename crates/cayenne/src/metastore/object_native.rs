@@ -385,6 +385,45 @@ pub(crate) fn replica_change_message(dataset: &str) -> String {
     )
 }
 
+/// Logged when a replica takes up a schema change its writer applied.
+pub(crate) fn replica_schema_adopted_message(dataset: &str, change: &str) -> String {
+    format!(
+        "{} now serves the schema change its writer applied ({change}), without a restart.",
+        subject(dataset)
+    )
+}
+
+/// The refusal a replica gives a query when the writer stored a schema the
+/// replica's live schema cannot widen to.
+pub(crate) fn replica_schema_unservable_message(dataset: &str, reason: &str) -> String {
+    format!(
+        "{} cannot serve the schema its writer stored ({reason}), so this instance answers no query of it until it loads the dataset again. Restart this instance to load it with the stored schema. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+        subject(dataset)
+    )
+}
+
+#[cfg(test)]
+mod replica_schema_message_tests {
+    #[test]
+    fn an_adopted_schema_names_the_dataset_and_the_change() {
+        assert_eq!(
+            super::replica_schema_adopted_message("orders", "1 added column (extra)"),
+            "Dataset 'orders' (cayenne) now serves the schema change its writer applied (1 added column (extra)), without a restart."
+        );
+    }
+
+    #[test]
+    fn an_unservable_schema_names_the_dataset_the_reason_and_the_fix() {
+        assert_eq!(
+            super::replica_schema_unservable_message(
+                "orders",
+                "The type of `v` changed from `Int64` to `Int32`, which is not a lossless widening"
+            ),
+            "Dataset 'orders' (cayenne) cannot serve the schema its writer stored (The type of `v` changed from `Int64` to `Int32`, which is not a lossless widening), so this instance answers no query of it until it loads the dataset again. Restart this instance to load it with the stored schema. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        );
+    }
+}
+
 #[cfg(test)]
 mod commit_outcome_message_tests {
     use super::{

@@ -1040,6 +1040,11 @@ impl Inner {
                 configured: configured_location.unwrap_or_else(|| "<unset>".to_string()),
             });
         }
+        // Replicas serve the writer's stored settings and schema. Taking the
+        // writer lease reloads the dataset and applies this instance's options.
+        if !matches!(self.head, Head::Writer(_)) {
+            return Ok(stored.table_id);
+        }
         let original_config = serde_json::to_string(&stored.vortex_config).map_err(invalid)?;
         let original_conflict = stored.on_conflict.as_ref().map(ToString::to_string);
         let new_vc = &options.vortex_config;

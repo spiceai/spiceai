@@ -1,0 +1,155 @@
+name: object-native-schema-changes
+description: >
+  Three instances share one object-native state location and one Postgres
+  source under CDC. a and c run a Spicepod whose `on_schema_change` evolves
+  the schema; b runs the previous Spicepod, with the default `block`. The
+  writer's policy decides the copy's schema: while a writes, the source adds a
+  column and widens another, and every instance serves the new schema without
+  a restart, b included. The writer is then killed just after it applies a
+  schema change, and the instance that takes over, and the one that follows
+  it, serve the new column too. Every answer is checked against the source by
+  column name, on a local state location and in an object store.
+
+sources:
+  src: { kind: postgres, shared: true }
+  lake: { kind: rustfs }
+  dir: { kind: files, shared: true }
+
+matrix:
+  store: [rustfs, local]
+  policy: [append_new_columns, sync_all_columns]
+
+variants:
+  a: { datasets: { t: { on_schema_change: '${matrix.policy}' } } }
+  b: {}
+  c: { datasets: { t: { on_schema_change: '${matrix.policy}' } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: object-native-schema-changes
+  runtime:
+    params: { cayenne_vnext: enabled }
+    state:
+      location: s3://${sources.lake.shared_bucket}/state/
+      params:
+        s3_endpoint: ${sources.lake.endpoint}
+        s3_region: us-east-1
+        s3_auth: key
+        s3_key: ${sources.lake.key}
+        s3_secret: ${sources.lake.secret}
+        allow_http: 'true'
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: id
+        params:
+          # Commit the in-memory CDC tier on every tick, so replicas see each
+          # change soon after the writer applies it.
+          cayenne_cdc_mem_tier_min_flush_bytes: '0'
+
+defaults:
+  # The instances share one location, so they run side by side.
+  run-variants: side-by-side
+  compare-variants: false
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id integer PRIMARY KEY, v integer, s text);
+        INSERT INTO t SELECT i, i, 's' || i FROM generate_series(1, 200) i;
+    only: a
+
+  # a starts first and writes the copy; b and c serve it as replicas. With
+  # `store: local`, the first start of each moves the state location to a
+  # directory every instance shares; later starts keep it.
+  - start: { patch: { spicepod: { runtime: { state: { location: 'file://${sources.dir.path}/state/', params: null } } } } }
+    when: { store: local }
+    only: a
+  - start: {}
+    when: { store: rustfs }
+    only: a
+  - query: SELECT id, v, s FROM t
+    eventually: 60s
+    only: a
+  - start: { patch: { spicepod: { runtime: { state: { location: 'file://${sources.dir.path}/state/', params: null } } } } }
+    when: { store: local }
+    only: [b, c]
+  - start: {}
+    when: { store: rustfs }
+    only: [b, c]
+  - query: SELECT id, v, s FROM t
+    eventually: 60s
+    only: [b, c]
+
+  # The source adds a column. a's policy evolves the copy, and the replicas
+  # serve the new column without a restart: b too, whose own Spicepod would
+  # not have evolved it.
+  - source-exec:
+      src: |
+        ALTER TABLE t ADD COLUMN extra text;
+        UPDATE t SET extra = 'e' || id, v = v + 1000 WHERE id % 2 = 0;
+        INSERT INTO t VALUES (201, 201, 's201', 'e201');
+    only: a
+  - query: SELECT * FROM t
+    eventually: 60s
+    only: [a, b, c]
+  - query: SELECT id, extra FROM t WHERE extra IS NOT NULL
+    eventually: 30s
+    only: [a, b, c]
+
+  # The source widens a column with values only the wider type holds; under
+  # sync_all_columns the copy widens, and every instance serves the values.
+  - source-exec:
+      src: |
+        ALTER TABLE t ALTER COLUMN v TYPE bigint;
+        UPDATE t SET v = v + 3000000000 WHERE id <= 5;
+        INSERT INTO t VALUES (202, 5000000000, 's202', 'e202');
+    only: a
+    when: { policy: sync_all_columns }
+  - query: SELECT * FROM t
+    eventually: 60s
+    only: [a, b, c]
+    when: { policy: sync_all_columns }
+  - query: SELECT arrow_typeof(v) AS ty FROM t LIMIT 1
+    expect: { rows: [['Int64']] }
+    eventually: 30s
+    only: [a, b, c]
+    when: { policy: sync_all_columns }
+
+  # The writer is killed just after it applies a schema change. The instance
+  # that takes over writes on from the committed copy, and every survivor
+  # serves the new column and the changes made meanwhile.
+  - source-exec:
+      src: "ALTER TABLE t ADD COLUMN late integer; UPDATE t SET late = id * 2 WHERE id <= 50"
+    only: a
+  - assert-log: { contains: "applied live schema evolution from the CDC stream: 1 added column \\(late\\)" }
+    eventually: 60s
+    only: a
+  - kill-spiced: {}
+    only: a
+  - source-exec:
+      src: "UPDATE t SET late = id * 3, v = v + 1 WHERE id % 3 = 0; INSERT INTO t (id, v, s, extra, late) VALUES (203, 203, 's203', 'e203', 609)"
+    only: b
+  - query: SELECT * FROM t
+    eventually: 120s
+    only: [b, c]
+  # Every row once: a change applied twice or skipped would change these.
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(late) AS late FROM t
+    only: [b, c]
+
+  # a, started again, follows the new writer.
+  - start: {}
+    only: a
+  - query: SELECT * FROM t
+    eventually: 60s
+    only: a
+  - assert-status: { dataset: t, status: Ready, ready: true }
+    only: [a, b, c]

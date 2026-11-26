@@ -1,0 +1,46 @@
+name: schema-restored-column
+description: >
+  Under CDC, a column the source drops and later adds again holds only the
+  values the source gives it after it is added: a row the source did not
+  change since keeps NULL in it, never the value it held before the drop.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  sync-all-columns: { datasets: { t: { on_schema_change: sync_all_columns } } }
+  object-native:
+    datasets: { t: { on_schema_change: sync_all_columns } }
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state: { location: 'file://${instance.dir}/state/' }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: schema-restored-column
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec: { src: "CREATE TABLE t (id integer PRIMARY KEY, v integer, extra text); INSERT INTO t SELECT i, i, 'e' || i FROM generate_series(1, 100) i" }
+  - start: {}
+  - query: SELECT id, v, extra FROM t
+    eventually: 60s
+  - source-exec: { src: "ALTER TABLE t DROP COLUMN extra; UPDATE t SET v = v + 1 WHERE id % 2 = 0" }
+  - query: SELECT id, v FROM t
+    eventually: 60s
+  - source-exec: { src: "ALTER TABLE t ADD COLUMN extra text; UPDATE t SET extra = 'g' || id WHERE id % 5 = 0" }
+  - query: SELECT id, v, extra FROM t
+    eventually: 60s
+  - restart: {}
+  - query: SELECT id, v, extra FROM t
+    eventually: 60s

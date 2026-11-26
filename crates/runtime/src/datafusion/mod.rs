@@ -418,6 +418,18 @@ pub enum Error {
         change: String,
     },
 
+    #[snafu(display("{}", shared_schema_recreate_message(dataset_name, reason)))]
+    SharedSchemaRecreate {
+        dataset_name: String,
+        reason: String,
+    },
+
+    #[snafu(display("{}", shared_settings_recreate_message(dataset_name, reason)))]
+    SharedSettingsRecreate {
+        dataset_name: String,
+        reason: String,
+    },
+
     #[snafu(display("The catalog {catalog} is not registered."))]
     CatalogMissing { catalog: String },
 
@@ -821,6 +833,20 @@ async fn read_one_row(
         batch?;
     }
     Ok(())
+}
+
+fn shared_settings_recreate_message(dataset: &str, reason: &str) -> String {
+    let reason = util::single_line(reason);
+    format!(
+        "Failed to load dataset {dataset} (cayenne): rebuilding the acceleration ({reason}) would drop its copy in the state location, which other Spice instances may be serving. This instance does not load the dataset; the other instances keep serving its existing rows. Revert the settings change to load it again. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
+fn shared_schema_recreate_message(dataset: &str, reason: &str) -> String {
+    let reason = util::single_line(reason);
+    format!(
+        "Failed to load dataset {dataset} (cayenne): the source schema changed in a way the acceleration cannot apply in place ({reason}), and rebuilding it would drop its copy in the state location, which other Spice instances may be serving. This instance does not load the dataset; the other instances keep serving its existing rows. Revert the source schema change to load it again. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
 }
 
 /// The line an operator reads when an acceleration is rebuilt: for changed settings its
@@ -5261,6 +5287,51 @@ impl DataFusion {
             Arc::clone(&existing_schema)
         };
 
+        // Check the stored placement before any recreate warning, snapshot or drop.
+        // The source schema may still be evolved in place without removing the copy.
+        let accelerator = self
+            .accelerator_engine_registry
+            .get_accelerator_engine(acceleration_settings.engine)
+            .await
+            .ok_or_else(|| Error::ExpectedAccelerationSettings {
+                name: dataset.name.to_string(),
+            })?;
+        let shared_copy = accelerator
+            .stored_data_is_shared(dataset)
+            .await
+            .map_err(|source| dataaccelerator::Error::AccelerationCreationFailed { source })
+            .context(UnableToCreateDataAcceleratorSnafu)?;
+
+        // A copy other instances share takes its schema from its writer, under the
+        // writer's `on_schema_change`. An instance that does not write it registers
+        // with the stored schema and evolves, recreates and reports nothing: it
+        // takes up each widening its writer commits as it follows the copy, and
+        // registers again, under its own policy, if it takes the writer lease over.
+        if shared_copy
+            && accelerator
+                .writer_role(dataset)
+                .await
+                .is_some_and(|role| !*role.borrow())
+        {
+            tracing::debug!(
+                dataset = %dataset.name,
+                "Registering with the schema the copy's writer stored; this instance does not write the copy",
+            );
+            return Ok(Some(Arc::clone(&comparison_schema)));
+        }
+        // Refuses only what would drop the copy: a recreate on a shared copy.
+        let refuse_shared_recreate = |reason: &str| -> Result<()> {
+            if allow_recreate && shared_copy {
+                SharedSchemaRecreateSnafu {
+                    dataset_name: dataset.name.to_string(),
+                    reason: reason.to_string(),
+                }
+                .fail()
+            } else {
+                Ok(())
+            }
+        };
+
         if policy != OnSchemaChange::Block {
             let dataset_name = dataset.name.to_string();
             let ctx = EvolutionContext { constraint_columns };
@@ -5296,6 +5367,12 @@ impl DataFusion {
                             change,
                         }
                         .fail();
+                    }
+                    if !evolution_allowed(policy, &plan)
+                        || refresh_mode == RefreshMode::Caching
+                        || !engine_supports_in_place_evolution(acceleration_settings.engine)
+                    {
+                        refuse_shared_recreate(&change)?;
                     }
                     if !evolution_allowed(policy, &plan) {
                         SCHEMA_EVOLUTION_FAILED.add(
@@ -5371,6 +5448,9 @@ impl DataFusion {
                                 return Ok(Some(Arc::clone(&plan.evolved_schema)));
                             }
                             Err(e) => {
+                                // On a shared copy a failed evolution keeps the copy
+                                // rather than drop it: the fallback below drops nothing.
+                                let recreates = allow_recreate && !shared_copy;
                                 SCHEMA_EVOLUTION_FAILED.add(
                                     1,
                                     &schema_evolution_labels(&dataset_name, kind, "apply_error"),
@@ -5378,13 +5458,13 @@ impl DataFusion {
                                 tracing::warn!(
                                     dataset = %dataset.name,
                                     "Failed to apply widening schema evolution ({change}): {e}{fallback}",
-                                    fallback = if allow_recreate {
+                                    fallback = if recreates {
                                         ". The acceleration is dropped and recreated with the new schema"
                                     } else {
                                         ". The new schema is not applied; a restart retries the evolution"
                                     },
                                 );
-                                if !allow_recreate {
+                                if !recreates {
                                     // Evolution failed and we will not drop-recreate: pin
                                     // back to the un-evolved engine-table schema so the
                                     // registered provider matches it. Use `comparison_schema`,
@@ -5422,6 +5502,7 @@ impl DataFusion {
                         .fail();
                     }
                     if allow_recreate {
+                        refuse_shared_recreate(&reason)?;
                         // `drop_and_recreate` (full mode) or `file_update`: the change
                         // cannot be applied in place, so fall through to the snapshot +
                         // drop + recreate path below, which logs and emits the APPLIED
@@ -5463,6 +5544,7 @@ impl DataFusion {
                 &normalized_refresh_schema,
             )
         {
+            refuse_shared_recreate(&diff.to_string())?;
             let dataset_name = dataset.name.to_string();
             let trigger = if is_file_update {
                 "file_update mode"
@@ -5685,6 +5767,25 @@ impl DataFusion {
         cause: &str,
     ) -> Result<()> {
         let dataset_name = source.name().to_string();
+        let accelerator = self
+            .accelerator_engine_registry
+            .get_accelerator_engine(acceleration_settings.engine)
+            .await
+            .ok_or_else(|| Error::ExpectedAccelerationSettings {
+                name: dataset_name.clone(),
+            })?;
+        if accelerator
+            .stored_data_is_shared(source)
+            .await
+            .map_err(|source| dataaccelerator::Error::AccelerationCreationFailed { source })
+            .context(UnableToCreateDataAcceleratorSnafu)?
+        {
+            return SharedSettingsRecreateSnafu {
+                dataset_name,
+                reason: cause.to_string(),
+            }
+            .fail();
+        }
         let checkpoint = dataset_checkpointer(
             source,
             self.accelerator_engine_registry(),
@@ -8371,6 +8472,40 @@ mod tests {
             "Failed to rebuild the acceleration of dataset 'trips' for its changed settings, so the dataset does not load until a retry succeeds: its load checkpoint could not be cleared. Cause: database is locked"
         );
         assert!(checkpoint.is_retriable());
+    }
+
+    #[test]
+    fn shared_settings_recreate_message_names_the_copy_and_recovery() {
+        let expected = "Failed to load dataset orders (cayenne): rebuilding the acceleration (on_conflict changed) would drop its copy in the state location, which other Spice instances may be serving. This instance does not load the dataset; the other instances keep serving its existing rows. Revert the settings change to load it again. See: https://spiceai.org/docs/components/data-accelerators/cayenne";
+        assert_eq!(
+            shared_settings_recreate_message("orders", "on_conflict changed"),
+            expected
+        );
+        assert_eq!(
+            Error::SharedSettingsRecreate {
+                dataset_name: "orders".to_string(),
+                reason: "on_conflict changed".to_string()
+            }
+            .to_string(),
+            expected
+        );
+    }
+
+    #[test]
+    fn shared_schema_recreate_message_names_the_copy_and_recovery() {
+        let expected = "Failed to load dataset orders (cayenne): the source schema changed in a way the acceleration cannot apply in place (v changed from Int32 to Utf8), and rebuilding it would drop its copy in the state location, which other Spice instances may be serving. This instance does not load the dataset; the other instances keep serving its existing rows. Revert the source schema change to load it again. See: https://spiceai.org/docs/components/data-accelerators/cayenne";
+        assert_eq!(
+            shared_schema_recreate_message("orders", "v changed from Int32 to Utf8"),
+            expected
+        );
+        assert_eq!(
+            Error::SharedSchemaRecreate {
+                dataset_name: "orders".to_string(),
+                reason: "v changed from Int32 to Utf8".to_string()
+            }
+            .to_string(),
+            expected
+        );
     }
 
     #[test]

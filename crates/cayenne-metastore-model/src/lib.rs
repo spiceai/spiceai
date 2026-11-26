@@ -22,6 +22,7 @@ mod read_programs;
 mod reads;
 mod replicas;
 mod retention;
+mod schema;
 mod seq_order;
 mod source_positions;
 mod standby;
@@ -370,6 +371,54 @@ pub fn runs() -> Vec<Run> {
             bound: 0,
             seed: None,
             failure: "a copy's writer serves it",
+        },
+        Run {
+            name: "schema",
+            family: "schema",
+            mode: "schema",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "schema-positional",
+            family: "schema",
+            mode: "schema-positional",
+            bound: 0,
+            seed: None,
+            failure: "a replica never serves rows misaligned with its schema",
+        },
+        Run {
+            name: "schema-recreate-drops",
+            family: "schema",
+            mode: "schema-recreate-drops",
+            bound: 0,
+            seed: None,
+            failure: "no instance drops a copy another serves",
+        },
+        Run {
+            name: "schema-takeover-narrows",
+            family: "schema",
+            mode: "schema-takeover-narrows",
+            bound: 0,
+            seed: None,
+            failure: "a copy's schema never narrows below its data",
+        },
+        Run {
+            name: "schema-replica-commits",
+            family: "schema",
+            mode: "schema-replica-commits",
+            bound: 0,
+            seed: None,
+            failure: "an instance fails only for a change it cannot apply",
+        },
+        Run {
+            name: "schema-no-adopt",
+            family: "schema",
+            mode: "schema-no-adopt",
+            bound: 0,
+            seed: None,
+            failure: "a replica that followed the log serves the committed schema",
         },
         Run {
             name: "source-positions",
@@ -3250,6 +3299,7 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
             && match run.name {
                 "dataset-lifecycle"
                 | "definitions"
+                | "schema"
                 | "source-positions"
                 | "retention"
                 | "replicas"
@@ -3482,6 +3532,7 @@ fn dispatch(r: Run, v: &mut impl Visitor) -> Option<bool> {
         "dataset-lifecycle" => v.visit(dataset_lifecycle::Protocol::new(r.mode, r.bound), r, None),
         "source-positions" => v.visit(source_positions::Protocol::new(r.mode, r.bound), r, None),
         "definitions" => v.visit(definitions::Protocol::new(r.mode), r, None),
+        "schema" => v.visit(schema::Protocol::new(r.mode), r, None),
         "standby" => v.visit(standby::Protocol::new(r.mode), r, None),
         "object-names" => v.visit(object_names::Protocol::new(r.mode, r.bound), r, None),
         "reads" => v.visit(reads::Protocol::new(r.mode, r.bound), r, None),
@@ -3806,11 +3857,12 @@ mod explorer_tests {
     use std::collections::BTreeSet;
 
     /// Families that show text only; every other family draws its state.
-    const TEXT_ONLY: [&str; 5] = [
+    const TEXT_ONLY: [&str; 6] = [
         "action-compatibility",
         "position-deletes",
         "predicate-progress",
         "read-delivery",
+        "schema",
         "state-rules",
     ];
 
@@ -3910,7 +3962,7 @@ mod explorer_tests {
             .filter(|f| !TEXT_ONLY.contains(f))
             .collect();
         assert_eq!(render.drawn, expected);
-        assert_eq!(render.families.len(), 26, "{:?}", render.families);
+        assert_eq!(render.families.len(), 27, "{:?}", render.families);
         assert!(
             render.steps > 10_000,
             "only {} steps rendered",

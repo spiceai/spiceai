@@ -129,6 +129,8 @@
   "object-native-definitions": 63,
   "object-native-replicas": 85,
   "object-native-same-bucket": 47,
+  "object-native-schema-changes": 600,
+  "object-native-schema-recreate": 300,
   "on-zero-results": 43,
   "ordering-window-join-semantics": 5,
   "parquet-struct-map-key": 3,

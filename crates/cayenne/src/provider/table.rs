@@ -7027,12 +7027,8 @@ impl CayenneTableProvider {
                     .await
                     .map_err(|source| Error::Catalog { source })?;
             }
-            self.table_schema.store(Arc::clone(&plan.evolved_schema));
             if drop_table_stats {
                 self.cold_manifest.store(Arc::new(None));
-            }
-            if let (Some(state), Some(shapes)) = (&self.lookup_index, index_shapes) {
-                state.adopt_shapes(shapes);
             }
             {
                 // Cached optimizer statistics are column-indexed against the
@@ -7070,10 +7066,8 @@ impl CayenneTableProvider {
                         .is_some_and(|raw| raw.num_rows_exact);
                 }
             }
-            // Per-file statistics were inferred against the old logical schema
-            // width; drop them so the next scan re-infers at the evolved width.
-            self.clear_scan_file_statistics_cache();
-            self.refresh_listing_table_under_held_fence().await?;
+            self.install_schema_under_held_fence(&plan.evolved_schema, index_shapes)
+                .await?;
         }
 
         tracing::info!(
@@ -7083,6 +7077,91 @@ impl CayenneTableProvider {
             plan.describe()
         );
 
+        Ok(())
+    }
+
+    /// Make `schema` this table's live schema: what queries plan against and
+    /// scans produce, and what the secondary index keys and per-file statistics
+    /// are built at. The caller holds `listing_fence` for writing and
+    /// `table_statistics_persistence_lock`, and has persisted `schema` (the
+    /// writer) or read it from the committed state (a replica).
+    async fn install_schema_under_held_fence(
+        &self,
+        schema: &SchemaRef,
+        index_shapes: Option<super::lookup_index::KeyShapes>,
+    ) -> Result<()> {
+        self.table_schema.store(Arc::clone(schema));
+        if let (Some(state), Some(shapes)) = (&self.lookup_index, index_shapes) {
+            state.adopt_shapes(shapes);
+        }
+        // Per-file statistics were inferred against the old logical schema
+        // width; drop them so the next scan re-infers at the new width.
+        self.clear_scan_file_statistics_cache();
+        self.refresh_listing_table_under_held_fence().await
+    }
+
+    /// On a replica, serve the schema the writer committed. The writer widens
+    /// the stored schema under its own `on_schema_change` policy (added
+    /// columns, widened types, relaxed nullability) and writes data under it;
+    /// a replica that kept the schema it opened with would hide the new
+    /// columns and fail every query that reads a value its narrower type
+    /// cannot hold. A replica commits nothing, so it adopts only a widening of
+    /// its live schema; any other change to the stored schema leaves it
+    /// refusing queries until it reopens the dataset. Called from
+    /// [`Self::confirm_head`], after the reload of the listing.
+    async fn adopt_committed_schema(&self) -> Result<()> {
+        let stored = self
+            .catalog
+            .get_table(&self.table_metadata.table_name)
+            .await
+            .map_err(|source| Error::Catalog { source })?;
+        let current = self.table_schema();
+        if stored.schema.as_ref() == current.as_ref() {
+            return Ok(());
+        }
+        let ctx = EvolutionContext {
+            constraint_columns: &self.table_metadata.primary_key,
+        };
+        let change = match classify(&current, &stored.schema, &ctx) {
+            SchemaEvolution::Identical => return Ok(()),
+            SchemaEvolution::Widening(plan) => plan.describe(),
+            SchemaEvolution::Incompatible { reason } => {
+                return Err(Error::Catalog {
+                    source: crate::catalog::CatalogError::InvalidOperationNoSource {
+                        message: crate::metastore::object_native::replica_schema_unservable_message(
+                            &self.table_metadata.table_name,
+                            &reason,
+                        ),
+                    },
+                });
+            }
+        };
+        let index_shapes = self
+            .lookup_index
+            .as_ref()
+            .map(|state| state.shapes_for(&stored.schema))
+            .transpose()
+            .map_err(|message| Error::InvalidConfiguration {
+                table: self.table_metadata.table_name.clone(),
+                message,
+            })?;
+        {
+            let _fence = self.listing_fence.write().await;
+            let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
+            // The cold manifest and the statistics are read again from the
+            // catalog at the new width by the reload that follows.
+            self.cold_manifest.store(Arc::new(None));
+            self.install_schema_under_held_fence(&stored.schema, index_shapes)
+                .await?;
+        }
+        tracing::info!(
+            target: "spiced::acceleration::cayenne",
+            "{}",
+            crate::metastore::object_native::replica_schema_adopted_message(
+                &self.table_metadata.table_name,
+                &change
+            )
+        );
         Ok(())
     }
 
@@ -12238,7 +12317,7 @@ impl CayenneTableProvider {
         // next mem-tier checkpoint delta taints a drifted one. A record that could
         // not be read is not trusted at all.
         let (table_statistics, table_statistics_count_exact) =
-            Self::load_table_statistics(&catalog, &table_metadata).await;
+            Self::load_table_statistics(&catalog, &table_metadata, &table_metadata.schema).await;
         // An empty `pk_column_indices` (no primary key) yields the legacy
         // insert-only behavior. Runtime configuration rejects no-PK MIN/MAX, and
         // direct callers remain bounded by the provider-level retained-index cap.
@@ -15259,21 +15338,24 @@ impl CayenneTableProvider {
     /// schema-evolution re-derivation, which likewise refuses to trust a count it
     /// cannot read. Only a genuinely absent record keeps the documented
     /// trusted-exact-once migration behaviour.
+    /// The table's persisted statistics, decoded at the width of `schema`: the
+    /// table's live schema, which a live evolution or a replica adopting the
+    /// writer's change can have widened since the table opened.
     async fn load_table_statistics(
         catalog: &Arc<dyn MetadataCatalog>,
         table_metadata: &TableMetadata,
+        schema: &arrow_schema::Schema,
     ) -> (Option<Statistics>, bool) {
         match Self::read_persisted_table_statistics(catalog, table_metadata).await {
             PersistedTableStatistics::Present(stats) => {
                 let num_rows_exact = stats.num_rows_exact;
-                let df_stats = Self::table_statistics_to_df(&table_metadata.schema, &stats)
-                    .or_else(|| {
-                        tracing::warn!(
-                            "Failed to deserialize table stats for {}",
-                            table_metadata.table_name
-                        );
-                        None
-                    });
+                let df_stats = Self::table_statistics_to_df(schema, &stats).or_else(|| {
+                    tracing::warn!(
+                        "Failed to deserialize table stats for {}",
+                        table_metadata.table_name
+                    );
+                    None
+                });
                 (df_stats, num_rows_exact)
             }
             PersistedTableStatistics::Absent => (None, true),
@@ -26464,7 +26546,16 @@ impl CayenneTableProvider {
             let mut maintenance_state = self.post_write_maintenance.state.lock();
             if let Some(stats) = stats {
                 if let Some(existing) = &maintenance_state.stats {
-                    existing.merge_from(&stats);
+                    // Bounds from different logical schemas cannot be merged.
+                    // Keep the stale accumulator so persistence rejects the whole
+                    // coalesced update and taints its outstanding row-count deltas.
+                    if existing.schema() == stats.schema() {
+                        existing.merge_from(&stats);
+                    } else if existing.schema() == self.table_schema().as_ref() {
+                        // An old-schema publisher can queue after a new one.
+                        // Its stale schema must invalidate this entire update too.
+                        maintenance_state.stats = Some(stats);
+                    }
                 } else {
                     maintenance_state.stats = Some(stats);
                 }
@@ -35352,7 +35443,14 @@ impl CayenneTableProvider {
             .await
             .map_err(|source| Error::Catalog { source })?;
         if self.loaded_revision.load(Ordering::Acquire) != revision {
+            // A capture must pair the committed schema, listing, deletion view
+            // and inline cache from one reload, including background confirmations.
+            let _structural_guard = self.structural_version.begin_mutation();
+            // Remote commits do not feed this instance's maintained aggregates.
+            // Base-table scans remain authoritative until they are rebuilt.
+            self.mark_maintained_aggregates_stale();
             self.reload_from_catalog().await?;
+            self.adopt_committed_schema().await?;
             self.reload_cached_statistics_and_inline_state().await?;
             self.loaded_revision.store(revision, Ordering::Release);
         }
@@ -35363,7 +35461,8 @@ impl CayenneTableProvider {
     /// catalog after another instance changed them.
     async fn reload_cached_statistics_and_inline_state(&self) -> Result<()> {
         let (statistics, count_exact) =
-            Self::load_table_statistics(&self.catalog, &self.table_metadata).await;
+            Self::load_table_statistics(&self.catalog, &self.table_metadata, &self.table_schema())
+                .await;
         {
             let mut cache = self.table_statistics.write();
             cache.optimizer_inexact = statistics
@@ -37408,8 +37507,11 @@ impl CayenneTableProvider {
         let entry_batches = self.adapt_inlined_batches_to_live_schema(entry_batches)?;
         // Pre-filter stats are a conservative superset: tombstone removal can only
         // shrink row ranges, never widen min/max.
+        let schema = entry_batches
+            .first()
+            .map_or_else(|| self.table_schema(), RecordBatch::schema);
         let statistics = Arc::new(super::file_pruning::statistics_from_record_batches(
-            &self.table_metadata.schema,
+            &schema,
             &entry_batches,
         ));
         let mut filtered_batches = Vec::with_capacity(entry_batches.len());
@@ -38434,6 +38536,9 @@ impl CayenneTableProvider {
                 // A strict query reuses no view built before it arrived, so
                 // only the read of the head and the reload are done ahead of it.
                 let _reload_guard = provider.write_lock.lock().await;
+                // Match the query/rewrite lock order and keep captures out while
+                // the reload awaits I/O under the structural mutation guard.
+                let _build_permit = provider.scan_view_cache.build_lock.lock().await;
                 provider
                     .confirm_head()
                     .await
@@ -38971,7 +39076,13 @@ impl CayenneTableProvider {
         } else {
             None
         };
-        self.pruned_inlined_batches_with_removal(view, removal.as_ref(), None, pruning_predicate)
+        self.pruned_inlined_batches_with_removal(
+            view,
+            removal.as_ref(),
+            None,
+            pruning_predicate,
+            &self.table_schema(),
+        )
     }
 
     /// `pruned_inlined_batches` over a PRECOMPUTED removal map — the scan path
@@ -38989,15 +39100,15 @@ impl CayenneTableProvider {
         removal: Option<&InlinedDeletionMaps>,
         captured: Option<&PkDeletionSnapshot>,
         pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
+        schema: &SchemaRef,
     ) -> Result<Vec<RecordBatch>> {
         if view.is_empty() {
             return Ok(Vec::new());
         }
 
-        let schema = Arc::clone(&self.table_metadata.schema);
         let may_match = pruning_predicate.map(|predicate| {
             let stats: Vec<&Arc<Statistics>> = view.iter().map(|entry| &entry.statistics).collect();
-            super::file_pruning::statistics_may_match(&stats, &schema, predicate)
+            super::file_pruning::statistics_may_match(&stats, schema, predicate)
         });
 
         let mut batches = Vec::new();
@@ -42246,15 +42357,15 @@ impl CayenneTableProvider {
         pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
         target_partitions: usize,
         read_schema: &SchemaRef,
+        statistics_schema: &SchemaRef,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
         if segments.is_empty() {
             return Ok(None);
         }
-        let schema = Arc::clone(&self.table_metadata.schema);
         let may_match = pruning_predicate.map(|predicate| {
             let stats: Vec<&Arc<Statistics>> =
                 segments.iter().map(|segment| &segment.statistics).collect();
-            super::file_pruning::statistics_may_match(&stats, &schema, predicate)
+            super::file_pruning::statistics_may_match(&stats, statistics_schema, predicate)
         });
         let mut visible_batches: Vec<RecordBatch> = Vec::new();
         for (index, segment) in segments.iter().enumerate() {
@@ -46772,6 +46883,39 @@ impl CayenneTableProvider {
     }
 }
 
+/// A scan built after its table took up a wider schema, projected back to the
+/// schema the query was planned against: each planned column by name, cast to
+/// its planned type. A value the planned type cannot hold fails the query
+/// rather than become NULL or wrap.
+fn conform_scan_to_planned_schema(
+    plan: Arc<dyn ExecutionPlan>,
+    planned: &SchemaRef,
+) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+    let input = plan.schema();
+    let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+        Vec::with_capacity(planned.fields().len());
+    for field in planned.fields() {
+        let (index, built) = input.column_with_name(field.name()).ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "column '{}' of the planned schema is not in the scan",
+                field.name()
+            ))
+        })?;
+        let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new(field.name(), index));
+        let expr = if built.data_type() == field.data_type() {
+            column
+        } else {
+            Arc::new(datafusion_physical_expr::expressions::CastExpr::new(
+                column,
+                field.data_type().clone(),
+                None,
+            ))
+        };
+        exprs.push((expr, field.name().clone()));
+    }
+    Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
+}
+
 /// Map a stored Arrow schema's `Utf8` columns to `Utf8View` for the read/query
 /// path. ONLY `Utf8` is mapped:
 /// - `LargeUtf8`/`LargeBinary` already use i64 offsets (no 2 GiB overflow), so
@@ -47481,13 +47625,9 @@ impl CayenneTableProvider {
         }
 
         let mem_tier_pruning_predicate = super::file_pruning::build_listing_pruning_predicate(
-            // Live (possibly widened) schema, NOT the construction-time
-            // `table_metadata.schema`: a query filter on a column added by live
-            // `evolve_schema_live` must resolve against the evolved schema here,
-            // or the pruning-predicate build fails with `FieldNotFound`. (On a
-            // restart `table_metadata.schema` already equals the evolved schema,
-            // so this only bit the live-swap path.)
-            &self.table_schema(),
+            // Predicate columns and column-indexed statistics must use the
+            // same captured schema, including columns added by live evolution.
+            &file_statistics_schema,
             &mem_tier_pruning_filters,
         )?;
         let inlined_batches = self
@@ -47496,6 +47636,7 @@ impl CayenneTableProvider {
                 mem_tier_removal,
                 Some(&captured_deletions),
                 mem_tier_pruning_predicate.as_ref(),
+                &file_statistics_schema,
             )
             .map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(
@@ -47777,6 +47918,7 @@ impl CayenneTableProvider {
                 // One partition for a selective scan — see the inline branch.
                 memory_branch_partitions,
                 &read_schema,
+                &file_statistics_schema,
             )?
             .map(|mem_exec| self.wrap_memory_branch_with_scan_filters(mem_exec, filters));
         if lookup_index_explain.is_none() {
@@ -47912,6 +48054,10 @@ impl TableProvider for CayenneTableProvider {
                 .map_err(|error| DataFusionError::External(Box::new(error)))?;
         }
         let (reuse, confirm_head) = self.prepare_scan(state, filters).await?;
+        // The schema this query was planned against. A replica that confirms
+        // the head may take up a wider schema the writer committed before the
+        // scan is built (see `adopt_committed_schema`).
+        let planned_schema = self.read_schema();
         // Obtain the scan-view bundle from the demand cache. See
         // [`Self::scan_view_at_current_input`]. The KDI merge + visible mem-tier
         // segments are computed OFF the query path (in `spawn_blocking`) and
@@ -47929,6 +48075,7 @@ impl TableProvider for CayenneTableProvider {
                 .store(scan_view_instant_as_ns(Instant::now()), Ordering::Relaxed);
         }
         let scan_view = self.scan_view_confirming_head(reuse, confirm_head).await?;
+        let captured_schema = Arc::clone(&scan_view.raw.read_schema);
         #[cfg(test)]
         {
             let hook = self.test_post_scan_view_selection_hook.lock().take();
@@ -47936,15 +48083,24 @@ impl TableProvider for CayenneTableProvider {
                 hook().await;
             }
         }
-        self.plan_scan_from_view(
-            state,
-            projection,
-            filters,
-            limit,
-            scan_view,
-            TombstonePushdown::Apply,
-        )
-        .await
+        let plan = self
+            .plan_scan_from_view(
+                state,
+                projection,
+                filters,
+                limit,
+                scan_view,
+                TombstonePushdown::Apply,
+            )
+            .await?;
+        if captured_schema.as_ref() == planned_schema.as_ref() {
+            return Ok(plan);
+        }
+        let planned = match projection {
+            Some(indices) => Arc::new(planned_schema.project(indices)?),
+            None => planned_schema,
+        };
+        conform_scan_to_planned_schema(plan, &planned)
     }
 
     // Filter-pushdown exactness contract (read before changing the arms below):

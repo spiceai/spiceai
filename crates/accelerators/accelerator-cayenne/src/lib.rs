@@ -3818,6 +3818,21 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
 
 #[async_trait]
 impl DataAccelerator for CayenneAccelerator {
+    async fn stored_data_is_shared(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if !source.is_file_accelerated() {
+            return Ok(false);
+        }
+        let catalog = self.catalog_for_source(source).await?;
+        match catalog.get_table(&source.name().to_string()).await {
+            Ok(stored) => Ok(data_in_state_location(catalog.as_ref(), &stored.path)),
+            Err(cayenne::CatalogError::TableNotFound { .. }) => Ok(false),
+            Err(error) => Err(Box::new(error)),
+        }
+    }
+
     async fn writer_role(
         &self,
         source: &dyn AccelerationSource,
