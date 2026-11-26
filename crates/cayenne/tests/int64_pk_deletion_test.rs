@@ -38,10 +38,7 @@ use arrow::array::{Int64Array, RecordBatch, StringArray};
 
 use arrow::datatypes::{DataType, Field, Schema};
 
-use cayenne::{
-    CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog,
-    metadata::CreateTableOptions,
-};
+use cayenne::{CayenneTableProvider, MetadataCatalog, metadata::CreateTableOptions};
 
 use common::TestFixture;
 
@@ -78,7 +75,7 @@ async fn setup_int64_pk_table(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: None, // Int64 PK strategy
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -87,7 +84,10 @@ async fn setup_int64_pk_table(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
@@ -218,7 +218,7 @@ async fn test_int64_pk_delete_all_empty_filter_impl(fixture: TestFixture) -> Tes
     );
     Ok(())
 }
-test_with_backends!(test_int64_pk_delete_all_empty_filter_impl);
+test_on_data_store!(test_int64_pk_delete_all_empty_filter_impl);
 
 /// A delete-all larger than `PK_DELETE_FLUSH_BATCH_SIZE` (`50_000`) spans multiple
 /// deletion-vector flush chunks in one logical delete. Every chunk's vector file
@@ -237,7 +237,7 @@ async fn test_int64_pk_delete_all_multichunk_atomic_impl(fixture: TestFixture) -
     assert_eq!(get_row_count(&ctx, "int64_delete_multichunk").await?, 0);
     Ok(())
 }
-test_with_backends!(test_int64_pk_delete_all_multichunk_atomic_impl);
+test_on_data_store!(test_int64_pk_delete_all_multichunk_atomic_impl);
 
 // =============================================================================
 // Edge Case 1: Empty deletion set (no matching rows)
@@ -267,7 +267,7 @@ async fn test_int64_pk_delete_no_matches_impl(fixture: TestFixture) -> TestResul
     Ok(())
 }
 
-test_with_backends!(test_int64_pk_delete_no_matches_impl);
+test_on_data_store!(test_int64_pk_delete_no_matches_impl);
 
 // =============================================================================
 // User-visible `DELETE ... WHERE id IN (...)` reports the exact number of live
@@ -313,7 +313,7 @@ async fn test_int64_pk_delete_in_list_reports_exact_count_impl(
     Ok(())
 }
 
-test_with_backends!(test_int64_pk_delete_in_list_reports_exact_count_impl);
+test_on_data_store!(test_int64_pk_delete_in_list_reports_exact_count_impl);
 
 /// The durable CDC delete path (`CayenneTableProvider::delete_from_cdc_fast`)
 /// must stay on the count-skipping `pk IN (...)` fast path, not the scan-to-count
@@ -355,7 +355,7 @@ async fn test_int64_pk_cdc_fast_delete_keeps_fast_path_impl(
     Ok(())
 }
 
-test_with_backends!(test_int64_pk_cdc_fast_delete_keeps_fast_path_impl);
+test_on_data_store!(test_int64_pk_cdc_fast_delete_keeps_fast_path_impl);
 
 // =============================================================================
 // Edge Case 2: Delete all rows
@@ -400,7 +400,7 @@ async fn test_int64_pk_delete_all_rows_impl(fixture: TestFixture) -> TestResult<
     Ok(())
 }
 
-test_with_backends!(test_int64_pk_delete_all_rows_impl);
+test_on_data_store!(test_int64_pk_delete_all_rows_impl);
 
 // =============================================================================
 // Edge Case 3: Idempotent deletion
@@ -433,7 +433,7 @@ async fn test_int64_pk_idempotent_delete_impl(fixture: TestFixture) -> TestResul
     Ok(())
 }
 
-test_with_backends!(test_int64_pk_idempotent_delete_impl);
+test_on_data_store!(test_int64_pk_idempotent_delete_impl);
 
 // =============================================================================
 // Edge Case 4: Sequential deletes
@@ -471,7 +471,7 @@ async fn test_int64_pk_sequential_deletes_impl(fixture: TestFixture) -> TestResu
     Ok(())
 }
 
-test_with_backends!(test_int64_pk_sequential_deletes_impl);
+test_on_data_store!(test_int64_pk_sequential_deletes_impl);
 
 // =============================================================================
 // Edge Case 5: Projection without PK column
@@ -517,7 +517,7 @@ async fn test_int64_pk_projection_after_delete_impl(fixture: TestFixture) -> Tes
     Ok(())
 }
 
-test_with_backends!(test_int64_pk_projection_after_delete_impl);
+test_on_data_store!(test_int64_pk_projection_after_delete_impl);
 
 // =============================================================================
 // Edge Case 6: Multi-file deletion
@@ -560,7 +560,7 @@ async fn test_int64_pk_multi_file_deletion_impl(fixture: TestFixture) -> TestRes
     Ok(())
 }
 
-test_with_backends!(test_int64_pk_multi_file_deletion_impl);
+test_on_data_store!(test_int64_pk_multi_file_deletion_impl);
 
 // =============================================================================
 // Edge Case 7: Boundary values
@@ -594,7 +594,7 @@ async fn test_int64_pk_boundary_values_impl(fixture: TestFixture) -> TestResult<
     Ok(())
 }
 
-test_with_backends!(test_int64_pk_boundary_values_impl);
+test_on_data_store!(test_int64_pk_boundary_values_impl);
 
 // =============================================================================
 // Edge Case 8: Delete from empty table
@@ -613,7 +613,7 @@ async fn test_int64_pk_delete_from_empty_impl(fixture: TestFixture) -> TestResul
     Ok(())
 }
 
-test_with_backends!(test_int64_pk_delete_from_empty_impl);
+test_on_data_store!(test_int64_pk_delete_from_empty_impl);
 
 // =============================================================================
 // Edge Case 9: Persistence after full delete
@@ -629,7 +629,7 @@ async fn test_int64_pk_persistence_after_full_delete_impl(fixture: TestFixture) 
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -638,7 +638,10 @@ async fn test_int64_pk_persistence_after_full_delete_impl(fixture: TestFixture) 
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
 
     let batch = RecordBatch::try_new(
@@ -661,8 +664,9 @@ async fn test_int64_pk_persistence_after_full_delete_impl(fixture: TestFixture) 
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table2 = Arc::new(
-        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-            .open(table_name)
+        fixture
+            .data_store
+            .open(catalog, ctx.runtime_env(), table_name)
             .await?,
     );
 
@@ -674,7 +678,7 @@ async fn test_int64_pk_persistence_after_full_delete_impl(fixture: TestFixture) 
     Ok(())
 }
 
-test_with_backends!(test_int64_pk_persistence_after_full_delete_impl);
+test_on_data_store!(test_int64_pk_persistence_after_full_delete_impl);
 
 // =============================================================================
 // Edge Case 10: Complex filter conditions
@@ -715,7 +719,7 @@ async fn test_int64_pk_complex_filter_impl(fixture: TestFixture) -> TestResult<(
     Ok(())
 }
 
-test_with_backends!(test_int64_pk_complex_filter_impl);
+test_on_data_store!(test_int64_pk_complex_filter_impl);
 
 // =============================================================================
 // Edge Case 11: Stress test with interleaved inserts/deletes
@@ -772,7 +776,7 @@ async fn test_int64_pk_stress_interleaved_impl(fixture: TestFixture) -> TestResu
     Ok(())
 }
 
-test_with_backends!(test_int64_pk_stress_interleaved_impl);
+test_on_data_store!(test_int64_pk_stress_interleaved_impl);
 
 // =============================================================================
 // Edge Case 12: Partial batch deletion
@@ -809,7 +813,7 @@ async fn test_int64_pk_partial_batch_impl(fixture: TestFixture) -> TestResult<()
     Ok(())
 }
 
-test_with_backends!(test_int64_pk_partial_batch_impl);
+test_on_data_store!(test_int64_pk_partial_batch_impl);
 
 // =============================================================================
 // Edge Case 13: Insert after delete (reusing PKs) - UPSERT BEHAVIOR
@@ -894,4 +898,4 @@ async fn test_int64_pk_insert_after_delete_same_pk_impl(fixture: TestFixture) ->
     Ok(())
 }
 
-test_with_backends!(test_int64_pk_insert_after_delete_same_pk_impl);
+test_on_data_store!(test_int64_pk_insert_after_delete_same_pk_impl);

@@ -1,4 +1,6 @@
 name: openai-static-key
+duration: 4s
+requires-env: [SPICE_OPENAI_API_KEY]
 description: >
   An OpenAI model and embedding authenticate with a static `openai_api_key`
   read through `${secrets:…}`: a chat completion answers and an embedding has

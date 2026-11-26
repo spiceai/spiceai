@@ -1,4 +1,5 @@
 name: mysql-join-capabilities
+duration: 22s
 tags: [long]
 description: Full joins stay local for MySQL while supported joins still federate.
 sources:

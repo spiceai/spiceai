@@ -1,4 +1,5 @@
 name: on-zero-results
+duration: 43s
 tags: [long]
 description: >
   Subqueries over accelerations with on_zero_results answer as the source

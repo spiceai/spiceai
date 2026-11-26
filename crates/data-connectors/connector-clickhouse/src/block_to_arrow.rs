@@ -521,7 +521,7 @@ mod tests {
     /// `DateColumnData<u16>`, and the only thing that produces the 32-bit one is
     /// `column::factory`'s `"Date32"` wire-type arm, reached from `Block::load`,
     /// which is `pub(crate)`. That half of the patch is guarded end-to-end instead,
-    /// by the `Date32` column in `test/scripts/setup-data-clickhouse.sql` — losing
+    /// by the `Date32` column in `test/spicescript/clickhouse-literals.yaml` — losing
     /// it leaves the wire type unrecognised and fails the whole `SELECT`.
     #[test]
     fn a_date32_value_decodes_the_dates_a_date_column_cannot_hold() {

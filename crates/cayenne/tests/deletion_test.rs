@@ -28,7 +28,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 
 use cayenne::metadata::CreateTableOptions;
 
-use cayenne::{CayenneTableProvider, MetadataCatalog};
+use cayenne::MetadataCatalog;
 
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
@@ -38,20 +38,17 @@ use datafusion_physical_plan::collect;
 use std::sync::Arc;
 
 // Generate test variants for each backend
-test_with_backends!(test_delete_with_primary_key_impl);
-test_with_backends!(test_delete_without_primary_key_impl);
-test_with_backends!(test_delete_all_rows_impl);
-test_with_backends!(test_delete_then_insert_impl);
-test_with_backends!(test_delete_with_complex_filter_impl);
+test_on_data_store!(test_delete_with_primary_key_impl);
+test_on_data_store!(test_delete_without_primary_key_impl);
+test_on_data_store!(test_delete_all_rows_impl);
+test_on_data_store!(test_delete_then_insert_impl);
+test_on_data_store!(test_delete_with_complex_filter_impl);
 
 async fn test_delete_with_primary_key_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let backend_name = fixture.backend_type.name();
     println!("\n🧪 Testing DELETE with primary key using {backend_name}...");
-
-    // 1. Setup test environment
-    let data_path = fixture.data_path;
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -64,15 +61,17 @@ async fn test_delete_with_primary_key_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: None,
-        base_path: data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("test_delete_pk"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
     println!("✓ Table created with primary key on 'id'");
 
@@ -187,11 +186,6 @@ async fn test_delete_without_primary_key_impl(
     let backend_name = fixture.backend_type.name();
     println!("\n🧪 Testing DELETE without primary key using {backend_name}...");
 
-    // 1. Setup test environment
-    let temp_dir = &fixture.temp_dir;
-    let data_path = temp_dir.path().join("data");
-    std::fs::create_dir_all(&data_path)?;
-
     // 2. Create catalog and table WITHOUT primary key
 
     let schema = Arc::new(Schema::new(vec![
@@ -205,15 +199,17 @@ async fn test_delete_without_primary_key_impl(
         schema: Arc::clone(&schema),
         primary_key: vec![], // NO primary key
         on_conflict: None,
-        base_path: data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("test_delete_no_pk"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
     println!("✓ Table created WITHOUT primary key");
 
@@ -290,11 +286,6 @@ async fn test_delete_all_rows_impl(
     let backend_name = fixture.backend_type.name();
     println!("\n🧪 Testing DELETE all rows using {backend_name}...");
 
-    // 1. Setup test environment
-    let temp_dir = &fixture.temp_dir;
-    let data_path = temp_dir.path().join("data");
-    std::fs::create_dir_all(&data_path)?;
-
     // 2. Create catalog and table
 
     let schema = Arc::new(Schema::new(vec![
@@ -307,15 +298,17 @@ async fn test_delete_all_rows_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: None,
-        base_path: data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("test_table"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
 
     // 3. Register with DataFusion
@@ -368,11 +361,6 @@ async fn test_delete_then_insert_impl(
     let backend_name = fixture.backend_type.name();
     println!("\n🧪 Testing DELETE followed by INSERT using {backend_name}...");
 
-    // 1. Setup test environment
-    let temp_dir = &fixture.temp_dir;
-    let data_path = temp_dir.path().join("data");
-    std::fs::create_dir_all(&data_path)?;
-
     // 2. Create catalog and table
 
     let schema = Arc::new(Schema::new(vec![
@@ -385,15 +373,17 @@ async fn test_delete_then_insert_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: None,
-        base_path: data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("test_delete_insert"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
 
     // 3. Register with DataFusion
@@ -473,11 +463,6 @@ async fn test_delete_with_complex_filter_impl(
     let backend_name = fixture.backend_type.name();
     println!("\n🧪 Testing DELETE with complex filter using {backend_name}...");
 
-    // 1. Setup test environment
-    let temp_dir = &fixture.temp_dir;
-    let data_path = temp_dir.path().join("data");
-    std::fs::create_dir_all(&data_path)?;
-
     // 2. Create catalog and table
 
     let schema = Arc::new(Schema::new(vec![
@@ -492,15 +477,17 @@ async fn test_delete_with_complex_filter_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: None,
-        base_path: data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("test_delete_complex"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     let table = Arc::new(table);
 
     // 3. Register with DataFusion

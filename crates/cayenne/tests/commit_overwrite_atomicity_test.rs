@@ -136,7 +136,7 @@ async fn plant_full_pre_overwrite_state(
 
     // 3. cayenne_snapshot_sequence row.
     catalog
-        .set_snapshot_sequence(table_id, snapshot_id, 17)
+        .set_snapshot_sequence(table_id, snapshot_id, 17, None)
         .await
         .expect("set_snapshot_sequence");
 

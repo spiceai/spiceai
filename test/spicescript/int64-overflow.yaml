@@ -1,4 +1,5 @@
 name: int64-overflow
+duration: 1s
 description: Signed BIGINT arithmetic must reject overflow rather than returning wrapped values.
 spicepod:
   version: v1

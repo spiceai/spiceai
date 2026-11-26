@@ -1,4 +1,5 @@
 name: http-response-limits
+duration: 129s
 description: >
   A response an HTTP API returns is held to the query memory limit, by its
   size once decompressed. An HTTP dataset whose response is larger than
