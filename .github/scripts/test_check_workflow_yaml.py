@@ -1973,6 +1973,14 @@ class CheckHashedPythonInstallsTest(unittest.TestCase):
         self.assertEqual(len(self.problems("pip install --require-hashes -r a.txt && pip3 install b", job)), 1)
         self.assertEqual(len(self.problems("pip install \\\n            b", job)), 1)
         self.assertEqual(self.problems("# pip install b", job), [])
+        for run in ("pip -q install b", "python -m pip --disable-pip-version-check install b",
+                    "pip3.12 install b", "pip install b  # --require-hashes",
+                    "pip install --index-url=https://x/--require-hashes b"):
+            with self.subTest(run=run):
+                self.assertEqual(len(self.problems(run, job)), 1, run)
+        self.assertEqual(
+            len(self.problems("pip install b", "    permissions: read-all\n    env:\n      K: ${{ secrets.API_KEY }}\n")), 1
+        )
 
     def test_a_hashed_install_or_a_read_only_job_is_accepted(self):
         self.assertEqual(

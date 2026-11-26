@@ -508,7 +508,9 @@ def check_share_off_trunk(jobs: dict) -> list[str]:
     return problems
 
 
-PIP_INSTALL = re.compile(r"(?<![\w-])(?:pip3?|pip3\.\d+)\s+install\b")
+# `pip`, `pip3`, `pip3.12` or `-m pip`, then any options before the `install` subcommand.
+PIP_INSTALL = re.compile(r"(?<![\w-])pip(?:3(?:\.\d+)?)?(?:\s+-[\w-]+(?:=\S+)?)*\s+install\b")
+REQUIRE_HASHES = re.compile(r"(?:^|\s)--require-hashes(?:\s|$)")
 SECRET_OTHER_THAN_TOKEN = re.compile(r"\bsecrets\s*(?:\.\s*(?!GITHUB_TOKEN\b)[A-Za-z_]|\[)")
 
 
@@ -517,8 +519,10 @@ def _pip_installs_without_hashes(script: str) -> list[str]:
     text = re.sub(r"^[ \t]*#[^\n]*\n", "", script, flags=re.M).replace("\\\n", " ")
     found = []
     for line in text.splitlines():
+        # A comment after the command says nothing about what pip is told.
+        line = re.sub(r"(?:^|\s)#.*$", "", line)
         for command in re.split(r"&&|\|\||;|\|", line):
-            if PIP_INSTALL.search(command) and "--require-hashes" not in command:
+            if PIP_INSTALL.search(command) and not REQUIRE_HASHES.search(command):
                 found.append(command.strip())
     return found
 
@@ -530,16 +534,18 @@ def _job_credentials(job: dict) -> str | None:
         environment = environment.get("name")
     if environment is not None and str(environment) != "secret-free":
         return f"runs in the `{environment}` environment"
+    if SECRET_OTHER_THAN_TOKEN.search(json.dumps(job, default=str)):
+        return "reads a secret"
     permissions = job.get("permissions")
-    if permissions in ("write-all", "read-all"):
-        return None if permissions == "read-all" else "has `permissions: write-all`"
+    if permissions == "write-all":
+        return "has `permissions: write-all`"
+    if permissions == "read-all":
+        return None
     if not isinstance(permissions, dict):
         return "has no job-level `permissions:`, so it gets the workflow's"
     for scope, level in permissions.items():
         if str(level) == "write":
             return f"has `{scope}: write`"
-    if SECRET_OTHER_THAN_TOKEN.search(json.dumps(job, default=str)):
-        return "reads a secret"
     return None
 
 
