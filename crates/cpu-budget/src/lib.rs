@@ -1407,6 +1407,16 @@ impl CpuBudget {
         if threads < 2 { 2 } else { threads }
     }
 
+    /// PostgreSQL initial-snapshot connections: one per `pages_per_reader`
+    /// heap pages (rounded up), bounded by the CPU entitlement and eight source
+    /// connections. Small or unanalyzed relations use one connection.
+    #[must_use]
+    pub fn postgres_snapshot_readers(&self, pages: u32, pages_per_reader: u32) -> usize {
+        let readers =
+            usize::try_from(pages.div_ceil(pages_per_reader.max(1))).unwrap_or(usize::MAX);
+        readers.clamp(1, 8).min(self.cores)
+    }
+
     // ---- query engine ----
 
     /// `DataFusion`'s local query fan-out when `runtime.query.target_partitions`

@@ -100,8 +100,6 @@ pub mod snowflake;
 #[cfg(feature = "spark_connect")]
 pub mod spark_connect;
 pub mod spice_cloud;
-#[cfg(feature = "sqlite")]
-pub mod sqlite;
 pub mod unity_catalog;
 
 pub mod catalog_filter;

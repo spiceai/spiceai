@@ -175,16 +175,6 @@
       "group": "append-and-retention"
     }
   ],
-  "append-upsert-same-time": [
-    {
-      "run": "append-upsert-same-time",
-      "who": "sqlite",
-      "key": "query: SELECT id, ts, v FROM events ORDER BY id #3",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"new\\\"\", actual: \"\\\"old\\\"\" }",
-      "group": "append-and-retention"
-    }
-  ],
   "retention-epoch-formats": [
     {
       "run": "retention-epoch-formats[format=unix_seconds]",

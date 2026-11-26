@@ -811,6 +811,7 @@ pub struct ChangeEnvelope {
     change_batch: LazyChangeBatch,
     is_dataset_ready: bool,
     history_unavailable: bool,
+    snapshot_rows: bool,
 }
 
 impl ChangeEnvelope {
@@ -825,6 +826,7 @@ impl ChangeEnvelope {
             change_batch: LazyChangeBatch::ready(change_batch),
             is_dataset_ready,
             history_unavailable: false,
+            snapshot_rows: false,
         }
     }
 
@@ -847,6 +849,7 @@ impl ChangeEnvelope {
             change_batch: LazyChangeBatch::from_rows(rows),
             is_dataset_ready,
             history_unavailable: false,
+            snapshot_rows: false,
         }
     }
 
@@ -916,7 +919,7 @@ impl ChangeEnvelope {
     }
 
     /// Separate source acknowledgement and control from row storage without
-    /// decoding. The source retains the committer and both control flags.
+    /// decoding. The source retains the committer and all control flags.
     #[must_use]
     pub fn into_lazy_parts(self) -> LazyChangeEnvelopeParts {
         (
@@ -924,6 +927,7 @@ impl ChangeEnvelope {
             self.change_batch,
             self.is_dataset_ready,
             self.history_unavailable,
+            self.snapshot_rows,
         )
     }
 
@@ -940,6 +944,7 @@ impl ChangeEnvelope {
             batch,
             self.is_dataset_ready,
             self.history_unavailable,
+            self.snapshot_rows,
         ))
     }
 
@@ -973,13 +978,31 @@ impl ChangeEnvelope {
         change_batch: ChangeBatch,
         is_dataset_ready: bool,
         history_unavailable: bool,
+        snapshot_rows: bool,
     ) -> Self {
         Self {
             change_committer,
             change_batch: LazyChangeBatch::ready(change_batch),
             is_dataset_ready,
             history_unavailable,
+            snapshot_rows,
         }
+    }
+
+    /// Mark rows from a consistent snapshot of a table with a primary key.
+    /// Every operation must be an insert, keys must be distinct across the whole
+    /// snapshot, and the committer must acknowledge no source position. The
+    /// source publishes its position in a separate, unmarked boundary envelope.
+    #[must_use]
+    pub fn with_snapshot_rows(mut self) -> Self {
+        self.snapshot_rows = true;
+        self
+    }
+
+    /// Whether these rows satisfy the snapshot contract in [`Self::with_snapshot_rows`].
+    #[must_use]
+    pub fn is_snapshot_rows(&self) -> bool {
+        self.snapshot_rows
     }
 
     /// Whether the accelerator must be rebuilt from the source before this
@@ -1044,19 +1067,26 @@ impl ChangeEnvelope {
 }
 
 /// The parts of a consumed [`ChangeEnvelope`]: committer, built change batch,
-/// dataset-ready flag, and rebuild-required flag.
+/// dataset-ready flag, rebuild-required flag, and snapshot-rows flag.
 ///
 /// Every field is carried explicitly rather than defaulted on reconstruction:
 /// a consumer that decomposes an envelope and rebuilds it (indexing, embedding,
 /// full-text wrapping) must forward the flags, and dropping one is a silent
 /// correctness bug rather than a compile error if the tuple hides it. See
 /// [`ChangeEnvelope::history_unavailable`].
-pub type ChangeEnvelopeParts = (Box<dyn CommitChange + Send + Sync>, ChangeBatch, bool, bool);
+pub type ChangeEnvelopeParts = (
+    Box<dyn CommitChange + Send + Sync>,
+    ChangeBatch,
+    bool,
+    bool,
+    bool,
+);
 
-/// Source acknowledgement, lazy row payload, readiness, and rebuild control.
+/// Source acknowledgement, lazy rows, readiness, rebuild, and snapshot controls.
 pub type LazyChangeEnvelopeParts = (
     Box<dyn CommitChange + Send + Sync>,
     LazyChangeBatch,
+    bool,
     bool,
     bool,
 );
@@ -1351,19 +1381,20 @@ pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope,
 /// happened, so the next start finds the same unusable position and re-reads the
 /// whole table again — on every restart of a dataset whose source is quiet. A
 /// source with a position to record should build the envelope itself around its
-/// own committer (`ChangeEnvelope::from_parts(committer, batch, false, true)`),
+/// own committer (`ChangeEnvelope::from_parts(committer, batch, false, true, false)`),
 /// which also keeps it out of the consumer's zero-row heartbeat stripping. Use
 /// this only when there is genuinely no position to persist.
 pub fn build_history_unavailable_envelope(
     schema: &SchemaRef,
 ) -> Result<ChangeEnvelope, ChangeBatchError> {
-    let (committer, batch, is_dataset_ready, _) =
+    let (committer, batch, is_dataset_ready, _, _) =
         build_heartbeat_envelope(schema, None, false)?.into_parts()?;
     Ok(ChangeEnvelope::from_parts(
         committer,
         batch,
         is_dataset_ready,
         true,
+        false,
     ))
 }
 
@@ -2705,7 +2736,7 @@ mod deferred_tests {
             },
             true,
         );
-        let (_committer, batch, ready, _) = env.into_parts().expect("into_parts builds ok");
+        let (_committer, batch, ready, _, _) = env.into_parts().expect("into_parts builds ok");
         assert_eq!(batch.record.num_rows(), 1);
         assert!(ready);
         assert_eq!(builds.load(Ordering::SeqCst), 1);
@@ -2778,7 +2809,7 @@ mod deferred_tests {
         assert_eq!(
             parts
                 .iter()
-                .map(|(_, batch, _, _)| batch.record.num_rows())
+                .map(|(_, batch, _, _, _)| batch.record.num_rows())
                 .collect::<Vec<_>>(),
             vec![1, 2, 3],
             "burst order must be preserved — committers pair with their batches"
@@ -2803,7 +2834,7 @@ mod deferred_tests {
         assert_eq!(
             parts
                 .iter()
-                .map(|(_, batch, ready, _)| (batch.record.num_rows(), *ready))
+                .map(|(_, batch, ready, _, _)| (batch.record.num_rows(), *ready))
                 .collect::<Vec<_>>(),
             vec![(2, false), (4, true)]
         );
@@ -2906,7 +2937,7 @@ mod deferred_tests {
         assert_eq!(
             parts
                 .iter()
-                .map(|(_, batch, _, _)| batch.record.num_rows())
+                .map(|(_, batch, _, _, _)| batch.record.num_rows())
                 .collect::<Vec<_>>(),
             vec![1, 2, 3],
             "group order must be preserved — committers pair with their batches"
@@ -3326,7 +3357,7 @@ mod deferred_tests {
         // snapshot-boundary pattern) must NOT be treated as a heartbeat: its
         // commit persists source progress and needs durability-then-commit
         // ordering.
-        let (_, boundary_batch, _, _) = build_heartbeat_envelope(&schema, None, false)
+        let (_, boundary_batch, _, _, _) = build_heartbeat_envelope(&schema, None, false)
             .expect("boundary batch builds")
             .into_parts()
             .expect("already built");

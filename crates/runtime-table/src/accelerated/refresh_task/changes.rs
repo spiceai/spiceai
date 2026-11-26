@@ -15,6 +15,7 @@ limitations under the License.
 */
 mod ingress;
 mod policy;
+mod snapshot;
 
 use super::DatasetMetricLabels;
 use super::RefreshTask;
@@ -1587,12 +1588,12 @@ impl RefreshTask {
         if history_unavailable {
             let listing_rebuild = parts
                 .iter()
-                .any(|(_, batch, _, _)| batch.rebuild_from_this_batch());
+                .any(|(_, batch, _, _, _)| batch.rebuild_from_this_batch());
             if listing_rebuild {
                 let rebuild_batches: Vec<RecordBatch> = parts
                     .iter()
-                    .filter(|(_, batch, _, _)| batch.rebuild_from_this_batch())
-                    .map(|(_, batch, _, _)| batch.data_batch())
+                    .filter(|(_, batch, _, _, _)| batch.rebuild_from_this_batch())
+                    .map(|(_, batch, _, _, _)| batch.data_batch())
                     .collect();
                 let schema = rebuild_batches
                     .first()
@@ -1615,7 +1616,7 @@ impl RefreshTask {
         let mut rebuild_committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>> = Vec::new();
         let mut committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>> = Vec::new();
         let mut batches: Vec<ChangeBatch> = Vec::new();
-        for (committer, batch, _is_ready, _history_unavailable) in parts {
+        for (committer, batch, _is_ready, _history_unavailable, _snapshot_rows) in parts {
             if batch.rebuild_from_this_batch() {
                 rebuild_committers.push(committer);
             } else {
@@ -6806,6 +6807,7 @@ mod tests {
                 .with_rebuild_from_this_batch(true),
             false,
             true,
+            false,
         );
         assert!(
             task.apply_envelope_run(&mut context, vec![signal]).await,
@@ -6910,6 +6912,7 @@ mod tests {
                 .with_rebuild_from_this_batch(true),
             false,
             true,
+            false,
         );
         assert!(
             task.apply_envelope_run(&mut context, vec![signal]).await,
@@ -7084,6 +7087,7 @@ mod tests {
                 .with_rebuild_from_this_batch(true),
             true,
             true,
+            false,
         );
         let apply = task.apply_envelope_run(&mut context, vec![reload]);
         tokio::pin!(apply);
@@ -7193,6 +7197,7 @@ mod tests {
                 .with_rebuild_from_this_batch(true),
             false,
             true,
+            false,
         );
         let later = make_tracked_envelope(2, Arc::clone(&log), false);
 
