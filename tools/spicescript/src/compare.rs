@@ -566,30 +566,6 @@ pub async fn compare_async(
     expected: &[RecordBatch],
     expect_empty: bool,
 ) -> Result<Option<String>> {
-    compare_off_runtime(compare, name, sql, actual, expected, expect_empty).await
-}
-
-/// [`compare_protocol`] off the async runtime.
-pub async fn compare_protocol_async(
-    name: &str,
-    sql: &str,
-    actual: &[RecordBatch],
-    expected: &[RecordBatch],
-    expect_empty: bool,
-) -> Result<Option<String>> {
-    compare_off_runtime(compare_protocol, name, sql, actual, expected, expect_empty).await
-}
-
-type CompareFn = fn(&str, &str, &[RecordBatch], &[RecordBatch], bool) -> Result<Option<String>>;
-
-async fn compare_off_runtime(
-    compare: CompareFn,
-    name: &str,
-    sql: &str,
-    actual: &[RecordBatch],
-    expected: &[RecordBatch],
-    expect_empty: bool,
-) -> Result<Option<String>> {
     let (name, sql, actual, expected) = (
         name.to_owned(),
         sql.to_owned(),
@@ -602,7 +578,9 @@ async fn compare_off_runtime(
 /// Runs CPU-bound work on a blocking thread. Parsing, typing or comparing an
 /// answer of millions of rows takes seconds; on the async runtime it delays
 /// every other script's steps, and so the timing their checks depend on.
-/// Load clients and generated queries compare small answers and stay inline.
+/// Work inside a timeout that times Spice stays inline, since the timeout
+/// would count it and cannot stop it here; load clients, which compare small
+/// answers, stay inline too.
 pub async fn off_runtime<T: Send + 'static>(
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
