@@ -49,5 +49,13 @@
     "sha256": {
       "linux-amd64": "01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891"
     }
+  },
+  "sccache": {
+    "version": "0.9.1",
+    "url": "https://github.com/mozilla/sccache/releases/download/v{version}/sccache-v{version}-{target}",
+    "sha256": {
+      "x86_64-unknown-linux-musl.tar.gz": "911f611db54e48dc50c32232462a99848824be5ba0f6f52cc33903712cd78715",
+      "x86_64-pc-windows-msvc.zip": "9c862bcaef62804f2124dfc2605a0204f4fe0c5fa337ba4264e9bcae9d2ba487"
+    }
   }
 }

@@ -139,10 +139,22 @@ runs:
       env:
         INPUT_MINIO_ENDPOINT: ${{ inputs.minio_endpoint }}
       run: |
-        sudo apt-get update && sudo apt-get install wget -y
-        wget -q https://github.com/mozilla/sccache/releases/download/v0.9.1/sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
-        tar -xzf sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
-        sudo mv sccache-v0.9.1-x86_64-unknown-linux-musl/sccache /usr/local/bin
+        # The sccache release pinned in .github/ci-cache/pins.json, checked against its
+        # SHA-256 before anything is extracted. It pins the x86_64 build only; elsewhere
+        # sccache stays uninstalled, and the pre-flight below turns the cache off.
+        case "$(uname -m)" in
+          x86_64) target=x86_64-unknown-linux-musl.tar.gz ;;
+          *) target='' ;;
+        esac
+        if [ -n "$target" ]; then
+          dir="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/sccache.XXXXXX")"
+          bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" sccache "$dir/sccache.tar.gz" "$target"
+          tar -xzf "$dir/sccache.tar.gz" -C "$dir"
+          sudo install -m 0755 "$dir"/sccache-v*/sccache /usr/local/bin/sccache
+          rm -rf "$dir"
+        else
+          echo "::warning::.github/ci-cache/pins.json pins no sccache for Linux $(uname -m); building without the compiler cache."
+        fi
         echo "SCCACHE_CACHE_SIZE=4T" >> $GITHUB_ENV
         : "${SCCACHE_CONF:=${RUNNER_TEMP}/sccache/config}"
         mkdir -p "$(dirname "${SCCACHE_CONF}")"
@@ -192,13 +204,27 @@ runs:
         INPUT_MINIO_ENDPOINT: ${{ inputs.minio_endpoint }}
       run: |
         $ErrorActionPreference = 'Stop'
-        # Download and install sccache
-        $sccacheVersion = "v0.9.1"
-        $sccacheUrl = "https://github.com/mozilla/sccache/releases/download/$sccacheVersion/sccache-$sccacheVersion-x86_64-pc-windows-msvc.zip"
+        # The sccache release pinned in .github/ci-cache/pins.json, checked against its
+        # SHA-256 before it is extracted.
+        $pin = (Get-Content -Raw (Join-Path $env:GITHUB_ACTION_PATH '..\..\ci-cache\pins.json') | ConvertFrom-Json).'sccache'
+        $target = 'x86_64-pc-windows-msvc.zip'
+        $expectedSha256 = $pin.sha256.$target
+        if ([string]::IsNullOrEmpty($expectedSha256)) {
+          Write-Output "::error::.github/ci-cache/pins.json pins no sccache for $target."
+          exit 1
+        }
+        $sccacheVersion = "v$($pin.version)"
+        $sccacheUrl = $pin.url.Replace('{version}', $pin.version).Replace('{target}', $target)
         $sccacheZip = "$env:TEMP\sccache.zip"
         $sccacheDir = "$env:USERPROFILE\sccache"
 
         Invoke-WebRequest -Uri $sccacheUrl -OutFile $sccacheZip
+        $actualSha256 = (Get-FileHash -Algorithm SHA256 -Path $sccacheZip).Hash.ToLowerInvariant()
+        if ($actualSha256 -ne $expectedSha256) {
+          Remove-Item -Force $sccacheZip
+          Write-Output "::error::$sccacheUrl does not match its pinned SHA-256: expected $expectedSha256, got $actualSha256. It was not used."
+          exit 1
+        }
         Expand-Archive -Path $sccacheZip -DestinationPath $sccacheDir -Force
         $sccacheExtractedDir = Join-Path $sccacheDir "sccache-$sccacheVersion-x86_64-pc-windows-msvc"
         $sccacheExePath = Join-Path $sccacheExtractedDir "sccache.exe"

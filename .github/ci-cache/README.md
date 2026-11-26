@@ -87,6 +87,12 @@ entry itself as `(Get-Content … | ConvertFrom-Json).'<name>'`, names its targe
   `e17bb437a50742ecd571b5ce0c1c72e05baa1487`); the mirror's file matches it. `setup-minio`'s
   macOS (Homebrew) and Windows (dl.min.io) steps are unchanged: no source serves a pinnable
   build for either any more, and no job runs the action there.
+- **`sccache`**: the compiler cache `setup-sccache` installs on Linux x86_64 (the musl
+  archive) and Windows (the MSVC zip), with the SHA-256s the release publishes beside each
+  asset (`<asset>.sha256`). The target names the asset, extension included. On another Linux
+  architecture sccache stays uninstalled and the pre-flight turns the cache off, as it did
+  when the x86_64 binary failed to run there. The self-hosted Macs use the sccache their
+  hosts carry.
 
 ## How the cache is filled
 

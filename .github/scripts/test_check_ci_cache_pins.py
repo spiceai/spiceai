@@ -213,5 +213,19 @@ class CheckCiCachePinsTest(unittest.TestCase):
         self.assertIn("asks for mc for linux-amd64, but mc pins one file for no target.", result.stdout)
 
 
+    def test_every_target_setup_sccache_asks_for_must_be_pinned(self):
+        # The Linux step's `case` arm and the Windows step's `$target`.
+        for target in ("x86_64-unknown-linux-musl.tar.gz", "x86_64-pc-windows-msvc.zip"):
+            with self.subTest(target=target):
+                self.setUp()
+                self.edit_pins(lambda pins: pins["sccache"]["sha256"].pop(target))
+                result = self.run_check()
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(
+                    f"sccache.sha256 has no pin for {target}, which .github/actions/setup-sccache/action.yml asks for",
+                    result.stdout,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

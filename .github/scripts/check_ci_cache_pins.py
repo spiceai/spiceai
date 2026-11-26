@@ -45,6 +45,7 @@ RUSTUP_ARCHIVE = "https://static.rust-lang.org/rustup/archive/"
 # a pin fails the job that asks for it, on the platform that asks, and nowhere else.
 FETCHED_PINS = {
     "mc": (".github/actions/setup-minio/action.yml", ".github/actions/upload-to-minio/action.yml"),
+    "sccache": (".github/actions/setup-sccache/action.yml",),
 }
 # A call in a shell script: `fetch_pinned.sh" NAME DEST [TARGET]`, with TARGET a literal or a
 # variable such as "$target".
