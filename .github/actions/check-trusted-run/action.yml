@@ -113,6 +113,9 @@ runs:
         fetch_branches() {
           [ -z "$git_dir" ] || return 0
           git_dir=$(mktemp -d "${RUNNER_TEMP:-/tmp}/check-trusted-run.XXXXXX")
+          # Only git's own defaults: a self-hosted Mac's ~/.gitconfig, which any job there can write, could
+          # point the fetch at another history (url.*.insteadOf) or another proxy.
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
           git init -q --bare "$git_dir"
           server="${GITHUB_SERVER_URL:-https://github.com}"
           git --git-dir "$git_dir" remote add origin "$server/$GITHUB_REPOSITORY.git"

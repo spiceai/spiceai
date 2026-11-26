@@ -56,13 +56,23 @@ class CiRoleTest(unittest.TestCase):
         git(bare, "update-ref", "-d", "refs/heads/feature")
         git(bare, "update-ref", "refs/heads/feature", cls.feature)
         cls.server = f"file://{server}"
+        # A history in which the feature commit is trunk's, as a planted insteadOf could serve.
+        fake = root / "fake"
+        (fake / "owner").mkdir(parents=True)
+        fake_bare = fake / "owner" / "repo.git"
+        git(root, "clone", "-q", "--bare", str(work), str(fake_bare))
+        git(fake_bare, "config", "uploadpack.allowFilter", "true")
+        git(fake_bare, "update-ref", "refs/heads/trunk", cls.feature)
+        cls.fake_server = f"file://{fake}"
 
     @classmethod
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def choose(self, event, ref, builds="", pull_request_role=True, server=None, images=""):
+    def choose(self, event, ref, builds="", pull_request_role=True, server=None, images="", gitconfig=""):
         with tempfile.TemporaryDirectory() as run:
+            if gitconfig:
+                (Path(run) / ".gitconfig").write_text(gitconfig)
             out, env_file = Path(run) / "output", Path(run) / "env"
             out.touch()
             env_file.touch()
@@ -89,6 +99,12 @@ class CiRoleTest(unittest.TestCase):
         self.assertEqual(output, f"full={'true' if full else 'false'}\n")
         self.assertEqual(env, "CI_ROLE_FULL=true\n" if full else "CI_CACHE_READ_ONLY=true\n")
         self.assertNotIn("a-token", proc.stdout + proc.stderr)
+
+    def test_a_planted_global_git_config_cannot_serve_another_trunk(self):
+        planted = f'[url "{self.fake_server}/"]\n\tinsteadOf = {self.server}/\n'
+        proc, output, _ = self.choose("push", "refs/heads/trunk", f"spiced_commit={self.feature}", gitconfig=planted)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("full=true", output)
 
     # --- the run's own ref --------------------------------------------------------------
 

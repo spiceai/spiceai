@@ -81,6 +81,9 @@ runs:
         on_trunk() {
           local git_dir server auth fetched=""
           git_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/setup-spiced.XXXXXX")"
+          # Only git's own defaults: a self-hosted Mac's ~/.gitconfig, which any job there can write, could
+          # point the fetch at another history (url.*.insteadOf) or another proxy.
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
           git init -q --bare "$git_dir"
           server="${GITHUB_SERVER_URL:-https://github.com}"
           auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
@@ -180,7 +183,8 @@ runs:
         PLATFORM_ARCH: ${{ steps.platform.outputs.arch }}
         PLATFORM_EXT: ${{ steps.platform.outputs.ext }}
       run: |
-        git fetch --depth=10 origin -- "$REF"
+        # git's own defaults, not a self-hosted Mac's shared ~/.gitconfig, as on_trunk above.
+        GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git fetch --depth=10 origin -- "$REF"
         echo "Fetching latest 10 commits from $REF"
 
         commit_hashes=($(git log FETCH_HEAD --pretty=format:"%H" -n 10))

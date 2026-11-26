@@ -876,8 +876,14 @@ class CheckMacWorkspaceTest(unittest.TestCase):
         matrix = "    strategy:\n      matrix:\n        runner: [spiceai-dev-runners, spiceai-macos]\n"
         self.assertEqual(len(self.problems("${{ matrix.runner }}", self.CHECKOUT, matrix)), 1)
 
+    def test_a_runner_an_expression_or_a_label_list_chooses_may_be_a_mac(self):
+        for runner in ("${{ inputs.runner_type }}", "${{ matrix.target.runner }}", "[self-hosted, macOS, ARM64]", "self-hosted"):
+            with self.subTest(runner=runner):
+                self.assertEqual(len(self.problems(runner, self.CHECKOUT)), 1)
+                self.assertEqual(self.problems(runner, self.CLEAN + self.CHECKOUT), [])
+
     def test_other_runners_need_nothing(self):
-        for runner in ("ubuntu-24.04", "macos-14", "spiceai-dev-runners"):
+        for runner in ("ubuntu-24.04", "macos-14", "spiceai-dev-runners", "[ubuntu-24.04]"):
             with self.subTest(runner=runner):
                 self.assertEqual(self.problems(runner, self.CHECKOUT), [])
 

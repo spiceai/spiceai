@@ -27,11 +27,11 @@ runs:
         # would send this push, token and all, elsewhere.
         GIT_CONFIG_GLOBAL="$(mktemp "${RUNNER_TEMP:?RUNNER_TEMP is not set}/gitconfig.XXXXXX")"
         export GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM=1
-        # The checkout's own config can redirect the push too, or pull in another file, and its
-        # hooks run in this step: anything that set them is not this action. So such config is
-        # refused, and no hook runs (core.hooksPath given on the command line, through the
-        # environment, overrides the repository's).
-        if redirects="$(git config --local --name-only --get-regexp '^(url\..*|core\.hookspath|include\..*|includeif\..*)$')"; then
+        # The checkout's own config can redirect the push too, pull in another file, or run a
+        # program, and its hooks run in this step: anything that set them is not this action. So
+        # such config is refused, and no hook runs (core.hooksPath given through the environment
+        # overrides the repository's).
+        if redirects="$(git config --local --name-only --get-regexp '^(url\..*|include\..*|includeif\..*|core\.(hookspath|fsmonitor|sshcommand|askpass|gitproxy|pager|editor|attributesfile)|filter\..*|diff\.external|diff\..*\.(textconv|command)|gpg\..*|commit\.gpgsign|tag\.gpgsign|credential\..*|http\..*|remote\..*\.(pushurl|proxy|receivepack|uploadpack|vcs)|protocol\..*)$')"; then
           echo "::error::The checkout's git config sets ${redirects//$'\n'/, }, which can send this push elsewhere or run other code; not pushing."
           exit 1
         fi

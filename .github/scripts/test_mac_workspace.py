@@ -60,7 +60,8 @@ class CleanMacWorkspaceTest(unittest.TestCase):
 
     def run_step(self, **env):
         base = {k: v for k, v in os.environ.items() if not k.startswith(("RUNNER_", "GITHUB_"))}
-        base.update({"GITHUB_WORKSPACE": str(self.workspace), "RUNNER_OS": "macOS", "RUNNER_ENVIRONMENT": "self-hosted"})
+        base.update({"GITHUB_WORKSPACE": str(self.workspace), "RUNNER_OS": "macOS", "RUNNER_ENVIRONMENT": "self-hosted",
+                     "RUNNER_TEMP": str(self.tmp)})
         base.update(env)
         base = {k: v for k, v in base.items() if v is not None}
         return subprocess.run(["bash", "-e", "-c", step("clean-mac-workspace", "Empty the workspace")],
@@ -73,6 +74,34 @@ class CleanMacWorkspaceTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(list(self.workspace.iterdir()), [])
         self.assertEqual(self.outside.read_text(), "keep\n")
+
+    def test_what_an_earlier_job_locked_inside_cannot_block_the_next_job(self):
+        if sys.platform != "darwin":
+            self.skipTest("chflags is macOS's")
+        deep = self.workspace / "deep"
+        deep.mkdir()
+        (deep / "appendonly").write_text("x")
+        subprocess.run(["chflags", "uappnd", str(deep / "appendonly")], check=True)
+        (deep / "locked").write_text("x")
+        subprocess.run(["chflags", "uchg", str(deep / "locked")], check=True)
+        deep.chmod(0o000)
+        proc = self.run_step(RUNNER_TEMP=str(self.tmp))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(self.workspace.is_dir())
+        self.assertEqual(list(self.workspace.iterdir()), [])
+
+    def test_a_link_left_as_the_workspace_is_moved_aside_not_followed(self):
+        target = self.tmp / "target"
+        target.mkdir()
+        (target / "keep").write_text("keep\n")
+        shutil.rmtree(self.workspace, ignore_errors=True)
+        subprocess.run(["chmod", "-R", "u+rwx", str(self.tmp / "work")], capture_output=True)
+        shutil.rmtree(self.workspace, ignore_errors=True)
+        self.workspace.symlink_to(target)
+        proc = self.run_step(RUNNER_TEMP=str(self.tmp))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(self.workspace.is_dir() and not self.workspace.is_symlink())
+        self.assertEqual((target / "keep").read_text(), "keep\n")
 
     def test_a_mac_that_does_not_say_where_it_runs_is_emptied_too(self):
         proc = self.run_step(RUNNER_ENVIRONMENT=None)
@@ -116,7 +145,13 @@ class PushSnapChangesConfigTest(unittest.TestCase):
                            ("url.https://evil.invalid/.pushInsteadOf", "https://github.com/"),
                            ("core.hooksPath", str(self.tmp)),
                            ("include.path", str(self.tmp / "other")),
-                           ("includeIf.gitdir:/.path", str(self.tmp / "other"))):
+                           ("includeIf.gitdir:/.path", str(self.tmp / "other")),
+                           ("core.fsmonitor", "/tmp/x"),
+                           ("filter.x.clean", "/tmp/x"),
+                           ("gpg.program", "/tmp/x"),
+                           ("http.proxy", "http://127.0.0.1:9"),
+                           ("remote.origin.pushurl", "https://evil.invalid/x.git"),
+                           ("core.askPass", "/tmp/x")):
             with self.subTest(key=key):
                 git(self.repo, "config", key, value)
                 proc = self.run_step()

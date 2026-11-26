@@ -713,15 +713,24 @@ def check_mac_workspace(jobs: dict) -> list[str]:
 
     Each runner instance there reuses its workspace across jobs of every ref, and actions/checkout
     keeps an existing repository's local config and hooks, which run in the next job. So such a job
-    runs `clean-mac-workspace` before its first checkout. A job is on such a Mac when its `runs-on`,
-    or its matrix, names a `spiceai-macos` runner.
+    runs `clean-mac-workspace` before its first checkout. A job may be on such a Mac when its
+    `runs-on` or its matrix names a `spiceai-macos` runner, when `runs-on` is an expression, or when
+    it is a label list that asks for a self-hosted or macOS runner.
     """
     problems = []
     for name, job in jobs.items():
         if not isinstance(job, dict):
             continue
-        runners = json.dumps(job.get("runs-on", "")) + json.dumps((job.get("strategy") or {}).get("matrix", {}))
-        if not SELF_HOSTED_MAC.search(runners):
+        runs_on = job.get("runs-on", "")
+        runners = json.dumps(runs_on) + json.dumps((job.get("strategy") or {}).get("matrix", {}))
+        # A runner chosen by an expression (a matrix value, an input) can be one of those Macs, and
+        # so can a label list that asks for a self-hosted or macOS runner.
+        may_be_mac = (
+            SELF_HOSTED_MAC.search(runners)
+            or "${{" in json.dumps(runs_on)
+            or any(str(label).lower() in ("self-hosted", "macos") for label in (runs_on if isinstance(runs_on, list) else [runs_on]))
+        )
+        if not may_be_mac:
             continue
         cleaned = False
         for position, step in enumerate(_steps(job), start=1):
