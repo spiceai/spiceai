@@ -233,7 +233,7 @@ impl CatalogConnector for UnityCatalog {
 
 fn table_reference_creator(uc_table: &UCTable) -> Option<TableReference> {
     let storage_location = uc_table.object_storage_location()?;
-    // Don't append a trailing slash here — `DeltaTable::from` calls
+    // Don't append a trailing slash here — `DeltaTable::open` calls
     // `ensure_folder_location` which already adds one when needed.
     // Unconditionally appending caused double-slash paths (e.g.
     // "file:///path/to/table//") when the Unity Catalog API returned

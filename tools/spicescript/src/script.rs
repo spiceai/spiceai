@@ -431,6 +431,9 @@ pub enum Action {
         /// `false` waits only for `spiced` to answer HTTP, for a start whose
         /// datasets are expected not to become ready.
         wait_ready: bool,
+        /// `false` waits for nothing, for a start that is expected not to
+        /// serve yet; a later `wait-ready` waits for it.
+        wait: bool,
         /// A change to the spicepod, kept for every later start.
         patch: Option<VariantSpec>,
         /// `spiced` must refuse to start: exit with a failure, before it
@@ -879,6 +882,8 @@ pub struct HttpStep {
     pub timing: Timing,
     /// The API key the request presents (`api-key: none` for none).
     pub key: crate::spiced::Key,
+    /// Nothing answers: the connection is refused (`expect: { refused: true }`).
+    pub refused: bool,
 }
 
 /// Checks the instance's `spiced.log`, across every start.
@@ -1782,12 +1787,22 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
     }
     let mut opts = Opts(map);
     let action = match name {
-        "start" => Action::Start {
-            ready_timeout: opts.duration_in(&arg, "ready-timeout")?,
-            wait_ready: wait_ready(&arg)?,
-            patch: patch(&arg)?,
-            exits: exits(&arg)?,
-        },
+        "start" => {
+            let wait = start_waits(&arg)?;
+            ensure!(
+                wait || (arg.get("ready").is_none()
+                    && arg.get("ready-timeout").is_none()
+                    && arg.get("exits").is_none()),
+                "`start` with `wait: false` waits for nothing, so it takes no `ready`, `ready-timeout` or `exits`; put `ready` and `ready-timeout` on a later `wait-ready`"
+            );
+            Action::Start {
+                ready_timeout: opts.duration_in(&arg, "ready-timeout")?,
+                wait_ready: wait_ready(&arg)?,
+                wait,
+                patch: patch(&arg)?,
+                exits: exits(&arg)?,
+            }
+        }
         "stop" => Action::Stop,
         "kill-spiced" => Action::Kill {
             signal: parse_signal(arg.get("signal"))?.unwrap_or(KillSignal::Kill),
@@ -2272,10 +2287,16 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
             let mut body_matches = Vec::new();
             let mut body_lacks = Vec::new();
             let mut json = Vec::new();
+            let mut refused = false;
             let (status, expect_headers, lacks_headers, body_contains) = match opts.take("expect") {
                 None => (None, Vec::new(), Vec::new(), None),
                 Some(Value::Object(e)) => {
                     let mut e = Opts(e);
+                    refused = e.bool("refused")?;
+                    ensure!(
+                        !refused || e.0.is_empty(),
+                        "`refused: true` expects no response, so it takes no other expectation"
+                    );
                     let status = e.parse::<u16>("status", "`status` must be a number")?;
                     let expect_headers = pairs(e.take("headers"), "headers")?;
                     let lacks_headers: Vec<String> = e
@@ -2331,6 +2352,7 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
                 json,
                 timing,
                 key,
+                refused,
             })
         }
         "assert-log" => {
@@ -2756,6 +2778,15 @@ fn exits(arg: &Value) -> Result<Option<regex::Regex>> {
             .map(Some)
             .with_context(|| format!("`exits` is not a valid pattern: {pattern}")),
         Some(_) => bail!("`exits` must be the pattern spiced's log must match"),
+    }
+}
+
+/// `wait:` on `start`: `false` starts `spiced` and waits for nothing.
+fn start_waits(arg: &Value) -> Result<bool> {
+    match arg.get("wait") {
+        None => Ok(true),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => bail!("`wait` must be true or false"),
     }
 }
 

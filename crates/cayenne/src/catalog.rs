@@ -306,6 +306,152 @@ pub struct SnapshotSequenceCommit {
     pub sequence_number: i64,
 }
 
+/// Whether an instance may write a table's data files; shared by the table and
+/// the metastore log that decides it, so the table sees a change of writer at
+/// once. See [`MetadataCatalog::data_write_gate`].
+///
+/// Under a writer lease the gate also closes by itself at the lease's
+/// deadline ([`Self::hold_until`]): an instance that cannot renew its lease
+/// sends no data write once another instance could judge the lease lapsed and
+/// take over, even if it never learns it was replaced.
+///
+/// Each time the instance becomes the writer again the gate's generation
+/// rises. A table binds the generation it opened at ([`Self::for_table`]), so
+/// a table whose state was seeded before another instance wrote the dataset
+/// refuses writes until it is opened again from the committed state: its
+/// sequence numbers and key sets would otherwise be stale.
+#[derive(Clone, Debug)]
+pub struct DataWriteGate {
+    state: std::sync::Arc<GateState>,
+    /// The generation a table's gate was bound at; `None` for the log's own.
+    bound: Option<u64>,
+}
+
+#[derive(Debug)]
+struct GateState {
+    allowed: std::sync::atomic::AtomicBool,
+    generation: std::sync::atomic::AtomicU64,
+    /// Writes are refused from this instant on, as nanoseconds since
+    /// [`gate_clock_epoch`]; `u64::MAX` for no deadline.
+    valid_until_ns: std::sync::atomic::AtomicU64,
+    /// Whether writes are allowed, for whoever waits for a change of writer.
+    changes: tokio::sync::watch::Sender<bool>,
+}
+
+impl DataWriteGate {
+    fn with(allowed: bool) -> Self {
+        Self {
+            state: std::sync::Arc::new(GateState {
+                allowed: std::sync::atomic::AtomicBool::new(allowed),
+                generation: std::sync::atomic::AtomicU64::new(0),
+                valid_until_ns: std::sync::atomic::AtomicU64::new(u64::MAX),
+                changes: tokio::sync::watch::Sender::new(allowed),
+            }),
+            bound: None,
+        }
+    }
+
+    /// A gate that allows writes: the instance writes the table.
+    #[must_use]
+    pub fn open() -> Self {
+        Self::with(true)
+    }
+
+    /// A gate that refuses writes: another instance writes the table.
+    #[must_use]
+    pub fn closed() -> Self {
+        Self::with(false)
+    }
+
+    /// This gate for a table opening now: it allows writes only while the
+    /// instance stays the writer it is at this generation.
+    #[must_use]
+    pub fn for_table(&self) -> Self {
+        Self {
+            state: std::sync::Arc::clone(&self.state),
+            bound: Some(
+                self.state
+                    .generation
+                    .load(std::sync::atomic::Ordering::Acquire),
+            ),
+        }
+    }
+
+    /// Follow whether this instance writes the table: `true` while it does.
+    /// Changes when another instance takes it over, or this one does.
+    #[must_use]
+    pub fn watch(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.state.changes.subscribe()
+    }
+
+    /// Whether a write may be sent now.
+    #[must_use]
+    pub fn allows(&self) -> bool {
+        // The generation is read after `allowed`, which `set` publishes after
+        // raising it, so an allowed read never pairs with an older generation.
+        let allowed = self
+            .state
+            .allowed
+            .load(std::sync::atomic::Ordering::Acquire);
+        allowed
+            && self.bound.is_none_or(|bound| {
+                bound
+                    == self
+                        .state
+                        .generation
+                        .load(std::sync::atomic::Ordering::Acquire)
+            })
+            && gate_clock_ns(std::time::Instant::now())
+                < self
+                    .state
+                    .valid_until_ns
+                    .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Refuse writes from `deadline` on, until a later call moves it: the
+    /// instant a writer lease could lapse unless renewed.
+    pub fn hold_until(&self, deadline: std::time::Instant) {
+        self.state.valid_until_ns.store(
+            gate_clock_ns(deadline),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// Allow or refuse writes from now on. Allowing them again after a refusal
+    /// starts a new generation.
+    pub fn set(&self, allows: bool) {
+        use std::sync::atomic::Ordering;
+        if allows {
+            if !self.state.allowed.load(Ordering::Acquire) {
+                self.state.generation.fetch_add(1, Ordering::AcqRel);
+            }
+            self.state.allowed.store(true, Ordering::Release);
+            self.state
+                .changes
+                .send_if_modified(|allowed| !std::mem::replace(allowed, true));
+        } else {
+            self.state.allowed.store(false, Ordering::Release);
+            self.state
+                .changes
+                .send_if_modified(|allowed| std::mem::replace(allowed, false));
+        }
+    }
+}
+
+/// Process-local origin of [`GateState::valid_until_ns`].
+fn gate_clock_epoch() -> std::time::Instant {
+    static EPOCH: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    *EPOCH
+}
+
+/// `at` as nanoseconds since [`gate_clock_epoch`]; an instant before the epoch
+/// counts as the epoch.
+fn gate_clock_ns(at: std::time::Instant) -> u64 {
+    u64::try_from(at.saturating_duration_since(gate_clock_epoch()).as_nanos())
+        .unwrap_or(u64::MAX - 1)
+}
+
 /// The durable effects of one mem-tier seal or checkpoint.
 #[derive(Debug, Default)]
 pub struct MemTierDurableCommit {
@@ -689,6 +835,28 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Initialize the catalog, creating necessary tables if they don't exist.
     async fn init(&self) -> CatalogResult<()>;
+
+    /// Bring this instance's view of `table_id` up to the commits another
+    /// instance made to it: on a replica of an object-native location, one
+    /// conditional read of the dataset head, and the records after it when it
+    /// moved. Returns the revision of the committed state afterwards, which
+    /// changes whenever that state does: a table reloads what it caches from
+    /// the catalog when the revision differs from the one it last loaded at,
+    /// so a reload that failed, or another table's follow, is caught up by the
+    /// next call. A metastore this instance alone writes is always current and
+    /// returns a constant.
+    ///
+    /// No default: a wrapper must forward it, or its replica never sees new
+    /// commits.
+    async fn follow_commits(&self, table_id: &str) -> CatalogResult<u64>;
+
+    /// Whether this instance may write `table_id`'s data to its location: open
+    /// while it writes the table, closed while another instance does. Every
+    /// data-file write and delete of a table checks it first, so an instance
+    /// that does not write a table leaves no object behind.
+    ///
+    /// No default: a wrapper must forward it, or a replica writes data files.
+    fn data_write_gate(&self, table_id: &str) -> DataWriteGate;
 
     /// List all table names in the catalog.
     async fn list_table_names(&self) -> CatalogResult<Vec<String>>;
@@ -1114,12 +1282,18 @@ pub trait MetadataCatalog: Send + Sync {
     ///
     /// Returns `Ok(false)` if any input snapshot is no longer active (the
     /// caller should discard the rewritten output and retry on a later trigger).
+    ///
+    /// `files` names the files of the merged snapshot, which has no manifest
+    /// rows yet, in the same commit as the swap, so that no crash leaves the
+    /// files of a snapshot that never became live named, where no sweep
+    /// reclaims them. `None` when the caller recorded the manifest already.
     async fn swap_protected_snapshots(
         &self,
         table_id: &str,
         old_snapshot_ids: &[String],
         new_snapshot_id: &str,
         new_sequence_number: i64,
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<bool>;
 
     /// Atomically commit an overwrite: update the snapshot pointer, clear all

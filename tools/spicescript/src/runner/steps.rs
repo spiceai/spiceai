@@ -382,11 +382,19 @@ async fn run_step(
         Action::Start {
             ready_timeout,
             wait_ready,
+            wait,
             patch,
             exits,
         } => {
+            ensure!(
+                *wait || (instance.executors.is_empty() && instance.sidecar.is_none()),
+                "`start` with `wait: false` starts one `spiced`, and this instance also runs executors or a sidecar"
+            );
             apply_patch(instance, patch.as_ref())?;
             instance.spiced.start(&instance.spicepod_yaml)?;
+            if !*wait {
+                return Ok(format!(" ({:.1}s)", started.elapsed().as_secs_f64()));
+            }
             let timeout = ready_timeout.unwrap_or(ready_default);
             if let Some(pattern) = exits {
                 instance.spiced.wait_exit(timeout, pattern).await?;

@@ -20,20 +20,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import check_rust_gate_paths  # noqa: E402
-from check_rust_gate_paths import (  # noqa: E402
-    coverage_gaps,
-    derived_gate_paths,
-    extract_code_change_globs,
-    gate_config_errors,
-    glob_matches,
-    read_patterns,
-    referenced_inputs,
-    rust_source_errors,
-    rust_source_trees,
-    sibling_imports,
-    tracked_files,
-)
+# The cases patch module globals (`lint_recipe`, `MAKEFILE`) that the guard's
+# functions read at call time, so everything is reached through the module.
+import check_rust_gate_paths as gate  # noqa: E402
 
 failures = 0
 checks = 0
@@ -57,12 +46,12 @@ print("glob_matches")
 
 check(
     "a `dir/**` glob reaches a nested source file",
-    glob_matches("vendor/**", "vendor/mysql-common-derive/src/lib.rs"),
+    gate.glob_matches("vendor/**", "vendor/mysql-common-derive/src/lib.rs"),
     True,
 )
 check(
     "a `dir/**` glob does not reach a sibling directory",
-    glob_matches("vendor/**", "vendored/lib.rs"),
+    gate.glob_matches("vendor/**", "vendored/lib.rs"),
     False,
 )
 # dorny/paths-filter builds its matchers with `{dot: true}`, so a wildcard does
@@ -70,23 +59,23 @@ check(
 # stricter than the filter and report a covered path as ungated.
 check(
     "a wildcard reaches a dot-prefixed segment",
-    glob_matches("**", ".ci/clippy.toml"),
+    gate.glob_matches("**", ".ci/clippy.toml"),
     True,
 )
 check(
     "a glob spelling the dot segment out also matches",
-    glob_matches(".ci/**", ".ci/clippy.toml"),
+    gate.glob_matches(".ci/**", ".ci/clippy.toml"),
     True,
 )
 check(
     "a leading `**/` reaches a dot-prefixed segment",
-    glob_matches("**/clippy.toml", ".ci/clippy.toml"),
+    gate.glob_matches("**/clippy.toml", ".ci/clippy.toml"),
     True,
 )
-check("a wildcard still does not cross a segment boundary", glob_matches("*", "a/b"), False)
+check("a wildcard still does not cross a segment boundary", gate.glob_matches("*", "a/b"), False)
 check(
     "a leading `**/` may match nothing",
-    glob_matches("**/clippy.toml", "clippy.toml"),
+    gate.glob_matches("**/clippy.toml", "clippy.toml"),
     True,
 )
 
@@ -97,12 +86,12 @@ print("coverage_gaps")
 # so a list that stops being checked fails here rather than in one report only.
 check(
     "a path missing from both lists is reported by both halves",
-    coverage_gaps(["vendor/x.rs", "crates/y.rs"], ["crates/**"], {"scripts/signoff": r"^crates/"}),
+    gate.coverage_gaps(["vendor/x.rs", "crates/y.rs"], ["crates/**"], {"scripts/signoff": r"^crates/"}),
     ({"scripts/signoff": ["vendor/x.rs"]}, ["vendor/x.rs"]),
 )
 check(
     "a fully covered path is in neither half",
-    coverage_gaps(["crates/y.rs"], ["crates/**"], RS_PATTERN),
+    gate.coverage_gaps(["crates/y.rs"], ["crates/**"], RS_PATTERN),
     ({"scripts/signoff": []}, []),
 )
 
@@ -120,12 +109,12 @@ GLOB_MISS = (
 )
 check(
     "a config path the globs miss names the merge-queue consequence",
-    gate_config_errors([".ci/clippy.toml"], ["crates/**"], RS_PATTERN),
+    gate.gate_config_errors([".ci/clippy.toml"], ["crates/**"], RS_PATTERN),
     [PATTERN_MISS, GLOB_MISS],
 )
 check(
     "a config path both lists cover is silent",
-    gate_config_errors([".ci/clippy.toml"], [".ci/**"], {"scripts/signoff": r"clippy\.toml$"}),
+    gate.gate_config_errors([".ci/clippy.toml"], [".ci/**"], {"scripts/signoff": r"clippy\.toml$"}),
     [],
 )
 
@@ -140,13 +129,13 @@ fixture_paths = [
     "vendor/example/schema.proto",
     "fixtures/root.snap",
 ]
-derived_inputs, _ = derived_gate_paths(fixture_paths)
+derived_inputs, _ = gate.derived_gate_paths(fixture_paths)
 check("all workspace test inputs are derived regardless of extension",
       sorted(p for p in derived_inputs if p in fixture_paths), sorted(fixture_paths))
 
 check(
     "tracked sources group by top-level directory",
-    rust_source_trees(
+    gate.rust_source_trees(
         [
             "crates/runtime/src/lib.rs",
             "crates/app/src/lib.rs",
@@ -160,16 +149,16 @@ check(
         "vendor": ["vendor/x/src/lib.rs"],
     },
 )
-check("a tree with no Rust sources is absent", rust_source_trees(["docs/dev/ci_signoff.md"]), {})
+check("a tree with no Rust sources is absent", gate.rust_source_trees(["docs/dev/ci_signoff.md"]), {})
 # No glob covers a bare root-level `.rs`, so this is a shape an error can take —
 # and keying it on the filename would report a directory that does not exist.
-check("a root-level source keys on the root", rust_source_trees(["build.rs"]), {".": ["build.rs"]})
+check("a root-level source keys on the root", gate.rust_source_trees(["build.rs"]), {".": ["build.rs"]})
 
 
 print("rust_source_errors")
 
 # This is #13120 in miniature: the tree is real, compiled, and in no glob.
-ungated = rust_source_errors(
+ungated = gate.rust_source_errors(
     {"vendor": ["vendor/x/src/lib.rs", "vendor/x/src/error.rs"]},
     ["crates/**", "bin/**"],
     RS_PATTERN,
@@ -185,7 +174,7 @@ check(
 
 check(
     "a glob covering the tree clears it",
-    rust_source_errors(
+    gate.rust_source_errors(
         {"vendor": ["vendor/x/src/lib.rs"]}, ["crates/**", "vendor/**"], RS_PATTERN
     ),
     [],
@@ -193,7 +182,7 @@ check(
 
 # One error per tree, not per file: the fix is a single glob either way, and a
 # per-file list would bury it. 200 files must still read as one problem.
-many = rust_source_errors(
+many = gate.rust_source_errors(
     {"vendor": [f"vendor/x/src/f{i}.rs" for i in range(200)]}, ["crates/**"], RS_PATTERN
 )
 check("a large tree still reports one error", len(many), 1)
@@ -201,7 +190,7 @@ check("the count is the file count", "holds 200 tracked" in many[0], True)
 
 # The pattern half of the same check: covered by a glob, but a sign-off would
 # skip the branch, so the merge queue is green and nothing was ever linted.
-pattern_only = rust_source_errors(
+pattern_only = gate.rust_source_errors(
     {"vendor": ["vendor/x/src/lib.rs"]},
     ["vendor/**"],
     {"scripts/signoff": r"^crates/"},
@@ -215,17 +204,17 @@ check(
 
 # Both halves can fail at once, and both must be reported — fixing only the glob
 # leaves the branch unsigned-off.
-both = rust_source_errors(
+both = gate.rust_source_errors(
     {"vendor": ["vendor/x/src/lib.rs"]}, ["crates/**"], {"scripts/signoff": r"^crates/"}
 )
 check("a tree failing both lists reports both", len(both), 2)
 
-root = rust_source_errors({".": ["build.rs"]}, ["crates/**"], RS_PATTERN)
+root = gate.rust_source_errors({".": ["build.rs"]}, ["crates/**"], RS_PATTERN)
 check("a root-level source reads as the repo root", "the repo root holds 1" in root[0], True)
 
 check(
     "trees are reported in a stable order",
-    [e.split("/", 1)[0] for e in rust_source_errors(
+    [e.split("/", 1)[0] for e in gate.rust_source_errors(
         {"vendor": ["vendor/a.rs"], "attic": ["attic/a.rs"]}, ["crates/**"], RS_PATTERN
     )],
     ["attic", "vendor"],
@@ -243,18 +232,18 @@ print("derived_gate_paths")
 
 def derived_from(recipe: str) -> list[str]:
     """Guard paths `derived_gate_paths` reads out of a synthetic `lint-rust` recipe."""
-    original = check_rust_gate_paths.lint_recipe
-    check_rust_gate_paths.lint_recipe = lambda: recipe
+    original = gate.lint_recipe
+    gate.lint_recipe = lambda: recipe
     try:
         # The guards' imports are read from the real files, which would tie these
         # recipe-spelling cases to whatever those files import today; they are
         # pinned separately below.
-        paths, _ = derived_gate_paths([], imports=lambda guards: set())
+        paths, _ = gate.derived_gate_paths([], imports=lambda guards: set())
     finally:
-        check_rust_gate_paths.lint_recipe = original
+        gate.lint_recipe = original
     # `RUST_SOURCE_PATHS` is seeded unconditionally and derived from nothing, so
     # dropping it leaves exactly what the recipe contributed.
-    return sorted(set(paths) - set(check_rust_gate_paths.RUST_SOURCE_PATHS))
+    return sorted(set(paths) - set(gate.RUST_SOURCE_PATHS))
 
 
 # The recipe invokes the guards through `$(PYTHON)`; a bare `python3` is still
@@ -307,19 +296,19 @@ print("lint_recipe")
 
 def extracted_from(makefile: str) -> list[str]:
     """Guard paths derived from `makefile` read through `lint_recipe`."""
-    original = check_rust_gate_paths.MAKEFILE
+    original = gate.MAKEFILE
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "Makefile"
         path.write_text(makefile, encoding="utf-8")
-        check_rust_gate_paths.MAKEFILE = path
+        gate.MAKEFILE = path
         try:
             # As above: these cases pin what `lint_recipe` extracts, so the
             # guards' imports are held out rather than tying them to whatever
             # the real guard files import today.
-            paths, _ = derived_gate_paths([], imports=lambda guards: set())
+            paths, _ = gate.derived_gate_paths([], imports=lambda guards: set())
         finally:
-            check_rust_gate_paths.MAKEFILE = original
-    return sorted(set(paths) - set(check_rust_gate_paths.RUST_SOURCE_PATHS))
+            gate.MAKEFILE = original
+    return sorted(set(paths) - set(gate.RUST_SOURCE_PATHS))
 
 
 RECIPE_SHAPES = {
@@ -358,17 +347,17 @@ reader = SCRIPTS.get
 
 check(
     "a guard's `from x import` pulls in its sibling, transitively",
-    sorted(sibling_imports(["scripts/check_a.py"], reader)),
+    sorted(gate.sibling_imports(["scripts/check_a.py"], reader)),
     ["scripts/common.py", "scripts/deeper.py"],
 )
 check(
     "an indented import is read, and a stdlib module is not a gate path",
-    sorted(sibling_imports(["scripts/check_b.py"], reader)),
+    sorted(gate.sibling_imports(["scripts/check_b.py"], reader)),
     ["scripts/common.py", "scripts/deeper.py"],
 )
 check(
     "every module of a multi-module import is read",
-    sibling_imports(
+    gate.sibling_imports(
         ["scripts/check_d.py"],
         {"scripts/check_d.py": "import json, common\n", "scripts/common.py": ""}.get,
     ),
@@ -376,7 +365,7 @@ check(
 )
 check(
     "an import that is only text in a docstring is not read",
-    sibling_imports(
+    gate.sibling_imports(
         ["scripts/check_e.py"],
         {"scripts/check_e.py": '"""\nimport common\n"""\n', "scripts/common.py": ""}.get,
     ),
@@ -384,12 +373,12 @@ check(
 )
 check(
     "a guard that is not on disk contributes nothing",
-    sibling_imports(["scripts/check_missing.py"], reader),
+    gate.sibling_imports(["scripts/check_missing.py"], reader),
     set(),
 )
 check(
     "a commented-out import is not read",
-    sibling_imports(["scripts/check_c.py"], {"scripts/check_c.py": "# import nowhere\n"}.get),
+    gate.sibling_imports(["scripts/check_c.py"], {"scripts/check_c.py": "# import nowhere\n"}.get),
     set(),
 )
 # The shipped helper is imported by both cargo-metadata guards and named by no
@@ -397,7 +386,7 @@ check(
 check(
     "the shipped guards derive scripts/rust_guard_common.py",
     "scripts/rust_guard_common.py"
-    in sibling_imports(["scripts/check_crate_layers.py", "scripts/check_module_reachability.py"]),
+    in gate.sibling_imports(["scripts/check_crate_layers.py", "scripts/check_module_reachability.py"]),
     True,
 )
 
@@ -434,11 +423,11 @@ SOURCES = {
 }
 check(
     "every relative path a Rust source names outside the trees is derived",
-    sorted(referenced_inputs(sorted(SOURCES), SOURCES.get)),
+    sorted(gate.referenced_inputs(sorted(SOURCES), SOURCES.get)),
     ["test/data/rows.csv", "test/spicepods/pod.yaml", "test/tls/cert.pem"],
 )
-derived_paths, _ = derived_gate_paths(
-    sorted(SOURCES), references=lambda tracked: referenced_inputs(tracked, SOURCES.get)
+derived_paths, _ = gate.derived_gate_paths(
+    sorted(SOURCES), references=lambda tracked: gate.referenced_inputs(tracked, SOURCES.get)
 )
 check("derived_gate_paths includes what the sources name", "test/tls/cert.pem" in derived_paths, True)
 
@@ -446,33 +435,33 @@ print("live tree")
 
 # Regression test for #13120. The synthetic cases above prove the derivation
 # works; this proves it is wired to the lists the repo actually ships.
-tracked, notes = tracked_files()
+tracked, notes = gate.tracked_files()
 if notes:
     # Not a skip: the guard exits 2 here rather than reporting a green tree it
     # never read, so this harness must not pass on the same condition either.
     failures += 1
     print(f"  FAIL: could not read the tracked files ({notes[0]})")
 else:
-    patterns = read_patterns()
-    globs = extract_code_change_globs()
+    patterns = gate.read_patterns()
+    globs = gate.extract_code_change_globs()
     if patterns is None or not globs:
         failures += 1
         print("  FAIL: could not read the shipped patterns or globs")
     else:
-        trees = rust_source_trees(tracked)
+        trees = gate.rust_source_trees(tracked)
         check("vendor/ is a tracked Rust source tree", "vendor" in trees, True)
         check(
             "every shipped Rust source tree is covered by all three lists",
-            rust_source_errors(trees, globs, patterns),
+            gate.rust_source_errors(trees, globs, patterns),
             [],
         )
         # `crates/runtime-tls` pins this certificate's SHA-256 in a unit test, so a
         # branch changing only the certificate must still be signed off.
-        gated, _ = derived_gate_paths(tracked)
+        gated, _ = gate.derived_gate_paths(tracked)
         check(
             "the shipped TLS fixture a unit test embeds is derived and gated by all three lists",
             ("test/tls/spiced_cert.pem" in gated,
-             coverage_gaps(["test/tls/spiced_cert.pem"], globs, patterns)),
+             gate.coverage_gaps(["test/tls/spiced_cert.pem"], globs, patterns)),
             (True, ({name: [] for name in patterns}, [])),
         )
 

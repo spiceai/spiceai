@@ -1616,13 +1616,14 @@ pub async fn validate_datalake_store_access(
     config: &cayenne::metadata::ObjectStoreConfig,
     dataset_name: &str,
 ) -> Result<()> {
-    let prefix = config.url.path().trim_matches('/');
-    let probe_name = format!(".spice-datalake-probe-{}", uuid::Uuid::now_v7());
-    let probe = if prefix.is_empty() {
-        Path::from(probe_name)
-    } else {
-        Path::from(format!("{prefix}/{probe_name}"))
-    };
+    let probe = cayenne::dataset_storage::object_key_of_url(&config.url)
+        .boxed()
+        .map_err(|source| Error::DatalakeAccessDenied {
+            dataset: dataset_name.to_string(),
+            location: config.url.to_string(),
+            source,
+        })?
+        .join(format!(".spice-datalake-probe-{}", uuid::Uuid::now_v7()));
 
     config
         .store

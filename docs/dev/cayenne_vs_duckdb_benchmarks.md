@@ -12,11 +12,11 @@ TPC-H/TPC-DS/ClickBench/CH-benCHmark/SSB/SpiceBench/SQLLancer/micro. Entry point
 
 - `crates/cayenne/tests/correctness/` — inventory, standalone DuckDB↔SQLite
   baseline, Cayenne↔standalone oracles
-- `crates/runtime/tests/result_correctness.rs` — the Spice SQLite accelerator
-  ↔ standalone SQLite, and Spicepod-built runtimes ↔ standalone SQLite and DuckDB
+- `crates/runtime/tests/result_correctness.rs` — Spicepod-built runtimes ↔
+  standalone SQLite and DuckDB
 
 Run with `cargo test -p cayenne --features result-correctness-duckdb|result-correctness-chdb`
-and `ADBC_DRIVER_PATH="$(python3 scripts/libduckdb.py)" cargo nextest run -p runtime --features sqlite --test integration -E 'test(/^result_correctness::/)'`
+and `ADBC_DRIVER_PATH="$(python3 scripts/libduckdb.py)" cargo nextest run -p runtime --test integration -E 'test(/^result_correctness::/)'`
 — not with `cargo bench` or Criterion features. See
 `crates/cayenne/tests/correctness/README.md`. Do not treat those tests as perf
 regressions or fold them into this matrix.
