@@ -1091,8 +1091,7 @@ async fn a_late_append_during_compaction_is_carried_without_a_copy() {
 /// before an append can store its view after the flush populated the cache for the
 /// append. The flush then clears every inline row; had it flushed the older view,
 /// the append's rows would be in no file and no longer inline: acknowledged and
-/// gone. A lab arm lost one 1,000-record export this way, or in a race of this shape
-/// (`runs/ar6_stream_r1_20261126T015121Z`, cayenne-bench-runs).
+/// gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_flush_writes_the_inline_rows_it_read_not_an_older_view_another_reader_stored() {
     const NAME: &str = "inline_flush_stale_view";
