@@ -134,6 +134,10 @@ jobs:
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
+          # The build of the code under test: a pull request reads its base branch's, a release
+          # branch's run its own (once a release branch is cut from trunk, this file is its), and
+          # any other run trunk's.
+          ref: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || startsWith(github.ref, 'refs/heads/release/') && github.ref || 'refs/heads/trunk' }}
 
       # The baseline is a recorded release (.github/release-digests.json): the input, or by
       # default the newest recorded one. setup-released-spiced verifies it before it runs.

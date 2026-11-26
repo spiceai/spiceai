@@ -9,6 +9,7 @@ for the keys a test stores, so nothing is downloaded.
 """
 
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -17,12 +18,101 @@ from pathlib import Path
 import yaml
 
 ACTION = Path(__file__).resolve().parent.parent / "actions" / "setup-spiced" / "action.yml"
+COLD_START = Path(__file__).resolve().parent.parent / "workflows" / "testoperator_run_cold_start.yml"
 REPOSITORY_ID = "394089041"
 PULL_REQUEST = "refs/pull/16720/merge"
 
 
 def git(cwd, *args):
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+
+TOKEN = re.compile(r"\s*(?:('(?:[^']|'')*')|(&&|\|\||==|!=|[(),!])|([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*))")
+FUNCTIONS = {
+    "format": lambda text, *args: re.sub(r"\{(\d+)\}", lambda m: str(args[int(m.group(1))]), text),
+    "startsWith": lambda text, start: str(text).lower().startswith(str(start).lower()),
+}
+
+
+def evaluate(expression, context):
+    """A `${{ }}` expression's value, by GitHub's rules for the operators these workflows use:
+    `&&` and `||` return an operand, `==` compares strings without case, and a missing context
+    value is empty."""
+    body = expression.strip()
+    assert body.startswith("${{") and body.endswith("}}"), expression
+    body = body[3:-2].strip()
+    tokens, pos = [], 0
+    while pos < len(body):
+        m = TOKEN.match(body, pos)
+        assert m and m.end() > pos, f"cannot read {body[pos:]!r}"
+        string, op, name = m.groups()
+        tokens.append(("str", string[1:-1].replace("''", "'")) if string is not None else ("op", op) if op else ("name", name))
+        pos = m.end()
+    i = 0
+
+    def peek():
+        return tokens[i] if i < len(tokens) else (None, None)
+
+    def take(expected=None):
+        nonlocal i
+        assert expected is None or peek() == expected, (peek(), expected)
+        i += 1
+        return tokens[i - 1]
+
+    def either():
+        value = both()
+        while peek() == ("op", "||"):
+            take()
+            other = both()
+            value = value if value else other
+        return value
+
+    def both():
+        value = compare()
+        while peek() == ("op", "&&"):
+            take()
+            other = compare()
+            value = other if value else value
+        return value
+
+    def compare():
+        value = unary()
+        if peek() in (("op", "=="), ("op", "!=")):
+            op = take()[1]
+            same = str(unary()).lower() == str(value).lower()
+            value = same if op == "==" else not same
+        return value
+
+    def unary():
+        if peek() == ("op", "!"):
+            take()
+            return not unary()
+        if peek() == ("op", "("):
+            take()
+            value = either()
+            take(("op", ")"))
+            return value
+        kind, value = take()
+        if kind == "str":
+            return value
+        assert kind == "name", value
+        if peek() == ("op", "("):
+            take()
+            args = []
+            while peek() != ("op", ")"):
+                args.append(either())
+                if peek() == ("op", ","):
+                    take()
+            take(("op", ")"))
+            return FUNCTIONS[value](*args)
+        found = context
+        for part in value.split("."):
+            found = found.get(part, "") if isinstance(found, dict) else ""
+        return found
+
+    value = either()
+    assert i == len(tokens), tokens[i:]
+    return value
 
 
 # Logs every call, and `stat` succeeds only for a key listed in $MC_STORED.
@@ -54,6 +144,12 @@ class SetupSpicedTest(unittest.TestCase):
         (work / "f").write_text("feature")
         git(work, "commit", "-qam", "feature")
         cls.feature = git(work, "rev-parse", "HEAD")
+        # A release branch cut from trunk, with a commit of its own.
+        git(work, "checkout", "-q", "trunk")
+        git(work, "checkout", "-qb", "release/1.0")
+        (work / "f").write_text("release")
+        git(work, "commit", "-qam", "release")
+        cls.release = git(work, "rev-parse", "HEAD")
         git(work, "checkout", "-q", "trunk")
         server = root / "server"
         (server / "owner").mkdir(parents=True)
@@ -116,9 +212,10 @@ class SetupSpicedTest(unittest.TestCase):
         values.update(dict(line.split("=", 1) for line in github_env.read_text().splitlines() if "=" in line))
         return proc, values
 
-    def locate(self, github_ref, ref="refs/heads/trunk", spiced_commit="", verify="false"):
+    def locate(self, github_ref, ref="refs/heads/trunk", spiced_commit="", verify="false", event="push", base_ref=""):
         return self.run_step("locate", {"GITHUB_REF": github_ref, "REF": ref, "INPUT_SPICED_COMMIT": spiced_commit,
-                                   "INPUT_VERIFY": verify})
+                                   "INPUT_VERIFY": verify, "RUN_EVENT": event,
+                                   "PULL_REQUEST_BASE": base_ref if event == "pull_request" else ""})
 
     def test_a_pull_request_finds_trunks_latest_build_at_trunks_keys(self):
         # The cold-start regression: a pull request looked for trunk's builds under its own prefix.
@@ -191,6 +288,79 @@ class SetupSpicedTest(unittest.TestCase):
                 self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
                 self.assertIn("runs only a spiced that trunk or this run's own ref built", proc.stdout)
                 self.assertEqual(located, {})
+
+    def test_a_pull_request_reads_its_base_branchs_build(self):
+        prefix = f"untrusted/{REPOSITORY_ID}/refs/heads/release/1.0/"
+        proc, located = self.locate("refs/pull/7/merge", ref="refs/heads/release/1.0", event="pull_request",
+                                    base_ref="release/1.0")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(located, {"ref": "refs/heads/release/1.0", "prefix": prefix, "trunk": "false"})
+        # Only its own base, and only for a pull_request event: the base name comes from the event.
+        for event, base_ref in (("pull_request", "release/2.0"), ("pull_request", ""), ("push", "release/1.0"),
+                                ("pull_request_target", "release/1.0"), ("workflow_dispatch", "release/1.0")):
+            with self.subTest(event=event, base_ref=base_ref):
+                proc, located = self.locate("refs/pull/7/merge", ref="refs/heads/release/1.0", event=event,
+                                            base_ref=base_ref)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("runs only a spiced that trunk or this run's own ref built", proc.stdout)
+                self.assertEqual(located, {})
+        # A job with the full CI roles still takes only trunk's attested builds.
+        proc, located = self.locate("refs/pull/7/merge", ref="refs/heads/release/1.0", verify="true",
+                                    event="pull_request", base_ref="release/1.0")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("runs only a spiced built and attested on trunk", proc.stdout)
+
+    def test_the_pull_request_check_reads_the_event_not_the_environment(self):
+        locate = self.steps["locate"]
+        self.assertEqual(locate["env"]["RUN_EVENT"], "${{ github.event_name }}")
+        self.assertEqual(locate["env"]["PULL_REQUEST_BASE"],
+                         "${{ github.event_name == 'pull_request' && github.base_ref || '' }}")
+        self.assertNotIn("GITHUB_BASE_REF", locate["run"])
+        self.assertNotIn("GITHUB_EVENT_NAME", locate["run"])
+        # GITHUB_* values a step could add to the environment change nothing.
+        proc, located = self.run_step("locate", {
+            "GITHUB_REF": "refs/pull/7/merge", "REF": "refs/heads/release/1.0", "INPUT_SPICED_COMMIT": "",
+            "INPUT_VERIFY": "false", "RUN_EVENT": "push", "PULL_REQUEST_BASE": "",
+            "GITHUB_EVENT_NAME": "pull_request", "GITHUB_BASE_REF": "release/1.0"})
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(located, {})
+
+    def test_cold_start_reads_the_build_of_the_code_under_test(self):
+        steps = yaml.safe_load(COLD_START.read_text())["jobs"]["cold-start"]["steps"]
+        ref = next(s for s in steps if s.get("id") == "setup-spiced")["with"]["ref"]
+        release_prefix = f"untrusted/{REPOSITORY_ID}/refs/heads/release/1.0/"
+        self.stored.write_text(self.key(release_prefix, self.release) + "\n" + self.key("", self.trunk) + "\n")
+        for event, github_ref, base_ref, expected, prefix, commit in (
+            ("schedule", "refs/heads/trunk", "", "refs/heads/trunk", "", self.trunk),
+            ("workflow_dispatch", "refs/heads/feature", "", "refs/heads/trunk", "", self.trunk),
+            ("pull_request", PULL_REQUEST, "trunk", "refs/heads/trunk", "", self.trunk),
+            # A release branch cut from trunk carries this file: its runs and its pull requests
+            # test the branch's own build, not trunk's newer runtime.
+            ("workflow_dispatch", "refs/heads/release/1.0", "", "refs/heads/release/1.0", release_prefix, self.release),
+            ("pull_request", "refs/pull/7/merge", "release/1.0", "refs/heads/release/1.0", release_prefix, self.release),
+        ):
+            with self.subTest(event=event, github_ref=github_ref):
+                resolved = evaluate(ref, {"github": {"event_name": event, "ref": github_ref, "base_ref": base_ref}})
+                self.assertEqual(resolved, expected)
+                proc, located = self.locate(github_ref, ref=resolved, event=event, base_ref=base_ref)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(located["prefix"], prefix)
+                proc, found = self.run_step("Find the latest built spiced commit",
+                                            {"REF": located["ref"], "SOURCE_PREFIX": located["prefix"]})
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(found["SPICED_COMMIT"], commit)
+
+    def test_no_build_of_the_ref_says_which_ref_and_where(self):
+        # A ref with no build of its own fails with the ref and the prefix it searched.
+        prefix = f"untrusted/{REPOSITORY_ID}/refs/heads/release/1.0/"
+        self.stored.write_text(self.key("", self.release) + "\n")
+        proc, found = self.run_step("Find the latest built spiced commit",
+                                    {"REF": "refs/heads/release/1.0", "SOURCE_PREFIX": prefix})
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertNotIn("SPICED_COMMIT", found)
+        self.assertIn("::error::No spiced build of refs/heads/release/1.0's last 10 commits is stored", proc.stdout)
+        self.assertIn(f"under artifacts/{prefix}spiced/", proc.stdout)
+        self.assertIn("run build_release.yml on refs/heads/release/1.0 first", proc.stdout)
 
     def test_a_spiced_commit_that_is_not_a_full_hash_is_refused(self):
         for commit in (f"{self.trunk}\nprefix=", self.trunk[:12], f"{self.trunk[:39]}$(id)", "../../../../x",
