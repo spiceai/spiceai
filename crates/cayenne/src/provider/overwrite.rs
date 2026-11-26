@@ -363,7 +363,9 @@ impl PreparedOverwrite {
                 false,
                 true,
                 0,
-                self.table.reserve_live_rows_delta().published(),
+                self.table
+                    .reserve_live_rows_delta()
+                    .published(self.table.statistics_epoch()),
             );
         }
 
@@ -407,12 +409,9 @@ impl PreparedOverwrite {
 
         self.table.schedule_old_snapshot_cleanup();
 
-        // Invalidate the in-memory optimizer cache so a zero-row overwrite
-        // leaves the cache empty rather than stale; `persist_table_stats`
-        // repopulates it when the accumulator has rows. The catalog row was
-        // already cleared atomically with the snapshot pointer flip.
-        // The accumulator counts every written row, including those the position
-        // deletes hide.
+        // Record the overwrite's statistics; the flip has already cleared the
+        // cached ones. The accumulator counts every written row, including
+        // those the position deletes hide.
         let hidden: u64 = self
             .position_deletions
             .values()

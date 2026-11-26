@@ -23,7 +23,7 @@ use crate::kafka::{
 use crate::{
     cdc::{self, ChangeBatch, ChangeEnvelope, ChangesStream},
     debezium::{
-        arrow::changes,
+        arrow::{ColumnDefaults, changes},
         change_event::{ChangeEvent, ChangeEventKey},
     },
     kafka::{Error, KafkaConsumer},
@@ -54,6 +54,8 @@ pub struct DebeziumKafka {
     projection: Option<SchemaProjection>,
     dataset_name: String,
     runtime_status: Option<Arc<runtime_status::RuntimeStatus>>,
+    /// The value a required column takes in an event that predates it.
+    column_defaults: Arc<ColumnDefaults>,
 }
 
 impl std::fmt::Debug for DebeziumKafka {
@@ -104,7 +106,19 @@ impl DebeziumKafka {
             projection,
             dataset_name: String::new(),
             runtime_status: None,
+            column_defaults: Arc::new(ColumnDefaults::new()),
         }
+    }
+
+    /// Gives a required column an event does not carry the column's default
+    /// from the table's event schema (see [`column_defaults`]), instead of
+    /// failing the batch that holds the event.
+    ///
+    /// [`column_defaults`]: crate::debezium::arrow::column_defaults
+    #[must_use]
+    pub fn with_column_defaults(mut self, column_defaults: ColumnDefaults) -> Self {
+        self.column_defaults = Arc::new(column_defaults);
+        self
     }
 
     #[must_use]
@@ -142,6 +156,7 @@ impl DebeziumKafka {
         let consumer = self.consumer;
         let offset_commit_hook = self.offset_commit_hook.clone();
         let projection = self.projection.clone();
+        let column_defaults = Arc::clone(&self.column_defaults);
         let batching = self.batching;
         let dataset_name = self.dataset_name.clone();
         let runtime_status = self.runtime_status.clone();
@@ -196,6 +211,7 @@ impl DebeziumKafka {
                                         schema: &schema,
                                         primary_keys: &primary_keys,
                                         projection: projection.as_ref(),
+                                        column_defaults: &column_defaults,
                                         consumer,
                                         offset_commit_hook: offset_commit_hook.clone(),
                                         runtime_status: runtime_status.as_ref(),
@@ -218,6 +234,7 @@ impl DebeziumKafka {
                             schema: &schema,
                             primary_keys: &primary_keys,
                             projection: projection.as_ref(),
+                            column_defaults: &column_defaults,
                             consumer,
                             offset_commit_hook: offset_commit_hook.clone(),
                             runtime_status: runtime_status.as_ref(),
@@ -239,6 +256,7 @@ struct DecodeChunk<'a> {
     schema: &'a SchemaRef,
     primary_keys: &'a [String],
     projection: Option<&'a SchemaProjection>,
+    column_defaults: &'a ColumnDefaults,
     consumer: &'static KafkaConsumer,
     offset_commit_hook: Option<Arc<dyn KafkaOffsetCommitHook>>,
     runtime_status: Option<&'a Arc<runtime_status::RuntimeStatus>>,
@@ -288,11 +306,18 @@ fn decode_one_change(
     primary_keys: &[String],
     change: &ChangeEvent,
     projection: Option<&SchemaProjection>,
+    column_defaults: &ColumnDefaults,
 ) -> Result<ChangeBatch, &'static str> {
     let source_commit_ts_ms = event_commit_ts_ms(change);
-    changes::to_change_batch(schema, primary_keys, change, projection)
-        .map(|batch| batch.with_source_commit_ts_ms(Some(source_commit_ts_ms)))
-        .map_err(|e| e.kind())
+    changes::to_change_batch_with_defaults(
+        schema,
+        primary_keys,
+        change,
+        projection,
+        column_defaults,
+    )
+    .map(|batch| batch.with_source_commit_ts_ms(Some(source_commit_ts_ms)))
+    .map_err(|e| e.kind())
 }
 
 fn concat_decoded_change_batches(
@@ -338,6 +363,7 @@ fn decode_debezium_chunk(
             ctx.primary_keys,
             message.value(),
             ctx.projection,
+            ctx.column_defaults,
         ) {
             Ok(batch) => decoded.push(batch),
             Err(kind) => report_skipped_change_event(

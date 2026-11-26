@@ -527,16 +527,18 @@ impl MetadataCatalog for Domain {
         table_id: &str,
         snapshot_id: &str,
         sequence_number: i64,
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()> {
-        self.inner
-            .take()
-            .await
-            .commit(vec![actions::set_group(
+        let mut batch = vec![actions::set_group(table_id, snapshot_id, sequence_number)];
+        if let Some(files) = files {
+            batch.push(snapshot_manifest_action(
                 table_id,
                 snapshot_id,
-                sequence_number,
-            )])
-            .await
+                files,
+                false,
+            )?);
+        }
+        self.inner.take().await.commit(batch).await
     }
     async fn clear_snapshot_sequence(
         &self,

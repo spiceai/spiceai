@@ -32,6 +32,7 @@ bb8-oracle = { version = "0.3", features = ["chrono"], optional = true }
 bigdecimal = { workspace = true, optional = true }
 bytes.workspace = true
 chrono.workspace = true
+cpu-budget.workspace = true
 connector-postgres-common = { path = "../data-connectors/connector-postgres-common", optional = true }
 dashmap = "6.1"
 dataformat-json = { path = "../dataformat-json" }
@@ -53,6 +54,7 @@ duration-parse = { path = "../duration-parse" }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
 moka.workspace = true
+opentelemetry.workspace = true
 globset.workspace = true
 hash-index = { path = "../hash-index", features = ["metrics"] }
 http-body-limit = { path = "../http-body-limit" }

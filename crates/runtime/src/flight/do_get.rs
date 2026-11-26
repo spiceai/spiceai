@@ -19,6 +19,7 @@ use arrow_flight::{
     flight_service_server::FlightService,
     sql::{Any, Command},
 };
+use flight_client::parameterized_ticket::PARAMETERIZED_SUBSTRAIT_PLAN_TYPE_URL;
 use prost::Message;
 use tonic::{Request, Response, Status};
 
@@ -53,6 +54,17 @@ pub(crate) async fn handle(
         server_timing::time_do_get(ticket).await;
         return Box::pin(do_get_simple(request)).await;
     };
+
+    // Not a Flight SQL command, so matched before `Command::try_from`, which
+    // would report it as `Unknown`: that `Unimplemented` is what an upstream
+    // without this support answers, and what its client falls back on.
+    if msg.type_url == PARAMETERIZED_SUBSTRAIT_PLAN_TYPE_URL {
+        server_timing::time_do_get(ticket).await;
+        return Box::pin(flightsql::statement_substrait_plan::do_get_parameterized(
+            msg.value,
+        ))
+        .await;
+    }
 
     // The arms below record per-command; a ticket that is not a `Command` reaches
     // none of them, so it is recorded here.
