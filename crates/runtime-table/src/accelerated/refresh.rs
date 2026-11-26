@@ -1666,9 +1666,11 @@ impl Refresher {
         }
 
         // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
-        // The `select!` block handle waiting on both
+        // The `select!` block waits on
         //   1. The manual refresh [`Receiver`] channel `on_start_refresh_external`
-        //   2. The sleep [`future`] `scheduled_refresh_future`.
+        //   2. The sleep [`future`] `scheduled_refresh_future`
+        //   3. A manual refresh's jitter wait, `delayed_trigger_due`
+        //   4. Refresh completions, `on_refresh_complete`.
         //
         // Doing it in this way stops
         //   1. Periodic and manual refreshes happening at the same time

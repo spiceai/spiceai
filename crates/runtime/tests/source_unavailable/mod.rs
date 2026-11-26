@@ -1698,7 +1698,8 @@ mod served_from_acceleration {
         Ok(())
     }
 
-    /// Missed cron occurrences are skipped unless a refresh has already been triggered.
+    /// Missed cron occurrences are skipped unless a refresh has already been triggered,
+    /// and a triggered refresh due after the next cron time shows the cron time.
     #[tokio::test]
     async fn cron_freshness_skips_missed_occurrences_and_retains_pending_refresh()
     -> Result<(), anyhow::Error> {
@@ -1735,6 +1736,10 @@ mod served_from_acceleration {
         };
         let pending: chrono::DateTime<chrono::Utc> = pending.into();
         assert_eq!(next_refresh.timestamp(), pending.timestamp());
+        // A refresh waiting out a long jitter; the next cron tick starts it first.
+        rt.status()
+            .record_dataset_next_refresh(&name, now + Duration::from_hours(2 * 8760));
+        assert_eq!(freshness(&rt).await.1, Some(expected));
         rt.status().clear_dataset_next_refresh(&name);
         assert_eq!(freshness(&rt).await.1, Some(expected));
         stop(rt, loader).await;

@@ -324,8 +324,9 @@ fn dataset_infos(
 /// `ds`'s last refresh and next scheduled refresh, as RFC 3339 timestamps, for an
 /// accelerated dataset, following its active parent scheduler when synchronized.
 /// Only a dataset with a schedule has a next refresh. For a
-/// `refresh_cron` dataset it is the next cron time after now, or, once a refresh
-/// has been triggered, its recorded due time including jitter until completion.
+/// `refresh_cron` dataset it is the next cron time after now or, once a refresh
+/// has been triggered, its recorded due time including jitter until completion,
+/// whichever is earlier.
 fn dataset_freshness(
     df: &DataFusion,
     ds: &Dataset,
@@ -343,15 +344,18 @@ fn dataset_freshness(
             let acceleration = source_dataset.acceleration.as_ref().filter(|a| a.enabled)?;
             let scheduled = acceleration.refresh_check_interval.is_some()
                 || acceleration.refresh_cron.is_some();
-            df.runtime_status()
+            let recorded = df
+                .runtime_status()
                 .dataset_freshness(&source)
                 .next_refresh
-                .filter(|_| scheduled)
-                .or_else(|| {
-                    let cron = acceleration.refresh_cron.as_deref()?;
-                    scheduler::channel::cron::next_cron_time(cron, std::time::SystemTime::now())
-                        .ok()
-                })
+                .filter(|_| scheduled);
+            let next_cron = acceleration.refresh_cron.as_deref().and_then(|cron| {
+                scheduler::channel::cron::next_cron_time(cron, std::time::SystemTime::now()).ok()
+            });
+            match (recorded, next_cron) {
+                (Some(recorded), Some(next_cron)) => Some(recorded.min(next_cron)),
+                (recorded, next_cron) => recorded.or(next_cron),
+            }
         });
     (
         freshness.last_refresh.map(rfc3339),
