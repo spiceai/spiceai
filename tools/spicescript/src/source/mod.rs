@@ -69,9 +69,9 @@ pub trait Source: Send + Sync {
     /// The source's container; `None` for a source with no server (files).
     fn container(&self) -> Option<&Container>;
 
-    /// Partitions or heals the connector path. Returns false for sources
+    /// Injects `fault` on the connector path. Returns false for sources
     /// without one.
-    fn set_partitioned(&self, _partitioned: bool) -> bool {
+    fn inject_fault(&self, _fault: crate::script::ProxyFault) -> bool {
         false
     }
 

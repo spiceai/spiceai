@@ -112,10 +112,10 @@ impl Source for Mysql {
         Some(&self.container)
     }
 
-    fn set_partitioned(&self, partitioned: bool) -> bool {
+    fn inject_fault(&self, fault: crate::script::ProxyFault) -> bool {
         match &self.proxy {
             Some(proxy) => {
-                proxy.set_partitioned(partitioned);
+                proxy.inject(fault);
                 true
             }
             None => false,

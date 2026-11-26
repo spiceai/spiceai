@@ -198,6 +198,7 @@ During a partition, the proxy holds bytes in both directions, delays new upstrea
 After healing, a client that writes on a connection the source closed gets a TCP RST; a client that does not write stays connected and silent.
 The proxy terminates the client TCP connection, so it answers keepalive probes and keepalive cannot detect the lost source close.
 It does not model TCP retransmission or backpressure; it holds up to 1 MiB per direction, then stops reading that side until healing.
+`stall-source` stops relaying on every open connection for the rest of the run, like a relay that keeps the source side alive but stops delivering; new connections relay normally. `throttle-source` caps the rate of bytes from the source to `spiced`.
 
 **DuckDB releases.** `spiced` reads `duckdb:` and `ducklake:` through the
 DuckDB library installed on the host, so each `duckdb` or `ducklake` source
@@ -290,6 +291,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `edit-spicepod: <patch>` | Rewrite the running instance's spicepod (for `--pods-watcher-enabled`). |
 | `start-source`, `stop-source`, `pause-source`, `unpause-source: <name>` | Control a source container; it keeps its host port across a stop. |
 | `partition-source`, `heal-source: <name>` | Partition or restore a `partitionable` source's connector path; see the MySQL source description above. |
+| `stall-source: <name>`, `throttle-source: { <name>: <bytes per second> }`, `unthrottle-source: <name>` | Stall the open connections, or cap or uncap the bandwidth, of a `partitionable` source's connector path. |
 | `source-exec: { <name>: <sql, list, or { file }> }` | Run statements on a source, in this instance's database. On an object store (`rustfs`), one command per line in the instance's bucket: `delete-first <prefix> <contains>` and `truncate-first <prefix> <contains>` delete, or keep the first half of, the first key in key order under the prefix that contains the text; `copy <from-prefix> <to-prefix>` copies every object under a prefix, and `delete-prefix <prefix>` deletes them. |
 | `write: { <source>: <sql or list> }` | Execute PostgreSQL DML on the required `mirror: <postgres source>` and apply its row images to the target. `key: <column>` defaults to `id`. |
 | `source-query: { <name>: <sql> }` | Ask a source directly and check `expect: { rows }`. |

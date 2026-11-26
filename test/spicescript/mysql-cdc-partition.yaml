@@ -1,7 +1,9 @@
 name: mysql-cdc-partition
 description: >
-  MySQL CDC resumes after a network partition during which the source closed
-  the runtime's connections, and both datasets match the source.
+  MySQL CDC resumes after a network partition that closed the runtime's
+  connections, after a relay stalls a dump the source still runs, and after a
+  slow link delivers a row that outlasts the silence limit; every dataset
+  matches the source.
 
 sources:
   src: { kind: mysql, partitionable: true }
@@ -22,6 +24,10 @@ spicepod:
       name: quiet
       params: ${sources.src.params}
       acceleration: { enabled: true, engine: '${matrix.engine}', mode: file, refresh_mode: changes, primary_key: id }
+    - from: mysql:large
+      name: large
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file, refresh_mode: changes, primary_key: id }
 
 defaults:
   expect: { oracle: src }
@@ -31,6 +37,7 @@ steps:
       src: |
         CREATE TABLE busy (id int PRIMARY KEY, v int);
         CREATE TABLE quiet (id int PRIMARY KEY, v int);
+        CREATE TABLE large (id int PRIMARY KEY, payload longtext);
         INSERT INTO busy VALUES (1, 0), (2, 20), (3, 30);
         INSERT INTO quiet VALUES (1, 10), (2, 20), (3, 30);
   - start: {}
@@ -101,5 +108,18 @@ steps:
     eventually: 60s
   - query: SELECT id, v FROM quiet
     eventually: 60s
+
+  # The source still runs the stalled dump, so only the silence reveals it.
+  - stall-source: src
+  - source-exec: { src: "UPDATE quiet SET v = v + 100 WHERE id = 3" }
+  - query: SELECT id, v FROM quiet
+    eventually: 60s
+
+  # 20 MiB at 1 MiB/s outlasts the 15 s silence limit but not the doubled one.
+  - throttle-source: { src: 1048576 }
+  - source-exec: { src: "INSERT INTO large VALUES (1, REPEAT('x', 20971520))" }
+  - query: SELECT id, length(payload) AS n FROM large
+    eventually: 120s
+  - unthrottle-source: src
   - assert-log:
-      contains: ['binlog connection lost; reconnecting.*the source no longer runs this binlog dump']
+      contains: ['binlog connection lost; reconnecting.*nothing arrived on the binlog stream']

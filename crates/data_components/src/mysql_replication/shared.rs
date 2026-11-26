@@ -112,7 +112,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::binlog::{
-    AdoptedLayout, MIN_VALID_EVENT_POS, OpenedDump, QueryKind, StatementKind, adopt_current_layout,
+    AdoptedLayout, DumpSilence, MIN_VALID_EVENT_POS, QueryKind, StatementKind, adopt_current_layout,
     classify_query, classify_statement, compute_pk_source_indexes, immediate_commit_ts_ms,
     layout_event_mismatch, log_transient_reconnect, open_binlog_stream, purged_position_error,
     readiness_heartbeat, record_watermark, transaction_commit_ts_ms,
@@ -151,8 +151,6 @@ const MEMBER_SEND_STALL_WARN: Duration = Duration::from_secs(5);
 /// cannot stall it.
 const HEAD_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Bounds the check of whether a silent dump is still running.
-const DUMP_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `(database, table)` of a member's source table — the routing key.
 type MemberKey = (String, String);
@@ -1802,7 +1800,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
     let idle_tick = crate::cdc::heartbeat_interval(params.ready_lag)
         .min(params.checkpoint_interval)
         .min(IDLE_TICK_CAP);
-    let silence_limit = super::binlog::dump_silence_limit(params.checkpoint_interval);
+    let mut silence = DumpSilence::new(params.checkpoint_interval);
     let mut side_conn: Option<Conn> = None;
     // Positioning mode for this shared dump, decided once at the source level
     // (all members share the connection, so all see the same `gtid_mode`): GTID
@@ -1851,11 +1849,8 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
             GtidSet::new()
         };
 
-        let OpenedDump {
-            mut stream,
-            identity: dump_identity,
-        } = match open_binlog_stream(&params, &resume, &connection, use_gtid, &resume_gtid).await {
-            Ok(opened) => {
+        let mut stream = match open_binlog_stream(&params, &resume, &connection, use_gtid, &resume_gtid).await {
+            Ok(stream) => {
                 backoff.reset();
                 if reconnect_attempts > 0 {
                     // In GTID mode the dump repositions from the shared executed
@@ -1871,7 +1866,8 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                 // floor), so every snapshot-complete member's gap is covered:
                 // promote them to routable + creditable.
                 source.ack.promote_ready_members();
-                opened
+                silence.on_open();
+                stream
             }
             Err(e) if super::resilience::is_purged_position_error(&e) => {
                 // The shared min was purged from the source. Honor
@@ -1920,8 +1916,6 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
         // Commit time of the transaction currently being read, in milliseconds, from
         // its GTID event; taken by the commit or statement that closes it.
         let mut current_txn_commit_ts_ms: Option<i64> = None;
-        // Reset by each event and by each check that finds the dump running.
-        let mut silent_since = Instant::now();
 
         'recv: loop {
             if crate::cdc::shutdown_epoch() != shutdown_epoch {
@@ -1943,6 +1937,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                 return;
             }
 
+            let waited_from = Instant::now();
             let polled = tokio::select! {
                 polled = tokio::time::timeout(idle_tick, stream.next()) => polled,
                 // Wake for a shutdown as it is signalled: the check at the head of
@@ -1952,48 +1947,33 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
             };
             let next_event = match polled {
                 Ok(item) => {
-                    silent_since = Instant::now();
+                    silence.on_event();
                     item
                 }
                 Err(_idle) => {
-                    let mut source_reachable = true;
-                    if silent_since.elapsed() >= silence_limit {
-                        let gone = tokio::select! {
-                            gone = dump_gone(&source, &mut side_conn, &params, &dump_identity) => gone,
-                            () = crate::cdc::shutdown_signalled(shutdown_epoch) => continue 'recv,
-                        };
-                        match gone {
-                            Some(true) => {
-                                note_connection_lost(
-                                    &source,
-                                    &mut reconnect_attempts,
-                                    &connection,
-                                    &format!(
-                                        "nothing arrived for {}s and the source no longer runs this binlog dump",
-                                        silent_since.elapsed().as_secs()
-                                    ),
-                                    &mut backoff,
-                                );
-                                break 'recv;
-                            }
-                            Some(false) => silent_since = Instant::now(),
-                            // Ask again next tick; skip the head poll, which
-                            // could not reach the source either.
-                            None => source_reachable = false,
-                        }
+                    if let Some(silent_for) = silence.expired(waited_from) {
+                        note_connection_lost(
+                            &source,
+                            &mut reconnect_attempts,
+                            &connection,
+                            &format!(
+                                "nothing arrived on the binlog stream for {}s",
+                                silent_for.as_secs()
+                            ),
+                            &mut backoff,
+                        );
+                        break 'recv;
                     }
                     if last_persist_at.elapsed() >= params.checkpoint_interval {
                         persist_all(&source, &mut last_persisted).await;
                         last_persist_at = Instant::now();
                     }
-                    if source_reachable {
-                        crate::cdc::until_shutdown(
-                            shutdown_epoch,
-                            poll_head_and_heartbeat(&source, &mut side_conn, &params),
-                        )
-                        .await;
-                        last_heartbeat_at = Instant::now();
-                    }
+                    crate::cdc::until_shutdown(
+                        shutdown_epoch,
+                        poll_head_and_heartbeat(&source, &mut side_conn, &params),
+                    )
+                    .await;
+                    last_heartbeat_at = Instant::now();
                     continue 'recv;
                 }
             };
@@ -2212,6 +2192,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                 }
                 Some(EventData::XidEvent(_)) => {
                     txn_open = false;
+                    silence.on_commit();
                     let commit_pos = BinlogPosition::new(current_file.clone(), event_end_pos);
                     deliver_commit(
                         &source,
@@ -2234,6 +2215,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                         }
                         QueryKind::Commit => {
                             txn_open = false;
+                            silence.on_commit();
                             let commit_pos =
                                 BinlogPosition::new(current_file.clone(), event_end_pos);
                             deliver_commit(
@@ -2276,6 +2258,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                             // shared resume never advances past foreign traffic again.
                             txn_open = false;
                             txn.clear();
+                            silence.on_commit();
                         }
                     }
                 }
@@ -2986,14 +2969,14 @@ fn note_connection_lost(
     );
 }
 
-/// Runs `query` on the side connection within `timeout`, opening the
-/// connection if needed. On failure, drops the connection and returns `None`.
+/// Runs `query` on the side connection within [`HEAD_POLL_TIMEOUT`], opening
+/// the connection if needed. On failure, drops the connection and returns
+/// `None`.
 async fn side_query<T, E: std::fmt::Display>(
     source: &SharedSource,
     side_conn: &mut Option<Conn>,
     params: &ReplicationParams,
     what: &str,
-    timeout: Duration,
     query: impl AsyncFnOnce(&mut Conn) -> std::result::Result<T, E>,
 ) -> Option<T> {
     let attempt = async {
@@ -3007,37 +2990,14 @@ async fn side_query<T, E: std::fmt::Display>(
         };
         query(conn).await.map_err(|e| e.to_string())
     };
-    let error = match tokio::time::timeout(timeout, attempt).await {
+    let error = match tokio::time::timeout(HEAD_POLL_TIMEOUT, attempt).await {
         Ok(Ok(value)) => return Some(value),
         Ok(Err(e)) => e,
-        Err(_) => format!("no answer within {}s", timeout.as_secs()),
+        Err(_) => format!("no answer within {}s", HEAD_POLL_TIMEOUT.as_secs()),
     };
     tracing::debug!(connection = %source.key.label(), error = %error, "shared {what} failed");
     *side_conn = None;
     None
-}
-
-/// Whether the source no longer runs `dump`, or `None` if it could not be
-/// asked.
-async fn dump_gone(
-    source: &SharedSource,
-    side_conn: &mut Option<Conn>,
-    params: &ReplicationParams,
-    dump: &super::binlog::DumpIdentity,
-) -> Option<bool> {
-    side_query(
-        source,
-        side_conn,
-        params,
-        "dump liveness query",
-        DUMP_LIVENESS_TIMEOUT,
-        async |conn| {
-            super::setup::fetch_dump_status(conn, dump.thread_id)
-                .await
-                .map(|status| dump.is_gone(status.server_id, status.uptime, status.dumps_with_id))
-        },
-    )
-    .await
 }
 
 /// Poll the source head over a lazily-maintained side connection, publish the
@@ -3056,7 +3016,6 @@ async fn poll_head_and_heartbeat(
         side_conn,
         params,
         "head poll",
-        HEAD_POLL_TIMEOUT,
         async |conn| super::setup::fetch_head_position(conn).await,
     )
     .await
@@ -3079,7 +3038,6 @@ async fn poll_head_and_heartbeat(
         side_conn,
         params,
         "source-clock query",
-        HEAD_POLL_TIMEOUT,
         async |conn| super::setup::fetch_source_now_ms(conn).await,
     )
     .await
