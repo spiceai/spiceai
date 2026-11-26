@@ -112,6 +112,53 @@ class SpicedDockerDevTest(unittest.TestCase):
         self.assertIs(attest["with"]["push-to-registry"], True)
         self.assertLess(names.index("Import images and create manifest"), names.index("Attest the image"))
 
+    def run_publish(self, ghcr_digest=None):
+        """The publish step with a stub docker: the job's registry holds the index this job made."""
+        job = yaml.safe_load((WORKFLOWS / "spiced_docker_dev.yml").read_text())["jobs"]["publish"]
+        step = next(s for s in job["steps"] if s.get("id") == "push")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "image-amd64.tar").write_text("")
+            (tmp / "bin").mkdir()
+            built = "sha256:" + "a" * 64
+            calls = tmp / "calls"
+            (tmp / "bin" / "docker").write_text(
+                "#!/usr/bin/env bash\n"
+                f'echo "$*" >> "{calls}"\n'
+                'if [ "$1 $2 $3" = "buildx imagetools inspect" ] && [ "${5:-}" = --format ]; then\n'
+                f'  case "$4" in localhost:5000/*) d="{built}" ;; *) d="{ghcr_digest or built}" ;; esac\n'
+                '  printf \'{"digest":"%s"}\\n\' "$d"\n'
+                "fi\n"
+            )
+            (tmp / "bin" / "docker").chmod(0o755)
+            output = tmp / "output"
+            output.write_text("")
+            script = step["run"].replace("/tmp/", f"{tmp}/")
+            env = {
+                **os.environ,
+                "PATH": f"{tmp / 'bin'}:{os.environ['PATH']}",
+                "GITHUB_OUTPUT": str(output),
+                "IMAGE_TAG": "trunk-0123456789ab",
+                "REL_VERSION": "2.5.0-unstable",
+            }
+            proc = subprocess.run(["bash", "-e", "-c", script], env=env, capture_output=True, text=True)
+            return proc, output.read_text(), calls.read_text().splitlines(), built
+
+    def test_the_attested_digest_is_the_index_this_job_built(self):
+        proc, output, calls, built = self.run_publish()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(output.strip(), f"digest={built}")
+        copy = [c for c in calls if c.startswith("buildx imagetools create") and "ghcr.io" in c]
+        self.assertEqual(len(copy), 1, calls)
+        self.assertTrue(copy[0].endswith(f"localhost:5000/spiceai@{built}"), copy[0])
+        self.assertIn("--prefer-index=false", copy[0])
+
+    def test_a_tag_another_run_pushed_meanwhile_fails_before_the_attestation(self):
+        proc, output, _, _ = self.run_publish(ghcr_digest="sha256:" + "b" * 64)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(output, "")
+        self.assertIn("another run pushed the same tag", proc.stdout + proc.stderr)
+
     def test_another_refs_run_builds_its_commit(self):
         proc, output = self.provenance("refs/heads/feature", self.feature)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)

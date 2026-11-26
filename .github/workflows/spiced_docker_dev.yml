@@ -480,17 +480,29 @@ jobs:
             exit 1
           fi
 
-          echo "Creating and pushing multi-arch manifest"
-          docker buildx imagetools create \
-            -t ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} \
-            -t ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}-${REL_VERSION} \
-            $sources
+          # The multi-arch index is made in this job's own registry first, so its digest is the
+          # digest of what this job built. It is then copied to ghcr.io as is, and the tag must
+          # name that digest once pushed: any workflow of this repository can push a tag there,
+          # so a digest read back from the tag alone could be another run's image.
+          echo "Creating the multi-arch manifest"
+          docker buildx imagetools create -t localhost:5000/spiceai:dev-index $sources
+          digest="$(docker buildx imagetools inspect localhost:5000/spiceai:dev-index --format '{{json .Manifest}}' | jq -r .digest)"
+          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not read the digest of the manifest this job built."
+            exit 1
+          fi
+
+          echo "Pushing $digest"
+          docker buildx imagetools create --prefer-index=false \
+            -t "ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}" \
+            -t "ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}-${REL_VERSION}" \
+            "localhost:5000/spiceai@${digest}"
 
           echo "Verifying image:"
-          docker buildx imagetools inspect ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}
-          digest="$(docker buildx imagetools inspect "ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}" --format '{{json .Manifest}}' | jq -r .digest)"
-          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::Could not read the digest of ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}."
+          docker buildx imagetools inspect "ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}"
+          pushed="$(docker buildx imagetools inspect "ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}" --format '{{json .Manifest}}' | jq -r .digest)"
+          if [ "$pushed" != "$digest" ]; then
+            echo "::error::ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} names ${pushed:-nothing}, not ${digest}, the manifest this job pushed; another run pushed the same tag."
             exit 1
           fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
