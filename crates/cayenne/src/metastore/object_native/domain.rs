@@ -675,7 +675,8 @@ impl Domain {
     /// read the writer's commits.
     pub async fn sidecar_value(&self, key: &str) -> CatalogResult<Option<Vec<u8>>> {
         let mut inner = self.read().await?;
-        inner.follow().await?;
+        let served = inner.revision;
+        inner.follow(served).await?;
         Ok(inner
             .reader
             .state
@@ -784,7 +785,8 @@ impl Domain {
         make: impl FnOnce() -> Vec<u8>,
     ) -> CatalogResult<Option<Vec<u8>>> {
         let mut inner = self.read().await?;
-        inner.follow().await?;
+        let served = inner.revision;
+        inner.follow(served).await?;
         let position = (key.to_string(), String::new());
         if let Some(value) = inner.reader.state.positions.get(&position) {
             return Ok(Some(value.clone()));
