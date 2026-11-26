@@ -1,4 +1,5 @@
 name: mysql-null-ordering
+duration: 21s
 tags: [long]
 description: Numeric NULL placement and window ranking agree with PostgreSQL across federation and acceleration.
 sources:

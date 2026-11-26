@@ -525,11 +525,12 @@ async fn initial(disk: &Disk, catalog: Arc<dyn MetadataCatalog>) -> Arc<CayenneT
         .expect("genesis sequence");
     assert_eq!(sequence, 1);
     table
-        .insert_to_new_snapshot_with_sequence(
+        .fold_inline_into_new_snapshot(
             single_batch_stream(batch(&[(0, 1), (1, 2)])),
             sequence,
             1,
             None,
+            &[],
         )
         .await
         .expect("genesis snapshot");
@@ -990,6 +991,18 @@ async fn mem_tier_model_replay_control_one_call() {
 async fn mem_tier_model_replay_control_capture_reservation() {
     control_witness(include_str!(
         "../../../../tests/traces/mem-tier-no-capture-reservation.jsonl"
+    ))
+    .await;
+}
+
+/// A bake prunes a key's delete from the in-memory index while its delete vector
+/// stays in the catalog; the key is upserted again with no delete of its own, and
+/// a second bake folds that row. The second bake's tag must stay at or above the
+/// pruned delete, or a restart reloads the vector and hides the row (#16706).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mem_tier_model_replay_control_pruned_floor() {
+    control_witness(include_str!(
+        "../../../../tests/traces/mem-tier-no-pruned-floor.jsonl"
     ))
     .await;
 }

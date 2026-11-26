@@ -1,8 +1,0 @@
-{
-  "cluster-cdc-ready": 37,
-  "cluster-dataset-writes": 40,
-  "cluster-executor-loss-cayenne": 42,
-  "cluster-failed-dataset-empties-others": 39,
-  "cluster-http-caching": 7,
-  "cluster-refresh-status": 40
-}

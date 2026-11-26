@@ -1,5 +1,6 @@
 # Known failing (#15544).
 name: mongodb-cdc-resume-numeric-id
+duration: 61s
 description: >
   A MongoDB collection whose _id is a NumberLong, followed by change streams
   into Cayenne, resumes after a clean restart from the token it persisted:

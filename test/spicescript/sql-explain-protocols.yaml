@@ -1,5 +1,6 @@
 {
   "name": "sql-explain-protocols",
+  "duration": "1s",
   "description": "Documented EXPLAIN options over Flight SQL and HTTP; metric text is execution-dependent.",
   "spicepod": {
     "version": "v1",

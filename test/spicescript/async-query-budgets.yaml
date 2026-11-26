@@ -1,4 +1,5 @@
 name: async-query-budgets
+duration: 158s
 description: >
   On a scheduler, each caller runs up to 64 async queries at once. Further
   queries wait as PENDING and start in submission order as running ones

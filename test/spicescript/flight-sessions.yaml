@@ -1,4 +1,5 @@
 name: flight-sessions
+duration: 6s
 description: >
   SQL PREPARE and EXECUTE over Flight SQL: a statement prepared in a session
   executes there with its arguments, as PostgreSQL answers with the values

@@ -29,7 +29,7 @@ data-accelerator-api = { path = "../../data-accelerator-api" }
 app = { path = "../../app" }
 cayenne = { path = "../../cayenne", features = ["partition-table-provider"] }
 data_components = { path = "../../data_components" }
-runtime-acceleration = { path = "../../runtime-acceleration", features = ["sqlite"] }
+runtime-acceleration = { path = "../../runtime-acceleration" }
 runtime-checkpoint-api = { path = "../../runtime-checkpoint-api" }
 runtime-component = { path = "../../runtime-component" }
 runtime-checkpoint-sqlite = { path = "../../runtime-checkpoint-sqlite" }
@@ -91,7 +91,7 @@ spice-table = { path = "../../spice-table" }
 insta.workspace = true
 tracing-subscriber.workspace = true
 tempfile.workspace = true
-runtime-acceleration = { path = "../../runtime-acceleration", features = ["sqlite", "test-support"] }
+runtime-acceleration = { path = "../../runtime-acceleration", features = ["test-support"] }
 datafusion-table-providers = { workspace = true, features = ["sqlite"] }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 # Reads the object-native metastore's head log in tests.

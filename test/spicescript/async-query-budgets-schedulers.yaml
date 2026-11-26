@@ -1,4 +1,5 @@
 name: async-query-budgets-schedulers
+duration: 10s
 description: >
   Each scheduler of a cluster keeps its own async query budget for a caller,
   in memory: two schedulers over one state location each run up to 64 of

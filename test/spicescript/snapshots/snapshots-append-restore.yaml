@@ -1,4 +1,5 @@
 name: snapshots-append-restore
+duration: 12s
 description: >
   An append acceleration restores on empty local storage with its source
   offline and remains queryable (#15463). Once the source returns,

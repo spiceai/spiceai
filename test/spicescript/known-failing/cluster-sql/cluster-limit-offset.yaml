@@ -2,6 +2,7 @@
 # round-robin repartition under the global limit and fails "does not satisfy
 # distribution requirements: SinglePartition".
 name: cluster-limit-offset
+duration: 43s
 description: >
   On a cluster, a query reading an ORDER BY … LIMIT … OFFSET subquery over a
   filtered Cayenne table answers as PostgreSQL does.

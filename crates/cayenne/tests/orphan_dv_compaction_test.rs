@@ -58,9 +58,9 @@ const SWEEP_MIN_FILES: usize = 20;
 /// trigger fires and each test drives the floor-advancing pass itself.
 const NO_AUTOMATIC_COMPACTION: usize = 1_000_000;
 
-test_with_backends!(bake_publication_schedules_orphan_dv_cleanup_impl);
-test_with_backends!(protected_subset_merge_schedules_orphan_dv_cleanup_impl);
-test_with_backends!(scheduled_cleanup_keeps_a_deletion_vector_still_needed_impl);
+test_on_data_store!(bake_publication_schedules_orphan_dv_cleanup_impl);
+test_on_data_store!(protected_subset_merge_schedules_orphan_dv_cleanup_impl);
+test_on_data_store!(scheduled_cleanup_keeps_a_deletion_vector_still_needed_impl);
 test_with_backends!(provider_open_replays_an_orphan_backlog_left_by_a_crash_impl);
 test_with_backends!(scheduled_cleanup_waits_for_the_orphan_threshold_impl);
 test_with_backends!(scheduled_cleanup_keeps_a_deletion_vector_the_cold_tier_needs_impl);
@@ -76,7 +76,6 @@ async fn bake_publication_schedules_orphan_dv_cleanup_impl(fixture: TestFixture)
     let table_name = "orphan_dv_bake";
     let ctx = SessionContext::new();
     let table = create_key_upsert_table(&fixture, table_name, ctx.runtime_env()).await?;
-    let base_dir = fixture.data_path.join(table_name);
 
     // One key, upserted repeatedly: every upsert but the first writes a key DV
     // that shadows the previous copy, and lands its own protected snapshot.
@@ -89,7 +88,7 @@ async fn bake_publication_schedules_orphan_dv_cleanup_impl(fixture: TestFixture)
         "precondition: more than the sweep threshold of key DVs exist, got {before}"
     );
     assert_eq!(
-        count_arrow_files(&base_dir),
+        count_arrow_files(&fixture, &table).await,
         before,
         "every catalog key-DV row has its .arrow file on disk before the bake"
     );
@@ -106,7 +105,7 @@ async fn bake_publication_schedules_orphan_dv_cleanup_impl(fixture: TestFixture)
         "the bake must schedule the orphaned-DV sweep: {before} key DVs before, {after} after"
     );
     assert_eq!(
-        count_arrow_files(&base_dir),
+        count_arrow_files(&fixture, &table).await,
         after,
         "reclaimed .arrow files must be unlinked, not just dropped from the catalog"
     );
@@ -128,7 +127,6 @@ async fn protected_subset_merge_schedules_orphan_dv_cleanup_impl(
     let table_name = "orphan_dv_subset";
     let ctx = SessionContext::new();
     let table = create_key_upsert_table(&fixture, table_name, ctx.runtime_env()).await?;
-    let base_dir = fixture.data_path.join(table_name);
 
     upsert_key(&fixture, &table, 1, 0..=SWEEP_MIN_FILES + 5).await?;
     quiesce(&table).await?;
@@ -163,7 +161,7 @@ async fn protected_subset_merge_schedules_orphan_dv_cleanup_impl(
          {after} after"
     );
     assert_eq!(
-        count_arrow_files(&base_dir),
+        count_arrow_files(&fixture, &table).await,
         after,
         "reclaimed .arrow files must be unlinked, not just dropped from the catalog"
     );
@@ -187,7 +185,6 @@ async fn scheduled_cleanup_keeps_a_deletion_vector_still_needed_impl(
     let table_name = "orphan_dv_needed";
     let ctx = SessionContext::new();
     let table = create_key_upsert_table(&fixture, table_name, ctx.runtime_env()).await?;
-    let base_dir = fixture.data_path.join(table_name);
 
     upsert_key(&fixture, &table, 1, 0..=SWEEP_MIN_FILES + 5).await?;
     quiesce(&table).await?;
@@ -228,7 +225,7 @@ async fn scheduled_cleanup_keeps_a_deletion_vector_still_needed_impl(
         "a DV above the surviving-sequence floor must be RETAINED, not swept"
     );
     assert_eq!(
-        count_arrow_files(&base_dir),
+        count_arrow_files(&fixture, &table).await,
         after,
         "the retained DV keeps its .arrow file; only the reclaimed ones are unlinked"
     );
@@ -266,7 +263,6 @@ async fn provider_open_replays_an_orphan_backlog_left_by_a_crash_impl(
     let table_name = "orphan_dv_startup";
     let ctx = SessionContext::new();
     let table = create_key_upsert_table(&fixture, table_name, ctx.runtime_env()).await?;
-    let base_dir = fixture.data_path.join(table_name);
 
     insert_row(&table, 1, 100).await?;
     quiesce(&table).await?;
@@ -297,7 +293,7 @@ async fn provider_open_replays_an_orphan_backlog_left_by_a_crash_impl(
         );
     }
     assert_eq!(
-        count_arrow_files(&base_dir),
+        count_arrow_files(&fixture, &table).await,
         0,
         "no orphaned .arrow file survives the startup replay"
     );
@@ -427,9 +423,6 @@ async fn create_key_upsert_table(
     table_name: &str,
     runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
 ) -> Result<Arc<CayenneTableProvider>, Box<dyn std::error::Error>> {
-    let table_dir = fixture.data_path.join(table_name);
-    std::fs::create_dir_all(&table_dir)?;
-
     let options = CreateTableOptions {
         table_name: table_name.to_string(),
         schema: table_schema(),
@@ -437,7 +430,7 @@ async fn create_key_upsert_table(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: table_dir.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config: parked_config(),
     };
@@ -445,8 +438,9 @@ async fn create_key_upsert_table(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     Ok(Arc::new(
-        CayenneTableProviderBuilder::new(catalog, runtime_env)
-            .create(options)
+        fixture
+            .data_store
+            .create(catalog, runtime_env, options)
             .await?,
     ))
 }
@@ -530,8 +524,9 @@ async fn reopen(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     Ok(Arc::new(
-        CayenneTableProviderBuilder::new(catalog, runtime_env)
-            .open(table_name)
+        fixture
+            .data_store
+            .open(catalog, runtime_env, table_name)
             .await?,
     ))
 }
@@ -554,9 +549,11 @@ async fn reopen_with_size_tier_merge_armed(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     Ok(Arc::new(
-        CayenneTableProviderBuilder::new(catalog, Arc::clone(&runtime_env))
-            .with_context(CayenneContext::new(&config, runtime_env, table_name))
-            .open(table_name)
+        fixture
+            .data_store
+            .open_with(catalog, Arc::clone(&runtime_env), table_name, |builder| {
+                builder.with_context(CayenneContext::new(&config, runtime_env, table_name))
+            })
             .await?,
     ))
 }
@@ -622,9 +619,7 @@ async fn seed_orphan_delete_files(
     sequence: i64,
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let table_id = table.metadata().table_id.clone();
-    let dir = fixture
-        .data_path
-        .join(table.metadata().table_name.clone())
+    let dir = Path::new(&table.metadata().path)
         .join(table.current_snapshot_id())
         .join("deletions");
     std::fs::create_dir_all(&dir)?;
@@ -675,24 +670,19 @@ fn write_empty_key_deletion_vector(path: &Path) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-/// Count `.arrow` deletion-vector files physically present anywhere under `root`.
-fn count_arrow_files(root: &Path) -> usize {
-    fn walk(dir: &Path, count: &mut usize) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.filter_map(std::result::Result::ok) {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, count);
-            } else if path.extension().is_some_and(|ext| ext == "arrow") {
-                *count += 1;
-            }
-        }
-    }
-    let mut count = 0;
-    walk(root, &mut count);
-    count
+/// Count the deletion vectors the store holds under the table's data path, once
+/// the files a table in the object-native location keeps for the data-file
+/// retention are deleted ([`common::reclaim_delayed_deletes`]).
+async fn count_arrow_files(fixture: &TestFixture, table: &CayenneTableProvider) -> usize {
+    common::reclaim_delayed_deletes(fixture, table).await;
+    fixture
+        .data_store
+        .list_files(&table.metadata().path)
+        .await
+        .expect("list the table's data path")
+        .iter()
+        .filter(|file| file.is_deletion_vector())
+        .count()
 }
 
 async fn read_ids(

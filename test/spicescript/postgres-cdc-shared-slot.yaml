@@ -1,4 +1,5 @@
 name: postgres-cdc-shared-slot
+duration: 50s
 tags: [long]
 description: >
   Datasets that name the same PostgreSQL replication slot share one replication

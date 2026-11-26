@@ -1,11 +1,14 @@
 name: graceful-shutdown
+duration: 49s
 tags: [long]
 description: >
   Under query load, with the source rewriting its rows every second and append
   refreshes running against them, `spiced` exits cleanly and promptly on
   SIGTERM, leaves a file acceleration it can reopen, and after a restart
   serves one row per key: the newest version (Cayenne keeps the newest by time
-  column whatever `on_conflict` says). Every query during the load succeeds.
+  column whatever `on_conflict` says), or with no primary key every version it
+  read, the newest of each key the source's. Every query during the load
+  succeeds. Keyed and indexed, keyed only, and indexed only.
 
 sources:
   src: { kind: postgres }
@@ -17,6 +20,11 @@ variants:
   default: {}
   # The spicepod as written, with the prototype object-native Cayenne metastore.
   object-native: object-native
+  # A primary key without an index, and indexes without a primary key: the
+  # appends then keep every version they read, and each key's newest is the
+  # source's.
+  primary-key-only: { datasets: { '*': { acceleration: { indexes: null } } } }
+  indexes-only: { datasets: { '*': { acceleration: { primary_key: null, on_conflict: null } } } }
 
 spicepod:
   version: v1
@@ -114,11 +122,74 @@ steps:
   - query: SELECT * FROM data_upsert
     oracle-sql: SELECT * FROM service_data
     eventually: 60s
+    except: indexes-only
   # Cayenne keeps each key's newest version whatever `on_conflict` says.
   - query: SELECT * FROM data_drop
     oracle-sql: SELECT * FROM service_data
     eventually: 60s
     when: { engine: cayenne }
+    except: indexes-only
+  # Without a primary key every version an append read is kept. The newest of
+  # each key is the source's row, whole and once; every stored version is one
+  # the source wrote (`initial`, or `round r` at 2025-01-01 + r seconds), with
+  # its other columns intact, and none twice; and each key's version loaded
+  # before the writer started is still there after the restart.
+  - query: >
+      SELECT d.id, d.data, d.date_created, d.date_updated FROM data_upsert d
+      JOIN (SELECT id, max(date_updated) AS newest FROM data_upsert GROUP BY id) n
+        ON d.id = n.id AND d.date_updated = n.newest
+    oracle-sql: SELECT * FROM service_data
+    eventually: 60s
+    only: indexes-only
+  # NULL-safe: a version with a NULL column counts as foreign, not unknown.
+  - query: >
+      SELECT count(*) AS foreign_versions FROM data_upsert
+      WHERE NOT coalesce(date_created = TIMESTAMP '2025-01-01'
+        AND ((data = 'initial ' || CAST(id AS VARCHAR) AND date_updated = TIMESTAMP '2025-01-01')
+          OR data = 'round ' || CAST(CAST(to_unixtime(date_updated) - to_unixtime(TIMESTAMP '2025-01-01') AS BIGINT) AS VARCHAR)
+                    || ' of ' || CAST(id AS VARCHAR)), false)
+    expect: { rows: [['0']] }
+    only: indexes-only
+  # Each key's pre-load version, once: compared as rows, not counted.
+  - query: SELECT id, data, date_created, date_updated FROM data_upsert WHERE data = 'initial ' || CAST(id AS VARCHAR)
+    oracle-sql: >
+      SELECT i AS id, 'initial ' || i AS data, TIMESTAMP '2025-01-01' AS date_created,
+        TIMESTAMP '2025-01-01' AS date_updated FROM generate_series(1, 100) AS i
+    only: indexes-only
+  # No version is stored twice.
+  - query: >
+      SELECT count(*) AS duplicated_versions FROM
+        (SELECT id, date_updated FROM data_upsert GROUP BY id, date_updated HAVING count(*) > 1) AS d
+    expect: { rows: [['0']] }
+    only: indexes-only
+  - query: >
+      SELECT d.id, d.data, d.date_created, d.date_updated FROM data_drop d
+      JOIN (SELECT id, max(date_updated) AS newest FROM data_drop GROUP BY id) n
+        ON d.id = n.id AND d.date_updated = n.newest
+    oracle-sql: SELECT * FROM service_data
+    eventually: 60s
+    only: indexes-only
+  # NULL-safe: a version with a NULL column counts as foreign, not unknown.
+  - query: >
+      SELECT count(*) AS foreign_versions FROM data_drop
+      WHERE NOT coalesce(date_created = TIMESTAMP '2025-01-01'
+        AND ((data = 'initial ' || CAST(id AS VARCHAR) AND date_updated = TIMESTAMP '2025-01-01')
+          OR data = 'round ' || CAST(CAST(to_unixtime(date_updated) - to_unixtime(TIMESTAMP '2025-01-01') AS BIGINT) AS VARCHAR)
+                    || ' of ' || CAST(id AS VARCHAR)), false)
+    expect: { rows: [['0']] }
+    only: indexes-only
+  # Each key's pre-load version, once: compared as rows, not counted.
+  - query: SELECT id, data, date_created, date_updated FROM data_drop WHERE data = 'initial ' || CAST(id AS VARCHAR)
+    oracle-sql: >
+      SELECT i AS id, 'initial ' || i AS data, TIMESTAMP '2025-01-01' AS date_created,
+        TIMESTAMP '2025-01-01' AS date_updated FROM generate_series(1, 100) AS i
+    only: indexes-only
+  # No version is stored twice.
+  - query: >
+      SELECT count(*) AS duplicated_versions FROM
+        (SELECT id, date_updated FROM data_drop GROUP BY id, date_updated HAVING count(*) > 1) AS d
+    expect: { rows: [['0']] }
+    only: indexes-only
   # A refresh in flight when SIGTERM arrives can log this as an ERROR,
   # though the shutdown is clean and no data is affected.
   - assert-log: { clean: true, allow: ['ERROR runtime_table::accelerated::refresh_task: Failed to provide stats on the amount of data written into data_(full|drop|upsert) *$'] }

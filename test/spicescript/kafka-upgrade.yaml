@@ -1,0 +1,137 @@
+name: kafka-upgrade
+duration: 161s
+description: >
+  Kafka ingestion resumes across an upgrade in place from each of the last two
+  releases: an append acceleration with no primary key gets every message
+  produced while the runtime was down, each once, resuming from the offsets
+  the release recorded. The messages the release consumed are deleted from the
+  topic before the upgrade, so a runtime that read the topic from its start
+  again would miss rows, and one that re-read them would duplicate them. With
+  the object-native metastore the acceleration loads from its source instead,
+  which holds only the messages the topic still retains: the release's rows
+  are gone, as the upgrade documents.
+
+matrix:
+  from: [2.3.x, 2.4.x]
+from: '${matrix.from}'
+
+sources:
+  kafka:
+    kind: docker
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.6
+    ports: [19092]
+    command: [redpanda, start, --smp, '1', --overprovisioned, --node-id, '0', --mode, dev-container,
+      --kafka-addr, 'internal://0.0.0.0:9092,external://0.0.0.0:19092',
+      --advertise-kafka-addr, 'internal://127.0.0.1:9092,external://127.0.0.1:${port.19092}']
+    ready: rpk cluster health | grep -E 'Healthy:.+true'
+  ref: { kind: postgres }
+
+variants:
+  sqlite: {}
+  object-native: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: kafka-upgrade
+  datasets:
+    - from: kafka:t_${sources.kafka.namespace}
+      name: t
+      params:
+        kafka_bootstrap_servers: 127.0.0.1:${sources.kafka.port.19092}
+        kafka_security_protocol: PLAINTEXT
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: append }
+
+defaults:
+  expect: { oracle: ref }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      kafka: >-
+        rpk topic create t_${sources.kafka.namespace} -p 3 &&
+        for g in $(seq 1 300); do echo "{\"id\": $g, \"s\": \"v$g\"}"; done | rpk topic produce t_${sources.kafka.namespace}
+  - source-exec:
+      ref: >-
+        CREATE TABLE t (id bigint, s text);
+        INSERT INTO t SELECT g, 'v' || g FROM generate_series(1, 300) g;
+  - start: {}
+  - query: SELECT id, s FROM t
+    oracle-sql: SELECT id, s FROM t
+    eventually: 60s
+
+  # Down: the consumed messages leave the topic, and new ones arrive.
+  - stop: {}
+  - source-exec:
+      kafka: >-
+        for p in 0 1 2; do
+          end=$(rpk topic describe t_${sources.kafka.namespace} -p | awk -v p=$p '$1 == p { print $NF }');
+          rpk topic trim-prefix t_${sources.kafka.namespace} -p $p -o $end --no-confirm || exit 1;
+        done &&
+        for g in $(seq 301 350); do echo "{\"id\": $g, \"s\": \"while down\"}"; done | rpk topic produce t_${sources.kafka.namespace}
+  - source-exec:
+      ref: INSERT INTO t SELECT g, 'while down' FROM generate_series(301, 350) g;
+  - upgrade: {}
+  - query: SELECT id, s FROM t
+    oracle-sql: SELECT id, s FROM t
+    eventually: 60s
+    except: object-native
+  - query: SELECT id, s FROM t
+    oracle-sql: SELECT id, s FROM t WHERE id > 300
+    eventually: 60s
+    only: object-native
+
+  # And the upgraded runtime keeps following.
+  - source-exec:
+      kafka: >-
+        for g in $(seq 351 360); do echo "{\"id\": $g, \"s\": \"after\"}"; done | rpk topic produce t_${sources.kafka.namespace}
+  - source-exec: { ref: "INSERT INTO t SELECT g, 'after' FROM generate_series(351, 360) g" }
+  - query: SELECT id, s FROM t
+    oracle-sql: SELECT id, s FROM t
+    eventually: 30s
+    except: object-native
+  - query: SELECT id, s FROM t
+    oracle-sql: SELECT id, s FROM t WHERE id > 300
+    eventually: 30s
+    only: object-native
+
+  # Moved to SQLite and back: the flag off with `mode: file_create`, then the
+  # flag on again, where the dataset's earlier object-native table was dropped.
+  # The new table loads every message the topic retains, rather than resuming
+  # from the offsets the dropped table left, and a restart then resumes from
+  # its own, duplicating nothing.
+  - restart:
+      patch:
+        spicepod: { runtime: { params: { cayenne_vnext: disabled } } }
+        datasets: { t: { acceleration: { mode: file_create } } }
+    only: object-native
+  - query: SELECT id, s FROM t
+    oracle-sql: SELECT id, s FROM t WHERE id > 300
+    eventually: 60s
+    only: object-native
+  - stop: {}
+    only: object-native
+  - source-exec:
+      kafka: >-
+        for g in $(seq 361 370); do echo "{\"id\": $g, \"s\": \"moved back\"}"; done | rpk topic produce t_${sources.kafka.namespace}
+    only: object-native
+  - source-exec: { ref: "INSERT INTO t SELECT g, 'moved back' FROM generate_series(361, 370) g" }
+    only: object-native
+  - restart:
+      patch:
+        spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+        datasets: { t: { acceleration: { mode: file } } }
+    only: object-native
+  - query: SELECT id, s FROM t
+    oracle-sql: SELECT id, s FROM t WHERE id > 300
+    eventually: 60s
+    only: object-native
+  - restart: {}
+    only: object-native
+  - query: SELECT id, s FROM t
+    oracle-sql: SELECT id, s FROM t WHERE id > 300
+    eventually: 30s
+    only: object-native
+  - query: SELECT count(*) - count(DISTINCT id) AS duplicates FROM t
+    expect: { rows: [['0']] }
+    only: object-native

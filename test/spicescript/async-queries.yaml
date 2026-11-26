@@ -1,4 +1,5 @@
 name: async-queries
+duration: 21s
 description: >
   On a cluster, an async query (`POST /v1/queries`) is held to
   `runtime.query.timeout` like every other query the runtime's APIs run: a

@@ -1,4 +1,5 @@
 name: tool-results
+duration: 11s
 description: >
   The data tools (`sql`, `random_sample`, `top_n_sample`,
   `sample_distinct_columns`) return `{"columns": [...], "rows": [[...]]}`
