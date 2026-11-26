@@ -84,14 +84,16 @@ entry itself as `(Get-Content … | ConvertFrom-Json).'<name>'`, names its targe
   MinIO no longer serves mc (dl.min.io answers 410 for every release and checksum), so the
   source is the copy on `public-data.spiceai.org`, and the SHA-256 is the one MinIO's own
   Homebrew tap lists for that release (`mc.rb` in `minio/homebrew-stable`, commit
-  `e17bb437a50742ecd571b5ce0c1c72e05baa1487`); the mirror's file matches it. `setup-minio`'s
-  macOS (Homebrew) and Windows (dl.min.io) steps are unchanged: no source serves a pinnable
-  build for either any more, and no job runs the action there.
+  `e17bb437a50742ecd571b5ce0c1c72e05baa1487`); the mirror's file matches it. Each job
+  installs it into a new directory of its own under `RUNNER_TEMP`, first on PATH, whatever
+  mc the runner already has. No source serves a pinnable macOS or Windows build any more,
+  so `setup-minio` refuses to run there, and no job runs it there.
 - **`sccache`**: the compiler cache `setup-sccache` installs on Linux x86_64 (the musl
   archive) and Windows (the MSVC zip), with the SHA-256s the release publishes beside each
-  asset (`<asset>.sha256`). The target names the asset, extension included. On another Linux
-  architecture sccache stays uninstalled and the pre-flight turns the cache off, as it did
-  when the x86_64 binary failed to run there. The self-hosted Macs use the sccache their
+  asset (`<asset>.sha256`). The target names the asset, extension included. On Linux each job
+  installs it into a new directory of its own, first on PATH, so `RUSTC_WRAPPER=sccache` is
+  always the pinned binary. On another Linux architecture the job compiles uncached and
+  nothing runs sccache, whatever the runner has. The self-hosted Macs use the sccache their
   hosts carry.
 - **`protoc`**: one protobuf release for every platform `install-protoc` supports (Linux
   x86_64, aarch64, s390x and ppc64le, macOS x86_64 and arm64, Windows 64- and 32-bit). The
@@ -116,9 +118,11 @@ entry itself as `(Get-Content … | ConvertFrom-Json).'<name>'`, names its targe
   download from the release's own versioned URL (for Athena, the download's MD5 also matches
   the S3 ETag the server reports).
 - **`awscli`**: AWS CLI v2 2.40.1 for Linux x86_64, from its versioned URL
-  (`awscli-exe-linux-x86_64-<version>.zip`), for `setup-spicescript`, `spicescript_dispatch.yml`
-  and `testoperator_run_cluster_bench_aws.yml`, which used to install whatever the unversioned
-  URL served. 2.40.1 was the newest release at least two weeks old when it was pinned. The
+  (`awscli-exe-linux-x86_64-<version>.zip`), installed by `install-aws-cli` for
+  `setup-spicescript`, `spicescript_dispatch.yml` and `testoperator_run_cluster_bench_aws.yml`,
+  which used to install whatever the unversioned URL served. Each job installs it into a new
+  directory of its own, first on PATH, whatever aws the runner already has. The action reads
+  its own copy of the pin, so a workflow called at `@trunk` installs trunk's. 2.40.1 was the newest release at least two weeks old when it was pinned. The
   zip's `.sig` verifies with the AWS CLI team's key (fingerprint
   `FB5D B77F D5C1 18B8 0511 ADA8 A631 0ACC 4672 475C`, as AWS's install guide lists it); to
   bump it, verify the new zip the same way, in a throwaway `GNUPGHOME`, and pin its SHA-256.
@@ -128,8 +132,8 @@ entry itself as `(Get-Content … | ConvertFrom-Json).'<name>'`, names its targe
   `test/tpc-bench/Makefile` pins the v2.0.0 CLI archives its TPC-H generator downloads in
   its own `case` arms the same way, and `check_ci_cache_pins.py` requires a SHA-256 in each.
 - **`github-cli-keyring`**: the apt keyring of GitHub CLI's package repository, which
-  `push-snap-changes` and the bench, schema and cluster bench workflows install before
-  `apt install gh`. The SHA-256 is the one GitHub publishes for the binary keyring in
+  `install-gh-cli` (for `push-snap-changes` and the bench, schema and cluster bench
+  workflows) installs before `apt install gh`, from the action's own copy of the pin. The SHA-256 is the one GitHub publishes for the binary keyring in
   `docs/install_linux.md` of `cli/cli`; the file holds the keys `2C61 0620 1985 B60E 6C7A C873
   23F3 D4EA 7571 6059` and `7F38 BBB5 9D06 4DBC B3D8 4D72 5612 B364 6231 3325`, the
   fingerprints that page lists, and the repository is signed by the second. When GitHub

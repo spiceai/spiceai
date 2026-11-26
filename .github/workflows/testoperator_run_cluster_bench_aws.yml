@@ -284,15 +284,7 @@ jobs:
 
       - name: Install AWS CLI
         if: env.CB_COMPUTE == 'ec2'
-        run: |
-          if ! command -v aws &> /dev/null; then
-            # The AWS CLI release pinned in .github/ci-cache/pins.json, checked against its SHA-256.
-            bash .github/scripts/fetch_pinned.sh awscli /tmp/awscliv2.zip
-            unzip -q /tmp/awscliv2.zip -d /tmp
-            sudo /tmp/aws/install
-            rm -rf /tmp/awscliv2.zip /tmp/aws
-          fi
-          aws --version
+        uses: $/.github/actions/install-aws-cli
 
       # Credentials must outlast every image's run and its teardown, so they
       # match the job timeout rather than the 1-hour default.
@@ -589,21 +581,7 @@ jobs:
 
       - name: Install gh CLI
         if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
-        run: |
-          if command -v gh >/dev/null 2>&1; then
-            echo "gh already installed"
-            exit 0
-          fi
-          # The keyring's SHA-256 is pinned in .github/ci-cache/pins.json, as GitHub publishes it.
-          sudo mkdir -p -m 755 /etc/apt/keyrings
-          out=$(mktemp)
-          bash .github/scripts/fetch_pinned.sh github-cli-keyring "$out"
-          cat "$out" | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null
-          sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-            | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-          sudo apt update
-          sudo apt install gh -y
+        uses: $/.github/actions/install-gh-cli
 
       - name: Open snapshot-update PR
         # Writes to the repository: only with the full CI roles.

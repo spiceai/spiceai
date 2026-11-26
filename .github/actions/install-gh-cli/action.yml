@@ -1,0 +1,27 @@
+name: Install the GitHub CLI
+description: >-
+  Install gh from GitHub's apt repository, trusted through the keyring whose SHA-256
+  .github/ci-cache/pins.json pins as GitHub publishes it, unless the runner already has gh.
+  The pin and the helper come from this action's own copy of the repository, so a workflow
+  called at @trunk uses trunk's pin whatever commit it checked out.
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install the GitHub CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        if command -v gh >/dev/null 2>&1; then
+          echo "gh is already installed: $(gh --version | head -1)"
+          exit 0
+        fi
+        out="$(mktemp "${RUNNER_TEMP:?RUNNER_TEMP is not set}/githubcli-keyring.XXXXXX")"
+        bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" github-cli-keyring "$out"
+        sudo mkdir -p -m 755 /etc/apt/keyrings /etc/apt/sources.list.d
+        sudo install -m 0644 "$out" /etc/apt/keyrings/githubcli-archive-keyring.gpg
+        rm -f "$out"
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+          | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+        sudo apt-get update
+        sudo apt-get install -y gh

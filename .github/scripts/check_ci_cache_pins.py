@@ -53,18 +53,9 @@ FETCHED_PINS = {
     "oracle-instantclient": (".github/actions/setup-oracle-odpi/action.yml",),
     "simba-spark-odbc": (".github/actions/setup-odbc/action.yml",),
     "athena-odbc": (".github/actions/setup-odbc/action.yml",),
-    "awscli": (
-        ".github/actions/setup-spicescript/action.yml",
-        ".github/workflows/spicescript_dispatch.yml",
-        ".github/workflows/testoperator_run_cluster_bench_aws.yml",
-    ),
+    "awscli": (".github/actions/install-aws-cli/action.yml",),
     "duckdb-cli": (".github/actions/setup-spicescript/action.yml", ".github/workflows/spicescript_dispatch.yml"),
-    "github-cli-keyring": (
-        ".github/actions/push-snap-changes/action.yml",
-        ".github/workflows/testoperator_run_bench_aws.yml",
-        ".github/workflows/testoperator_run_schema_aws.yml",
-        ".github/workflows/testoperator_run_cluster_bench_aws.yml",
-    ),
+    "github-cli-keyring": (".github/actions/install-gh-cli/action.yml",),
 }
 # Single-file pins a workflow writes out inline instead, with `sha256sum -c`: the file must
 # name the pin's URL and SHA-256 and check every download of that URL. Used where the

@@ -1,0 +1,27 @@
+name: Install the AWS CLI
+description: >-
+  Install the AWS CLI release pinned in .github/ci-cache/pins.json, checked against its
+  SHA-256, into a new directory of the job's own, first on PATH for the rest of the job. An
+  aws already on the runner is never what the job runs. The pin and the helper come from
+  this action's own copy of the repository, so a workflow called at @trunk installs trunk's
+  pin whatever commit it checked out.
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install the AWS CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ "$(uname -s)" != Linux ]; then
+          echo "::error::install-aws-cli installs the Linux build pinned in .github/ci-cache/pins.json; run this job on Linux."
+          exit 1
+        fi
+        command -v unzip >/dev/null || { sudo apt-get update && sudo apt-get install -y unzip; }
+        dir="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/awscli.XXXXXX")"
+        bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" awscli "$dir/awscliv2.zip"
+        unzip -q "$dir/awscliv2.zip" -d "$dir/src"
+        "$dir/src/aws/install" --install-dir "$dir/aws-cli" --bin-dir "$dir/bin"
+        rm -rf "$dir/awscliv2.zip" "$dir/src"
+        echo "$dir/bin" >> "$GITHUB_PATH"
+        "$dir/bin/aws" --version

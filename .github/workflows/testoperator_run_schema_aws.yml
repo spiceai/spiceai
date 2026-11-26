@@ -455,15 +455,7 @@ jobs:
           INPUT_MIN_TABLES: ${{ inputs.min_tables }}
 
       - name: Install GH CLI
-        run: |
-          # The keyring's SHA-256 is pinned in .github/ci-cache/pins.json, as GitHub publishes it.
-          sudo mkdir -p -m 755 /etc/apt/keyrings \
-          && out=$(mktemp) && bash .github/scripts/fetch_pinned.sh github-cli-keyring "$out" \
-          && cat "$out" | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
-          && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
-          && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-          && sudo apt update \
-          && sudo apt install gh -y
+        uses: $/.github/actions/install-gh-cli
 
       - name: Upload schema snapshots to branch
         # Writes to the repository: only with the full CI roles.

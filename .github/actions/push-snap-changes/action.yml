@@ -16,21 +16,8 @@ runs:
   using: 'composite'
   steps:
     - name: Install GH CLI if not installed
-      shell: bash
-      run: |
-        if ! command -v gh &> /dev/null; then
-          # The keyring's SHA-256 is pinned in .github/ci-cache/pins.json, as GitHub publishes it.
-          sudo mkdir -p -m 755 /etc/apt/keyrings \
-            && out=$(mktemp) && bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" github-cli-keyring "$out" \
-            && cat "$out" | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
-            && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
-            && sudo mkdir -p -m 755 /etc/apt/sources.list.d \
-            && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-            && sudo apt update \
-            && sudo apt install gh -y
-        else
-          echo "GH CLI is already installed"
-        fi
+      uses: $/.github/actions/install-gh-cli
+
     - name: Upload snapshots to branch
       shell: bash
       run: |

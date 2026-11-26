@@ -20,19 +20,16 @@ inputs:
 runs:
   using: 'composite'
   steps:
+    # Every job runs the mc release pinned in .github/ci-cache/pins.json, checked against
+    # its SHA-256 by .github/scripts/cached_fetch.sh (which also retries a failure of the
+    # network or the server) and installed into a new directory of the job's own, first on
+    # PATH. An mc already on the runner is never what a job runs. dl.min.io no longer
+    # serves mc, so the pin's source is a mirror, which holds the Linux x86_64 build only.
     - name: Install MinIO on Linux
       shell: bash
       if: runner.os == 'Linux'
       run: |
         set -euo pipefail
-        if command -v mc >/dev/null 2>&1; then
-          exit 0
-        fi
-
-        # The mc release pinned in .github/ci-cache/pins.json, checked against its SHA-256
-        # by .github/scripts/cached_fetch.sh, which also retries a failure of the network
-        # or the server. dl.min.io no longer serves mc, so the pin's source is a mirror,
-        # which holds the Linux x86_64 build only.
         case "$(uname -m)" in
           x86_64) target=linux-amd64 ;;
           *)
@@ -40,35 +37,25 @@ runs:
             exit 1
             ;;
         esac
-        dir="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/mc.XXXXXX")"
+        dir="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/mc.XXXXXX")"
         bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" mc "$dir/mc" "$target"
-        sudo install -m 0755 "$dir/mc" /usr/local/bin/mc
-        rm -rf "$dir"
+        chmod 0755 "$dir/mc"
+        echo "$dir" >> "$GITHUB_PATH"
 
-    - name: Install MinIO on macOS
+    - name: Refuse a MinIO client that is not pinned
+      if: runner.os != 'Linux'
       shell: bash
-      if: runner.os == 'macOS'
       run: |
-        brew update
-        brew install minio/stable/mc
-
-    - name: Install MinIO on Windows
-      if: runner.os == 'Windows'
-      shell: pwsh
-      run: |
-        $ErrorActionPreference = 'Stop'
-        $mcPath = "$env:USERPROFILE\mc"
-        New-Item -ItemType Directory -Force -Path $mcPath | Out-Null
-        Invoke-WebRequest -Uri "https://dl.min.io/client/mc/release/windows-amd64/mc.exe" -OutFile "$mcPath\mc.exe"
-        echo "$mcPath" >> $env:GITHUB_PATH
+        echo "::error::.github/ci-cache/pins.json pins a MinIO client for Linux x86_64 only, and no source serves a $RUNNER_OS build to pin; run this job on Linux."
+        exit 1
 
     # Read through `env` rather than interpolating `${{ }}` into the script, so a
     # value containing shell metacharacters stays a value. A run that cannot read
     # the repository's Actions secrets (a Dependabot or fork pull request) passes
     # all three empty, and mc then fails with only "Incorrect number of
     # arguments", so name that cause instead.
-    - name: Set MinIO alias (Linux/macOS)
-      if: runner.os != 'Windows'
+    - name: Set MinIO alias
+      if: runner.os == 'Linux'
       shell: bash
       env:
         MINIO_ENDPOINT: ${{ inputs.minio_endpoint }}
@@ -96,31 +83,3 @@ runs:
         else
           mc alias set spice-minio "$MINIO_ENDPOINT" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
         fi
-
-    - name: Set MinIO alias (Windows)
-      if: runner.os == 'Windows'
-      shell: pwsh
-      env:
-        MINIO_ENDPOINT: ${{ inputs.minio_endpoint }}
-        MINIO_ACCESS_KEY: ${{ inputs.minio_access_key }}
-        MINIO_SECRET_KEY: ${{ inputs.minio_secret_key }}
-        MINIO_SESSION_TOKEN: ${{ inputs.minio_session_token }}
-      run: |
-        $ErrorActionPreference = 'Stop'
-        $missing = @('MINIO_ENDPOINT', 'MINIO_ACCESS_KEY', 'MINIO_SECRET_KEY') | Where-Object { -not [Environment]::GetEnvironmentVariable($_) }
-        if ($missing) {
-          Write-Output "::error::setup-minio received an empty $(($missing | ForEach-Object { $_.ToLower() }) -join ' '). The secrets that feed these inputs are not available to this run (event: $env:GITHUB_EVENT_NAME, actor: $env:GITHUB_ACTOR); Dependabot and fork pull requests cannot read the repository's Actions secrets. Rerun from a branch of this repository, or dispatch the workflow."
-          exit 1
-        }
-        if ($env:MINIO_SESSION_TOKEN) {
-          # Appended to $GITHUB_ENV as NAME=value: a newline would inject more entries.
-          if (@($env:MINIO_ENDPOINT, $env:MINIO_ACCESS_KEY, $env:MINIO_SECRET_KEY, $env:MINIO_SESSION_TOKEN) -match "[`r`n]") {
-            Write-Output "::error::setup-minio: MinIO inputs must not contain a newline"
-            exit 1
-          }
-          $scheme, $hostPort = $env:MINIO_ENDPOINT -split '://', 2
-          "MC_HOST_spice-minio=${scheme}://$($env:MINIO_ACCESS_KEY):$($env:MINIO_SECRET_KEY):$($env:MINIO_SESSION_TOKEN)@${hostPort}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-        } else {
-          $mcExePath = Join-Path $env:USERPROFILE 'mc\mc.exe'
-          & $mcExePath alias set spice-minio $env:MINIO_ENDPOINT $env:MINIO_ACCESS_KEY $env:MINIO_SECRET_KEY
-        }

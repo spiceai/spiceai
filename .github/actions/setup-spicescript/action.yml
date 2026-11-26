@@ -78,25 +78,21 @@ runs:
 
     # Object-store sources (rustfs) are managed with the aws CLI.
     - name: Install the AWS CLI
-      shell: bash
-      run: |
-        command -v unzip >/dev/null || { sudo apt-get update && sudo apt-get install -y unzip; }
-        if ! command -v aws >/dev/null; then
-          # The AWS CLI release pinned in .github/ci-cache/pins.json, checked against its SHA-256.
-          bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" awscli "$RUNNER_TEMP/awscliv2.zip"
-          unzip -q "$RUNNER_TEMP/awscliv2.zip" -d "$RUNNER_TEMP"
-          sudo "$RUNNER_TEMP/aws/install"
-        fi
+      uses: $/.github/actions/install-aws-cli
 
     # Iceberg sources and dbgen write and read through the DuckDB CLI. The
     # DuckLake source fetches the release matching spiced's embedded DuckDB.
     - name: Install DuckDB CLI
       shell: bash
       run: |
-        # DuckDB CLI v1.5.5, pinned in .github/ci-cache/pins.json and checked against its SHA-256.
-        bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" duckdb-cli "$RUNNER_TEMP/duckdb.zip"
-        unzip -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
-        echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
+        set -euo pipefail
+        # DuckDB CLI v1.5.5, pinned in .github/ci-cache/pins.json and checked against its
+        # SHA-256, unpacked into a new directory of the job's own.
+        dir="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/duckdb.XXXXXX")"
+        bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" duckdb-cli "$dir/duckdb.zip"
+        unzip -q "$dir/duckdb.zip" -d "$dir/bin"
+        rm -f "$dir/duckdb.zip"
+        echo "$dir/bin" >> "$GITHUB_PATH"
 
     # The search and embedding scripts download a Hub model at startup. Without
     # a token they share the pool's anonymous per-IP quota, and a rate limit fails

@@ -28,6 +28,7 @@ on:
       - '.github/scripts/test_fetch_pinned.py'
       - '.github/scripts/test_pinned_checkouts.py'
       - '.github/scripts/test_install_protoc.py'
+      - '.github/scripts/test_pinned_tools.py'
       - '.github/scripts/rustfs_credentials.sh'
       - '.github/scripts/test_rustfs_credentials.py'
       - '.github/scripts/rust_dist_mirror.py'
@@ -86,6 +87,7 @@ on:
       - '.github/scripts/test_fetch_pinned.py'
       - '.github/scripts/test_pinned_checkouts.py'
       - '.github/scripts/test_install_protoc.py'
+      - '.github/scripts/test_pinned_tools.py'
       - '.github/scripts/rustfs_credentials.sh'
       - '.github/scripts/test_rustfs_credentials.py'
       - '.github/scripts/rust_dist_mirror.py'
@@ -171,6 +173,7 @@ jobs:
           python .github/scripts/test_fetch_pinned.py -v
           python .github/scripts/test_pinned_checkouts.py -v
           python .github/scripts/test_install_protoc.py -v
+          python .github/scripts/test_pinned_tools.py -v
           python .github/scripts/test_rustfs_credentials.py -v
           python .github/scripts/test_rust_dist_mirror.py -v
           python .github/scripts/test_ci_role.py -v

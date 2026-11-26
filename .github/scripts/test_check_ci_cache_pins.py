@@ -306,11 +306,11 @@ class CheckCiCachePinsTest(unittest.TestCase):
         result = self.run_check()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("github-cli-keyring", result.stdout)
-        path = self.tmp / ".github/actions/push-snap-changes/action.yml"
+        path = self.tmp / ".github/actions/install-gh-cli/action.yml"
         path.write_text(path.read_text().replace('fetch_pinned.sh" github-cli-keyring "$out"', 'wget" -O"$out" x'))
         result = self.run_check()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("push-snap-changes/action.yml does not download github-cli-keyring", result.stdout)
+        self.assertIn("install-gh-cli/action.yml does not download github-cli-keyring", result.stdout)
 
     def test_the_docker_apt_key_is_checked_inline_against_its_pin(self):
         result = self.run_check()

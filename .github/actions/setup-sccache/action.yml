@@ -134,27 +134,39 @@ runs:
       uses: $/.github/actions/configure-apt
 
     - name: Set up sccache (Linux)
+      id: linux
       if: runner.os == 'Linux' && inputs.minio_endpoint != ''
       shell: bash
       env:
         INPUT_MINIO_ENDPOINT: ${{ inputs.minio_endpoint }}
       run: |
+        set -eo pipefail
         # The sccache release pinned in .github/ci-cache/pins.json, checked against its
-        # SHA-256 before anything is extracted. It pins the x86_64 build only; elsewhere
-        # sccache stays uninstalled, and the pre-flight below turns the cache off.
+        # SHA-256 before anything is extracted, and installed into a new directory of the
+        # job's own, first on PATH: an sccache already on the runner is never what wraps
+        # rustc. It pins the x86_64 build only; elsewhere the job compiles uncached, and
+        # nothing runs sccache.
         case "$(uname -m)" in
           x86_64) target=x86_64-unknown-linux-musl.tar.gz ;;
           *) target='' ;;
         esac
-        if [ -n "$target" ]; then
-          dir="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/sccache.XXXXXX")"
-          bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" sccache "$dir/sccache.tar.gz" "$target"
-          tar -xzf "$dir/sccache.tar.gz" -C "$dir"
-          sudo install -m 0755 "$dir"/sccache-v*/sccache /usr/local/bin/sccache
-          rm -rf "$dir"
-        else
+        if [ -z "$target" ]; then
           echo "::warning::.github/ci-cache/pins.json pins no sccache for Linux $(uname -m); building without the compiler cache."
+          {
+            echo "RUSTC_WRAPPER="
+            echo "SCCACHE_SETUP=false"
+          } >> "$GITHUB_ENV"
+          echo "installed=false" >> "$GITHUB_OUTPUT"
+          exit 0
         fi
+        dir="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/sccache.XXXXXX")"
+        bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" sccache "$dir/sccache.tar.gz" "$target"
+        mkdir "$dir/bin"
+        tar -xzf "$dir/sccache.tar.gz" -C "$dir"
+        install -m 0755 "$dir"/sccache-v*/sccache "$dir/bin/sccache"
+        rm -rf "$dir/sccache.tar.gz" "$dir"/sccache-v*
+        echo "$dir/bin" >> "$GITHUB_PATH"
+        echo "installed=true" >> "$GITHUB_OUTPUT"
         echo "SCCACHE_CACHE_SIZE=4T" >> $GITHUB_ENV
         : "${SCCACHE_CONF:=${RUNNER_TEMP}/sccache/config}"
         mkdir -p "$(dirname "${SCCACHE_CONF}")"
@@ -247,7 +259,7 @@ runs:
         $config | Out-File -FilePath $configPath -Encoding utf8
 
     - name: Confirm the compiler cache answers before wrapping rustc
-      if: (runner.os == 'Linux' && inputs.minio_endpoint != '') || (runner.os == 'macOS' && (inputs.minio_endpoint != '' || inputs.spiceio_endpoint != ''))
+      if: (runner.os == 'Linux' && inputs.minio_endpoint != '' && steps.linux.outputs.installed == 'true') || (runner.os == 'macOS' && (inputs.minio_endpoint != '' || inputs.spiceio_endpoint != ''))
       shell: bash
       # Invoked through `bash` rather than as `./…` so the step does not depend on
       # the script's executable bit surviving a checkout on every platform. The probe
