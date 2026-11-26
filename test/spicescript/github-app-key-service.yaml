@@ -1,4 +1,5 @@
 name: github-app-key-service
+duration: 130s
 tags: [long]
 description: >
   A GitHub App whose private key a key service holds: a dataset with

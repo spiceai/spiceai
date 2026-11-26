@@ -1,4 +1,5 @@
 name: cayenne-vnext
+duration: 11s
 tags: [long]
 description: >
   `runtime.params.cayenne_vnext: enabled` puts every Cayenne dataset on the

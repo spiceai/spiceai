@@ -11,8 +11,9 @@
 #         tag            the release tag, e.g. v2.4.2
 #         version        the tag without its v, as the installers take it
 #         sums           yes when the release publishes SHA256SUMS, otherwise no
-#         api_requests   the GitHub API requests one install of it makes: the latest release
-#                        lookup, and the release's asset list when it has no SHA256SUMS
+#         api_requests   the GitHub API requests one install of it makes: the release's asset
+#                        list when it has no SHA256SUMS, and none when it has one (the latest
+#                        release comes from the github.com redirect, not the API)
 #         cli_asset, runtime_asset   the release assets the installers download on this runner
 #   install-release-check.sh budget <requests>
 #       Asks GitHub, with no token, how many API requests this runner's address has left, which
@@ -53,7 +54,7 @@ release() {
         echo "tag=$tag"
         echo "version=${tag#v}"
         echo "sums=$sums"
-        if [[ "$sums" == yes ]]; then echo "api_requests=1"; else echo "api_requests=2"; fi
+        if [[ "$sums" == yes ]]; then echo "api_requests=0"; else echo "api_requests=1"; fi
         if [[ "$os" == windows ]]; then
             echo "cli_asset=spice.exe_windows_x86_64.tar.gz"
         else

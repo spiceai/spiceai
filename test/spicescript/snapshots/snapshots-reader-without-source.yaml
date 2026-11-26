@@ -1,4 +1,5 @@
 name: snapshots-reader-without-source
+duration: 206s
 description: >
   A reader with refresh_mode: snapshot follows a writer through the snapshot
   store alone when its original source table is missing, its credentials are

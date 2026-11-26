@@ -1,5 +1,6 @@
 # Regression test for #16625.
 name: postgres-cdc-replay-after-reconnect
+duration: 669s
 tags: [long]
 description: >
   Spice re-establishes a PostgreSQL replication connection when it drops, and

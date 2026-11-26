@@ -1,4 +1,5 @@
 name: qualified-outer-reference
+duration: 7s
 description: >
   A schema-qualified outer reference keeps its binding when an intermediate
   subquery has a bare alias with the same table name. PostgreSQL resolves the

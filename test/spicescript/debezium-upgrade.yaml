@@ -1,4 +1,5 @@
 name: debezium-upgrade
+duration: 86s
 description: >
   Debezium change capture (PostgreSQL through Kafka) resumes across an upgrade
   in place from each of the last two releases: a `refresh_mode: changes`

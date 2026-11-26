@@ -380,6 +380,19 @@ impl From<ChangeBatchError> for StreamError {
     }
 }
 
+/// Stands in for a source value in a decode error, showing only its length.
+///
+/// Change-stream rows can hold credentials, and stream errors are logged
+/// verbatim, so decode errors name the column and the kind of failure but
+/// never quote the value. Format it with `{:?}`.
+pub struct RedactedValue(pub usize);
+
+impl std::fmt::Debug for RedactedValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{}-byte value not shown>", self.0)
+    }
+}
+
 impl std::fmt::Display for StreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

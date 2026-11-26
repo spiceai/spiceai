@@ -2,6 +2,7 @@
 # accelerations fail with "executor_table: table 'orders' must be
 # catalog-qualified" (8 of the 22 queries).
 name: cluster-tpch-joins
+duration: 48s
 description: >
   On a cluster scheduler with one executor, TPC-H's multi-table queries over
   Cayenne accelerations answer as PostgreSQL does over the same rows.

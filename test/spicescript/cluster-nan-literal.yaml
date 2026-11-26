@@ -1,4 +1,5 @@
 name: cluster-nan-literal
+duration: 48s
 description: >
   On a cluster, a filter comparing a float column with
   `CAST('NaN' AS DOUBLE PRECISION)` answers as PostgreSQL does (#15538): the

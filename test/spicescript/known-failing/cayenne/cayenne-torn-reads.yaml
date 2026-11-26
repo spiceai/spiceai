@@ -4,6 +4,7 @@
 # moved row twice or half a transfer, and a partitioned full refresh exposes a
 # partial swap.
 name: cayenne-torn-reads
+duration: 77s
 description: >
   A reader never sees part of a source transaction. While PostgreSQL commits
   transfers between rows (one row down, another up) and moves rows to new

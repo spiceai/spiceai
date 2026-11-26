@@ -3,6 +3,7 @@
 # and schema, and the identical CREATE TABLE text is refused the second time.
 # Needs a `spiced` built with the `spicebench` feature.
 name: cayenne-catalog-recreate
+duration: 10s
 description: >
   A Cayenne catalog table dropped and created again under the same name, on a
   cluster scheduler with one executor, starts empty and takes the new schema;
