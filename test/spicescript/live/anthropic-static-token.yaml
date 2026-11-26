@@ -1,5 +1,6 @@
 name: anthropic-static-token
 duration: 3s
+requires-env: [SPICE_ANTHROPIC_AUTH_TOKEN]
 description: >
   An Anthropic model authenticates with a static `anthropic_auth_token`, sent as
   a bearer token and read through `${secrets:…}`: a chat completion answers.

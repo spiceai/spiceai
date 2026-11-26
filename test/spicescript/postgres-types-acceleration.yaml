@@ -80,8 +80,9 @@ steps:
     oracle-sql: SELECT * FROM test_postgresql_table WHERE int2_column IS NULL
     eventually: 30s
     except: federated
-  # A LIMIT keeps unspecified rows, so only their number is checked.
-  - spice: [refresh, full_t, --refresh-sql, SELECT * FROM full_t LIMIT 2]
+  # A LIMIT keeps unspecified rows, so only their number is checked. The CLI's
+  # `--refresh-jitter-max` goes with the override.
+  - spice: [refresh, full_t, --refresh-jitter-max=1s, --refresh-sql, SELECT * FROM full_t LIMIT 2]
     output-contains: Dataset refresh triggered
     except: federated
   - query: SELECT count(*) FROM full_t

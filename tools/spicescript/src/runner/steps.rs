@@ -280,7 +280,7 @@ pub(super) async fn run_instance_step(
         return super::load::run_load(script, instance, load, tier, sources).await;
     }
     match tier {
-        Tier::Upstream => run_step(script, instance, step, sources).await,
+        Tier::Upstream => run_step(script, instance, step, sources, tier).await,
         Tier::Sidecar if step.action.is_lifecycle() => {
             let started = Instant::now();
             sidecar_lifecycle(script, instance, step).await?;
@@ -288,7 +288,7 @@ pub(super) async fn run_instance_step(
         }
         Tier::Sidecar => {
             swap_sidecar(instance);
-            let outcome = run_step(script, instance, step, sources).await;
+            let outcome = run_step(script, instance, step, sources, tier).await;
             swap_sidecar(instance);
             outcome
         }
@@ -387,6 +387,7 @@ async fn run_step(
     instance: &mut Instance,
     step: &Step,
     sources: &Sources,
+    tier: Tier,
 ) -> Result<String> {
     let ready_default = ready_default(script);
     let started = Instant::now();
@@ -851,11 +852,19 @@ async fn run_step(
         }
         Action::SpiceCli {
             args,
+            input,
             output_contains,
             expect_error,
         } => {
-            let shown =
-                spice_cli(instance, args, output_contains.as_deref(), *expect_error).await?;
+            let shown = spice_cli(
+                instance,
+                tier,
+                args,
+                input.as_deref(),
+                output_contains.as_deref(),
+                *expect_error,
+            )
+            .await?;
             return Ok(format!(
                 " ({:.1}s) {shown}",
                 started.elapsed().as_secs_f64()

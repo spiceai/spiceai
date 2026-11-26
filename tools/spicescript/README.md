@@ -107,6 +107,7 @@ this run's other combinations have reserved does not count toward that.
 | `--spice-cli PATH` | The `spice` CLI that `spice` steps run. |
 | `--record-failures` | Rewrite each run script's entries in its directory's `recordings/expected-failures.json` with the failures this run saw (see [Expected failures](#expected-failures)). |
 | `--duckdb-version VERSION` | The DuckDB release `duckdb` and `ducklake` sources use when their spec names no `version` (also `SPICESCRIPT_DUCKDB_VERSION`); defaults to the newest in `test/duckdb_versions.json`. `--record-failures` refuses any other, since the ledger is recorded at the default. |
+| `--require-all-env` | Fail the run when a selected script is not run because a variable its `requires-env` names is unset. Without it such a script is listed as not run (in the output and under `not_run` in `--results`), never counted as passed, and does not change the exit status. For CI jobs meant to hold every credential. |
 | `--check` | Parse every script, including its corpora, and stop. Also fails on an `avoid:` whose defect no longer fails anywhere. |
 
 **Logs and cleanup.** Each failure prints the step, what was expected and what
@@ -168,13 +169,29 @@ steps:
     eventually: 60s
 ```
 
-`tags:` is optional. The one tag is `long`: the script is too slow for the
+`requires-env:` lists the environment variables a script needs, such as a
+provider's credentials (`requires-env: [SPICE_OPENAI_API_KEY]`). When any is
+unset or empty the script is not run: the run prints `not run: <script>
+(<file>): <VARIABLES> unset` before it starts and again beside the totals, and
+`--results` lists it under `not_run`, apart from the scripts that ran. A
+developer can run `live/` with one provider's key and see the rest listed;
+`--require-all-env` turns any not-run script into a failure, as the trunk
+`spicescript: live` job runs.
+
+`tags:` is optional. `long` means the script is too slow for the
 run before every merge, for what it catches there, so the merge queue skips it
 (`--exclude-tag long`) and it runs after merge, on trunk, in
 `trunk_tests.yml`. A script without it runs before every merge. Leave a new
 script untagged unless it is slow; tag it `long` when its CI time is high and
 its failure history low. A PR that edits a `long` script runs it in the merge
-queue too; a PR that only changes its `tags:` line does not. Write the list on
+queue too; a PR that only changes its `tags:` line does not. `macos-smoke`
+also runs the script against the macOS build, in E2E Test CI's `spicescript:
+macOS smoke` job (`--only-tag macos-smoke`); those runners have no Docker, so
+every source of such a script must be `files`, `mock-http` or `duckdb` (which
+run on the host), and the parser refuses any other. Keep that set small: it is
+the macOS coverage of what differs by platform (file-mode acceleration on its
+filesystem, loading the host's DuckDB library, the CLI, the protocols), not a
+second copy of the suite. Write the list on
 one line with plain names (`tags: [long]`), since CI selects those scripts by
 that line; a block list, a list over several lines, a quoted or escaped name,
 and unknown or duplicate tags are rejected.
@@ -303,7 +320,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `flight-put: { dataset, rows \| from-source }` | Write rows with Flight `DoPut`; `times: n` repeats it. |
 | `flight-exec: <sql>` | Flight SQL `ExecuteUpdate`; `count: n` affected rows. |
 | `http: { path, method, query, headers, body, api-key }` | One request; `query:` maps URL parameters, which are encoded and appended to `path`. `expect: { status, headers, lacks-headers, body-contains, body-matches, body-lacks, json }`; `json` checks the body as JSON (see [JSON responses](#json-responses)). `expect: { refused: true }` requires that nothing accepts the connection. |
-| `spice: [args…]` | Run the `spice` CLI against the instance; `output-contains`, `expect-error`. |
+| `spice: [args…]` | Run the `spice` CLI against the instance, in the instance's directory (so `spice dataset configure` edits its `spicepod.yaml`); `input` is written to its standard input, for an interactive command's prompts; `output-contains`, `expect-error`. A spicepod the command changes becomes that of the tier the step reaches (the upstream's, or the sidecar's on `on: sidecar`), so a later `start` or `restart` keeps the change. |
 | `refresh: <dataset>` | Trigger a refresh and wait for it to finish; `expect-error`; `wait: false` only triggers it. |
 | `explain: <sql>` | `EXPLAIN` (`analyze: true`), requiring `contains:` fragments or the absence of `omits:` ones. |
 | `assert-status: { dataset, status, message-contains, ready, has, lacks }` | Check a dataset's status from `/v1/datasets`. |
@@ -681,7 +698,7 @@ Defaults (`defaults:`):
 - **Comparing variants:** `compare-variants: false` turns off agreement between variants; `compare-to: <variant>` compares every variant with one.
 - **Protocols and auth:** `also-http: true` also asks every query over HTTP JSON and requires the same answer; `also-async: true` also runs every query as a `/v1/queries` job (a distributed job on a cluster) and requires the same answer; `api-key`; `tls: { ca }`.
 - **Running spiced:** `spiced-args`, `executor-args`.
-- **Clusters:** `cluster: { executors, spare, containers }`, and `cluster-partition-by: { <dataset or *>: <column> }` for `--cluster` runs. `containers: true` runs each executor in a container of its own on the host's network (Linux only; elsewhere the script is skipped), with the work and script directories mounted, from `ubuntu:26.04` or the image `--executor-image` names. Behind a rootless Docker daemon, whose host network is not this machine's, the executors run on the bridge network instead: their ports and the script's object store sources are published on every interface, which reaches them at this machine's routable address as well as loopback, the nodes advertise that address, and the spicepod names the sources at it. Each object store then has a secret of its own. The spicepod of such a script may name only `rustfs`, `files` and `duckdb` sources; its other sources, such as an oracle, stay on loopback, and a spicepod that names one is refused. Each executor writes shuffle output to its own `/tmp`, so a stage reads another executor's output over the network, as on separate hosts; a spicepod that sets `runtime.query.temp_directory` to a shared path undoes this, since an executor reads a peer's shuffle file from disk wherever its path exists.
+- **Clusters:** `single-node: <reason>` makes `--cluster` skip the script with that reason, for what it cannot see in the spicepod up front (datasets a `spice` step adds while the script runs); `cluster: { executors, spare, containers }`, and `cluster-partition-by: { <dataset or *>: <column> }` for `--cluster` runs. `containers: true` runs each executor in a container of its own on the host's network (Linux only; elsewhere the script is skipped), with the work and script directories mounted, from `ubuntu:26.04` or the image `--executor-image` names. Behind a rootless Docker daemon, whose host network is not this machine's, the executors run on the bridge network instead: their ports and the script's object store sources are published on every interface, which reaches them at this machine's routable address as well as loopback, the nodes advertise that address, and the spicepod names the sources at it. Each object store then has a secret of its own. The spicepod of such a script may name only `rustfs`, `files` and `duckdb` sources; its other sources, such as an oracle, stay on loopback, and a spicepod that names one is refused. Each executor writes shuffle output to its own `/tmp`, so a stage reads another executor's output over the network, as on separate hosts; a spicepod that sets `runtime.query.temp_directory` to a shared path undoes this, since an executor reads a peer's shuffle file from disk wherever its path exists.
 - **Scheduling:**
   - `exclusive: true` runs the script alone, its instances one after another;
   - `run-variants: side-by-side` runs variants that work together (a snapshot writer and its reader) a step at a time, as one job.

@@ -39,7 +39,15 @@ pub enum Tag {
     /// runs every script. As with Go's `-short`, a script runs before merge
     /// unless it opts out.
     Long,
+    /// Run on the macOS runners too, by E2E Test CI's `spicescript: macOS
+    /// smoke` job (`--only-tag macos-smoke`), as well as on Linux. Those
+    /// runners have no Docker, so every source must be `files`, `mock-http` or
+    /// `duckdb`.
+    MacosSmoke,
 }
+
+/// Source kinds that run on the host rather than in a container.
+const IN_PROCESS_SOURCES: &[&str] = &["files", "mock-http", "duckdb"];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -49,6 +57,12 @@ pub struct Script {
     pub tags: Vec<Tag>,
     #[serde(default)]
     pub description: Option<String>,
+    /// Environment variables the script needs, such as a provider's
+    /// credentials. When any is unset or empty the script is not run, and the
+    /// run lists it as not run rather than counting it as passed or failed;
+    /// `--require-all-env` makes that a failure.
+    #[serde(default)]
+    pub requires_env: Vec<String>,
     #[serde(default)]
     pub sources: IndexMap<String, SourceSpec>,
     /// Every combination of these values is a separate run, exposed to the
@@ -290,6 +304,11 @@ pub struct Defaults {
     /// node mTLS with a CA and certificates generated for the run.
     #[serde(default)]
     pub cluster: Option<ClusterDefaults>,
+    /// Why the script runs only as a single node: `--cluster` skips it with
+    /// this reason. For what the runner cannot see in the spicepod up front,
+    /// such as datasets a `spice` step adds while it runs.
+    #[serde(default)]
+    pub single_node: Option<String>,
     /// When the script runs as a cluster, the column each acceleration without
     /// `partition_by` is bucketed on, by dataset name (`*` for any other).
     #[serde(default)]
@@ -360,6 +379,7 @@ impl Default for Defaults {
             spiced_args: Vec::new(),
             executor_args: None,
             cluster: None,
+            single_node: None,
             cluster_partition_by: BTreeMap::new(),
             exclusive: false,
             run_variants: RunVariants::OneAfterAnother,
@@ -563,9 +583,11 @@ pub enum Action {
         /// Failures matching one of these do not fail the step.
         allow: Vec<regex::Regex>,
     },
-    /// Runs the `spice` CLI against the instance's runtime.
+    /// Runs the `spice` CLI against the instance's runtime, in the instance's
+    /// directory, with `input` on its standard input.
     SpiceCli {
         args: Vec<String>,
+        input: Option<String>,
         output_contains: Option<String>,
         expect_error: bool,
     },
@@ -1041,6 +1063,15 @@ impl Script {
         Ok(script)
     }
 
+    /// The `requires-env` variables that are unset or empty here.
+    pub fn missing_env(&self) -> Vec<String> {
+        self.requires_env
+            .iter()
+            .filter(|name| std::env::var_os(name).is_none_or(|value| value.is_empty()))
+            .cloned()
+            .collect()
+    }
+
     /// Records how long the script at `path` took, in whole seconds rounded
     /// up, in its `duration` line.
     pub fn record_duration(path: &Path, took: Duration) -> Result<()> {
@@ -1153,6 +1184,29 @@ impl Script {
                 tag.to_possible_value()
                     .map_or_else(String::new, |value| value.get_name().to_string())
             );
+        }
+        ensure!(
+            script.defaults.single_node.is_none()
+                || (script.defaults.cluster.is_none() && script.defaults.executor_args.is_none()),
+            "`defaults.single-node` contradicts `defaults.cluster` and `defaults.executor-args`, \
+             which run the script with executors; keep one"
+        );
+        for name in &script.requires_env {
+            ensure!(
+                !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "`requires-env` names environment variables, not `{name}`"
+            );
+        }
+        if script.tags.contains(&Tag::MacosSmoke) {
+            for (name, source) in &script.sources {
+                ensure!(
+                    IN_PROCESS_SOURCES.contains(&source.kind.as_str()),
+                    "Source `{name}` is `{}`, which runs in Docker, but the script is tagged \
+                     `macos-smoke` and the macOS runners have no Docker; use a `files`, \
+                     `mock-http` or `duckdb` source, or drop the tag",
+                    source.kind
+                );
+            }
         }
         let Value::Array(steps) = steps else {
             bail!("`steps` must be a list");
@@ -2019,9 +2073,10 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
             })
         }
         "spice" => {
-            let (args, output_contains, expect_error) = match arg {
+            let (args, input, output_contains, expect_error) = match arg {
                 Value::Array(_) => (
                     serde_json::from_value(arg).context("`spice` arguments must be strings")?,
+                    opts.string("input")?,
                     opts.string("output-contains")?,
                     opts.bool("expect-error")?,
                 ),
@@ -2030,15 +2085,17 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
                     let args = inner
                         .parse("args", "`args` must be a list of strings")?
                         .context("`spice` needs `args`")?;
+                    let input = inner.string("input")?;
                     let contains = inner.string("output-contains")?;
                     let expect_error = inner.bool("expect-error")?;
                     inner.finish()?;
-                    (args, contains, expect_error)
+                    (args, input, contains, expect_error)
                 }
                 _ => bail!("`spice` takes a list of arguments, or a mapping with `args`"),
             };
             Action::SpiceCli {
                 args,
+                input,
                 output_contains,
                 expect_error,
             }
@@ -3213,7 +3270,33 @@ mod tests {
     fn tags_reject_unknown_tag() {
         let error = Script::parse("name: s\ntags: [slow]\nspicepod: {}\nsteps: []")
             .expect_err("unknown tag");
-        assert_eq!(error.to_string(), "unknown variant `slow`, expected `long`");
+        assert_eq!(
+            error.to_string(),
+            "unknown variant `slow`, expected `long` or `macos-smoke`"
+        );
+    }
+
+    #[test]
+    fn macos_smoke_refuses_a_source_that_runs_in_docker() {
+        let parse = |kind: &str| {
+            Script::parse(&format!(
+                "name: s\ntags: [macos-smoke]\nsources:\n  src: {{ kind: {kind} }}\nspicepod: {{}}\nsteps: []"
+            ))
+            .map(|s| s.tags)
+            .map_err(|e| e.to_string())
+        };
+        assert_eq!(parse("files"), Ok(vec![Tag::MacosSmoke]));
+        assert_eq!(parse("mock-http"), Ok(vec![Tag::MacosSmoke]));
+        assert_eq!(parse("duckdb"), Ok(vec![Tag::MacosSmoke]));
+        assert_eq!(
+            parse("postgres"),
+            Err(
+                "Source `src` is `postgres`, which runs in Docker, but the script is tagged \
+                 `macos-smoke` and the macOS runners have no Docker; use a `files`, \
+                 `mock-http` or `duckdb` source, or drop the tag"
+                    .to_string()
+            )
+        );
     }
 
     #[test]

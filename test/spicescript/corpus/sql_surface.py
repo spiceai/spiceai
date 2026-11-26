@@ -693,6 +693,8 @@ def main():
         main_script = (HERE.parent / "query-protocols.yaml").read_text()
         setup = main_script.split("  - corpus:", 1)[0]
         setup = setup.replace("query-protocols", "sql-surface-known")
+        # The main suite also runs on macOS; a known-failing script does not.
+        setup = re.sub(r"^(tags: \[.*?), macos-smoke\]$", r"\1]", setup, flags=re.M)
         setup = re.sub(r"description: >.*?(?=\nsources:)",
                        "description: >\n  Generated documented-SQL cases with reproduced errors or schema mismatches.\n  These cases remain executable until their tracked failures are resolved.\n",
                        setup, flags=re.S)
