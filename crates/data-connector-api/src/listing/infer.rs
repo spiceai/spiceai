@@ -74,6 +74,29 @@ pub(crate) fn infer_partitions_with_types_from_files(
         .collect::<Vec<_>>())
 }
 
+/// Infer the partitioning from one file's `key=value` parent directories under `table_path_prefix`.
+///
+/// Returns `None` if the file is not under the prefix, sits directly in it, or has a parent
+/// directory that is not `key=value`. Such a file does not show the partition layout.
+pub(crate) fn infer_partitions_with_types_from_hive_file(
+    table_path_prefix: &ListingTableUrl,
+    file: &ObjectMeta,
+) -> Option<Vec<(String, DataType)>> {
+    let mut path_parts = strip_prefix(table_path_prefix, &file.location)?.collect_vec();
+    path_parts.pop(); // the file itself
+    if path_parts.is_empty() {
+        return None;
+    }
+
+    path_parts
+        .into_iter()
+        .map(|part| match part.split_once('=') {
+            Some((key, _)) if !key.is_empty() => Some((key.to_string(), DataType::Utf8)),
+            _ => None,
+        })
+        .collect()
+}
+
 async fn list_max_10_files(
     state: &SessionState,
     table_path: &ListingTableUrl,
@@ -221,6 +244,45 @@ mod tests {
         let result = infer_partitions_with_types_from_files(&table_url, &files)
             .expect("Expected empty partitions");
         assert_eq!(result, [] as [(String, DataType); 0]);
+    }
+
+    #[test]
+    fn test_infer_partitions_with_types_from_hive_file() {
+        let table_url =
+            ListingTableUrl::parse("memory://bucket/data/").expect("Failed to parse table URL");
+        let file = create_test_object_meta("data/year=2023/month=01/file.parquet", 100);
+
+        let result = infer_partitions_with_types_from_hive_file(&table_url, &file)
+            .expect("a file in key=value directories gives its partitions");
+
+        assert_eq!(
+            result,
+            vec![
+                ("year".to_string(), DataType::Utf8),
+                ("month".to_string(), DataType::Utf8)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_infer_partitions_with_types_from_hive_file_not_hive_layout() {
+        let table_url =
+            ListingTableUrl::parse("memory://bucket/data/").expect("Failed to parse table URL");
+
+        for path in [
+            "other/year=2023/file.parquet",
+            "data/file.parquet",
+            "data/_schema/file.parquet",
+            "data/year=2023/_schema/file.parquet",
+            "data/=2023/file.parquet",
+        ] {
+            let file = create_test_object_meta(path, 100);
+            assert_eq!(
+                infer_partitions_with_types_from_hive_file(&table_url, &file),
+                None,
+                "{path} does not show the partition layout"
+            );
+        }
     }
 
     #[test]

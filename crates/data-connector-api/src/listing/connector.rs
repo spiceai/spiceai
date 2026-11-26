@@ -70,7 +70,10 @@ use {
 use crate::accelerated::RegisteredAcceleratedTable;
 use crate::{
     ConnectorComponent, DataConnector, DataConnectorError, DataConnectorResult,
-    listing::infer::{infer_partitions_with_types_from_files, infer_partitions_with_types_prefix},
+    listing::infer::{
+        infer_partitions_with_types_from_files, infer_partitions_with_types_from_hive_file,
+        infer_partitions_with_types_prefix,
+    },
 };
 use app::App;
 use data_components::object::{
@@ -92,6 +95,9 @@ use runtime_object_store::registry::default_runtime_env;
 
 /// Maximum number of files to scan when validating that the schema source path contains objects with the expected extension.
 const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
+
+/// Maximum data files whose directories are compared when inferring hive partition columns.
+const PARTITION_INFER_FILE_LIMIT: usize = 10;
 
 /// Maximum matching `ORC` objects whose footers are merged when inferring a
 /// collection schema. The default listing path otherwise passes only the
@@ -2071,30 +2077,43 @@ pub trait ListingTableConnector: DataConnector {
 
         // If we should infer partitions and the path is a folder, infer the partitions from the folder structure.
         if dataset.get_param("hive_partitioning_enabled", false) && table_path.is_collection() {
-            let inferred_partitions = match schema_infer_meta {
-                Some(meta) => infer_partitions_with_types_from_files(&table_path, &[meta]),
-                None if format_selected_data_suffix(extension).is_some() => {
-                    match list_matching_listing_files(
-                        &ctx.state(),
-                        &table_path,
-                        object_store.as_ref(),
-                        extension,
-                        10,
-                    )
-                    .await
-                    {
-                        Ok(files) => infer_partitions_with_types_from_files(&table_path, &files),
-                        Err(e) => {
-                            tracing::debug!(
-                                "Failed to list files for partition inference for {table_path:?}: {e}"
-                            );
-                            Ok(Vec::new())
+            let schema_source_partitions = schema_infer_meta
+                .as_ref()
+                .and_then(|meta| infer_partitions_with_types_from_hive_file(&table_path, meta));
+            let inferred_partitions = if let Some(partitions) = schema_source_partitions {
+                // The `schema_source_path` file sits in the partition layout under
+                // `table_path`, so its directories name the partitions without a listing.
+                Ok(partitions)
+            } else if schema_infer_meta.is_some()
+                || format_selected_data_suffix(extension).is_some()
+            {
+                // Infer from the data files under `table_path`. `schema_source_path` replaces
+                // only the file schema, so its file is skipped if it is under `table_path`.
+                match list_matching_listing_files(
+                    &ctx.state(),
+                    &table_path,
+                    object_store.as_ref(),
+                    extension,
+                    PARTITION_INFER_FILE_LIMIT + 1,
+                )
+                .await
+                {
+                    Ok(mut files) => {
+                        if let Some(schema_file) = &schema_infer_meta {
+                            files.retain(|file| file.location != schema_file.location);
                         }
+                        files.truncate(PARTITION_INFER_FILE_LIMIT);
+                        infer_partitions_with_types_from_files(&table_path, &files)
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "Failed to list files for partition inference for {table_path:?}: {e}"
+                        );
+                        Ok(Vec::new())
                     }
                 }
-                None => {
-                    infer_partitions_with_types_prefix(&ctx.state(), &table_path, extension).await
-                }
+            } else {
+                infer_partitions_with_types_prefix(&ctx.state(), &table_path, extension).await
             };
             match inferred_partitions {
                 Ok(partitions) => {
@@ -5782,6 +5801,138 @@ mod tests {
             .schema()
             .field_with_name("extra")
             .expect("scan-path merge must keep extra from table/data/id_extra.orc");
+    }
+
+    /// `schema_source_path` replaces only the file schema. The hive partition
+    /// columns still come from the data files under `from`, wherever the schema
+    /// file is.
+    #[tokio::test]
+    async fn create_listing_table_infers_hive_partitions_with_schema_source_path() {
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        fn write_parquet(path: &std::path::Path, batch: &RecordBatch) {
+            std::fs::create_dir_all(path.parent().expect("parent directory"))
+                .expect("create directory");
+            let mut writer = ArrowWriter::try_new(
+                std::fs::File::create(path).expect("create parquet"),
+                batch.schema(),
+                None,
+            )
+            .expect("parquet writer");
+            writer.write(batch).expect("write parquet");
+            writer.close().expect("close parquet");
+        }
+
+        let data_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let schema_with_year = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
+            Field::new("year", DataType::Utf8, true),
+        ]));
+
+        // (schema file path relative to the temp dir, schema of that file)
+        let cases = [
+            ("_schema/events.parquet", &data_schema),
+            ("_schema/events.parquet", &schema_with_year),
+            ("events/_schema/events.parquet", &data_schema),
+            ("events/year=2024/month=01/schema.parquet", &data_schema),
+        ];
+
+        for (schema_file, schema_file_schema) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            for partition in ["year=2024/month=01", "year=2025/month=02"] {
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&data_schema),
+                    vec![
+                        Arc::new(arrow::array::Int64Array::from(vec![1, 2])),
+                        Arc::new(arrow::array::Float64Array::from(vec![1.5, 2.5])),
+                    ],
+                )
+                .expect("data batch");
+                write_parquet(
+                    &dir.path().join(format!("events/{partition}/part.parquet")),
+                    &batch,
+                );
+            }
+            write_parquet(
+                &dir.path().join(schema_file),
+                &RecordBatch::new_empty(Arc::clone(schema_file_schema)),
+            );
+
+            let table_url = format!("file://{}/events/", dir.path().display());
+            let mut params = HashMap::new();
+            params.insert("file_format".to_string(), "parquet".to_string());
+            let (connector, mut dataset) = setup_connector(table_url.clone(), params);
+            dataset
+                .params
+                .insert("hive_partitioning_enabled".to_string(), "true".to_string());
+            dataset.params.insert(
+                "schema_source_path".to_string(),
+                format!("file://{}/{schema_file}", dir.path().display()),
+            );
+
+            let url = Url::parse(&table_url).expect("table url");
+            let (Some(file_format), extension) = connector
+                .get_file_format_and_extension(&dataset)
+                .await
+                .expect("parquet listing format")
+            else {
+                panic!("expected a parquet file format");
+            };
+            let provider = connector
+                .create_listing_table(
+                    &dataset,
+                    &url,
+                    &extension,
+                    file_format,
+                    &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                        as Arc<dyn MemoryPool>),
+                )
+                .await
+                .expect("create_listing_table production path");
+
+            let schema = provider.schema();
+            for column in ["year", "month"] {
+                assert_eq!(
+                    schema
+                        .fields()
+                        .iter()
+                        .filter(|field| field.name() == column)
+                        .count(),
+                    1,
+                    "schema file {schema_file} must give exactly one {column} column: {schema:?}"
+                );
+            }
+
+            let ctx = SessionContext::new();
+            ctx.register_table("events", provider)
+                .expect("register listing table");
+            let batches = ctx
+                .sql("SELECT year, count(*) AS n FROM events GROUP BY year ORDER BY year")
+                .await
+                .expect("plan group by partition column")
+                .collect()
+                .await
+                .expect("run group by partition column");
+            let mut rows = Vec::new();
+            for batch in &batches {
+                for row in 0..batch.num_rows() {
+                    let year = arrow::util::display::array_value_to_string(batch.column(0), row)
+                        .expect("year renders");
+                    let n = arrow::util::display::array_value_to_string(batch.column(1), row)
+                        .expect("count renders");
+                    rows.push(format!("{year}:{n}"));
+                }
+            }
+            assert_eq!(
+                rows,
+                ["2024:2", "2025:2"],
+                "schema file {schema_file} must not change the partition values"
+            );
+        }
     }
 
     #[test]
