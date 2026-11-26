@@ -54,7 +54,8 @@ class CleanMacWorkspaceTest(unittest.TestCase):
         (self.workspace / "locked").chmod(0o500)
 
     def _cleanup(self):
-        subprocess.run(["chflags", "-R", "nouchg", str(self.tmp)], capture_output=True)
+        if shutil.which("chflags"):
+            subprocess.run(["chflags", "-R", "nouchg,nouappnd", str(self.tmp)], capture_output=True)
         subprocess.run(["chmod", "-R", "u+rwx", str(self.tmp)], capture_output=True)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
