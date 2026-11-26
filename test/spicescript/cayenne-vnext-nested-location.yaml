@@ -1,0 +1,68 @@
+name: cayenne-vnext-nested-location
+description: >
+  A state location inside another dataset's data directory survives that
+  dataset's recreate. With `runtime.params.cayenne_vnext` on, dataset `b` is in
+  the object-native metastore at `.spice/data/orders/state/`; with the flag
+  off, a `mode: file_create` start of a dataset named `orders`, whose data
+  directory is `.spice/data/orders/`, replaces only its own tables, and the
+  object-native metastore and `b` in it are kept.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-vnext-nested-location
+  runtime:
+    params: { cayenne_vnext: enabled }
+    state: { location: 'file://${instance.dir}/.spice/data/orders/state/' }
+  datasets:
+    - from: postgres:public.items
+      name: b
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_check_interval: 1h }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec: { src: "CREATE TABLE items (id int PRIMARY KEY, v text); INSERT INTO items SELECT g, 'v' || g FROM generate_series(1, 2000) g" }
+  - start: {}
+  - query: SELECT * FROM b
+    oracle-sql: SELECT * FROM items
+  - assert-files: { contains: ['^\.spice/data/orders/state/cayenne/v1/catalog/head$'] }
+  - restart:
+      ready: false
+      patch:
+        spicepod:
+          runtime: { params: { cayenne_vnext: disabled } }
+          datasets:
+            - from: postgres:public.items
+              name: b
+              params: ${sources.src.params}
+              acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_check_interval: 1h }
+            - from: postgres:public.items
+              name: orders
+              params: ${sources.src.params}
+              acceleration: { enabled: true, engine: cayenne, mode: file_create, refresh_mode: full }
+  - query: SELECT * FROM orders
+    oracle-sql: SELECT * FROM items
+    eventually: 60s
+  - assert-files: { contains: ['^\.spice/data/orders/state/cayenne/v1/catalog/head$'] }
+
+  # The flag on again, without `orders` (whose data directory holds the state
+  # location, which the flag refuses): b is served from the object-native
+  # metastore, which the recreate did not touch.
+  - restart:
+      patch:
+        spicepod:
+          runtime: { params: { cayenne_vnext: enabled } }
+          datasets:
+            - from: postgres:public.items
+              name: b
+              params: ${sources.src.params}
+              acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_check_interval: 1h }
+  - query: SELECT * FROM b
+    oracle-sql: SELECT * FROM items
+  - assert-log: { count: { 'Loaded [0-9,]+ rows.* for dataset b in': 1 } }
