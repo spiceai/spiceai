@@ -186,8 +186,11 @@ fn view_definition(
             {
                 let builder = super::view::ViewBuilder::try_from(spec.clone())
                     .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
-                let read =
-                    View::new(builder.build(), Arc::clone(&view.runtime), Arc::clone(&view.app));
+                let read = View::new(
+                    builder.build(),
+                    Arc::clone(&view.runtime),
+                    Arc::clone(&view.app),
+                );
                 Some(view_definition(&read, depth + 1).await?)
             } else {
                 // A table the Spicepod does not define (a catalog's): its name.

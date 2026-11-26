@@ -255,7 +255,11 @@ impl Model for Protocol {
         };
         let mut boxes = vec![];
         boxes.push(match &state.copy {
-            None => ("COPY".to_string(), vec!["not created".to_string()], Tone::Gone),
+            None => (
+                "COPY".to_string(),
+                vec!["not created".to_string()],
+                Tone::Gone,
+            ),
             Some(copy) => (
                 "COPY".to_string(),
                 vec![
@@ -290,11 +294,7 @@ impl Model for Protocol {
                     format!("app {}, host {}", app(state.app[i]), Self::host(i)),
                     format!("{:?}", state.status[i]),
                 ],
-                if reads_other {
-                    Tone::Bad
-                } else {
-                    Tone::Actor
-                },
+                if reads_other { Tone::Bad } else { Tone::Actor },
             ));
         }
         let lanes = vec![

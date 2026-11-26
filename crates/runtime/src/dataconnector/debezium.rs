@@ -319,7 +319,10 @@ impl DataConnectorFactory for DebeziumFactory {
         &self,
         params: &runtime_parameters::Parameters,
     ) -> Result<Option<Vec<(String, String)>>, String> {
-        Ok(Some(data_connector_api::source_identity_of(params, &["transport", "message_format", "kafka_bootstrap_servers"])))
+        Ok(Some(data_connector_api::source_identity_of(
+            params,
+            &["transport", "message_format", "kafka_bootstrap_servers"],
+        )))
     }
 }
 

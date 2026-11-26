@@ -160,9 +160,7 @@ impl DatasetDefinition {
                 |on_conflict| match &on_conflict {
                     datafusion_table_providers::util::on_conflict::OnConflict::Upsert(columns)
                         if !primary_key.is_empty()
-                            && columns.iter().eq(primary_key
-                                .iter()
-                                .map(String::as_str)) =>
+                            && columns.iter().eq(primary_key.iter().map(String::as_str)) =>
                     {
                         "upsert on the primary key".to_string()
                     }

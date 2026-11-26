@@ -338,7 +338,10 @@ impl DataConnectorFactory for S3Factory {
         &self,
         params: &runtime_parameters::Parameters,
     ) -> Result<Option<Vec<(String, String)>>, String> {
-        Ok(Some(data_connector_api::source_identity_of(params, &["endpoint"])))
+        Ok(Some(data_connector_api::source_identity_of(
+            params,
+            &["endpoint"],
+        )))
     }
 }
 
