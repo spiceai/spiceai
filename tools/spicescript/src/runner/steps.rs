@@ -243,7 +243,7 @@ pub(super) fn one_line(s: &str, max: usize) -> String {
     }
 }
 
-pub(super) async fn run_source_step(action: &Action, sources: &mut Sources) -> Result<String> {
+pub(super) async fn run_source_step(action: &Action, sources: &Sources) -> Result<String> {
     let started = Instant::now();
     match action {
         Action::StartSource(name) | Action::UnpauseSource(name) => {
