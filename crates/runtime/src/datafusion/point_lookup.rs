@@ -157,7 +157,9 @@ pub(crate) async fn create_physical_plan(
     let Some(lookup) = point_lookup else {
         return session.create_physical_plan(plan).await;
     };
-    let optimized = optimize_lean(session, plan, lookup)?;
+    let Some(optimized) = optimize_lean(session, plan, lookup)? else {
+        return session.create_physical_plan(plan).await;
+    };
     let planner = Arc::clone(session.query_planner());
     PLANNING_POINT_LOOKUP
         .scope(lookup, planner.create_physical_plan(&optimized, session))
@@ -166,20 +168,76 @@ pub(crate) async fn create_physical_plan(
 
 /// Optimizes a point lookup's logical plan with one pass and its [`SKIPPABLE_RULES`] skipped, then
 /// with full optimization when that pass leaves work another pass would do.
+///
+/// Returns `None` when analysis takes the plan out of the lookup shape, and the plan must be
+/// planned in full. [`is_point_lookup`] sees the plan before the analyzer runs, and an analyzer
+/// rule may rewrite it into something the skipped rules do act on: on a cluster,
+/// `PartitionedTableScanRewrite` turns the scan into the union of its partitions, which with one
+/// executor is a union of one input that only `optimize_unions` removes.
 pub(crate) fn optimize_lean(
     session: &mut SessionState,
     plan: &LogicalPlan,
     lookup: PointLookup,
-) -> Result<LogicalPlan> {
+) -> Result<Option<LogicalPlan>> {
+    let analyzed = OPTIMIZING_POINT_LOOKUP.sync_scope(lookup, || {
+        session
+            .analyzer()
+            .execute_and_check(plan.clone(), session.config_options(), |_, _| {})
+    })?;
+    if !is_lookup_shaped(&analyzed) {
+        return Ok(None);
+    }
     let max_passes = session.config().options().optimizer.max_passes;
     session.config_mut().options_mut().optimizer.max_passes = 1;
-    let optimized = OPTIMIZING_POINT_LOOKUP.sync_scope(lookup, || session.optimize(plan));
+    let optimized = OPTIMIZING_POINT_LOOKUP.sync_scope(lookup, || {
+        session.optimizer().optimize(analyzed, &*session, |_, _| {})
+    });
     session.config_mut().options_mut().optimizer.max_passes = max_passes;
     let optimized = optimized?;
     if has_constant_predicate(&optimized) || limit_can_reach_scan(&optimized) {
-        return session.optimize(&optimized);
+        return session.optimize(&optimized).map(Some);
     }
-    Ok(optimized)
+    Ok(Some(optimized))
+}
+
+/// Whether the analyzed `plan` still has only the nodes a point lookup is made of — limits,
+/// projections, aliases and filters over one table scan — and no subquery in any expression.
+/// The rules in [`SKIPPABLE_RULES`] act only on nodes and expressions outside that set. The scan
+/// may have become the federated plan that federation analysis made of it: a leaf with no
+/// expressions, which no logical rule can reach into.
+fn is_lookup_shaped(plan: &LogicalPlan) -> bool {
+    let mut node = plan;
+    loop {
+        let holds_subquery = node.expressions().iter().any(|expr| {
+            expr.exists(|expr| {
+                Ok(matches!(
+                    expr,
+                    Expr::Exists(_)
+                        | Expr::InSubquery(_)
+                        | Expr::SetComparison(_)
+                        | Expr::ScalarSubquery(_)
+                ))
+            })
+            .unwrap_or(true)
+        });
+        if holds_subquery {
+            return false;
+        }
+        node = match node {
+            LogicalPlan::Limit(limit) => limit.input.as_ref(),
+            LogicalPlan::Projection(projection) => projection.input.as_ref(),
+            LogicalPlan::SubqueryAlias(alias) => alias.input.as_ref(),
+            LogicalPlan::Filter(filter) => filter.input.as_ref(),
+            LogicalPlan::TableScan(_) => return true,
+            LogicalPlan::Extension(extension) => {
+                return extension
+                    .node
+                    .as_any()
+                    .is::<datafusion_federation::FederatedPlanNode>();
+            }
+            _ => return false,
+        };
+    }
 }
 
 /// Whether a limit in `plan` sits above a table scan with only projections and aliases between
@@ -783,6 +841,7 @@ mod tests {
     use datafusion::catalog::MemTable;
     use datafusion::common::{Constraint, Constraints};
     use datafusion::execution::SessionStateBuilder;
+    use datafusion::logical_expr::LogicalPlan;
     use datafusion::physical_plan::displayable;
     use datafusion::prelude::SessionContext;
 
@@ -1145,6 +1204,158 @@ mod tests {
         assert_lean_matches_full(&ctx, "SELECT region, name FROM hidden WHERE region = 1").await;
     }
 
+    /// Hands every table to the cluster's scan rewrite as `partitions` partitions, each read
+    /// through the table itself and serving the given `region` values (none: the whole table).
+    struct Partitions {
+        ctx: SessionContext,
+        regions: Vec<Vec<i32>>,
+    }
+
+    impl std::fmt::Debug for Partitions {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Partitions")
+                .field("regions", &self.regions)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl runtime_datafusion::analyzer_rule::TablePartitionProvider for Partitions {
+        fn get_partitions(
+            &self,
+            table: &datafusion::common::TableReference,
+            _schema: &datafusion::arrow::datatypes::SchemaRef,
+        ) -> datafusion::error::Result<runtime_datafusion::analyzer_rule::PartitionProviders>
+        {
+            let provider = futures::executor::block_on(self.ctx.table_provider(table.clone()))?;
+            Ok(self
+                .regions
+                .iter()
+                .map(|regions| {
+                    let values = regions
+                        .iter()
+                        .map(|region| {
+                            std::collections::HashMap::from([(
+                                "region".to_string(),
+                                Some(region.to_string()),
+                            )])
+                        })
+                        .collect();
+                    (Arc::clone(&provider), values)
+                })
+                .collect())
+        }
+
+        fn should_partition(&self, _scan: &datafusion::logical_expr::TableScan) -> bool {
+            true
+        }
+    }
+
+    /// On a cluster an analyzer rule rewrites the lookup's scan into the union of its partitions,
+    /// after the lookup was recognised: with one executor a union of one input, which only
+    /// `optimize_unions` (a rule a lookup skips) removes. A plan the analyzer took out of the
+    /// lookup shape must get every rule. Regression test for #16856.
+    #[tokio::test]
+    async fn a_lookup_the_analyzer_partitions_gets_every_rule() {
+        for regions in [
+            vec![vec![]],
+            vec![vec![0, 1, 2, 3]],
+            vec![vec![0, 1], vec![2, 3]],
+        ] {
+            let ctx = context();
+            let rule = runtime_datafusion::analyzer_rule::PartitionedTableScanRewrite::new(
+                Arc::new(Partitions {
+                    ctx: ctx.clone(),
+                    regions: regions.clone(),
+                }),
+                &ctx,
+            );
+            ctx.add_analyzer_rule(Arc::new(rule));
+            for sql in [
+                "SELECT * FROM unkeyed WHERE id = 5",
+                "SELECT 1 AS present FROM unkeyed WHERE name = 'n5' LIMIT 1",
+                "SELECT * FROM keyed WHERE id = 5",
+            ] {
+                let plan = unoptimized(&ctx, sql).await;
+                let lookup = is_point_lookup(&plan);
+                // Recognised before analysis, and planned in full after it.
+                assert!(
+                    optimize_lean(&mut ctx.state(), &plan, lookup.expect("a point lookup"))
+                        .expect("analyzed")
+                        .is_none(),
+                    "{sql} over {regions:?}"
+                );
+                let full = ctx
+                    .state()
+                    .create_physical_plan(&plan)
+                    .await
+                    .unwrap_or_else(|e| panic!("full plan {sql} over {regions:?}: {e}"));
+                let lean = create_physical_plan(&mut ctx.state(), &plan, lookup)
+                    .await
+                    .unwrap_or_else(|e| panic!("lean plan {sql} over {regions:?}: {e}"));
+                assert_eq!(
+                    displayable(full.as_ref()).indent(true).to_string(),
+                    displayable(lean.as_ref()).indent(true).to_string(),
+                    "{sql} over {regions:?}"
+                );
+                let full_rows = datafusion::physical_plan::collect(full, ctx.task_ctx())
+                    .await
+                    .expect("full rows");
+                let lean_rows = datafusion::physical_plan::collect(lean, ctx.task_ctx())
+                    .await
+                    .expect("lean rows");
+                assert_eq!(sorted_rows(&full_rows), sorted_rows(&lean_rows), "{sql}");
+                // The header and the one matching row.
+                assert_eq!(sorted_rows(&lean_rows).len(), 2, "{sql} over {regions:?}");
+            }
+        }
+    }
+
+    struct NeverPlanned;
+
+    #[async_trait::async_trait]
+    impl datafusion_federation::FederationPlanner for NeverPlanned {
+        async fn plan_federation(
+            &self,
+            _node: &datafusion_federation::FederatedPlanNode,
+            _session_state: &datafusion::execution::session_state::SessionState,
+        ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+            datafusion::common::not_impl_err!("never planned")
+        }
+    }
+
+    /// Federation analysis replaces a federated lookup's scan, or the whole lookup, with a leaf it
+    /// plans itself; that is still a lookup. A union, as a cluster makes of a scan, is not.
+    #[tokio::test]
+    async fn federated_lookups_keep_the_lookup_shape() {
+        use datafusion::logical_expr::{Extension, LogicalPlanBuilder};
+        let ctx = context();
+        let lookup = ctx
+            .state()
+            .optimize(&unoptimized(&ctx, "SELECT * FROM unkeyed WHERE id = 5").await)
+            .expect("optimize");
+        let federated = || {
+            LogicalPlan::Extension(Extension {
+                node: Arc::new(datafusion_federation::FederatedPlanNode::new(
+                    lookup.clone(),
+                    Arc::new(NeverPlanned),
+                )),
+            })
+        };
+        assert!(super::is_lookup_shaped(&lookup));
+        assert!(super::is_lookup_shaped(&federated()));
+        let projected = LogicalPlanBuilder::from(federated())
+            .project(vec![datafusion::prelude::col("id")])
+            .and_then(|plan| plan.limit(0, Some(1)))
+            .and_then(LogicalPlanBuilder::build)
+            .expect("plan");
+        assert!(super::is_lookup_shaped(&projected));
+        let union = LogicalPlanBuilder::from(lookup.clone())
+            .union(lookup.clone())
+            .and_then(LogicalPlanBuilder::build)
+            .expect("union");
+        assert!(!super::is_lookup_shaped(&union));
+    }
+
     fn sorted_rows(batches: &[RecordBatch]) -> Vec<String> {
         let table = datafusion::arrow::util::pretty::pretty_format_batches(batches)
             .expect("format")
@@ -1171,7 +1382,9 @@ mod tests {
             let plan = unoptimized(&ctx, sql).await;
             let lookup = is_point_lookup(&plan).expect("a point lookup");
             let full = ctx.state().optimize(&plan).expect("full");
-            let lean = optimize_lean(&mut ctx.state(), &plan, lookup).expect("lean");
+            let lean = optimize_lean(&mut ctx.state(), &plan, lookup)
+                .expect("lean")
+                .expect("a lookup after analysis");
             assert_eq!(
                 full.display_indent().to_string(),
                 lean.display_indent().to_string(),
