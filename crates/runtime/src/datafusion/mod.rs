@@ -6988,6 +6988,10 @@ impl DataFusion {
         }
         ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &view.name)?;
 
+        sql_depth_guard::ensure_data_types_within_depth_limit(&view.sql, &PostgreSqlDialect {})
+            .map_err(|e| Error::UnableToCreateView {
+                reason: format_datafusion_error(&e),
+            })?;
         let statements = DFParser::parse_sql_with_dialect(&view.sql, &PostgreSqlDialect {})
             .context(UnableToParseSqlSnafu)?;
         if statements.len() != 1 {
@@ -6999,6 +7003,11 @@ impl DataFusion {
             }
             .fail();
         }
+        sql_depth_guard::ensure_statement_within_depth_limits(&statements[0]).map_err(|e| {
+            Error::UnableToCreateView {
+                reason: format_datafusion_error(&e),
+            }
+        })?;
 
         let ctx = Arc::clone(&self.ctx);
         let df_ref = Arc::clone(self);
