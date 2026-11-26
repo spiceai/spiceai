@@ -2,6 +2,7 @@
 # numeric(38, 10) value with 28 integer digits ("numeric magnitude exceeds
 # Decimal128 range"), and the dataset stops applying every later change.
 name: postgres-cdc-numeric-38-digits
+duration: 79s
 description: >
   Through PostgreSQL CDC, numeric values that use every digit of their
   declared precision arrive as the source holds them, whatever the scale, and

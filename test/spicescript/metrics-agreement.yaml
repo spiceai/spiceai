@@ -1,4 +1,5 @@
 name: metrics-agreement
+duration: 26s
 tags: [long]
 description: >
   What the runtime reports agrees with what ran: after a known workload (7

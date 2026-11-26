@@ -219,6 +219,172 @@ function Add-PathEntry {
     return "$pathValue;$directory"
 }
 
+# Spice skills for AI coding agents (https://github.com/spiceai/skills). The installer offers
+# them only in an interactive session: neither CI nor NONINTERACTIVE set, a session that is not a
+# service, and a console whose input and output are not redirected. An unattended install, such
+# as a CI job or a provisioning script, never asks and never changes an agent's configuration.
+$skillsRepo = "spiceai/skills"
+$skillsUrl = "https://github.com/spiceai/skills"
+# The agents whose own CLI installs the plugin, in the order the installer lists them. Each name
+# is also the agent's command. Cursor and the rest install the skills with `npx skills add`,
+# which the installer does not run: it fetches and runs a package from npm.
+$skillsAgentOrder = @("claude", "codex", "copilot", "grok")
+
+# Whether a person can answer a question.
+function Test-Interactive {
+    if ($env:CI -or $env:NONINTERACTIVE) {
+        return $false
+    }
+    if (-not [Environment]::UserInteractive) {
+        return $false
+    }
+    try {
+        return -not ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected)
+    } catch {
+        return $false
+    }
+}
+
+function Get-AgentName {
+    param([string]$Agent)
+    switch ($Agent) {
+        "claude" { return "Claude Code" }
+        "codex" { return "Codex" }
+        "copilot" { return "GitHub Copilot CLI" }
+        "grok" { return "Grok Build" }
+    }
+}
+
+# The arguments of the agent's commands that install the plugin: Marketplace, which adds the
+# spiceai/skills marketplace (none for Grok), then Install.
+function Get-AgentSkillCommand {
+    param([string]$Agent)
+    switch ($Agent) {
+        "claude" { return @{ Marketplace = @("plugin", "marketplace", "add", $skillsRepo); Install = @("plugin", "install", "spiceai@spiceai") } }
+        "codex" { return @{ Marketplace = @("plugin", "marketplace", "add", $skillsRepo); Install = @("plugin", "add", "spiceai@spiceai") } }
+        "copilot" { return @{ Marketplace = @("plugin", "marketplace", "add", $skillsRepo); Install = @("plugin", "install", "spiceai@spiceai") } }
+        "grok" { return @{ Marketplace = $null; Install = @("plugin", "install", $skillsRepo, "--trust") } }
+    }
+}
+
+# Installs the Spice skills plugin for $Agent with the agent's own CLI. The marketplace step may
+# report that the marketplace is already added; whether the plugin install succeeds is what
+# counts, and a plugin that is already installed is a success. Adds the agent to
+# $script:SkillsInstalled when it is.
+function Install-AgentSkill {
+    param([string]$Agent)
+    # A native command's stderr must not stop the script, whatever the caller's preference.
+    $ErrorActionPreference = "Continue"
+    $name = Get-AgentName $Agent
+    $commands = Get-AgentSkillCommand $Agent
+    $marketplace = $commands.Marketplace
+    $install = $commands.Install
+    Write-Output "Installing the Spice skills plugin for $name..."
+    # Empty input: a question from the agent's CLI fails it rather than waiting unseen.
+    $log = @()
+    if ($marketplace) {
+        $log += @($null | & $Agent @marketplace 2>&1)
+    }
+    $log += @($null | & $Agent @install 2>&1)
+    $status = $LASTEXITCODE
+    $text = ($log | Out-String).Trim()
+    if ($status -ne 0 -and $text -match "already installed") {
+        Write-Output "The Spice skills plugin is already installed for $name."
+        $script:SkillsInstalled += $Agent
+    } elseif ($status -ne 0) {
+        Write-Warning "Could not install the Spice skills plugin for $name (exit status $status). spice itself is installed. $name printed: $text"
+        $retry = @()
+        if ($marketplace) {
+            $retry += "$Agent $($marketplace -join ' ')"
+        }
+        $retry += "$Agent $($install -join ' ')"
+        Write-Output "To try again, run: $($retry -join '; ')"
+    } else {
+        Write-Output "Installed the Spice skills plugin for $name."
+        $script:SkillsInstalled += $Agent
+    }
+}
+
+# The agents an answer picks from the listed ones: numbers from the list, separated by commas or
+# spaces, "a" for all, or "n" or nothing for none. Valid is false for any other answer.
+function Select-SkillAgent {
+    param([string]$Answer, [string[]]$Listed)
+    $words = @((($Answer + "").ToLowerInvariant() -replace ',', ' ') -split '\s+' | Where-Object { $_ })
+    if ($words.Count -eq 0 -or ($words.Count -eq 1 -and $words[0] -in @("n", "no", "none"))) {
+        return @{ Valid = $true; Agents = @() }
+    }
+    if ($words.Count -eq 1 -and $words[0] -in @("a", "all")) {
+        return @{ Valid = $true; Agents = $Listed }
+    }
+    $chosen = @()
+    foreach ($word in $words) {
+        if ($word -notmatch '^[0-9]{1,3}$') {
+            return @{ Valid = $false; Agents = @() }
+        }
+        $index = [int]$word
+        if ($index -lt 1 -or $index -gt $Listed.Count) {
+            return @{ Valid = $false; Agents = @() }
+        }
+        if ($chosen -notcontains $Listed[$index - 1]) {
+            $chosen += $Listed[$index - 1]
+        }
+    }
+    return @{ Valid = $true; Agents = $chosen }
+}
+
+# Asks which of the agents found on PATH should get the Spice skills plugin, and installs it for
+# them. Without a person to ask, prints where to find the skills instead.
+function Invoke-SkillOffer {
+    $script:SkillsInstalled = @()
+    $found = @($skillsAgentOrder | Where-Object { Get-Command $_ -ErrorAction SilentlyContinue })
+    if ($found.Count -eq 0) {
+        return
+    }
+    if (-not (Test-Interactive)) {
+        Write-Output "To add the Spice skills to your AI coding agents, see $skillsUrl#installation"
+        return
+    }
+
+    Write-Output ""
+    Write-Output "Spice skills teach AI coding agents to set up and use Spice: $skillsUrl"
+    Write-Output "Install the Spice skills plugin for:"
+    for ($i = 0; $i -lt $found.Count; $i++) {
+        Write-Output "  $($i + 1)) $(Get-AgentName $found[$i])"
+    }
+    Write-Output "  a) All of these"
+    Write-Output "  n) None"
+    $selection = @{ Valid = $true; Agents = @() }
+    for ($try = 1; $try -le 3; $try++) {
+        $selection = Select-SkillAgent (Read-Host "Choose one or more, such as 1,2 [n]") $found
+        if ($selection.Valid) {
+            break
+        }
+        if ($try -eq 3) {
+            Write-Output "No agent chosen."
+            $selection = @{ Valid = $true; Agents = @() }
+        } else {
+            Write-Output "Answer with numbers from 1 to $($found.Count), a for all, or n for none."
+        }
+    }
+    if ($selection.Agents.Count -eq 0) {
+        Write-Output "To add the Spice skills later, see $skillsUrl#installation"
+        return
+    }
+    foreach ($agent in $selection.Agents) {
+        Install-AgentSkill $agent
+    }
+    if ($script:SkillsInstalled.Count -gt 0) {
+        Write-Output "Start a new session of your agent and ask it to set up Spice."
+        if ($script:SkillsInstalled -contains "claude") {
+            Write-Output "  In Claude Code: /spiceai:setup"
+        }
+        if ($script:SkillsInstalled -contains "codex") {
+            Write-Output "  In Codex: `$spiceai:setup"
+        }
+    }
+    Write-Output "For Cursor and other agents, see $skillsUrl#installation"
+}
+
 Assert-Supported
 
 Install-SpiceCli
@@ -234,3 +400,5 @@ if ($null -ne $newEnvPath) {
 }
 
 Write-Output "`nTo get started with Spice.ai, visit https://spiceai.org/docs"
+
+Invoke-SkillOffer

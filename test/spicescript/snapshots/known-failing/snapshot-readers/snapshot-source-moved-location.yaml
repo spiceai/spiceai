@@ -1,4 +1,5 @@
 name: snapshot-source-moved-location
+duration: 7s
 description: >
   A file_format snapshot dataset pointed at another snapshot location never
   serves the rows it restored from the previous one. The new location lists

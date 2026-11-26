@@ -1,4 +1,5 @@
 name: freshness-status
+duration: 37s
 tags: [long]
 description: >
   /v1/datasets reports when each acceleration last refreshed and will refresh

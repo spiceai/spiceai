@@ -1,4 +1,5 @@
 name: refresh-api-invalid-sql
+duration: 6s
 description: >
   Known failing (#15546). A refresh request with `refresh_sql` it can never run —
   another table, two statements, a DELETE — is refused with 400 and the

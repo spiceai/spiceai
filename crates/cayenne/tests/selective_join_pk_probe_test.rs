@@ -44,9 +44,9 @@ use datafusion::prelude::*;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-test_with_backends!(selective_join_probe_emits_one_row_impl);
-test_with_backends!(selective_join_pushes_a_dynamic_filter_to_the_probe_impl);
-test_with_backends!(mixed_tier_join_keeps_the_inlined_side_in_the_metastore_impl);
+test_on_data_store!(selective_join_probe_emits_one_row_impl);
+test_on_data_store!(selective_join_pushes_a_dynamic_filter_to_the_probe_impl);
+test_on_data_store!(mixed_tier_join_keeps_the_inlined_side_in_the_metastore_impl);
 
 const PARENT_ROWS: i64 = 20_000;
 
@@ -77,21 +77,23 @@ async fn make_table(
     pk: Vec<String>,
 ) -> CayenneTableProvider {
     let ctx = SessionContext::new();
-    CayenneTableProvider::create_table(
-        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
-        CreateTableOptions {
-            table_name: name.to_string(),
-            schema,
-            primary_key: pk,
-            on_conflict: None,
-            base_path: fixture.data_path.to_string_lossy().to_string(),
-            partition_column: None,
-            vortex_config: VortexConfig::default(),
-        },
-        ctx.runtime_env(),
-    )
-    .await
-    .expect("create table")
+    fixture
+        .data_store
+        .create(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+            CreateTableOptions {
+                table_name: name.to_string(),
+                schema,
+                primary_key: pk,
+                on_conflict: None,
+                base_path: fixture.data_store.base_path(name),
+                partition_column: None,
+                vortex_config: VortexConfig::default(),
+            },
+        )
+        .await
+        .expect("create table")
 }
 
 /// Register both tables in one context and return the `EXPLAIN ANALYZE` text

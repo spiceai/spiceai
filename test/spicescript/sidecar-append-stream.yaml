@@ -6,6 +6,7 @@
 # of the upstream reloads each dataset from the upstream's new snapshot, and
 # once that reload is swapped in each reads current again.
 name: sidecar-append-stream
+duration: 35s
 description: >
   Two sidecar datasets that read one upstream dataset over its append stream
   each load the upstream's rows, reload them after the upstream restarts, and
