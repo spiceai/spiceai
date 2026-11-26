@@ -20,6 +20,7 @@ members = [
     "crates/chrono-tz",
     "crates/chunking",
     "crates/cloud-connect-crypto",
+    "crates/container-images",
     "crates/cpu-budget",
     "crates/data-accelerator-api",
     "crates/data-connectors/*",

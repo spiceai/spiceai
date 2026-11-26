@@ -68,6 +68,13 @@ Docker must be running. The `aws` CLI is needed for object-store sources, and
 fetch the DuckDB release they use into `~/.cache/spicescript/` (see
 **DuckDB releases** below).
 
+Every container a script starts, a source's or an executor's, runs from an
+image pinned in `test/container_images.json`: it is pulled and run as
+`registry/repository:tag@sha256:<digest>`, with the digest recorded for that
+tag, so a tag that moves cannot change what a run starts. An image the file
+does not pin is refused before Docker is asked for it, here as in CI; record
+one with `.github/scripts/pin_container_images.py --write <image>`.
+
 Under a rootless Docker daemon, every running container holds one kernel key
 charged to the daemon's uid. That uid's quota (`kernel.keys.maxkeys` and
 `kernel.keys.maxbytes`, 200 keys and 20000 bytes by default) is shared with
@@ -642,7 +649,7 @@ selects their key (default `id`); replace mode clears the existing collection,
 topic or table first. `${sources.src.from_prefix}t${sources.src.from_suffix}`
 selects a table for any of these built-in kinds, including across a matrix.
 Their `source-exec` and `source-query` steps run container shell commands.
-`version` overrides the image tag.
+`version` overrides the image tag, which must be pinned in `test/container_images.json`.
 
 The mirror statement commits before target application. A target failure fails
 the step and reports that the mirror has committed; there is no cross-source

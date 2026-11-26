@@ -28,8 +28,8 @@ use crate::{
     generate::Dialect,
 };
 
-const IMAGE: &str = "clickhouse/clickhouse-server";
-const DEFAULT_VERSION: &str = "24.8";
+/// The image a source starts when its spec names no `version`.
+const IMAGE: &str = "clickhouse/clickhouse-server:24.8";
 const USER: &str = "spicescript";
 const PASSWORD: &str = "spicescript-secret";
 
@@ -41,7 +41,7 @@ impl ClickHouse {
     pub async fn start(name: &str, run_id: &str, version: Option<&str>) -> Result<Self> {
         let container = Container::start(ContainerSpec {
             name: format!("spicescript-{run_id}-{name}"),
-            image: format!("{IMAGE}:{}", version.unwrap_or(DEFAULT_VERSION)),
+            image: super::at_version(IMAGE, version),
             env: vec![
                 ("CLICKHOUSE_USER".into(), USER.into()),
                 ("CLICKHOUSE_PASSWORD".into(), PASSWORD.into()),

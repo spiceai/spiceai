@@ -346,6 +346,8 @@ util = "foundation"
 redact = "foundation"
 vortex-datafusion = "foundation"
 yaml = "foundation"
+# The image digests the test harnesses pin; depends on nothing in the workspace.
+container-images = "foundation"
 
 # --- shared-utility: composable libraries the runtime is built from (default
 # tier, but listed here for clarity / auditability). Everything else defaults to

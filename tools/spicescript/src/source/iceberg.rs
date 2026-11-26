@@ -40,7 +40,7 @@ use crate::{
 };
 
 const STORE_IMAGE: &str = "rustfs/rustfs:1.0.1";
-const CATALOG_IMAGE: &str = "apache/iceberg-rest-fixture:latest";
+const CATALOG_IMAGE: &str = "apache/iceberg-rest-fixture:1.10.1";
 const USER: &str = "spicescript";
 const PASSWORD: &str = "spicescript-secret";
 const WAREHOUSE: &str = "warehouse";

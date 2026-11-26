@@ -31,7 +31,7 @@ limitations under the License.
 //! The Azure Cosmos emulator (`mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator`)
 //! is not used by these tests: its image and cold start exceed the budgets of
 //! the shared runner and `docker/mod.rs` `CONTAINER_SEMAPHORE`. The push-down
-//! round trip in `pushdown_roundtrip.rs` does use its `vnext-preview` build, and
+//! round trip in `pushdown_roundtrip.rs` does use its vNext emulator (a `vnext-EN…` release), and
 //! is ignored by default for the same reason.
 
 #![allow(dead_code, clippy::allow_attributes)]

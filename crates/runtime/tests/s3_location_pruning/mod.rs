@@ -71,7 +71,7 @@ async fn test_location_metadata_preserves_custom_s3_endpoint() -> Result<(), any
     #[instrument]
     async fn start_rustfs_container() -> Result<RunningContainer, anyhow::Error> {
         let running_container = ContainerRunnerBuilder::new("spice_test_rustfs_location_pruning")
-            .image("rustfs/rustfs:latest".to_string())
+            .image("rustfs/rustfs:1.0.6".to_string())
             .publish_port(9000)
             .add_env_var("RUSTFS_ACCESS_KEY", RUSTFS_ACCESS_KEY)
             .add_env_var("RUSTFS_SECRET_KEY", RUSTFS_SECRET_KEY)

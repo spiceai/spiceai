@@ -365,7 +365,7 @@ async fn build_image_from_source(
 ) -> Result<(), anyhow::Error> {
     let temp_dir = tempfile::tempdir()?;
     let dockerfile_path = temp_dir.path().join("Dockerfile.retention-oom");
-    std::fs::write(&dockerfile_path, dockerfile_for_source_build())?;
+    std::fs::write(&dockerfile_path, dockerfile_for_source_build()?)?;
 
     let build_status = Command::new("docker")
         .arg("build")
@@ -454,7 +454,7 @@ async fn build_image_from_host_binary(
         );
     }
 
-    std::fs::write(&dockerfile_path, dockerfile_for_host_binary())?;
+    std::fs::write(&dockerfile_path, dockerfile_for_host_binary()?)?;
 
     let build_status = Command::new("docker")
         .arg("build")
@@ -476,9 +476,15 @@ async fn build_image_from_host_binary(
     Ok(())
 }
 
-fn dockerfile_for_host_binary() -> &'static str {
-    r#"FROM rust:1.91-slim-trixie
+/// The image the test binary is packaged in, or built in. `docker build` pulls
+/// it by the digest `test/container_images.json` pins for it.
+const BUILD_IMAGE: &str = "rust:1.91-slim-trixie";
 
+fn dockerfile_for_host_binary() -> Result<String, anyhow::Error> {
+    Ok(format!(
+        "FROM {}\n{}",
+        container_images::pinned(BUILD_IMAGE)?,
+        r#"
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         libprotobuf-dev \
@@ -492,11 +498,14 @@ RUN chmod +x /usr/local/bin/retention_oom
 
 ENTRYPOINT ["/usr/local/bin/retention_oom"]
 "#
+    ))
 }
 
-fn dockerfile_for_source_build() -> &'static str {
-    r#"FROM rust:1.91-slim-trixie
-
+fn dockerfile_for_source_build() -> Result<String, anyhow::Error> {
+    Ok(format!(
+        "FROM {}\n{}",
+        container_images::pinned(BUILD_IMAGE)?,
+        r#"
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         build-essential \
@@ -535,6 +544,7 @@ RUN chmod +x /usr/local/bin/run-retention-oom.sh
 
 ENTRYPOINT ["/usr/local/bin/run-retention-oom.sh"]
 "#
+    ))
 }
 
 fn write_large_csv(path: &Path, rows: usize, payload_bytes: usize) -> Result<(), anyhow::Error> {

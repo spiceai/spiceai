@@ -31,7 +31,7 @@ pub(crate) const S3_BUCKET: &str = "lake";
 /// A `RustFS` object store in a container, healthy and reachable on its published port.
 pub(crate) async fn start_object_store(name: &str) -> anyhow::Result<RunningContainer> {
     let container = ContainerRunnerBuilder::new(name)
-        .image("rustfs/rustfs:latest".to_string())
+        .image("rustfs/rustfs:1.0.6".to_string())
         .publish_port(9000)
         .add_env_var("RUSTFS_ACCESS_KEY", S3_ACCESS_KEY)
         .add_env_var("RUSTFS_SECRET_KEY", S3_SECRET_KEY)

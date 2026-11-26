@@ -83,7 +83,16 @@ impl Container {
     ///
     /// Waits for room in the kernel key quota first, and retries a start that
     /// runc refused because the quota filled meanwhile (see [`crate::keyquota`]).
+    ///
+    /// The image runs by the digest `test/container_images.json` pins for
+    /// its tag; an image the file does not pin is refused before Docker is
+    /// reached.
     pub async fn start_on(spec: ContainerSpec, host_ports: HashMap<u16, u16>) -> Result<Self> {
+        let spec = ContainerSpec {
+            image: container_images::pinned(&spec.image)
+                .with_context(|| format!("not starting container {}", spec.name))?,
+            ..spec
+        };
         let mut attempt = 1;
         loop {
             crate::keyquota::wait_for_room(1, &format!("container {}", spec.name)).await?;
@@ -1130,6 +1139,50 @@ pub fn healthcheck(probe: &str) -> HealthConfig {
         retries: Some(120),
         start_period: Some(10_000_000_000),
         start_interval: Some(250_000_000),
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::{Container, ContainerSpec};
+
+    fn spec(image: &str) -> ContainerSpec {
+        ContainerSpec {
+            name: "spicescript-pin-test".into(),
+            image: image.into(),
+            env: Vec::new(),
+            command: None,
+            ports: Vec::new(),
+            healthcheck: None,
+            network: None,
+            alias: None,
+        }
+    }
+
+    /// The images are under a reserved domain, so nothing could be pulled
+    /// even if they were not refused.
+    #[tokio::test]
+    async fn a_container_starts_only_from_a_pinned_image() {
+        for (image, refusal) in [
+            (
+                "registry.invalid/nosuch/image:1",
+                "registry.invalid/nosuch/image:1 is not pinned: test/container_images.json records no digest for registry.invalid/nosuch/image:1",
+            ),
+            (
+                "registry.invalid/nosuch/image:latest",
+                "registry.invalid/nosuch/image:latest names `latest`, a tag that moves to each new release",
+            ),
+        ] {
+            let Err(err) = Container::start(spec(image)).await else {
+                panic!("{image} started");
+            };
+            let message = format!("{err:#}");
+            assert!(
+                message.starts_with("not starting container spicescript-pin-test: "),
+                "{message}"
+            );
+            assert!(message.contains(refusal), "{message}");
+        }
     }
 }
 

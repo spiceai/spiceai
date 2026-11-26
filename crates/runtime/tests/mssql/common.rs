@@ -51,7 +51,7 @@ pub async fn start_mssql_docker_container(
     container_name: &str,
 ) -> Result<RunningContainer, anyhow::Error> {
     let running_container = ContainerRunnerBuilder::new(container_name)
-        .image("mcr.microsoft.com/mssql/server:2022-latest".to_string())
+        .image("mcr.microsoft.com/mssql/server:2022-CU28-ubuntu-22.04".to_string())
         .publish_port(1433)
         .add_env_var("MSSQL_SA_PASSWORD", MSSQL_ROOT_PASSWORD)
         .add_env_var("ACCEPT_EULA", "Y")

@@ -1,0 +1,22 @@
+[package]
+description = "The digest each container image the integration tests and spicescript start is pinned to, from test/container_images.json"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "container-images"
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+regex.workspace = true
+yaml = { path = "../yaml" }
+
+[lints]
+workspace = true

@@ -24,7 +24,7 @@ use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 
 pub const ORACLE_USERNAME: &str = "system";
 pub const ORACLE_ROOT_PASSWORD: &str = "S3cret_Pass123";
-const ORACLE_IMAGE: &str = "docker.io/gvenzl/oracle-free:latest";
+const ORACLE_IMAGE: &str = "docker.io/gvenzl/oracle-free:23.26.4";
 
 pub fn make_oracle_dataset(path: &str, name: &str, port: u16) -> Dataset {
     let mut dataset = Dataset::new(format!("oracle:{path}"), name.to_string());

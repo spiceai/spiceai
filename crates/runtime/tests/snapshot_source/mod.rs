@@ -107,7 +107,7 @@ async fn start_rustfs(name: &str) -> Result<(Rustfs, RunningContainer)> {
     use bollard::secret::HealthConfig;
 
     let container = ContainerRunnerBuilder::new(name)
-        .image("rustfs/rustfs:latest".to_string())
+        .image("rustfs/rustfs:1.0.6".to_string())
         .publish_port(9000)
         .add_env_var("RUSTFS_ACCESS_KEY", ACCESS_KEY)
         .add_env_var("RUSTFS_SECRET_KEY", SECRET_KEY)

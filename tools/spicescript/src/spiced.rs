@@ -216,7 +216,12 @@ impl Spiced {
     /// Runs `spiced` in `run`'s container. A bridged one publishes its ports
     /// on every interface, so they are given out again from those free on
     /// every interface: a loopback probe misses a listener on another address.
-    pub fn set_container(&mut self, run: ContainerRun) -> Result<()> {
+    pub fn set_container(&mut self, mut run: ContainerRun) -> Result<()> {
+        // `docker run` pulls a missing image: by the digest
+        // `test/container_images.json` pins for its tag, and never one the
+        // file does not pin.
+        run.image = container_images::pinned(&run.image)
+            .with_context(|| format!("not running {} in a container", run.name))?;
         if run.bridge.is_some() {
             let every = std::net::Ipv4Addr::UNSPECIFIED.into();
             self.http = crate::docker::free_port_on(every)?;
@@ -1224,6 +1229,61 @@ fn not_yet_loaded(text: &str, declared: &[String]) -> Vec<String> {
         .filter_map(|d| d.get("name").and_then(serde_json::Value::as_str))
         .map(str::to_string);
     missing.chain(loading).collect()
+}
+
+#[cfg(test)]
+mod container_image_tests {
+    use std::collections::BTreeMap;
+
+    use super::{ContainerRun, Spiced};
+
+    fn run(image: &str) -> ContainerRun {
+        ContainerRun {
+            image: image.into(),
+            name: "spicescript-pin-test".into(),
+            volumes: Vec::new(),
+            rootless: false,
+            bridge: None,
+        }
+    }
+
+    #[test]
+    fn spiced_runs_in_a_container_only_from_a_pinned_image() {
+        let dir = std::env::temp_dir().join(format!("spicescript-pin-test-{}", std::process::id()));
+        let mut spiced =
+            Spiced::new("spiced".into(), dir.clone(), BTreeMap::new()).expect("instance");
+        spiced
+            .set_container(run("ubuntu:26.04"))
+            .expect("a pinned image");
+        let image = &spiced.container.as_ref().expect("a container").image;
+        assert!(
+            image.starts_with("docker.io/library/ubuntu:26.04@sha256:"),
+            "{image}"
+        );
+        // Under a reserved domain, so nothing could be pulled even if it were
+        // not refused.
+        for (image, refusal) in [
+            (
+                "registry.invalid/nosuch/image:1",
+                "is not pinned: test/container_images.json records no digest",
+            ),
+            (
+                "registry.invalid/nosuch/image:latest",
+                "names `latest`, a tag that moves",
+            ),
+        ] {
+            let message = format!(
+                "{:#}",
+                spiced.set_container(run(image)).expect_err("refused")
+            );
+            assert!(
+                message.starts_with("not running spicescript-pin-test in a container: "),
+                "{message}"
+            );
+            assert!(message.contains(refusal), "{message}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

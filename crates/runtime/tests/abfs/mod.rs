@@ -56,7 +56,7 @@ const AZURITE_CONTAINER: &str = "testcontainer";
 #[instrument]
 pub async fn start_azurite_docker_container() -> Result<RunningContainer, anyhow::Error> {
     let running_container = ContainerRunnerBuilder::new("spice_test_azurite")
-        .image("mcr.microsoft.com/azure-storage/azurite:latest".to_string())
+        .image("mcr.microsoft.com/azure-storage/azurite:3.38.0".to_string())
         .publish_port(10001)
         .publish_port(10000)
         .healthcheck(HealthConfig {
