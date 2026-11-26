@@ -1445,3 +1445,46 @@ async fn a_removed_indexs_run_files_are_reclaimed_once_their_data_files_are_gone
     );
     assert_eq!(a.count_and_sum().await, expected(1..=100));
 }
+
+/// A run over a hundred thousand data files, whose file list alone is
+/// larger than four MiB, left unregistered after its data files are gone: the
+/// orphan sweep reads its whole file list, retires it, and the retirement
+/// sweep deletes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unregistered_run_with_a_long_file_list_is_reclaimed() {
+    let (a, objects, table, table_id) = indexed_instance().await;
+    a.insert(1, 100).await.expect("A writes");
+    let (registered, stored) =
+        wait_for_runs(&a, &objects, &table_id, "A persists a run", |r, f| {
+            !r.is_empty() && f.len() == r.len()
+        })
+        .await;
+    let names: Vec<String> = (0..100_000)
+        .map(|i| format!("01b0000000000000000000000000{i:06}_00000.vortex"))
+        .collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (run_name, run_bytes) = run_file(&refs);
+    let list_bytes: usize = names.iter().map(|name| name.len() + 4).sum();
+    assert!(
+        list_bytes > 4 * 1024 * 1024,
+        "the file list alone is {list_bytes} bytes"
+    );
+    let run_path = stored[0].replace(registered[0].split_once('/').expect("key/run").1, &run_name);
+    objects
+        .put(&Path::from(run_path.as_str()), PutPayload::from(run_bytes))
+        .await
+        .expect("plant the run file");
+
+    let swept = table.sweep_orphan_files_now().await.expect("sweep");
+    let key = registered[0].split_once('/').expect("key/run").0;
+    assert_eq!(
+        swept.retired_index_runs,
+        vec![format!("_lookup_index/{key}/{run_name}")],
+        "the orphan sweep reads the whole file list and retires the run"
+    );
+    table.reclaim_retired_snapshots_now().await;
+    assert!(
+        !stored_run_files(&objects).await.contains(&run_path),
+        "the retirement sweep deletes it"
+    );
+}

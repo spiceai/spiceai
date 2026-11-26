@@ -2712,6 +2712,10 @@ fn additional_runs() -> Vec<Run> {
             "index-runs-manifest-not-readable",
             "registered run's file exists",
         ),
+        (
+            "index-runs-in-flight-unseen",
+            "registered run's file exists",
+        ),
     ] {
         runs.push(Run {
             name,

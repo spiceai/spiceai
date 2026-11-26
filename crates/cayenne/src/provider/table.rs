@@ -3638,9 +3638,11 @@ pub struct CayenneTableProvider {
     /// When the orphan sweep last ran, or the table opened.
     last_orphan_sweep: Arc<ParkingMutex<Instant>>,
     /// The data files each unregistered lookup-index run file the orphan sweep
-    /// has read covers, by its key relative to the table's directory. A run
-    /// file's name is derived from those files, so the entry never changes.
-    index_run_covers: Arc<ParkingMutex<HashMap<String, Vec<String>>>>,
+    /// has read covers, by its key relative to the table's directory, or
+    /// `None` for one that could not be read as a run. A run file's name is
+    /// derived from those files, so an entry never changes while its file is
+    /// listed.
+    index_run_covers: Arc<ParkingMutex<HashMap<String, Option<Vec<String>>>>>,
     /// Held by the orphan sweep while it runs, from when it is scheduled: one
     /// runs at a time, and [`Self::sweep_orphan_files_now`] and
     /// [`Self::drain_in_flight_maintenance`] wait for a scheduled one.
@@ -4164,6 +4166,10 @@ pub struct SnapshotDirPins {
     retired: Arc<ParkingMutex<HashMap<String, Instant>>>,
     retired_files: Arc<ParkingMutex<HashMap<String, Instant>>>,
     retired_orphans: Arc<ParkingMutex<HashMap<String, u64>>>,
+    /// The files the table's writes have uploaded and no commit names yet,
+    /// shared with a provider opened over these pins: a replaced provider's
+    /// writes may still be in flight, and the new one's sweeps must see them.
+    uncommitted: Arc<super::uncommitted_files::UncommittedFiles>,
 }
 
 impl SnapshotDirPins {
@@ -4175,6 +4181,7 @@ impl SnapshotDirPins {
             && Arc::ptr_eq(&self.retired, &other.retired)
             && Arc::ptr_eq(&self.retired_files, &other.retired_files)
             && Arc::ptr_eq(&self.retired_orphans, &other.retired_orphans)
+            && Arc::ptr_eq(&self.uncommitted, &other.uncommitted)
     }
 }
 
@@ -8756,6 +8763,7 @@ impl CayenneTableProvider {
             retired: Arc::clone(&self.retired_snapshot_dirs),
             retired_files: Arc::clone(&self.retired_file_timers),
             retired_orphans: Arc::clone(&self.retired_orphan_sizes),
+            uncommitted: Arc::clone(&self.uncommitted_files),
         }
     }
 
@@ -12150,8 +12158,11 @@ impl CayenneTableProvider {
 
         // The files this table's writers put in its storage and no commit names
         // yet (see `super::uncommitted_files`), shared with its storage for the
-        // deletion vectors written through it.
-        let uncommitted_files: Arc<super::uncommitted_files::UncommittedFiles> = Arc::default();
+        // deletion vectors written through it, and with the provider this one
+        // replaces, whose writes may still be in flight.
+        let uncommitted_files: Arc<super::uncommitted_files::UncommittedFiles> = snapshot_dir_pins
+            .as_ref()
+            .map_or_else(Arc::default, |pins| Arc::clone(&pins.uncommitted));
         // A table whose data path is an object-store URL reads and writes through
         // its own store, under a URL of its own (see `crate::dataset_storage`).
         // A `file://` table given no store (the `cayenne_vnext` flag off) keeps the
@@ -25541,10 +25552,11 @@ impl CayenneTableProvider {
                 continue;
             }
             let known = self.index_run_covers.lock().get(relative).cloned();
-            let files = if let Some(files) = known {
-                files
+            let described = if let Some(described) = known {
+                described
             } else {
-                let Some(files) = super::lookup_index::describe_run_file(
+                // A read that fails now is tried again by the next sweep.
+                let Ok(described) = super::lookup_index::describe_run_file(
                     config.store.as_ref(),
                     &meta.location,
                     name,
@@ -25555,8 +25567,12 @@ impl CayenneTableProvider {
                 };
                 self.index_run_covers
                     .lock()
-                    .insert(relative.to_string(), files.clone());
-                files
+                    .insert(relative.to_string(), described.clone());
+                described
+            };
+            // A file that cannot be read as a run is left, and not read again.
+            let Some(files) = described else {
+                continue;
             };
             let held = self.uncommitted_files.held_keys();
             if native
@@ -89055,6 +89071,7 @@ mod tests {
     }
 
     mod layered_upsert_state;
+    mod object_native_index_run_reload;
     mod object_native_scan_consistency;
     mod repeated_keys;
     mod update_visibility;

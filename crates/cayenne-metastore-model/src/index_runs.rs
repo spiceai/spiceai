@@ -11,10 +11,12 @@
 //! run file costs time, never rows. The property checked here is the stronger
 //! one, that a registered run's file exists.
 //!
-//! Data files go from absent to manifested (written, and named by the
-//! manifest of a snapshot that is not live yet: a compaction records it, and
-//! stops holding its files as uncommitted uploads, before the snapshot goes
-//! live), then live (the snapshot goes live) or gone (the snapshot is
+//! Data files go from absent to uploaded (written by a writer, which holds it
+//! in its process's record of uploads no commit names yet; no other process
+//! sees that record), to manifested (named by the manifest of a snapshot that
+//! is not live yet: a compaction records it, and stops holding its files as
+//! uncommitted uploads, before the snapshot goes live) or gone (the write is
+//! discarded, its process crashes, or it was fenced), then live (the snapshot goes live) or gone (the snapshot is
 //! abandoned), then retired (a commit removes them; old snapshots still read
 //! them), then gone (deleted and forgotten). A run is built over files that can
 //! be read (manifested, live or retired), possibly slowly: it can finish after
@@ -23,8 +25,9 @@
 //! takeover has fenced keeps running unaware, and its uploads and deletes
 //! still land, but its commits are refused (and tell it it was fenced).
 //!
-//! The protocol: a file is gone once no manifest, live set or retired set
-//! names it. A run file is written, then registered by a commit that accepts
+//! The protocol: a file is gone, as a writer judges it, once no manifest, live
+//! set or retired set names it and its own process does not hold it as an
+//! upload. A run file is written, then registered by a commit that accepts
 //! it only while none of its data files is gone and its name is not retired. A run no longer wanted is unregistered and its file kept, since
 //! the same run may be built again. A run file is retired, by a commit that
 //! also unregisters it, only once one of its data files is gone: no run over
@@ -43,7 +46,9 @@
 //! retired; `persist-forgotten` keeps the protocol's retirement rule but
 //! registers a run whose build finished after one of its files was gone;
 //! `manifest-not-readable` counts a file named only by a not-yet-live
-//! snapshot's manifest as gone.
+//! snapshot's manifest as gone; `in-flight-unseen` counts a file its own
+//! process holds as an upload as gone, as a provider that does not share the
+//! record of the provider it replaced would.
 use stateright::{Model, Property};
 
 /// Data files.
@@ -62,6 +67,8 @@ const CRASHES: u8 = 1;
 enum Data {
     #[default]
     Absent,
+    /// Written by the writer with this index, whose process holds it.
+    Uploaded(usize),
     Manifested,
     Live,
     Retired,
@@ -70,7 +77,10 @@ enum Data {
 impl Data {
     /// Whether the file exists to be read, so a run can be built over it.
     fn readable(self) -> bool {
-        matches!(self, Data::Manifested | Data::Live | Data::Retired)
+        matches!(
+            self,
+            Data::Uploaded(_) | Data::Manifested | Data::Live | Data::Retired
+        )
     }
 }
 
@@ -81,6 +91,7 @@ enum Rule {
     SkipRetired,
     PersistForgotten,
     ManifestNotReadable,
+    InFlightUnseen,
 }
 
 #[derive(Clone, Debug)]
@@ -150,7 +161,9 @@ pub(crate) struct State {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
-    DataWrite(usize),
+    DataWrite(usize, usize),
+    DataManifest(usize),
+    DataDiscard(usize),
     DataPublish(usize),
     DataAbandon(usize),
     DataRetire(usize),
@@ -177,6 +190,8 @@ impl Protocol {
             Rule::PersistForgotten
         } else if mode.contains("manifest-not-readable") {
             Rule::ManifestNotReadable
+        } else if mode.contains("in-flight-unseen") {
+            Rule::InFlightUnseen
         } else {
             Rule::Protocol
         };
@@ -188,13 +203,14 @@ impl Protocol {
     fn holder(s: &State) -> Option<usize> {
         (0..WRITERS).find(|&w| Self::holds_lease(s, w))
     }
-    /// Whether one of `name`'s files is gone, as the rule judges it from the
-    /// manifests, live set and retired set.
-    fn any_gone(&self, s: &State, name: Name) -> bool {
+    /// Whether one of `name`'s files is gone, as writer `w` judges it from the
+    /// manifests, live set, retired set and its own process's uploads.
+    fn any_gone(&self, s: &State, w: usize, name: Name) -> bool {
         (0..DATA).any(|f| {
             covers(name, f)
                 && match s.data[f] {
                     Data::Gone => true,
+                    Data::Uploaded(by) => by != w || self.rule == Rule::InFlightUnseen,
                     Data::Manifested => self.rule == Rule::ManifestNotReadable,
                     Data::Absent | Data::Live | Data::Retired => false,
                 }
@@ -203,22 +219,34 @@ impl Protocol {
     fn all_readable(s: &State, name: Name) -> bool {
         (0..DATA).all(|f| !covers(name, f) || s.data[f].readable())
     }
-    /// Whether a register commit of `name` is accepted under the lease.
-    fn may_register(&self, s: &State, name: Name) -> bool {
+    /// Whether writer `w`'s register commit of `name` is accepted under the lease.
+    fn may_register(&self, s: &State, w: usize, name: Name) -> bool {
         let retired = s.retired & bit(name) != 0;
         match self.rule {
-            Rule::Protocol | Rule::ManifestNotReadable => !retired && !self.any_gone(s, name),
+            Rule::Protocol | Rule::ManifestNotReadable | Rule::InFlightUnseen => {
+                !retired && !self.any_gone(s, w, name)
+            }
             Rule::SkipRetired | Rule::PersistForgotten => !retired,
             Rule::DeleteWhileLive => true,
         }
     }
-    /// Whether a retirement commit of `name` is accepted under the lease.
-    fn may_retire(&self, s: &State, name: Name) -> bool {
+    /// Whether writer `w`'s retirement commit of `name` is accepted under the
+    /// lease.
+    fn may_retire(&self, s: &State, w: usize, name: Name) -> bool {
         match self.rule {
-            Rule::Protocol | Rule::PersistForgotten | Rule::ManifestNotReadable => {
-                self.any_gone(s, name)
-            }
+            Rule::Protocol
+            | Rule::PersistForgotten
+            | Rule::ManifestNotReadable
+            | Rule::InFlightUnseen => self.any_gone(s, w, name),
             Rule::DeleteWhileLive | Rule::SkipRetired => true,
+        }
+    }
+    /// Writer `w`'s process lost its record of uploads: none is ever committed.
+    fn lose_uploads(next: &mut State, w: usize) {
+        for data in &mut next.data {
+            if *data == Data::Uploaded(w) {
+                *data = Data::Gone;
+            }
         }
     }
     /// A fenced writer's refused commit: it learns it was fenced and stops.
@@ -257,8 +285,12 @@ impl Model for Protocol {
     }
     fn actions(&self, s: &State, a: &mut Vec<Action>) {
         for f in 0..DATA {
+            for w in 0..WRITERS {
+                a.push(Action::DataWrite(w, f));
+            }
             a.extend([
-                Action::DataWrite(f),
+                Action::DataManifest(f),
+                Action::DataDiscard(f),
                 Action::DataPublish(f),
                 Action::DataAbandon(f),
                 Action::DataRetire(f),
@@ -293,10 +325,13 @@ impl Model for Protocol {
         }
         let mut next = s.clone();
         match action {
-            Action::DataWrite(f) => next.data[f] = Data::Manifested,
+            Action::DataWrite(w, f) => next.data[f] = Data::Uploaded(w),
+            Action::DataManifest(f) => next.data[f] = Data::Manifested,
             Action::DataPublish(f) => next.data[f] = Data::Live,
             Action::DataRetire(f) => next.data[f] = Data::Retired,
-            Action::DataAbandon(f) | Action::DataForget(f) => next.data[f] = Data::Gone,
+            Action::DataDiscard(f) | Action::DataAbandon(f) | Action::DataForget(f) => {
+                next.data[f] = Data::Gone;
+            }
             Action::BuildStart(w, name) => {
                 next.writers[w].build = Some(name);
                 next.builds += 1;
@@ -315,7 +350,7 @@ impl Model for Protocol {
                 next.writers[w].put = None;
                 if !Self::holds_lease(s, w) {
                     Self::refuse(&mut next, w);
-                } else if self.may_register(s, name) {
+                } else if self.may_register(s, w, name) {
                     next.reused |= s.unwanted & bit(name) != 0;
                     next.registered |= bit(name);
                 }
@@ -326,7 +361,7 @@ impl Model for Protocol {
             }
             Action::RetireRun(w, name) => {
                 if Self::holds_lease(s, w) {
-                    if self.may_retire(s, name) {
+                    if self.may_retire(s, w, name) {
                         if s.registered & bit(name) != 0 {
                             next.unwanted |= bit(name);
                         }
@@ -363,10 +398,13 @@ impl Model for Protocol {
                     generation: Some(next.lease),
                     ..Writer::default()
                 };
+                // Its uploads under the old generation can never be committed.
+                Self::lose_uploads(&mut next, w);
             }
             Action::Crash(w) => {
                 next.crashes += 1;
                 next.writers[w] = Writer::default();
+                Self::lose_uploads(&mut next, w);
             }
         }
         (next != *s).then_some(next)
@@ -380,9 +418,11 @@ impl Model for Protocol {
                 .join("+")
         };
         match *action {
-            Action::DataWrite(f) => {
-                format!("data file d{f} is written and named by a manifest not yet live")
+            Action::DataWrite(w, f) => format!("writer {w} uploads data file d{f}"),
+            Action::DataManifest(f) => {
+                format!("data file d{f} is named by a manifest not yet live")
             }
+            Action::DataDiscard(f) => format!("the write of data file d{f} is discarded"),
             Action::DataPublish(f) => format!("the snapshot naming d{f} goes live"),
             Action::DataAbandon(f) => format!("the snapshot naming d{f} is abandoned"),
             Action::DataRetire(f) => format!("a commit retires data file d{f}"),
@@ -449,7 +489,12 @@ impl Protocol {
         let writer = |w: usize| &s.writers[w];
         let holder = Self::holder(s).is_some();
         match *action {
-            Action::DataWrite(f) => holder && s.data[f] == Data::Absent,
+            Action::DataWrite(w, f) => writer(w).generation.is_some() && s.data[f] == Data::Absent,
+            // Only the lease holder's commit names its upload.
+            Action::DataManifest(f) => {
+                matches!(s.data[f], Data::Uploaded(by) if Self::holds_lease(s, by))
+            }
+            Action::DataDiscard(f) => matches!(s.data[f], Data::Uploaded(_)),
             Action::DataPublish(f) | Action::DataAbandon(f) => {
                 holder && s.data[f] == Data::Manifested
             }
@@ -469,7 +514,7 @@ impl Protocol {
                 writer(w).generation.is_some()
                     && (s.store | s.registered) & bit(name) != 0
                     && s.retired & bit(name) == 0
-                    && (!Self::holds_lease(s, w) || self.may_retire(s, name))
+                    && (!Self::holds_lease(s, w) || self.may_retire(s, w, name))
             }
             Action::SweepDelete(w, name) => {
                 let known = if Self::holds_lease(s, w) {
