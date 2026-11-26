@@ -101,7 +101,9 @@ entry itself as `(Get-Content … | ConvertFrom-Json).'<name>'`, names its targe
   release asset, each checked against a download. To bump it, pick the newest release that
   is not a pre-release and is at least two weeks old, take each zip's `digest` from
   `gh api repos/protocolbuffers/protobuf/releases/tags/v<version>`, and check it against a
-  download.
+  download. Each job unpacks its own checked zip into a new directory under `RUNNER_TEMP`
+  and runs that copy, never one kept in the runner's tool cache, which every job on a
+  self-hosted host can write.
 - **`oracle-instantclient`**: Oracle Instant Client 23.26.4.0.0 Basic for Linux x86_64, for
   `setup-oracle-odpi`. The action used to download Oracle's unversioned
   `instantclient-basic-linuxx64.zip`, which is whatever 23.26 build Oracle points it at; the
