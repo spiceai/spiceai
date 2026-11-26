@@ -684,7 +684,11 @@ impl DeletionSink for InlineAwareDeletionSink {
         let _write_guard = if super::write_lock_held::is_held() {
             None
         } else if self.table.key_tombstones_wait_for_staged_appends() {
-            Some(self.table.lock_write_after_staged_appends().await?)
+            Some(
+                self.table
+                    .lock_write_after_staged_appends("the delete or update")
+                    .await?,
+            )
         } else {
             Some(self.table.write_lock_arc().lock_owned().await)
         };

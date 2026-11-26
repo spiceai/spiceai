@@ -1650,7 +1650,9 @@ impl<'a> AppendMutationWriter<'a> {
         // The caller has made this commit's rows visible, so from here the claim
         // survives a cancellation or a failure: a commit that dies after
         // publishing has left rows it will never queue a delta for.
-        let published_live_rows_delta = reserved_live_rows_delta.published();
+        // Still under the `write_lock` the caller held across the publish.
+        let published_live_rows_delta =
+            reserved_live_rows_delta.published(self.table.statistics_epoch());
 
         let retention_requested = self.table.has_retention_delete_filters();
 
@@ -1897,13 +1899,14 @@ impl<'a> AppendMutationWriter<'a> {
                 let retention_requested = table.has_retention_delete_filters();
                 self.table
                     .publish_when_committed(async move {
-                        publish.run().await;
+                        let statistics_epoch = publish.run().await;
                         // The inline rows are visible now, so the claim
                         // survives from here. `run` awaits the
                         // maintained-aggregate apply after its own visibility
                         // flip, so a cancellation inside it still loses the
                         // claim — see #13721.
-                        let published_live_rows_delta = reserved_live_rows_delta.published();
+                        let published_live_rows_delta =
+                            reserved_live_rows_delta.published(statistics_epoch);
                         // `write_cdc_pipelined` reaches this inline commit
                         // without consulting `InlineMutationPolicy`, so unlike
                         // the staged path it can land here on a table that has

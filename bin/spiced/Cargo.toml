@@ -44,7 +44,6 @@ connector-mysql = { path = "../../crates/data-connectors/connector-mysql", optio
 connector-nfs = { path = "../../crates/data-connectors/connector-nfs", optional = true }
 connector-odbc = { path = "../../crates/data-connectors/connector-odbc", optional = true }
 connector-oracle = { path = "../../crates/data-connectors/connector-oracle", optional = true }
-accelerator-sqlite = { path = "../../crates/accelerators/accelerator-sqlite", optional = true }
 llms-llamacpp = { path = "../../crates/llms-llamacpp", optional = true }
 accelerator-cayenne = { path = "../../crates/accelerators/accelerator-cayenne" }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
@@ -165,7 +164,6 @@ debezium = ["runtime/debezium"]
 default = [
     "adbc",
     "postgres",
-    "sqlite",
     "mysql",
     "flightsql",
     "delta_lake",
@@ -236,7 +234,6 @@ client_tls = ["runtime/client_tls"]
 snowflake = ["connector-snowflake", "runtime/snowflake"]
 spark = ["connector-spark", "runtime/spark", "connector-databricks/spark"]
 spicebench = ["runtime/spicebench"]
-sqlite = ["accelerator-sqlite", "runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
 vortex = ["runtime/vortex"]
 

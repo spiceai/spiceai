@@ -40,13 +40,12 @@ use crate::component::dataset::{
         resolved_message, unavailable_engine_cause, waiting_for_snapshot_message,
     },
 };
-use crate::dataaccelerator::acceleration_file_path;
 use crate::dataconnector::snapshot_source::{
     projected_publisher_message, publisher_column_projection,
 };
 use crate::datafusion::engine_to_acceleration_engine;
 use crate::init::dataset_loads::DatasetLoad;
-use crate::{LogErrors, Runtime, UnableToBuildDatasetSnafu, status};
+use crate::{Runtime, UnableToBuildDatasetSnafu, status};
 
 /// Holds installed by tests that must supersede a snapshot restore after that
 /// restore has taken the load's attempt. Keyed by table name so parallel tests
@@ -178,10 +177,6 @@ impl Runtime {
         // meanwhile waits for the restore.
         let _attempt = load.start_attempt().await?;
         if stopped() {
-            return None;
-        }
-        if let Err(message) = self.check_snapshot_source_conflicts(&resolved).await {
-            self.refuse_snapshot_source(&name, &message);
             return None;
         }
 
@@ -367,56 +362,6 @@ impl Runtime {
             .get_accelerator_engine(engine)
             .await?;
         Some(engine)
-    }
-
-    /// Refuses a resolved snapshot dataset that would share accelerator state with
-    /// another dataset in a way startup refuses. Startup validates every accelerated
-    /// dataset it initializes, and a snapshot dataset is initialized only here, once its
-    /// engine is known.
-    async fn check_snapshot_source_conflicts(
-        self: &Arc<Self>,
-        dataset: &Arc<Dataset>,
-    ) -> Result<(), String> {
-        let Some(acceleration) = &dataset.acceleration else {
-            return Ok(());
-        };
-        let datasets = Arc::clone(self).get_valid_datasets(&dataset.app(), LogErrors(false));
-
-        // Restoring a `SQLite` snapshot replaces the whole file, so a
-        // file two datasets share would serve whichever restored last to both.
-        let param = match acceleration.engine {
-            Engine::Sqlite => "sqlite_file",
-            _ => return Ok(()),
-        };
-        let registry = self.accelerator_engine_registry();
-        let Ok(path) = acceleration_file_path(dataset.as_ref(), &registry).await else {
-            return Ok(());
-        };
-        let others = datasets.iter().filter(|other| {
-            other.name != dataset.name
-                && other.is_file_accelerated()
-                && other
-                    .acceleration
-                    .as_ref()
-                    .is_some_and(|other| other.engine == acceleration.engine)
-        });
-        for other in others {
-            if acceleration_file_path(other.as_ref(), &registry)
-                .await
-                .is_ok_and(|other_path| other_path == path)
-            {
-                return Err(cannot_load_snapshot_message(
-                    &dataset.name,
-                    &format!(
-                        "its local copy '{}' is also the file of dataset '{}', and restoring a snapshot replaces the whole file. Set a different `{param}` for '{}'",
-                        path.display(),
-                        other.name,
-                        other.name,
-                    ),
-                ));
-            }
-        }
-        Ok(())
     }
 
     /// The backoff between attempts to describe `dataset`'s snapshots, capped at the

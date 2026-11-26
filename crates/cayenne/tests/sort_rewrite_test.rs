@@ -36,7 +36,7 @@ use arrow::record_batch::RecordBatch;
 
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
 use cayenne::provider::CayenneContext;
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::{CayenneTableProvider, MetadataCatalog};
 
 use datafusion::datasource::TableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -89,7 +89,7 @@ async fn create_table_with_config(
         schema,
         primary_key: vec![],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config,
     };
@@ -97,9 +97,11 @@ async fn create_table_with_config(
     let catalog_arc = Arc::clone(&fixture.catalog);
     let catalog_arc: Arc<dyn MetadataCatalog> = catalog_arc;
     Arc::new(
-        CayenneTableProviderBuilder::new(catalog_arc, runtime_env)
-            .with_context(context)
-            .create(options)
+        fixture
+            .data_store
+            .create_with(catalog_arc, runtime_env, options, |builder| {
+                builder.with_context(context)
+            })
             .await
             .expect("table should be created"),
     )
@@ -209,7 +211,7 @@ fn total_rows(batches: &[RecordBatch]) -> usize {
 // Tests
 // ============================================================================
 
-test_with_backends!(test_sort_rewrite_basic_impl);
+test_on_data_store!(test_sort_rewrite_basic_impl);
 
 /// Basic test: insert unsorted data, sort-rewrite, verify sorted output.
 async fn test_sort_rewrite_basic_impl(
@@ -263,7 +265,7 @@ async fn test_sort_rewrite_basic_impl(
     Ok(())
 }
 
-test_with_backends!(test_sort_rewrite_multiple_inserts_impl);
+test_on_data_store!(test_sort_rewrite_multiple_inserts_impl);
 
 /// Multiple inserts then sort: data from separate append operations is merged and sorted.
 async fn test_sort_rewrite_multiple_inserts_impl(
@@ -326,7 +328,7 @@ async fn test_sort_rewrite_multiple_inserts_impl(
     Ok(())
 }
 
-test_with_backends!(test_sort_rewrite_with_nulls_impl);
+test_on_data_store!(test_sort_rewrite_with_nulls_impl);
 
 /// Sort with nullable columns: NULLs should sort to the end (default ASC NULLS LAST).
 async fn test_sort_rewrite_with_nulls_impl(
@@ -379,7 +381,7 @@ async fn test_sort_rewrite_with_nulls_impl(
     Ok(())
 }
 
-test_with_backends!(test_sort_rewrite_idempotent_impl);
+test_on_data_store!(test_sort_rewrite_idempotent_impl);
 
 /// Sort idempotency: sorting already-sorted data should produce identical results.
 async fn test_sort_rewrite_idempotent_impl(
@@ -446,7 +448,7 @@ async fn test_sort_rewrite_idempotent_impl(
     Ok(())
 }
 
-test_with_backends!(test_sort_rewrite_empty_table_impl);
+test_on_data_store!(test_sort_rewrite_empty_table_impl);
 
 /// Sorting an empty table is a safe no-op.
 async fn test_sort_rewrite_empty_table_impl(
@@ -478,7 +480,7 @@ async fn test_sort_rewrite_empty_table_impl(
     Ok(())
 }
 
-test_with_backends!(test_sort_rewrite_snapshot_changes_impl);
+test_on_data_store!(test_sort_rewrite_snapshot_changes_impl);
 
 /// Verify that sort-rewrite creates a new snapshot (the snapshot ID changes).
 async fn test_sort_rewrite_snapshot_changes_impl(
@@ -529,7 +531,7 @@ async fn test_sort_rewrite_snapshot_changes_impl(
     Ok(())
 }
 
-test_with_backends!(test_sort_rewrite_then_insert_impl);
+test_on_data_store!(test_sort_rewrite_then_insert_impl);
 
 /// Sort-rewrite followed by more inserts: new data should be appendable after sort.
 async fn test_sort_rewrite_then_insert_impl(
@@ -587,7 +589,7 @@ async fn test_sort_rewrite_then_insert_impl(
     Ok(())
 }
 
-test_with_backends!(test_sort_rewrite_orders_nulls_and_duplicates_across_files_impl);
+test_on_data_store!(test_sort_rewrite_orders_nulls_and_duplicates_across_files_impl);
 
 /// The full compaction sorts each scan partition on its own and merges them.
 /// With a nullable, heavily duplicated key spread over several input files and
@@ -728,7 +730,7 @@ async fn test_sort_rewrite_orders_nulls_and_duplicates_across_files_impl(
     Ok(())
 }
 
-test_with_backends!(test_sort_rewrite_large_dataset_impl);
+test_on_data_store!(test_sort_rewrite_large_dataset_impl);
 
 /// Sort a larger dataset to exercise chunking behavior.
 async fn test_sort_rewrite_large_dataset_impl(
@@ -793,7 +795,7 @@ async fn test_sort_rewrite_large_dataset_impl(
     Ok(())
 }
 
-test_with_backends!(test_sort_rewrite_multi_column_sort_impl);
+test_on_data_store!(test_sort_rewrite_multi_column_sort_impl);
 
 /// Sort-rewrite on a table with multiple sort columns.
 ///
@@ -860,7 +862,7 @@ async fn test_sort_rewrite_multi_column_sort_impl(
     Ok(())
 }
 
-test_with_backends!(test_sort_rewrite_reopen_table_impl);
+test_on_data_store!(test_sort_rewrite_reopen_table_impl);
 
 /// Verify sort-rewrite persists: re-opening the table from catalog shows sorted data.
 async fn test_sort_rewrite_reopen_table_impl(
@@ -890,7 +892,7 @@ async fn test_sort_rewrite_reopen_table_impl(
         schema: Arc::clone(&schema),
         primary_key: vec![],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("sort_reopen"),
         partition_column: None,
         vortex_config: vortex_config.clone(),
     };
@@ -899,9 +901,14 @@ async fn test_sort_rewrite_reopen_table_impl(
     let catalog_arc: Arc<dyn MetadataCatalog> = catalog_arc;
 
     let table = Arc::new(
-        CayenneTableProviderBuilder::new(Arc::clone(&catalog_arc), Arc::clone(&runtime_env))
-            .with_context(Arc::clone(&context))
-            .create(options)
+        fixture
+            .data_store
+            .create_with(
+                Arc::clone(&catalog_arc),
+                Arc::clone(&runtime_env),
+                options,
+                |builder| builder.with_context(Arc::clone(&context)),
+            )
             .await
             .expect("table should be created"),
     );
@@ -922,9 +929,14 @@ async fn test_sort_rewrite_reopen_table_impl(
     drop(table);
 
     let reopened = Arc::new(
-        CayenneTableProviderBuilder::new(Arc::clone(&catalog_arc), runtime_env)
-            .with_context(context)
-            .open("sort_reopen")
+        fixture
+            .data_store
+            .open_with(
+                Arc::clone(&catalog_arc),
+                runtime_env,
+                "sort_reopen",
+                |builder| builder.with_context(context),
+            )
             .await
             .expect("re-opening table should succeed"),
     );
@@ -953,7 +965,7 @@ async fn test_sort_rewrite_reopen_table_impl(
     Ok(())
 }
 
-test_with_backends!(test_sort_rewrite_duplicate_values_impl);
+test_on_data_store!(test_sort_rewrite_duplicate_values_impl);
 
 /// Sort with duplicate sort-column values: duplicates should be preserved (stable-ish).
 async fn test_sort_rewrite_duplicate_values_impl(
@@ -1024,7 +1036,7 @@ async fn test_sort_rewrite_duplicate_values_impl(
     Ok(())
 }
 
-test_with_backends!(test_sort_rewrite_waits_for_a_running_compaction_impl);
+test_on_data_store!(test_sort_rewrite_waits_for_a_running_compaction_impl);
 
 /// A forced full compaction waits for a compaction pass already holding the
 /// table rather than running beside it. Two passes over the same snapshot would
@@ -1112,27 +1124,32 @@ async fn file_key_ranges(
     use vortex::file::OpenOptionsSessionExt;
     use vortex_session::VortexSession;
 
-    let dir = fixture
-        .data_path
-        .join(table.table_id())
-        .join(table.current_snapshot_id());
-    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-        .expect("read snapshot dir")
-        .map(|entry| entry.expect("dir entry").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "vortex"))
-        .collect();
-    paths.sort();
+    let files = fixture
+        .data_store
+        .snapshot_data_files(
+            fixture.catalog.as_ref(),
+            table.table_id(),
+            &table.metadata().path,
+            &[table.current_snapshot_id()],
+        )
+        .await
+        .expect("list the current snapshot's data files");
     let column = table.schema().index_of("k").expect("k in schema");
-    let mut ranges = Vec::with_capacity(paths.len());
-    for path in paths {
+    let mut ranges = Vec::with_capacity(files.len());
+    for stored in files {
+        let bytes = fixture
+            .data_store
+            .read(&stored.path)
+            .await
+            .expect("read data file");
         let session = VortexSession::default();
         let file = session
             .open_options()
-            .open_path(&path)
-            .await
+            .open_buffer(bytes.to_vec())
             .expect("open data file");
         let stats = file.file_stats().expect("data file has footer statistics");
-        let (set, dtype) = stats.get(column);
+        let (aggregates, dtype) = stats.get(column);
+        let set = aggregates.to_stats_set();
         let nulls = set
             .get_as::<u64>(
                 Stat::NullCount,
@@ -1144,11 +1161,7 @@ async fn file_key_ranges(
             .into_inner()
             .expect("footer null count of k");
         ranges.push(FileKeyRange {
-            name: path
-                .file_name()
-                .expect("file name")
-                .to_string_lossy()
-                .into_owned(),
+            name: stored.name().to_string(),
             min: set.get_as::<i64>(Stat::Min, dtype).into_inner(),
             max: set.get_as::<i64>(Stat::Max, dtype).into_inner(),
             nulls,

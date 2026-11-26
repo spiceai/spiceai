@@ -416,6 +416,9 @@ pub enum Action {
         /// `false` waits only for `spiced` to answer HTTP, for a start whose
         /// datasets are expected not to become ready.
         wait_ready: bool,
+        /// `false` waits for nothing, for a start that is expected not to
+        /// serve yet; a later `wait-ready` waits for it.
+        wait: bool,
         /// A change to the spicepod, kept for every later start.
         patch: Option<VariantSpec>,
     },
@@ -434,6 +437,9 @@ pub enum Action {
         /// `upgrade`: start again on the binary under test (from the one
         /// `--from` started the instance on).
         upgrade: bool,
+        /// `downgrade`: start again on the binary the instance started on, the
+        /// release `from:` or `--from` names, as a rollback does.
+        downgrade: bool,
     },
     WaitReady {
         timeout: Duration,
@@ -534,11 +540,20 @@ pub enum Action {
         keep: Vec<String>,
     },
     /// Checks the files under the instance's directory, by path relative to it,
-    /// and that no directory matches `lacks_dirs` (paths end in `/`).
+    /// that no directory matches `lacks_dirs` (paths end in `/`), and that every
+    /// file `unchanged_since` names (a `mark-files` id) is still there, unchanged.
     AssertFiles {
         contains: Vec<regex::Regex>,
         lacks: Vec<regex::Regex>,
         lacks_dirs: Vec<regex::Regex>,
+        unchanged_since: Option<String>,
+    },
+    /// Keep the size and a digest of every file under the instance's directory
+    /// whose relative path matches one of `matching` (every file when it is
+    /// empty), for a later `assert-files: { unchanged-since: <id> }`.
+    MarkFiles {
+        id: String,
+        matching: Vec<regex::Regex>,
     },
     StopBackground {
         id: String,
@@ -861,6 +876,8 @@ pub struct HttpStep {
     pub timing: Timing,
     /// The API key the request presents (`api-key: none` for none).
     pub key: crate::spiced::Key,
+    /// Nothing answers: the connection is refused (`expect: { refused: true }`).
+    pub refused: bool,
 }
 
 /// Checks the instance's `spiced.log`, across every start.
@@ -1600,6 +1617,7 @@ const ACTIONS: &[&str] = &[
     "kill-spiced",
     "restart",
     "upgrade",
+    "downgrade",
     "wait-ready",
     "edit-spicepod",
     "flight-put",
@@ -1626,6 +1644,7 @@ const ACTIONS: &[&str] = &[
     "dbgen",
     "source-query",
     "assert-files",
+    "mark-files",
     "wipe-instance-dir",
     "stop-background",
     "spice",
@@ -1660,6 +1679,7 @@ const REACH_NO_SPICED: &[&str] = &[
 /// has none of.
 const UPSTREAM_ONLY: &[&str] = &[
     "upgrade",
+    "downgrade",
     "kill-executor",
     "start-executors",
     "add-executor",
@@ -1674,6 +1694,7 @@ const FAULT_ACTIONS: &[&str] = &[
     "kill-spiced",
     "restart",
     "upgrade",
+    "downgrade",
     "wait-ready",
     "kill-executor",
     "start-executors",
@@ -1764,21 +1785,30 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
     }
     let mut opts = Opts(map);
     let action = match name {
-        "start" => Action::Start {
-            ready_timeout: opts.duration_in(&arg, "ready-timeout")?,
-            wait_ready: wait_ready(&arg)?,
-            patch: patch(&arg)?,
-        },
+        "start" => {
+            let wait = start_waits(&arg)?;
+            ensure!(
+                wait || (arg.get("ready").is_none() && arg.get("ready-timeout").is_none()),
+                "`start` with `wait: false` waits for nothing, so it takes no `ready` or `ready-timeout`; put them on a later `wait-ready`"
+            );
+            Action::Start {
+                ready_timeout: opts.duration_in(&arg, "ready-timeout")?,
+                wait_ready: wait_ready(&arg)?,
+                wait,
+                patch: patch(&arg)?,
+            }
+        }
         "stop" => Action::Stop,
         "kill-spiced" => Action::Kill {
             signal: parse_signal(arg.get("signal"))?.unwrap_or(KillSignal::Kill),
         },
-        "restart" | "upgrade" => Action::Restart {
+        "restart" | "upgrade" | "downgrade" => Action::Restart {
             wait_ready: wait_ready(&arg)?,
             patch: patch(&arg)?,
             kill: parse_signal(arg.get("kill"))?,
             ready_timeout: opts.duration_in(&arg, "ready-timeout")?,
             upgrade: name == "upgrade",
+            downgrade: name == "downgrade",
         },
         "kill-executor" => Action::KillExecutor(
             serde_json::from_value(arg.clone())
@@ -2019,20 +2049,25 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
         "assert-files" => {
             let mut inner = Opts::of_mapping(
                 arg,
-                "`assert-files` takes a mapping with `contains`, `lacks` or `lacks-dirs`",
+                "`assert-files` takes a mapping with `contains`, `lacks`, `lacks-dirs` or `unchanged-since`",
             )?;
             let contains = inner.patterns("contains")?;
             let lacks = inner.patterns("lacks")?;
             let lacks_dirs = inner.patterns("lacks-dirs")?;
+            let unchanged_since = inner.string("unchanged-since")?;
             inner.finish()?;
             ensure!(
-                !contains.is_empty() || !lacks.is_empty() || !lacks_dirs.is_empty(),
-                "`assert-files` needs `contains`, `lacks` or `lacks-dirs`"
+                !contains.is_empty()
+                    || !lacks.is_empty()
+                    || !lacks_dirs.is_empty()
+                    || unchanged_since.is_some(),
+                "`assert-files` needs `contains`, `lacks`, `lacks-dirs` or `unchanged-since`"
             );
             Action::AssertFiles {
                 contains,
                 lacks,
                 lacks_dirs,
+                unchanged_since,
             }
         }
         "wipe-instance-dir" => {
@@ -2253,10 +2288,16 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
             let mut body_matches = Vec::new();
             let mut body_lacks = Vec::new();
             let mut json = Vec::new();
+            let mut refused = false;
             let (status, expect_headers, lacks_headers, body_contains) = match opts.take("expect") {
                 None => (None, Vec::new(), Vec::new(), None),
                 Some(Value::Object(e)) => {
                     let mut e = Opts(e);
+                    refused = e.bool("refused")?;
+                    ensure!(
+                        !refused || e.0.is_empty(),
+                        "`refused: true` expects no response, so it takes no other expectation"
+                    );
                     let status = e.parse::<u16>("status", "`status` must be a number")?;
                     let expect_headers = pairs(e.take("headers"), "headers")?;
                     let lacks_headers: Vec<String> = e
@@ -2312,6 +2353,7 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
                 json,
                 timing,
                 key,
+                refused,
             })
         }
         "assert-log" => {
@@ -2552,6 +2594,23 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
             })
         }
         "mark-metrics" => Action::MarkMetrics(string_arg(&arg, name)?),
+        "mark-files" => {
+            if arg.is_string() {
+                Action::MarkFiles {
+                    id: string_arg(&arg, name)?,
+                    matching: Vec::new(),
+                }
+            } else {
+                let mut inner = Opts::of_mapping(
+                    arg,
+                    "`mark-files` takes an id, or a mapping with `id` and `matching`",
+                )?;
+                let id = inner.string("id")?.context("`mark-files` needs an `id`")?;
+                let matching = inner.patterns("matching")?;
+                inner.finish()?;
+                Action::MarkFiles { id, matching }
+            }
+        }
         "load" => Action::Load(parse_load(arg, base)?),
         "sleep" => Action::Sleep(parse_duration(&arg)?),
         _ => unreachable!("every name in ACTIONS is handled"),
@@ -2725,6 +2784,15 @@ fn wait_ready(arg: &Value) -> Result<bool> {
         None => Ok(true),
         Some(Value::Bool(b)) => Ok(*b),
         Some(_) => bail!("`ready` must be true or false"),
+    }
+}
+
+/// `wait:` on `start`: `false` starts `spiced` and waits for nothing.
+fn start_waits(arg: &Value) -> Result<bool> {
+    match arg.get("wait") {
+        None => Ok(true),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => bail!("`wait` must be true or false"),
     }
 }
 
@@ -3612,7 +3680,7 @@ steps:
             ),
             (
                 "{ queries: [SELECT 1], duration: 5s, recover-within: 1s, faults: [{ at: 1s, query: SELECT 1 }] }",
-                "a fault runs one of start, stop, kill-spiced, restart, upgrade, wait-ready, kill-executor, start-executors, add-executor, not `query`",
+                "a fault runs one of start, stop, kill-spiced, restart, upgrade, downgrade, wait-ready, kill-executor, start-executors, add-executor, not `query`",
             ),
             (
                 "{ queries: [SELECT 1], duration: 5s, recover-within: 1s, faults: [{ kill-executor: 0 }] }",
