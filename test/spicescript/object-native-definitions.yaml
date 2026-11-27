@@ -210,3 +210,43 @@ steps:
   - assert-log:
       lacks: ['was built from a different definition']
     only: shop
+
+  # `mode: file_create` replaces a copy only when no other instance writes it.
+  # While shop writes the copy, store's `file_create` leaves it to shop, and
+  # shop keeps serving only its own rows.
+  - restart:
+      ready: false
+      patch: { datasets: { orders: { acceleration: { mode: file_create } } } }
+    only: store
+  - assert-status:
+      dataset: orders
+      status: Error
+      message-contains: "Dataset 'orders' (cayenne) is written by another Spice instance"
+    eventually: 60s
+    only: store
+  - query: SELECT o_owner, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_owner
+    expect: { oracle: shop_db }
+    oracle-sql: SELECT o_owner, count(*) AS n, sum(o_total) AS total FROM orders WHERE o_id <= 100 GROUP BY o_owner
+    consistently: 10s
+    only: shop
+
+  # Once shop stops and its lease lapses, store's `file_create` replaces the
+  # copy with its own; shop, started again, is refused the replacement.
+  - kill-spiced: {}
+    only: shop
+  - sleep: 45s
+    only: shop
+  - restart: { ready: false }
+    only: store
+  - query: SELECT o_owner, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_owner
+    expect: { oracle: store_db }
+    eventually: 90s
+    only: store
+  - start: { ready: false }
+    only: shop
+  - assert-status:
+      dataset: orders
+      status: Error
+      message-contains: "was built from a different definition (`pg_port` changed)"
+    eventually: 60s
+    only: shop

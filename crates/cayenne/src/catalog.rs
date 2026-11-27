@@ -280,7 +280,7 @@ pub enum CatalogError {
     /// definition than the one requested (see [`crate::DatasetDefinition`]): opening it
     /// would serve, and then write, one definition's rows in another's copy.
     #[snafu(display(
-        "Failed to load dataset '{table_name}' (cayenne): its copy in the state location '{location}' was built from a different definition ({changes}), so this instance neither serves nor writes it rather than mix rows from two definitions in one copy. Revert the change. To replace the copy for every instance that shares the location, restart once with `acceleration.mode: file_create`, which rebuilds it from the source; to keep both, give this Spicepod its own `runtime.state.location`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        "Failed to load dataset '{table_name}' (cayenne): its copy in the state location '{location}' was built from a different definition ({changes}), so this instance neither serves nor writes it rather than mix rows from two definitions in one copy. Revert the change. To replace the copy, restart once with `acceleration.mode: file_create` while no other Spice instance serves the dataset, which rebuilds it from the source for every instance on the location; to keep both copies, give this Spicepod its own `runtime.state.location`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     ))]
     DefinitionChanged {
         table_name: String,

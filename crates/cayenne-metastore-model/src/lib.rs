@@ -389,6 +389,38 @@ pub fn runs() -> Vec<Run> {
             failure: "an instance reads only its own source's rows",
         },
         Run {
+            name: "definitions-unrecorded",
+            family: "definitions",
+            mode: "definitions-unrecorded",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "definitions-no-recheck-after-acquire",
+            family: "definitions",
+            mode: "definitions-no-recheck-after-acquire",
+            bound: 0,
+            seed: None,
+            failure: "a copy's writer serves it",
+        },
+        Run {
+            name: "definitions-unrecorded-admits",
+            family: "definitions",
+            mode: "definitions-unrecorded-admits",
+            bound: 0,
+            seed: None,
+            failure: "an instance reads only its own source's rows",
+        },
+        Run {
+            name: "definitions-reload-without-check",
+            family: "definitions",
+            mode: "definitions-reload-without-check",
+            bound: 0,
+            seed: None,
+            failure: "an instance reads only its own source's rows",
+        },
+        Run {
             name: "definitions-failed-takes-lease",
             family: "definitions",
             mode: "definitions-failed-takes-lease",
@@ -3287,6 +3319,9 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
                 | "replicas-readers-source-404-only"
                 | "replicas-orphan-head-age"
                 | "unknown-action-refusal" => *expectation == Expectation::Sometimes,
+                "definitions-unrecorded" => {
+                    name == "the other Spicepod's instance is refused the copy"
+                }
                 "commits-retry-expiry" => name == "unresolved past evidence horizon",
                 "replicas-eu-orphan-no-source-check" => {
                     name == "writer commits an upload the replica already deleted"

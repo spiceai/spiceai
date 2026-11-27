@@ -666,36 +666,26 @@ async fn an_instance_refused_its_copy_hands_back_a_lease_it_won_meanwhile() {
     assert_eq!(c.count_and_sum().await, expected(1..=10));
 }
 
-/// A copy created before copies recorded their definitions has none until its
-/// writer records one. A replica waits for that record instead of serving a
-/// copy it cannot compare with, then is refused when it differs.
+/// A copy built with no definition (as by DDL) says nothing about its source,
+/// so a dataset a Spicepod defines is refused it rather than serve its rows:
+/// both the instance that writes it and a replica.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_replica_waits_for_the_writer_to_record_a_definition() {
+async fn a_copy_with_no_recorded_definition_is_refused() {
     let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let a = Instance::start(&objects, "a", LEASE).await;
     a.load_defined(None)
         .await
         .expect("A creates a copy with no definition");
-    let b = Arc::new(Instance::start(&objects, "b", LEASE).await);
-    let waiting = {
-        let b = Arc::clone(&b);
-        tokio::spawn(async move { b.load_defined(Some(defined_at("store", "db-b"))).await })
-    };
-    tokio::time::sleep(LEASE / 2).await;
-    assert!(
-        !waiting.is_finished(),
-        "B served a copy with no recorded definition"
-    );
-
-    a.load_defined(Some(defined_at("shop", "db-a")))
-        .await
-        .expect("A records its definition");
-    let error = waiting
-        .await
-        .expect("join")
-        .expect_err("B is refused once the definition is recorded");
-    assert!(
-        error.contains("was built from a different definition"),
-        "{error}"
-    );
+    let b = Instance::start(&objects, "b", LEASE).await;
+    for (instance, name) in [(&b, "the replica"), (&a, "the writer")] {
+        let error = instance
+            .load_defined(Some(defined_at("store", "db-b")))
+            .await
+            .expect_err("a copy with no definition is refused");
+        assert!(
+            error
+                .contains("was built from a different definition (the copy records no definition)"),
+            "{name}: {error}"
+        );
+    }
 }

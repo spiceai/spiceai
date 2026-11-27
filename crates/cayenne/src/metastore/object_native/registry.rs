@@ -46,11 +46,9 @@ const LOCATION_ID_KEY: &str = "spice_sys_location_id";
 /// The key in a dataset's log of the [`DefinitionRecord`] its copy was built from.
 const DEFINITION_KEY: &str = "cayenne:definition";
 
-/// The first byte of a registry entry that lists a dataset's copies. An entry was
-/// a folder name before copies recorded their definitions; a folder name is text
-/// and never starts with this byte. Nor is an entry that does valid text, so a
-/// build that reads entries as folder names refuses the location rather than
-/// misread one, and never takes a copy's folder for one nothing names.
+/// The first byte of every registry entry. It is not valid text, so a build that
+/// reads an entry as a bare folder name refuses the location rather than misread
+/// the entry, and never takes a copy's folder for one nothing names.
 const COPIES_MARKER: u8 = 0xFF;
 
 /// A registry entry: the copies of one dataset. A copy per definition (#16252)
@@ -68,7 +66,7 @@ struct RegisteredCopy {
     #[prost(string, tag = "1")]
     folder: String,
     /// [`DatasetDefinition::id`] of the definition the copy was built from; empty
-    /// for a copy no Spicepod defines, or one built before definitions were kept.
+    /// for a copy no Spicepod defines.
     #[prost(bytes = "vec", tag = "2")]
     definition: Vec<u8>,
 }
@@ -89,7 +87,10 @@ fn registry_entry(folder: &str, definition: Option<&DatasetDefinition>) -> Vec<u
 /// Every copy's folder that the registry entry `value` of `dataset` names.
 pub(super) fn registered_folders(dataset: &str, value: &[u8]) -> CatalogResult<Vec<String>> {
     let Some((&COPIES_MARKER, encoded)) = value.split_first() else {
-        return Ok(vec![String::from_utf8(value.to_vec()).map_err(invalid)?]);
+        return Err(invalid(format!(
+            "{} has a registry entry this version of Spice cannot read",
+            subject(dataset)
+        )));
     };
     let entry = RegisteredDataset::decode(encoded).map_err(|error| {
         invalid(format!(
@@ -598,74 +599,47 @@ impl ObjectNativeCatalog {
         let Some(requested) = requested else {
             return Ok(());
         };
-        let Some(stored) = self.recorded_definition(name, domain, requested).await? else {
-            // A copy built before copies recorded their definitions, which this
-            // instance writes: it takes this instance's definition.
-            domain.accept_lease();
-            self.record_definition(name, domain, requested).await;
-            return Ok(());
-        };
-        let stored = DefinitionRecord::decode_stored(&stored)
-            .map_err(|reason| invalid(format!("{} cannot be opened: {reason}", subject(name))))?;
-        let changes = stored.changes(requested);
-        if !changes.is_empty() {
-            domain.decline_lease().await;
-            return Err(CatalogError::DefinitionChanged {
-                table_name: name.to_string(),
-                location: self.location(),
-                changes: changes.join(", "),
-            });
-        }
-        domain.accept_lease();
-        if !stored.app.is_empty() && stored.app != requested.app() {
-            tracing::info!(
-                "{}",
-                super::app_changed_message(name, &stored.app, &self.location(), requested.app())
-            );
-        }
-        // The same definition, under another app name or with a setting written
-        // another way that reads the same value: recorded as it is now, so a later
-        // change is named against the current Spicepod.
-        if stored != requested.record() {
-            self.record_definition(name, domain, requested).await;
-        }
-        Ok(())
-    }
-
-    /// The definition record of `name`'s copy, following its log. A copy built
-    /// before copies recorded their definitions has none until the instance that
-    /// writes it records its own: a replica waits for that record (up to four
-    /// lease durations) rather than serve a copy it cannot compare with. `None`
-    /// when this instance writes the copy and none is recorded.
-    async fn recorded_definition(
-        &self,
-        name: &str,
-        domain: &Domain,
-        requested: &DatasetDefinition,
-    ) -> CatalogResult<Option<Vec<u8>>> {
-        let lease = match self.config.access {
-            super::Access::Leased(settings) => settings.duration,
-            super::Access::Writer | super::Access::Replica => {
-                super::LeaseSettings::default().duration
+        // Every copy built for a Spicepod records its definition before the
+        // registry names it, so one with none was built with no definition (by
+        // DDL): its source cannot be known, and a Spicepod's dataset is refused it.
+        let changes = match domain.sidecar_value(DEFINITION_KEY).await? {
+            None => vec!["the copy records no definition".to_string()],
+            Some(stored) => {
+                let stored = DefinitionRecord::decode_stored(&stored).map_err(|reason| {
+                    invalid(format!("{} cannot be opened: {reason}", subject(name)))
+                })?;
+                let changes = stored.changes(requested);
+                if changes.is_empty() {
+                    domain.accept_lease();
+                    if !stored.app.is_empty() && stored.app != requested.app() {
+                        tracing::info!(
+                            "{}",
+                            super::app_changed_message(
+                                name,
+                                &stored.app,
+                                &self.location(),
+                                requested.app()
+                            )
+                        );
+                    }
+                    // The same definition, under another app name or with a
+                    // setting written another way that reads the same value:
+                    // recorded as it is now, so a later change is named against
+                    // the current Spicepod.
+                    if stored != requested.record() {
+                        self.record_definition(name, domain, requested).await;
+                    }
+                    return Ok(());
+                }
+                changes
             }
         };
-        let deadline = tokio::time::Instant::now() + lease * 4;
-        loop {
-            if let Some(stored) = domain.sidecar_value(DEFINITION_KEY).await? {
-                return Ok(Some(stored));
-            }
-            if domain.data_writes.allows() {
-                return Ok(None);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(invalid(format!(
-                    "{} has no recorded definition in the shared state location yet, and another Spice instance writes it, so this instance (app '{}') waits for that instance to record one rather than serve a copy it cannot compare with. Retry once the instance that writes the dataset has loaded it.",
-                    subject(name),
-                    requested.app()
-                )));
-            }
-            tokio::time::sleep((lease / 6).max(std::time::Duration::from_millis(50))).await;
-        }
+        domain.decline_lease().await;
+        Err(CatalogError::DefinitionChanged {
+            table_name: name.to_string(),
+            location: self.location(),
+            changes: changes.join(", "),
+        })
     }
 
     /// Record `definition`, with its app, as the one `name`'s copy was built from,

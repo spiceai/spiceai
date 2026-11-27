@@ -57,6 +57,7 @@ fn main() -> Result<(), String> {
                 "read-same-key",
                 "source-positions",
                 "definitions",
+                "definitions-unrecorded",
                 "commits-restart-turnover",
                 "unknown-action-refusal",
                 "naming",
