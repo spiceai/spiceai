@@ -189,9 +189,18 @@ impl StoredJsonKeys {
                 let take = (SAMPLE_ROWS - counts.rows).min(json.len());
                 let json = json.slice(0, take);
                 match json.data_type() {
-                    DataType::Utf8 => json.as_string::<i32>().iter().for_each(|doc| counts.observe(doc)),
-                    DataType::LargeUtf8 => json.as_string::<i64>().iter().for_each(|doc| counts.observe(doc)),
-                    DataType::Utf8View => json.as_string_view().iter().for_each(|doc| counts.observe(doc)),
+                    DataType::Utf8 => json
+                        .as_string::<i32>()
+                        .iter()
+                        .for_each(|doc| counts.observe(doc)),
+                    DataType::LargeUtf8 => json
+                        .as_string::<i64>()
+                        .iter()
+                        .for_each(|doc| counts.observe(doc)),
+                    DataType::Utf8View => json
+                        .as_string_view()
+                        .iter()
+                        .for_each(|doc| counts.observe(doc)),
                     _ => {}
                 }
             }
@@ -280,7 +289,9 @@ impl ValueBuilder {
     fn new(data_type: &DataType, rows: usize) -> Option<Self> {
         match data_type {
             DataType::Utf8 => Some(Self::Utf8(StringBuilder::with_capacity(rows, 0))),
-            DataType::LargeUtf8 => Some(Self::LargeUtf8(LargeStringBuilder::with_capacity(rows, 0))),
+            DataType::LargeUtf8 => {
+                Some(Self::LargeUtf8(LargeStringBuilder::with_capacity(rows, 0)))
+            }
             DataType::Utf8View => Some(Self::Utf8View(StringViewBuilder::with_capacity(rows))),
             _ => None,
         }
@@ -320,16 +331,14 @@ impl StoredColumn {
         };
         let keys: Vec<&str> = self.keys.iter().map(String::as_str).collect();
         let mut found: Vec<Option<Range<usize>>> = vec![None; keys.len()];
-        let mut store = |document: Option<&str>| {
-            match document {
-                Some(document) => {
-                    top_level_value_ranges(document, &keys, &mut found);
-                    for (builder, range) in builders.iter_mut().zip(&found) {
-                        builder.append(range.clone().and_then(|range| document.get(range)));
-                    }
+        let mut store = |document: Option<&str>| match document {
+            Some(document) => {
+                top_level_value_ranges(document, &keys, &mut found);
+                for (builder, range) in builders.iter_mut().zip(&found) {
+                    builder.append(range.clone().and_then(|range| document.get(range)));
                 }
-                None => builders.iter_mut().for_each(|builder| builder.append(None)),
             }
+            None => builders.iter_mut().for_each(|builder| builder.append(None)),
         };
         match json.data_type() {
             DataType::Utf8 => json.as_string::<i32>().iter().for_each(&mut store),
@@ -394,15 +403,26 @@ mod tests {
             Field::new("attributes", DataType::Utf8, true),
             Field::new("body", DataType::Utf8, true),
         ];
-        fields.extend(extra.iter().map(|name| Field::new(*name, DataType::Utf8, true)));
+        fields.extend(
+            extra
+                .iter()
+                .map(|name| Field::new(*name, DataType::Utf8, true)),
+        );
         Arc::new(Schema::new(fields))
     }
 
     fn batch(schema: &SchemaRef, attributes: &[Option<String>], body: &[&str]) -> RecordBatch {
         let rows = attributes.len();
         let mut columns: Vec<ArrayRef> = vec![
-            Arc::new(Int64Array::from_iter_values(0..i64::try_from(rows).expect("fits"))),
-            Arc::new(attributes.iter().map(Option::as_deref).collect::<StringArray>()),
+            Arc::new(Int64Array::from_iter_values(
+                0..i64::try_from(rows).expect("fits"),
+            )),
+            Arc::new(
+                attributes
+                    .iter()
+                    .map(Option::as_deref)
+                    .collect::<StringArray>(),
+            ),
             Arc::new(body.iter().map(|b| Some(*b)).collect::<StringArray>()),
         ];
         for _ in 3..schema.fields().len() {
@@ -472,7 +492,10 @@ mod tests {
                 .collect()
         };
         // `half` (50 of 100 rows) qualifies; `rare` (49) does not.
-        assert_eq!(chosen(false), vec!["always".to_string(), "half".to_string()]);
+        assert_eq!(
+            chosen(false),
+            vec!["always".to_string(), "half".to_string()]
+        );
         // 22 keys qualify; the 16 most frequent are stored, ties by name.
         let mut expected = vec!["always".to_string()];
         expected.extend((0..15).map(|k| format!("k{k:02}")));
@@ -480,7 +503,13 @@ mod tests {
 
         // A column whose values are mostly not objects stores nothing.
         let mostly_text: Vec<Option<String>> = (0..100)
-            .map(|row| Some(if row < 89 { "{\"a\": 1}".to_string() } else { "text".to_string() }))
+            .map(|row| {
+                Some(if row < 89 {
+                    "{\"a\": 1}".to_string()
+                } else {
+                    "text".to_string()
+                })
+            })
             .collect();
         assert!(
             StoredJsonKeys::choose(&schema, &candidates, &[batch(&schema, &mostly_text, &body)])

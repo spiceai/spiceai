@@ -13565,9 +13565,10 @@ impl CayenneTableProvider {
         // from the write's first rows before its first file opens.
         let (stream, stored_json_keys) =
             self.sample_stored_json_keys(stream, &write_schema).await?;
-        let file_schema = stored_json_keys
-            .as_ref()
-            .map_or_else(|| Arc::clone(&write_schema), |keys| keys.file_schema(&write_schema));
+        let file_schema = stored_json_keys.as_ref().map_or_else(
+            || Arc::clone(&write_schema),
+            |keys| keys.file_schema(&write_schema),
+        );
 
         // Create a new ListingTable pointing to the snapshot directory
         let snapshot_listing_table = Self::create_listing_table(
@@ -13718,7 +13719,8 @@ impl CayenneTableProvider {
                 .boxed(),
                 None => tracked_stream.boxed(),
             };
-        let tracked_stream = RecordBatchStreamAdapter::new(Arc::clone(&file_schema), tracked_stream);
+        let tracked_stream =
+            RecordBatchStreamAdapter::new(Arc::clone(&file_schema), tracked_stream);
         // The Vortex sink performs intra-write sharding internally (see
         // `write_shard_format` / `ShardSpec`), so the writer input is a single
         // coordinated stream — no upstream round-robin repartition, which would
@@ -22906,16 +22908,13 @@ impl CayenneTableProvider {
     )> {
         use datafusion::execution::memory_pool::MemoryConsumer;
 
-        let candidates =
-            json_shred::StoredJsonKeys::candidates(write_schema, &self.table_schema());
+        let candidates = json_shred::StoredJsonKeys::candidates(write_schema, &self.table_schema());
         if candidates.is_empty() {
             return Ok((data, None));
         }
-        let reservation = MemoryConsumer::new(format!(
-            "cayenne_json_key_sample:{}",
-            self.table_name()
-        ))
-        .register(&self.context.runtime_env().memory_pool);
+        let reservation =
+            MemoryConsumer::new(format!("cayenne_json_key_sample:{}", self.table_name()))
+                .register(&self.context.runtime_env().memory_pool);
         let mut head: Vec<RecordBatch> = Vec::new();
         let mut head_sizes: Vec<usize> = Vec::new();
         let mut head_rows = 0_usize;
@@ -30098,23 +30097,18 @@ impl CayenneTableProvider {
         // table's (see `write_to_snapshot_with_schema`).
         let (stream, stored_json_keys) =
             self.sample_stored_json_keys(stream, &table_schema).await?;
-        let (file_schema, stream): (SchemaRef, SendableRecordBatchStream) =
-            match stored_json_keys {
-                Some(keys) => {
-                    let file_schema = keys.file_schema(&table_schema);
-                    let stream = json_shred::append_to_stream(
-                        stream,
-                        keys,
-                        Arc::clone(&file_schema),
-                        1,
-                    );
-                    (
-                        Arc::clone(&file_schema),
-                        Box::pin(RecordBatchStreamAdapter::new(file_schema, stream)),
-                    )
-                }
-                None => (table_schema, stream),
-            };
+        let (file_schema, stream): (SchemaRef, SendableRecordBatchStream) = match stored_json_keys {
+            Some(keys) => {
+                let file_schema = keys.file_schema(&table_schema);
+                let stream =
+                    json_shred::append_to_stream(stream, keys, Arc::clone(&file_schema), 1);
+                (
+                    Arc::clone(&file_schema),
+                    Box::pin(RecordBatchStreamAdapter::new(file_schema, stream)),
+                )
+            }
+            None => (table_schema, stream),
+        };
         let listing = Self::create_listing_table(
             dir_url,
             Arc::clone(&file_schema),
@@ -38136,9 +38130,11 @@ impl CayenneTableProvider {
                              view (the deletion + tier snapshots captured in \
                              this same block keep visibility correct)"
                         );
-                        Some(rebuilt_view.take().unwrap_or_else(|| {
-                            Arc::clone(&self.inlined_cache.load().view)
-                        }))
+                        Some(
+                            rebuilt_view
+                                .take()
+                                .unwrap_or_else(|| Arc::clone(&self.inlined_cache.load().view)),
+                        )
                     }
                     None => None,
                 };
@@ -44943,9 +44939,9 @@ impl CayenneTableProvider {
                 Some(source) => (
                     source,
                     None,
-                    Some(json_shred::JsonKeyExprAdapterFactory::counting(
-                        Arc::clone(&self.json_key_stored_reads),
-                    )),
+                    Some(json_shred::JsonKeyExprAdapterFactory::counting(Arc::clone(
+                        &self.json_key_stored_reads,
+                    ))),
                 ),
                 None => (file_source, projection.cloned(), None),
             };
@@ -45246,9 +45242,9 @@ impl CayenneTableProvider {
                 Some(source) => (
                     source,
                     None,
-                    Some(json_shred::JsonKeyExprAdapterFactory::counting(
-                        Arc::clone(&self.json_key_stored_reads),
-                    )),
+                    Some(json_shred::JsonKeyExprAdapterFactory::counting(Arc::clone(
+                        &self.json_key_stored_reads,
+                    ))),
                 ),
                 None => (file_source, scan_projection, None),
             };
@@ -46098,7 +46094,8 @@ impl CayenneTableProvider {
     #[doc(hidden)]
     #[must_use]
     pub fn json_key_stored_reads(&self) -> u64 {
-        self.json_key_stored_reads.load(std::sync::atomic::Ordering::Relaxed)
+        self.json_key_stored_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Per-file statistics collection accounting for this table: footer reads,
@@ -48035,12 +48032,7 @@ impl CayenneTableProvider {
                     if json_keys.is_empty() {
                         return Ok(projected);
                     }
-                    json_shred::with_json_key_columns(
-                        &batch,
-                        &projected,
-                        json_keys,
-                        &output_schema,
-                    )
+                    json_shred::with_json_key_columns(&batch, &projected, json_keys, &output_schema)
                 })
                 .collect::<datafusion_common::Result<Vec<_>>>()?;
 

@@ -299,8 +299,16 @@ mod tests {
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Int64, false),
                 Field::new("attributes", DataType::Utf8, true),
-                Field::new("__cayenne_json_key:10:attributes:url.path", DataType::Utf8, true),
-                Field::new("__cayenne_json_key:v0:10:attributes:url.path", DataType::Utf8, true),
+                Field::new(
+                    "__cayenne_json_key:10:attributes:url.path",
+                    DataType::Utf8,
+                    true,
+                ),
+                Field::new(
+                    "__cayenne_json_key:v0:10:attributes:url.path",
+                    DataType::Utf8,
+                    true,
+                ),
             ])),
             vec![
                 Arc::new(Int64Array::from(vec![21, 22, 23, 24])),

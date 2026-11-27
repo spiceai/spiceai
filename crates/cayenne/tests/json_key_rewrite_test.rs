@@ -48,12 +48,12 @@ use std::sync::Arc;
 use arrow::array::{Array, AsArray, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::util::display::array_value_to_string;
+use cayenne::LastSmallFileCompactPath;
 use cayenne::json_shred::{
     CayenneJsonKeyRewrite, JsonKeyColumn, JsonKeyColumnScan, JsonKeyScanTable, hidden_column_name,
     top_level_value,
 };
 use cayenne::metadata::{CdcDurability, CreateTableOptions, VortexConfig};
-use cayenne::LastSmallFileCompactPath;
 use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, SlotAdvancer};
 use common::TestFixture;
 use datafusion::catalog::Session;
@@ -249,11 +249,11 @@ fn logs_document(rng: &mut Rng, profile: Profile) -> Option<String> {
         _ if rng.below(7) == 0 => return document(rng),
         Profile::Http => [
             format!("\"url.path\":{ws}{}", rng.pick(&PATHS)),
+            format!("\"http.response.status_code\":{ws}{}", rng.pick(&STATUSES)),
             format!(
-                "\"http.response.status_code\":{ws}{}",
-                rng.pick(&STATUSES)
+                "\"duration\":{ws}{}",
+                rng.pick(&["1.5", "-0.0", "1e5", "3"])
             ),
-            format!("\"duration\":{ws}{}", rng.pick(&["1.5", "-0.0", "1e5", "3"])),
             format!("\"flag\":{ws}{}", rng.pick(&["true", "false", "null"])),
             format!(
                 "\"nested\":{ws}{{\"a\":{ws}{},\"b\":{ws}\"bee\"}}",
@@ -266,14 +266,8 @@ fn logs_document(rng: &mut Rng, profile: Profile) -> Option<String> {
         .collect::<Vec<_>>(),
         Profile::K8s => vec![
             format!("\"url.path\":{ws}{}", rng.pick(&PATHS)),
-            format!(
-                "\"k8s.pod.name\":{ws}\"pod-{}\"",
-                rng.below(4)
-            ),
-            format!(
-                "\"http.response.status_code\":{ws}{}",
-                rng.pick(&STATUSES)
-            ),
+            format!("\"k8s.pod.name\":{ws}\"pod-{}\"", rng.below(4)),
+            format!("\"http.response.status_code\":{ws}{}", rng.pick(&STATUSES)),
         ],
     };
     for i in (1..members.len()).rev() {
@@ -285,7 +279,9 @@ fn logs_document(rng: &mut Rng, profile: Profile) -> Option<String> {
 
 fn logs_documents(seed: u64, rows: usize, profile: Profile) -> Vec<Option<String>> {
     let mut rng = Rng(seed);
-    (0..rows).map(|_| logs_document(&mut rng, profile)).collect()
+    (0..rows)
+        .map(|_| logs_document(&mut rng, profile))
+        .collect()
 }
 
 fn base_schema() -> SchemaRef {
@@ -776,7 +772,10 @@ async fn vortex_files(dir: &Path) -> TestResult<Vec<PathBuf>> {
             let path = entry.path();
             if entry.file_type().await?.is_dir() {
                 pending.push(path);
-            } else if path.extension().is_some_and(|extension| extension == "vortex") {
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "vortex")
+            {
                 files.push(path);
             }
         }
@@ -908,7 +907,10 @@ async fn assert_served_scan_reads_stored_values(
 ) -> TestResult {
     let sql = STATUS_BY_PATH.replace("{t}", "t");
     let both = BTreeSet::from([
-        ("attributes".to_string(), "http.response.status_code".to_string()),
+        (
+            "attributes".to_string(),
+            "http.response.status_code".to_string(),
+        ),
         ("attributes".to_string(), "url.path".to_string()),
     ]);
     let current = table
@@ -988,12 +990,32 @@ async fn json_keys_stored_by_every_write_path(fixture: TestFixture) -> TestResul
 
     // An overwrite of the empty table, an append of documents with other keys,
     // and appends small enough to stay inline until the flush writes them.
-    let overwrite = rows(&schema, 0..1500, &logs_documents(11, 1500, Profile::Http), None)?;
+    let overwrite = rows(
+        &schema,
+        0..1500,
+        &logs_documents(11, 1500, Profile::Http),
+        None,
+    )?;
     common::write_batches(&table, vec![overwrite.clone()], InsertOp::Overwrite).await?;
-    let append = rows(&schema, 1500..3000, &logs_documents(12, 1500, Profile::K8s), None)?;
+    let append = rows(
+        &schema,
+        1500..3000,
+        &logs_documents(12, 1500, Profile::K8s),
+        None,
+    )?;
     common::insert_batch(&table, append.clone()).await?;
-    let inline_http = rows(&schema, 3000..3060, &logs_documents(13, 60, Profile::Http), None)?;
-    let inline_k8s = rows(&schema, 3060..3120, &logs_documents(14, 60, Profile::K8s), None)?;
+    let inline_http = rows(
+        &schema,
+        3000..3060,
+        &logs_documents(13, 60, Profile::Http),
+        None,
+    )?;
+    let inline_k8s = rows(
+        &schema,
+        3060..3120,
+        &logs_documents(14, 60, Profile::K8s),
+        None,
+    )?;
     common::insert_batch(&table, inline_http.clone()).await?;
     common::insert_batch(&table, inline_k8s.clone()).await?;
     assert_eq!(
@@ -1023,7 +1045,10 @@ async fn json_keys_stored_by_every_write_path(fixture: TestFixture) -> TestResul
         written.storing.len() >= 3 && written.key_sets().len() >= 2,
         "the overwrite, the append and the flush must each store keys, not all the same: {written:?}"
     );
-    assert!(written.values >= 5000, "too few stored values compared: {written:?}");
+    assert!(
+        written.values >= 5000,
+        "too few stored values compared: {written:?}"
+    );
     assert_served_scan_reads_stored_values(&table, &written).await?;
 
     // A compaction rewrites the files, storing the keys its own rows choose: this
@@ -1066,7 +1091,12 @@ async fn json_keys_stored_by_every_write_path(fixture: TestFixture) -> TestResul
     // A file whose first stored column has no NULL, then the table widens: a
     // positional reading of that file's statistics would describe `extra` as
     // never NULL.
-    let clean = rows(&schema, 3120..4620, &logs_documents(15, 1500, Profile::Clean), None)?;
+    let clean = rows(
+        &schema,
+        3120..4620,
+        &logs_documents(15, 1500, Profile::Clean),
+        None,
+    )?;
     common::insert_batch(&table, clean.clone()).await?;
     all_rows.push(clean);
     let evolution = arrow_tools::schema_evolution::EvolutionContext {
@@ -1102,7 +1132,12 @@ async fn json_keys_stored_by_every_write_path(fixture: TestFixture) -> TestResul
             .map(|doc| doc.map(ToString::to_string))
             .collect();
         let no_extra = vec![None; batch.num_rows()];
-        widened_rows.push(rows(&widened, first..first + count, &docs, Some(&no_extra))?);
+        widened_rows.push(rows(
+            &widened,
+            first..first + count,
+            &docs,
+            Some(&no_extra),
+        )?);
     }
     widened_rows.push(new_rows);
     let queries: Vec<&str> = QUERIES.iter().chain(WIDENED_QUERIES).copied().collect();
