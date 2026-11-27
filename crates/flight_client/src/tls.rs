@@ -309,11 +309,12 @@ pub(crate) async fn new_tls_flight_channel_with_scope(
     Ok((channel, identity_scope))
 }
 
-/// Creates a Flight channel to `endpoint_str` that connects only to `addresses`.
+/// Creates a Flight channel to `endpoint_str` whose host resolves only to `addresses`.
 ///
 /// Requests still carry the authority of `endpoint_str`, and TLS still verifies the server
 /// against its host, so a caller that has checked every address the host resolves to can
-/// connect to those addresses and no others.
+/// connect to those addresses and no others. A host that is an IP address is not resolved: the
+/// channel connects to that address, which the caller must have checked.
 ///
 /// # Errors
 ///
