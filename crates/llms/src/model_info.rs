@@ -258,7 +258,10 @@ impl ListingCache {
                 let fetched = fetch(request.clone()).await;
                 if !matches!(fetched, Fetched::Unreachable(_)) {
                     if matches!(fetched, Fetched::Limits(_)) {
-                        tracing::debug!("Read the token limits at '{}'", request.url);
+                        tracing::debug!(
+                            "Read the token limits at '{}'",
+                            redact::redact_url_credentials(&request.url)
+                        );
                     }
                     entries.lock().insert(
                         key,
@@ -316,7 +319,11 @@ async fn fetch(request: Request) -> Fetched {
             Ok(json) => Fetched::Limits(Arc::new((request.read)(&json))),
             Err(error) if error.is_timeout() => unreachable(error),
             Err(error) => {
-                tracing::debug!("Model metadata at '{}' is not JSON: {error}", request.url);
+                tracing::debug!(
+                    "Model metadata at '{}' is not JSON: {}",
+                    redact::redact_url_credentials(&request.url),
+                    error.without_url()
+                );
                 Fetched::Answered
             }
         },
@@ -329,7 +336,7 @@ async fn fetch(request: Request) -> Fetched {
         Ok(response) => {
             tracing::debug!(
                 "Model metadata request to '{}' answered {}",
-                request.url,
+                redact::redact_url_credentials(&request.url),
                 response.status()
             );
             Fetched::Answered

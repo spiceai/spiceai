@@ -335,9 +335,6 @@ impl Runtime {
                 return false;
             }
 
-            tracing::debug!("Updated pods information: {new_app:?}");
-            tracing::debug!("Previous pods information: {current_app:?}");
-
             // Most of `runtime.*` sizes or builds something that is already
             // running. Say so rather than silently ignoring the edit.
             warn_on_start_time_only_changes(&current_app.runtime, &new_app.runtime);

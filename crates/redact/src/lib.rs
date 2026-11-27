@@ -35,9 +35,10 @@ const SPECIAL_URL_SCHEMES: &[&str] = &["http", "https", "ws", "wss", "ftp"];
 /// file name (`file://alice@report.csv`).
 const NON_CREDENTIAL_USERINFO_SCHEMES: &[&str] = &["abfs", "abfss", "wasb", "wasbs", "file"];
 
-/// Query keys whose values are credentials, compared with case and
-/// punctuation removed (`api_key` and `apiKey` are both `apikey`).
-const SECRET_QUERY_KEYS: &[&str] = &["key", "sig", "auth", "pwd", "pass"];
+/// Query keys whose values are credentials, or a URL that can hold one (`proxy_url`
+/// with a login), compared with case and punctuation removed (`api_key` and
+/// `apiKey` are both `apikey`).
+const SECRET_QUERY_KEYS: &[&str] = &["key", "sig", "auth", "pwd", "pass", "proxyurl"];
 
 /// Endings of query keys whose values are credentials (`password`,
 /// `client_secret`, `access_token`, `X-Amz-Signature`, `x-goog-credential`),
@@ -100,10 +101,11 @@ fn is_host_and_port(authority: &str) -> bool {
 /// `/` and `\\` after its `:`, or none (`https:host`), as URL parsers read it; any other
 /// scheme needs `//`.
 fn authority_start(s: &str) -> Option<usize> {
-    let colon = s.find(':')?;
+    // The scheme ends at the first character that cannot be in a scheme, so a long message
+    // is not searched for a `:` at every word.
+    let colon = s.find(|c: char| !is_scheme_char(c))?;
     let scheme = &s[..colon];
-    if !scheme.starts_with(|c: char| c.is_ascii_alphabetic()) || !scheme.chars().all(is_scheme_char)
-    {
+    if !s[colon..].starts_with(':') || !scheme.starts_with(|c: char| c.is_ascii_alphabetic()) {
         return None;
     }
     let after_colon = &s[colon + 1..];
@@ -423,6 +425,10 @@ mod tests {
             (
                 "gs://bucket/p/#service_account_key=K&client_timeout=30s",
                 "gs://bucket/p/#service_account_key=***&client_timeout=30s",
+            ),
+            (
+                "abfs://container/p/#account=acct&proxy_url=http%3A%2F%2Fuser%3Apass%40proxy%3A3128",
+                "abfs://container/p/#account=acct&proxy_url=***",
             ),
         ] {
             assert_eq!(redact_url_credentials(url), expected, "url: {url}");

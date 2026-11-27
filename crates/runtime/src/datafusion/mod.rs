@@ -2098,7 +2098,8 @@ impl DataFusion {
             } => {
                 if let Some(accelerated_table) = accelerated_table {
                     tracing::debug!(
-                        "Registering dataset {dataset:?} with preloaded accelerated table"
+                        "Registering dataset {} with preloaded accelerated table",
+                        dataset.name
                     );
                     let (notifier, _permit) = self
                         .install_prepared_acceleration(&dataset, source, *accelerated_table, false)
@@ -4330,7 +4331,7 @@ impl DataFusion {
         source: &Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
     ) -> Result<AccelerationSetup> {
-        tracing::trace!("Creating accelerated table {dataset:?}");
+        tracing::trace!("Creating accelerated table {}", dataset.name);
 
         // A writable dataset writes through its source (or, for write-back, back to
         // it), so the source must accept writes, unless its writes stay in the
@@ -6915,7 +6916,7 @@ impl DataFusion {
         source: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
     ) -> Result<()> {
-        tracing::debug!("Registering federated table {dataset:?}");
+        tracing::debug!("Registering federated table {}", dataset.name);
         let table_exists = self.ctx.table_exist(dataset.name.clone()).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
