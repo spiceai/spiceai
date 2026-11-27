@@ -1,11 +1,13 @@
 name: index-equivalence
-duration: 30s
+duration: 46s
 tags: [long]
 description: >
   A Cayenne lookup index never changes an answer: point, IN and OR lookups
   return the same rows with and without the index, and match Postgres, after a
   full refresh and while CDC moves rows between keys and deletes them. The
-  indexed variant must show that the index served the lookup.
+  indexed variant must show that the index served the lookup. With object-native
+  data, the index is read back from the state location after the instance loses
+  its working directory, with the source down, and covers every data file.
 
 sources:
   src: { kind: postgres }
@@ -19,8 +21,15 @@ variants:
   baseline: {}
   indexed:
     datasets: { orders: { acceleration: { indexes: { o_custkey: enabled } } } }
-  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  # The spicepod as written, with the prototype object-native Cayenne metastore,
+  # without and with the index.
   object-native: object-native
+  indexed-object-native:
+    datasets: { orders: { acceleration: { indexes: { o_custkey: enabled } } } }
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state: { location: 'file://${instance.dir}/state/' }
   # The same with the data in an S3 state location, without and with the index.
   object-native-s3: object-native-s3
   indexed-object-native-s3:
@@ -85,7 +94,7 @@ steps:
 
   - explain: SELECT * FROM orders WHERE o_custkey = 42
     contains: "lookup_index=o_custkey"
-    only: &indexed [indexed, indexed-object-native-s3]
+    only: &indexed [indexed, indexed-object-native, indexed-object-native-s3]
   - explain: SELECT * FROM orders WHERE o_custkey = 42
     omits: "lookup_index=o_custkey"
     only: [baseline, object-native, object-native-s3]
@@ -103,6 +112,7 @@ steps:
   - query: SELECT count(*), count(o_custkey), sum(o_total) FROM orders
     eventually: 60s
   - query: SELECT * FROM orders WHERE o_custkey = 42
+    id: lookup-42
     eventually: 30s
   - query: SELECT * FROM orders WHERE o_custkey = 43
     expect-empty: true
@@ -116,6 +126,7 @@ steps:
 
   - restart: {}
   - query: SELECT * FROM orders WHERE o_custkey IN (1, 42, 996, 5000)
+    id: lookup-in
     eventually: 30s
   - query: SELECT * FROM orders WHERE o_custkey = 8
     expect-empty: true
@@ -129,3 +140,43 @@ steps:
     only: &s3-variants [object-native-s3, indexed-object-native-s3]
   - assert-files: { lacks: ['(^|/)s3:', '\.vortex$', '\.arrow$'] }
     only: *s3-variants
+
+  # Lose the working directory and start with the source down: the index is
+  # loaded from the runs saved in the state location and covers every data
+  # file, and the lookups return the same rows. Full refresh only: a
+  # `refresh_mode: changes` dataset is not served while its source is down.
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: /_lookup_index/, min: 1 }
+    only: indexed-object-native-s3
+    when: &full { refresh_mode: full }
+  - assert-files: { contains: '^state/.*/_lookup_index/.*\.run$' }
+    only: indexed-object-native
+    when: *full
+  - stop: {}
+    only: &indexed-object-native [indexed-object-native, indexed-object-native-s3]
+    when: *full
+  - wipe-instance-dir: { keep: [state] }
+    only: *indexed-object-native
+    when: *full
+  - stop-source: src
+    only: *indexed-object-native
+    when: *full
+  - start: {}
+    only: *indexed-object-native
+    when: *full
+  # The first restart and this start each load the saved index. The plan alone
+  # cannot tell: an index rebuilt at startup also covers every file.
+  - assert-log: { count: { 'loaded its secondary index from disk .*, covering all': '>=2' } }
+    only: *indexed-object-native
+    when: *full
+  - explain: SELECT * FROM orders WHERE o_custkey = 42
+    contains: ["lookup_index=o_custkey", "uncovered_files=0"]
+    only: *indexed-object-native
+    when: *full
+  - query: SELECT * FROM orders WHERE o_custkey = 42
+    expect: { same-as: lookup-42 }
+    only: *indexed-object-native
+    when: *full
+  - query: SELECT * FROM orders WHERE o_custkey IN (1, 42, 996, 5000)
+    expect: { same-as: lookup-in }
+    only: *indexed-object-native
+    when: *full
