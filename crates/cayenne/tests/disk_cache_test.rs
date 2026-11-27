@@ -731,6 +731,9 @@ async fn delete_evicts_before_store_delete() {
         .get_range(&live[0].0, 0..live[0].1)
         .await
         .expect("read the live file");
+    // Closing skips entry writes still queued, so the fill must land first.
+    cache.wait_idle().await;
+    assert!(resident(&node, &live[0].0, 0..live[0].1).await);
 
     // A restart finds the eviction recorded: the cache does not serve the file
     // it evicted, and a read gets the location's bytes.
