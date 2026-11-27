@@ -5,10 +5,11 @@ Ask typed questions about your data in SQL, or over an HTTP API compatible with 
 | Model | Example `from` | Probabilities |
 | --- | --- | --- |
 | TypeSafe decision model | `typesafe:jev` | Calibrated by the model. See [TypeSafe models](typesafe.md). |
+| OpenRouter decision model | `openrouter:baseten/elephant-1` | The model's estimates. See [OpenRouter models](openrouter.md). |
 | OpenAI decision model | `openai:gpt-6-luna` | The model's estimates. OpenAI recommends setting thresholds from your own labeled examples. |
 | Any chat model | `openai:gpt-4o-mini`, `anthropic:claude-haiku-4-5`, `bedrock:…` | The model's own estimates. A chat model's `0.9` is not a 90% likelihood the way a calibrated model's is. |
 
-TypeSafe models answer decisions only; `/v1/chat/completions` returns 400 for them. OpenAI's `gpt-6-luna` also supports chat completions and text-to-SQL through NSQL, while decision requests use its native Decisions API. It takes the same params as other OpenAI models:
+TypeSafe and OpenRouter decision models answer decisions only; `/v1/chat/completions` returns 400 for them. OpenAI's `gpt-6-luna` also supports chat completions and text-to-SQL through NSQL, while decision requests use its native Decisions API. It takes the same params as other OpenAI models:
 
 ```yaml
 models:
@@ -138,7 +139,7 @@ curl -X POST http://localhost:8090/v1/decisions \
 `rerank(..., model => 'name')` picks how to score candidates in this order:
 
 1. A native reranker (Cohere, Voyage, Jina, TEI, HTTP) scores them itself.
-2. A model with a native decisions API (`typesafe:jev`, `openai:gpt-6-luna`) asks one `noul` question per candidate: "is this document relevant to the query?". The probability is the `rerank_score`. `strategy` defaults to `'pointwise'` (one request per candidate); `'listwise'` asks all questions in one request.
+2. A model with a native decisions API (`typesafe:jev`, `openai:gpt-6-luna`, `openrouter:baseten/elephant-1`) asks one `noul` question per candidate: "is this document relevant to the query?". The probability is the `rerank_score`. `strategy` defaults to `'pointwise'` (one request per candidate); `'listwise'` asks all questions in one request.
 3. Any other chat model gets an LLM-as-judge prompt and returns relative scores. `strategy` defaults to `'listwise'`.
 
 A chat model can answer decisions too (see below), but `rerank()` uses it as a judge unless asked otherwise. To pick the path yourself:

@@ -93,6 +93,7 @@ pub enum ModelSource {
     Databricks,
     Bedrock,
     TypeSafe,
+    OpenRouter,
 }
 
 /// The prefixes that select [`ModelSource::SpiceAI`]. `spice.ai` matches how the Spice.ai Cloud
@@ -238,6 +239,14 @@ impl TryFrom<&str> for ModelSource {
             // Bare `typesafe` is the documented default. A colon or slash must
             // carry a model id — `typesafe:` / `typesafe/` are not that default.
             Ok(ModelSource::TypeSafe)
+        } else if value == "openrouter"
+            || value.starts_with("openrouter:")
+            || value.starts_with("openrouter/")
+        {
+            // Bare `openrouter` is recognised so the loader can say a model id is missing,
+            // rather than reporting an unknown prefix. Lookalikes such as `openrouterx`
+            // are not this source.
+            Ok(ModelSource::OpenRouter)
         } else {
             Err("Unknown prefix")
         }
@@ -259,6 +268,7 @@ impl Display for ModelSource {
             ModelSource::Databricks => write!(f, "databricks"),
             ModelSource::Bedrock => write!(f, "bedrock"),
             ModelSource::TypeSafe => write!(f, "typesafe"),
+            ModelSource::OpenRouter => write!(f, "openrouter"),
         }
     }
 }
@@ -278,6 +288,7 @@ impl ModelSource {
             ModelSource::Databricks => "databricks",
             ModelSource::Bedrock => "bedrock",
             ModelSource::TypeSafe => "typesafe",
+            ModelSource::OpenRouter => "openrouter",
         }
     }
 }
@@ -576,6 +587,28 @@ mod tests {
         let lookalike = Model::new("typesafely:jev", "jev");
         assert_eq!(lookalike.get_source(), None);
         assert_eq!(lookalike.get_model_id(), None);
+    }
+
+    #[test]
+    fn openrouter_from_keeps_the_provider_in_the_model_id() {
+        for from in [
+            "openrouter:baseten/elephant-1",
+            "openrouter/baseten/elephant-1",
+        ] {
+            let model = Model::new(from, "elephant");
+            assert_eq!(model.get_source(), Some(ModelSource::OpenRouter), "{from}");
+            assert_eq!(
+                model.get_model_id().as_deref(),
+                Some("baseten/elephant-1"),
+                "{from}"
+            );
+        }
+        assert_eq!(
+            Model::new("openrouter", "elephant").get_source(),
+            Some(ModelSource::OpenRouter)
+        );
+        assert_eq!(Model::new("openrouter", "elephant").get_model_id(), None);
+        assert_eq!(Model::new("openrouterx:m", "m").get_source(), None);
     }
 
     use super::*;
