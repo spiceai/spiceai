@@ -118,12 +118,12 @@ fn authority_start(s: &str) -> Option<usize> {
     }
 }
 
-/// If `s` starts with a URL that has an authority, `s`'s URL prefix with the
+/// If `text` starts with a URL that has an authority, `text`'s URL prefix with the
 /// userinfo removed and secret query values replaced, plus how many bytes of
-/// `s` that prefix covers. `None` when `s` does not start with such a URL.
+/// `text` that prefix covers. `None` when `text` does not start with such a URL.
 ///
-/// `embedded` is set when `s` is free text (an error message), where
-/// whitespace and quotes end the URL; otherwise `s` is a whole source.
+/// `embedded` is set when `text` is free text (an error message), where
+/// whitespace and quotes end the URL; otherwise `text` is a whole source.
 ///
 /// This is a string scan, not a URL parse, so it also fails closed for URLs a
 /// parser would reject (a bad port, an unknown scheme, a raw `?`, `#` or quote
