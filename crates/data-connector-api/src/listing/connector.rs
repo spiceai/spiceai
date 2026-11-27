@@ -9225,8 +9225,8 @@ mod tests {
         writer.close().expect("closes the file");
 
         // The dictionary holds the three distinct values: 24 bytes, room for exactly 3.
-        let reader = SerializedFileReader::new(bytes::Bytes::from(file.clone()))
-            .expect("reads the footer");
+        let reader =
+            SerializedFileReader::new(bytes::Bytes::from(file.clone())).expect("reads the footer");
         let dictionary_offset = reader
             .metadata()
             .row_group(0)
@@ -9265,7 +9265,10 @@ mod tests {
                     .to_vec()
             })
             .collect();
-        assert_eq!(read, VALUES, "the honest dictionary page has to read back unchanged");
+        assert_eq!(
+            read, VALUES,
+            "the honest dictionary page has to read back unchanged"
+        );
 
         let Err(error) = scan(&over_capacity_path).await else {
             panic!("a dictionary page declaring 4 values in 24 bytes was decoded");
