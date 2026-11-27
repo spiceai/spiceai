@@ -40,16 +40,34 @@ limitations under the License.
 //! key as an index when the document is an array, which a top-level value cannot
 //! reproduce.
 
+mod adapter;
+mod rewrite;
+
+use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 
-use arrow::array::{Array, ArrayRef, AsArray, StringViewBuilder};
-use arrow::datatypes::DataType;
-use datafusion::common::{Result, ScalarValue, exec_err, plan_err};
+use arrow::array::builder::{NullBufferBuilder, make_view};
+use arrow::array::{
+    Array, ArrayRef, AsArray, ByteView, RecordBatch, RecordBatchOptions, StringViewArray,
+    StringViewBuilder,
+};
+use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
+use async_trait::async_trait;
+use datafusion::catalog::Session;
+use datafusion::common::config::ConfigOptions;
+use datafusion::common::{Result, ScalarValue, exec_err, internal_datafusion_err, plan_err};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
+    ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
+use datafusion::physical_expr::ScalarFunctionExpr;
+use datafusion::physical_expr::expressions::{Column, Literal};
+use datafusion::physical_expr::projection::{ProjectionExpr, ProjectionExprs};
+use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use jiter::{Jiter, Peek};
+
+pub(crate) use adapter::JsonKeyExprAdapterFactory;
+pub use rewrite::{CayenneJsonKeyRewrite, JsonKeyScanResolver, JsonKeyScanTable};
 
 /// The text of the value under top-level `key` in `json`, as the `json_get_*`
 /// functions find it; `None` when they find nothing: `json` is not an object, it
@@ -59,6 +77,11 @@ use jiter::{Jiter, Peek};
 /// `f(value, rest...)`, and why `key` must not parse as an integer.
 #[must_use]
 pub(crate) fn top_level_value<'j>(json: &'j str, key: &str) -> Option<&'j str> {
+    top_level_value_range(json, key).and_then(|range| json.get(range))
+}
+
+/// Where [`top_level_value`] lies in `json`, as a byte range on char boundaries.
+fn top_level_value_range(json: &str, key: &str) -> Option<Range<usize>> {
     debug_assert!(
         is_shreddable_key(key),
         "an integer key is an array index to json_get_*"
@@ -74,11 +97,239 @@ pub(crate) fn top_level_value<'j>(json: &'j str, key: &str) -> Option<&'j str> {
     }
     let peek = jiter.peek().ok()?;
     let start = jiter.current_index();
-    match jiter.known_skip(peek) {
-        // jiter stops on ASCII bytes, so both ends are on char boundaries.
-        Ok(()) => json.get(start..jiter.current_index()),
-        Err(_) => json.get(start..),
+    let end = match jiter.known_skip(peek) {
+        Ok(()) => jiter.current_index(),
+        Err(_) => json.len(),
+    };
+    // jiter stops on ASCII bytes, so both ends are on char boundaries; `get`
+    // checks rather than trusts it.
+    json.get(start..end).map(|_| start..end)
+}
+
+/// Prefix of the name of every column Cayenne derives from a JSON column's key.
+const JSON_KEY_COLUMN_PREFIX: &str = "__cayenne_json_key";
+
+/// The name of the column holding [`top_level_value`] of `key` in JSON column
+/// `json_column`: what a scan calls the column it derives, and what a data file
+/// calls the column that stores those values for its rows.
+///
+/// Distinct `(json_column, key)` pairs never share a name: the column's byte
+/// length precedes it, so where the column ends and the key starts is fixed.
+#[must_use]
+pub(crate) fn hidden_column_name(json_column: &str, key: &str) -> String {
+    format!(
+        "{JSON_KEY_COLUMN_PREFIX}:{}:{json_column}:{key}",
+        json_column.len()
+    )
+}
+
+/// A column a Cayenne scan derives from one of its table's JSON columns: per row,
+/// the text of the value under one top-level key ([`top_level_value`]), as
+/// `Utf8View`, NULL where the key is not found.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JsonKeyColumn {
+    /// Index of the JSON column in the table's schema.
+    source: usize,
+    /// Name of the JSON column, which the scan checks against its own schema.
+    source_name: String,
+    key: String,
+    name: String,
+}
+
+impl JsonKeyColumn {
+    /// The values of `key` in the JSON column `source_name` at `source`, or `None`
+    /// for a key that parses as an integer (see [`is_shreddable_key`]).
+    #[must_use]
+    pub(crate) fn new(source: usize, source_name: &str, key: &str) -> Option<Self> {
+        is_shreddable_key(key).then(|| Self {
+            source,
+            source_name: source_name.to_string(),
+            key: key.to_string(),
+            name: hidden_column_name(source_name, key),
+        })
     }
+
+    /// Index of the JSON column in the table's schema.
+    #[must_use]
+    pub fn source(&self) -> usize {
+        self.source
+    }
+
+    /// Name of the JSON column.
+    #[must_use]
+    pub fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    /// The top-level key.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// The column's name in a scan's output.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The column's field in a scan's output.
+    #[must_use]
+    pub fn field(&self) -> FieldRef {
+        Arc::new(Field::new(&self.name, DataType::Utf8View, true))
+    }
+
+    /// Whether `schema` (a table's schema) holds this column's JSON column at its
+    /// index, as a string column.
+    #[must_use]
+    pub(crate) fn matches(&self, schema: &Schema) -> bool {
+        schema.fields().get(self.source).is_some_and(|field| {
+            field.name() == &self.source_name && is_json_text_type(field.data_type())
+        })
+    }
+
+    /// `__cayenne_json_top_level_value(<json column>, '<key>')` over `schema`,
+    /// where the JSON column is at [`Self::source`].
+    fn computed(&self, schema: &Schema) -> Result<Arc<dyn PhysicalExpr>> {
+        let json: Arc<dyn PhysicalExpr> = Arc::new(Column::new(&self.source_name, self.source));
+        let key: Arc<dyn PhysicalExpr> =
+            Arc::new(Literal::new(ScalarValue::Utf8(Some(self.key.clone()))));
+        Ok(Arc::new(ScalarFunctionExpr::try_new(
+            Arc::clone(&JSON_TOP_LEVEL_VALUE_UDF),
+            vec![json, key],
+            schema,
+            Arc::new(ConfigOptions::default()),
+        )?))
+    }
+}
+
+/// Whether a column of `data_type` can hold the JSON documents
+/// [`top_level_value`] reads.
+pub(crate) fn is_json_text_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8
+    )
+}
+
+/// A table whose scans can return [`JsonKeyColumn`]s after the table columns they
+/// project: Cayenne, or a table that reads it in its place.
+#[async_trait]
+pub trait JsonKeyColumnScan: Send + Sync {
+    /// Whether a scan planned now would return the key columns itself. When it
+    /// would not, a rewrite to key columns only adds work: the caller computes
+    /// them from the JSON columns.
+    fn serves_json_keys(&self) -> bool;
+
+    /// Plans a scan whose output is the table columns `projection` selects, in
+    /// that order, then one column per entry of `keys`, named and typed as
+    /// [`JsonKeyColumn::field`]. `None` when this table cannot produce them now.
+    ///
+    /// # Errors
+    ///
+    /// Any error planning the scan.
+    async fn scan_with_json_keys(
+        &self,
+        state: &dyn Session,
+        projection: &[usize],
+        keys: &[JsonKeyColumn],
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>>;
+}
+
+/// `schema`'s fields selected by `projection`, then `keys`' fields.
+pub(crate) fn schema_with_json_keys(
+    schema: &Schema,
+    projection: Option<&[usize]>,
+    keys: &[JsonKeyColumn],
+) -> Result<SchemaRef> {
+    let mut fields: Vec<FieldRef> = match projection {
+        Some(projection) => projection
+            .iter()
+            .map(|&index| {
+                schema.fields().get(index).cloned().ok_or_else(|| {
+                    internal_datafusion_err!(
+                        "Projection index {index} is out of bounds for a schema of {} fields",
+                        schema.fields().len()
+                    )
+                })
+            })
+            .collect::<Result<_>>()?,
+        None => schema.fields().iter().cloned().collect(),
+    };
+    fields.extend(keys.iter().map(JsonKeyColumn::field));
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    )))
+}
+
+/// The projection a file scan pushes into its source for `keys`: the columns of
+/// `table_schema` (the source's table schema) that `projection` selects, then each
+/// key column computed from its JSON column, then the `trailing` columns. The
+/// scan's expression adapter ([`JsonKeyExprAdapterFactory`]) reads a file's stored
+/// values in place of a computed key column when the file has them.
+pub(crate) fn file_projection_with_json_keys(
+    table_schema: &Schema,
+    projection: &[usize],
+    keys: &[JsonKeyColumn],
+    trailing: &[usize],
+) -> Result<ProjectionExprs> {
+    let mut exprs: Vec<ProjectionExpr> = ProjectionExprs::from_indices(projection, table_schema)
+        .iter()
+        .cloned()
+        .collect();
+    for key in keys {
+        if !key.matches(table_schema) {
+            return exec_err!(
+                "Cannot read key '{}' of JSON column '{}': the scanned table has no such string column at index {}",
+                key.key,
+                key.source_name,
+                key.source
+            );
+        }
+        exprs.push(ProjectionExpr::new(key.computed(table_schema)?, key.name.clone()));
+    }
+    exprs.extend(
+        ProjectionExprs::from_indices(trailing, table_schema)
+            .iter()
+            .cloned(),
+    );
+    Ok(ProjectionExprs::new(exprs))
+}
+
+/// `projected` (the columns a scan selected from `source`) followed by `keys`,
+/// computed from `source`, the same rows with every table column.
+pub(crate) fn with_json_key_columns(
+    source: &RecordBatch,
+    projected: RecordBatch,
+    keys: &[JsonKeyColumn],
+    schema: SchemaRef,
+) -> Result<RecordBatch> {
+    let rows = projected.num_rows();
+    let mut columns = projected.columns().to_vec();
+    for key in keys {
+        let source_matches = source
+            .schema_ref()
+            .fields()
+            .get(key.source)
+            .is_some_and(|field| field.name() == &key.source_name);
+        let Some(json) = source.columns().get(key.source).filter(|_| source_matches) else {
+            return exec_err!(
+                "Cannot read key '{}' of JSON column '{}': the in-memory rows have no such column at index {}",
+                key.key,
+                key.source_name,
+                key.source
+            );
+        };
+        columns.push(top_level_values(json.as_ref(), &key.key)?);
+    }
+    Ok(RecordBatch::try_new_with_options(
+        schema,
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(rows)),
+    )?)
 }
 
 /// Whether `key` can be extracted with [`top_level_value`]: a key that parses as
@@ -152,6 +403,11 @@ impl ScalarUDFImpl for JsonTopLevelValue {
 
 /// [`top_level_value`] of every row of a string array, as a string view array.
 fn top_level_values(json: &dyn Array, key: &str) -> Result<ArrayRef> {
+    if let Some(views) = json.as_string_view_opt()
+        && let Some(values) = top_level_values_in_place(views, key)
+    {
+        return Ok(Arc::new(values));
+    }
     let mut out = StringViewBuilder::with_capacity(json.len());
     macro_rules! extract {
         ($array:expr) => {{
@@ -170,6 +426,41 @@ fn top_level_values(json: &dyn Array, key: &str) -> Result<ArrayRef> {
     }
     Ok(Arc::new(out.finish()))
 }
+
+/// [`top_level_values`] of a string view array without copying a value: each
+/// value is a substring of its document, so its view points into the document's
+/// own buffer. `None` when a value lies beyond what a view can address (an offset
+/// past `u32::MAX`), and the caller copies instead.
+fn top_level_values_in_place(json: &StringViewArray, key: &str) -> Option<StringViewArray> {
+    let mut views: Vec<u128> = Vec::with_capacity(json.len());
+    let mut nulls = NullBufferBuilder::new(json.len());
+    for (row, &view) in json.views().iter().enumerate() {
+        let document = (!json.is_null(row)).then(|| json.value(row));
+        let Some((document, range)) = document
+            .and_then(|document| top_level_value_range(document, key).map(|r| (document, r)))
+        else {
+            views.push(0);
+            nulls.append_null();
+            continue;
+        };
+        let value = document.get(range.clone())?.as_bytes();
+        // A value longer than a view's inline capacity lies in a document longer
+        // than that, which the view keeps in one of the array's data buffers.
+        let value_view = if value.len() <= MAX_INLINE_VIEW_BYTES {
+            make_view(value, 0, 0)
+        } else {
+            let view = ByteView::from(view);
+            let offset = u64::from(view.offset).checked_add(u64::try_from(range.start).ok()?)?;
+            make_view(value, view.buffer_index, u32::try_from(offset).ok()?)
+        };
+        views.push(value_view);
+        nulls.append_non_null();
+    }
+    StringViewArray::try_new(views.into(), json.data_buffers().to_vec(), nulls.finish()).ok()
+}
+
+/// The longest string a view stores inline rather than in a data buffer.
+const MAX_INLINE_VIEW_BYTES: usize = 12;
 
 #[cfg(test)]
 mod tests {

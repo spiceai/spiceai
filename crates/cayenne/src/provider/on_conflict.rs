@@ -1333,6 +1333,8 @@ pub(crate) struct ProtectedSnapshotScan<'a> {
     /// each protected snapshot's files as to the current snapshot's.
     pub(crate) lookup_selection: Option<super::lookup_index::LookupSelection>,
     pub(crate) pinned_lookup_index: Option<Arc<super::lookup_index::LookupIndexView>>,
+    /// JSON key columns each protected snapshot's scan appends after `projection`.
+    pub(crate) json_keys: &'a [crate::json_shred::JsonKeyColumn],
 }
 
 pub(crate) struct PreparedProtectedSnapshotUpdate {

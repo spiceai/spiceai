@@ -32,6 +32,7 @@ limitations under the License.
 //! - maintained-aggregate state (`maintained_aggregates`) and the per-table memory account.
 
 use super::column_stats::{ColumnStatsAccumulator, RowCountUpdate};
+use crate::json_shred::{self, JsonKeyColumn, JsonKeyColumnScan};
 use super::constants::{
     LOOKUP_INDEX_DIR_NAME, STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
 };
@@ -1976,6 +1977,10 @@ struct ColdTierScan<'a> {
     ///
     /// [`ColdTierFile::max_sequence`]: crate::metadata::ColdTierFile::max_sequence
     per_file_thresholds: bool,
+    /// JSON key columns the branch appends after `projection` (and before the
+    /// per-file threshold column), each read from a file's stored values or
+    /// computed from its JSON column.
+    json_keys: &'a [JsonKeyColumn],
 }
 
 /// Name of the constant per-file column a cold-tier scan built with
@@ -17841,6 +17846,7 @@ impl CayenneTableProvider {
                         &cold_deletions,
                         cold_files.as_slice(),
                     ),
+                    json_keys: &[],
                 })
                 .await?
                 .map(|branch| {
@@ -24308,6 +24314,7 @@ impl CayenneTableProvider {
                     None,
                     None,
                     None,
+                    &[],
                 )
                 .await
             }
@@ -29681,7 +29688,15 @@ impl CayenneTableProvider {
     ) -> Result<(SendableRecordBatchStream, Arc<dyn ExecutionPlan>)> {
         let state = ctx.state();
         let plan = self
-            .plan_scan_from_view(&state, None, &[], None, scan_view, TombstonePushdown::Skip)
+            .plan_scan_from_view(
+                &state,
+                None,
+                &[],
+                None,
+                scan_view,
+                TombstonePushdown::Skip,
+                &[],
+            )
             .await?;
         let task_ctx = ctx.task_ctx();
         let ordered = self.order_rewrite_plan(plan, order, &task_ctx)?;
@@ -29720,6 +29735,7 @@ impl CayenneTableProvider {
                 None,
                 scan_view,
                 TombstonePushdown::Skip,
+                &[],
             )
             .await?;
         Ok((plan, generation_before))
@@ -31063,6 +31079,7 @@ impl CayenneTableProvider {
                 cold_files: &inputs,
                 selective: false,
                 per_file_thresholds: cold_files_need_deletion_filter(&deletions, &inputs),
+                json_keys: &[],
             })
             .await?
         else {
@@ -42277,6 +42294,7 @@ impl CayenneTableProvider {
         pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
         target_partitions: usize,
         read_schema: &SchemaRef,
+        json_keys: &[JsonKeyColumn],
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
         if segments.is_empty() {
             return Ok(None);
@@ -42303,6 +42321,7 @@ impl CayenneTableProvider {
             effective_projection,
             target_partitions,
             read_schema,
+            json_keys,
         )
     }
 
@@ -42685,14 +42704,16 @@ impl CayenneTableProvider {
         })
     }
 
-    /// Shared tail of the mem-tier scan plan: apply the effective projection and
-    /// wrap the visible batches in a `MemorySourceConfig` exec.
+    /// Shared tail of the mem-tier scan plan: apply the effective projection,
+    /// append `json_keys` computed from each batch's JSON columns, and wrap the
+    /// visible batches in a `MemorySourceConfig` exec.
     fn finish_mem_tier_scan_plan(
         &self,
         visible_batches: Vec<RecordBatch>,
         effective_projection: Option<&Vec<usize>>,
         target_partitions: usize,
         read_schema: &SchemaRef,
+        json_keys: &[JsonKeyColumn],
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
         // Project to the effective projection (reusing the inlined-plan logic).
         // Build from the CAPTURED (gated) read schema (threaded down from `scan()`)
@@ -42709,6 +42730,11 @@ impl CayenneTableProvider {
         } else {
             Arc::clone(read_schema)
         };
+        let output_schema = if json_keys.is_empty() {
+            Arc::clone(&proj_schema)
+        } else {
+            json_shred::schema_with_json_keys(&proj_schema, None, json_keys)?
+        };
 
         let projected_batches: Vec<RecordBatch> = visible_batches
             .into_iter()
@@ -42721,17 +42747,26 @@ impl CayenneTableProvider {
                         ))
                     })?
                 } else {
-                    batch
+                    batch.clone()
                 };
                 // No-op cheap reschema when the projection has no string/binary
                 // columns; casts Utf8/Binary -> view otherwise.
-                arrow_tools::record_batch::try_cast_to(projected, Arc::clone(&proj_schema)).map_err(
-                    |e| {
-                        datafusion_common::DataFusionError::Execution(format!(
-                            "Failed to cast in-memory CDC tier batch to view read schema for table {}: {e}",
-                            self.table_metadata.table_name
-                        ))
-                    },
+                let projected =
+                    arrow_tools::record_batch::try_cast_to(projected, Arc::clone(&proj_schema))
+                        .map_err(|e| {
+                            datafusion_common::DataFusionError::Execution(format!(
+                                "Failed to cast in-memory CDC tier batch to view read schema for table {}: {e}",
+                                self.table_metadata.table_name
+                            ))
+                        })?;
+                if json_keys.is_empty() {
+                    return Ok(projected);
+                }
+                json_shred::with_json_key_columns(
+                    &batch,
+                    projected,
+                    json_keys,
+                    Arc::clone(&output_schema),
                 )
             })
             .collect::<datafusion_common::Result<Vec<_>>>()?;
@@ -42751,7 +42786,7 @@ impl CayenneTableProvider {
         Ok(Some(
             datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
                 &partitions,
-                proj_schema,
+                output_schema,
                 None,
             )?,
         ))
@@ -44079,19 +44114,19 @@ impl CayenneTableProvider {
     }
 
     /// When filtering by PK, we may have added PK columns to the scan that weren't in the
-    /// original projection. This creates a `ProjectionExec` that only outputs the originally
-    /// requested columns.
+    /// original projection. This creates a `ProjectionExec` that only outputs the columns
+    /// at `columns_to_keep`, the originally requested ones, in that order.
     #[expect(clippy::unused_self)]
     fn create_projection_strip(
         &self,
         input: Arc<dyn ExecutionPlan>,
-        num_columns_to_keep: usize,
+        columns_to_keep: impl ExactSizeIterator<Item = usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let input_schema = input.schema();
         let mut projection_expr: Vec<(Arc<dyn PhysicalExpr>, String)> =
-            Vec::with_capacity(num_columns_to_keep);
+            Vec::with_capacity(columns_to_keep.len());
 
-        for idx in 0..num_columns_to_keep {
+        for idx in columns_to_keep {
             let field = input_schema.field(idx);
             let col_name = field.name().clone();
             projection_expr.push((
@@ -44197,6 +44232,7 @@ impl CayenneTableProvider {
                     scan.lookup_selection.clone(),
                     scan.pinned_lookup_index.clone(),
                     scan.lookup_selection.is_some().then_some(&mut explain),
+                    scan.json_keys,
                 )
                 .await?;
 
@@ -44388,6 +44424,7 @@ impl CayenneTableProvider {
             None,
             None,
             None,
+            &[],
         )
         .await
     }
@@ -44436,6 +44473,8 @@ impl CayenneTableProvider {
         // Scan-local lookup-index evidence. The file listing below finalizes a
         // provisional selection's coverage: none, partial or full.
         lookup_index_explain: Option<&mut super::lookup_index::LookupIndexExplain>,
+        // JSON key columns appended after `projection`, which must then be set.
+        json_keys: &[JsonKeyColumn],
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let allow_runtime_lookup = lookup_index_explain.is_some();
         // The reference schema the Vortex decode targets. Internal reads
@@ -44575,7 +44614,15 @@ impl CayenneTableProvider {
         }
 
         if partitioned_file_lists.is_empty() {
-            let projected_schema = project_schema(&scan_schema, projection)?;
+            let projected_schema = if json_keys.is_empty() {
+                project_schema(&scan_schema, projection)?
+            } else {
+                json_shred::schema_with_json_keys(
+                    &scan_schema,
+                    projection.map(Vec::as_slice),
+                    json_keys,
+                )?
+            };
             return Ok(Arc::new(EmptyExec::new(projected_schema)));
         }
 
@@ -44767,6 +44814,11 @@ impl CayenneTableProvider {
             None
         };
 
+        let (file_source, projection_indices, expr_adapter) =
+            match Self::json_key_file_source(&file_source, projection, json_keys, &[])? {
+                Some(source) => (source, None, json_shred::JsonKeyExprAdapterFactory::shared()),
+                None => (file_source, projection.cloned(), None),
+            };
         let plan = plan_format
             .create_physical_plan(
                 state,
@@ -44774,10 +44826,11 @@ impl CayenneTableProvider {
                     .with_file_groups(partitioned_file_lists)
                     .with_constraints(Constraints::default())
                     .with_statistics(statistics)
-                    .with_projection_indices(projection.cloned())?
+                    .with_projection_indices(projection_indices)?
                     .with_limit(scan_pushdown_limit)
                     .with_output_ordering(output_ordering)
                     .with_output_partitioning(output_partitioning)
+                    .with_expr_adapter(expr_adapter)
                     .build(),
             )
             .await?;
@@ -44789,6 +44842,43 @@ impl CayenneTableProvider {
             ),
             None => plan,
         })
+    }
+
+    /// The file source of a file scan that outputs the table columns `projection`
+    /// selects, then `json_keys`, then the `trailing` columns of the source's table
+    /// schema: the projection pushed into `file_source` as expressions (see
+    /// [`json_shred::file_projection_with_json_keys`]). `None` without key columns,
+    /// when the scan is the plain one. A scan built from it takes
+    /// [`json_shred::JsonKeyExprAdapterFactory`], which reads each file's stored key
+    /// values when it has them.
+    fn json_key_file_source(
+        file_source: &Arc<dyn FileSource>,
+        projection: Option<&Vec<usize>>,
+        json_keys: &[JsonKeyColumn],
+        trailing: &[usize],
+    ) -> datafusion_common::Result<Option<Arc<dyn FileSource>>> {
+        if json_keys.is_empty() {
+            return Ok(None);
+        }
+        let Some(projection) = projection else {
+            return Err(datafusion_common::DataFusionError::Internal(
+                "A scan with JSON key columns must project its table columns".to_string(),
+            ));
+        };
+        let exprs = json_shred::file_projection_with_json_keys(
+            file_source.table_schema().table_schema(),
+            projection,
+            json_keys,
+            trailing,
+        )?;
+        file_source
+            .try_pushdown_projection(&exprs)?
+            .map(Some)
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(
+                    "The file source does not take a projection of expressions".to_string(),
+                )
+            })
     }
 
     /// Build the cold object-store tier scan branch, or `Ok(None)` when the cold
@@ -44825,6 +44915,7 @@ impl CayenneTableProvider {
             cold_files,
             selective,
             per_file_thresholds,
+            json_keys,
         } = scan;
         // Cold tier disabled (no location) → no branch.
         if !self.table_metadata.vortex_config.cold_tier_enabled() {
@@ -44985,7 +45076,9 @@ impl CayenneTableProvider {
             (Some(projection), true) => {
                 let mut extended = projection.clone();
                 extended.push(threshold_index);
-                let column = projection.len();
+                // Key columns, when requested, sit between the projection and the
+                // threshold column.
+                let column = projection.len() + json_keys.len();
                 (Some(extended), Some(column))
             }
             (None, true) => (None, Some(threshold_index)),
@@ -45013,6 +45106,16 @@ impl CayenneTableProvider {
         {
             file_source = unsplit;
         }
+        let threshold: &[usize] = if per_file_thresholds {
+            &[threshold_index]
+        } else {
+            &[]
+        };
+        let (file_source, scan_projection, expr_adapter) =
+            match Self::json_key_file_source(&file_source, projection, json_keys, threshold)? {
+                Some(source) => (source, None, json_shred::JsonKeyExprAdapterFactory::shared()),
+                None => (file_source, scan_projection, None),
+            };
 
         let plan = options
             .listing
@@ -45028,6 +45131,7 @@ impl CayenneTableProvider {
                     // Cold files are an unsorted internal union branch — never
                     // advertise an ordering.
                     .with_output_ordering(Vec::new())
+                    .with_expr_adapter(expr_adapter)
                     .build(),
             )
             .await?;
@@ -45089,7 +45193,7 @@ impl CayenneTableProvider {
             )),
             None => branch.plan,
         };
-        self.create_projection_strip(filtered, threshold_column)
+        self.create_projection_strip(filtered, 0..threshold_column)
     }
 
     /// Resolve a snapshot's data files from the manifest (`cayenne_snapshot_file`)
@@ -47363,7 +47467,16 @@ impl CayenneTableProvider {
         limit: Option<usize>,
         scan_view: Arc<ScanView>,
         tombstone_pushdown: TombstonePushdown,
+        // JSON key columns every branch appends after the projected table
+        // columns; the scan's output is the projection, then these.
+        json_keys: &[JsonKeyColumn],
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        if !json_keys.is_empty() && projection.is_none() {
+            return Err(DataFusionError::Internal(format!(
+                "A scan of table {} with JSON key columns must project its table columns",
+                self.table_metadata.table_name
+            )));
+        }
         let warm_files = scan_view.raw.warm_files.clone();
         let mem_tier_any_rows = scan_view.raw.mem_tier_shards.iter().any(|s| !s.is_empty());
         let maintained_aggregate_epoch = scan_view.raw.maintained_aggregate_epoch;
@@ -47640,6 +47753,7 @@ impl CayenneTableProvider {
                 lookup_selection,
                 pinned_lookup_index,
                 lookup_index_explain.as_mut(),
+                json_keys,
             )
             .await;
         self.record_listing_scan_duration(listing_scan_start.elapsed());
@@ -47664,6 +47778,7 @@ impl CayenneTableProvider {
                 file_statistics_schema: Arc::clone(&file_statistics_schema),
                 lookup_selection: protected_lookup_selection,
                 pinned_lookup_index: protected_pinned_lookup_index,
+                json_keys,
             })
             .await?;
         // One decision for the whole scan, recorded once: a key found only in
@@ -47701,6 +47816,7 @@ impl CayenneTableProvider {
                 selective: is_pk_selective_scan,
                 per_file_thresholds: need_pk_deletion
                     && cold_files_need_deletion_filter(&deletion_snapshot, captured_cold_files),
+                json_keys,
             })
             .await?
             .map(|branch| {
@@ -47735,6 +47851,11 @@ impl CayenneTableProvider {
             } else {
                 read_schema
             };
+            let output_schema = if json_keys.is_empty() {
+                Arc::clone(&proj_schema)
+            } else {
+                json_shred::schema_with_json_keys(&proj_schema, None, json_keys)?
+            };
 
             let projected_batches: Vec<RecordBatch> = inlined_batches
                 .into_iter()
@@ -47747,17 +47868,27 @@ impl CayenneTableProvider {
                             ))
                         })?
                     } else {
-                        batch
+                        batch.clone()
                     };
                     // No-op cheap reschema when the projection has no
                     // string/binary columns; casts Utf8/Binary -> view otherwise.
-                    arrow_tools::record_batch::try_cast_to(projected, Arc::clone(&proj_schema))
-                        .map_err(|e| {
-                            datafusion_common::DataFusionError::Execution(format!(
-                                "Failed to cast inlined batch to view read schema for table {}: {e}",
-                                self.table_metadata.table_name
-                            ))
-                        })
+                    let projected =
+                        arrow_tools::record_batch::try_cast_to(projected, Arc::clone(&proj_schema))
+                            .map_err(|e| {
+                                datafusion_common::DataFusionError::Execution(format!(
+                                    "Failed to cast inlined batch to view read schema for table {}: {e}",
+                                    self.table_metadata.table_name
+                                ))
+                            })?;
+                    if json_keys.is_empty() {
+                        return Ok(projected);
+                    }
+                    json_shred::with_json_key_columns(
+                        &batch,
+                        projected,
+                        json_keys,
+                        Arc::clone(&output_schema),
+                    )
                 })
                 .collect::<datafusion_common::Result<Vec<_>>>()?;
 
@@ -47777,7 +47908,7 @@ impl CayenneTableProvider {
                 let inline_exec: Arc<dyn ExecutionPlan> =
                     datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
                         &inline_partitions,
-                        proj_schema,
+                        output_schema,
                         None,
                     )?;
                 // Pre-filter the inline branch with the query's scan filters so
@@ -47808,6 +47939,7 @@ impl CayenneTableProvider {
                 // One partition for a selective scan — see the inline branch.
                 memory_branch_partitions,
                 &read_schema,
+                json_keys,
             )?
             .map(|mem_exec| self.wrap_memory_branch_with_scan_filters(mem_exec, filters));
         if lookup_index_explain.is_none() {
@@ -47888,9 +48020,17 @@ impl CayenneTableProvider {
         };
 
         // Strip extra columns (PK or retention time column) added to the projection
-        // but not originally requested by the query.
-        if need_projection_strip && let Some(orig_proj) = projection {
-            let plan = self.create_projection_strip(plan, orig_proj.len())?;
+        // but not originally requested by the query. Key columns follow the
+        // extended projection, and are kept.
+        if need_projection_strip
+            && let Some(orig_proj) = projection
+            && let Some(extended) = effective_projection.as_ref()
+        {
+            let keys = extended.len()..extended.len() + json_keys.len();
+            let plan = self.create_projection_strip(
+                plan,
+                (0..orig_proj.len()).chain(keys).collect::<Vec<_>>().into_iter(),
+            )?;
             return Ok(self.wrap_scan_plan_with_cayenne_metadata(
                 plan,
                 scan_guard,
@@ -47908,31 +48048,15 @@ impl CayenneTableProvider {
     }
 }
 
-#[async_trait]
-impl TableProvider for CayenneTableProvider {
-    fn schema(&self) -> SchemaRef {
-        // Advertise the view-typed read schema (string/binary -> view) so
-        // DataFusion plans the whole query — joins, aggregates, sorts — on view
-        // arrays, avoiding the i32 2 GiB offset overflow in hash-join build-side
-        // `concat_batches`. The stored schema (table_schema) stays Utf8/Binary
-        // for writes/CDC/stats; scan() decodes the matching view types.
-        self.read_schema()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    fn constraints(&self) -> Option<&Constraints> {
-        self.pk_constraints.as_ref()
-    }
-
-    async fn scan(
+impl CayenneTableProvider {
+    /// A query's scan of the table: `projection`, then `json_keys`.
+    async fn query_scan(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
+        json_keys: &[JsonKeyColumn],
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         // A table in the object-native location whose write could not learn
         // whether it committed may hold in memory a view its state no longer
@@ -47974,8 +48098,66 @@ impl TableProvider for CayenneTableProvider {
             limit,
             scan_view,
             TombstonePushdown::Apply,
+            json_keys,
         )
         .await
+    }
+}
+
+#[async_trait]
+impl JsonKeyColumnScan for CayenneTableProvider {
+    fn serves_json_keys(&self) -> bool {
+        true
+    }
+
+    async fn scan_with_json_keys(
+        &self,
+        state: &dyn Session,
+        projection: &[usize],
+        keys: &[JsonKeyColumn],
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
+        // Columns are only ever appended to a table, so a key column's JSON column
+        // keeps its index; a key that names another column is not this table's.
+        let schema = self.read_schema();
+        if !keys.iter().all(|key| key.matches(&schema)) {
+            return Ok(None);
+        }
+        let projection = projection.to_vec();
+        self.query_scan(state, Some(&projection), filters, limit, keys)
+            .await
+            .map(Some)
+    }
+}
+
+#[async_trait]
+impl TableProvider for CayenneTableProvider {
+    fn schema(&self) -> SchemaRef {
+        // Advertise the view-typed read schema (string/binary -> view) so
+        // DataFusion plans the whole query — joins, aggregates, sorts — on view
+        // arrays, avoiding the i32 2 GiB offset overflow in hash-join build-side
+        // `concat_batches`. The stored schema (table_schema) stays Utf8/Binary
+        // for writes/CDC/stats; scan() decodes the matching view types.
+        self.read_schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        self.pk_constraints.as_ref()
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        self.query_scan(state, projection, filters, limit, &[]).await
     }
 
     // Filter-pushdown exactness contract (read before changing the arms below):

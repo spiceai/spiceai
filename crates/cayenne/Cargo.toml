@@ -34,6 +34,8 @@ datafusion-common = { workspace = true }
 datafusion-datasource = { workspace = true }
 datafusion-execution = { workspace = true }
 datafusion-expr = { workspace = true }
+# The JSON functions the key-column rewrite recognizes by identity (json_shred).
+datafusion-functions-json = { workspace = true }
 # `DecimalAverager`: the maintained decimal AVG serves DataFusion's own
 # sum/count -> decimal quotient, so parity with a base-table re-scan is
 # structural rather than a re-implementation kept in sync by hand.
@@ -121,8 +123,6 @@ result-correctness-duckdb = []
 result-correctness-chdb = ["dep:chdb-rust"]
 
 [dev-dependencies]
-# The JSON functions a shredded column must answer exactly like (json_shred's differential test).
-datafusion-functions-json = { workspace = true }
 # Steps the model's transactions traces for the object-native catalog's replay.
 cayenne-metastore-model = { path = "../cayenne-metastore-model" }
 object_store_sim = { path = "../object_store_sim" }
