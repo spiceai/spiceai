@@ -14,10 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::net::{Ipv4Addr, SocketAddr};
+
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::json;
 
+use super::partition_proxy::PartitionProxy;
 use super::{Source, TextResult};
 use crate::docker::{Container, ContainerSpec, healthcheck};
 
@@ -27,6 +30,8 @@ pub struct Mysql {
     container: Container,
     /// The source's name on the run's MySQL network.
     peer_host: String,
+    /// Proxies `spiced`'s connections only; harness commands connect directly.
+    proxy: Option<PartitionProxy>,
 }
 
 impl Mysql {
@@ -38,7 +43,12 @@ impl Mysql {
     /// reachable by the source's name (`_` made `-`, which a host name may
     /// hold): a replica reaches its primary without a route to the host. The
     /// container's own name can be longer than a host name label allows.
-    pub async fn start(name: &str, run_id: &str, version: Option<&str>) -> Result<Self> {
+    pub async fn start(
+        name: &str,
+        run_id: &str,
+        version: Option<&str>,
+        partitionable: bool,
+    ) -> Result<Self> {
         let peer_host = name.replace('_', "-");
         let container = Container::start(ContainerSpec {
             name: format!("spicescript-{run_id}-{name}"),
@@ -61,9 +71,20 @@ impl Mysql {
             alias: Some(peer_host.clone()),
         })
         .await?;
+        let proxy = if partitionable {
+            let upstream = SocketAddr::from((Ipv4Addr::LOCALHOST, container.host_port(3306)?));
+            Some(
+                PartitionProxy::start(upstream)
+                    .await
+                    .with_context(|| format!("Failed to start partition proxy for '{name}'"))?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             container,
             peer_host,
+            proxy,
         })
     }
 
@@ -91,7 +112,20 @@ impl Source for Mysql {
         Some(&self.container)
     }
 
+    fn inject_fault(&self, fault: crate::script::ProxyFault) -> bool {
+        match &self.proxy {
+            Some(proxy) => {
+                proxy.inject(fault);
+                true
+            }
+            None => false,
+        }
+    }
+
     async fn remove(&self) -> Result<()> {
+        if let Some(proxy) = &self.proxy {
+            proxy.stop();
+        }
         self.container.remove().await?;
         // The run's other MySQL sources may still be on the network; the
         // last one out removes it, and the runner's final sweep removes it
@@ -108,10 +142,14 @@ impl Source for Mysql {
         // How another MySQL source of the run (a replica) reaches this one.
         extra.insert("peer_host".into(), json!(self.peer_host));
         extra.insert("peer_port".into(), json!(3306));
+        let connector_port = match &self.proxy {
+            Some(proxy) => proxy.port(),
+            None => self.container.host_port(3306)?,
+        };
         Ok(super::Namespace {
             params: json!({
                 "mysql_host": "127.0.0.1",
-                "mysql_tcp_port": self.container.host_port(3306)?.to_string(),
+                "mysql_tcp_port": connector_port.to_string(),
                 "mysql_user": "root",
                 "mysql_pass": PASSWORD,
                 "mysql_db": namespace,

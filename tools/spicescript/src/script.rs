@@ -22,7 +22,7 @@ limitations under the License.
 //! parsed by hand from a [`Value`] rather than with an externally tagged serde
 //! enum, because an externally tagged enum cannot carry sibling keys.
 
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{collections::BTreeMap, num::NonZeroU64, path::Path, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::ValueEnum as _;
@@ -192,6 +192,9 @@ pub struct SourceSpec {
     /// requests (buckets, `assert-objects`) go to the store directly.
     #[serde(default, with = "opt_duration")]
     pub latency: Option<Duration>,
+    /// `mysql` sources: route the connector through the partition proxy.
+    #[serde(default)]
+    pub partitionable: bool,
 }
 
 /// `sidecar:`: the application sidecar each instance runs beside it.
@@ -504,6 +507,11 @@ pub enum Action {
     StopSource(String),
     PauseSource(String),
     UnpauseSource(String),
+    /// Inject a fault on a `partitionable` source's connector path.
+    ProxyFault {
+        source: String,
+        fault: ProxyFault,
+    },
     /// Run statements on a source, in this instance's database.
     SourceExec {
         source: String,
@@ -624,6 +632,16 @@ pub enum Action {
     /// applied while they run.
     Load(LoadStep),
     Sleep(Duration),
+}
+
+/// A fault the partition proxy injects; see `tools/spicescript/README.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyFault {
+    Partition,
+    Heal,
+    Stall,
+    Throttle(NonZeroU64),
+    Unthrottle,
 }
 
 impl Action {
@@ -1680,6 +1698,11 @@ const ACTIONS: &[&str] = &[
     "stop-source",
     "pause-source",
     "unpause-source",
+    "partition-source",
+    "heal-source",
+    "stall-source",
+    "throttle-source",
+    "unthrottle-source",
     "source-exec",
     "write",
     "refresh",
@@ -1717,6 +1740,11 @@ const REACH_NO_SPICED: &[&str] = &[
     "stop-source",
     "pause-source",
     "unpause-source",
+    "partition-source",
+    "heal-source",
+    "stall-source",
+    "throttle-source",
+    "unthrottle-source",
     "source-exec",
     "write",
     "generate",
@@ -1928,6 +1956,24 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
         "stop-source" => Action::StopSource(string_arg(&arg, name)?),
         "pause-source" => Action::PauseSource(string_arg(&arg, name)?),
         "unpause-source" => Action::UnpauseSource(string_arg(&arg, name)?),
+        "partition-source" => proxy_fault(&arg, name, ProxyFault::Partition)?,
+        "heal-source" => proxy_fault(&arg, name, ProxyFault::Heal)?,
+        "stall-source" => proxy_fault(&arg, name, ProxyFault::Stall)?,
+        "unthrottle-source" => proxy_fault(&arg, name, ProxyFault::Unthrottle)?,
+        "throttle-source" => {
+            let Value::Object(m) = arg else {
+                bail!("`throttle-source` takes a mapping of source name to bytes per second");
+            };
+            let (source, rate) = single_entry(m, "`throttle-source` takes exactly one source")?;
+            let rate = rate
+                .as_u64()
+                .and_then(NonZeroU64::new)
+                .context("`throttle-source` takes a positive number of bytes per second")?;
+            Action::ProxyFault {
+                source,
+                fault: ProxyFault::Throttle(rate),
+            }
+        }
         "write" => {
             let Value::Object(m) = arg else {
                 bail!("`write` takes a mapping of source name to SQL");
@@ -2882,6 +2928,13 @@ fn compile_patterns(key: &str, patterns: &[String]) -> Result<Vec<regex::Regex>>
         .iter()
         .map(|p| regex::Regex::new(p).with_context(|| format!("invalid `{key}` pattern '{p}'")))
         .collect()
+}
+
+fn proxy_fault(arg: &Value, action: &str, fault: ProxyFault) -> Result<Action> {
+    Ok(Action::ProxyFault {
+        source: string_arg(arg, action)?,
+        fault,
+    })
 }
 
 fn string_arg(arg: &Value, action: &str) -> Result<String> {

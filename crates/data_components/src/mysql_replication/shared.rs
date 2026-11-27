@@ -112,10 +112,10 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::binlog::{
-    AdoptedLayout, MIN_VALID_EVENT_POS, QueryKind, StatementKind, adopt_current_layout,
-    classify_query, classify_statement, compute_pk_source_indexes, immediate_commit_ts_ms,
-    layout_event_mismatch, log_transient_reconnect, open_binlog_stream, purged_position_error,
-    readiness_heartbeat, record_watermark, transaction_commit_ts_ms,
+    AdoptedLayout, DumpSilence, MIN_VALID_EVENT_POS, QueryKind, StatementKind,
+    adopt_current_layout, classify_query, classify_statement, compute_pk_source_indexes,
+    immediate_commit_ts_ms, layout_event_mismatch, log_transient_reconnect, open_binlog_stream,
+    purged_position_error, readiness_heartbeat, record_watermark, transaction_commit_ts_ms,
 };
 use super::changes::{MemberLayout, MysqlChangeRows};
 use super::config::{BinlogPosition, ReplicationParams};
@@ -142,9 +142,14 @@ const DEFAULT_MEMBER_CHANNEL_CAPACITY: usize = 1024;
 const IDLE_TICK_CAP: Duration = Duration::from_secs(1);
 
 /// How long a single member's delivery may block the pump before we WARN and
-/// re-check shutdown. Purely observability + shutdown responsiveness; server
-/// liveness is not at risk (the dump connection keeps its own keepalives).
+/// re-check shutdown. Purely observability + shutdown responsiveness: unread
+/// events wait in the socket buffer, and the raised `net_write_timeout` keeps
+/// the source from dropping the dump.
 const MEMBER_SEND_STALL_WARN: Duration = Duration::from_secs(5);
+
+/// Bounds the head poll, which runs on the pump, so an unreachable source
+/// cannot stall it.
+const HEAD_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `(database, table)` of a member's source table — the routing key.
 type MemberKey = (String, String);
@@ -1795,6 +1800,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
     let idle_tick = crate::cdc::heartbeat_interval(params.ready_lag)
         .min(params.checkpoint_interval)
         .min(IDLE_TICK_CAP);
+    let mut silence = DumpSilence::new(params.checkpoint_interval);
     let mut side_conn: Option<Conn> = None;
     // Positioning mode for this shared dump, decided once at the source level
     // (all members share the connection, so all see the same `gtid_mode`): GTID
@@ -1868,6 +1874,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                 // floor), so every snapshot-complete member's gap is covered:
                 // promote them to routable + creditable.
                 source.ack.promote_ready_members();
+                silence.on_open();
                 stream
             }
             Err(e) if super::resilience::is_purged_position_error(&e) => {
@@ -1938,6 +1945,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                 return;
             }
 
+            let waited_from = Instant::now();
             let polled = tokio::select! {
                 polled = tokio::time::timeout(idle_tick, stream.next()) => polled,
                 // Wake for a shutdown as it is signalled: the check at the head of
@@ -1946,28 +1954,44 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                 () = crate::cdc::shutdown_signalled(shutdown_epoch) => continue 'recv,
             };
             let next_event = match polled {
-                Ok(item) => item,
+                Ok(item) => {
+                    silence.on_event();
+                    item
+                }
                 Err(_idle) => {
+                    if let Some(silent_for) = silence.expired(waited_from) {
+                        note_connection_lost(
+                            &source,
+                            &mut reconnect_attempts,
+                            &connection,
+                            &format!(
+                                "nothing arrived on the binlog stream for {}s",
+                                silent_for.as_secs()
+                            ),
+                            &mut backoff,
+                        );
+                        break 'recv;
+                    }
                     if last_persist_at.elapsed() >= params.checkpoint_interval {
                         persist_all(&source, &mut last_persisted).await;
                         last_persist_at = Instant::now();
                     }
-                    poll_head_and_heartbeat(&source, &mut side_conn, &params).await;
+                    crate::cdc::until_shutdown(
+                        shutdown_epoch,
+                        poll_head_and_heartbeat(&source, &mut side_conn, &params),
+                    )
+                    .await;
                     last_heartbeat_at = Instant::now();
                     continue 'recv;
                 }
             };
             let Some(event) = next_event else {
-                for (_, m) in source.live_members() {
-                    m.metrics.inc_recv_error();
-                    m.metrics.inc_reconnect();
-                }
-                reconnect_attempts = reconnect_attempts.saturating_add(1);
-                log_transient_reconnect(
-                    reconnect_attempts,
+                note_connection_lost(
+                    &source,
+                    &mut reconnect_attempts,
                     &connection,
                     "server closed the binlog stream",
-                    backoff.next_delay().as_millis(),
+                    &mut backoff,
                 );
                 break 'recv;
             };
@@ -1986,16 +2010,12 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                     }
                 }
                 Err(e) if super::resilience::is_transient_mysql(&e) => {
-                    for (_, m) in source.live_members() {
-                        m.metrics.inc_recv_error();
-                        m.metrics.inc_reconnect();
-                    }
-                    reconnect_attempts = reconnect_attempts.saturating_add(1);
-                    log_transient_reconnect(
-                        reconnect_attempts,
+                    note_connection_lost(
+                        &source,
+                        &mut reconnect_attempts,
                         &connection,
                         &e.to_string(),
-                        backoff.next_delay().as_millis(),
+                        &mut backoff,
                     );
                     break 'recv;
                 }
@@ -2180,6 +2200,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                 }
                 Some(EventData::XidEvent(_)) => {
                     txn_open = false;
+                    silence.on_commit();
                     let commit_pos = BinlogPosition::new(current_file.clone(), event_end_pos);
                     deliver_commit(
                         &source,
@@ -2202,6 +2223,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                         }
                         QueryKind::Commit => {
                             txn_open = false;
+                            silence.on_commit();
                             let commit_pos =
                                 BinlogPosition::new(current_file.clone(), event_end_pos);
                             deliver_commit(
@@ -2244,6 +2266,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                             // shared resume never advances past foreign traffic again.
                             txn_open = false;
                             txn.clear();
+                            silence.on_commit();
                         }
                     }
                 }
@@ -2330,7 +2353,11 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
             // publish head/lag metrics and fan a readiness heartbeat here too,
             // throttled to the idle-tick cadence.
             if last_heartbeat_at.elapsed() >= idle_tick {
-                poll_head_and_heartbeat(&source, &mut side_conn, &params).await;
+                crate::cdc::until_shutdown(
+                    shutdown_epoch,
+                    poll_head_and_heartbeat(&source, &mut side_conn, &params),
+                )
+                .await;
                 last_heartbeat_at = Instant::now();
             }
         } // 'recv
@@ -2928,6 +2955,59 @@ async fn persist_all(source: &Arc<SharedSource>, last: &mut HashMap<MemberKey, P
     }
 }
 
+/// Records a lost dump connection; the caller reopens it from the persisted
+/// position.
+fn note_connection_lost(
+    source: &SharedSource,
+    reconnect_attempts: &mut u32,
+    connection: &str,
+    reason: &str,
+    backoff: &mut super::resilience::StreamBackoff,
+) {
+    for (_, m) in source.live_members() {
+        m.metrics.inc_recv_error();
+        m.metrics.inc_reconnect();
+    }
+    *reconnect_attempts = reconnect_attempts.saturating_add(1);
+    log_transient_reconnect(
+        *reconnect_attempts,
+        connection,
+        reason,
+        backoff.next_delay().as_millis(),
+    );
+}
+
+/// Runs `query` on the side connection within [`HEAD_POLL_TIMEOUT`], opening
+/// the connection if needed. On failure, drops the connection and returns
+/// `None`.
+async fn side_query<T, E: std::fmt::Display>(
+    source: &SharedSource,
+    side_conn: &mut Option<Conn>,
+    params: &ReplicationParams,
+    what: &str,
+    query: impl AsyncFnOnce(&mut Conn) -> std::result::Result<T, E>,
+) -> Option<T> {
+    let attempt = async {
+        let conn = match side_conn {
+            Some(conn) => conn,
+            None => side_conn.insert(
+                super::setup::connect(params)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            ),
+        };
+        query(conn).await.map_err(|e| e.to_string())
+    };
+    let error = match tokio::time::timeout(HEAD_POLL_TIMEOUT, attempt).await {
+        Ok(Ok(value)) => return Some(value),
+        Ok(Err(e)) => e,
+        Err(_) => format!("no answer within {}s", HEAD_POLL_TIMEOUT.as_secs()),
+    };
+    tracing::debug!(connection = %source.key.label(), error = %error, "shared {what} failed");
+    *side_conn = None;
+    None
+}
+
 /// Poll the source head over a lazily-maintained side connection, publish the
 /// head/lag metrics to every member, and fan a readiness heartbeat to every
 /// caught-up streaming member. Best-effort — never disturbs replication.
@@ -2939,23 +3019,12 @@ async fn poll_head_and_heartbeat(
     let Some(resume) = source.ack.flush_position() else {
         return;
     };
-    let conn = match side_conn {
-        Some(conn) => conn,
-        None => match Conn::new(params.opts.clone()).await {
-            Ok(conn) => side_conn.insert(conn),
-            Err(e) => {
-                tracing::debug!(connection = %source.key.label(), error = %e, "shared head-poll connect failed");
-                return;
-            }
-        },
-    };
-    let head = match super::setup::fetch_head_position(conn).await {
-        Ok(head) => head,
-        Err(e) => {
-            tracing::debug!(connection = %source.key.label(), error = %e, "shared head poll failed");
-            *side_conn = None;
-            return;
-        }
+    let Some(head) = side_query(source, side_conn, params, "head poll", async |conn| {
+        super::setup::fetch_head_position(conn).await
+    })
+    .await
+    else {
+        return;
     };
     for (_, member) in source.live_members() {
         let lag = (head.file == resume.file).then(|| head.pos.saturating_sub(resume.pos));
@@ -2968,13 +3037,16 @@ async fn poll_head_and_heartbeat(
     if resume < head {
         return;
     }
-    let source_now_ms = match super::setup::fetch_source_now_ms(conn).await {
-        Ok(ms) => ms,
-        Err(e) => {
-            tracing::debug!(connection = %source.key.label(), error = %e, "shared source-clock query failed");
-            *side_conn = None;
-            return;
-        }
+    let Some(source_now_ms) = side_query(
+        source,
+        side_conn,
+        params,
+        "source-clock query",
+        async |conn| super::setup::fetch_source_now_ms(conn).await,
+    )
+    .await
+    else {
+        return;
     };
     for (key, member) in source.live_members() {
         if !source.ack.is_streaming(&key) {

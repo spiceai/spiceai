@@ -1,0 +1,126 @@
+name: mysql-cdc-partition
+duration: 120s
+description: >
+  MySQL CDC resumes after a network partition that closed the runtime's
+  connections, after a relay stalls a dump the source still runs, and after a
+  slow link delivers a row that outlasts the silence limit; every dataset
+  matches the source.
+
+sources:
+  src: { kind: mysql, partitionable: true }
+
+matrix:
+  engine: [cayenne]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mysql-cdc-partition
+  datasets:
+    - from: mysql:busy
+      name: busy
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file, refresh_mode: changes, primary_key: id }
+    - from: mysql:quiet
+      name: quiet
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file, refresh_mode: changes, primary_key: id }
+    - from: mysql:large
+      name: large
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file, refresh_mode: changes, primary_key: id }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE busy (id int PRIMARY KEY, v int);
+        CREATE TABLE quiet (id int PRIMARY KEY, v int);
+        CREATE TABLE large (id int PRIMARY KEY, payload longtext);
+        INSERT INTO busy VALUES (1, 0), (2, 20), (3, 30);
+        INSERT INTO quiet VALUES (1, 10), (2, 20), (3, 30);
+  - start: {}
+  - query: SELECT id, v FROM busy
+    eventually: 60s
+  - query: SELECT id, v FROM quiet
+    eventually: 60s
+
+  - background:
+      id: busy-writer
+      source-exec: { src: "UPDATE busy SET v = ${round} WHERE id = 1" }
+      every: 200ms
+  - source-query: { src: "SELECT count(*) AS recent FROM busy WHERE id = 1 AND v >= 5" }
+    expect: { rows: [['1']] }
+    eventually: 60s
+  - query: SELECT count(*) AS recent FROM busy WHERE id = 1 AND v >= 5
+    eventually: 60s
+
+  - partition-source: src
+  # The dump the kill below must close, so the scenario cannot pass vacuously.
+  - source-query:
+      src: |
+        SELECT count(*) AS dumps FROM information_schema.processlist
+        WHERE db = DATABASE() AND command LIKE 'Binlog Dump%'
+    expect: { rows: [['1']] }
+  - source-exec:
+      src: |
+        DROP PROCEDURE IF EXISTS kill_spiced_connections;
+        DELIMITER //
+        CREATE PROCEDURE kill_spiced_connections()
+        BEGIN
+          DECLARE done boolean DEFAULT false;
+          DECLARE victim_id bigint unsigned;
+          DECLARE victims CURSOR FOR
+            SELECT id
+            FROM information_schema.processlist
+            -- Each instance uses its own database, so it kills only its own
+            -- connections.
+            WHERE id <> CONNECTION_ID()
+              AND db = DATABASE()
+              AND host NOT LIKE '127.0.0.1:%'
+              AND host NOT LIKE 'localhost%';
+          DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = true;
+          OPEN victims;
+          kill_loop: LOOP
+            FETCH victims INTO victim_id;
+            IF done THEN
+              LEAVE kill_loop;
+            END IF;
+            SET @kill_sql = CONCAT('KILL ', victim_id);
+            PREPARE kill_statement FROM @kill_sql;
+            EXECUTE kill_statement;
+            DEALLOCATE PREPARE kill_statement;
+          END LOOP;
+          CLOSE victims;
+        END //
+        DELIMITER ;
+        CALL kill_spiced_connections();
+        DROP PROCEDURE kill_spiced_connections;
+  # Outlast the runtime's 10 s minimum silence limit while writes continue.
+  - sleep: 20s
+  - heal-source: src
+
+  # Only a resumed change stream can bring both tables up to date.
+  - source-exec: { src: "UPDATE quiet SET v = v + 100 WHERE id = 2" }
+  - stop-background: busy-writer
+  - query: SELECT id, v FROM busy
+    eventually: 60s
+  - query: SELECT id, v FROM quiet
+    eventually: 60s
+
+  # The source still runs the stalled dump, so only the silence reveals it.
+  - stall-source: src
+  - source-exec: { src: "UPDATE quiet SET v = v + 100 WHERE id = 3" }
+  - query: SELECT id, v FROM quiet
+    eventually: 60s
+
+  # 20 MiB at 1 MiB/s outlasts the 15 s silence limit but not the doubled one.
+  - throttle-source: { src: 1048576 }
+  - source-exec: { src: "INSERT INTO large VALUES (1, REPEAT('x', 20971520))" }
+  - query: SELECT id, length(payload) AS n FROM large
+    eventually: 120s
+  - unthrottle-source: src
+  - assert-log:
+      contains: ['binlog connection lost; reconnecting.*nothing arrived on the binlog stream']

@@ -43,7 +43,7 @@ limitations under the License.
 //! which the accelerator's PK upsert absorbs idempotently (at-least-once).
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use arrow_tools::schema_evolution::is_widening_cast;
@@ -119,6 +119,84 @@ fn net_write_timeout_left_alone_warning(connection: &str, reason: &str) -> Strin
     )
 }
 
+/// Heartbeat interval requested from the source for an idle dump: half the
+/// checkpoint interval, at least 500ms.
+fn dump_heartbeat_period(checkpoint_interval: Duration) -> Duration {
+    (checkpoint_interval / 2).max(Duration::from_millis(500))
+}
+
+/// How long a dump may receive nothing, not even a heartbeat, before it is
+/// reopened.
+///
+/// A dump client never writes, so if the source closes the connection during a
+/// network partition, or a proxy stops relaying it, the client may never see an
+/// error.
+fn dump_silence_limit(checkpoint_interval: Duration) -> Duration {
+    dump_heartbeat_period(checkpoint_interval)
+        .saturating_mul(3)
+        .max(Duration::from_secs(10))
+}
+
+/// MySQL caps a binlog event at 1 GiB (`max_allowed_packet`,
+/// `replica_max_allowed_packet`), which arrives within this limit on a link
+/// faster than about 4.3 MiB/s.
+const MAX_SILENCE_LIMIT: Duration = Duration::from_secs(240);
+
+/// Decides when a silent dump is reopened.
+///
+/// An event is read only once it arrives whole, so a large one on a slow link
+/// looks like silence. The limit doubles after each reopen that delivered no
+/// commit, and returns to its base on the next commit.
+pub(super) struct DumpSilence {
+    base: Duration,
+    limit: Duration,
+    since: Option<Instant>,
+    committed: bool,
+}
+
+impl DumpSilence {
+    pub(super) fn new(checkpoint_interval: Duration) -> Self {
+        let base = dump_silence_limit(checkpoint_interval);
+        Self {
+            base,
+            limit: base,
+            since: None,
+            committed: false,
+        }
+    }
+
+    pub(super) fn on_open(&mut self) {
+        self.since = None;
+        self.committed = false;
+    }
+
+    pub(super) fn on_event(&mut self) {
+        self.since = None;
+    }
+
+    pub(super) fn on_commit(&mut self) {
+        self.committed = true;
+        self.limit = self.base;
+    }
+
+    /// Records an idle wait that began at `waited_from`. Returns how long the
+    /// dump has been silent once that reaches the limit, doubling the limit
+    /// first if the dump delivered no commit.
+    pub(super) fn expired(&mut self, waited_from: Instant) -> Option<Duration> {
+        let silent_for = self.since.get_or_insert(waited_from).elapsed();
+        if silent_for < self.limit {
+            return None;
+        }
+        if !self.committed {
+            self.limit = self.limit.saturating_mul(2).min(MAX_SILENCE_LIMIT);
+        }
+        Some(silent_for)
+    }
+}
+
+/// Bounds opening the dump, so a reconnect during a partition cannot hang.
+const DUMP_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// One statement issued on the dump connection before `COM_BINLOG_DUMP`.
 struct PreDumpStatement {
     sql: String,
@@ -142,14 +220,10 @@ fn pre_dump_session_statements(
     checkpoint_interval: Duration,
     inherited_net_write_timeout: Option<u32>,
 ) -> Vec<PreDumpStatement> {
-    // Ask the source to send heartbeat events while idle so the stream can
-    // detect dead connections and advance its checkpoint. Half the
-    // checkpoint interval (min 500ms) keeps idle persists within ~1.5×
-    // the interval. The session variable is in nanoseconds; MySQL 8.4
-    // renamed the replica-facing vocabulary, so set both spellings (unknown
-    // user variables are inert).
-    let heartbeat_nanos = (checkpoint_interval / 2)
-        .max(Duration::from_millis(500))
+    // The session variable is in nanoseconds; MySQL 8.4 renamed the
+    // replica-facing vocabulary, so set both spellings (unknown user variables
+    // are inert).
+    let heartbeat_nanos = dump_heartbeat_period(checkpoint_interval)
         .as_nanos()
         .min(u128::from(u64::MAX));
     // Two separate statements: if a server rejects one spelling, the other
@@ -226,6 +300,27 @@ pub(super) async fn inherited_net_write_timeout(
 /// serves every `refresh_mode: changes` dataset on the source, so anything this
 /// function reports is about the connection they share.
 pub(super) async fn open_binlog_stream(
+    params: &ReplicationParams,
+    resume: &BinlogPosition,
+    connection: &str,
+    use_gtid: bool,
+    gtid: &GtidSet,
+) -> std::result::Result<BinlogStream, mysql_async::Error> {
+    let open = open_dump(params, resume, connection, use_gtid, gtid);
+    tokio::time::timeout(DUMP_OPEN_TIMEOUT, open)
+        .await
+        .unwrap_or_else(|_| {
+            // An I/O error, so the open is retried as transient.
+            Err(mysql_async::Error::Io(mysql_async::IoError::Io(
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("no answer within {}s", DUMP_OPEN_TIMEOUT.as_secs()),
+                ),
+            )))
+        })
+}
+
+async fn open_dump(
     params: &ReplicationParams,
     resume: &BinlogPosition,
     connection: &str,
@@ -1583,6 +1678,38 @@ mod tests {
                 "{var} must stay a user variable, in nanoseconds"
             );
         }
+    }
+
+    #[test]
+    fn a_silent_dump_waits_longer_after_each_reopen_without_a_commit() {
+        let ago = |secs| {
+            Instant::now()
+                .checked_sub(Duration::from_secs(secs))
+                .expect("the clock is past five minutes")
+        };
+        // A 10 s checkpoint interval gives a 15 s base limit.
+        let mut silence = DumpSilence::new(Duration::from_secs(10));
+        assert_eq!(silence.expired(ago(14)), None);
+        silence.on_event();
+        assert_eq!(silence.expired(ago(16)).map(|s| s.as_secs()), Some(16));
+        let limits: Vec<u64> = (0..5)
+            .map(|_| {
+                silence.on_open();
+                silence.on_event();
+                silence.expired(ago(300));
+                silence.limit.as_secs()
+            })
+            .collect();
+        assert_eq!(limits, [60, 120, 240, 240, 240]);
+        silence.on_commit();
+        assert_eq!(silence.limit, Duration::from_secs(15));
+        silence.on_event();
+        assert_eq!(silence.expired(ago(16)).map(|s| s.as_secs()), Some(16));
+        assert_eq!(
+            silence.limit,
+            Duration::from_secs(15),
+            "a dump that committed keeps its limit"
+        );
     }
 
     #[test]

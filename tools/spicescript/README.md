@@ -219,6 +219,13 @@ as changing the script.
 | `docker` | Any image: `image`, `ports`, `env` (`${port.N}` is the host port of container port N), `command`, and `ready` (a shell command that succeeds once the container is ready). `source-exec` runs a shell command inside it and `source-query` returns the lines it prints. `host-network: true` lets the container reach `spiced` and the other sources on the host: on Linux it shares the host's network, elsewhere Docker routes to the host, and `${sources.<name>.host_from_container}` is the host's address from inside the container either way. Useful for services such as Debezium Server. |
 | `mock-http` | An HTTP server whose routes the script sets with `source-exec`: `path`, and optionally `method`, `query`, `headers-match`, `status`, `headers`, `body`, `delay-ms`, `times`, `repeat` (the body is `body` that many times over, with any `{i}` in it replaced by each copy's index, so the copies differ as real records do) and `encoding: gzip` or `encoding: zstd` (the body is sent compressed, gzip at its best level or zstd at level 3, with `Content-Encoding`, for a response small on the wire that decodes to many times its size); `reset` removes them all. `source-query` reads what it received: `count <path>`, `log <path>`, `header <path> <name>`. |
 
+`partitionable: true` on a `mysql` source puts only `spiced`'s connector path through an in-process TCP proxy; harness traffic remains direct.
+During a partition, the proxy holds bytes in both directions, delays new upstream connections, and loses a source close.
+After healing, a client that writes on a connection the source closed gets a TCP RST; a client that does not write stays connected and silent.
+The proxy terminates the client TCP connection, so it answers keepalive probes and keepalive cannot detect the lost source close.
+It does not model TCP retransmission or backpressure; it holds up to 1 MiB per direction, then stops reading that side until healing.
+`stall-source` stops relaying on every open connection for the rest of the run, like a relay that keeps the source side alive but stops delivering; new connections relay normally. `throttle-source` caps the rate of bytes from the source to `spiced`.
+
 **DuckDB releases.** `spiced` reads `duckdb:` and `ducklake:` through the
 DuckDB library installed on the host, so each `duckdb` or `ducklake` source
 writes its data and checks answers with the `duckdb` CLI of one release and
@@ -310,6 +317,8 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `wait-ready: { timeout }` | Wait for `/v1/ready`. |
 | `edit-spicepod: <patch>` | Rewrite the running instance's spicepod (for `--pods-watcher-enabled`). |
 | `start-source`, `stop-source`, `pause-source`, `unpause-source: <name>` | Control a source container; it keeps its host port across a stop. |
+| `partition-source`, `heal-source: <name>` | Partition or restore a `partitionable` source's connector path; see the MySQL source description above. |
+| `stall-source: <name>`, `throttle-source: { <name>: <bytes per second> }`, `unthrottle-source: <name>` | Stall the open connections, or cap or uncap the bandwidth, of a `partitionable` source's connector path. |
 | `source-exec: { <name>: <sql, list, or { file }> }` | Run statements on a source, in this instance's database. On an object store (`rustfs`), one command per line in the instance's bucket: `delete-first <prefix> <contains>` and `truncate-first <prefix> <contains>` delete, or keep the first half of, the first key in key order under the prefix that contains the text; `copy <from-prefix> <to-prefix>` copies every object under a prefix, and `delete-prefix <prefix>` deletes them. |
 | `write: { <source>: <sql or list> }` | Execute PostgreSQL DML on the required `mirror: <postgres source>` and apply its row images to the target. `key: <column>` defaults to `id`. |
 | `source-query: { <name>: <sql> }` | Ask a source directly and check `expect: { rows }`. |

@@ -24,7 +24,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::Value;
 
 use crate::reap::PID_FILE;
-use crate::script::{Action, KillSignal, LoadEnd, Script, Step, Tier};
+use crate::script::{Action, KillSignal, LoadEnd, ProxyFault, Script, Step, Tier};
 use crate::spiced::Spiced;
 use crate::{compare, template};
 
@@ -71,6 +71,13 @@ pub(super) fn describe(action: &Action) -> String {
         Action::StopSource(s) => format!("stop-source {s}"),
         Action::PauseSource(s) => format!("pause-source {s}"),
         Action::UnpauseSource(s) => format!("unpause-source {s}"),
+        Action::ProxyFault { source, fault } => match fault {
+            ProxyFault::Partition => format!("partition-source {source}"),
+            ProxyFault::Heal => format!("heal-source {source}"),
+            ProxyFault::Stall => format!("stall-source {source}"),
+            ProxyFault::Throttle(rate) => format!("throttle-source {source}: {rate} B/s"),
+            ProxyFault::Unthrottle => format!("unthrottle-source {source}"),
+        },
         Action::Write { source, sql, .. } => {
             format!("write {source}: {}", one_line(&sql.join("; "), 70))
         }
@@ -251,6 +258,7 @@ pub(super) async fn run_source_step(action: &Action, sources: &mut Sources) -> R
         }
         Action::StopSource(name) => sources.set(name, SourceState::Stopped).await,
         Action::PauseSource(name) => sources.set(name, SourceState::Paused).await,
+        Action::ProxyFault { source, fault } => sources.inject_fault(source, *fault),
         Action::Sleep(d) => {
             tokio::time::sleep(*d).await;
             Ok(())
@@ -978,6 +986,7 @@ async fn run_step(
         | Action::StopSource(_)
         | Action::PauseSource(_)
         | Action::UnpauseSource(_)
+        | Action::ProxyFault { .. }
         | Action::Sleep(_) => unreachable!("source steps run once, not per instance"),
     }
     Ok(format!(" ({:.1}s)", started.elapsed().as_secs_f64()))

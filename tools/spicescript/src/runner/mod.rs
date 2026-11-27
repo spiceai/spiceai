@@ -42,7 +42,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     compare,
     script::{
-        Action, RunVariants, Script, SidecarSpec, Step, Tier, Timing, VariantSpec,
+        Action, ProxyFault, RunVariants, Script, SidecarSpec, Step, Tier, Timing, VariantSpec,
         matrix_combinations,
     },
     source::{self, Source},
@@ -322,6 +322,7 @@ fn schedule(script: &Script, steps: &[Step]) -> Schedule {
                     | Action::StopSource(_)
                     | Action::PauseSource(_)
                     | Action::UnpauseSource(_)
+                    | Action::ProxyFault { .. }
             )
         })
     {
@@ -658,6 +659,14 @@ impl Sources {
             _ => unreachable!("every pair of states is handled"),
         }
         self.state.insert(name.to_string(), target);
+        Ok(())
+    }
+
+    fn inject_fault(&self, name: &str, fault: ProxyFault) -> Result<()> {
+        ensure!(
+            self.get(name)?.inject_fault(fault),
+            "source '{name}' is not partitionable"
+        );
         Ok(())
     }
 }
@@ -1495,6 +1504,7 @@ fn is_source_step(action: &Action) -> bool {
             | Action::StopSource(_)
             | Action::PauseSource(_)
             | Action::UnpauseSource(_)
+            | Action::ProxyFault { .. }
             | Action::Sleep(_)
     )
 }
