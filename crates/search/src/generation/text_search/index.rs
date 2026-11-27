@@ -2701,6 +2701,128 @@ mod tests {
         );
     }
 
+    /// `text_search` / `/v1/search` query strings that use `AND NOT` must return the same
+    /// documents as the equivalent `-` form. Regression test for the documented query
+    /// syntax (`title:(spice OR runtime) AND NOT draft`) matching nothing.
+    #[tokio::test]
+    async fn and_not_matches_the_minus_form() {
+        let batch = record_batch!(
+            ("id", Int32, [1, 2, 3, 4, 5, 6]),
+            (
+                "title",
+                Utf8,
+                [
+                    "spice runtime",
+                    "spice draft",
+                    "runtime notes",
+                    "draft only",
+                    "other",
+                    "spice"
+                ]
+            ),
+            (
+                "comment",
+                Utf8,
+                [
+                    "dolphins play",
+                    "dolphins furiously",
+                    "pearls and dolphins",
+                    "pearls furiously",
+                    "only pearls",
+                    "furiously alone"
+                ]
+            )
+        )
+        .expect("Failed to create test batch");
+
+        let index = FullTextDatabaseIndex::try_new(
+            Arc::new(
+                MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
+                    .expect("Failed to create test table"),
+            ),
+            vec!["title".to_string(), "comment".to_string()],
+            Some(vec!["id".to_string()]),
+            None,
+            &["title".to_string(), "comment".to_string()],
+            false,
+        )
+        .expect("Failed to create FullTextDatabaseIndex");
+        index
+            .compute_index(vec![batch])
+            .await
+            .expect("failed to compute_index");
+
+        let and_not = search_ids_on(&index, "comment", "dolphins AND NOT furiously").await;
+        let minus = search_ids_on(&index, "comment", "dolphins -furiously").await;
+        let and_minus = search_ids_on(&index, "comment", "dolphins AND -furiously").await;
+        let not_word = search_ids_on(&index, "comment", "dolphins NOT furiously").await;
+        let paren = search_ids_on(&index, "comment", "dolphins AND (NOT furiously)").await;
+        assert_eq!(and_not, minus, "AND NOT must match the '-' form");
+        assert_eq!(and_not, and_minus, "AND NOT must match AND -");
+        assert_eq!(and_not, not_word, "AND NOT must match NOT without AND");
+        assert_eq!(and_not, paren, "AND NOT must match AND (NOT …)");
+        assert_eq!(and_not, vec![1, 3]);
+
+        let grouped_and_not = search_ids_on(
+            &index,
+            "comment",
+            "comment:(dolphins OR pearls) AND NOT furiously",
+        )
+        .await;
+        let grouped_minus =
+            search_ids_on(&index, "comment", "comment:(dolphins OR pearls) -furiously").await;
+        assert_eq!(
+            grouped_and_not, grouped_minus,
+            "field-grouped AND NOT must match the '-' form"
+        );
+        assert_eq!(grouped_and_not, vec![1, 3, 5]);
+
+        let doc_and_not =
+            search_ids_on(&index, "title", "title:(spice OR runtime) AND NOT draft").await;
+        let doc_minus = search_ids_on(&index, "title", "title:(spice OR runtime) -draft").await;
+        assert_eq!(
+            doc_and_not, doc_minus,
+            "the documented title:(a OR b) AND NOT c form must match the '-' form"
+        );
+        assert_eq!(doc_and_not, vec![1, 3, 6]);
+
+        assert_eq!(
+            search_ids_on(&index, "comment", "NOT furiously").await,
+            vec![1, 3, 5],
+            "a leading NOT matches every document except the term"
+        );
+    }
+
+    async fn search_ids_on(index: &FullTextDatabaseIndex, field: &str, query: &str) -> Vec<i32> {
+        index.reader.reload().expect("failed to reload the reader");
+        let search_index = index
+            .full_text_search_field_index(field)
+            .expect("Failed to create FullTextSearchFieldIndex");
+        let batches: Vec<RecordBatch> = search_index
+            .search(query.to_string(), vec![], 1000)
+            .expect("Failed to search")
+            .try_collect()
+            .await
+            .expect("Failed to collect search results");
+
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .expect("results carry the id column")
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int32Array>()
+                    .expect("id is Int32")
+                    .iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     // Regression test for #12274: an index created before the runtime changed the tokenizer it
     // configures still answers queries consistently with what it indexed, so it must keep
     // loading rather than fail the dataset on upgrade.
