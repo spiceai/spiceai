@@ -4082,10 +4082,10 @@ impl DataFusion {
                     DataFusionError::External(Box::new(EngineInitialization { source }))
                 })?;
                 // `file_create` recreated the acceleration empty during init. The dataset
-                // checkpoint and append cursor describe the table it replaced: left in
-                // place, a full refresh finds the checkpoint and skips the initial load,
-                // and the dataset serves no rows. A snapshot it bootstrapped from carries
-                // its own state, so that is kept.
+                // checkpoint, append cursor and source positions describe the table it
+                // replaced: left in place, a full refresh finds the checkpoint and skips the
+                // initial load, and a CDC source resumes past every row the table lost. A
+                // snapshot it bootstrapped from carries its own state, so that is kept.
                 if dataset.acceleration.as_ref().is_some_and(|acceleration| {
                     acceleration.mode == crate::component::dataset::acceleration::Mode::FileCreate
                 }) && matches!(status, BootstrapStatus::None)
@@ -8666,9 +8666,11 @@ mod installation_tests;
 #[cfg(test)]
 mod integer_overflow;
 
-/// Clears `source`'s dataset checkpoint and append cursor after its acceleration was
-/// recreated empty, as [`DataFusion::rebuild_acceleration`] does for a settings
-/// rebuild, so the refresh loads it as on a first start.
+/// Clears `source`'s dataset checkpoint, append cursor and source positions after
+/// its acceleration was recreated empty, so the refresh loads it as on a first start.
+///
+/// It must run before the data connector is built: a connector can read its positions
+/// when it is built, and one built earlier would keep using the positions this removes.
 async fn clear_recreated_acceleration_state(
     source: &dyn AccelerationSource,
     registry: Arc<AcceleratorEngineRegistry>,
@@ -8686,11 +8688,17 @@ async fn clear_recreated_acceleration_state(
     }
     crate::dataaccelerator::spice_sys::append_cursor_store_for(
         source,
-        registry,
+        Arc::clone(&registry),
         OpenOption::OpenExisting,
     )
     .await
     .clear()
+    .await?;
+    crate::dataaccelerator::spice_sys::clear_source_positions(
+        source,
+        registry,
+        OpenOption::OpenExisting,
+    )
     .await?;
     Ok(())
 }
@@ -8716,6 +8724,75 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Acceleration mode `append` requires `time_column` parameter for source https://api.example.com/rows.csv?api_key=***. Configure `time_column` parameter and try again. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#time_column"
+        );
+    }
+
+    /// `mode: file_create` recreates the table empty, so the positions its connector
+    /// resumed from are gone before the connector is built.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recreated_acceleration_keeps_no_source_positions() {
+        use runtime_acceleration::{
+            Engine,
+            acceleration::{Acceleration, Mode},
+            sidecar::OpenOption,
+            testing::TestAccelerationSource,
+        };
+        use runtime_checkpoint_api::kafka::{KafkaCheckpoint, KafkaOffset};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let source = TestAccelerationSource::new("events").with_acceleration(Acceleration {
+            enabled: true,
+            engine: Engine::Cayenne,
+            mode: Mode::FileCreate,
+            params: [
+                (
+                    "cayenne_file_path".to_string(),
+                    root.path().join("data").to_string_lossy().into_owned(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    root.path().join("metadata").to_string_lossy().into_owned(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+        let runtime = RuntimeBuilder::new().build().await;
+        let registry = runtime.accelerator_engine_registry();
+        let accelerator = registry
+            .get_accelerator_engine(Engine::Cayenne)
+            .await
+            .expect("this build links the Cayenne engine");
+        accelerator.init(&source).await.expect("init");
+        // The offsets the connector of the dropped table recorded.
+        let kafka = accelerator
+            .sidecar(&source, OpenOption::CreateIfNotExists)
+            .await
+            .expect("sidecar")
+            .kafka_checkpoint_store()
+            .expect("kafka store");
+        kafka
+            .upsert(&KafkaCheckpoint {
+                consumer_group_id: "group-1".to_string(),
+                topic: "events".to_string(),
+                schema_json: "{}".to_string(),
+                offsets: vec![KafkaOffset {
+                    topic: "events".to_string(),
+                    partition: 0,
+                    offset: 999,
+                }],
+            })
+            .await
+            .expect("kafka checkpoint");
+
+        clear_recreated_acceleration_state(&source, registry)
+            .await
+            .expect("clear");
+
+        assert!(
+            kafka.get().await.expect("kafka get").is_none(),
+            "the Kafka offsets of the dropped table must not reach the new connector"
         );
     }
 

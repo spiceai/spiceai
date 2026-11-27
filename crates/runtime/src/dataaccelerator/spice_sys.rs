@@ -164,6 +164,32 @@ pub async fn append_cursor_store_for(
     }
 }
 
+/// Clears the source positions `source` has in its sidecar, for a table recreated
+/// empty. A sidecar that does not exist has none.
+///
+/// # Errors
+///
+/// Returns [`CheckpointError::Store`] when the sidecar fails to clear them.
+pub async fn clear_source_positions(
+    source: &dyn AccelerationSource,
+    registry: Arc<AcceleratorEngineRegistry>,
+    open_option: OpenOption,
+) -> Result<(), CheckpointError> {
+    if !source.is_file_accelerated() {
+        return Ok(());
+    }
+    match sidecar_for(source, registry, open_option).await {
+        Ok(sidecar) => sidecar.clear_source_positions().await,
+        Err(e) => {
+            tracing::debug!(
+                "Dataset '{}' has no sidecar with source positions to clear ({e})",
+                source.name()
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Construct the **Kafka** checkpoint store over this dataset's accelerator.
 ///
 /// Unlike [`checkpoint_store`] this reports a resolution failure as an error: the Kafka

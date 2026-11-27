@@ -51,8 +51,8 @@ use rusqlite::OptionalExtension;
 
 use crate::{downcast_failed, store_error};
 
-const KAFKA_TABLE_NAME: &str = "spice_sys_kafka";
-const KAFKA_OFFSETS_TABLE_NAME: &str = "spice_sys_kafka_offsets";
+pub(crate) const KAFKA_TABLE_NAME: &str = "spice_sys_kafka";
+pub(crate) const KAFKA_OFFSETS_TABLE_NAME: &str = "spice_sys_kafka_offsets";
 
 /// Kafka checkpoint store backed by a `SQLite` accelerator.
 pub struct SqliteKafkaCheckpointStore {
@@ -211,7 +211,7 @@ impl KafkaCheckpointStore for SqliteKafkaCheckpointStore {
     }
 }
 
-fn ensure_kafka_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+pub(crate) fn ensure_kafka_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     let create_metadata = format!(
         "CREATE TABLE IF NOT EXISTS {KAFKA_TABLE_NAME} (
             dataset_name TEXT PRIMARY KEY,

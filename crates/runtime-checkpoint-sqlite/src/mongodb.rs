@@ -40,7 +40,7 @@ use runtime_checkpoint_api::{
 
 use crate::{downcast_failed, store_error};
 
-const MONGODB_TABLE_NAME: &str = "spice_sys_mongodb";
+pub(crate) const MONGODB_TABLE_NAME: &str = "spice_sys_mongodb";
 
 /// `MongoDB` resume-token store backed by a `SQLite` accelerator.
 pub struct SqliteMongoCheckpointStore {

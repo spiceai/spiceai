@@ -415,6 +415,28 @@ pub fn rebuild_cause(
     }
 }
 
+/// Whether a missing watermark is a gap: the `absence_implies_gap` argument of
+/// [`rebuild_cause`].
+///
+/// An ephemeral acceleration records no position and starts empty, so its snapshot
+/// is a full load. One that starts with rows anyway — a `mode: file_create` Cayenne
+/// table restored from an acceleration snapshot — holds rows its snapshot's upserts
+/// would keep even where the source deleted them, so unless it is observed empty it
+/// is rebuilt.
+#[must_use]
+pub fn absence_implies_gap(
+    ephemeral_accelerator: bool,
+    tracks_positions: bool,
+    load_runs_without_rebuild: bool,
+    acceleration: AccelerationContents,
+) -> bool {
+    if ephemeral_accelerator {
+        !acceleration.is_provably_empty()
+    } else {
+        tracks_positions && !load_runs_without_rebuild
+    }
+}
+
 /// Why an acceleration was rebuilt from the source rather than resumed.
 ///
 /// The causes are genuinely different situations calling for different
@@ -988,10 +1010,40 @@ pub(crate) fn err_to_stream(err: Error) -> StreamError {
 mod tests {
     use super::{
         AccelerationContents, AppliedLsn, CONNECTOR_DOCS, CreationCause, CreationInputs,
-        RebuildCause, RecordedPosition, SourceReadPolicy, UnusableReason, creation_cause,
-        creation_log_message, rebuild_cause, rebuild_log_message,
+        RebuildCause, RecordedPosition, SourceReadPolicy, UnusableReason, absence_implies_gap,
+        creation_cause, creation_log_message, rebuild_cause, rebuild_log_message,
         recorded_position_is_ahead_of_source,
     };
+
+    /// An ephemeral acceleration (`mode: file_create` Cayenne) restored from an
+    /// acceleration snapshot starts with rows. Its snapshot only upserts, so a row
+    /// the source deleted while Spice was down would stay: it is rebuilt instead.
+    #[test]
+    fn an_ephemeral_acceleration_that_starts_with_rows_is_rebuilt() {
+        let cause = |contents| {
+            rebuild_cause(
+                &RecordedPosition::Absent,
+                Some(0),
+                0,
+                absence_implies_gap(true, false, false, contents),
+                None,
+            )
+        };
+        assert_eq!(
+            cause(AccelerationContents::NonEmpty),
+            Some(RebuildCause::NoRecord)
+        );
+        assert_eq!(
+            cause(AccelerationContents::Unknown),
+            Some(RebuildCause::NoRecord),
+            "a probe that could not answer does not prove the acceleration empty"
+        );
+        assert_eq!(
+            cause(AccelerationContents::Empty),
+            None,
+            "an empty ephemeral acceleration loads through its snapshot"
+        );
+    }
 
     /// A slot that reaches everything, so a case varies only what it is about.
     ///

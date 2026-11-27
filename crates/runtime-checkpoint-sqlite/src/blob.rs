@@ -50,7 +50,7 @@ impl SqliteBlobCheckpointStore {
         }
     }
 
-    fn create_table_sql(table: &str) -> String {
+    pub(crate) fn create_table_sql(table: &str) -> String {
         format!(
             "CREATE TABLE IF NOT EXISTS {table} (
                 dataset_name TEXT PRIMARY KEY,

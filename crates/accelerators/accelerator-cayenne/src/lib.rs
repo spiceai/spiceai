@@ -4308,11 +4308,17 @@ impl DataAccelerator for CayenneAccelerator {
             if refuses_datalake_bootstrap(acceleration, source) {
                 return Ok(BootstrapStatus::none());
             }
-            let snapshot_engine = Arc::new(crate::snapshot_engine::CayenneSnapshotEngine::new(
-                catalog,
-                source.name().to_string(),
-                path_buf.clone(),
-            ));
+            let snapshot_engine = Arc::new(
+                self.with_position_sidecar(
+                    crate::snapshot_engine::CayenneSnapshotEngine::new(
+                        catalog,
+                        source.name().to_string(),
+                        path_buf.clone(),
+                    ),
+                    source,
+                )
+                .await,
+            );
 
             Ok(download_snapshot(
                 acceleration,
@@ -4753,14 +4759,13 @@ impl DataAccelerator for CayenneAccelerator {
                 return None;
             }
         };
-        Some(Arc::new(
-            crate::snapshot_engine::CayenneSnapshotEngine::new(
-                catalog,
-                source.name().to_string(),
-                PathBuf::from(dir_path),
-            )
-            .with_serving_providers(Arc::clone(&self.serving_snapshot_providers)),
-        ))
+        let engine = crate::snapshot_engine::CayenneSnapshotEngine::new(
+            catalog,
+            source.name().to_string(),
+            PathBuf::from(dir_path),
+        )
+        .with_serving_providers(Arc::clone(&self.serving_snapshot_providers));
+        Some(Arc::new(self.with_position_sidecar(engine, source).await))
     }
 
     /// Reloads the Cayenne-backed table provider from the snapshot directory
@@ -5366,6 +5371,28 @@ fn setting_under_vnext_refusal(dataset: &str, setting: UnsupportedSetting) -> St
 }
 
 impl CayenneAccelerator {
+    /// `engine`, carrying the dataset's source positions with its snapshots. Without
+    /// its sidecar a snapshot carries none, and a restore clears none.
+    async fn with_position_sidecar(
+        &self,
+        engine: crate::snapshot_engine::CayenneSnapshotEngine,
+        source: &dyn AccelerationSource,
+    ) -> crate::snapshot_engine::CayenneSnapshotEngine {
+        match self
+            .open_checkpoint_sidecar(source, OpenOption::CreateIfNotExists)
+            .await
+        {
+            Ok(sidecar) => engine.with_sidecar(sidecar),
+            Err(err) => {
+                tracing::warn!(
+                    "Snapshots of dataset '{}' do not carry its source positions, because its sidecar did not open: {err}",
+                    source.name()
+                );
+                engine
+            }
+        }
+    }
+
     /// Refuses a file-mode dataset whose own data would be in an object store (an
     /// `s3://` `cayenne_file_path`, S3 Express included, or `cayenne_s3_zone_ids`)
     /// unless `runtime.params.cayenne_vnext` is enabled, where that path stays

@@ -41,7 +41,7 @@ use runtime_checkpoint_api::CheckpointError;
 
 use crate::{downcast_failed, store_error};
 
-const CHECKPOINT_TABLE_NAME: &str = "spice_sys_dataset_checkpoint";
+pub(crate) const CHECKPOINT_TABLE_NAME: &str = "spice_sys_dataset_checkpoint";
 
 /// Dataset schema/refresh-SQL checkpoint backed by a `SQLite` accelerator.
 pub struct SqliteDatasetCheckpointer {

@@ -29,7 +29,7 @@ use runtime_checkpoint_api::{
 
 use crate::{downcast_failed, store_error};
 
-const MYSQL_BINLOG_TABLE_NAME: &str = "spice_sys_mysql_binlog";
+pub(crate) const MYSQL_BINLOG_TABLE_NAME: &str = "spice_sys_mysql_binlog";
 
 /// Idempotent migration adding the columns that postdate the initial schema.
 /// `SQLite`'s `ALTER TABLE ADD COLUMN` has no `IF NOT EXISTS`, so a duplicate

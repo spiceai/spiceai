@@ -17979,6 +17979,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "uuid 1.23.2",
 ]
 
 [[package]]

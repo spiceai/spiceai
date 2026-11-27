@@ -27,9 +27,11 @@ limitations under the License.
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::sqliteconn::SqliteConnection;
 use datafusion_table_providers::sql::db_connection_pool::sqlitepool::SqliteConnectionPool;
 use runtime_acceleration::{
-    dataset_checkpoint::DatasetCheckpointer, sidecar::AcceleratorSidecar,
+    dataset_checkpoint::DatasetCheckpointer,
+    sidecar::{AcceleratorSidecar, SourcePositions},
     snapshot::SnapshotBehavior,
 };
 use runtime_checkpoint_api::{
@@ -43,6 +45,7 @@ mod debezium;
 mod kafka;
 mod mongodb;
 mod mysql_binlog;
+mod positions;
 #[cfg(test)]
 mod test_support;
 
@@ -138,5 +141,47 @@ impl AcceleratorSidecar for SqliteSidecar {
             SqliteDatasetCheckpointer::try_new(Arc::clone(&self.pool), self.dataset_name.clone())
                 .await?,
         ))
+    }
+
+    async fn clear_source_positions(&self) -> Result<(), CheckpointError> {
+        let dataset_name = self.dataset_name.clone();
+        let conn_sync = self.pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err(downcast_failed());
+        };
+        conn.conn
+            .call(move |conn| positions::clear(conn, &dataset_name))
+            .await
+            .map_err(store_error)
+    }
+
+    async fn export_source_positions(&self) -> Result<Option<SourcePositions>, CheckpointError> {
+        let dataset_name = self.dataset_name.clone();
+        let conn_sync = self.pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err(downcast_failed());
+        };
+        conn.conn
+            .call(move |conn| positions::export(conn, &dataset_name))
+            .await
+            .map(Some)
+            .map_err(store_error)
+    }
+
+    async fn import_source_positions(
+        &self,
+        positions: Option<&SourcePositions>,
+    ) -> Result<(), CheckpointError> {
+        let dataset_name = self.dataset_name.clone();
+        let positions = positions.cloned();
+        let conn_sync = self.pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err(downcast_failed());
+        };
+        conn.conn
+            .call(move |conn| positions::import(conn, &dataset_name, positions.as_ref()))
+            .await
+            .map_err(store_error)?
+            .map_err(store_error)
     }
 }

@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use cayenne::metastore::object_native::ObjectNativeCatalog;
 use runtime_acceleration::{
     dataset_checkpoint::{DatasetCheckpointer, deserialize_schema, serialize_schema},
-    sidecar::AcceleratorSidecar,
+    sidecar::{AcceleratorSidecar, SourcePositions},
     snapshot::SnapshotBehavior,
 };
 use runtime_checkpoint_api::{
@@ -210,6 +210,26 @@ impl AcceleratorSidecar for NativeSidecar {
         Ok(Arc::new(NativeDatasetCheckpointer(
             self.values(DATASET_CHECKPOINT),
         )))
+    }
+
+    /// Clears nothing: the native catalog keeps Kafka offsets as counters that only
+    /// move up, so a cleared position would come back with the next write.
+    async fn clear_source_positions(&self) -> Result<(), CheckpointError> {
+        Ok(())
+    }
+
+    /// Snapshots are not supported under the native catalog.
+    async fn export_source_positions(&self) -> Result<Option<SourcePositions>, CheckpointError> {
+        Ok(None)
+    }
+
+    async fn import_source_positions(
+        &self,
+        _positions: Option<&SourcePositions>,
+    ) -> Result<(), CheckpointError> {
+        Err(store_error(
+            "the object-native Cayenne metastore does not restore snapshots",
+        ))
     }
 }
 

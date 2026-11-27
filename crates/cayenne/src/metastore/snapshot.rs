@@ -213,6 +213,11 @@ pub struct DatasetMetastoreSlice {
     /// Map of metastore table name -> rows. Each row is positional;
     /// column order must match the corresponding [`EXPECTED_TABLES`] entry.
     pub tables: BTreeMap<String, Vec<SliceRow>>,
+    /// The dataset's source positions, read with its rows: what its connector
+    /// resumes from. Opaque to the metastore. Absent from a slice whose writer did
+    /// not carry them, which a reader older than the field ignores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_positions: Option<serde_json::Value>,
 }
 
 impl DatasetMetastoreSlice {
@@ -522,6 +527,7 @@ pub async fn export_dataset(
 
     let mut slice = DatasetMetastoreSlice {
         format_version: SLICE_FORMAT_VERSION,
+        source_positions: None,
         engine: SLICE_ENGINE.to_string(),
         dataset_name: dataset_name.to_string(),
         exported_at_ms: chrono::Utc::now().timestamp_millis(),
@@ -1658,6 +1664,7 @@ mod tests {
         );
         let slice = DatasetMetastoreSlice {
             format_version: SLICE_FORMAT_VERSION_FULL_CLEANUP,
+            source_positions: None,
             engine: SLICE_ENGINE.to_string(),
             dataset_name: "trips".to_string(),
             exported_at_ms: 0,
@@ -1786,6 +1793,7 @@ mod tests {
         );
         let replace_slice = DatasetMetastoreSlice {
             format_version: SLICE_FORMAT_VERSION,
+            source_positions: None,
             engine: SLICE_ENGINE.to_string(),
             dataset_name: "ds".to_string(),
             exported_at_ms: 0,
@@ -1817,6 +1825,7 @@ mod tests {
         let (ms, tmp) = fresh_metastore().await;
         let mut slice = DatasetMetastoreSlice {
             format_version: 99,
+            source_positions: None,
             engine: SLICE_ENGINE.to_string(),
             dataset_name: "trips".to_string(),
             exported_at_ms: 0,
@@ -2084,6 +2093,7 @@ mod tests {
         );
         let slice = DatasetMetastoreSlice {
             format_version: SLICE_FORMAT_VERSION,
+            source_positions: None,
             engine: SLICE_ENGINE.to_string(),
             dataset_name: "events".to_string(),
             exported_at_ms: 0,
@@ -2132,6 +2142,7 @@ mod tests {
         tables.insert("cayenne_partition".to_string(), vec![partition]);
         let slice = DatasetMetastoreSlice {
             format_version: SLICE_FORMAT_VERSION,
+            source_positions: None,
             engine: SLICE_ENGINE.to_string(),
             dataset_name: "events".to_string(),
             exported_at_ms: 0,
@@ -2233,6 +2244,7 @@ mod tests {
         );
         let slice = DatasetMetastoreSlice {
             format_version: SLICE_FORMAT_VERSION,
+            source_positions: None,
             engine: SLICE_ENGINE.to_string(),
             dataset_name: "events".to_string(),
             exported_at_ms: 0,
@@ -2376,6 +2388,7 @@ mod tests {
         );
         let slice = DatasetMetastoreSlice {
             format_version: SLICE_FORMAT_VERSION,
+            source_positions: None,
             engine: SLICE_ENGINE.to_string(),
             dataset_name: "events".to_string(),
             exported_at_ms: 0,
@@ -2625,6 +2638,7 @@ mod tests {
         tables.insert("cayenne_partition".to_string(), vec![]);
         let slice = DatasetMetastoreSlice {
             format_version: SLICE_FORMAT_VERSION,
+            source_positions: None,
             engine: SLICE_ENGINE.to_string(),
             dataset_name: "events".to_string(),
             exported_at_ms: 0,
@@ -2900,6 +2914,7 @@ mod tests {
             // tolerated that error would pass without ever reaching the
             // resolution it is about.
             format_version: SLICE_FORMAT_VERSION_FULL_CLEANUP,
+            source_positions: None,
             engine: SLICE_ENGINE.to_string(),
             dataset_name: "events".to_string(),
             exported_at_ms: 0,
@@ -2971,6 +2986,7 @@ mod tests {
             // guard refuses it before any of this is reached, and the
             // assertion below would pass for the wrong reason.
             format_version: SLICE_FORMAT_VERSION_FULL_CLEANUP,
+            source_positions: None,
             engine: SLICE_ENGINE.to_string(),
             dataset_name: "events".to_string(),
             exported_at_ms: 0,
@@ -3039,6 +3055,7 @@ mod tests {
             );
             let slice = DatasetMetastoreSlice {
                 format_version: SLICE_FORMAT_VERSION_FULL_CLEANUP,
+                source_positions: None,
                 engine: SLICE_ENGINE.to_string(),
                 dataset_name: "events".to_string(),
                 exported_at_ms: 0,
@@ -3107,6 +3124,7 @@ mod tests {
         );
         let slice = DatasetMetastoreSlice {
             format_version: SLICE_FORMAT_VERSION_FULL_CLEANUP,
+            source_positions: None,
             engine: SLICE_ENGINE.to_string(),
             dataset_name: "events".to_string(),
             exported_at_ms: 0,
