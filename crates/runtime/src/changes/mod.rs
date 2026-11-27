@@ -177,6 +177,10 @@ fn rows_whose_key_ends_absent(
     last_truncate: Option<usize>,
     pk: &[String],
 ) -> Result<Vec<usize>, ArrowError> {
+    // A batch without key columns gives no key to remove a row before a truncate by.
+    if pk.is_empty() {
+        return Ok(delete_rows.to_vec());
+    }
     let truncated_upserts = upsert_rows
         .iter()
         .copied()
@@ -705,6 +709,12 @@ mod tests {
 
     /// A change batch keyed on `id`, one row per `(op, id, name)`.
     fn keyed_change_envelope(rows: &[(&str, i32, &str)]) -> ChangeEnvelope {
+        change_envelope(rows, &["id"])
+    }
+
+    /// A change batch whose rows carry `primary_key` as their key list, one row per
+    /// `(op, id, name)`.
+    fn change_envelope(rows: &[(&str, i32, &str)], primary_key: &[&str]) -> ChangeEnvelope {
         use arrow::array::{ArrayRef, ListBuilder, StringBuilder, StructArray};
 
         let table = Schema::new(vec![
@@ -728,7 +738,9 @@ mod tests {
         let mut primary_keys = ListBuilder::new(StringBuilder::new())
             .with_field(Arc::new(Field::new("item", DataType::Utf8, false)));
         for _ in rows {
-            primary_keys.values().append_value("id");
+            for column in primary_key {
+                primary_keys.values().append_value(column);
+            }
             primary_keys.append(true);
         }
         let record = RecordBatch::try_new(
@@ -801,5 +813,26 @@ mod tests {
             vec![("truncate", 0), ("index", 1), ("index", 2), ("delete", 1)],
             "id 1 was written before the truncate, so it must leave the index"
         );
+    }
+
+    #[tokio::test]
+    async fn a_keyless_batch_with_a_row_before_a_truncate_indexes() {
+        // A source table without a primary key sends an empty key list.
+        let envelope =
+            change_envelope(&[("c", 1, "osprey"), ("t", 0, ""), ("c", 2, "condor")], &[]);
+        let index = Arc::new(RecordingIndex::default());
+        let table = SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(vec![
+                Arc::clone(&index) as Arc<dyn Index + Send + Sync>
+            ])),
+            Arc::new(MockTableProvider),
+        );
+
+        index_change_envelope(Ok(envelope), Arc::new(table.into()))
+            .await
+            .expect("a keyless change batch still indexes");
+
+        let ops = index.ops.lock().expect("ops lock").clone();
+        assert_eq!(ops, vec![("truncate", 0), ("index", 1), ("index", 2)]);
     }
 }
