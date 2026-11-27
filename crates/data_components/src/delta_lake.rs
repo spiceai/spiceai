@@ -4640,12 +4640,19 @@ mod table_read_tests {
             assert_eq!(metadata.num_row_groups(), 2, "the file has two row groups");
             let size = std::fs::metadata(&file).expect("parquet file").len();
 
+            let stats = serde_json::json!({
+                "numRecords": 10,
+                "minValues": {"id": 10 * i},
+                "maxValues": {"id": 10 * i + 9},
+                "nullCount": {"id": 0}
+            });
             let mut add = serde_json::json!({
                 "path": path,
                 "partitionValues": {},
                 "size": size,
                 "modificationTime": 0,
-                "dataChange": true
+                "dataChange": true,
+                "stats": stats.to_string()
             });
             if let Some(deleted_rows) = deleted_rows {
                 let dv_file = table.join(format!("deletion_vector-{i}.bin"));
@@ -4711,6 +4718,22 @@ mod table_read_tests {
                 "+----+-----+",
             ],
             &query(dir.path(), "SELECT count(*) AS n, sum(id) AS s FROM t").await
+        );
+        // The file statistics skip files 0 and 1, so the scan metadata deselects their rows,
+        // including the row of the file 1 deletion vector.
+        assert_batches_eq!(
+            [
+                "+----+-----+",
+                "| n  | s   |",
+                "+----+-----+",
+                "| 19 | 560 |",
+                "+----+-----+",
+            ],
+            &query(
+                dir.path(),
+                "SELECT count(*) AS n, sum(id) AS s FROM t WHERE id >= 20"
+            )
+            .await
         );
     }
 
