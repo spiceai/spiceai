@@ -848,6 +848,18 @@ impl SlabStore {
         for t in tasks {
             loaded.extend(t.await.context(JoinSnafu)?);
         }
+        // Building the maps of a full cache of small entries takes seconds of
+        // CPU, so it runs on a blocking thread like the loads.
+        tokio::task::spawn_blocking(move || {
+            Arc::new(Self::assemble(root, slab_bytes, &ids, loaded))
+        })
+        .await
+        .context(JoinSnafu)
+    }
+
+    /// The store [`Self::open`] builds from the slabs `loaded` of the slab
+    /// numbers `ids`: the entry index, the object table and the slab table.
+    fn assemble(root: PathBuf, slab_bytes: u64, ids: &[u32], mut loaded: Vec<Loaded>) -> Self {
         loaded.sort_unstable_by_key(|(id, _, _, _)| *id);
         let mut quarantined = (ids.len() - loaded.len()) as u64;
         // Past every slab found, quarantined ones included: a slab whose
@@ -887,22 +899,16 @@ impl SlabStore {
             }
         }
         if !superseded.is_empty() {
-            let r = root.clone();
             // A slab whose superseded copies cannot be tombstoned is
             // quarantined, so no copy of it can come back once the newer one
             // is removed.
-            let failed = tokio::task::spawn_blocking(move || -> Vec<u32> {
-                let mut failed = Vec::new();
-                for (id, offsets) in superseded {
-                    if append_tombstones(&r, id, &offsets).is_err() {
-                        quarantine_slab(&r, id);
-                        failed.push(id);
-                    }
+            let mut failed = Vec::new();
+            for (id, offsets) in superseded {
+                if append_tombstones(&root, id, &offsets).is_err() {
+                    quarantine_slab(&root, id);
+                    failed.push(id);
                 }
-                failed
-            })
-            .await
-            .context(JoinSnafu)?;
+            }
             if !failed.is_empty() {
                 quarantined += failed.len() as u64;
                 loaded.retain(|(id, _, _, _)| !failed.contains(id));
@@ -958,7 +964,7 @@ impl SlabStore {
                 },
             );
         }
-        Ok(Arc::new(Self {
+        Self {
             root,
             slab_bytes,
             index: Arc::new(RwLock::new(index)),
@@ -972,7 +978,7 @@ impl SlabStore {
             corrupt: AtomicU64::new(0),
             corrupt_bytes: AtomicU64::new(0),
             quarantined,
-        }))
+        }
     }
 
     /// Number of slab files.
