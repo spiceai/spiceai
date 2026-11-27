@@ -38,6 +38,145 @@ pub struct Run {
     seed: Option<u64>,
     failure: &'static str,
 }
+
+/// What a run demonstrates. A run that expects no failure is [`Kind::Holds`]
+/// and one that expects a failure is [`Kind::RuleRequired`], unless it is
+/// listed in [`RULE_NOT_REQUIRED`], [`STRONGER_PROPERTIES`] or
+/// [`CURRENT_DEFECTS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Kind {
+    /// The design's properties hold: exhaustively within the run's bound, or
+    /// not violated on the sampled paths of a simulation run.
+    Holds,
+    /// A safeguard or an assumption is removed and the run must find the named
+    /// failure, which shows the design needs it.
+    RuleRequired,
+    /// A safeguard or an assumption is removed and every property still holds,
+    /// which shows the design does not need it for safety in this graph.
+    RuleNotRequired,
+    /// The run checks a property stronger than the design guarantees and must
+    /// find the named failure: the design does not promise that property, and
+    /// no safeguard is removed.
+    StrongerProperty,
+    /// The model follows the current code rather than the design and must
+    /// find the named failure: a known defect, not a design rule.
+    CurrentDefect,
+}
+impl Kind {
+    pub const ALL: [Kind; 5] = [
+        Kind::Holds,
+        Kind::RuleRequired,
+        Kind::RuleNotRequired,
+        Kind::StrongerProperty,
+        Kind::CurrentDefect,
+    ];
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Holds => "holds",
+            Kind::RuleRequired => "rule-required",
+            Kind::RuleNotRequired => "rule-not-required",
+            Kind::StrongerProperty => "stronger-property",
+            Kind::CurrentDefect => "current-defect",
+        }
+    }
+}
+
+/// Runs that remove a safeguard or an assumption and still hold.
+const RULE_NOT_REQUIRED: [&str; 14] = [
+    "transactions-txn-no-owner-resolve-1-exhaust",
+    "dataset-byte-window-metadata-prefix-no-sealed-floor-without-readers",
+    "dataset-query-expiry-no-delete-selection",
+    "dataset-query-expiry-no-log-expiry",
+    "remote-maintenance-minimal-no-file-set-lease",
+    "remote-maintenance-no-file-set-lease",
+    "remote-maintenance-no-guard-revalidation",
+    "remote-maintenance-minimal-no-guard-revalidation",
+    "read-transaction-minimal-no-overlay-read-keys",
+    "read-transaction-widened-no-overlay-read-keys",
+    "mem-tier-late-stamp",
+    "data-files-retire-prepared-lean-3-retire-ignores-reservation",
+    "standby-early-safety",
+    "intent-roll-forward-partitioned-without-done-2-exhaust",
+];
+
+/// Runs that check a property stronger than the design guarantees, and fail it.
+const STRONGER_PROPERTIES: [&str; 1] = ["replicas-readers-adoption-all-present"];
+
+/// Runs that model the current code and reproduce a known defect in it.
+const CURRENT_DEFECTS: [&str; 1] = ["mem-tier-current-3-exhaust"];
+
+/// Runs whose traces are replayed against the implementation: the trace files
+/// under `crates/cayenne/tests/traces` and `crates/object_store_occ/tests/traces`
+/// (including the data-file replay),
+/// and the runs `crates/cayenne`'s mem-tier replay names directly. A test keeps
+/// this list equal to the runs those files name.
+const REPLAYED_AGAINST_CODE: [&str; 36] = [
+    "commits-restart-no-persist-before-send",
+    "commits-restart-turnover",
+    "data-files",
+    "data-files-retire",
+    "data-files-retire-3",
+    "data-files-retire-3-retires-carried",
+    "data-files-retire-forget-early",
+    "data-files-retire-ignores-restore-hold",
+    "data-files-retire-local-ignores-retention",
+    "data-files-retire-prepared",
+    "data-files-retire-prepared-orphan-ignores-reservation",
+    "data-files-retire-remote",
+    "data-files-retire-remote-ignores-retention",
+    "data-files-retire-sweep-uncommitted",
+    "data-files-retire-whole-snapshot",
+    "mem-tier-current-3-exhaust",
+    "mem-tier-no-capture-reservation",
+    "mem-tier-no-one-call",
+    "mem-tier-no-pruned-floor",
+    "mem-tier-seal-delete-only",
+    "mem-tier-seal-delete-only-sqlite",
+    "source-ack-before-acceptance",
+    "source-no-redelivery-skip",
+    "source-position-before-data",
+    "source-positions",
+    "transactions-txn-1-exhaust",
+    "transactions-txn-no-coordinator-wait-0-exhaust",
+    "transactions-txn-no-create-once-0-exhaust",
+    "transactions-txn-no-fence-check-0-exhaust",
+    "transactions-txn-no-intent-check-1-exhaust",
+    "transactions-txn-no-matching-0-exhaust",
+    "transactions-txn-no-prepared-check-1-exhaust",
+    "transactions-txn-no-reservation-0-exhaust",
+    "window-storage-7-exhaust",
+    "window-storage-gc-early-5-exhaust",
+    "window-storage-no-exists-5-exhaust",
+];
+
+impl Run {
+    /// What this run demonstrates.
+    #[must_use]
+    pub fn kind(&self) -> Kind {
+        if CURRENT_DEFECTS.contains(&self.name) {
+            Kind::CurrentDefect
+        } else if RULE_NOT_REQUIRED.contains(&self.name) {
+            Kind::RuleNotRequired
+        } else if STRONGER_PROPERTIES.contains(&self.name) {
+            Kind::StrongerProperty
+        } else if self.failure.is_empty() {
+            Kind::Holds
+        } else {
+            Kind::RuleRequired
+        }
+    }
+    /// Whether the implementation's tests replay this run's traces.
+    #[must_use]
+    pub fn replayed(&self) -> bool {
+        REPLAYED_AGAINST_CODE.contains(&self.name)
+    }
+    /// A sampled (simulation) run, which cannot establish exhaustive safety.
+    #[must_use]
+    pub fn sampled(&self) -> bool {
+        self.seed.is_some()
+    }
+}
 /// Checker threads unless `MODEL_THREADS` says otherwise. Results do not depend
 /// on it; past about six, the shared state set gains little.
 const DEFAULT_THREADS: usize = 6;
@@ -70,6 +209,22 @@ pub fn runs() -> Vec<Run> {
             failure: "",
         },
         Run {
+            name: "mem-tier-seal-delete-only-deep",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only-deep",
+            bound: 3,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "mem-tier-seal-delete-only-sqlite-deep",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only-sqlite-deep",
+            bound: 3,
+            seed: None,
+            failure: "",
+        },
+        Run {
             name: "mem-tier-no-one-call",
             family: "mem-tier",
             mode: "mem-tier-seal-delete-only-no-one-call",
@@ -89,6 +244,14 @@ pub fn runs() -> Vec<Run> {
             name: "mem-tier-no-capture-reservation",
             family: "mem-tier",
             mode: "mem-tier-seal-delete-only-no-capture-reservation",
+            bound: 3,
+            seed: None,
+            failure: "recovered reads match the source",
+        },
+        Run {
+            name: "mem-tier-no-pruned-floor",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only-no-pruned-floor",
             bound: 3,
             seed: None,
             failure: "recovered reads match the source",
@@ -2850,8 +3013,9 @@ where
             return Err(format!("Cannot serve the Explorer on {address}: {error}"));
         }
         println!(
-            "EXPLORER {} serving http://{address}/ (Ctrl-C to stop)",
-            run.name
+            "EXPLORER {} ({}) serving http://{address}/ (Ctrl-C to stop)",
+            run.name,
+            run.kind().name()
         );
         model.checker().threads(threads).serve(address);
     }
@@ -3043,11 +3207,16 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
                 "flush between checkpoint stage and end"
                     | "crash between checkpoint stage and publish"
                     | "bake prunes then reinsert checkpoints"
+                    | "bake tag raised to the pruned-delete floor"
                     | "seal shadow recovered"
                     | "full rewrite committed"
                     | "full rewrite interleaves apply"
                     | "full rewrite retains later protected snapshot"
             ))
+        || (run.family == "mem-tier"
+            && run.failure.is_empty()
+            && run.mode.contains("deep")
+            && matches!(name, "second crash" | "second full rewrite committed"))
         || intent_required
         || added_required
         || standby_required
@@ -3212,8 +3381,9 @@ where
     }
     good &= expected_found;
     println!(
-        "RESULT {} expected={} matched={good} seconds={:.3}",
+        "RESULT {} kind={} expected={} matched={good} seconds={:.3}",
         run.name,
+        run.kind().name(),
         if run.failure.is_empty() {
             "holds"
         } else {
@@ -3254,7 +3424,7 @@ fn run_checks(name: &str, explore: Option<&str>) -> Result<(), String> {
         .find(|r| r.name == name)
         .ok_or_else(|| format!("Unknown run {name}; use list"))?;
     if explore.is_none()
-        && (r.mode.contains("-no-") || !r.failure.is_empty())
+        && r.kind() != Kind::Holds
         && std::env::var("EXHAUST").as_deref() != Ok("1")
     {
         return Err("Controls require EXHAUST=1".into());
@@ -3725,5 +3895,109 @@ mod explorer_tests {
             "only {} steps rendered",
             render.steps
         );
+    }
+}
+
+#[cfg(test)]
+mod run_kind_tests {
+    use super::{
+        CURRENT_DEFECTS, Kind, REPLAYED_AGAINST_CODE, RULE_NOT_REQUIRED, STRONGER_PROPERTIES, runs,
+    };
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    /// Every quoted name after `marker` in `text`.
+    fn quoted_after<'a>(text: &'a str, marker: &str) -> Vec<&'a str> {
+        text.match_indices(marker)
+            .filter_map(|(at, _)| {
+                let rest = &text[at + marker.len()..];
+                rest.find('"').map(|end| &rest[..end])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn listed_runs_exist_and_match_their_expected_outcome() {
+        let all = runs();
+        let find = |name: &str| {
+            all.iter()
+                .find(|r| r.name == name)
+                .unwrap_or_else(|| panic!("{name} is listed but is not a run"))
+        };
+        for name in RULE_NOT_REQUIRED {
+            assert!(find(name).failure.is_empty(), "{name} expects a failure");
+            assert_eq!(find(name).kind(), Kind::RuleNotRequired);
+        }
+        for name in STRONGER_PROPERTIES {
+            assert!(!find(name).failure.is_empty(), "{name} expects no failure");
+            assert_eq!(find(name).kind(), Kind::StrongerProperty);
+        }
+        for name in CURRENT_DEFECTS {
+            assert!(!find(name).failure.is_empty(), "{name} expects no failure");
+            assert_eq!(find(name).kind(), Kind::CurrentDefect);
+        }
+        for name in REPLAYED_AGAINST_CODE {
+            assert!(find(name).replayed());
+        }
+    }
+
+    /// A run whose mode names a removal (`-no-`, `-ignores-` or `-without-`) and
+    /// still holds must be classified, so a new one cannot pass as a plain
+    /// positive. Removals named otherwise are listed by hand.
+    #[test]
+    fn every_holding_safeguard_removal_is_rule_not_required() {
+        let unclassified: Vec<&str> = runs()
+            .iter()
+            .filter(|r| {
+                ["-no-", "-ignores-", "-without-"]
+                    .iter()
+                    .any(|marker| r.mode.contains(marker))
+                    && r.failure.is_empty()
+            })
+            .filter(|r| r.kind() != Kind::RuleNotRequired)
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(unclassified, Vec::<&str>::new());
+    }
+
+    /// The replayed list equals the runs the implementation's replay tests name:
+    /// a missing entry or a stale one fails.
+    #[test]
+    fn replayed_runs_are_the_runs_the_replay_tests_name() {
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates directory");
+        let mut named = BTreeSet::new();
+        for dir in ["cayenne/tests/traces", "object_store_occ/tests/traces"] {
+            let entries =
+                std::fs::read_dir(crates.join(dir)).unwrap_or_else(|e| panic!("{dir}: {e}"));
+            for entry in entries {
+                let path = entry.expect("trace directory entry").path();
+                if path.extension().is_some_and(|e| e == "jsonl") {
+                    let text = std::fs::read_to_string(&path).expect("trace file");
+                    named.extend(
+                        quoted_after(&text, "\"run\":\"")
+                            .into_iter()
+                            .map(String::from),
+                    );
+                }
+            }
+        }
+        let replay = std::fs::read_to_string(
+            crates.join("cayenne/src/provider/table/tests/mem_tier_model_replay.rs"),
+        )
+        .expect("mem-tier replay source");
+        for call in [
+            "mem_tier_steps(\"",
+            "transaction_steps(\"",
+            "window_head_after(\"",
+        ] {
+            named.extend(quoted_after(&replay, call).into_iter().map(String::from));
+        }
+        let listed: BTreeSet<String> = REPLAYED_AGAINST_CODE
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(listed, named);
     }
 }

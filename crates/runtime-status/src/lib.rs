@@ -503,6 +503,16 @@ impl RuntimeStatus {
         self.is_ready_with(UnhealthyComponents::Allow)
     }
 
+    /// Whether scheduled work, such as a SQL worker, may run: every component has been
+    /// `Ready` at least once ([`Self::is_ready`], which stays true after a component fails),
+    /// or every component not in `Error` has, unless every dataset is in `Error`
+    /// ([`Self::is_ready_allowing_unhealthy`]), since a component that failed before it loaded
+    /// may never load.
+    #[must_use]
+    pub fn is_ready_for_scheduled_work(&self) -> bool {
+        self.is_ready() || self.is_ready_allowing_unhealthy()
+    }
+
     fn is_ready_with(&self, unhealthy: UnhealthyComponents) -> bool {
         if self.is_shutdown() {
             return false;
@@ -1209,6 +1219,34 @@ mod tests {
         status.update_dataset(&bad, ComponentStatus::Ready);
         assert!(status.is_ready());
         assert!(status.is_ready_allowing_unhealthy());
+    }
+
+    #[test]
+    fn scheduled_work_is_not_held_back_by_a_component_that_failed() {
+        let status = RuntimeStatus::new();
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+        let loaded = TableReference::bare("loaded");
+        let never_loaded = TableReference::bare("never_loaded");
+
+        status.update_dataset(&loaded, ComponentStatus::Initializing);
+        assert!(!status.is_ready_for_scheduled_work());
+
+        status.update_dataset(&loaded, ComponentStatus::Ready);
+        status.update_dataset(
+            &never_loaded,
+            ComponentStatus::error_with_message("source unreachable"),
+        );
+        assert!(status.is_ready_for_scheduled_work());
+
+        // Every dataset in `Error`, each after it loaded: the data is still served.
+        let status = RuntimeStatus::new();
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+        status.update_dataset(&loaded, ComponentStatus::Ready);
+        status.update_dataset(
+            &loaded,
+            ComponentStatus::error_with_message("source unreachable"),
+        );
+        assert!(status.is_ready_for_scheduled_work());
     }
 
     #[test]

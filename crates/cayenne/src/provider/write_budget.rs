@@ -151,8 +151,82 @@ struct EncodeBudget {
 
 /// Permits held for one write's encode, released together on drop.
 pub(crate) struct EncodePermits {
-    _main: OwnedSemaphorePermit,
+    main: OwnedSemaphorePermit,
     _gate: Option<OwnedSemaphorePermit>,
+}
+
+impl EncodePermits {
+    /// Encode shards these permits pay for. A `Delta` write can be granted
+    /// fewer than it asked for (see [`acquire_from`]); the write must then
+    /// shard no wider than this.
+    pub(crate) fn granted(&self) -> usize {
+        self.main.num_permits()
+    }
+}
+
+/// Encode shards a seq-prefix bake may run: half of what the maintenance class
+/// may hold, at least one, or `None` when no budget is installed.
+///
+/// A bake re-encodes a protected prefix that can run to hundreds of megabytes
+/// and tens of seconds. Sized like any other maintenance write it held every
+/// maintenance permit for all of that time, which on a small host left the
+/// other tables' compaction nothing and their checkpoints only the reserve.
+pub(crate) fn bake_encode_shard_cap() -> Option<usize> {
+    let guard = GLOBAL_ENCODE_BUDGET.read();
+    let budget = guard.as_ref()?;
+    let total = budget.total.load(Ordering::Acquire);
+    Some((maintenance_gate_cap(total) / 2).max(1))
+}
+
+/// How long a delta write waits for every permit it asked for before it takes
+/// what is free and shards narrower (see [`acquire_delta`]).
+const DELTA_FULL_WIDTH_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// `wanted` permits for a delta write: all of them, if they come free within
+/// [`DELTA_FULL_WIDTH_WAIT`]; otherwise what is free then, at least one.
+///
+/// The wait is load-bearing, not only a cost. The runtime groups the appends
+/// that queue while a dataset's write runs into its next write, so the time a
+/// write takes sets how many appends the next one carries, and each write is
+/// one protected snapshot to merge. Measured on the append-mode metrics rig, a
+/// delta write that waited for its whole request averaged 206 ms of wait and
+/// wrote 14.7k snapshots an hour for one table; one that never waited averaged
+/// 18 ms and wrote 36.4k, and the extra snapshots outran the merges: protected
+/// snapshots per table spiked to 96-129 and query P99 rose two- to four-fold.
+/// Unbounded, though, the wait parked a checkpoint behind a seq-prefix bake for
+/// that bake's tens of seconds. Bounded, a write keeps the common wait and its
+/// grouping, and a bake costs it at most this long.
+async fn acquire_delta(semaphore: &Arc<Semaphore>, wanted: usize) -> Option<OwnedSemaphorePermit> {
+    let count = u32::try_from(wanted.max(1)).unwrap_or(u32::MAX);
+    match tokio::time::timeout(
+        DELTA_FULL_WIDTH_WAIT,
+        Arc::clone(semaphore).acquire_many_owned(count),
+    )
+    .await
+    {
+        Ok(permit) => permit.ok(),
+        Err(_) => acquire_available(semaphore, wanted).await,
+    }
+}
+
+/// Up to `wanted` permits from `semaphore` without waiting for more than one:
+/// the largest count free right now, else the next single permit to come free.
+///
+/// Released permits go to queued waiters before they become free, so taking
+/// what is free never overtakes a write already waiting.
+async fn acquire_available(
+    semaphore: &Arc<Semaphore>,
+    wanted: usize,
+) -> Option<OwnedSemaphorePermit> {
+    for count in (1..=wanted.max(1)).rev() {
+        let Ok(count) = u32::try_from(count) else {
+            continue;
+        };
+        if let Ok(permit) = Arc::clone(semaphore).try_acquire_many_owned(count) {
+            return Some(permit);
+        }
+    }
+    Arc::clone(semaphore).acquire_many_owned(1).await.ok()
 }
 
 /// Process-wide encode budget, injected once at startup by the binary (sized to
@@ -421,14 +495,24 @@ async fn acquire_from(
             )
         }
     };
-    let main_count = gate
-        .as_ref()
-        .map_or_else(|| shards.clamp(1, total), |g| g.num_permits().max(1));
-    let main_count = u32::try_from(main_count).unwrap_or(u32::MAX);
-    let main = Arc::clone(&budget.semaphore)
-        .acquire_many_owned(main_count)
-        .await
-        .ok()?;
+    let main = match gate.as_ref() {
+        // A maintenance write already holds its slice of the gate, sized below
+        // the total, so it waits for the same count of main permits.
+        Some(gate) => {
+            let main_count = u32::try_from(gate.num_permits().max(1)).unwrap_or(u32::MAX);
+            Arc::clone(&budget.semaphore)
+                .acquire_many_owned(main_count)
+                .await
+                .ok()?
+        }
+        // A delta write waits a bounded time for its whole request, then takes
+        // what is free and shards no wider. Waiting without a bound parked a
+        // checkpoint that asked for the budget's full width behind any
+        // maintenance write holding even one permit — a bake held its permits for
+        // tens of seconds — while its table's appends backed up behind the tier it
+        // could not flush. See `acquire_delta` for why it still waits at all.
+        None => acquire_delta(&budget.semaphore, shards.clamp(1, total)).await?,
+    };
     let class_label = match class {
         WriteClass::Delta => "delta",
         WriteClass::Maintenance => "maintenance",
@@ -437,10 +521,7 @@ async fn acquire_from(
         wait_start.elapsed(),
         &[telemetry::KeyValue::new("class", class_label)],
     );
-    Some(EncodePermits {
-        _main: main,
-        _gate: gate,
-    })
+    Some(EncodePermits { main, _gate: gate })
 }
 
 #[cfg(test)]
@@ -678,6 +759,55 @@ mod tests {
             acquire_encode_permits(8, WriteClass::Delta, false)
                 .await
                 .is_none()
+        );
+    }
+
+    /// A delta write that cannot get every permit it asked for waits for them,
+    /// up to its bound, rather than start narrower at once: the wait is what
+    /// groups the appends that queue behind it into its table's next write.
+    #[tokio::test(start_paused = true)]
+    async fn a_delta_write_waits_for_its_full_width() {
+        let b = Arc::new(budget(4));
+        let held = acquire_from(&b, 2, WriteClass::Maintenance)
+            .await
+            .expect("maintenance permits");
+        let delta = tokio::spawn({
+            let b = Arc::clone(&b);
+            async move { acquire_from(&b, 4, WriteClass::Delta).await }
+        });
+        tokio::time::sleep(DELTA_FULL_WIDTH_WAIT / 2).await;
+        assert!(
+            !delta.is_finished(),
+            "the delta write waits for the two permits it is missing"
+        );
+        drop(held);
+        let granted = delta
+            .await
+            .expect("delta task")
+            .expect("delta permits")
+            .granted();
+        assert_eq!(granted, 4, "once they come free it gets its whole width");
+    }
+
+    /// The wait is bounded: a delta write still missing permits after
+    /// `DELTA_FULL_WIDTH_WAIT` takes what is free and shards narrower, so a
+    /// long maintenance write — a seq-prefix bake — cannot hold it back.
+    #[tokio::test(start_paused = true)]
+    async fn a_delta_write_narrows_once_its_wait_is_spent() {
+        let b = budget(4);
+        let _held = acquire_from(&b, 2, WriteClass::Maintenance)
+            .await
+            .expect("maintenance permits");
+        let start = tokio::time::Instant::now();
+        let granted = acquire_from(&b, 4, WriteClass::Delta)
+            .await
+            .expect("delta permits")
+            .granted();
+        assert_eq!(granted, 2, "it takes the two permits that are free");
+        assert_eq!(
+            start.elapsed(),
+            DELTA_FULL_WIDTH_WAIT,
+            "after waiting out its bound, not before"
         );
     }
 

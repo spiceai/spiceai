@@ -41,10 +41,6 @@ mod test {
     use ::arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
-    // Links the `sqlite` engine's registration into this test binary, which
-    // `test_file_mode_sqlite_creation` resolves through the engine registry.
-    #[cfg(feature = "sqlite")]
-    use accelerator_sqlite as _;
     // Config types now live in `runtime-component`/`runtime-acceleration` (not re-exported
     // by the accelerator shim glob), and `Secrets` in `runtime-secrets`.
     use crate::component::dataset::acceleration::{Acceleration, Engine, IndexType, Mode};
@@ -303,84 +299,6 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(feature = "sqlite")]
-    async fn test_file_mode_sqlite_creation() {
-        use crate::builder::RuntimeBuilder;
-        use std::{fs, path::Path};
-
-        let path = "./abc-sqlite.db".to_string();
-        let params = HashMap::from([("sqlite_file".to_string(), path.clone())]);
-        let runtime = Arc::new(RuntimeBuilder::new().build().await);
-        let ctx = Arc::clone(&runtime.df.ctx);
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
-        let acceleration_settings = Acceleration {
-            params: params.clone(),
-            enabled: true,
-            mode: Mode::File,
-            engine: Engine::Sqlite,
-            ..Acceleration::default()
-        };
-
-        let _ = runtime
-            .accelerator_engine_registry
-            .create_accelerator_table(
-                "abc".into(),
-                schema,
-                None,
-                &acceleration_settings,
-                Arc::new(RwLock::new(Secrets::new())),
-                None,
-                ctx,
-            )
-            .await
-            .expect("accelerator table created");
-
-        let path = Path::new(&path);
-        assert!(path.is_file());
-        fs::remove_file(path).expect("file removed");
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sqlite")]
-    async fn test_file_mode_sqlite_creation_default_path() {
-        use crate::builder::RuntimeBuilder;
-        use data_accelerator_api::make_spice_data_directory;
-        use std::{fs, path::Path};
-
-        let spice_data_dir = crate::spice_data_base_path();
-        make_spice_data_directory().expect("spice data directory created");
-        let path = format!("{spice_data_dir}/abc_sqlite.db");
-
-        let runtime = Arc::new(RuntimeBuilder::new().build().await);
-        let ctx = Arc::clone(&runtime.df.ctx);
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
-        let acceleration_settings = Acceleration {
-            params: HashMap::new(),
-            enabled: true,
-            mode: Mode::File,
-            engine: Engine::Sqlite,
-            ..Acceleration::default()
-        };
-        let _ = runtime
-            .accelerator_engine_registry
-            .create_accelerator_table(
-                "abc".into(),
-                schema,
-                None,
-                &acceleration_settings,
-                Arc::new(RwLock::new(Secrets::new())),
-                None,
-                ctx,
-            )
-            .await
-            .expect("accelerator table created");
-
-        let path = Path::new(&path);
-        assert!(path.is_file());
-        fs::remove_file(path).expect("file removed");
-    }
-
-    #[tokio::test]
     async fn test_arrow_primary_key_enables_hash_index_and_upsert() {
         use crate::builder::RuntimeBuilder;
         use ::arrow::array::{Int64Array, RecordBatch, StringArray};
@@ -598,19 +516,27 @@ mod test {
                 let acceleration_settings = Acceleration {
                     enabled: true,
                     mode: Mode::Memory,
-                    engine: Engine::Arrow,
-                    params: HashMap::from([("arrow_key".to_string(), "${ env:KEY }".to_string())]),
+                    engine: Engine::Cayenne,
+                    params: HashMap::from([(
+                        "cayenne_key".to_string(),
+                        "${ env:KEY }".to_string(),
+                    )]),
                     ..Acceleration::default()
                 };
+                // Cayenne creates a table only for a source.
+                let source = runtime_acceleration::testing::TestAccelerationSource::new(
+                    "cayenne_secret_expansion",
+                )
+                .with_acceleration(acceleration_settings.clone());
                 runtime
                     .accelerator_engine_registry
                     .create_accelerator_table(
-                        "arrow_secret_expansion".into(),
+                        "cayenne_secret_expansion".into(),
                         schema,
                         None,
                         &acceleration_settings,
                         secrets,
-                        None,
+                        Some(&source),
                         ctx,
                     )
                     .await
@@ -759,7 +685,6 @@ mod accelerator_compat_tests {
         // Test both memory and file modes for databases
         // Format: (engine, mode, metastore_type)
         let test_configs = vec![
-            (Engine::Arrow, "memory", None),
             (Engine::Cayenne, "memory", None),
             (Engine::Cayenne, "file", Some("sqlite")), // Cayenne with SQLite metastore
         ];
@@ -965,7 +890,7 @@ mod accelerator_compat_tests {
                         }
                     }
                 }
-                _ => panic!("Unsupported engine for this test"),
+                Engine::PartitionedArrow => panic!("Unsupported engine for this test"),
             };
 
             test_fn(engine, table, mode_label.clone(), &test_env).await;
@@ -2117,7 +2042,7 @@ mod accelerator_compat_tests {
                             .await
                             .expect("Vortex table should be created")
                     }
-                    _ => panic!("Unsupported engine: {:?}", engine),
+                    Engine::PartitionedArrow => panic!("Unsupported engine: {:?}", engine),
                 };
 
                 // Insert boolean data
@@ -3309,7 +3234,7 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[ignore = "Run with --ignored flag: cargo test --features sqlite,duckdb,cayenne -- --ignored --nocapture benchmark_roundtrip"]
+    #[ignore = "Run with --ignored flag: cargo test -p runtime --lib -- --ignored --nocapture benchmark_roundtrip"]
     async fn benchmark_roundtrip() {
         use std::sync::Mutex;
         use std::time::Instant;

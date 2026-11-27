@@ -386,7 +386,7 @@ pub struct CurrentSnapshot {
     /// The id `current-snapshot-id` names.
     pub snapshot_id: u64,
     /// The acceleration engine that created the snapshot, lowercase as recorded
-    /// (`cayenne`, `sqlite`, or a removed engine such as `duckdb`).
+    /// (`cayenne`, or a removed engine such as `sqlite` or `duckdb`).
     pub engine: String,
     /// The dataset schema recorded for the snapshot.
     pub schema: SchemaRef,
@@ -947,8 +947,6 @@ impl<'a> SnapshotPathLayout<'a> {
 #[derive(Clone, PartialEq, Debug)]
 pub enum AccelerationEngine {
     Cayenne,
-    #[cfg(feature = "sqlite")]
-    Sqlite,
 }
 
 impl AccelerationEngine {
@@ -957,8 +955,6 @@ impl AccelerationEngine {
     pub fn snapshot_extension(&self) -> &'static str {
         match self {
             Self::Cayenne => ".cayenne",
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite => ".sqlite",
         }
     }
 }
@@ -966,8 +962,6 @@ impl std::fmt::Display for AccelerationEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Cayenne => write!(f, "cayenne"),
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite => write!(f, "sqlite"),
         }
     }
 }
@@ -990,7 +984,7 @@ pub struct SnapshotManager {
     snapshot_location_uri: String,
     /// The acceleration layout defining the storage paths for this accelerator.
     layout: AccelerationLayout,
-    /// The acceleration engine type (`cayenne` or `sqlite`).
+    /// The acceleration engine type.
     engine: AccelerationEngine,
     snapshot_engine: Arc<dyn SnapshotEngine>,
     object_store: Arc<dyn ObjectStore>,
@@ -1141,21 +1135,6 @@ pub(crate) async fn replace_downloaded_file(
     local_path: &Path,
     dataset_name: &str,
 ) -> Result<(), SnapshotDownloadError> {
-    // Finish a previous process's interrupted restore before this attempt
-    // takes the journal. The guard then keeps a pool open in this process
-    // from putting the parked WAL back while the rename is still in progress.
-    #[cfg(feature = "sqlite")]
-    {
-        engine::recover_interrupted_sqlite_restore(local_path, dataset_name)
-            .await
-            .map_err(|source| SnapshotDownloadError::FinalizeFile {
-                path: local_path.to_path_buf(),
-                source: Box::new(source),
-            })?;
-    }
-    #[cfg(feature = "sqlite")]
-    let _active_sqlite_restore = engine::begin_sqlite_restore(local_path);
-
     if let Err(source) = engine.prepare_file_restore(local_path, dataset_name).await {
         let _ = fs::remove_file(temp_path).await;
         return Err(SnapshotDownloadError::FinalizeFile {
@@ -1167,19 +1146,6 @@ pub(crate) async fn replace_downloaded_file(
     if let Err(source) = fs::rename(temp_path, local_path).await {
         if source.kind() == std::io::ErrorKind::AlreadyExists {
             let aside = local_path.with_extension(format!("old.{}", std::process::id()));
-            // Name the aside file in the journal before moving the live
-            // database, so a crash in between can rename it back.
-            #[cfg(feature = "sqlite")]
-            if let Err(source) =
-                engine::record_sqlite_restore_aside(local_path, &aside, dataset_name).await
-            {
-                let _ = fs::remove_file(temp_path).await;
-                let _ = engine.abort_file_restore(local_path, dataset_name).await;
-                return Err(SnapshotDownloadError::FinalizeFile {
-                    path: local_path.to_path_buf(),
-                    source: Box::new(source),
-                });
-            }
             if let Err(swap_err) = fs::rename(local_path, &aside).await {
                 let _ = fs::remove_file(temp_path).await;
                 return Err(
@@ -1965,7 +1931,7 @@ impl SnapshotManager {
 
     /// Creates a new snapshot by streaming the local acceleration file to object storage.
     ///
-    /// For file-based accelerators (`SQLite`), this copies and uploads the database file.
+    /// For a single-file accelerator, this copies and uploads the file.
     /// For directory-based accelerators (Cayenne), this archives the directories into a tar file
     /// before uploading.
     ///
@@ -2404,8 +2370,8 @@ impl SnapshotManager {
         );
 
         // Step 0: Engine-specific live checkpoint while the lock is held.
-        // For SQLite this drains the write-ahead log into the main
-        // file so that the subsequent `fs::copy` produces a self-contained
+        // An engine with a write-ahead log drains it into the main
+        // file here so that the subsequent `fs::copy` produces a self-contained
         // snapshot. Engines with nothing to flush return `Ok(())`.
         self.snapshot_engine
             .checkpoint_live(source_local_path, &self.dataset_name)
@@ -4632,25 +4598,10 @@ mod tests {
         )]))
     }
 
-    /// Writes a sample local accelerator file appropriate for the engine.
-    /// For `SQLite`, creates a real (empty) database so that the
-    /// engine's `checkpoint_live` hook can open it. For other engines, writes opaque
-    /// test bytes since no engine-side validation runs against the file pre-snapshot.
-    fn write_sample_local_db(path: &std::path::Path, engine: &AccelerationEngine) {
-        match engine {
-            #[cfg(feature = "sqlite")]
-            AccelerationEngine::Sqlite => {
-                let conn = rusqlite::Connection::open(path).expect("open sample sqlite db");
-                conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
-                    .expect("set wal");
-                conn.execute("CREATE TABLE sample(id INTEGER PRIMARY KEY)", [])
-                    .expect("create sample table");
-                drop(conn);
-            }
-            _ => {
-                std::fs::write(path, b"test snapshot content").expect("write test file");
-            }
-        }
+    /// Writes opaque test bytes as a sample local accelerator file; no engine-side
+    /// validation runs against the file before a snapshot.
+    fn write_sample_local_db(path: &std::path::Path, _engine: &AccelerationEngine) {
+        std::fs::write(path, b"test snapshot content").expect("write test file");
     }
 
     /// Builds a `SnapshotManager` for the specified engine type.
@@ -4959,96 +4910,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// Regression test for the first reload of a `refresh_mode: snapshot`
-    /// `SQLite` reader: the restore replaces a live WAL-mode database whose
-    /// connection is still open, and the replaced database's `-wal` must not be
-    /// applied to the restored rows.
-    #[tokio::test]
-    #[cfg(feature = "sqlite")]
-    async fn a_sqlite_restore_over_a_live_wal_database_serves_the_snapshot_rows() {
-        let temp_dir = TempDir::new().expect("create temp dir");
-        let local_path = temp_dir.path().join("orders.sqlite");
-        let live = rusqlite::Connection::open(&local_path).expect("open live");
-        live.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
-            .expect("wal");
-        live.execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE t(id INTEGER PRIMARY KEY);")
-            .expect("create live table");
-
-        let snapshot_file = temp_dir.path().join("published.sqlite");
-        let published = rusqlite::Connection::open(&snapshot_file).expect("open published");
-        published
-            .execute_batch(
-                "CREATE TABLE t(id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1), (2), (3);",
-            )
-            .expect("write published snapshot");
-        drop(published);
-        let contents = Bytes::from(std::fs::read(&snapshot_file).expect("read published"));
-
-        let store = Arc::new(InMemory::new());
-        let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::Sqlite);
-        let instant = Utc
-            .with_ymd_and_hms(2026, 9, 24, 5, 37, 3)
-            .single()
-            .expect("valid time");
-        let location = layout.build_location(&base, instant);
-        store
-            .put(&location, contents.clone().into())
-            .await
-            .expect("write snapshot");
-        let schema = sample_schema();
-        let metadata = SnapshotMetadata {
-            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
-            location: SNAPSHOT_URI_PREFIX.to_string(),
-            last_updated_ms: Utc::now().timestamp_millis(),
-            datasets: HashMap::from([(
-                DATASET_NAME.to_string(),
-                dataset_metadata(
-                    &schema,
-                    vec![SnapshotEntry {
-                        snapshot_id: 0,
-                        timestamp_ms: instant.timestamp_millis(),
-                        snapshot: snapshot_uri(&location),
-                        snapshot_checksum: compute_sha256_hex(contents.as_ref()),
-                        snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
-                        snapshot_size: contents.len() as u64,
-                        snapshot_engine: None,
-                        snapshot_row_count: None,
-                        snapshot_last_updated_at_ms: None,
-                    }],
-                    Some(0),
-                ),
-            )]),
-        };
-        write_metadata(&store, &base.join(METADATA_FILE_NAME), &metadata).await;
-
-        let manager = build_manager_for_engine(
-            Arc::clone(&store),
-            local_path.clone(),
-            BootstrapOnFailureBehavior::Warn,
-            &schema,
-            &AccelerationEngine::Sqlite,
-        );
-        manager
-            .download_latest_snapshot()
-            .await
-            .expect("download should succeed")
-            .expect("expected snapshot");
-
-        let fresh = rusqlite::Connection::open(&local_path).expect("open restored");
-        fresh
-            .query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
-            .expect("wal");
-        let rows: i64 = fresh
-            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
-            .expect("count");
-        assert_eq!(
-            rows, 3,
-            "the restored snapshot's rows must survive the replaced WAL"
-        );
-        drop(live);
     }
 
     /// A snapshot spanning several ranged GETs is reassembled byte-for-byte.
@@ -8422,12 +8283,6 @@ mod tests {
             published.is_empty(),
             "nothing may be published when there is no accelerator file to snapshot: {published:?}"
         );
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn sqlite_an_absent_accelerator_file_fails_the_snapshot() {
-        generic_an_absent_accelerator_file_fails_the_snapshot(&AccelerationEngine::Sqlite).await;
     }
 
     #[tokio::test]

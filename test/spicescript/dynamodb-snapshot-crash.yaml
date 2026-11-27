@@ -1,0 +1,193 @@
+name: dynamodb-snapshot-crash
+duration: 33s
+description: >
+  A DynamoDB Streams changes-mode acceleration that is killed partway through a
+  reload does not resume from the stream position an earlier run saved. The
+  reload truncates the accelerated table before it scans, so that position
+  describes rows that are no longer there: resuming from it serves only the rows
+  the scan had reached and never loads the rest. After the crash, `disabled`
+  (which never scans) reports that the table needs a reload, and `auto` scans
+  the table again, so every row comes back.
+
+sources:
+  # spiced reaches LocalStack through an HTTP proxy inside the container (port
+  # 4567). For the `stall_*` table it reads a reload's Scan two items a page and
+  # counts the reloads, and while `/tmp/hold-<table>` exists it holds every page
+  # after the first, so spiced can be killed with the table truncated and partly
+  # reloaded.
+  ddb:
+    kind: docker
+    image: docker.io/localstack/localstack:4.9
+    ports: [4566, 4567]
+    env: { SERVICES: dynamodb, AWS_DEFAULT_REGION: us-east-1 }
+    ready: awslocal dynamodb list-tables
+
+# Every persistent acceleration keeps a stream position, so each must recover.
+variants:
+  cayenne: {}
+  cayenne-object-native: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: dynamodb-snapshot-crash
+  datasets:
+    - from: dynamodb:stall_${sources.ddb.namespace}
+      name: stall
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4567}
+        # One scan segment, so the pages arrive in order and the hold stops
+        # the reload after its first page.
+        scan_segments: 1
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes }
+
+defaults:
+  # The proxy on port 4567 belongs to the one LocalStack container.
+  exclusive: true
+
+steps:
+  - source-exec:
+      ddb: |
+        cat > /tmp/proxy.py <<'PY'
+        import json, os, threading, time, urllib.request, urllib.error
+        from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+        lock = threading.Lock()
+        state = {'scans': {}, 'held': {}}
+        def save():
+            with open('/tmp/proxy-state.json.tmp', 'w') as f:
+                json.dump(state, f)
+            os.replace('/tmp/proxy-state.json.tmp', '/tmp/proxy-state.json')
+        class Proxy(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def reply(self, status, data, headers=()):
+                self.send_response(status)
+                for k, v in headers:
+                    if k.lower() not in ('transfer-encoding', 'connection', 'content-length'):
+                        self.send_header(k, v)
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+                op = self.headers.get('X-Amz-Target', '').rsplit('.', 1)[-1]
+                req = json.loads(body or b'{}')
+                table = req.get('TableName', '')
+                # Schema inference sets its own Limit; the reload's scan sets none.
+                if op == 'Scan' and table.startswith('stall_') and 'Limit' not in req:
+                    req['Limit'] = 2
+                    body = json.dumps(req).encode()
+                    if 'ExclusiveStartKey' not in req:
+                        with lock:
+                            state['scans'][table] = state['scans'].get(table, 0) + 1
+                            save()
+                    elif os.path.exists('/tmp/hold-' + table):
+                        with lock:
+                            state['held'][table] = state['held'].get(table, 0) + 1
+                            save()
+                        while os.path.exists('/tmp/hold-' + table):
+                            time.sleep(0.2)
+                headers = {k: v for k, v in self.headers.items() if k.lower() not in ('host', 'content-length')}
+                upstream = urllib.request.Request('http://127.0.0.1:4566' + self.path, data=body, method='POST', headers=headers)
+                try:
+                    with urllib.request.urlopen(upstream, timeout=30) as r:
+                        status, rheaders, data = r.status, list(r.headers.items()), r.read()
+                except urllib.error.HTTPError as e:
+                    status, rheaders, data = e.code, list(e.headers.items()), e.read()
+                self.reply(status, data, rheaders)
+        with lock:
+            save()
+        ThreadingHTTPServer(('0.0.0.0', 4567), Proxy).serve_forever()
+        PY
+        if ! python3 -c "import socket, sys; sys.exit(socket.socket().connect_ex(('127.0.0.1', 4567)))"; then
+          nohup python3 /tmp/proxy.py > /tmp/proxy.log 2>&1 < /dev/null &
+          sleep 1
+        fi
+  - source-exec:
+      ddb: |
+        python3 - <<'PY'
+        import boto3
+        d = boto3.resource('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+        t = d.create_table(TableName='stall_${sources.ddb.namespace}', KeySchema=[{'AttributeName': 'id', 'KeyType': 'HASH'}],
+            AttributeDefinitions=[{'AttributeName': 'id', 'AttributeType': 'S'}], BillingMode='PAY_PER_REQUEST',
+            StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'NEW_AND_OLD_IMAGES'})
+        t.wait_until_exists()
+        for i in range(10):
+            t.put_item(Item={'id': str(i), 'name': 'Item ' + str(i)})
+        PY
+
+  # The first start loads the table and saves a stream position.
+  - start: {}
+  - query: SELECT id, name FROM stall
+    expect: &all_rows
+      rows:
+        - ['0', Item 0]
+        - ['1', Item 1]
+        - ['2', Item 2]
+        - ['3', Item 3]
+        - ['4', Item 4]
+        - ['5', Item 5]
+        - ['6', Item 6]
+        - ['7', Item 7]
+        - ['8', Item 8]
+        - ['9', Item 9]
+    eventually: 60s
+
+  - source-query: { ddb: &proxy_state "python3 -c \"import json; s = json.load(open('/tmp/proxy-state.json')); t = 'stall_${sources.ddb.namespace}'; print(s['scans'].get(t, 0), s['held'].get(t, 0) > 0)\"" }
+    expect: { rows: [['1 False']] }
+
+  # A restart resumes from that position without scanning, so the crash below
+  # has a saved position it could resume from.
+  - restart: {}
+  - query: SELECT id, name FROM stall
+    expect: *all_rows
+    eventually: 30s
+  - source-query: { ddb: *proxy_state }
+    expect: { rows: [['1 False']] }
+
+  # `always` reloads the table on start. Hold the scan after its first page,
+  # and kill spiced once the reload has applied its truncate, which counts as
+  # one row.
+  - source-exec:
+      ddb: touch /tmp/hold-stall_${sources.ddb.namespace}
+  - restart:
+      ready: false
+      patch: { datasets: { stall: { params: { dynamodb_replication_initial_snapshot: always } } } }
+  - wait-metric:
+      name: dataset_acceleration_cdc_apply_burst_rows_total
+      labels: { dataset: stall }
+      above: 0
+      timeout: 60s
+  - source-query: { ddb: *proxy_state }
+    expect: { rows: [['2 True']] }
+    eventually: 30s
+  - kill-spiced: {}
+  - source-exec:
+      ddb: rm -f /tmp/hold-stall_${sources.ddb.namespace}
+
+  # `disabled` never scans, so it cannot repair the partly reloaded table and
+  # reports that it needs a reload instead of serving it.
+  - start:
+      ready: false
+      patch: { datasets: { stall: { params: { dynamodb_replication_initial_snapshot: disabled } } } }
+  - assert-status:
+      dataset: stall
+      status: Error
+      message-contains: because its last reload was interrupted
+    eventually: 60s
+
+  # Back on the default `auto`, the next start loads every row again.
+  - restart:
+      patch: { datasets: { stall: { params: { dynamodb_replication_initial_snapshot: auto } } } }
+  - query: SELECT id, name FROM stall
+    expect: *all_rows
+    eventually: 60s
+  - query: SELECT id, name FROM stall
+    expect: *all_rows
+    consistently: 5s
+  - source-query: { ddb: *proxy_state }
+    expect: { rows: [['3 True']] }

@@ -39,7 +39,12 @@ GH_STUB = """\
 echo "$*" >> "$GH_STUB_LOG"
 case "$1 $2" in
   "pr list") cat "$GH_STUB_PR_LIST" ;;
-  "pr view") printf '{"number":%s,"author":{"login":"viewed-%s"}}\\n' "$3" "$3" ;;
+  "pr view")
+    if [ "$3" = 404 ]; then
+      echo "GraphQL: Could not resolve to a PullRequest with the number of 404." >&2
+      exit 1
+    fi
+    printf '{"number":%s,"author":{"login":"viewed-%s"}}\\n' "$3" "$3" ;;
   *) echo "gh stub: unexpected call: $*" >&2; exit 1 ;;
 esac
 """
@@ -267,6 +272,23 @@ class GenerateChangelogStepTest(unittest.TestCase):
             f" - https://github.com/spiceai/spiceai/commit/{g}/",
             result.stdout.split("\n"),
         )
+
+    def test_a_pr_number_gh_cannot_resolve_is_listed_as_not_found(self):
+        # `gh pr view` exits non-zero for a number it cannot resolve, such as a
+        # PR of another repository quoted in a cherry-picked subject.
+        f = self.repo.git("rev-parse", "refs/remotes/origin/release/1.0")
+        self.repo.git("checkout", "-q", "release/1.0")
+        h = self.repo.commit("h.txt", "h\n", "fix: h (#404)")
+        self.repo.git("update-ref", "refs/remotes/origin/release/1.0", "release/1.0")
+        self.repo.git("checkout", "-q", "--detach", "trunk")
+        result = self.repo.run_workflow_step("v1.0.0", "release/1.0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            EXPECTED_CHANGELOG.format(f=f)
+            + f"- !!!! (PR NOT FOUND): fix: h (#404) - https://github.com/spiceai/spiceai/commit/{h}/\n",
+        )
+        self.assertIn("pr view 404 --json number,author --repo spiceai/spiceai", self.repo.gh_calls())
 
     def test_shell_syntax_in_an_input_runs_nothing(self):
         cases = [

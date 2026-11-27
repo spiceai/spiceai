@@ -54,6 +54,8 @@ use object_store::{
 };
 use tokio::sync::Notify;
 
+// These stay on SQLite: a table in the object-native location scans the files its
+// commits name and never lists a snapshot directory, so there is no listing to race.
 test_with_backends!(index_build_listing_racing_retention);
 test_with_backends!(index_build_listing_before_retention);
 test_with_backends!(index_build_listing_racing_retention_then_cache_cleared);

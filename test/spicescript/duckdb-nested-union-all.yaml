@@ -1,4 +1,5 @@
 name: duckdb-nested-union-all
+duration: 7s
 description: >
   A UNION ALL whose second branch is itself a UNION ALL returns every row of
   every branch when the whole query is sent to a DuckDB source, as it does

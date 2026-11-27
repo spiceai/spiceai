@@ -3,6 +3,7 @@
 # composite value panics the query, and some types keep their table out of the
 # catalog altogether. Move this script to test/spicescript/ once it passes.
 name: postgres-type-coverage
+duration: 4s
 description: >
   Every PostgreSQL column type is readable through a catalog: a type Spice maps
   natively answers as its value, any other as the text PostgreSQL renders for

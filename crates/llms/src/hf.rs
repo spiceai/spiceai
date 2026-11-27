@@ -95,10 +95,11 @@ pub const SAFETENSORS_INDEX: &str = "model.safetensors.index.json";
 ///
 /// # Errors
 ///
-/// Returns why the index cannot be used, worded to follow its file name.
-pub fn safetensors_shards(index: &str) -> Result<Vec<String>, String> {
+/// Returns why the index cannot be used, worded to follow its file name. Bytes that are not
+/// UTF-8 are not valid JSON.
+pub fn safetensors_shards(index: &[u8]) -> Result<Vec<String>, String> {
     let index: serde_json::Value =
-        serde_json::from_str(index).map_err(|_| "is not valid JSON".to_string())?;
+        serde_json::from_slice(index).map_err(|_| "is not valid JSON".to_string())?;
     let map = index
         .get("weight_map")
         .and_then(serde_json::Value::as_object)
@@ -125,14 +126,15 @@ pub fn safetensors_shards(index: &str) -> Result<Vec<String>, String> {
 pub async fn read_shards(snapshot: &Snapshot) -> Result<Vec<String>, DownloadError> {
     let index = snapshot.fetch_quietly(&[SAFETENSORS_INDEX]).await?;
     let index = index.first().cloned().unwrap_or_default();
-    let contents = tokio::fs::read_to_string(&index).await.map_err(|error| {
+    let contents = tokio::fs::read(&index).await.map_err(|error| {
         DownloadError::unusable(
             snapshot,
             format!("'{SAFETENSORS_INDEX}' could not be read ({error})"),
         )
     })?;
-    let shards = safetensors_shards(&contents)
-        .map_err(|why| DownloadError::unusable(snapshot, format!("'{SAFETENSORS_INDEX}' {why}")))?;
+    let shards = safetensors_shards(&contents).map_err(|why| {
+        DownloadError::invalid_file(snapshot, format!("'{SAFETENSORS_INDEX}' {why}"))
+    })?;
     if let Some(missing) = shards.iter().find(|shard| snapshot.file(shard).is_none()) {
         return Err(DownloadError::missing(
             snapshot,
@@ -154,22 +156,26 @@ mod tests {
     fn an_index_names_its_shards() {
         let index = r#"{"metadata":{},"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors","c":"model-00001-of-00002.safetensors"}}"#;
         assert_eq!(
-            safetensors_shards(index),
+            safetensors_shards(index.as_bytes()),
             Ok(owned(&[
                 "model-00001-of-00002.safetensors",
                 "model-00002-of-00002.safetensors"
             ]))
         );
         assert_eq!(
-            safetensors_shards("{}"),
+            safetensors_shards(b"{}"),
             Err("has no `weight_map`".to_string())
         );
         assert_eq!(
-            safetensors_shards(r#"{"weight_map":{}}"#),
+            safetensors_shards(br#"{"weight_map":{}}"#),
             Err("names no weight files".to_string())
         );
         assert_eq!(
-            safetensors_shards("not json"),
+            safetensors_shards(b"not json"),
+            Err("is not valid JSON".to_string())
+        );
+        assert_eq!(
+            safetensors_shards(b"{\"weight_map\":{\"a\":\"\xff\"}}"),
             Err("is not valid JSON".to_string())
         );
     }

@@ -1042,11 +1042,16 @@ async fn ensure_publication(
     );
     // In multi-replica deployments two replicas can both observe `exists =
     // false` and race into `CREATE PUBLICATION`. The loser gets SQLSTATE
-    // 42710 (`duplicate_object`) — but on a *shared* publication the winner
-    // may have created it for a different table, so losing the race does NOT
-    // imply our table is a member. Enforce membership explicitly with a
-    // follow-up ADD TABLE (itself 42710-tolerant for the same-table race).
-    if ignore_duplicate_object(client.simple_query(&stmt).await)?.is_none() {
+    // 42710 (`duplicate_object`) when the winner committed before it looked,
+    // or 23505 on `pg_publication_pubname_index` when both were inserting the
+    // catalog row at once — see [`ignore_existing_publication`]. Either way, on
+    // a *shared* publication the winner may have created it for a different
+    // table, so losing the race does NOT imply our table is a member. Enforce
+    // membership explicitly with a follow-up ADD TABLE (itself 42710-tolerant
+    // for the same-table race). The winner may also have created it without
+    // `publish_via_partition_root`, so repair that as the `exists` branch does.
+    if ignore_existing_publication(client.simple_query(&stmt).await)?.is_none() {
+        ensure_publish_via_partition_root(client, publication_name).await?;
         let add = format!(
             "ALTER PUBLICATION {pub} ADD TABLE {schema}.{table}",
             pub = quote_ident(publication_name),
@@ -1069,19 +1074,16 @@ async fn ensure_publication(
 /// failing setup: leaving `publish_via_partition_root` off is only a problem
 /// for partitioned source tables, so a non-owner with regular tables keeps
 /// working exactly as before.
+///
+/// Two replicas can both find the option off and run the `ALTER` at once. The
+/// one that loses fails with `tuple concurrently updated` (SQLSTATE XX000)
+/// rather than waiting and succeeding; it re-reads the option and accepts the
+/// other replica's update only when the option is now set.
 async fn ensure_publish_via_partition_root(
     client: &tokio_postgres::Client,
     publication_name: &str,
 ) -> Result<()> {
-    let via_root: bool = client
-        .query_one(
-            "SELECT pubviaroot FROM pg_publication WHERE pubname = $1",
-            &[&publication_name],
-        )
-        .await
-        .context(SetupExecSnafu)?
-        .get(0);
-    if via_root {
+    if publishes_via_partition_root(client, publication_name).await? {
         return Ok(());
     }
 
@@ -1106,8 +1108,40 @@ async fn ensure_publish_via_partition_root(
             );
             Ok(())
         }
+        Err(e)
+            if is_concurrent_catalog_update(&e)
+                && publishes_via_partition_root(client, publication_name).await? =>
+        {
+            Ok(())
+        }
         Err(e) => Err(e).context(SetupExecSnafu),
     }
+}
+
+/// Whether `publication_name` publishes partitioned-table changes under the
+/// root relation (`pg_publication.pubviaroot`).
+async fn publishes_via_partition_root(
+    client: &tokio_postgres::Client,
+    publication_name: &str,
+) -> Result<bool> {
+    Ok(client
+        .query_one(
+            "SELECT pubviaroot FROM pg_publication WHERE pubname = $1",
+            &[&publication_name],
+        )
+        .await
+        .context(SetupExecSnafu)?
+        .get(0))
+}
+
+/// Whether `e` is the error a catalog update gets when a concurrent transaction
+/// updated the same catalog row first: SQLSTATE XX000 (`internal_error`), which
+/// `PostgreSQL` raises for many unrelated faults, so the message is matched too.
+fn is_concurrent_catalog_update(e: &tokio_postgres::Error) -> bool {
+    e.as_db_error().is_some_and(|db| {
+        db.code() == &tokio_postgres::error::SqlState::INTERNAL_ERROR
+            && db.message() == "tuple concurrently updated"
+    })
 }
 
 /// Every table in a publication, as `(schema, table)`. An absent publication
@@ -1219,6 +1253,37 @@ pub async fn remove_table_from_publication(
     drop(client);
     let _ = conn_task.await;
     outcome
+}
+
+/// The unique index on `pg_publication.pubname`. A `CREATE PUBLICATION` that
+/// loses a race to a concurrent one for the same name fails on this index.
+const PUBLICATION_NAME_INDEX: &str = "pg_publication_pubname_index";
+
+/// Like [`ignore_duplicate_object`], for `CREATE PUBLICATION`: `Ok(None)` when
+/// the publication already exists, however `PostgreSQL` reports it.
+///
+/// A name that exists by the time the statement looks for it is SQLSTATE
+/// 42710. A name a concurrent transaction is inserting at the same moment is
+/// caught by the catalog's unique index instead: the statement waits for that
+/// transaction and, once it commits, fails with SQLSTATE 23505 (`unique_violation`)
+/// on [`PUBLICATION_NAME_INDEX`]. The publication exists in both cases. Any
+/// other unique violation is still an error.
+fn ignore_existing_publication<T>(
+    res: std::result::Result<T, tokio_postgres::Error>,
+) -> Result<Option<T>> {
+    match res {
+        Err(e) if is_publication_name_race(&e) => Ok(None),
+        res => ignore_duplicate_object(res),
+    }
+}
+
+/// Whether `e` is the unique violation a `CREATE PUBLICATION` gets when it
+/// loses a race to a concurrent one for the same name.
+fn is_publication_name_race(e: &tokio_postgres::Error) -> bool {
+    e.as_db_error().is_some_and(|db| {
+        db.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+            && db.constraint() == Some(PUBLICATION_NAME_INDEX)
+    })
 }
 
 /// Treats a `duplicate_object` SQLSTATE (42710) as success — some replica beat

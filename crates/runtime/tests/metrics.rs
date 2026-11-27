@@ -44,8 +44,6 @@ use accelerator_cayenne as _;
 // unreferenced static — and every integration binary links separately, so each one that
 // exercises an engine needs its own reference. `integration.rs`'s
 // `accelerator_crates_register_their_engines` guards the mechanism.
-#[cfg(feature = "sqlite")]
-use accelerator_sqlite as _;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -336,7 +334,7 @@ fn csv_backed_dataset(dir: &std::path::Path, name: &str) -> Dataset {
     dataset.time_format = Some(TimeFormat::UnixSeconds);
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("arrow".to_string()),
+        engine: Some("cayenne".to_string()),
         mode: Mode::Memory,
         refresh_mode: Some(RefreshMode::Full),
         ..Acceleration::default()

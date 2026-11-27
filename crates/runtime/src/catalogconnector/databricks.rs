@@ -561,8 +561,8 @@ fn table_reference_creator_delta_lake(uc_table: &UCTable) -> Option<TableReferen
         tracing::warn!("{}", uc_table.catalog_managed_skip_warning());
         return None;
     }
-    let storage_location = uc_table.storage_location.as_deref()?;
-    // Don't append a trailing slash here — `DeltaTable::from` calls
+    let storage_location = uc_table.object_storage_location()?;
+    // Don't append a trailing slash here — `DeltaTable::open` calls
     // `ensure_folder_location` which already adds one when needed.
     // Unconditionally appending caused double-slash paths (e.g.
     // "file:///path/to/table//") when the catalog API returned

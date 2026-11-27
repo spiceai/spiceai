@@ -16,6 +16,6 @@
     "crates/cayenne/src/provider/partitioned_wal.rs": 10,
     "crates/cayenne/src/provider/staged_upsert.rs": 1,
     "crates/cayenne/src/provider/staging_wal.rs": 12,
-    "crates/cayenne/src/provider/table.rs": 32
+    "crates/cayenne/src/provider/table.rs": 33
   }
 }

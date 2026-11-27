@@ -20,6 +20,35 @@ nice -n 10 cargo run --release -p cayenne-metastore-model -- run seq-order-two-w
 EXHAUST=1 nice -n 10 cargo run --release -p cayenne-metastore-model -- run seq-order-no-shift
 ```
 
+## Run kinds
+
+Every run demonstrates one of five things; `list` prints the kind first, and
+`RESULT` lines carry `kind=`:
+
+| Kind | What the run shows | How it is declared |
+|---|---|---|
+| `holds` | The design's properties hold: exhaustively within the bound, or not violated on a simulation run's sampled paths (a sampled run has a seed and cannot establish exhaustive safety) | No expected failure |
+| `rule-required` | A safeguard or an assumption is removed and the run must find the named failure, so the design needs it | An expected failure |
+| `rule-not-required` | A safeguard or an assumption is removed and every property still holds, so the design does not need it for safety in that graph | `RULE_NOT_REQUIRED` in `src/lib.rs` |
+| `stronger-property` | The run checks a property stronger than the design guarantees and must find the named failure; no safeguard is removed, so the failure is not evidence that the design needs a rule | `STRONGER_PROPERTIES` in `src/lib.rs` |
+| `current-defect` | The model follows the current code, not the design, and reproduces a known defect in it | `CURRENT_DEFECTS` in `src/lib.rs` |
+
+Separately, a run is `replayed` when the implementation's own tests replay its
+traces: the trace files under `crates/cayenne/tests/traces` and
+`crates/object_store_occ/tests/traces`, and the runs `crates/cayenne`'s mem-tier
+replay names. Those runs check the code; every other run checks the design.
+`REPLAYED_AGAINST_CODE` lists them, and a test keeps that list equal to the runs
+the replay files name. Another test requires every run whose mode names a
+removal (`-no-`, `-ignores-` or `-without-`) and still holds to be listed as
+`rule-not-required`; removals named otherwise, such as `standby-early-safety`,
+are listed by hand.
+
+```sh
+target/release/cayenne-metastore-model list rule-not-required
+target/release/cayenne-metastore-model list current-defect
+target/release/cayenne-metastore-model list replayed
+```
+
 `cite-check` checks the design documents' model citations: every code span
 after `Model:` (in any case) names a run (`prefix*` must match one), to the end
 of the paragraph, row or item when the marker opens it, to the closing
@@ -102,7 +131,7 @@ paths and renders each step as the Explorer does (every enabled action's label
 and text, and the drawing), failing on a panic, an empty label, malformed SVG,
 or a family that stops drawing.
 
-Checkers use 6 threads by default; set `MODEL_THREADS` to change it. Results do not depend on the thread count, and the binary uses mimalloc, because cloning states dominates checking. Models list candidate actions and reject disabled ones in `next_state`, so each successor is computed once; simulation runs, whose checker cannot replay a rejected pick, list only enabled actions. Controls require `EXHAUST=1`. A control stops once it has found its expected failure and every witness it must reach; its other safety properties print `NOT_FOUND`, not `HOLDS`, because the rest of its graph is not explored. A wrong outcome, missing
+Checkers use 6 threads by default; set `MODEL_THREADS` to change it. Results do not depend on the thread count, and the binary uses mimalloc, because cloning states dominates checking. Models list candidate actions and reject disabled ones in `next_state`, so each successor is computed once; simulation runs, whose checker cannot replay a rejected pick, list only enabled actions. Every run whose kind is not `holds` requires `EXHAUST=1`; the README calls these controls. A control stops once it has found its expected failure and every witness it must reach; its other safety properties print `NOT_FOUND`, not `HOLDS`, because the rest of its graph is not explored. A wrong outcome, missing
 required control failure, invalid witness, or checker timeout makes the command fail.
 A sampled run reports `NOT_FOUND`, which does not establish exhaustive safety.
 New exhaustive safe graphs require their essential reachability witnesses; missing
@@ -246,7 +275,9 @@ as a separate maintenance process does.
 
 ## Negative controls
 
-`list` prints every individual bound, seed and expected downstream failure.
+`list` prints every individual bound, seed and expected downstream failure. Rows below
+that hold are `rule-not-required` runs, `replicas-readers-adoption-all-present`
+is a `stronger-property` run, and the rest are `rule-required`.
 
 | Control suffix | Removed safeguard and required downstream failure |
 |---|---|
@@ -1023,10 +1054,11 @@ write their usual reinsert vector stamps and precomputed insert records.
 publication of every staged catalog call. Its `Flush` is idempotent and has no
 durability effect; the object-native run also accepts an empty `Flush`.
 
-All four mutations are based on `mem-tier-seal-delete-only`. Three are negative
+All five mutations are based on `mem-tier-seal-delete-only`. Four are negative
 controls: they keep requiring their named downstream failure even if exhaustive
 exploration finds none, and a missing failure is reported rather than relabeled
-safe or hidden. The fourth, `mem-tier-late-stamp`, expects to hold, because its
+safe or hidden. The fifth, `mem-tier-late-stamp`, is a `rule-not-required` run:
+it expects to hold, because its
 mutation is unobservable rather than unexplored: an insert stamp makes a row
 visible only on the current snapshot's scan, and only while no protected
 snapshot exists (`table.rs`, `InsertRecordHandling`; the key-delete pushdown
@@ -1038,19 +1070,35 @@ that a late stamp stays safe under that rule; the
 [object-native design](../../docs/design/object-native-metastore-technical.md#commit-numbers-and-sequence-numbers)
 records why a design that read the stamp elsewhere would make it required
 again. Bounds
-are three source applies, two seals, two explicit checkpoints, one bake attempt,
+are three source applies, two seals, two explicit checkpoints, two bakes,
 one full-rewrite attempt and one crash/recovery, with budgets retained across
 restart. The second seal is what lets a later seal acknowledge an apply that
 landed while an earlier seal was in flight; with one seal, the source redelivers
-that apply after a restart and `no-capture-reservation` has nothing to break. Six threads and the shared 540-second watchdog apply.
+that apply after a restart and `no-capture-reservation` has nothing to break.
+The second bake is what reads the first bake's residue: the first prunes a delete
+from the RAM index while its vector stays in the catalog, and a key upserted
+again after that delete writes no tombstone of its own. With one bake,
+`no-pruned-floor` has nothing to break (#16706). Six threads and the shared 540-second watchdog apply.
+
+`mem-tier-seal-delete-only-deep` and `mem-tier-seal-delete-only-sqlite-deep` run
+the same protocols with two crash/recoveries and two full-rewrite attempts. A
+second of each is reachable, and each alone multiplies the graph several times
+over: together about 200 million states in 215 s and 53 million in 61 s on an
+M-series Mac, against 14 million in 19 s and 4 million in 5 s for the default
+runs. They are not in `quick`, so a pull request does not run them; `all` (the
+scheduled run) does. Each must reach `second crash` and `second full rewrite
+committed`.
 
 ```sh
 nice -n 10 cargo build --release -p cayenne-metastore-model
 EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-current-3-exhaust
 nice -n 10 target/release/cayenne-metastore-model run mem-tier-seal-delete-only
+EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-seal-delete-only-deep
+EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-seal-delete-only-sqlite-deep
 EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-no-one-call
 EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-no-insert-records
 EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-no-capture-reservation
+EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-no-pruned-floor
 EXHAUST=1 nice -n 10 target/release/cayenne-metastore-model run mem-tier-late-stamp
 nice -n 10 cargo clippy -p cayenne-metastore-model --release --tests --no-deps -- -D warnings
 nice -n 10 cargo test -p cayenne-metastore-model --release --test mem_tier_steps -- --nocapture
@@ -1109,7 +1157,12 @@ the lower of that fence and the highest sequence among the snapshots it folds
 below its cold-tier files, which the model does not have). A tombstone above the
 folded snapshots may still hide an inline seal shadow, which the bake does not
 fold.
-It retains durable vectors and insert records. The replay configures the
+It retains durable vectors and insert records. The tag starts from the RAM
+index's delete max raised to the pruned-delete floor, the newest delete a bake or
+full rewrite has pruned from that index, clamped to a delete the index held
+(`table.rs::protected_merge_delete_fence`, `pruned_through`); the cap below a
+pending delete applies after it. The floor is in-process state: a crash resets it,
+and recovery reloads the pruned deletes from their vectors instead. The replay configures the
 existing `compaction_trigger_protected_snapshots` threshold to 2, so the engine
 keeps zero recent snapshots. The model enables `Bake` only with at least two
 eligible inputs and a clean physical current-file prefix. The all-protected
@@ -1133,7 +1186,8 @@ so its durability survives a later crash. Parsing and enablement follow
 not exhaustive checks during `cargo test`.
 
 Mandatory positive witnesses cover checkpoint stage/flush, stage/crash before
-publish, recovered seal shadow, bake/prune/reinsert/checkpoint, full rewrite,
+publish, recovered seal shadow, bake/prune/reinsert/checkpoint, a bake whose tag
+the pruned-delete floor raises, full rewrite,
 an apply overlapping rewrite, and a later protected snapshot retained by rewrite.
 The optional `protected survivor excluded by pushdown` diagnostic is hypothesis B.
 
@@ -1142,6 +1196,7 @@ The optional `protected survivor excluded by pushdown` diagnostic is hypothesis 
 | `mem-tier-no-one-call` | Stage seal shadow before pure vectors; stage checkpoint insert records after snapshot/vectors/clear, allowing flush/crash between | `recovered reads match the source` |
 | `mem-tier-no-insert-records` | Omit checkpoint insert records and hidden-key RAM upgrade, retaining checkpoint vector stamps | `recovered reads match the source` |
 | `mem-tier-no-capture-reservation` | Reserve the pure-delete seal's shadow sequence after releasing capture | `recovered reads match the source` |
+| `mem-tier-no-pruned-floor` | Tag a bake from the RAM index's delete max alone, without the pruned-delete floor | `recovered reads match the source` |
 | `mem-tier-late-stamp` | Reserve a fresh insert-record stamp at checkpoint staging after a post-capture apply | none: holds (see above) |
 
 Control names retain their original API; their modes have the
@@ -1188,6 +1243,7 @@ plus the existing worktree changes (locations relative to `crates/cayenne/src/`)
 | Checkpoint capture, empty/data arms, precomputed insert records, atomic visibility publish | `provider/table.rs:36381`, `:36481`, `:36682`, `:36923`, `:37001`; `:18294` and `:18348` |
 | Buffered catalog-live state, table flush, position commit before ack | `metastore/object_native.rs:595`, `:642`, `:712`; `provider/table.rs:37878` |
 | Bake fence, clean-prefix gate, partial-filter scan without query pushdown, per-side RAM prune | `provider/table.rs:30780`, `:28799`, `:29210`, `:29430`, `:31338`; `provider/deletion_index.rs:843` |
+| Bake tag raised to the pruned-delete floor, clamped to the index's delete max (#16706) | `provider/table.rs` `protected_merge_delete_fence`, `pruned_through`, `raise_pruned_delete_floor` |
 | Recovery merges vector and record inserts; inline watermark; protected reload | `provider/table.rs:39454`, `:39571`, `:39709`; `provider/delete/vector_io.rs:657`; `provider/table.rs:33190` |
 | Full rewrite capture, drain and fenced publication | `provider/table.rs:25608`, `:25912`, `:25950`, `:26325`, `:26401` |
 | Rewrite scan skips tombstone pushdown | `provider/table.rs:26546`, `:26561` |

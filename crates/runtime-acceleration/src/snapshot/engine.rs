@@ -21,25 +21,8 @@ use std::sync::Arc;
 
 use super::AccelerationEngine;
 
-#[cfg(feature = "sqlite")]
-mod sqlite;
-#[cfg(feature = "sqlite")]
-pub use sqlite::SqliteSnapshotEngine;
-#[cfg(feature = "sqlite")]
-pub(crate) use sqlite::begin_sqlite_restore;
-#[cfg(feature = "sqlite")]
-pub(crate) use sqlite::record_sqlite_restore_aside;
-#[cfg(feature = "sqlite")]
-pub use sqlite::recover_interrupted_sqlite_restore;
-#[cfg(feature = "sqlite")]
-pub use sqlite::wait_for_sqlite_restore;
-
 #[derive(Debug, Snafu)]
 pub enum SnapshotEngineError {
-    #[snafu(display("SQLite snapshot error: {source}"))]
-    #[cfg(feature = "sqlite")]
-    Sqlite { source: sqlite::SqliteSnapshotError },
-
     /// Open-ended variant used by engines that live outside `runtime-acceleration`
     /// (e.g. `CayenneSnapshotEngine` in the runtime crate). The owning crate
     /// formats its rich error to a string and wraps it here.
@@ -62,8 +45,7 @@ impl SnapshotEngineError {
 pub trait SnapshotEngine: Send + Sync {
     /// Hook invoked on the **live** accelerator file *before* it is copied to a
     /// temporary snapshot location. An engine that buffers writes outside the
-    /// primary file — `DuckDB` and `SQLite` both keep a write-ahead log —
-    /// must checkpoint here so that the subsequent `fs::copy` produces a
+    /// primary file, such as in a write-ahead log, must checkpoint here so that the subsequent `fs::copy` produces a
     /// self-contained file. An engine with nothing to flush returns `Ok(())`.
     ///
     /// **Deliberately has no default.** A no-op default is invisible to an engine that
@@ -123,10 +105,10 @@ pub trait SnapshotEngine: Send + Sync {
     ///
     /// Engines that keep state beside the primary file must move it out of the
     /// way here: a connection that opens the path once the restored file is in
-    /// place would otherwise pair it with the *replaced* file's state. `SQLite`
-    /// in WAL mode is the case: the old database's `-wal` and `-shm` would stay
+    /// place would otherwise pair it with the *replaced* file's state. A database
+    /// in write-ahead-log mode is the case: the old database's log would stay
     /// beside the restored file, and a connection opening it applies that stale
-    /// write-ahead log, losing the restored rows for good. Removing them only
+    /// log, losing the restored rows for good. Removing them only
     /// after the rename leaves a window for exactly that connection.
     ///
     /// The move has to be reversible. When the rename does not replace the live
@@ -291,8 +273,6 @@ impl SnapshotEngine for DefaultSnapshotEngine {
 #[must_use]
 pub fn create_snapshot_engine(engine: &AccelerationEngine) -> Arc<dyn SnapshotEngine> {
     match engine {
-        #[cfg(feature = "sqlite")]
-        AccelerationEngine::Sqlite => Arc::new(SqliteSnapshotEngine::new()),
         AccelerationEngine::Cayenne => Arc::new(DefaultSnapshotEngine),
     }
 }

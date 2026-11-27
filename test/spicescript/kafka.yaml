@@ -1,4 +1,5 @@
 name: kafka
+duration: 74s
 tags: [long]
 description: >
   The Kafka connector against Redpanda: JSON messages on a topic are

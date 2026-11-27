@@ -1,4 +1,5 @@
 name: mysql-cdc-partition
+duration: 120s
 description: >
   MySQL CDC resumes after a network partition that closed the runtime's
   connections, after a relay stalls a dump the source still runs, and after a
