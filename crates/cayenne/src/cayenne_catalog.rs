@@ -4612,11 +4612,6 @@ impl MetadataCatalog for CayenneCatalog {
             .await
     }
 
-    // Scans persist per-file statistics in `cayenne_snapshot_file_statistics`.
-    fn records_file_statistics_with_files(&self) -> bool {
-        false
-    }
-
     async fn upsert_snapshot_file(&self, file: &SnapshotFile) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {

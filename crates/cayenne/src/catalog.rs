@@ -1384,12 +1384,6 @@ pub trait MetadataCatalog: Send + Sync {
     /// Clear all per-file statistics rows for a table.
     async fn clear_snapshot_file_statistics(&self, table_id: &str) -> CatalogResult<()>;
 
-    /// Whether the commit that adds a data file records the file's footer
-    /// statistics with it ([`SnapshotFile::recorded_statistics`]). Such a catalog's
-    /// scans read those and never write per-file statistics: a file recorded
-    /// without them is read from its footer. Wrappers must forward this.
-    fn records_file_statistics_with_files(&self) -> bool;
-
     /// Upsert one row of the authoritative per-snapshot data-file manifest
     /// (`cayenne_snapshot_file`) — the complete file set for a snapshot.
     async fn upsert_snapshot_file(&self, file: &SnapshotFile) -> CatalogResult<()>;

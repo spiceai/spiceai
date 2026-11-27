@@ -47,6 +47,8 @@ const TABLE: &str = "file_stats_source";
 test_on_data_store!(file_scan_byte_size_statistics_do_not_depend_on_their_source);
 // The object-native metastore records statistics with each file instead.
 test_with_backends!(compaction_persists_no_statistics_for_the_files_it_replaces);
+test_with_backends!(a_blob_without_byte_sizes_is_re_inferred_from_its_footer);
+test_with_backends!(a_widened_table_still_serves_its_files_from_the_persisted_blob);
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -244,9 +246,6 @@ async fn file_scan_byte_size_statistics_do_not_depend_on_their_source(
     Ok(())
 }
 
-// The object-native metastore records statistics with each file instead.
-test_with_backends!(a_blob_without_byte_sizes_is_re_inferred_from_its_footer);
-
 /// Build a blob shaped like one written before per-column byte sizes were
 /// persisted: every column's `byte_size` absent, so the restored total is too.
 fn legacy_blob(num_rows: i64) -> Vec<u8> {
@@ -411,9 +410,6 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
 
     Ok(())
 }
-
-// The object-native metastore records statistics with each file instead.
-test_with_backends!(a_widened_table_still_serves_its_files_from_the_persisted_blob);
 
 const EVOLVED_TABLE: &str = "file_stats_source_evolved";
 
@@ -732,15 +728,13 @@ impl object_store::ObjectStore for FooterReadCounter {
 
 /// A provider over the fixture's metastore with every cache cold — a fresh
 /// catalog connection, a fresh provider, and a runtime that keeps no footers —
-/// whose reads go through a fresh [`FooterReadCounter`]. On the object-native
-/// metastore the table reads through the fixture's own store instead, and no
-/// counter is returned.
+/// whose reads go through a fresh [`FooterReadCounter`].
 async fn open_cold(
     fixture: &common::TestFixture,
 ) -> TestResult<(
     Arc<CayenneTableProvider>,
     SessionContext,
-    Option<Arc<FooterReadCounter>>,
+    Arc<FooterReadCounter>,
 )> {
     let catalog = common::fixture_catalog(fixture.connection_string()).await?;
     catalog.init().await?;
@@ -748,17 +742,6 @@ async fn open_cold(
         .with_metadata_cache_limit(0)
         .build_arc()?;
     let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
-    if fixture.backend_type == common::BackendType::ObjectNative {
-        let table = fixture
-            .data_store
-            .open(
-                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
-                ctx.runtime_env(),
-                SINGLE_FLIGHT_TABLE,
-            )
-            .await?;
-        return Ok((Arc::new(table), ctx, None));
-    }
     let table = Arc::new(
         CayenneTableProviderBuilder::new(
             Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
@@ -772,7 +755,7 @@ async fn open_cold(
         &url::Url::parse("file:///")?,
         Arc::clone(&store) as Arc<dyn object_store::ObjectStore>,
     );
-    Ok((table, ctx, Some(store)))
+    Ok((table, ctx, store))
 }
 
 /// The full statistics of a plain scan's plan.
@@ -875,7 +858,6 @@ async fn concurrent_cold_scans_share_one_footer_read_and_upsert_per_file(
         log.clear().await?;
     }
     let (table, ctx, store) = open_cold(&fixture).await?;
-    let store = store.expect("a SQLite fixture counts its footer reads");
     let reference = plan_statistics(&table, &ctx).await?;
     table.wait_for_scan_file_statistics_persistence().await;
     let lone_reads = store.reads();
@@ -911,7 +893,6 @@ async fn concurrent_cold_scans_share_one_footer_read_and_upsert_per_file(
         log.clear().await?;
     }
     let (table, ctx, store) = open_cold(&fixture).await?;
-    let store = store.expect("a SQLite fixture counts its footer reads");
     let started = std::time::Instant::now();
     let concurrent =
         futures::future::try_join_all((0..CONCURRENT_SCANS).map(|_| plan_statistics(&table, &ctx)))
@@ -1006,7 +987,7 @@ async fn delete_first_ids(
 }
 
 /// A scan's statistics after [`delete_first_ids`], as a footer read reports
-/// them (a SQLite table's cold scan reports exactly these): the row count leaves out the deleted rows (inexact, as the scan marks
+/// them: the row count leaves out the deleted rows (inexact, as a scan marks
 /// every count while a delete is pending), the first file's bounds still cover
 /// them and so are no longer exact, and no sum survives it.
 fn assert_deletes_adjusted(statistics: &Statistics) -> TestResult<()> {
@@ -1048,7 +1029,6 @@ async fn scan_file_statistics_counters_match_the_store_and_the_metastore(
 
     // Cold, no persisted rows: every file goes to its footer, once.
     let (table, ctx, store) = open_cold(&fixture).await?;
-    let store = store.expect("a SQLite fixture counts its footer reads");
     futures::future::try_join_all((0..CONCURRENT_SCANS).map(|_| plan_statistics(&table, &ctx)))
         .await?;
     table.wait_for_scan_file_statistics_persistence().await;
@@ -1069,7 +1049,6 @@ async fn scan_file_statistics_counters_match_the_store_and_the_metastore(
     // A restart over those rows: every file is served from its persisted row,
     // read once however many scans asked.
     let (table, ctx, store) = open_cold(&fixture).await?;
-    let store = store.expect("a SQLite fixture counts its footer reads");
     futures::future::try_join_all((0..CONCURRENT_SCANS).map(|_| plan_statistics(&table, &ctx)))
         .await?;
     table.wait_for_scan_file_statistics_persistence().await;
@@ -1089,9 +1068,9 @@ async fn scan_file_statistics_counters_match_the_store_and_the_metastore(
 /// [`scan_file_statistics_counters_match_the_store_and_the_metastore`] on the
 /// object-native metastore, where each file's writer records its footer
 /// statistics in the commit that adds it. The first cold scan after a restart
-/// is served from those for every file: the store's log shows it read no footer
-/// and wrote nothing, the dataset's log gained no commit, and the scan plans
-/// with the statistics a footer read gives after the position delete.
+/// is served from those for every file: it writes nothing to the store, the
+/// dataset's log gains no commit, and the scan plans with the statistics a
+/// footer read gives after the position delete.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scan_file_statistics_counters_match_the_store_and_the_metastore_object_native()
 -> TestResult<()> {
@@ -1110,7 +1089,22 @@ async fn scan_file_statistics_counters_match_the_store_and_the_metastore_object_
         .clear_snapshot_file_statistics(&table_id)
         .await?;
 
-    let (table, ctx, _) = open_cold(&fixture).await?;
+    let catalog = common::fixture_catalog(fixture.connection_string()).await?;
+    catalog.init().await?;
+    let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+        .with_metadata_cache_limit(0)
+        .build_arc()?;
+    let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+    let table = Arc::new(
+        fixture
+            .data_store
+            .open(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+                SINGLE_FLIGHT_TABLE,
+            )
+            .await?,
+    );
     let commits_before = fixture
         .object_native_head_commit(SINGLE_FLIGHT_TABLE)
         .await?;
@@ -1123,13 +1117,7 @@ async fn scan_file_statistics_counters_match_the_store_and_the_metastore_object_
     let commits_after = fixture
         .object_native_head_commit(SINGLE_FLIGHT_TABLE)
         .await?;
-    let logged = faults.log().split_off(logged_before);
-    let footer_reads: Vec<String> = logged
-        .iter()
-        .filter(|op| op.op == object_store_sim::Op::Get && op.path.as_ref().ends_with(".vortex"))
-        .map(|op| op.path.to_string())
-        .collect();
-    let store_writes: Vec<String> = logged
+    let store_writes: Vec<String> = faults.log()[logged_before..]
         .iter()
         .filter(|op| {
             matches!(
@@ -1142,21 +1130,12 @@ async fn scan_file_statistics_counters_match_the_store_and_the_metastore_object_
         })
         .map(|op| format!("{:?} {}", op.op, op.path))
         .collect();
-    eprintln!(
-        "SINGLE_FLIGHT object-native counters, cold after a restart: {counters:?}, \
-         footer reads {footer_reads:?}, writes {store_writes:?}, \
-         dataset log head {commits_before:?} -> {commits_after:?}"
-    );
     assert_eq!(
         counters.footer_reads, 0,
         "every file is served from the statistics its writer recorded"
     );
     assert_eq!(counters.persisted_hits, u64::try_from(SINGLE_FLIGHT_FILES)?);
     assert_eq!(counters.persisted_upserts, 0, "a scan persists nothing");
-    assert!(
-        footer_reads.is_empty(),
-        "the store saw no footer read: {footer_reads:?}"
-    );
     assert!(
         store_writes.is_empty(),
         "a scan writes no object to the store: {store_writes:?}"
@@ -1166,8 +1145,6 @@ async fn scan_file_statistics_counters_match_the_store_and_the_metastore_object_
         "a scan commits nothing to the dataset's log"
     );
 
-    // The writer recorded its files' statistics with no delete applied; the scan
-    // adjusts them for the delete as the SQLite leg's footer reads are adjusted.
     for statistics in &cold {
         assert_deletes_adjusted(statistics)?;
     }

@@ -995,8 +995,8 @@ impl FileFormat for VortexFormat {
         let file_metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
 
         let statistics = SpawnedTask::spawn(async move {
-            // Try to get cached metadata first
-            let cached_metadata = file_metadata_cache
+            // The cached footer, if any; otherwise open the file and cache it.
+            let cached = file_metadata_cache
                 .get(&object.location)
                 .filter(|entry| entry.is_valid_for(&object))
                 .and_then(|entry| {
@@ -1005,67 +1005,41 @@ impl FileFormat for VortexFormat {
                         .as_any()
                         .downcast_ref::<CachedVortexMetadata>()
                         .map(|m| {
-                            (
-                                m.footer().dtype().clone(),
-                                m.footer().statistics().cloned(),
-                                m.footer().row_count(),
-                            )
+                            footer_statistics(&session, &object.location, m.footer(), &table_schema)
                         })
                 });
-
-            let (dtype, file_stats, row_count) = if let Some(metadata) = cached_metadata {
-                metadata
-            } else {
-                // Not cached - open the file
-                let reader = Arc::new(ObjectStoreReadAt::new(
-                    store,
-                    object.location.clone(),
-                    session.handle(),
-                ));
-
-                let vxf = session
-                    .open_options()
-                    .with_initial_read_size(opts.footer_initial_read_size_bytes)
-                    .with_file_size(object.size)
-                    .open_read(reader)
-                    .await
-                    .map_err(|e| {
-                        DataFusionError::Execution(format!(
-                            "Failed to open Vortex file {}: {e}",
-                            object.location
-                        ))
-                    })?;
-
-                // Cache the metadata
-                let cached = Arc::new(CachedVortexMetadata::new(&vxf));
-                cache_footer(&file_metadata_cache, object.clone(), cached, "infer_stats");
-
-                (
-                    vxf.dtype().clone(),
-                    vxf.file_stats().cloned(),
-                    vxf.row_count(),
-                )
-            };
-
-            footer_parts_statistics(
-                &session,
-                &object.location,
-                &dtype,
-                file_stats.as_ref(),
-                row_count,
-                &table_schema,
-            )
+            if let Some(statistics) = cached {
+                return statistics;
+            }
+            let reader = Arc::new(ObjectStoreReadAt::new(
+                store,
+                object.location.clone(),
+                session.handle(),
+            ));
+            let vxf = session
+                .open_options()
+                .with_initial_read_size(opts.footer_initial_read_size_bytes)
+                .with_file_size(object.size)
+                .open_read(reader)
+                .await
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to open Vortex file {}: {e}",
+                        object.location
+                    ))
+                })?;
+            let cached = Arc::new(CachedVortexMetadata::new(&vxf));
+            let statistics =
+                footer_statistics(&session, &object.location, cached.footer(), &table_schema);
+            cache_footer(&file_metadata_cache, object.clone(), cached, "infer_stats");
+            statistics
         })
         .await
         .map_err(|e| {
             DataFusionError::Execution(format!("Failed to join Vortex infer_stats task: {e}"))
         })??;
 
-        if let Some(provider) = self.access_plan_provider.as_ref() {
-            Ok(provider.adjust_statistics(&object_for_adjustment, statistics))
-        } else {
-            Ok(statistics)
-        }
+        Ok(self.adjust_statistics(&object_for_adjustment, statistics))
     }
 
     async fn create_physical_plan(
@@ -1322,16 +1296,23 @@ fn scalar_stat_to_df(
         .unwrap_or(stats::Precision::Absent)
 }
 
-/// The statistics `DataFusion` plans with for a Vortex file, from the parts of
-/// its footer, laid out as `table_schema`: no deletion is applied.
-fn footer_parts_statistics(
+/// The statistics [`VortexFormat`]'s `infer_stats` reports for the file at
+/// `location` whose footer is `footer`, laid out as `table_schema`, before an
+/// access plan provider adjusts them for deleted rows. A writer that has just
+/// written the file can record them without reading it back.
+///
+/// # Errors
+///
+/// The footer's type is not a struct, its row count does not fit in `usize`,
+/// or a column of `table_schema` has no Vortex type.
+pub fn footer_statistics(
     session: &VortexSession,
     location: &Path,
-    dtype: &DType,
-    file_stats: Option<&FileStatistics>,
-    row_count: u64,
+    footer: &Footer,
     table_schema: &Schema,
 ) -> DFResult<Statistics> {
+    let dtype = footer.dtype();
+    let row_count = footer.row_count();
     if dtype.as_struct_fields_opt().is_none() {
         return Err(DataFusionError::Execution(format!(
             "Failed to infer statistics for Vortex file {location}: file dtype is not a struct"
@@ -1345,7 +1326,7 @@ fn footer_parts_statistics(
     })?;
 
     // Evaluate the statistics for each column that we are able to return to DataFusion.
-    let Some(file_stats) = file_stats else {
+    let Some(file_stats) = footer.statistics() else {
         // If the file has no column stats, the best we can do is return a row count.
         return Ok(Statistics {
             num_rows: Precision::Exact(num_rows),
@@ -1441,31 +1422,6 @@ fn footer_parts_statistics(
         total_byte_size,
         column_statistics,
     })
-}
-
-/// The statistics [`VortexFormat`]'s `infer_stats` reports for the file at
-/// `location` whose footer is `footer`, laid out as `table_schema`, before an
-/// access plan provider adjusts them for deleted rows. A writer that has just
-/// written the file can record them without reading it back.
-///
-/// # Errors
-///
-/// The footer's type is not a struct, its row count does not fit in `usize`,
-/// or a column of `table_schema` has no Vortex type.
-pub fn footer_statistics(
-    session: &VortexSession,
-    location: &Path,
-    footer: &Footer,
-    table_schema: &Schema,
-) -> DFResult<Statistics> {
-    footer_parts_statistics(
-        session,
-        location,
-        footer.dtype(),
-        footer.statistics(),
-        footer.row_count(),
-        table_schema,
-    )
 }
 
 /// The statistics a file records for its top-level column `name`, with the column's Vortex type,

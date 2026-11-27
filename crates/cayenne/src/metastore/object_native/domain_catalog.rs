@@ -1385,9 +1385,6 @@ impl MetadataCatalog for Domain {
             function: "object-native: import_dataset_slice".to_string(),
         })
     }
-    fn records_file_statistics_with_files(&self) -> bool {
-        true
-    }
     fn keeps_retirement_record(&self) -> bool {
         true
     }

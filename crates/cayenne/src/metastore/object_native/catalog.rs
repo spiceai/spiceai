@@ -565,9 +565,6 @@ impl MetadataCatalog for ObjectNativeCatalog {
             .clear_snapshot_file_statistics(table_id)
             .await
     }
-    fn records_file_statistics_with_files(&self) -> bool {
-        true
-    }
     async fn upsert_snapshot_file(&self, file: &SnapshotFile) -> CatalogResult<()> {
         self.for_table(&file.table_id)
             .upsert_snapshot_file(file)

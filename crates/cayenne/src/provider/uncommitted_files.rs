@@ -53,12 +53,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::SchemaRef;
 use parking_lot::Mutex;
 use vortex::file::Footer;
 use vortex::session::VortexSession;
 use vortex_datafusion::VortexWriteObserver;
 
+use super::table::LiveSchema;
 use crate::metadata::RecordedFileStatistics;
 
 /// Files written into snapshot directories and not yet named by a commit, by
@@ -314,17 +314,14 @@ impl UncommittedFiles {
     }
 }
 
-/// Records every file one write closes into [`UncommittedFiles`] under the
-/// snapshot it writes, with the footer statistics of `schema`, the table's,
-/// whose [`crate::stats::schema_identity`] is `schema_identity`.
+/// Records every file one write closes into [`UncommittedFiles`], with the
+/// footer statistics its commit records.
 pub(crate) struct UncommittedFilesObserver {
     pub(crate) files: Arc<UncommittedFiles>,
     pub(crate) snapshot_id: String,
     /// The session the write's format converts types with, as its scans do.
     pub(crate) session: VortexSession,
-    pub(crate) schema: SchemaRef,
-    /// `None` records no statistics.
-    pub(crate) schema_identity: Option<u64>,
+    pub(crate) schema: Arc<LiveSchema>,
 }
 
 impl std::fmt::Debug for UncommittedFilesObserver {
@@ -344,12 +341,12 @@ impl UncommittedFilesObserver {
         file_path: &object_store::path::Path,
         footer: &Footer,
     ) -> Option<RecordedFileStatistics> {
-        let schema = self.schema_identity?;
+        let schema = self.schema.identity?;
         let statistics = match vortex_datafusion::footer_statistics(
             &self.session,
             file_path,
             footer,
-            &self.schema,
+            &self.schema.schema,
         ) {
             Ok(statistics) => statistics,
             Err(error) => {
@@ -365,7 +362,7 @@ impl UncommittedFilesObserver {
             rows: i64::try_from(footer.row_count()).ok()?,
             blob: bytes::Bytes::from(crate::stats::statistics_to_persisted_blob(
                 &statistics,
-                &self.schema,
+                &self.schema.schema,
             )?),
             schema,
         })

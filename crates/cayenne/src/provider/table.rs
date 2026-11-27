@@ -2879,7 +2879,9 @@ pub struct CayenneTableProvider {
     /// loaded (old files read under the old schema stay valid). All schema
     /// readers must go through [`Self::table_schema`] rather than
     /// `table_metadata.schema`, which is frozen at open time.
-    table_schema: Arc<ArcSwap<arrow_schema::Schema>>,
+    table_schema: Arc<ArcSwap<LiveSchema>>,
+    /// [`Self::data_in_object_native_location`], fixed by the table's path.
+    data_in_object_native_location: bool,
     /// Reference to the metadata catalog for file operations
     catalog: Arc<dyn MetadataCatalog>,
     /// Underlying Vortex `ListingTable` that scans all virtual files in the table directory.
@@ -4978,6 +4980,21 @@ struct SubsetRewriteCarry {
 /// ([`CayenneTableProvider::collect_scan_file_statistics`]): the file and how to
 /// read it, the schema the statistics are computed in, and the cache generation
 /// the collection started in.
+/// The table schema with the [`crate::stats::schema_identity`] that recorded
+/// file statistics laid out as it carry, swapped together.
+#[derive(Debug)]
+pub(crate) struct LiveSchema {
+    pub(crate) schema: SchemaRef,
+    pub(crate) identity: Option<u64>,
+}
+
+impl LiveSchema {
+    fn new(schema: SchemaRef) -> Self {
+        let identity = crate::stats::schema_identity(&schema);
+        Self { schema, identity }
+    }
+}
+
 struct ScanFileStatisticsRequest<'a> {
     state: &'a dyn Session,
     snapshot_id: &'a str,
@@ -4987,9 +5004,6 @@ struct ScanFileStatisticsRequest<'a> {
     table_schema: &'a SchemaRef,
     schema_fingerprint: &'a Arc<SchemaFingerprint>,
     generation: u64,
-    /// [`crate::stats::schema_identity`] of `table_schema` when the table
-    /// records file statistics with its files.
-    recorded_schema: Option<u64>,
 }
 
 /// What a data-bearing mem-tier checkpoint commits beside its tombstones and
@@ -7124,7 +7138,7 @@ impl CayenneTableProvider {
     /// always prefer it over `table_metadata.schema`, which is frozen at open.
     #[must_use]
     pub fn table_schema(&self) -> SchemaRef {
-        self.table_schema.load_full()
+        Arc::clone(&self.table_schema.load().schema)
     }
 
     /// The schema advertised to query planning and produced by `scan()`: the
@@ -7299,7 +7313,8 @@ impl CayenneTableProvider {
                     .await
                     .map_err(|source| Error::Catalog { source })?;
             }
-            self.table_schema.store(Arc::clone(&plan.evolved_schema));
+            self.table_schema
+                .store(Arc::new(LiveSchema::new(Arc::clone(&plan.evolved_schema))));
             if drop_table_stats {
                 self.cold_manifest.store(Arc::new(None));
             }
@@ -9940,7 +9955,7 @@ impl CayenneTableProvider {
     /// The table path the metastore recorded at creation is the placement record
     /// (see [`crate::metastore_layout::is_object_native_data_path`]).
     pub(crate) fn data_in_object_native_location(&self) -> bool {
-        crate::metastore_layout::is_object_native_data_path(&self.table_metadata.path)
+        self.data_in_object_native_location
     }
 
     /// Whether `id` names a reserved directory of the table rather than a
@@ -12788,9 +12803,12 @@ impl CayenneTableProvider {
             test_rewrite_capture_probe: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_rewrite_post_capture_hook: Arc::new(ParkingMutex::new(None)),
-            table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
+            table_schema: Arc::new(ArcSwap::from_pointee(LiveSchema::new(Arc::clone(
                 &table_metadata.schema,
-            ))),
+            )))),
+            data_in_object_native_location: crate::metastore_layout::is_object_native_data_path(
+                &table_metadata.path,
+            ),
             table_metadata,
             catalog,
             listing_table: Arc::new(ArcSwap::new(listing_table)),
@@ -13905,8 +13923,7 @@ impl CayenneTableProvider {
                     files: Arc::clone(&self.uncommitted_files),
                     snapshot_id: snapshot_id.to_string(),
                     session: write_format.session().clone(),
-                    schema_identity: crate::stats::schema_identity(&self.table_schema()),
-                    schema: self.table_schema(),
+                    schema: self.table_schema.load_full(),
                 },
             ));
         }
@@ -15310,6 +15327,7 @@ impl CayenneTableProvider {
             table_metadata: self.table_metadata.clone(),
             // Shared so a live schema swap is observed by every writer clone.
             table_schema: Arc::clone(&self.table_schema),
+            data_in_object_native_location: self.data_in_object_native_location,
             catalog: Arc::clone(&self.catalog),
             listing_table: Arc::clone(&self.listing_table),
             listing_fence: Arc::clone(&self.listing_fence),
@@ -28326,20 +28344,15 @@ impl CayenneTableProvider {
     }
 
     /// Whether this table's writers record each data file's footer statistics
-    /// in the commit that adds it, and its scans read those and persist none:
-    /// a table in the object-native location, whose writes report every file
-    /// they close ([`super::uncommitted_files::UncommittedFilesObserver`]), on a
-    /// catalog that keeps them.
+    /// in the commit that adds it, so its scans read those and persist none:
+    /// only a table in the object-native location reports every file it writes.
     pub(crate) fn records_file_statistics(&self) -> bool {
-        self.data_in_object_native_location() && self.catalog.records_file_statistics_with_files()
+        self.data_in_object_native_location()
     }
 
     /// The row count and footer statistics a manifest row of `file_name`
-    /// records on a table whose writers record statistics: those the file's
-    /// writer computed, if this process wrote it and no commit names it yet,
-    /// else those of `existing`, the snapshot's committed row for it. Without
-    /// statistics the count is `existing`'s, which an earlier build recorded,
-    /// or 0.
+    /// records: its writer's if this process wrote it, else `existing`'s, so a
+    /// rebuilt manifest keeps what the file's commit recorded.
     pub(crate) fn file_statistics_to_record(
         &self,
         file_name: &str,
@@ -33802,12 +33815,7 @@ impl CayenneTableProvider {
                 &store,
                 self.context.file_format().as_ref(),
                 file,
-                (
-                    &self.table_schema(),
-                    self.records_file_statistics()
-                        .then(|| crate::stats::schema_identity(&self.table_schema()))
-                        .flatten(),
-                ),
+                &self.table_schema(),
             )
             .await?;
         Ok(match statistics.num_rows {
@@ -46637,13 +46645,6 @@ impl CayenneTableProvider {
                 self.snapshot_file_list(request, &store).await?
             };
 
-        // Computed once for the scan; a file's recorded statistics are used
-        // only when they carry it.
-        let recorded_schema = if collect_stats && self.records_file_statistics() {
-            crate::stats::schema_identity(&request.file_statistics_schema)
-        } else {
-            None
-        };
         let files = file_list
             .map(|part_file| async {
                 let part_file = part_file?;
@@ -46654,7 +46655,7 @@ impl CayenneTableProvider {
                         &store,
                         request.options.listing.format.as_ref(),
                         &part_file,
-                        (&request.file_statistics_schema, recorded_schema),
+                        &request.file_statistics_schema,
                     )
                     .await?
                 } else if collect_stats {
@@ -46753,7 +46754,7 @@ impl CayenneTableProvider {
         store: &Arc<dyn ObjectStore>,
         format: &dyn FileFormat,
         part_file: &PartitionedFile,
-        (table_schema, recorded_schema): (&SchemaRef, Option<u64>),
+        table_schema: &SchemaRef,
     ) -> datafusion_common::Result<Arc<Statistics>> {
         // The statistics below are computed against the table schema, so a cached
         // entry is valid only for the schema it was computed with.
@@ -46785,7 +46786,6 @@ impl CayenneTableProvider {
             table_schema,
             schema_fingerprint: &schema_fingerprint,
             generation,
-            recorded_schema,
         };
         flight
             .cell()
@@ -46846,10 +46846,8 @@ impl CayenneTableProvider {
         // changed during the read never returns to `table_schema`, so the row is
         // not used. Footer I/O below stays outside the lock.
         //
-        // A table whose writers record each file's footer statistics in the
-        // commit that adds it serves those, which its manifest listing attached
-        // to the file, when they are laid out as this scan's schema, and this
-        // scan writes nothing: any other file is read from its footer.
+        // Recorded statistics are used only when laid out as this scan's schema:
+        // bounds decode by the scan's column types.
         let recorded_with_files = self.records_file_statistics();
         let restored =
             if written_since_open || table_schema.as_ref() != self.table_schema().as_ref() {
@@ -46858,7 +46856,11 @@ impl CayenneTableProvider {
                 part_file
                     .extensions
                     .get::<RecordedFileStatistics>()
-                    .filter(|recorded| Some(recorded.schema) == request.recorded_schema)
+                    .filter(|recorded| {
+                        let live = self.table_schema.load();
+                        live.schema.as_ref() == table_schema.as_ref()
+                            && live.identity == Some(recorded.schema)
+                    })
                     .and_then(|recorded| {
                         crate::stats::restore_persisted_statistics(
                             &recorded.blob,
@@ -46909,7 +46911,7 @@ impl CayenneTableProvider {
                 Arc::new(adjust_file_statistics_for_deletions(
                     request.format,
                     &part_file.object_meta,
-                    Statistics::clone(&restored.statistics),
+                    Arc::unwrap_or_clone(restored.statistics),
                 ))
             } else {
                 restored.statistics
@@ -47000,7 +47002,7 @@ impl CayenneTableProvider {
         tokio::spawn(async move {
             let _pending = pending;
             let _guard = lock.lock().await;
-            if collected_under.as_ref() != live_schema.load_full().as_ref()
+            if collected_under.as_ref() != live_schema.load().schema.as_ref()
                 || !flights.is_current(generation)
             {
                 return;

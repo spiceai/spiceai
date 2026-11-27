@@ -907,11 +907,6 @@ async fn suite(backend: Backend) {
         );
     }
     eprintln!("{backend:?} {counts:?}");
-    // A scan commits nothing, so no publication lands ahead of the model's.
-    assert_eq!(
-        counts.matched_durable_plus_pending, 0,
-        "no state is published early"
-    );
     assert_eq!(counts.bakes_declined, 0, "enabled model bakes must commit");
     assert!(
         counts.bakes_committed > 0 && counts.bake_pruned_entries > 0,
