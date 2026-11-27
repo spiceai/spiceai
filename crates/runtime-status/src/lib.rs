@@ -100,6 +100,10 @@ pub struct RuntimeStatus {
     statuses: Arc<RwLock<HashMap<String, ComponentState>>>,
     /// Tracks components that have been in the Ready state at least once.
     ever_ready_components: Arc<RwLock<HashSet<String>>>,
+    /// Components that entered `Error` before their first `Ready`. Cleared on
+    /// first `Ready`. Used only by [`Self::is_ready_allowing_unhealthy`]: retry
+    /// passes through `Refreshing`/`Initializing` must not flip that probe.
+    failed_before_first_ready: Arc<RwLock<HashSet<String>>>,
     /// When each dataset was last refreshed and is next due, by dataset name.
     dataset_freshness: Arc<RwLock<HashMap<String, DatasetFreshness>>>,
     /// The parent refresher that schedules each synchronized dataset.
@@ -136,6 +140,7 @@ impl Default for RuntimeStatus {
         Self {
             statuses: Arc::new(RwLock::new(HashMap::new())),
             ever_ready_components: Arc::new(RwLock::new(HashSet::new())),
+            failed_before_first_ready: Arc::new(RwLock::new(HashSet::new())),
             dataset_freshness: Arc::new(RwLock::new(HashMap::new())),
             dataset_refresh_sources: Arc::new(RwLock::new(HashMap::new())),
             is_shutdown: Arc::new(AtomicBool::new(false)),
@@ -199,6 +204,24 @@ impl RuntimeStatus {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(component_name.to_string());
+            self.failed_before_first_ready
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(component_name);
+        } else if matches!(status, ComponentStatus::Error(_)) {
+            // Lock order: `ever_ready_components` then `failed_before_first_ready`,
+            // matching [`Self::is_ready_with`].
+            let ever_ready = self
+                .ever_ready_components
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !ever_ready.contains(component_name) {
+                drop(ever_ready);
+                self.failed_before_first_ready
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(component_name.to_string());
+            }
         }
     }
 
@@ -484,20 +507,26 @@ impl RuntimeStatus {
     /// Like [`Self::is_ready`], but a component currently in `Error` does not
     /// hold readiness back under `OnLoad`: the runtime counts as ready once
     /// every other component has been ready at least once, so a single failed
-    /// dataset no longer keeps the whole runtime out of service. A component
-    /// still on its first load (`Initializing`, or `Refreshing` before it was
-    /// ever ready) still blocks. Under `OnRegistration` this is the same as
-    /// [`Self::is_ready`], which already treats `Error` as ready-enough.
+    /// dataset no longer keeps the whole runtime out of service.
+    ///
+    /// A component that has never been ready and has failed at least once stays
+    /// in that unhealthy bucket until its first `Ready`, including while a retry
+    /// puts it in `Refreshing` or `Initializing`. A component still on its first
+    /// load (`Initializing`, or `Refreshing` before any failure) still blocks.
+    /// Under `OnRegistration` this is the same as [`Self::is_ready`], which
+    /// already treats `Error` as ready-enough.
     ///
     /// One guard: under `OnLoad`, when the Spicepod has at least one (non-disabled)
-    /// dataset and every dataset is in `Error`, the runtime stays not ready, so
+    /// dataset and every dataset is unhealthy in this sense (`Error`, or retrying
+    /// after a failure before first ready), the runtime stays not ready, so
     /// a runtime with nothing to serve is never routed to. A partly broken
     /// runtime serves.
     ///
     /// Backs `GET /v1/ready?allow_unhealthy=true`, which an orchestrator can use
     /// as its readiness probe to route traffic to the healthy components of a
     /// runtime whose load has settled with some components failed, while
-    /// `GET /v1/ready` keeps reporting full readiness.
+    /// `GET /v1/ready` keeps reporting full readiness. The user-visible component
+    /// status is unchanged: this decision is only for that probe.
     #[must_use]
     pub fn is_ready_allowing_unhealthy(&self) -> bool {
         self.is_ready_with(UnhealthyComponents::Allow)
@@ -539,10 +568,14 @@ impl RuntimeStatus {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
+                let failed_before_first_ready = match self.failed_before_first_ready.read() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
 
                 // Tolerating failed components must not report a runtime ready when it has
-                // nothing to serve: if the Spicepod has datasets and every one of them failed,
-                // stay not ready.
+                // nothing to serve: if the Spicepod has datasets and every one of them is
+                // failed, or retrying after a failure before first ready, stay not ready.
                 if unhealthy == UnhealthyComponents::Allow {
                     let mut datasets = statuses
                         .iter()
@@ -552,8 +585,13 @@ impl RuntimeStatus {
                         })
                         .peekable();
                     if datasets.peek().is_some()
-                        && datasets
-                            .all(|(_, state)| matches!(state.status, ComponentStatus::Error(_)))
+                        && datasets.all(|(component, state)| {
+                            Self::is_unhealthy_for_allow(
+                                component,
+                                state,
+                                &failed_before_first_ready,
+                            )
+                        })
                     {
                         return false;
                     }
@@ -565,9 +603,13 @@ impl RuntimeStatus {
                 statuses
                     .iter()
                     .filter(|(_, state)| !matches!(state.status, ComponentStatus::Disabled))
-                    .filter(|(_, state)| {
+                    .filter(|(component, state)| {
                         unhealthy == UnhealthyComponents::Block
-                            || !matches!(state.status, ComponentStatus::Error(_))
+                            || !Self::is_unhealthy_for_allow(
+                                component,
+                                state,
+                                &failed_before_first_ready,
+                            )
                     })
                     .all(|(component, _)| ever_ready.contains(component))
             }
@@ -576,6 +618,22 @@ impl RuntimeStatus {
             RuntimeReadyState::OnRegistration => statuses
                 .values()
                 .all(|state| !matches!(state.status, ComponentStatus::ShuttingDown)),
+        }
+    }
+
+    /// Unhealthy for `allow_unhealthy`: currently `Error`, or never ready and
+    /// already failed at least once (a retry in `Refreshing`/`Initializing`).
+    /// `Ready` is never skipped. User-visible status is not this classification.
+    #[must_use]
+    fn is_unhealthy_for_allow(
+        component: &str,
+        state: &ComponentState,
+        failed_before_first_ready: &HashSet<String>,
+    ) -> bool {
+        match state.status {
+            ComponentStatus::Error(_) => true,
+            ComponentStatus::Ready => false,
+            _ => failed_before_first_ready.contains(component),
         }
     }
 
@@ -1201,12 +1259,113 @@ mod tests {
         assert!(!status.is_ready());
         assert!(status.is_ready_allowing_unhealthy());
 
-        // A retry that puts the failed dataset back on its first load blocks again.
+        // A retry after that failure stays unhealthy for allow_unhealthy; it does
+        // not flip the probe back to not-ready. Visible status is still the retry.
         status.update_dataset(&bad, ComponentStatus::Initializing);
-        assert!(!status.is_ready_allowing_unhealthy());
+        assert_eq!(
+            status.get_dataset_status(&bad),
+            Some(ComponentStatus::Initializing)
+        );
+        assert!(!status.is_ready());
+        assert!(status.is_ready_allowing_unhealthy());
 
         // Recovery makes both checks pass.
         status.update_dataset(&bad, ComponentStatus::Ready);
+        assert!(status.is_ready());
+        assert!(status.is_ready_allowing_unhealthy());
+    }
+
+    #[test]
+    fn test_is_ready_allowing_unhealthy_holds_through_error_refreshing_retry_cycle() {
+        let status = RuntimeStatus::new();
+        let good = TableReference::bare("good");
+        let bad = TableReference::bare("bad");
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+
+        status.update_dataset(&good, ComponentStatus::Ready);
+        status.update_dataset(&bad, ComponentStatus::Initializing);
+        assert!(!status.is_ready());
+        assert!(!status.is_ready_allowing_unhealthy());
+
+        status.update_dataset(
+            &bad,
+            ComponentStatus::error_with_message("bucket not found"),
+        );
+        assert!(!status.is_ready());
+        assert!(status.is_ready_allowing_unhealthy());
+        assert_eq!(
+            status.get_dataset_status(&bad),
+            Some(ComponentStatus::error_with_message("bucket not found"))
+        );
+
+        for _ in 0..3 {
+            status.update_dataset(&bad, ComponentStatus::Refreshing);
+            assert_eq!(
+                status.get_dataset_status(&bad),
+                Some(ComponentStatus::Refreshing)
+            );
+            assert!(!status.is_ready());
+            assert!(status.is_ready_allowing_unhealthy());
+
+            status.update_dataset(
+                &bad,
+                ComponentStatus::error_with_message("bucket not found"),
+            );
+            assert_eq!(
+                status.get_dataset_status(&bad),
+                Some(ComponentStatus::error_with_message("bucket not found"))
+            );
+            assert!(!status.is_ready());
+            assert!(status.is_ready_allowing_unhealthy());
+        }
+    }
+
+    #[test]
+    fn test_is_ready_allowing_unhealthy_blocks_refreshing_before_any_failure() {
+        let status = RuntimeStatus::new();
+        let good = TableReference::bare("good");
+        let slow = TableReference::bare("slow");
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+
+        status.update_dataset(&good, ComponentStatus::Ready);
+        status.update_dataset(&slow, ComponentStatus::Refreshing);
+        assert_eq!(
+            status.get_dataset_status(&slow),
+            Some(ComponentStatus::Refreshing)
+        );
+        assert!(!status.is_ready());
+        assert!(!status.is_ready_allowing_unhealthy());
+    }
+
+    #[test]
+    fn test_is_ready_allowing_unhealthy_clears_sticky_failure_on_first_ready() {
+        let status = RuntimeStatus::new();
+        let good = TableReference::bare("good");
+        let bad = TableReference::bare("bad");
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+
+        status.update_dataset(&good, ComponentStatus::Ready);
+        status.update_dataset(
+            &bad,
+            ComponentStatus::error_with_message("bucket not found"),
+        );
+        status.update_dataset(&bad, ComponentStatus::Refreshing);
+        assert!(!status.is_ready());
+        assert!(status.is_ready_allowing_unhealthy());
+
+        status.update_dataset(&bad, ComponentStatus::Ready);
+        assert!(status.is_ready());
+        assert!(status.is_ready_allowing_unhealthy());
+
+        // After the first Ready, a later refresh is the ordinary ever-ready path:
+        // both probes stay ready. Disabling the healthy dataset would make a
+        // stale sticky flag look like "every dataset failed" during that refresh.
+        status.update_dataset(&good, ComponentStatus::Disabled);
+        status.update_dataset(&bad, ComponentStatus::Refreshing);
+        assert_eq!(
+            status.get_dataset_status(&bad),
+            Some(ComponentStatus::Refreshing)
+        );
         assert!(status.is_ready());
         assert!(status.is_ready_allowing_unhealthy());
     }
@@ -1250,6 +1409,32 @@ mod tests {
 
         // A disabled dataset is not counted: the only remaining dataset failed.
         status.update_dataset(&a, ComponentStatus::Disabled);
+        assert!(!status.is_ready_allowing_unhealthy());
+    }
+
+    #[test]
+    fn test_is_ready_allowing_unhealthy_stays_not_ready_when_every_dataset_is_retrying_after_failure()
+     {
+        let status = RuntimeStatus::new();
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+        let a = TableReference::bare("a");
+        let b = TableReference::bare("b");
+
+        status.update_dataset(&a, ComponentStatus::error_with_message("secret not found"));
+        status.update_dataset(&b, ComponentStatus::error_with_message("bucket not found"));
+        assert!(!status.is_ready());
+        assert!(!status.is_ready_allowing_unhealthy());
+
+        status.update_dataset(&b, ComponentStatus::Refreshing);
+        assert_eq!(
+            status.get_dataset_status(&b),
+            Some(ComponentStatus::Refreshing)
+        );
+        assert!(!status.is_ready());
+        assert!(!status.is_ready_allowing_unhealthy());
+
+        status.update_dataset(&a, ComponentStatus::Refreshing);
+        assert!(!status.is_ready());
         assert!(!status.is_ready_allowing_unhealthy());
     }
 

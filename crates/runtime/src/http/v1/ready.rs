@@ -49,10 +49,13 @@ pub struct ReadyQuery {
     #[serde(default)]
     pub min_ready_executors_percent: Option<u8>,
 
-    /// When `true`, a component that failed to load (status `Error`) does not hold readiness back:
-    /// the runtime reports ready once every other component has loaded, so the healthy datasets
-    /// can be served while the failed one reports its error. A component still on its first load
-    /// still blocks, and a runtime whose datasets have all failed stays not ready. Defaults to
+    /// When `true`, a component that failed to load does not hold readiness back: the runtime
+    /// reports ready once every other component has loaded, so the healthy datasets can be served
+    /// while the failed one reports its error. A component still on its first load
+    /// (`Initializing`, or `Refreshing` before any failure) still blocks. After a component has
+    /// failed at least once without ever becoming ready, retry passes through `Refreshing` /
+    /// `Initializing` keep it unhealthy until the first successful load. A runtime whose datasets
+    /// have all failed, or are retrying after such a failure, stays not ready. Defaults to
     /// `false`, where every component must have loaded.
     #[serde(default)]
     pub allow_unhealthy: bool,
@@ -100,7 +103,8 @@ impl ReadyQuery {
 /// ```
 ///
 /// To route traffic to the healthy datasets of a runtime where one dataset failed to load, while
-/// still waiting for every dataset to finish its first load:
+/// still waiting for every dataset to finish its first attempt (retries after a failure do not
+/// flip the probe back to not ready):
 /// ```yaml
 /// readinessProbe:
 ///  httpGet:
@@ -694,5 +698,106 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    async fn ready_http_codes(status: Arc<RuntimeStatus>) -> (StatusCode, StatusCode) {
+        let plain = get(
+            Extension(Arc::clone(&status)),
+            Extension(None),
+            Query(ReadyQuery::default()),
+        )
+        .await;
+        let allow = get(
+            Extension(status),
+            Extension(None),
+            Query(ReadyQuery {
+                allow_unhealthy: true,
+                ..ReadyQuery::default()
+            }),
+        )
+        .await;
+        (plain.status(), allow.status())
+    }
+
+    #[tokio::test]
+    async fn allow_unhealthy_holds_ready_while_a_failed_dataset_retries() {
+        use datafusion::common::TableReference;
+        use runtime_status::{ComponentStatus, RuntimeReadyState};
+        let status = RuntimeStatus::new();
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+        status.update_dataset(&TableReference::bare("nation"), ComponentStatus::Ready);
+        let missing = TableReference::bare("region_missing");
+        status.update_dataset(
+            &missing,
+            ComponentStatus::error_with_message("bucket not found"),
+        );
+
+        let (plain, allow) = ready_http_codes(Arc::clone(&status)).await;
+        assert_eq!(plain, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(allow, StatusCode::OK);
+
+        for _ in 0..3 {
+            status.update_dataset(&missing, ComponentStatus::Refreshing);
+            assert_eq!(
+                status.get_dataset_status(&missing),
+                Some(ComponentStatus::Refreshing)
+            );
+            let (plain, allow) = ready_http_codes(Arc::clone(&status)).await;
+            assert_eq!(plain, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(allow, StatusCode::OK);
+
+            status.update_dataset(
+                &missing,
+                ComponentStatus::error_with_message("bucket not found"),
+            );
+            let (plain, allow) = ready_http_codes(Arc::clone(&status)).await;
+            assert_eq!(plain, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(allow, StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_unhealthy_stays_not_ready_on_first_attempt_refreshing() {
+        use datafusion::common::TableReference;
+        use runtime_status::{ComponentStatus, RuntimeReadyState};
+        let status = RuntimeStatus::new();
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+        status.update_dataset(&TableReference::bare("nation"), ComponentStatus::Ready);
+        status.update_dataset(&TableReference::bare("slow"), ComponentStatus::Refreshing);
+
+        let (plain, allow) = ready_http_codes(status).await;
+        assert_eq!(plain, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(allow, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn allow_unhealthy_resumes_normal_refresh_after_first_ready() {
+        use datafusion::common::TableReference;
+        use runtime_status::{ComponentStatus, RuntimeReadyState};
+        let status = RuntimeStatus::new();
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+        let nation = TableReference::bare("nation");
+        let missing = TableReference::bare("region_missing");
+        status.update_dataset(&nation, ComponentStatus::Ready);
+        status.update_dataset(
+            &missing,
+            ComponentStatus::error_with_message("bucket not found"),
+        );
+        status.update_dataset(&missing, ComponentStatus::Refreshing);
+        status.update_dataset(&missing, ComponentStatus::Ready);
+
+        let (plain, allow) = ready_http_codes(Arc::clone(&status)).await;
+        assert_eq!(plain, StatusCode::OK);
+        assert_eq!(allow, StatusCode::OK);
+
+        status.update_dataset(&nation, ComponentStatus::Disabled);
+        status.update_dataset(&missing, ComponentStatus::Refreshing);
+        assert_eq!(
+            status.get_dataset_status(&missing),
+            Some(ComponentStatus::Refreshing)
+        );
+        let (plain, allow) = ready_http_codes(status).await;
+        assert_eq!(plain, StatusCode::OK);
+        assert_eq!(allow, StatusCode::OK);
     }
 }
