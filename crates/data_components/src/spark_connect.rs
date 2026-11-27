@@ -48,6 +48,7 @@ use runtime_udfs_api::deny_spice_specific_functions;
 use spark_connect_rs::errors::SparkError;
 use spark_connect_rs::{SparkSession, SparkSessionBuilder, client::ChannelBuilder, functions::col};
 use tokio::sync::{Mutex, RwLock};
+use util::sql_string_literal::{BackslashEscapedStrings, QuoteEscape};
 use uuid::Uuid;
 
 use std::error::Error;
@@ -577,9 +578,12 @@ fn expr_to_sql(expr: &Expr) -> DataFusionResult<String> {
     // Spark Connect parses pushed-down filters as Spark SQL (see `DataFrame::filter` below), which
     // quotes identifiers with backticks. `DefaultDialect` would emit double-quoted identifiers,
     // which Spark interprets as string literals, breaking case-sensitive or keyword column refs.
-    let dialect = CustomDialectBuilder::new()
-        .with_identifier_quote_style('`')
-        .build();
+    let dialect = BackslashEscapedStrings::new(
+        CustomDialectBuilder::new()
+            .with_identifier_quote_style('`')
+            .build(),
+        QuoteEscape::Unicode,
+    );
     Unparser::new(&dialect)
         .expr_to_sql(expr)
         .map(|expr| expr.to_string())
@@ -722,6 +726,20 @@ pub(super) async fn acquire_rate_controller_permit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pushed_filter_string_literals_read_back_as_their_value() {
+        use util::sql_string_literal::test_support::{
+            UNICODE_QUOTE_LITERALS, assert_string_literals, read_spark,
+        };
+
+        assert_string_literals(
+            |expr| expr_to_sql(expr).expect("unparse"),
+            "`c`",
+            UNICODE_QUOTE_LITERALS,
+            read_spark,
+        );
+    }
 
     const TEST_CONNECTION: &str = "sc://dbc-abcd.cloud.databricks.com:443/;use_ssl=true;user_id=spice.ai;session_id=00000000-0000-0000-0000-000000000001;token=secret-token;x-databricks-cluster-id=cluster-123;user_agent=SpiceAI_OSS/1.0;";
 

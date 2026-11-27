@@ -1258,6 +1258,46 @@ mod tests {
         }
     }
 
+    /// `MySQL` reads `\` as an escape unless `sql_mode` holds
+    /// `NO_BACKSLASH_ESCAPES`. A value with a backslash stays local, and any
+    /// other value reads back as itself in both modes.
+    #[test]
+    fn mysql_string_literals_read_back_in_both_escape_modes() {
+        use datafusion::logical_expr::expr::Like;
+        use datafusion::sql::sqlparser::dialect::{AnsiDialect, MySqlDialect as MySqlParser};
+        use datafusion::sql::unparser::dialect::MySqlDialect;
+        use util::sql_string_literal::test_support::{
+            DOUBLED_QUOTE_LITERALS, VALUES, read_with_tokenizer,
+        };
+
+        let support = crate::function_support::deny_spice_functions_for_mysql_table_providers();
+        let scope = DFSchema::try_from(Schema::new(vec![Field::new("c", DataType::Utf8, true)]))
+            .expect("schema");
+        let unparser = Unparser::new(&MySqlDialect {});
+        for (value, literal) in VALUES.into_iter().zip(DOUBLED_QUOTE_LITERALS) {
+            let expr = col("c").eq(lit(value));
+            if value.contains('\\') {
+                assert!(!support.supports(&expr, Some(&scope)), "{value:?}");
+                continue;
+            }
+            assert!(support.supports(&expr, Some(&scope)), "{value:?}");
+            assert_eq!(
+                unparser.expr_to_sql(&expr).expect("unparse").to_string(),
+                format!("(`c` = {literal})")
+            );
+            assert_eq!(read_with_tokenizer(&MySqlParser {}, literal), value);
+            assert_eq!(read_with_tokenizer(&AnsiDialect {}, literal), value);
+        }
+        let like = Expr::Like(Like::new(
+            false,
+            Box::new(col("c")),
+            Box::new(lit("a")),
+            Some('\\'),
+            false,
+        ));
+        assert!(!support.supports(&like, Some(&scope)));
+    }
+
     /// A string with a backslash stays local on `MySQL`, which reads the
     /// backslash as an escape: `C:\new` would hold a newline, and `a\'b` or
     /// `trail\` would end the literal somewhere else. So does a `LIKE` or

@@ -39,6 +39,7 @@ use datafusion_table_providers::sql::{
 use snowflake_api::SnowflakeApi;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
+use util::sql_string_literal::{BackslashEscapedStrings, QuoteEscape};
 
 use crate::schema_discovery::{NoPermissionsCheck, SchemaProbeResult, discover_schema};
 use crate::{
@@ -141,8 +142,8 @@ fn parse_snowflake_table_reference(path: &str) -> std::result::Result<TableRefer
     }
 }
 
-fn snowflake_dialect() -> dialect::CustomDialect {
-    dialect::CustomDialectBuilder::new()
+fn snowflake_dialect() -> BackslashEscapedStrings<dialect::CustomDialect> {
+    let dialect = dialect::CustomDialectBuilder::new()
         .with_identifier_quote_style('"')
         // Render `expr AT TIME ZONE 'tz'` as `CAST(CONVERT_TIMEZONE('tz', expr) AS
         // TIMESTAMP_NTZ)` rather than dropping the zone name (which silently changed
@@ -152,7 +153,8 @@ fn snowflake_dialect() -> dialect::CustomDialect {
         // TIMEZONE` call in `db_connection_pool::snowflakepool`). Background:
         // https://github.com/spiceai/datafusion/pull/160.
         .with_timezone_cast_style(dialect::TimezoneCastStyle::ConvertTimezone)
-        .build()
+        .build();
+    BackslashEscapedStrings::new(dialect, QuoteEscape::Doubled)
 }
 
 /// Probes `information_schema.columns` for a Snowflake table.
@@ -1020,6 +1022,24 @@ mod tests {
         Int32Array, Int64Array, NullArray, RecordBatch, StringArray, UInt8Array, UInt16Array,
         UInt32Array, UInt64Array,
     };
+
+    #[test]
+    fn snowflake_dialect_string_literals_read_back_as_their_value() {
+        use datafusion::sql::sqlparser::dialect::SnowflakeDialect;
+        use datafusion::sql::unparser::Unparser;
+        use util::sql_string_literal::test_support::{
+            DOUBLED_QUOTE_LITERALS, assert_string_literals, read_with_tokenizer,
+        };
+
+        let dialect = snowflake_dialect();
+        let unparser = Unparser::new(&dialect);
+        assert_string_literals(
+            |expr| unparser.expr_to_sql(expr).expect("unparse").to_string(),
+            "\"c\"",
+            DOUBLED_QUOTE_LITERALS,
+            |sql| read_with_tokenizer(&SnowflakeDialect {}, sql),
+        );
+    }
 
     #[test]
     fn snowflake_dialect_unparses_at_time_zone_as_convert_timezone() {

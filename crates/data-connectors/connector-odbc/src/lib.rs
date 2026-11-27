@@ -48,6 +48,7 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use util::sql_string_literal::{BackslashEscapedStrings, QuoteEscape};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -106,13 +107,14 @@ enum ODBCProfile {
     Unknown,
 }
 
-fn databricks_dialect() -> CustomDialect {
-    CustomDialectBuilder::new()
+fn databricks_dialect() -> BackslashEscapedStrings<CustomDialect> {
+    let dialect = CustomDialectBuilder::new()
         .with_identifier_quote_style('`')
         .with_interval_style(IntervalStyle::MySQL)
         .with_utf8_cast_dtype(datafusion::sql::sqlparser::ast::DataType::String(None))
         .with_large_utf8_cast_dtype(datafusion::sql::sqlparser::ast::DataType::String(None))
-        .build()
+        .build();
+    BackslashEscapedStrings::new(dialect, QuoteEscape::Unicode)
 }
 
 /// Athena (Trino) SQL. Identifiers are double-quoted: the statement names
@@ -450,6 +452,22 @@ mod test {
     use datafusion::logical_expr::cast;
     use datafusion::prelude::col;
     use datafusion::sql::unparser::Unparser;
+
+    #[test]
+    fn databricks_string_literals_read_back_as_their_value() {
+        use util::sql_string_literal::test_support::{
+            UNICODE_QUOTE_LITERALS, assert_string_literals, read_spark,
+        };
+
+        let dialect = databricks_dialect();
+        let unparser = Unparser::new(&dialect);
+        assert_string_literals(
+            |expr| unparser.expr_to_sql(expr).expect("unparse").to_string(),
+            "`c`",
+            UNICODE_QUOTE_LITERALS,
+            read_spark,
+        );
+    }
 
     #[test]
     fn test_athena_dialect_overrides() -> Result<()> {

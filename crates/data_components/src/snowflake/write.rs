@@ -43,6 +43,7 @@ use futures::{StreamExt, stream};
 use snafu::prelude::*;
 use snowflake_api::{QueryResult, SnowflakeApi};
 use tokio::sync::Mutex;
+use util::sql_string_literal::{QuoteEscape, backslash_escaped_string_literal};
 
 use datafusion_federation::{
     FederatedTableProviderAdaptor, FederationAnalyzerForLogicalPlan, FederationProvider,
@@ -905,7 +906,7 @@ fn quote_sql_string_literal(value: &str, column: &str) -> Result<String> {
         }
     );
 
-    Ok(format!("'{}'", value.replace('\'', "''")))
+    Ok(backslash_escaped_string_literal(value, QuoteEscape::Doubled).to_string())
 }
 
 fn scalar_to_sql_literal(value: ScalarValue, column: &str) -> Result<String> {
@@ -1162,6 +1163,22 @@ mod tests {
     use super::*;
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn quoted_string_literals_read_back_as_their_value() {
+        use datafusion::sql::sqlparser::dialect::SnowflakeDialect;
+        use util::sql_string_literal::test_support::{
+            DOUBLED_QUOTE_LITERALS, VALUES, read_with_tokenizer,
+        };
+
+        for (value, literal) in VALUES.into_iter().zip(DOUBLED_QUOTE_LITERALS) {
+            assert_eq!(
+                quote_sql_string_literal(value, "c").expect("quote"),
+                literal
+            );
+            assert_eq!(read_with_tokenizer(&SnowflakeDialect {}, literal), value);
+        }
+    }
 
     #[test]
     fn quote_identifier_escapes_double_quotes() {

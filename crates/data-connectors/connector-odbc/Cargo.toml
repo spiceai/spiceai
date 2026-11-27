@@ -47,13 +47,14 @@ snafu.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "macros"] }
 tokio-util.workspace = true
 tracing.workspace = true
-util.workspace = true
+util = { workspace = true, features = ["datafusion"] }
 
 [features]
 default = []
 
 [dev-dependencies]
 runtime = { path = "../../runtime" }
+util = { workspace = true, features = ["test-support"] }
 data-accelerator-api = { path = "../../data-accelerator-api" }
 
 [lints]

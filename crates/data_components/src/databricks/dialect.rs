@@ -27,6 +27,7 @@ use datafusion::sql::sqlparser::ast::{
 };
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::{Dialect, IntervalStyle};
+use util::sql_string_literal::{QuoteEscape, backslash_escaped_string_literal};
 
 /// Databricks SQL dialect for Spark SQL compatibility.
 ///
@@ -63,6 +64,11 @@ impl Dialect for DatabricksDialect {
     /// Databricks/Spark SQL uses STRING for large UTF8 strings.
     fn large_utf8_cast_dtype(&self) -> ast::DataType {
         ast::DataType::String(None)
+    }
+
+    /// Databricks/Spark SQL reads `\` as an escape character in a string literal.
+    fn string_literal_to_sql(&self, s: &str) -> Option<ast::Expr> {
+        Some(backslash_escaped_string_literal(s, QuoteEscape::Unicode))
     }
 
     /// Override scalar functions to translate `DataFusion` functions to Spark SQL equivalents.
@@ -148,6 +154,23 @@ mod tests {
 
     fn create_dialect() -> DatabricksDialect {
         DatabricksDialect::new()
+    }
+
+    #[test]
+    fn string_literals_read_back_as_their_value() {
+        use datafusion::prelude::col;
+        use util::sql_string_literal::test_support::{
+            UNICODE_QUOTE_LITERALS, assert_string_literals, read_spark,
+        };
+
+        let dialect = create_dialect();
+        let unparser = Unparser::new(&dialect);
+        assert_string_literals(
+            |expr| unparser.expr_to_sql(expr).expect("unparse").to_string(),
+            "`c`",
+            UNICODE_QUOTE_LITERALS,
+            read_spark,
+        );
     }
 
     #[test]
