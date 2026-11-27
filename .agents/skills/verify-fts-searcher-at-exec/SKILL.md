@@ -12,10 +12,11 @@ Unit coverage lives in `crates/search` (`reused_field_index_sees_refresh_for_{me
 ## Build
 
 ```bash
-CC=gcc CXX=g++ LIBRARY_PATH=/usr/lib/gcc/x86_64-linux-gnu/13 cargo build -p spiced --no-default-features
+CC=gcc CXX=g++ LIBRARY_PATH=/usr/lib/gcc/x86_64-linux-gnu/13 \
+  cargo build -p spiced --no-default-features --features models
 ```
 
-File connector and Cayenne are always linked on Linux. Do not let a script prepend an installed `spiced` over the binary under test.
+File connector and Cayenne are always linked on Linux. `models` registers `POST /v1/search` (it is in the default `spiced` feature set). A `--no-default-features` binary still answers `text_search` SQL but returns HTTP 404 on `/v1/search`. Do not let a script prepend an installed `spiced` over the binary under test.
 
 ## Run
 

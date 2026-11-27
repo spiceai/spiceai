@@ -118,7 +118,9 @@ YAML
   }
 
   search_api() {
-    curl -sS --max-time 30 -X POST "$URL/v1/search" \
+    # `/v1/search` is registered when `spiced` is built with `models` (the default
+    # feature set). A `--no-default-features` binary answers 404 here.
+    curl -sS --max-time 30 -w ' HTTP %{http_code}' -X POST "$URL/v1/search" \
       -H 'Content-Type: application/json' \
       -d "{\"text\":\"$1\",\"datasets\":[\"docs\"]}"
   }
