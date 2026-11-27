@@ -40,6 +40,15 @@ limitations under the License.
 //! key as an index when the document is an array, which a top-level value cannot
 //! reproduce.
 
+use std::sync::{Arc, LazyLock};
+
+use arrow::array::{Array, ArrayRef, AsArray, StringViewBuilder};
+use arrow::datatypes::DataType;
+use datafusion::common::{Result, ScalarValue, exec_err, plan_err};
+use datafusion::logical_expr::{
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
+    Volatility,
+};
 use jiter::{Jiter, Peek};
 
 /// The text of the value under top-level `key` in `json`, as the `json_get_*`
@@ -79,16 +88,97 @@ pub(crate) fn is_shreddable_key(key: &str) -> bool {
     key.parse::<isize>().is_err()
 }
 
+/// Name of [`JsonTopLevelValue`] in plans. Not registered with any session, so SQL
+/// cannot call it: Cayenne builds it into the plans it rewrites.
+pub(crate) const JSON_TOP_LEVEL_VALUE_NAME: &str = "__cayenne_json_top_level_value";
+
+/// `__cayenne_json_top_level_value(json, key)`: [`top_level_value`] over a column,
+/// as text the `json_get_*` functions read exactly as they read `key` in `json`.
+/// `key` must be a non-NULL string literal that does not parse as an integer.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct JsonTopLevelValue;
+
+static JSON_TOP_LEVEL_VALUE_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
+    Signature::one_of(
+        [DataType::Utf8, DataType::Utf8View, DataType::LargeUtf8]
+            .into_iter()
+            .map(|json| TypeSignature::Exact(vec![json, DataType::Utf8]))
+            .collect(),
+        Volatility::Immutable,
+    )
+});
+
+/// The shared [`ScalarUDF`] for [`JsonTopLevelValue`].
+pub(crate) static JSON_TOP_LEVEL_VALUE_UDF: LazyLock<Arc<ScalarUDF>> =
+    LazyLock::new(|| Arc::new(ScalarUDF::new_from_impl(JsonTopLevelValue)));
+
+impl ScalarUDFImpl for JsonTopLevelValue {
+    fn name(&self) -> &str {
+        JSON_TOP_LEVEL_VALUE_NAME
+    }
+
+    fn signature(&self) -> &Signature {
+        &JSON_TOP_LEVEL_VALUE_SIGNATURE
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Utf8View)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let [json, key] = args.args.as_slice() else {
+            return exec_err!("{JSON_TOP_LEVEL_VALUE_NAME} takes a JSON column and a key");
+        };
+        let ColumnarValue::Scalar(ScalarValue::Utf8(Some(key))) = key else {
+            return plan_err!("{JSON_TOP_LEVEL_VALUE_NAME} takes its key as a non-NULL string literal");
+        };
+        if !is_shreddable_key(key) {
+            return plan_err!(
+                "{JSON_TOP_LEVEL_VALUE_NAME} cannot extract key '{key}': a key that parses as an integer is an array index to the JSON functions"
+            );
+        }
+        match json {
+            ColumnarValue::Array(array) => {
+                Ok(ColumnarValue::Array(top_level_values(array.as_ref(), key)?))
+            }
+            ColumnarValue::Scalar(scalar) => {
+                let array = scalar.to_array_of_size(1)?;
+                let values = top_level_values(array.as_ref(), key)?;
+                Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(&values, 0)?))
+            }
+        }
+    }
+}
+
+/// [`top_level_value`] of every row of a string array, as a string view array.
+fn top_level_values(json: &dyn Array, key: &str) -> Result<ArrayRef> {
+    let mut out = StringViewBuilder::with_capacity(json.len());
+    macro_rules! extract {
+        ($array:expr) => {{
+            for doc in $array.iter() {
+                out.append_option(doc.and_then(|doc| top_level_value(doc, key)));
+            }
+        }};
+    }
+    match json.data_type() {
+        DataType::Utf8 => extract!(json.as_string::<i32>()),
+        DataType::LargeUtf8 => extract!(json.as_string::<i64>()),
+        DataType::Utf8View => extract!(json.as_string_view()),
+        other => {
+            return exec_err!("{JSON_TOP_LEVEL_VALUE_NAME} takes a string column, not {other}");
+        }
+    }
+    Ok(Arc::new(out.finish()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, ArrayRef, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::StringArray;
+    use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionContext;
-    use datafusion::scalar::ScalarValue;
-    use std::sync::Arc;
 
     /// A small seeded generator, so a failure names the seed that reproduces it.
     struct Rng(u64);
@@ -210,6 +300,8 @@ mod tests {
             let mut ctx_state = ctx.state();
             datafusion_functions_json::register_all(&mut ctx_state).expect("register json functions");
             let ctx = SessionContext::new_with_state(ctx_state);
+            // Test-only: the function is never registered outside Cayenne's plans.
+            ctx.register_udf(ScalarUDF::clone(&JSON_TOP_LEVEL_VALUE_UDF));
             for key in EXTRACTED_KEYS {
                 let values: StringArray = docs
                     .iter()
@@ -231,7 +323,8 @@ mod tests {
                 for f in FUNCTIONS {
                     for rest in REST_PATHS {
                         let sql = format!(
-                            "SELECT doc, {f}(doc, '{key}'{rest}) AS whole, {f}(val{rest}) AS extracted FROM t"
+                            "SELECT doc, {f}(doc, '{key}'{rest}) AS whole, {f}(val{rest}) AS extracted, \
+                             {f}({JSON_TOP_LEVEL_VALUE_NAME}(doc, '{key}'){rest}) AS via_udf FROM t"
                         );
                         let batches = ctx
                             .sql(&sql)
@@ -249,6 +342,12 @@ mod tests {
                                 if !whole.is_null() {
                                     *answered.entry(f).or_default() += 1;
                                 }
+                                let via_udf = ScalarValue::try_from_array(b.column(3), row)
+                                    .expect("via_udf");
+                                assert_eq!(
+                                    whole, via_udf,
+                                    "seed {seed}: {f}(doc, '{key}'{rest}) differs through {JSON_TOP_LEVEL_VALUE_NAME}"
+                                );
                                 assert_eq!(
                                     whole,
                                     extracted,
