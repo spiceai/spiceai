@@ -116,7 +116,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `3900b813e0c626c1add27c7005a1c61db58944b0` | `phillip/unparse-like-escape-literal` (TEMPORARY: spiceai/datafusion#320) |
+| [datafusion](#datafusion) | `2436c78a8b439307359b747f8f1282939217f565` | `phillip/unparse-like-escape-literal` (TEMPORARY: spiceai/datafusion#320) |
 | [datafusion-ballista](#datafusion-ballista) | `6e7a8775a6deb99c2ebf924f1ff5b3111d38e615` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `c5f1094e4f5aa7bc0cb5d3bf0f7753a33e5fc39d` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `b0464de933ba5e0cf5e8847f5b4341b75908667f` | `spiceai-55` |
@@ -262,8 +262,8 @@ the column of an `ANY`/`ALL` subquery a name of its own, #309 quotes the qualifi
 expression, and #308 keeps a regex that matches a backslash from becoming `LIKE`. On top of #308, #312 has
 `ANY`/`ALL` over an aggregate without `GROUP BY` compare with that aggregate's one row, and #306
 ports apache/datafusion#23188 so `SIMILAR TO` is an anchored SQL pattern. On top of #306, #320 writes the
-`ESCAPE` character of a `LIKE` the way the dialect writes a string literal; the pin is #320's commit
-(`3900b813e0c626c1add27c7005a1c61db58944b0`).
+`ESCAPE` character of a `LIKE` the way the dialect writes a string literal, and refuses to write a cast to a
+time zone that holds a quote or a backslash; the pin is #320's head commit (`2436c78a8b439307359b747f8f1282939217f565`).
 Outside the six files #298 resolved by hand, every Spice patch's diff against `55.3.0` is line for line
 its diff against `55.2.0`. Of those six, #251 keeps its empty-file rule beside upstream's null-partition
 statistics (apache/datafusion#26310), and #277's ordered *partial* path is replaced by upstream's
@@ -419,6 +419,7 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | Optimizer: `RewriteSetComparison` writes `x op ANY (sub)` and `x op ALL (sub)` as the scalar comparison `x op (sub)` when the subquery is an aggregate without `GROUP BY` under projections and aliases, which returns exactly one row; correlated, only in a projection or filter; and keeps each rewritten expression's name, a backport of apache/datafusion#26657, which is upstream in `56.0.0` (`optimizer/src/rewrite_set_comparison.rs`; spiceai/datafusion#312) | An outer row with no inner row compares with no row instead of the aggregate's row (`max` NULL, `count` 0): `t.v > ALL (SELECT max(s.v) FROM s WHERE s.k = t.k)` keeps it, `t.v - 40 = ANY (SELECT count(*) …)` drops it, and the same comparison in a `SELECT` list fails to plan | silent (wrong data / query failure) | `crates/runtime-datafusion/src/fork_backport_guards.rs::any_all_over_an_aggregate_without_group_by_compares_with_its_row`; in the fork, the groupless-aggregate ANY/ALL cases in `subquery.slt` |
 | `SIMILAR TO` and `NOT SIMILAR TO` translate the SQL pattern (`%` any string, `_` one character, `.` `^` `$` literal) into an anchored regex before matching, instead of handing it to the regex kernel unchanged; `ESCAPE` is refused (`physical-expr/src/expressions/similar_to_pattern.rs`, `binary.rs`; apache/datafusion#23188, spiceai/datafusion#306) | `%` and `_` never match as wildcards and a pattern matches anywhere in the string: `'abc' SIMILAR TO 'a%'` is false and `'abc' SIMILAR TO 'b'` is true, so `WHERE c SIMILAR TO '(AUTO|BUILD)%'` returned 0 rows where `LIKE` returned 59,894 | silent (wrong rows) | `crates/runtime-datafusion/src/fork_backport_guards.rs::similar_to_matches_the_whole_string_with_sql_wildcards`; `crates/cayenne/tests/similar_to_semantics_test.rs` for a Cayenne table |
 | Unparser: the `ESCAPE` character of a `LIKE`, `ILIKE` or `SIMILAR TO` is written by `Dialect::string_literal_to_sql`, as every other string literal is (`unparser/expr.rs` `escape_char_to_sql`; spiceai/datafusion#320) | An engine that reads `\` as an escape inside a string literal (Spark SQL, Databricks, Snowflake, BigQuery, ClickHouse) reads `ESCAPE '\'` as a literal that does not end there, so the rest of the statement is read as part of it or as SQL | query failure / silent (wrong data) | `crates/data_components/src/databricks/dialect.rs::tests::string_literals_read_back_as_their_value` and the other `string_literals_read_back_as_their_value` tests, through `util::sql_string_literal::test_support::assert_string_literals`; in the fork, `unparser/expr.rs::like_escape_char_is_written_as_a_dialect_string_literal` |
+| Unparser: a cast to a time zone that holds a quote or a backslash is not written as SQL (`unparser/expr.rs` `cast_to_sql`; spiceai/datafusion#320) | Dialects write the zone of `AT TIME ZONE` and `CONVERT_TIMEZONE` as a plain string literal, so on Snowflake a zone that ends in `\` ends the literal at the next quote and the rest of the statement is read as SQL | silent (wrong data) | `crates/data_components/src/snowflake/mod.rs::tests::snowflake_dialect_refuses_a_zone_with_a_quote_or_backslash`; in the fork, `unparser/expr.rs::cast_to_a_zone_with_a_quote_or_backslash_is_not_written` |
 
 ## arrow-rs
 

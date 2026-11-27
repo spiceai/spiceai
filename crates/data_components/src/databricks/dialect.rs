@@ -158,7 +158,6 @@ mod tests {
 
     #[test]
     fn string_literals_read_back_as_their_value() {
-        use datafusion::prelude::col;
         use util::sql_string_literal::test_support::{
             UNICODE_QUOTE_LITERALS, assert_string_literals, read_spark,
         };

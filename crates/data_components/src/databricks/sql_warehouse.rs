@@ -56,6 +56,7 @@ use tokio::sync::Semaphore;
 use util::{
     fibonacci_backoff::{Backoff, FibonacciBackoffBuilder},
     format_datafusion_error,
+    sql_string_literal::{QuoteEscape, backslash_escaped_string_literal},
 };
 
 #[cfg(test)]
@@ -1047,12 +1048,12 @@ impl SqlWarehouseApi {
         let table_catalog = table.catalog().ok_or_else(|| Error::FullyQualifiedPath {
             reason: "missing catalog".into(),
         })?;
-        // Escape single quotes by doubling them to prevent SQL injection
-        let escaped_table = table.table().replace('\'', "''");
-        let escaped_schema = table_schema.replace('\'', "''");
-        let escaped_catalog = table_catalog.replace('\'', "''");
+        let literal = |s: &str| backslash_escaped_string_literal(s, QuoteEscape::Unicode);
         let sql = format!(
-            "SELECT c.column_name, c.{data_type_column}, c.is_nullable, c.comment, t.comment FROM information_schema.columns c LEFT JOIN information_schema.tables t ON c.table_catalog = t.table_catalog AND c.table_schema = t.table_schema AND c.table_name = t.table_name WHERE c.table_name = '{escaped_table}' AND c.table_schema = '{escaped_schema}' AND c.table_catalog = '{escaped_catalog}' ORDER BY c.ordinal_position"
+            "SELECT c.column_name, c.{data_type_column}, c.is_nullable, c.comment, t.comment FROM information_schema.columns c LEFT JOIN information_schema.tables t ON c.table_catalog = t.table_catalog AND c.table_schema = t.table_schema AND c.table_name = t.table_name WHERE c.table_name = {} AND c.table_schema = {} AND c.table_catalog = {} ORDER BY c.ordinal_position",
+            literal(table.table()),
+            literal(table_schema),
+            literal(table_catalog),
         );
         // Databricks SQL Statements API max wait_timeout is 50s.
         // https://docs.databricks.com/api/workspace/statementexecution/executestatement
@@ -2862,6 +2863,29 @@ mod tests {
                 .contains("my_table"),
             "statement should reference the table"
         );
+    }
+
+    #[test]
+    fn schema_payload_literals_read_back_as_their_value() {
+        use util::sql_string_literal::test_support::{VALUES, spark_string_literals};
+
+        let api = SqlWarehouseApi::new(
+            "host.example.com",
+            "warehouse-123",
+            Arc::new(StaticTokenProvider("token".to_string())),
+            &SqlWarehouseConfig::default(),
+            Arc::new(DatabricksMetrics::default()),
+            Arc::new(Semaphore::new(8)),
+            None,
+        )
+        .expect("should create api");
+        for value in VALUES {
+            let payload = api
+                .create_schema_payload(&TableReference::full(value, value, value), "data_type")
+                .expect("should create payload");
+            let sql = payload["statement"].as_str().expect("statement");
+            assert_eq!(spark_string_literals(sql), [value; 3], "{sql}");
+        }
     }
 
     #[test]

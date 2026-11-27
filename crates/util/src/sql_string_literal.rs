@@ -39,7 +39,10 @@ pub enum QuoteEscape {
     Doubled,
     /// As `\u0027`. Spark SQL reads `''` as two adjacent literals, so
     /// `'a''b'` is `ab`, and `BigQuery` reads `'''` as the start of a
-    /// triple-quoted string.
+    /// triple-quoted string. A `$` is also written as `\u0024`, because Spark
+    /// replaces each `${...}` in the SQL text before it reads a literal, and a
+    /// line break as `\n` or `\r`, which a `BigQuery` single-quoted literal
+    /// cannot hold.
     Unicode,
 }
 
@@ -52,6 +55,9 @@ pub fn backslash_escaped_string_literal(s: &str, quote: QuoteEscape) -> ast::Exp
         match c {
             '\\' => escaped.push_str(r"\\"),
             '\'' if quote == QuoteEscape::Unicode => escaped.push_str(r"\u0027"),
+            '$' if quote == QuoteEscape::Unicode => escaped.push_str(r"\u0024"),
+            '\n' if quote == QuoteEscape::Unicode => escaped.push_str(r"\n"),
+            '\r' if quote == QuoteEscape::Unicode => escaped.push_str(r"\r"),
             c => escaped.push(c),
         }
     }
@@ -333,8 +339,9 @@ pub mod test_support {
     /// differently: a lone and a doubled quote, a lone backslash, a backslash
     /// before a quote, an escaped backslash before a quote, a backslash before
     /// a letter, a name with a quote, and a value that ends the literal early
-    /// wherever `\'` is read as an escaped quote.
-    pub const VALUES: [&str; 8] = [
+    /// wherever `\'` is read as an escaped quote; then a Spark variable
+    /// reference and a line break.
+    pub const VALUES: [&str; 10] = [
         "'",
         "''",
         r"\",
@@ -343,10 +350,12 @@ pub mod test_support {
         r"a\nb",
         "O'Brien",
         r"x\') OR 1=1 --",
+        "${x}",
+        "a\r\nb",
     ];
 
     /// Each of [`VALUES`] written with [`super::QuoteEscape::Unicode`].
-    pub const UNICODE_QUOTE_LITERALS: [&str; 8] = [
+    pub const UNICODE_QUOTE_LITERALS: [&str; 10] = [
         r"'\u0027'",
         r"'\u0027\u0027'",
         r"'\\'",
@@ -355,10 +364,12 @@ pub mod test_support {
         r"'a\\nb'",
         r"'O\u0027Brien'",
         r"'x\\\u0027) OR 1=1 --'",
+        r"'\u0024{x}'",
+        r"'a\r\nb'",
     ];
 
     /// Each of [`VALUES`] written with [`super::QuoteEscape::Doubled`].
-    pub const DOUBLED_QUOTE_LITERALS: [&str; 8] = [
+    pub const DOUBLED_QUOTE_LITERALS: [&str; 10] = [
         "''''",
         "''''''",
         r"'\\'",
@@ -367,6 +378,8 @@ pub mod test_support {
         r"'a\\nb'",
         "'O''Brien'",
         r"'x\\'') OR 1=1 --'",
+        "'${x}'",
+        "'a\r\nb'",
     ];
 
     /// Asserts that `unparse` writes column `c` compared with each of
@@ -381,7 +394,7 @@ pub mod test_support {
     pub fn assert_string_literals(
         unparse: impl Fn(&Expr) -> String,
         column: &str,
-        literals: [&str; 8],
+        literals: [&str; 10],
         read: impl Fn(&str) -> String,
     ) {
         let assert_written = |expr: &Expr, expected: &str| {
@@ -428,15 +441,64 @@ pub mod test_support {
     ///
     /// # Panics
     ///
-    /// When `sql` is not exactly one Spark SQL string literal.
+    /// When `sql` is not exactly one Spark SQL string literal, or holds `${`,
+    /// which Spark's variable substitution replaces before it reads the SQL.
     #[must_use]
     pub fn read_spark(sql: &str) -> String {
-        let body = literal_body(&SparkLiteral, sql);
+        assert!(!sql.contains("${"), "Spark substitutes variables in {sql}");
+        decode_spark(&literal_body(&SparkLiteral, sql))
+    }
+
+    /// The values of every string literal in `sql`, as the sqlparser tokenizer
+    /// for `dialect` reads them with escapes applied.
+    ///
+    /// # Panics
+    ///
+    /// When `sql` does not tokenize.
+    #[must_use]
+    pub fn string_literals_with_tokenizer(dialect: &dyn ParserDialect, sql: &str) -> Vec<String> {
+        Tokenizer::new(dialect, sql)
+            .tokenize()
+            .unwrap_or_else(|e| panic!("{sql} does not tokenize: {e}"))
+            .into_iter()
+            .filter_map(|token| match token {
+                Token::SingleQuotedString(value) => Some(value),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The values of every string literal in `sql`, as Spark SQL reads them.
+    ///
+    /// # Panics
+    ///
+    /// When `sql` does not tokenize, holds `${`, or a literal holds `''`.
+    #[must_use]
+    pub fn spark_string_literals(sql: &str) -> Vec<String> {
+        assert!(!sql.contains("${"), "Spark substitutes variables in {sql}");
+        Tokenizer::new(&SparkLiteral, sql)
+            .with_unescape(false)
+            .tokenize()
+            .unwrap_or_else(|e| panic!("{sql} does not tokenize: {e}"))
+            .into_iter()
+            .filter_map(|token| match token {
+                Token::SingleQuotedString(body) => {
+                    assert!(!body.contains("''"), "{sql} holds `''`");
+                    Some(decode_spark(&body))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A Spark SQL literal body decoded as Spark 3.5's
+    /// `SparkParserUtils.unescapeSQLString` decodes it.
+    fn decode_spark(body: &str) -> String {
         let code_points = CodePoints {
             hex: &[('u', 4), ('U', 8)],
             octal_lead: '0'..='1',
         };
-        decode(&body, &code_points, |escape, out| match escape {
+        decode(body, &code_points, |escape, out| match escape {
             '0' => out.push('\0'),
             'b' => out.push('\u{8}'),
             'n' => out.push('\n'),
@@ -456,11 +518,15 @@ pub mod test_support {
     ///
     /// # Panics
     ///
-    /// When `sql` is not exactly one `BigQuery` string literal, or holds an
-    /// escape `BigQuery` rejects.
+    /// When `sql` is not exactly one `BigQuery` string literal, or holds a line
+    /// break or an escape `BigQuery` rejects.
     #[must_use]
     pub fn read_bigquery(sql: &str) -> String {
         let body = literal_body(&BigQueryDialect {}, sql);
+        assert!(
+            !body.contains(['\n', '\r']),
+            "BigQuery rejects a line break in {sql}"
+        );
         let code_points = CodePoints {
             hex: &[('u', 4), ('U', 8), ('x', 2), ('X', 2)],
             octal_lead: '0'..='3',
