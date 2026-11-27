@@ -8,5 +8,4 @@ expression: pretty
 | scheduled_worker     | SELECT COUNT(*) FROM item |                   |
 | sql_query            | SELECT COUNT(*) FROM item | [{"count(*)":20}] |
 | acceleration_refresh | item                      |                   |
-| acceleration_refresh | runtime.task_history      |                   |
 +----------------------+---------------------------+-------------------+
