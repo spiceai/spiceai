@@ -58,6 +58,8 @@ mod file_create_duckdb;
 mod file_swap_duckdb;
 #[cfg(feature = "sqlite")]
 mod file_watcher;
+#[cfg(not(target_os = "windows"))]
+mod fts_refresh;
 mod hash_index;
 mod localpod_sync;
 #[cfg(all(feature = "postgres-accel", feature = "duckdb", feature = "sqlite"))]
