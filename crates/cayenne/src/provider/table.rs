@@ -1372,14 +1372,15 @@ pub(crate) struct CapturedSnapshotFiles {
     dir_generation: u64,
     listing_epoch: u64,
     files: Arc<Vec<PartitionedFile>>,
-    /// The position deletes as they stood when `files` was captured. A scan of
-    /// these files applies these, not the live cache: a compaction committing
-    /// after the capture clears that cache, and the files would be read
-    /// without their deletes. Deletion memory accounting counts only the live
-    /// cache; vectors the live cache has dropped stay resident only while the
-    /// table's one cached scan view, a view still being built, or a running
-    /// scan holds them.
-    positions: CapturedPositionDeletions,
+    /// The position deletes as they stood when `files` was captured, which a
+    /// scan of these files applies instead of the live cache: a compaction that
+    /// commits after the capture clears that cache while the scan still reads
+    /// these files. Statistics adjusted for them reach the shared caches only
+    /// while they are still the live vectors; the pending-deletes gate on
+    /// exact statistics keeps `COUNT(*)` and the `LIMIT` early stop correct
+    /// when an older adjustment gets there anyway.
+    /// Held past the live cache only by the cached scan view and running scans.
+    positions: Arc<PositionBitmap>,
     /// Whether `files` is the snapshot's whole file set. Only a whole one may
     /// become [`CayenneTableProvider::cached_snapshot_listing`], which every
     /// later scan of the snapshot plans from.
@@ -1396,7 +1397,7 @@ impl CapturedSnapshotFiles {
         dir_generation: u64,
         listing_epoch: u64,
         files: Arc<Vec<PartitionedFile>>,
-        positions: CapturedPositionDeletions,
+        positions: Arc<PositionBitmap>,
     ) -> Self {
         Self {
             dir_generation,
@@ -1415,7 +1416,7 @@ impl CapturedSnapshotFiles {
         dir_generation: u64,
         listing_epoch: u64,
         files: Arc<Vec<PartitionedFile>>,
-        positions: CapturedPositionDeletions,
+        positions: Arc<PositionBitmap>,
     ) -> Self {
         Self {
             whole_snapshot: false,
@@ -1430,26 +1431,9 @@ impl CapturedSnapshotFiles {
             self.dir_generation,
             self.listing_epoch,
             Arc::new(files),
-            self.positions.clone(),
+            Arc::clone(&self.positions),
         )
     }
-}
-
-/// The position-delete vectors a capture's files are read with, and the
-/// file-statistics cache generation they were read at.
-#[derive(Clone)]
-pub(crate) struct CapturedPositionDeletions {
-    /// Once the live vectors differ from [`Self::vectors`], statistics adjusted
-    /// for them are published to the shared file-statistics cache only while it
-    /// is still at this generation (see
-    /// [`CayenneTableProvider::scan_statistics_generation`]). Not every change
-    /// to the vectors advances it, nor only after publishing them: a buffered
-    /// `DELETE` clears the cache before its vectors are published. Statistics
-    /// adjusted for older vectors can therefore still reach the cache; they are
-    /// trusted as exact only when no position delete is pending, captured or
-    /// live, which keeps `COUNT(*)` and the `LIMIT` early stop correct.
-    statistics_generation: u64,
-    vectors: Arc<PositionBitmap>,
 }
 
 /// A captured file set with each file's statistics, computed against
@@ -2064,7 +2048,7 @@ impl RawScanInput {
             maintained_aggregate_epoch: self.maintained_aggregate_epoch,
             mem_tier_versions: self.mem_tier_shards.iter().map(|s| s.version).collect(),
             deletion_index_ptr: self.deletion_snapshot.index_ptr(),
-            position_deletions_ptr: Arc::as_ptr(&self.warm_files.positions.vectors).addr(),
+            position_deletions_ptr: Arc::as_ptr(&self.warm_files.positions).addr(),
             protected_map_ptr: Arc::as_ptr(&self.protected_map).addr(),
             inlined_view_ptr: Arc::as_ptr(&self.inlined_view).addr(),
             lookup_index_ptr: self
@@ -11018,16 +11002,15 @@ impl CayenneTableProvider {
         )))
     }
 
-    /// [`Self::position_deletion_plans`] for a scan of `captured`: the vectors
-    /// captured with its files, so the files it reads keep the deletes they had
-    /// however the live cache has moved since.
+    /// [`Self::position_deletion_plans`] over the vectors captured with
+    /// `captured`'s files.
     fn scan_position_deletion_plans(
         &self,
         captured: Option<&CapturedSnapshotFiles>,
     ) -> Arc<dyn VortexAccessPlanProvider> {
         match captured {
-            Some(captured) => Arc::new(PositionDeletionAccessPlanProvider::captured(Arc::clone(
-                &captured.positions.vectors,
+            Some(captured) => Arc::new(PositionDeletionAccessPlanProvider::new(Arc::new(
+                ArcSwap::new(Arc::clone(&captured.positions)),
             ))),
             None => Self::position_deletion_plans(&self.pk_deletion_strategy),
         }
@@ -25249,7 +25232,7 @@ impl CayenneTableProvider {
                 self.current_dir_generation.load(Ordering::Acquire),
                 self.listing_cache_epoch.load(Ordering::Acquire),
                 Arc::new(files),
-                self.capture_position_deletions(),
+                self.pk_deletion_strategy.position_cache().load_full(),
             ),
             unpicked_rows,
         ))
@@ -33815,7 +33798,6 @@ impl CayenneTableProvider {
                 self.context.file_format().as_ref(),
                 file,
                 &self.table_schema(),
-                self.scan_file_statistics_flights.generation(),
             )
             .await?;
         Ok(match statistics.num_rows {
@@ -39268,7 +39250,7 @@ impl CayenneTableProvider {
     ) -> datafusion_common::Result<CapturedSnapshotFiles> {
         let dir_generation = self.current_dir_generation.load(Ordering::Acquire);
         let listing_epoch = self.listing_cache_epoch.load(Ordering::Acquire);
-        let positions = self.capture_position_deletions();
+        let positions = self.pk_deletion_strategy.position_cache().load_full();
         let files = if let Some(cached) = self.cached_snapshot_listing.load_full()
             && cached.snapshot_id == snapshot_id
             && cached.dir_generation == dir_generation
@@ -39288,17 +39270,6 @@ impl CayenneTableProvider {
         ))
     }
 
-    /// The live position deletes, with the statistics generation read first so
-    /// a cache clear that follows a publish of the vectors is never paired with
-    /// the vectors from before it.
-    fn capture_position_deletions(&self) -> CapturedPositionDeletions {
-        let statistics_generation = self.scan_file_statistics_flights.generation();
-        CapturedPositionDeletions {
-            statistics_generation,
-            vectors: self.pk_deletion_strategy.position_cache().load_full(),
-        }
-    }
-
     /// Every protected snapshot's unpruned file set, captured the way
     /// [`Self::capture_warm_files`] captures the current snapshot's. The caller
     /// must hold `listing_fence.read()`, for the same reason.
@@ -39311,7 +39282,7 @@ impl CayenneTableProvider {
         }
         let dir_generation = self.current_dir_generation.load(Ordering::Acquire);
         let listing_epoch = self.listing_cache_epoch.load(Ordering::Acquire);
-        let positions = self.capture_position_deletions();
+        let positions = self.pk_deletion_strategy.position_cache().load_full();
         let ctx = self.create_session_context();
         let state = ctx.state();
         let mut captured = HashMap::with_capacity(protected.len());
@@ -39319,7 +39290,12 @@ impl CayenneTableProvider {
             let files = self.list_snapshot_dir_files(&state, snapshot_id).await?;
             captured.insert(
                 snapshot_id.clone(),
-                CapturedSnapshotFiles::new(dir_generation, listing_epoch, files, positions.clone()),
+                CapturedSnapshotFiles::new(
+                    dir_generation,
+                    listing_epoch,
+                    files,
+                    Arc::clone(&positions),
+                ),
             );
         }
         Ok(captured)
@@ -46377,13 +46353,10 @@ impl CayenneTableProvider {
         // footer row counts are not live-row counts, however, so pending
         // deletions separately disable LIMIT early-stop and exact aggregates.
         let collect_stats = request.options.collect_stat;
-        // The captured vectors are the ones this scan applies; the live state
-        // covers deletes since the capture, which a statistics cache entry may
-        // already reflect.
         let has_pending_deletions = self.has_rows_hidden_from_file_statistics()
             || request
                 .captured_files
-                .is_some_and(|captured| !captured.positions.vectors.is_empty());
+                .is_some_and(|captured| !captured.positions.is_empty());
         let use_stats_for_limit = collect_stats && !has_pending_deletions;
         let dir_generation = request.captured_files.map_or_else(
             || self.current_dir_generation.load(Ordering::Acquire),
@@ -46637,7 +46610,12 @@ impl CayenneTableProvider {
                 .meta_fetch_concurrency,
         );
 
-        let statistics_generation = self.scan_statistics_generation(request.captured_files);
+        let publishes_statistics = request.captured_files.is_none_or(|captured| {
+            Arc::ptr_eq(
+                &captured.positions,
+                &self.pk_deletion_strategy.position_cache().load(),
+            )
+        });
         let file_list: futures::stream::BoxStream<'_, DataFusionResult<PartitionedFile>> =
             if let Some(captured) = request.captured_files {
                 stream::iter(captured.files.iter().cloned().map(Ok)).boxed()
@@ -46648,7 +46626,7 @@ impl CayenneTableProvider {
         let files = file_list
             .map(|part_file| async {
                 let part_file = part_file?;
-                let statistics = if collect_stats {
+                let statistics = if collect_stats && publishes_statistics {
                     self.collect_scan_file_statistics(
                         request.state,
                         request.snapshot_id,
@@ -46656,9 +46634,22 @@ impl CayenneTableProvider {
                         request.options.listing.format.as_ref(),
                         &part_file,
                         &request.file_statistics_schema,
-                        statistics_generation,
                     )
                     .await?
+                } else if collect_stats {
+                    Arc::new(
+                        request
+                            .options
+                            .listing
+                            .format
+                            .infer_stats(
+                                request.state,
+                                &store,
+                                Arc::clone(&request.file_statistics_schema),
+                                &part_file.object_meta,
+                            )
+                            .await?,
+                    )
                 } else {
                     Arc::new(Statistics::new_unknown(&request.file_statistics_schema))
                 };
@@ -46676,7 +46667,7 @@ impl CayenneTableProvider {
         #[cfg(test)]
         self.run_test_post_snapshot_list_hook().await;
         let mut current = false;
-        if collect_stats && !truncated {
+        if collect_stats && !truncated && publishes_statistics {
             let gen_after = self.current_dir_generation.load(Ordering::Acquire);
             let epoch_after = self.listing_cache_epoch.load(Ordering::Acquire);
             if gen_after == dir_generation && epoch_after == listing_epoch {
@@ -46734,31 +46725,6 @@ impl CayenneTableProvider {
         (file_group, truncated)
     }
 
-    /// The file-statistics cache generation a scan of `captured` collects under.
-    /// While the live position deletes are still the captured ones, statistics
-    /// adjusted for them are as current as a fresh capture's, so a reused view
-    /// keeps filling the cache; otherwise they are published only if the cache
-    /// has not moved since the capture. The live generation is read before the
-    /// vectors are compared, so it is never newer than them.
-    fn scan_statistics_generation(&self, captured: Option<&CapturedSnapshotFiles>) -> u64 {
-        let live = self.scan_file_statistics_flights.generation();
-        match captured {
-            Some(captured)
-                if !Arc::ptr_eq(
-                    &captured.positions.vectors,
-                    &self.pk_deletion_strategy.position_cache().load(),
-                ) =>
-            {
-                captured.positions.statistics_generation
-            }
-            _ => live,
-        }
-    }
-
-    /// `generation` is the file-statistics cache generation the deletes `format`
-    /// applies were read at: a collection publishes and persists its result only
-    /// while the cache is still at it.
-    #[expect(clippy::too_many_arguments)]
     async fn collect_scan_file_statistics(
         &self,
         state: &dyn Session,
@@ -46767,7 +46733,6 @@ impl CayenneTableProvider {
         format: &dyn FileFormat,
         part_file: &PartitionedFile,
         table_schema: &SchemaRef,
-        generation: u64,
     ) -> datafusion_common::Result<Arc<Statistics>> {
         // The statistics below are computed against the table schema, so a cached
         // entry is valid only for the schema it was computed with.
@@ -46781,6 +46746,7 @@ impl CayenneTableProvider {
         // at most one footer read and one upsert, and the same answer for all of
         // them. The generation is part of the identity, so a scan that starts after
         // a cache clear never waits on a collection that started before it.
+        let generation = self.scan_file_statistics_flights.generation();
         let flight = self
             .scan_file_statistics_flights
             .join(ScanFileStatisticsKey::new(

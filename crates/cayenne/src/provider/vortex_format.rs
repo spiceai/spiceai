@@ -34,41 +34,21 @@ use vortex_datafusion::{VortexAccessPlan, VortexAccessPlanProvider};
 /// Provides Cayenne's position-based deletion vectors to `vortex-datafusion`.
 #[derive(Clone)]
 pub(crate) struct PositionDeletionAccessPlanProvider {
-    deletions: PositionDeletions,
-}
-
-/// Where a [`PositionDeletionAccessPlanProvider`] reads its vectors from.
-#[derive(Clone)]
-enum PositionDeletions {
-    /// The table's live cache, read on every lookup.
-    Live(Arc<ArcSwap<PositionBitmap>>),
-    /// The vectors captured with a scan's file list. A compaction that commits
-    /// after the capture clears the live cache while the scan still reads the
-    /// files it captured, so those files keep the deletes they had.
-    Captured(Arc<PositionBitmap>),
+    deletion_cache: Arc<ArcSwap<PositionBitmap>>,
 }
 
 impl PositionDeletionAccessPlanProvider {
     #[must_use]
     pub(crate) fn new(deletion_cache: Arc<ArcSwap<PositionBitmap>>) -> Self {
-        Self {
-            deletions: PositionDeletions::Live(deletion_cache),
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn captured(deletions: Arc<PositionBitmap>) -> Self {
-        Self {
-            deletions: PositionDeletions::Captured(deletions),
-        }
+        Self { deletion_cache }
     }
 
     fn deletion_vector_for_path(&self, file_path: &str) -> Option<Arc<PositionDeletionVector>> {
-        let vector = match &self.deletions {
-            PositionDeletions::Live(cache) => cache.load().get(file_path).cloned(),
-            PositionDeletions::Captured(deletions) => deletions.get(file_path).cloned(),
-        };
-        vector.filter(|deletion_vector| !deletion_vector.is_empty())
+        let snapshot = self.deletion_cache.load();
+        snapshot
+            .get(file_path)
+            .filter(|deletion_vector| !deletion_vector.is_empty())
+            .cloned()
     }
 }
 
