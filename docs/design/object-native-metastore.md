@@ -423,7 +423,19 @@ decides only which long queries can fail, never which rows a query returns.
 - *Readers write nothing.* A query starts from a head confirmed within S of
   when its GET was sent, so every object it needs survives at least T − S.
   One that outlives that may fail, with an error saying to rerun it; it never
-  gets other rows. A read-only node needs only read access.
+  gets other rows. A read-only node needs only read access. A replica's scan
+  stops before any read once T has passed on its own clock since its GET was
+  sent, and reports any read error after that as having outlived its files; GC
+  waits T plus a twelfth after first observing a removal, so a read meets a
+  deleted file only past the reader's deadline, even on clocks whose rates
+  differ, and then fails as outlived. The writer answers from its own state
+  only while its gate, timed from the renewal's send, keeps any other instance
+  from committing. That relies on the gate's clock running on while the writer
+  is paused and at the other instances' rate within the gate's margin: the gate
+  is timed on a clock that keeps counting through a host suspend and closes a
+  twelfth of the lease duration early. A clock that stops during a suspend, or
+  a rate difference beyond that margin, breaks it. Model: `retention-deadline`,
+  `standby-reads*`.
 - *Uploads that never committed* are collected by age on the store's clock.
   Every object has a fresh name (its identity plus its owner: the leased unit
   that created it and that unit's generation). GC deletes an unreferenced upload once the head's
