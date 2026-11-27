@@ -4,6 +4,7 @@
 # (rebuild_cause="acknowledged_past") instead of resuming. The rows still match;
 # the check that nothing was rebuilt fails. From 2.4.x it passes.
 name: postgres-cdc-upgrade
+duration: 24s
 description: >
   PostgreSQL change capture resumes across an upgrade in place from each of the last
   two releases: datasets sharing one replication slot (one

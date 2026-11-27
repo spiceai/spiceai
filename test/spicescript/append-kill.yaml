@@ -1,4 +1,5 @@
 name: append-kill
+duration: 74s
 tags: [long]
 description: >
   Append refresh into Cayenne on a short interval, which holds new rows in

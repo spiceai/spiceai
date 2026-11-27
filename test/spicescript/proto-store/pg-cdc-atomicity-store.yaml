@@ -1,4 +1,5 @@
 name: pg-cdc-atomicity-store
+duration: 93s
 description: >
   A reader never sees part of a source transaction. While PostgreSQL commits
   transfers between rows (one row down, another up) and moves rows to new

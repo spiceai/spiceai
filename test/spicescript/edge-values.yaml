@@ -1,4 +1,5 @@
 name: edge-values
+duration: 22s
 tags: [long]
 description: >
   The boundary values of each type answer through Spice as PostgreSQL answers

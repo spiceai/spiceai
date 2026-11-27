@@ -534,6 +534,14 @@ Per dataset, a **dataset entry** (name, partitions), and per table:
     the shadow row beside its replacement. The engine's bake prunes at the lowest
     of that fence, the highest `seq` it folds and its cold-tier cap, which keeps
     the delete.
+  - *A merge's cutoff counts deletes it no longer holds in memory.* A bake
+    drops the deletes it applied from the in-memory index, while their vectors
+    stay until a clear or the deletion-vector sweep removes them. A later merge
+    that took its `applied_through` from the emptied index would record a cutoff
+    below those vectors, and the next open would apply them to its rows, hiding a
+    key deleted and then upserted again. Its cutoff starts at the newest delete
+    any earlier prune applied. The mem-tier model needs a second bake to reach
+    this (`mem-tier-no-pruned-floor`, #16706).
   - *Clearing follows coverage, not one compaction.* A compaction that rewrites
     every file a delete could hide rows in clears it in its own record; otherwise
     a later record, such as a cold promotion, clears it once the rest are

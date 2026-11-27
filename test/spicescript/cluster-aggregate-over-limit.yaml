@@ -1,4 +1,5 @@
 name: cluster-aggregate-over-limit
+duration: 50s
 tags: [long]
 description: >
   On a cluster, an aggregate over a subquery with ORDER BY … LIMIT counts the

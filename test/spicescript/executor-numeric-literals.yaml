@@ -1,4 +1,5 @@
 name: executor-numeric-literals
+duration: 16s
 tags: [long]
 description: >
   Numeric literals sent to Spice executors retain their Arrow types and values,

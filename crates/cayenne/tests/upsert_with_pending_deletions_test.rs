@@ -64,7 +64,7 @@ async fn setup_upsert_table(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -73,7 +73,10 @@ async fn setup_upsert_table(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
@@ -217,7 +220,7 @@ async fn test_consecutive_upserts_no_duplicates_impl(fixture: TestFixture) -> Te
     Ok(())
 }
 
-test_with_backends!(test_consecutive_upserts_no_duplicates_impl);
+test_on_data_store!(test_consecutive_upserts_no_duplicates_impl);
 
 // =============================================================================
 // Test: Upsert with mix of new and existing PKs when pending deletions exist
@@ -312,7 +315,7 @@ async fn test_upsert_mixed_pks_with_pending_deletions_impl(fixture: TestFixture)
     Ok(())
 }
 
-test_with_backends!(test_upsert_mixed_pks_with_pending_deletions_impl);
+test_on_data_store!(test_upsert_mixed_pks_with_pending_deletions_impl);
 
 // =============================================================================
 // Test: Multiple consecutive upsert cycles
@@ -387,7 +390,7 @@ async fn test_many_consecutive_upsert_cycles_impl(fixture: TestFixture) -> TestR
     Ok(())
 }
 
-test_with_backends!(test_many_consecutive_upsert_cycles_impl);
+test_on_data_store!(test_many_consecutive_upsert_cycles_impl);
 
 // =============================================================================
 // Test: New key in protected snapshot must be detected as conflict in next insert
@@ -516,7 +519,7 @@ async fn test_new_key_in_protected_snapshot_detected_as_conflict_impl(
     Ok(())
 }
 
-test_with_backends!(test_new_key_in_protected_snapshot_detected_as_conflict_impl);
+test_on_data_store!(test_new_key_in_protected_snapshot_detected_as_conflict_impl);
 
 // =============================================================================
 // Test: Protected snapshots must remain readable when pending deletions exist
@@ -637,7 +640,7 @@ async fn test_protected_snapshots_readable_with_pending_deletions_impl(
     Ok(())
 }
 
-test_with_backends!(test_protected_snapshots_readable_with_pending_deletions_impl);
+test_on_data_store!(test_protected_snapshots_readable_with_pending_deletions_impl);
 
 // =============================================================================
 // Test: Upsert after explicit DELETE must not create duplicate PKs
@@ -807,4 +810,4 @@ async fn test_upsert_after_explicit_delete_no_duplicates_impl(
     Ok(())
 }
 
-test_with_backends!(test_upsert_after_explicit_delete_no_duplicates_impl);
+test_on_data_store!(test_upsert_after_explicit_delete_no_duplicates_impl);

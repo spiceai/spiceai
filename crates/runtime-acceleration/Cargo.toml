@@ -40,7 +40,6 @@ runtime-object-store = { path = "../runtime-object-store" }
 runtime-secrets = { path = "../runtime-secrets" }
 runtime-state-location = { path = "../runtime-state-location" }
 s3-event-notifications = { path = "../s3-event-notifications" }
-rusqlite = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -62,7 +61,6 @@ libc = "0.2"
 default = []
 openapi = ["dep:utoipa"]
 snapshots = []
-sqlite = ["dep:rusqlite"]
 # An `AccelerationSource` the engine crates can build in their own tests.
 test-support = []
 

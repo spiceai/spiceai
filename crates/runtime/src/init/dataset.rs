@@ -1948,8 +1948,15 @@ impl Runtime {
     /// Reload each dataset named on `changes`, whose shared acceleration
     /// changed writer: a takeover reopens it from what the previous writer
     /// committed and starts its refresh, a handover stops its refresh.
+    ///
+    /// Holds the runtime only while it handles a change. The senders of
+    /// `changes` belong to the runtime's own `DataFusion`, so a strong
+    /// reference held across `recv` would keep the runtime, and every
+    /// acceleration and metastore connection it opened, alive after it shuts
+    /// down: a runtime started again in the same process would then share the
+    /// stopped one's metastore connections to files since replaced.
     pub(crate) async fn reload_on_writer_changes(
-        self: Arc<Self>,
+        runtime: std::sync::Weak<Self>,
         mut changes: tokio::sync::mpsc::UnboundedReceiver<TableReference>,
     ) {
         let mut queued = std::collections::VecDeque::new();
@@ -1961,10 +1968,14 @@ impl Runtime {
                     None => return,
                 },
             };
-            let Some(app) = self.read_app().await else {
+            // Dropped at the end of this iteration, before the next `recv`.
+            let Some(this) = runtime.upgrade() else {
+                return;
+            };
+            let Some(app) = this.read_app().await else {
                 continue;
             };
-            let Some(dataset) = Arc::clone(&self)
+            let Some(dataset) = Arc::clone(&this)
                 .get_valid_datasets(&app, LogErrors(false))
                 .into_iter()
                 .find(|ds| ds.name == name)
@@ -1974,10 +1985,10 @@ impl Runtime {
             // A reload that unregistered the dataset and then failed to load it
             // again is retried as an added dataset's load is, rather than wait
             // for another change of writer that may never come.
-            if let Some(bootstrap) = Arc::clone(&self).update_dataset(Arc::clone(&dataset)).await {
-                let runtime = Arc::clone(&self);
-                let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
-                let load = self.dataset_loads.begin(&dataset.name);
+            if let Some(bootstrap) = Arc::clone(&this).update_dataset(Arc::clone(&dataset)).await {
+                let runtime = Arc::clone(&this);
+                let load_semaphore = Arc::clone(&this.dataset_load_semaphore);
+                let load = this.dataset_loads.begin(&dataset.name);
                 tokio::spawn(async move {
                     runtime
                         .load_dataset(dataset, bootstrap, load_semaphore, load)
@@ -4322,8 +4333,8 @@ mod tests {
     #[test]
     fn the_last_arrival_warning_says_which_rows_are_missed_and_how_to_load_them() {
         assert_eq!(
-            last_arrival_without_overlap_warning("acc", Engine::Sqlite),
-            "Dataset 'acc' (`engine: sqlite`) has no `refresh_append_overlap`, so a row that arrives after a newer one is never loaded. Use `engine: cayenne` to load every new row, or set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+            last_arrival_without_overlap_warning("acc", Engine::Arrow),
+            "Dataset 'acc' (`engine: arrow`) has no `refresh_append_overlap`, so a row that arrives after a newer one is never loaded. Use `engine: cayenne` to load every new row, or set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
         );
     }
 
@@ -4343,11 +4354,11 @@ mod tests {
         let (keyed, time_keyed) = (Some(&key), Some(&with_time));
         let (append, full) = (RefreshMode::Append, RefreshMode::Full);
         for (engine, key, mode, expected, what) in [
-            (Engine::Sqlite, keyed, append, true, "keyed"),
-            (Engine::Sqlite, None, append, false, "unkeyed"),
-            (Engine::Sqlite, keyed, full, false, "full"),
+            (Engine::Arrow, keyed, append, true, "keyed"),
+            (Engine::Arrow, None, append, false, "unkeyed"),
+            (Engine::Arrow, keyed, full, false, "full"),
             (Engine::Cayenne, keyed, append, false, "keeps newest"),
-            (Engine::Sqlite, time_keyed, append, false, "key holds time"),
+            (Engine::Arrow, time_keyed, append, false, "key holds time"),
         ] {
             assert_eq!(
                 reads_by_time_despite_commits(&acceleration(engine, key), ts, mode),

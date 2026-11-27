@@ -1,5 +1,6 @@
 # Known failing (#15550).
 name: postgres-write-through-arithmetic
+duration: 9s
 description: >
   Under `write_mode: write_through` to PostgreSQL, an UPDATE that sets a
   column from arithmetic on an int, smallint or numeric column is applied as

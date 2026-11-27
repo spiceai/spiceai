@@ -1,4 +1,5 @@
 name: hive-null-partition
+duration: 2s
 description: >
   A Hive-partitioned file dataset reads the rows under the
   `__HIVE_DEFAULT_PARTITION__` directory with NULL in the partition column,

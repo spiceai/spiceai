@@ -112,7 +112,7 @@ const CURRENT_DEFECTS: [&str; 1] = ["mem-tier-current-3-exhaust"];
 /// (including the data-file replay),
 /// and the runs `crates/cayenne`'s mem-tier replay names directly. A test keeps
 /// this list equal to the runs those files name.
-const REPLAYED_AGAINST_CODE: [&str; 35] = [
+const REPLAYED_AGAINST_CODE: [&str; 36] = [
     "commits-restart-no-persist-before-send",
     "commits-restart-turnover",
     "data-files",
@@ -131,6 +131,7 @@ const REPLAYED_AGAINST_CODE: [&str; 35] = [
     "mem-tier-current-3-exhaust",
     "mem-tier-no-capture-reservation",
     "mem-tier-no-one-call",
+    "mem-tier-no-pruned-floor",
     "mem-tier-seal-delete-only",
     "mem-tier-seal-delete-only-sqlite",
     "source-ack-before-acceptance",
@@ -209,6 +210,22 @@ pub fn runs() -> Vec<Run> {
             failure: "",
         },
         Run {
+            name: "mem-tier-seal-delete-only-deep",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only-deep",
+            bound: 3,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "mem-tier-seal-delete-only-sqlite-deep",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only-sqlite-deep",
+            bound: 3,
+            seed: None,
+            failure: "",
+        },
+        Run {
             name: "mem-tier-no-one-call",
             family: "mem-tier",
             mode: "mem-tier-seal-delete-only-no-one-call",
@@ -228,6 +245,14 @@ pub fn runs() -> Vec<Run> {
             name: "mem-tier-no-capture-reservation",
             family: "mem-tier",
             mode: "mem-tier-seal-delete-only-no-capture-reservation",
+            bound: 3,
+            seed: None,
+            failure: "recovered reads match the source",
+        },
+        Run {
+            name: "mem-tier-no-pruned-floor",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only-no-pruned-floor",
             bound: 3,
             seed: None,
             failure: "recovered reads match the source",
@@ -3231,11 +3256,16 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
                 "flush between checkpoint stage and end"
                     | "crash between checkpoint stage and publish"
                     | "bake prunes then reinsert checkpoints"
+                    | "bake tag raised to the pruned-delete floor"
                     | "seal shadow recovered"
                     | "full rewrite committed"
                     | "full rewrite interleaves apply"
                     | "full rewrite retains later protected snapshot"
             ))
+        || (run.family == "mem-tier"
+            && run.failure.is_empty()
+            && run.mode.contains("deep")
+            && matches!(name, "second crash" | "second full rewrite committed"))
         || intent_required
         || added_required
         || standby_required

@@ -1,4 +1,5 @@
 name: refresh-data-window
+duration: 10s
 description: >
   `refresh_data_window` loads into Cayenne only the rows whose time column
   falls inside the window ending now, for each `time_format`: timestamptz,

@@ -1,4 +1,5 @@
 name: object-native-definitions
+duration: 63s
 description: >
   Two Spicepods, apps 'shop' and 'store', run on one state location. Both
   declare a dataset 'orders' with the same `from` and no connection settings:

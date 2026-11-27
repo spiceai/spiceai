@@ -1,4 +1,5 @@
 name: cluster-literals
+duration: 49s
 description: >
   On a cluster, typed literals sent to executors keep their types (#15538):
   a REAL literal (`r = 0.1`) stays a REAL, an infinity stays a float rather
