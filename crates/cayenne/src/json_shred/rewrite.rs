@@ -760,7 +760,7 @@ mod tests {
         );
         assert_eq!(
             super::super::hidden_column_name("attributes", "url.path"),
-            "__cayenne_json_key:10:attributes:url.path"
+            "__cayenne_json_key:v1:10:attributes:url.path"
         );
     }
 }

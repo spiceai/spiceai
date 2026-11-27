@@ -2761,6 +2761,11 @@ pub struct CayenneTableProvider {
     /// [`Self::scan_file_statistics`]. Shared by `clone_for_write` copies, like the
     /// cache it fills.
     scan_file_statistics_flights: Arc<ScanFileStatisticsFlights>,
+    /// JSON key column reads a file scan answered from the values a data file
+    /// stores rather than from its JSON column; shared by `clone_for_write`
+    /// copies. Diagnostic: tests read it to require that the stored values were
+    /// read.
+    json_key_stored_reads: Arc<AtomicU64>,
     /// Unpruned snapshot directory listing (paths + footer stats) for the
     /// current file set. Keyed by snapshot id, [`Self::current_dir_generation`],
     /// and [`Self::listing_cache_epoch`] so a publish that adds files cannot
@@ -12486,6 +12491,7 @@ impl CayenneTableProvider {
                 .with_name("DefaultFileStatisticsCache"),
             ),
             scan_file_statistics_flights: Arc::default(),
+            json_key_stored_reads: Arc::default(),
             cached_snapshot_listing: Arc::new(ArcSwapOption::empty()),
             listing_cache_epoch: Arc::new(AtomicU64::new(0)),
             table_statistics: Arc::new(RwLock::new(CachedTableStatistics {
@@ -13555,10 +13561,18 @@ impl CayenneTableProvider {
             None => write_format,
         };
 
+        // The JSON key columns each file stores after the written columns, chosen
+        // from the write's first rows before its first file opens.
+        let (stream, stored_json_keys) =
+            self.sample_stored_json_keys(stream, &write_schema).await?;
+        let file_schema = stored_json_keys
+            .as_ref()
+            .map_or_else(|| Arc::clone(&write_schema), |keys| keys.file_schema(&write_schema));
+
         // Create a new ListingTable pointing to the snapshot directory
         let snapshot_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
-            Arc::clone(&write_schema),
+            Arc::clone(&file_schema),
             &write_format,
             &self.pk_deletion_strategy,
         )?;
@@ -13689,14 +13703,28 @@ impl CayenneTableProvider {
             })
         };
 
-        let tracked_stream =
-            RecordBatchStreamAdapter::new(Arc::clone(&tracked_schema), tracked_stream);
+        // Each batch's stored JSON key columns follow its written columns, which
+        // the statistics above have already counted: they are none of the
+        // table's. Computed off the async runtime, as many batches at once as the
+        // write has encode shards.
+        let tracked_stream: futures::stream::BoxStream<'static, DataFusionResult<RecordBatch>> =
+            match stored_json_keys {
+                Some(keys) => json_shred::append_to_stream(
+                    tracked_stream,
+                    keys,
+                    Arc::clone(&file_schema),
+                    shard_count,
+                )
+                .boxed(),
+                None => tracked_stream.boxed(),
+            };
+        let tracked_stream = RecordBatchStreamAdapter::new(Arc::clone(&file_schema), tracked_stream);
         // The Vortex sink performs intra-write sharding internally (see
         // `write_shard_format` / `ShardSpec`), so the writer input is a single
         // coordinated stream — no upstream round-robin repartition, which would
         // only be coalesced back to one stream before the `DataSinkExec` anyway.
         let writer_input_plan: Arc<dyn ExecutionPlan> =
-            Arc::new(StreamingExec::new(tracked_schema, Box::pin(tracked_stream)));
+            Arc::new(StreamingExec::new(file_schema, Box::pin(tracked_stream)));
 
         let insert_plan = if self.data_in_object_native_location()
             && snapshot_listing_table.options().file_sort_order.is_empty()
@@ -14950,6 +14978,7 @@ impl CayenneTableProvider {
             listing_fence: Arc::clone(&self.listing_fence),
             scan_file_statistics: Arc::clone(&self.scan_file_statistics),
             scan_file_statistics_flights: Arc::clone(&self.scan_file_statistics_flights),
+            json_key_stored_reads: Arc::clone(&self.json_key_stored_reads),
             cached_snapshot_listing: Arc::clone(&self.cached_snapshot_listing),
             listing_cache_epoch: Arc::clone(&self.listing_cache_epoch),
             table_statistics: Arc::clone(&self.table_statistics),
@@ -22855,6 +22884,80 @@ impl CayenneTableProvider {
         Ok((data, plan))
     }
 
+    /// The JSON key columns every file of a write of `write_schema` stores
+    /// ([`json_shred::StoredJsonKeys`]), chosen from the head of `data`: its
+    /// first batches, up to [`json_shred::STORED_KEYS_SAMPLE_ROWS`] rows. `None`
+    /// when the table has no string column, or the head shows no JSON column
+    /// with a key in at least half of its rows.
+    ///
+    /// The head is read before the write opens its first file, since a file's
+    /// schema is fixed from its first byte, and stays charged to the memory pool
+    /// until the writer takes it, as [`Self::input_range_plan`]'s does. A batch
+    /// the pool refuses ends the head; it is sampled, since it is already held,
+    /// and written next. The returned stream yields the head, then the rest of
+    /// `data`, unchanged.
+    async fn sample_stored_json_keys(
+        &self,
+        mut data: SendableRecordBatchStream,
+        write_schema: &SchemaRef,
+    ) -> DataFusionResult<(
+        SendableRecordBatchStream,
+        Option<Arc<json_shred::StoredJsonKeys>>,
+    )> {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        let candidates =
+            json_shred::StoredJsonKeys::candidates(write_schema, &self.table_schema());
+        if candidates.is_empty() {
+            return Ok((data, None));
+        }
+        let reservation = MemoryConsumer::new(format!(
+            "cayenne_json_key_sample:{}",
+            self.table_name()
+        ))
+        .register(&self.context.runtime_env().memory_pool);
+        let mut head: Vec<RecordBatch> = Vec::new();
+        let mut head_sizes: Vec<usize> = Vec::new();
+        let mut head_rows = 0_usize;
+        let mut refused: Option<RecordBatch> = None;
+        while head_rows < json_shred::STORED_KEYS_SAMPLE_ROWS {
+            let Some(batch) = data.next().await.transpose()? else {
+                break;
+            };
+            let bytes = batch.get_array_memory_size();
+            if reservation.try_grow(bytes).is_err() {
+                refused = Some(batch);
+                break;
+            }
+            head_rows = head_rows.saturating_add(batch.num_rows());
+            head_sizes.push(bytes);
+            head.push(batch);
+        }
+
+        // One walk of each sampled document, off the async runtime.
+        let sample: Vec<RecordBatch> = head.iter().chain(refused.as_ref()).cloned().collect();
+        let schema = Arc::clone(write_schema);
+        let stored = tokio::task::spawn_blocking(move || {
+            json_shred::StoredJsonKeys::choose(&schema, &candidates, &sample)
+        })
+        .await
+        .map_err(|error| DataFusionError::ExecutionJoin(Box::new(error)))?
+        .map(Arc::new);
+        if let Some(stored) = &stored {
+            tracing::debug!(
+                table = self.table_name(),
+                keys = ?stored.keys(write_schema),
+                head_rows,
+                "Stores JSON key columns in the files of a write"
+            );
+        }
+        let input_schema = data.schema();
+        let rest = ChargedInputHead::new(head, head_sizes, refused, data, reservation);
+        let data: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(input_schema, rest));
+        Ok((data, stored))
+    }
+
     /// Key-range split points for a mem-tier checkpoint's encode shards, cut
     /// from the corpus it flushes, which is the whole input and so a fair sample
     /// of itself (see [`Self::sampled_input_bounds`]).
@@ -29990,14 +30093,35 @@ impl CayenneTableProvider {
         dir_url: &str,
         stream: SendableRecordBatchStream,
     ) -> Result<()> {
+        let table_schema = self.table_schema();
+        // As every warm write, a cold file stores its JSON key columns after the
+        // table's (see `write_to_snapshot_with_schema`).
+        let (stream, stored_json_keys) =
+            self.sample_stored_json_keys(stream, &table_schema).await?;
+        let (file_schema, stream): (SchemaRef, SendableRecordBatchStream) =
+            match stored_json_keys {
+                Some(keys) => {
+                    let file_schema = keys.file_schema(&table_schema);
+                    let stream = json_shred::append_to_stream(
+                        stream,
+                        keys,
+                        Arc::clone(&file_schema),
+                        1,
+                    );
+                    (
+                        Arc::clone(&file_schema),
+                        Box::pin(RecordBatchStreamAdapter::new(file_schema, stream)),
+                    )
+                }
+                None => (table_schema, stream),
+            };
         let listing = Self::create_listing_table(
             dir_url,
-            self.table_schema(),
+            Arc::clone(&file_schema),
             write_format,
             &self.pk_deletion_strategy,
         )?;
-        let input: Arc<dyn ExecutionPlan> =
-            Arc::new(StreamingExec::new(self.table_schema(), stream));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(StreamingExec::new(file_schema, stream));
         let plan = listing
             .insert_into(session_state, input, InsertOp::Append)
             .await?;
@@ -44819,7 +44943,9 @@ impl CayenneTableProvider {
                 Some(source) => (
                     source,
                     None,
-                    Some(json_shred::JsonKeyExprAdapterFactory::shared()),
+                    Some(json_shred::JsonKeyExprAdapterFactory::counting(
+                        Arc::clone(&self.json_key_stored_reads),
+                    )),
                 ),
                 None => (file_source, projection.cloned(), None),
             };
@@ -45120,7 +45246,9 @@ impl CayenneTableProvider {
                 Some(source) => (
                     source,
                     None,
-                    Some(json_shred::JsonKeyExprAdapterFactory::shared()),
+                    Some(json_shred::JsonKeyExprAdapterFactory::counting(
+                        Arc::clone(&self.json_key_stored_reads),
+                    )),
                 ),
                 None => (file_source, scan_projection, None),
             };
@@ -45961,6 +46089,16 @@ impl CayenneTableProvider {
                     ),
                 );
             });
+    }
+
+    /// How many JSON key column reads this table's file scans have answered from
+    /// the values a data file stores, rather than by computing them from the
+    /// file's JSON column. Exposed so tests can require that a scan read the
+    /// stored values.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn json_key_stored_reads(&self) -> u64 {
+        self.json_key_stored_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Per-file statistics collection accounting for this table: footer reads,

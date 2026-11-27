@@ -42,6 +42,7 @@ limitations under the License.
 
 mod adapter;
 mod rewrite;
+mod stored;
 
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
@@ -68,6 +69,7 @@ use jiter::{Jiter, Peek};
 
 pub(crate) use adapter::JsonKeyExprAdapterFactory;
 pub use rewrite::{CayenneJsonKeyRewrite, JsonKeyScanResolver, JsonKeyScanTable};
+pub(crate) use stored::{SAMPLE_ROWS as STORED_KEYS_SAMPLE_ROWS, StoredJsonKeys, append_to_stream};
 
 /// The text of the value under top-level `key` in `json`, as the `json_get_*`
 /// functions find it; `None` when they find nothing: `json` is not an object, it
@@ -76,7 +78,7 @@ pub use rewrite::{CayenneJsonKeyRewrite, JsonKeyScanResolver, JsonKeyScanTable};
 /// See the module documentation for why `f(json, key, rest...)` equals
 /// `f(value, rest...)`, and why `key` must not parse as an integer.
 #[must_use]
-pub(crate) fn top_level_value<'j>(json: &'j str, key: &str) -> Option<&'j str> {
+pub fn top_level_value<'j>(json: &'j str, key: &str) -> Option<&'j str> {
     top_level_value_range(json, key).and_then(|range| json.get(range))
 }
 
@@ -106,19 +108,117 @@ fn top_level_value_range(json: &str, key: &str) -> Option<Range<usize>> {
     json.get(start..end).map(|_| start..end)
 }
 
+/// [`top_level_value_range`] of every one of `keys` (distinct, none parsing as an
+/// integer) in `json`, from one walk of the document: `found[i]` for `keys[i]`.
+///
+/// The walk is the one [`top_level_value_range`] takes for each key, shared: it
+/// stops where that walk would stop for every key not yet found. A key's first
+/// match is its value; a later duplicate is skipped as any other member. A value
+/// that fails to parse ends the walk, since every walk for a later key would have
+/// to skip it, and its key's text is the rest of the document.
+fn top_level_value_ranges(json: &str, keys: &[&str], found: &mut [Option<Range<usize>>]) {
+    debug_assert_eq!(keys.len(), found.len(), "one slot per key");
+    found.fill(None);
+    let mut missing = keys.len();
+    if missing == 0 {
+        return;
+    }
+    let mut jiter = Jiter::new(json.as_bytes());
+    if !matches!(jiter.peek(), Ok(Peek::Object)) {
+        return;
+    }
+    let mut member = jiter.known_object();
+    loop {
+        let wanted = match member {
+            Ok(Some(key)) => keys
+                .iter()
+                .position(|wanted| *wanted == key)
+                .filter(|&slot| found[slot].is_none()),
+            Ok(None) | Err(_) => return,
+        };
+        match wanted {
+            Some(slot) => {
+                let Ok(peek) = jiter.peek() else {
+                    return;
+                };
+                let start = jiter.current_index();
+                match jiter.known_skip(peek) {
+                    Ok(()) => {
+                        let end = jiter.current_index();
+                        found[slot] = json.get(start..end).map(|_| start..end);
+                    }
+                    Err(_) => {
+                        found[slot] = json.get(start..).map(|_| start..json.len());
+                        return;
+                    }
+                }
+                missing -= 1;
+                if missing == 0 {
+                    return;
+                }
+            }
+            None => {
+                if jiter.next_skip().is_err() {
+                    return;
+                }
+            }
+        }
+        member = jiter.next_key();
+    }
+}
+
+/// Calls `on_key` with each distinct top-level key of `json` that
+/// [`top_level_value`] finds a value for, in document order, and returns whether
+/// `json` is an object whose every top-level member parsed.
+fn for_each_top_level_key(json: &str, mut on_key: impl FnMut(&str)) -> bool {
+    let mut jiter = Jiter::new(json.as_bytes());
+    if !matches!(jiter.peek(), Ok(Peek::Object)) {
+        return false;
+    }
+    let mut member = jiter.known_object();
+    loop {
+        match member {
+            Ok(Some(key)) => on_key(key),
+            Ok(None) => return true,
+            Err(_) => return false,
+        }
+        if jiter.next_skip().is_err() {
+            return false;
+        }
+        member = jiter.next_key();
+    }
+}
+
 /// Prefix of the name of every column Cayenne derives from a JSON column's key.
 const JSON_KEY_COLUMN_PREFIX: &str = "__cayenne_json_key";
 
+/// Version of the rules a JSON key column's values follow: [`top_level_value`],
+/// as proven against the `json_get_*` functions of the `datafusion-functions-json`
+/// version Cayenne links. It is part of every key column's name
+/// ([`hidden_column_name`]), and a scan reads only a file's column of the current
+/// name, so a file written under other rules has its values computed again from
+/// its JSON column rather than read.
+///
+/// Bump it whenever [`top_level_value`] changes what it returns, or a
+/// `datafusion-functions-json` or `jiter` upgrade changes an answer the
+/// differential test `extracting_a_key_leaves_every_json_function_s_answer_unchanged`
+/// compares (duplicate keys, malformed values, number spelling, ...). The test
+/// `the_semantics_version_was_proven_against_the_linked_json_crates` fails when
+/// either crate's locked version moves, to make that check happen.
+pub(crate) const JSON_KEY_SEMANTICS_VERSION: u32 = 1;
+
 /// The name of the column holding [`top_level_value`] of `key` in JSON column
 /// `json_column`: what a scan calls the column it derives, and what a data file
-/// calls the column that stores those values for its rows.
+/// calls the column that stores those values for its rows. It carries
+/// [`JSON_KEY_SEMANTICS_VERSION`], so a column stored under other rules has
+/// another name.
 ///
 /// Distinct `(json_column, key)` pairs never share a name: the column's byte
 /// length precedes it, so where the column ends and the key starts is fixed.
 #[must_use]
-pub(crate) fn hidden_column_name(json_column: &str, key: &str) -> String {
+pub fn hidden_column_name(json_column: &str, key: &str) -> String {
     format!(
-        "{JSON_KEY_COLUMN_PREFIX}:{}:{json_column}:{key}",
+        "{JSON_KEY_COLUMN_PREFIX}:v{JSON_KEY_SEMANTICS_VERSION}:{}:{json_column}:{key}",
         json_column.len()
     )
 }
@@ -740,5 +840,90 @@ mod tests {
         );
         assert!(!is_shreddable_key("0") && !is_shreddable_key("-3"));
         assert!(is_shreddable_key("url.path") && is_shreddable_key("0x1"));
+    }
+
+    /// The crates the current [`JSON_KEY_SEMANTICS_VERSION`] was proven against
+    /// by the differential test above, at the versions it ran with.
+    const PROVEN_AGAINST: [(&str, &str); 2] =
+        [("datafusion-functions-json", "0.55.6"), ("jiter", "0.17.0")];
+
+    /// The workspace links exactly the versions of the JSON crates the stored key
+    /// columns' rules were proven against. When one moves, the rules may no
+    /// longer match what `json_get_*` returns, and a stored column written under
+    /// the old ones would be read as if they still held.
+    #[test]
+    fn the_semantics_version_was_proven_against_the_linked_json_crates() {
+        let lock_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock");
+        let lock = std::fs::read_to_string(lock_path).expect("read the workspace Cargo.lock");
+        for (name, proven) in PROVEN_AGAINST {
+            let locked: Vec<&str> = lock
+                .split("[[package]]")
+                .filter(|package| {
+                    package
+                        .lines()
+                        .any(|line| line.trim() == format!("name = \"{name}\""))
+                })
+                .filter_map(|package| {
+                    package.lines().find_map(|line| {
+                        line.trim()
+                            .strip_prefix("version = \"")
+                            .and_then(|rest| rest.strip_suffix('"'))
+                    })
+                })
+                .collect();
+            assert_eq!(
+                locked,
+                vec![proven],
+                "Cargo.lock pins {name} {locked:?}, but JSON_KEY_SEMANTICS_VERSION \
+                 {JSON_KEY_SEMANTICS_VERSION} was proven against {name} {proven}. Run \
+                 `cargo test -p cayenne --lib json_shred` (the differential test \
+                 extracting_a_key_leaves_every_json_function_s_answer_unchanged): if \
+                 any answer changed, fix top_level_value and bump \
+                 JSON_KEY_SEMANTICS_VERSION in crates/cayenne/src/json_shred.rs, so \
+                 files whose key columns were stored under the old rules are computed \
+                 again rather than read. Then record {name} at its new version in \
+                 PROVEN_AGAINST."
+            );
+        }
+    }
+
+    /// One walk for many keys finds, for each, exactly what [`top_level_value`]
+    /// finds for it alone: over generated documents with escaped, duplicate and
+    /// non-ASCII keys, malformed and truncated values, non-objects and trailing
+    /// garbage, and for key sets in every order, with keys present and absent.
+    #[test]
+    fn one_walk_for_many_keys_finds_each_key_s_value() {
+        let candidates = ["a", "url.path", "dup", "ké", "b", "missing", "x"];
+        let mut found_some = 0_usize;
+        for seed in [3_u64, 0xfeed, 20_261_126] {
+            let mut rng = Rng(seed);
+            let docs: Vec<String> = (0..4000).filter_map(|_| document(&mut rng)).collect();
+            for (row, doc) in docs.iter().enumerate() {
+                // A different subset and order of the keys for each document.
+                let mut keys: Vec<&str> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|_| rng.below(3) != 0)
+                    .collect();
+                for i in (1..keys.len()).rev() {
+                    keys.swap(i, rng.below(i + 1));
+                }
+                let mut found = vec![Some(0..0); keys.len()];
+                top_level_value_ranges(doc, &keys, &mut found);
+                for (key, range) in keys.iter().zip(&found) {
+                    let one_walk = range.clone().and_then(|range| doc.get(range));
+                    assert_eq!(
+                        one_walk,
+                        top_level_value(doc, key),
+                        "seed {seed}, document {row} {doc:?}, key {key:?} among {keys:?}"
+                    );
+                    found_some += usize::from(one_walk.is_some());
+                }
+            }
+        }
+        assert!(
+            found_some > 5000,
+            "only {found_some} values found: the documents exercise too little"
+        );
     }
 }

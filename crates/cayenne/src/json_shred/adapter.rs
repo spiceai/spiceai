@@ -18,6 +18,7 @@ limitations under the License.
 //! it, or computes it from the file's JSON column when the file stores none.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
@@ -42,18 +43,31 @@ use super::{JsonTopLevelValue, hidden_column_name, is_json_text_type};
 #[derive(Debug)]
 pub(crate) struct JsonKeyExprAdapterFactory {
     inner: Arc<dyn PhysicalExprAdapterFactory>,
+    /// Counts each key column read from a file's stored values.
+    stored_reads: Option<Arc<AtomicU64>>,
 }
 
 impl JsonKeyExprAdapterFactory {
     pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(DefaultPhysicalExprAdapterFactory),
+            stored_reads: None,
         }
     }
 
     /// The factory, as a file scan configuration takes it.
+    #[cfg(test)]
     pub(crate) fn shared() -> Arc<dyn PhysicalExprAdapterFactory> {
         Arc::new(Self::new())
+    }
+
+    /// [`Self::shared`], adding one to `stored_reads` for each key column it
+    /// reads from a file's stored values.
+    pub(crate) fn counting(stored_reads: Arc<AtomicU64>) -> Arc<dyn PhysicalExprAdapterFactory> {
+        Arc::new(Self {
+            stored_reads: Some(stored_reads),
+            ..Self::new()
+        })
     }
 }
 
@@ -70,6 +84,7 @@ impl PhysicalExprAdapterFactory for JsonKeyExprAdapterFactory {
             )?,
             logical_file_schema,
             physical_file_schema,
+            stored_reads: self.stored_reads.clone(),
         }))
     }
 }
@@ -79,6 +94,7 @@ struct JsonKeyExprAdapter {
     inner: Arc<dyn PhysicalExprAdapter>,
     logical_file_schema: SchemaRef,
     physical_file_schema: SchemaRef,
+    stored_reads: Option<Arc<AtomicU64>>,
 }
 
 impl PhysicalExprAdapter for JsonKeyExprAdapter {
@@ -120,6 +136,9 @@ impl JsonKeyExprAdapter {
             return None;
         }
         let stored: Arc<dyn PhysicalExpr> = Arc::new(Column::new(&name, index));
+        if let Some(stored_reads) = &self.stored_reads {
+            stored_reads.fetch_add(1, Ordering::Relaxed);
+        }
         Some(if *data_type == DataType::Utf8View {
             stored
         } else {
@@ -146,7 +165,7 @@ mod tests {
 
     use crate::json_shred::{JsonKeyColumn, file_projection_with_json_keys};
 
-    const STORED: &str = "__cayenne_json_key:10:attributes:url.path";
+    const STORED: &str = "__cayenne_json_key:v1:10:attributes:url.path";
 
     /// Writes `batch` as a Vortex file at `path`, returning its size.
     async fn write_vortex(path: &std::path::Path, batch: &RecordBatch) -> u64 {
@@ -236,8 +255,9 @@ mod tests {
         rows
     }
 
-    /// A file that stores a key's values is read for them; a file without them, and
-    /// any file when the table itself has a column of that name, is computed from.
+    /// A file that stores a key's values is read for them; a file without them, a
+    /// file that stores them under another version's rules, and any file when the
+    /// table itself has a column of that name, is computed from.
     /// The stored values here differ from the computed ones on purpose, so the
     /// test can tell which a row came from.
     #[tokio::test]
@@ -273,9 +293,31 @@ mod tests {
             ],
         )
         .expect("batch");
+        // Values stored under other extraction rules, named as those rules named
+        // them: the unversioned name and an older version's.
+        let old_rules = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("attributes", DataType::Utf8, true),
+                Field::new("__cayenne_json_key:10:attributes:url.path", DataType::Utf8, true),
+                Field::new("__cayenne_json_key:v0:10:attributes:url.path", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![21, 22, 23, 24])),
+                Arc::new(documents()),
+                Arc::new(StringArray::from(vec![Some("\"old\""); 4])),
+                Arc::new(StringArray::from(vec![Some("\"v0\""); 4])),
+            ],
+        )
+        .expect("batch");
         let stored_size = write_vortex(&dir.path().join("stored.vortex"), &with_stored).await;
         let plain_size = write_vortex(&dir.path().join("plain.vortex"), &plain).await;
-        let files = [("stored.vortex", stored_size), ("plain.vortex", plain_size)];
+        let old_size = write_vortex(&dir.path().join("old_rules.vortex"), &old_rules).await;
+        let files = [
+            ("stored.vortex", stored_size),
+            ("plain.vortex", plain_size),
+            ("old_rules.vortex", old_size),
+        ];
 
         let table = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -290,6 +332,11 @@ mod tests {
             (12, Some("\"/a/longer/than/twelve/bytes\"".to_string())),
             (13, None),
             (14, None),
+            // Stored under other rules: computed again, never read.
+            (21, Some("\"/a\"".to_string())),
+            (22, Some("\"/a/longer/than/twelve/bytes\"".to_string())),
+            (23, None),
+            (24, None),
         ];
         for pushdown in [ProjectionPushdown::Off, ProjectionPushdown::On] {
             assert_eq!(
@@ -315,6 +362,10 @@ mod tests {
             (12, Some("\"/a/longer/than/twelve/bytes\"".to_string())),
             (13, None),
             (14, None),
+            (21, Some("\"/a\"".to_string())),
+            (22, Some("\"/a/longer/than/twelve/bytes\"".to_string())),
+            (23, None),
+            (24, None),
         ];
         assert_eq!(
             scan(
