@@ -44,7 +44,8 @@ use datafusion::physical_plan::{
 };
 
 use data_components::flightsql::{
-    FlightSqlClient, FlightSqlExec, query_to_stream, trace_parent_from_task_context,
+    EndpointLocationGuard, FlightSqlClient, FlightSqlExec, query_to_stream,
+    trace_parent_from_task_context,
 };
 use data_components::sql_expr::{
     numeric_literal_to_spice_sql, to_spice_sql, to_sql_preserving_precedence,
@@ -162,6 +163,8 @@ pub struct PartialAggregationFlightSqlExec {
     client: FlightSqlClient,
     /// Cookie store for authentication propagation.
     cookie_store: Arc<CookieStore>,
+    /// Endpoint locations inherited from the source `FlightSqlExec`.
+    endpoint_locations: EndpointLocationGuard,
     /// Cached plan properties.
     properties: Arc<PlanProperties>,
     /// Optional W3C `traceparent` value inherited from the source
@@ -202,6 +205,7 @@ impl PartialAggregationFlightSqlExec {
             column_substitutions,
             client: source.client().clone(),
             cookie_store: Arc::clone(source.cookie_store()),
+            endpoint_locations: source.endpoint_locations().clone(),
             properties,
             trace_parent: source.trace_parent().map(str::to_string),
             statistics,
@@ -349,6 +353,7 @@ impl ExecutionPlan for PartialAggregationFlightSqlExec {
             query.sql,
             Arc::clone(&self.cookie_store),
             self.table_reference.to_quoted_string(),
+            self.endpoint_locations.clone(),
         )
         .map(move |result: std::result::Result<_, DataFusionError>| {
             result.and_then(|batch| remap_batch(&batch, &column_mapping, &target_schema))

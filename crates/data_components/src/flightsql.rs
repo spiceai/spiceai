@@ -27,12 +27,16 @@ use async_trait::async_trait;
 use flight_client::{
     MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE,
     cookie::{CookieService, CookieStore},
-    tls::new_tls_flight_channel,
+    tls::{new_tls_flight_channel, new_tls_flight_channel_to_addresses},
     within_decompression_bound,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
+use object_store_spawn::DestinationGuard;
+use runtime_object_store::ssrf;
 use snafu::prelude::*;
+use std::net::{IpAddr, SocketAddr};
 use std::{fmt, sync::Arc, vec};
+use url::Url;
 
 use arrow_flight::{
     FlightEndpoint, IpcMessage, Ticket,
@@ -236,6 +240,7 @@ pub struct FlightSQLTable {
     function_support: Option<FunctionSupport>,
     token: Option<String>,
     spice_sql: bool,
+    endpoint_locations: EndpointLocationGuard,
 }
 
 #[expect(clippy::needless_pass_by_value)]
@@ -264,6 +269,7 @@ impl FlightSQLTable {
             function_support: None,
             token: None,
             spice_sql: false,
+            endpoint_locations: EndpointLocationGuard::for_endpoint(endpoint),
         })
     }
 
@@ -288,6 +294,7 @@ impl FlightSQLTable {
             function_support: None,
             token: None,
             spice_sql: false,
+            endpoint_locations: EndpointLocationGuard::for_endpoint(endpoint),
         }
     }
 
@@ -508,7 +515,8 @@ impl FlightSQLTable {
         )?;
         let exec = exec
             .with_token(self.token.clone())
-            .with_spice_sql(self.spice_sql);
+            .with_spice_sql(self.spice_sql)
+            .with_endpoint_locations(self.endpoint_locations.clone());
         // Project the table-level statistics onto the scan's (projected) output
         // schema so the column-statistics list lines up with the output columns.
         //
@@ -612,6 +620,7 @@ pub struct FlightSqlExec {
     statistics: Statistics,
     token: Option<String>,
     spice_sql: bool,
+    endpoint_locations: EndpointLocationGuard,
 }
 
 impl FlightSqlExec {
@@ -659,6 +668,7 @@ impl FlightSqlExec {
             statistics,
             token: None,
             spice_sql: false,
+            endpoint_locations: EndpointLocationGuard::default(),
         })
     }
 
@@ -694,6 +704,19 @@ impl FlightSqlExec {
     pub fn with_token(mut self, token: Option<String>) -> Self {
         self.token = token;
         self
+    }
+
+    /// Set which endpoint locations this scan's queries connect to.
+    #[must_use]
+    pub fn with_endpoint_locations(mut self, endpoint_locations: EndpointLocationGuard) -> Self {
+        self.endpoint_locations = endpoint_locations;
+        self
+    }
+
+    /// Returns which endpoint locations this scan's queries connect to.
+    #[must_use]
+    pub fn endpoint_locations(&self) -> &EndpointLocationGuard {
+        &self.endpoint_locations
     }
 
     /// Returns the currently configured W3C `traceparent` value, if any.
@@ -908,6 +931,7 @@ impl ExecutionPlan for FlightSqlExec {
             statistics: self.statistics.clone(),
             token: self.token.clone(),
             spice_sql: self.spice_sql,
+            endpoint_locations: self.endpoint_locations.clone(),
         };
 
         Ok(SortOrderPushdownResult::Exact {
@@ -946,6 +970,7 @@ impl ExecutionPlan for FlightSqlExec {
             sql,
             Arc::clone(&self.cookie_store),
             self.table_reference.to_quoted_string(),
+            self.endpoint_locations.clone(),
         )
         .map(move |result| result.and_then(|batch| coerce_batch_to_schema(&batch, &target_schema)));
 
@@ -1020,6 +1045,7 @@ impl ExecutionPlan for FlightSqlExec {
             statistics,
             token: self.token.clone(),
             spice_sql: self.spice_sql,
+            endpoint_locations: self.endpoint_locations.clone(),
         };
 
         Some(Arc::new(new_plan))
@@ -1124,6 +1150,7 @@ pub fn query_to_stream(
     sql: String,
     cookie_store: Arc<CookieStore>,
     table_name: String,
+    endpoint_locations: EndpointLocationGuard,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     stream! {
         let flight_info = client
@@ -1141,6 +1168,8 @@ pub fn query_to_stream(
                     &client,
                     ep,
                     &cookie_store,
+                    &endpoint_locations,
+                    &table_name,
                 )
                 .await
                     .map_err(to_execution_error)?
@@ -1232,38 +1261,149 @@ async fn guarded_do_get(
     .with_headers(headers))
 }
 
-pub async fn get_client_for_flight_endpoint(
-    client: &FlightSqlClient,
-    ep: FlightEndpoint,
-    cookie_store: &Arc<CookieStore>,
-) -> Result<FlightSqlClient, Box<dyn std::error::Error>> {
-    if ep.location.is_empty() {
-        Ok(client.clone())
-    } else {
-        // Some Flight SQL servers (e.g. StarRocks) advertise an internal/cluster-only address
-        // in the endpoint location that's unreachable from external clients. Per the Flight SQL
-        // spec, data served at the same address as the FlightInfo may carry an empty location;
-        // StarRocks instead returns its internal FE address. If we can't reach the advertised
-        // location, fall back to the original connection that served the FlightInfo.
-        match new_tls_flight_channel(&ep.location[0].uri, None).await {
-            Ok(channel) => {
-                let channel = CookieService::new(channel, Arc::clone(cookie_store));
-                let mut new_client = FlightSqlServiceClient::new(channel);
-                // Propagate auth token to avoid "invalid authentication credentials" on DoGet.
-                // Per-endpoint clients don't inherit the handshake session of the original client.
-                if let Some(t) = client.token().cloned() {
-                    new_client.set_token(t);
-                }
-                Ok(new_client)
+/// The location scheme that asks the client to fetch the data over the connection that served
+/// the `FlightInfo`.
+const REUSE_CONNECTION_SCHEME: &str = "arrow-flight-reuse-connection";
+
+/// Which `FlightEndpoint` locations a query connects to, carrying the connection's bearer token.
+///
+/// A location on the configured endpoint's host is followed as the server names it. Any other
+/// location is refused when its host is a private, loopback, or link-local address, a well-known
+/// internal name, or a name that resolves to such an address, unless
+/// [`ssrf::ALLOW_PRIVATE_HOSTS_ENV`] allows it. Otherwise it connects only to the addresses that
+/// were checked, so a second lookup cannot move it to an internal address.
+#[derive(Clone, Debug, Default)]
+pub struct EndpointLocationGuard {
+    /// The configured endpoint's host, as [`ssrf::redirect_host_key`] keys it.
+    endpoint_host: Option<String>,
+    allow_private_hosts: bool,
+}
+
+/// Where [`EndpointLocationGuard`] sends a query for one endpoint's data.
+#[derive(Debug, PartialEq, Eq)]
+enum LocationDestination {
+    /// The connection that served the `FlightInfo`.
+    OriginalConnection,
+    /// The location, connected to as the server names it.
+    AsNamed,
+    /// The location, connected to only through these checked addresses.
+    Checked(Vec<IpAddr>),
+    /// The connection that served the `FlightInfo`, because the location's host is internal.
+    Refused { host: String },
+}
+
+impl EndpointLocationGuard {
+    /// The guard for locations returned by the Flight SQL server at `endpoint`.
+    #[must_use]
+    pub fn for_endpoint(endpoint: &str) -> Self {
+        Self {
+            endpoint_host: Url::parse(endpoint)
+                .ok()
+                .as_ref()
+                .and_then(location_host)
+                .map(|host| ssrf::redirect_host_key(&host)),
+            allow_private_hosts: ssrf::allow_private_hosts(),
+        }
+    }
+
+    async fn destination(&self, location: &str) -> LocationDestination {
+        let url = Url::parse(location).ok();
+        if url
+            .as_ref()
+            .is_some_and(|url| url.scheme() == REUSE_CONNECTION_SCHEME)
+        {
+            return LocationDestination::OriginalConnection;
+        }
+        if self.allow_private_hosts {
+            return LocationDestination::AsNamed;
+        }
+        let Some(host) = url.as_ref().and_then(location_host) else {
+            return LocationDestination::OriginalConnection;
+        };
+        if self.endpoint_host.as_deref() == Some(ssrf::redirect_host_key(&host).as_str()) {
+            return LocationDestination::AsNamed;
+        }
+        if ssrf::is_blocked_internal_hostname(&host) {
+            return LocationDestination::Refused { host };
+        }
+        let guard = DestinationGuard::new(
+            ssrf::is_internal_ip,
+            ssrf::redirect_target_is_internal,
+            "a Flight SQL endpoint location is not followed to a private, loopback, or link-local address",
+        );
+        match guard.resolve(&host).await {
+            Ok(addresses) => {
+                LocationDestination::Checked(addresses.iter().map(SocketAddr::ip).collect())
             }
-            Err(_) => Ok(client.clone()),
+            Err(error) if error.downcast_ref::<ssrf::DestinationRefused>().is_some() => {
+                LocationDestination::Refused { host }
+            }
+            Err(_) => LocationDestination::OriginalConnection,
         }
     }
 }
 
+/// The host a location names, without the brackets of an IPv6 literal.
+fn location_host(url: &Url) -> Option<String> {
+    match url.host()? {
+        url::Host::Domain(domain) => (!domain.is_empty()).then(|| domain.to_string()),
+        url::Host::Ipv4(ip) => Some(ip.to_string()),
+        url::Host::Ipv6(ip) => Some(ip.to_string()),
+    }
+}
+
+fn refused_location_warning(table_name: &str, host: &str) -> String {
+    format!(
+        "Flight SQL table {table_name} did not connect to '{host}', an endpoint location the server returned, so it requests that endpoint's data from the configured endpoint instead. \
+        Cause: '{host}' is a private, loopback, or link-local address. \
+        If the server intentionally serves data from an internal address, set `{}=true`. \
+        See: https://spiceai.org/docs/components/data-connectors/flightsql",
+        ssrf::ALLOW_PRIVATE_HOSTS_ENV
+    )
+}
+
+pub async fn get_client_for_flight_endpoint(
+    client: &FlightSqlClient,
+    ep: FlightEndpoint,
+    cookie_store: &Arc<CookieStore>,
+    locations: &EndpointLocationGuard,
+    table_name: &str,
+) -> Result<FlightSqlClient, Box<dyn std::error::Error>> {
+    let Some(location) = ep.location.first() else {
+        return Ok(client.clone());
+    };
+    // Some Flight SQL servers (e.g. StarRocks) advertise an internal/cluster-only address
+    // in the endpoint location that's unreachable from external clients. Per the Flight SQL
+    // spec, data served at the same address as the FlightInfo may carry an empty location;
+    // StarRocks instead returns its internal FE address. If we can't reach the advertised
+    // location, fall back to the original connection that served the FlightInfo.
+    let channel = match locations.destination(&location.uri).await {
+        LocationDestination::OriginalConnection => return Ok(client.clone()),
+        LocationDestination::Refused { host } => {
+            tracing::warn!("{}", refused_location_warning(table_name, &host));
+            return Ok(client.clone());
+        }
+        LocationDestination::AsNamed => new_tls_flight_channel(&location.uri, None).await,
+        LocationDestination::Checked(addresses) => {
+            new_tls_flight_channel_to_addresses(&location.uri, addresses).await
+        }
+    };
+    let Ok(channel) = channel else {
+        return Ok(client.clone());
+    };
+    let channel = CookieService::new(channel, Arc::clone(cookie_store));
+    let mut new_client = FlightSqlServiceClient::new(channel);
+    // Propagate auth token to avoid "invalid authentication credentials" on DoGet.
+    // Per-endpoint clients don't inherit the handshake session of the original client.
+    if let Some(t) = client.token().cloned() {
+        new_client.set_token(t);
+    }
+    Ok(new_client)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FlightSqlClient, query_to_stream};
+    use super::{EndpointLocationGuard, FlightSqlClient, LocationDestination, query_to_stream};
     use crate::flightsql::FlightSqlExec;
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
@@ -1281,7 +1421,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -1410,6 +1550,9 @@ mod tests {
         /// with a dictionary nested in the map, numbered the way a server other than `arrow-rs`
         /// may number them (see [`crate::flight::dictionary_id_fixture`]).
         NullableMapEntriesWithReorderedDictionaryIds,
+        /// Serves one batch holding a single `marker` value, so a test can tell which server
+        /// answered.
+        Marker(i64),
     }
 
     struct TestServer {
@@ -1420,17 +1563,36 @@ mod tests {
 
     impl TestServer {
         async fn start(cookie_seen: Arc<AtomicBool>, do_get_mode: DoGetMode) -> Self {
+            Self::start_with_location(
+                |addr| format!("http://{addr}"),
+                cookie_seen,
+                do_get_mode,
+                Arc::default(),
+            )
+            .await
+        }
+
+        /// A server whose endpoints carry `location(its address)`, or no location when that is
+        /// empty, and which counts the connections it accepts in `connections`.
+        async fn start_with_location(
+            location: impl FnOnce(SocketAddr) -> String,
+            cookie_seen: Arc<AtomicBool>,
+            do_get_mode: DoGetMode,
+            connections: Arc<AtomicUsize>,
+        ) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("listener should bind");
             let addr = listener.local_addr().expect("listener should have addr");
-            let location = format!("http://{addr}");
-            let service = CookieFlightSqlService::new(cookie_seen, location, do_get_mode);
+            let service = CookieFlightSqlService::new(cookie_seen, location(addr), do_get_mode);
+            let incoming = TcpListenerStream::new(listener).inspect(move |_| {
+                connections.fetch_add(1, Ordering::SeqCst);
+            });
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             let handle = tokio::spawn(async move {
                 tonic::transport::Server::builder()
                     .add_service(FlightServiceServer::new(service))
-                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    .serve_with_incoming_shutdown(incoming, async move {
                         let _ = shutdown_rx.await;
                     })
                     .await
@@ -1508,9 +1670,13 @@ mod tests {
                 ticket: Some(Ticket {
                     ticket: Bytes::from_static(b"ticket"),
                 }),
-                location: vec![Location {
-                    uri: self.location.clone(),
-                }],
+                location: if self.location.is_empty() {
+                    vec![]
+                } else {
+                    vec![Location {
+                        uri: self.location.clone(),
+                    }]
+                },
                 expiration_time: None,
                 app_metadata: Bytes::new(),
             };
@@ -1582,6 +1748,17 @@ mod tests {
                         data.into_iter().map(Ok),
                     ))))
                 }
+                DoGetMode::Marker(marker) => {
+                    let batch = marker_batch(marker);
+                    let data = arrow_flight::utils::batches_to_flight_data(
+                        batch.schema().as_ref(),
+                        vec![batch],
+                    )
+                    .map_err(|e| Status::internal(format!("encoding the marker batch: {e}")))?;
+                    Ok(Response::new(Box::pin(futures::stream::iter(
+                        data.into_iter().map(Ok),
+                    ))))
+                }
             }
         }
 
@@ -1633,6 +1810,7 @@ mod tests {
             "SELECT 1".to_string(),
             Arc::clone(&cookie_store),
             "\"t\"".to_string(),
+            EndpointLocationGuard::for_endpoint(&format!("http://{}", server.addr)),
         )
         .try_collect::<Vec<_>>()
         .await
@@ -2090,6 +2268,7 @@ mod tests {
             "SELECT m FROM t".to_string(),
             cookie_store,
             "\"t\"".to_string(),
+            EndpointLocationGuard::for_endpoint(&format!("http://{}", server.addr)),
         )
         .try_collect::<Vec<_>>()
         .await
@@ -2149,6 +2328,7 @@ mod tests {
             "SELECT a, m, c FROM t".to_string(),
             cookie_store,
             "\"t\"".to_string(),
+            EndpointLocationGuard::for_endpoint(&format!("http://{}", server.addr)),
         )
         .try_collect::<Vec<_>>()
         .await
@@ -2160,6 +2340,251 @@ mod tests {
         assert_eq!(values(batch), expected_values());
 
         server.shutdown().await;
+    }
+
+    /// The marker the server a query is configured against serves.
+    const ENDPOINT_MARKER: i64 = 1;
+    /// The marker the server an endpoint location names serves.
+    const LOCATION_MARKER: i64 = 2;
+
+    fn marker_batch(marker: i64) -> arrow::array::RecordBatch {
+        arrow::array::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "marker",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![marker]))],
+        )
+        .expect("marker batch")
+    }
+
+    fn markers(batches: &[arrow::array::RecordBatch]) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .expect("an Int64 marker column")
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    fn location_guard(endpoint: &str, allow_private_hosts: bool) -> EndpointLocationGuard {
+        EndpointLocationGuard {
+            allow_private_hosts,
+            ..EndpointLocationGuard::for_endpoint(endpoint)
+        }
+    }
+
+    async fn query_markers(
+        client: FlightSqlClient,
+        cookie_store: Arc<CookieStore>,
+        locations: EndpointLocationGuard,
+    ) -> Vec<i64> {
+        let batches = query_to_stream(
+            client,
+            "SELECT marker FROM t".to_string(),
+            cookie_store,
+            "\"t\"".to_string(),
+            locations,
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("query should succeed");
+        markers(&batches)
+    }
+
+    /// Queries a server configured as `endpoint(its address)` that serves [`ENDPOINT_MARKER`]
+    /// and returns `location(second)` as its endpoint location, where `second` is the address of
+    /// a server that serves [`LOCATION_MARKER`]. Returns the markers the query read and the
+    /// connections the second server accepted.
+    async fn query_through_location(
+        location: impl FnOnce(SocketAddr) -> String,
+        endpoint: impl FnOnce(SocketAddr) -> String,
+        allow_private_hosts: bool,
+    ) -> (Vec<i64>, usize) {
+        let second_connections = Arc::new(AtomicUsize::new(0));
+        let second = TestServer::start_with_location(
+            |_| String::new(),
+            Arc::default(),
+            DoGetMode::Marker(LOCATION_MARKER),
+            Arc::clone(&second_connections),
+        )
+        .await;
+        let second_addr = second.addr;
+        let first = TestServer::start_with_location(
+            |_| location(second_addr),
+            Arc::default(),
+            DoGetMode::Marker(ENDPOINT_MARKER),
+            Arc::default(),
+        )
+        .await;
+
+        let endpoint = endpoint(first.addr);
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_shared(endpoint.clone())
+            .expect("channel should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let client: FlightSqlClient = arrow_flight::sql::client::FlightSqlServiceClient::new(
+            CookieService::new(channel, Arc::clone(&cookie_store)),
+        );
+        let markers = query_markers(
+            client,
+            cookie_store,
+            location_guard(&endpoint, allow_private_hosts),
+        )
+        .await;
+
+        first.shutdown().await;
+        second.shutdown().await;
+        (markers, second_connections.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_location_on_a_loopback_address_is_not_followed() {
+        let (markers, location_connections) = query_through_location(
+            |second| format!("grpc://127.0.0.1:{}", second.port()),
+            |first| format!("http://localhost:{}", first.port()),
+            false,
+        )
+        .await;
+        assert_eq!(markers, [ENDPOINT_MARKER]);
+        assert_eq!(location_connections, 0);
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_location_on_localhost_is_not_followed() {
+        let (markers, location_connections) = query_through_location(
+            |second| format!("grpc://localhost:{}", second.port()),
+            |first| format!("http://127.0.0.1:{}", first.port()),
+            false,
+        )
+        .await;
+        assert_eq!(markers, [ENDPOINT_MARKER]);
+        assert_eq!(location_connections, 0);
+    }
+
+    #[tokio::test]
+    async fn an_internal_endpoint_location_is_followed_when_private_hosts_are_allowed() {
+        let (markers, location_connections) = query_through_location(
+            |second| format!("grpc://127.0.0.1:{}", second.port()),
+            |first| format!("http://localhost:{}", first.port()),
+            true,
+        )
+        .await;
+        assert_eq!(markers, [LOCATION_MARKER]);
+        assert_eq!(location_connections, 1);
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_location_on_the_configured_endpoints_host_is_followed() {
+        let (markers, location_connections) = query_through_location(
+            |second| format!("grpc://127.0.0.1:{}", second.port()),
+            |first| format!("http://127.0.0.1:{}", first.port()),
+            false,
+        )
+        .await;
+        assert_eq!(markers, [LOCATION_MARKER]);
+        assert_eq!(location_connections, 1);
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_reuse_connection_location_reads_from_the_configured_endpoint() {
+        for location in ["", "arrow-flight-reuse-connection://?"] {
+            let (markers, location_connections) = query_through_location(
+                |_| location.to_string(),
+                |first| format!("http://localhost:{}", first.port()),
+                false,
+            )
+            .await;
+            assert_eq!(markers, [ENDPOINT_MARKER], "location {location:?}");
+            assert_eq!(location_connections, 0, "location {location:?}");
+        }
+    }
+
+    /// `flight.invalid` never resolves (RFC 6761), so the rows can only come from the checked
+    /// address the channel was given.
+    #[tokio::test]
+    async fn a_channel_to_checked_addresses_connects_only_to_them() {
+        let server = TestServer::start_with_location(
+            |_| String::new(),
+            Arc::default(),
+            DoGetMode::Marker(LOCATION_MARKER),
+            Arc::default(),
+        )
+        .await;
+        let channel = flight_client::tls::new_tls_flight_channel_to_addresses(
+            &format!("grpc://flight.invalid:{}", server.addr.port()),
+            vec![server.addr.ip()],
+        )
+        .await
+        .expect("channel should connect to the checked address");
+        let cookie_store = Arc::new(CookieStore::new());
+        let client: FlightSqlClient = arrow_flight::sql::client::FlightSqlServiceClient::new(
+            CookieService::new(channel, Arc::clone(&cookie_store)),
+        );
+
+        let markers = query_markers(client, cookie_store, EndpointLocationGuard::default()).await;
+        assert_eq!(markers, [LOCATION_MARKER]);
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn endpoint_location_destinations() {
+        let refused = |host: &str| LocationDestination::Refused {
+            host: host.to_string(),
+        };
+        let guard = location_guard("grpc+tls://flight.example.com:443", false);
+        for (location, expected) in [
+            ("grpc://127.0.0.1:1", refused("127.0.0.1")),
+            ("grpc://[::1]:1", refused("::1")),
+            ("grpc+tls://10.1.2.3:443", refused("10.1.2.3")),
+            ("grpc://169.254.169.254:80", refused("169.254.169.254")),
+            (
+                "grpc://[::ffff:169.254.169.254]:80",
+                refused("::ffff:169.254.169.254"),
+            ),
+            ("grpc://localhost:1", refused("localhost")),
+            (
+                "grpc://metadata.google.internal:80",
+                refused("metadata.google.internal"),
+            ),
+            (
+                "grpc+tls://8.8.8.8:443",
+                LocationDestination::Checked(vec!["8.8.8.8".parse().expect("an IP address")]),
+            ),
+            (
+                "grpc+tls://FLIGHT.example.com.:8443",
+                LocationDestination::AsNamed,
+            ),
+            (
+                "arrow-flight-reuse-connection://?",
+                LocationDestination::OriginalConnection,
+            ),
+            ("not a location", LocationDestination::OriginalConnection),
+        ] {
+            assert_eq!(guard.destination(location).await, expected, "{location}");
+        }
+
+        let allowed = location_guard("grpc+tls://flight.example.com:443", true);
+        assert_eq!(
+            allowed.destination("grpc://127.0.0.1:1").await,
+            LocationDestination::AsNamed
+        );
+        assert_eq!(
+            allowed
+                .destination("arrow-flight-reuse-connection://?")
+                .await,
+            LocationDestination::OriginalConnection
+        );
     }
 
     #[tokio::test]
@@ -2211,6 +2636,7 @@ mod tests {
             "SELECT 1".to_string(),
             Arc::clone(&cookie_store),
             "\"t\"".to_string(),
+            EndpointLocationGuard::for_endpoint(&location),
         )
         .try_collect::<Vec<_>>()
         .await
