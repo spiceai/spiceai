@@ -620,6 +620,8 @@ struct Sources {
     state: BTreeMap<String, SourceState>,
     /// Each source's resolved kind (`postgres`, `mysql`).
     kinds: BTreeMap<String, String>,
+    /// Sources whose instances all share one namespace (`shared: true`).
+    shared: std::collections::BTreeSet<String>,
 }
 
 impl Sources {
@@ -816,6 +818,7 @@ async fn run_combination(
         by_name: IndexMap::new(),
         state: BTreeMap::new(),
         kinds: BTreeMap::new(),
+        shared: std::collections::BTreeSet::new(),
     };
     let result = async {
         // Bridged executors reach the sources at this address, not loopback.
@@ -834,6 +837,11 @@ async fn run_combination(
         // still being created is removed by the task creating it). Those
         // that had started are registered first, so the removal below stops
         // them.
+        for (name, spec, _, _) in &resolved {
+            if spec.shared {
+                sources.shared.insert(String::clone(name));
+            }
+        }
         let work = options.work_dir.join(run_id).join("sources");
         let mut starting: futures::stream::FuturesUnordered<_> = resolved
             .into_iter()
@@ -1164,6 +1172,8 @@ async fn create_instances(
         "host.docker.internal".to_string()
     };
     let mut instances = Vec::new();
+    // A shared source's namespace, created by the first instance.
+    let mut shared_namespaces: BTreeMap<String, crate::source::Namespace> = BTreeMap::new();
     for target in &options.targets {
         for (variant_name, variant) in variants {
             if !when_matches(&variant.when, combo) {
@@ -1179,8 +1189,22 @@ async fn create_instances(
             let mut namespaces = BTreeMap::new();
             let mut source_ctx = Map::new();
             for (name, src) in &sources.by_name {
-                let namespace = format!("i{index}_{}", sanitize(variant_name));
-                let created = src.create_namespace(&namespace).await?;
+                let shared = sources.shared.contains(name);
+                let namespace = if shared {
+                    "shared".to_string()
+                } else {
+                    format!("i{index}_{}", sanitize(variant_name))
+                };
+                let created = match shared_namespaces.get(name) {
+                    Some(created) if shared => created.clone(),
+                    _ => {
+                        let created = src.create_namespace(&namespace).await?;
+                        if shared {
+                            shared_namespaces.insert(name.clone(), created.clone());
+                        }
+                        created
+                    }
+                };
                 let mut entry = created.extra;
                 entry.insert("namespace".into(), json!(namespace));
                 let kind = sources.kinds.get(name).map_or("", String::as_str);

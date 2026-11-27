@@ -1945,7 +1945,68 @@ impl Runtime {
         true
     }
 
-    #[cfg(test)]
+    /// Reload each dataset named on `changes`, whose shared acceleration
+    /// changed writer: a takeover reopens it from what the previous writer
+    /// committed and starts its refresh, a handover stops its refresh.
+    ///
+    /// Holds the runtime only while it handles a change. The senders of
+    /// `changes` belong to the runtime's own `DataFusion`, so a strong
+    /// reference held across `recv` would keep the runtime, and every
+    /// acceleration and metastore connection it opened, alive after it shuts
+    /// down: a runtime started again in the same process would then share the
+    /// stopped one's metastore connections to files since replaced.
+    pub(crate) async fn reload_on_writer_changes(
+        runtime: std::sync::Weak<Self>,
+        mut changes: tokio::sync::mpsc::UnboundedReceiver<TableReference>,
+    ) {
+        let mut queued = std::collections::VecDeque::new();
+        loop {
+            let name = match queued.pop_front() {
+                Some(name) => name,
+                None => match changes.recv().await {
+                    Some(name) => name,
+                    None => return,
+                },
+            };
+            // Dropped at the end of this iteration, before the next `recv`.
+            let Some(this) = runtime.upgrade() else {
+                return;
+            };
+            let Some(app) = this.read_app().await else {
+                continue;
+            };
+            let Some(dataset) = Arc::clone(&this)
+                .get_valid_datasets(&app, LogErrors(false))
+                .into_iter()
+                .find(|ds| ds.name == name)
+            else {
+                continue;
+            };
+            // A reload that unregistered the dataset and then failed to load it
+            // again is retried as an added dataset's load is, rather than wait
+            // for another change of writer that may never come.
+            if let Some(bootstrap) = Arc::clone(&this).update_dataset(Arc::clone(&dataset)).await {
+                let runtime = Arc::clone(&this);
+                let load_semaphore = Arc::clone(&this.dataset_load_semaphore);
+                let load = this.dataset_loads.begin(&dataset.name);
+                tokio::spawn(async move {
+                    runtime
+                        .load_dataset(dataset, bootstrap, load_semaphore, load)
+                        .await;
+                });
+            }
+            // Requests for this dataset that arrived during its reload were
+            // made by the table it replaced (a table still serving the wrong
+            // role asks again), so they are answered; a table that still
+            // serves the wrong role asks again later.
+            while let Ok(next) = changes.try_recv() {
+                if next != name && !queued.contains(&next) {
+                    queued.push_back(next);
+                }
+            }
+        }
+    }
+
     async fn update_dataset(self: Arc<Self>, ds: Arc<Dataset>) -> Option<AcceleratorBootstrap> {
         self.update_dataset_with_bootstrap(ds, BootstrapStatus::None.into())
             .await
@@ -6423,6 +6484,21 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
 
     #[async_trait::async_trait]
     impl data_accelerator_api::DataAccelerator for RecordingAccelerator {
+        async fn writer_role(
+            &self,
+            _source: &dyn data_accelerator_api::AccelerationSource,
+        ) -> Option<data_accelerator_api::WriterRole> {
+            // Only this instance writes this engine's accelerations.
+            None
+        }
+
+        async fn shared_location_id(
+            &self,
+            _source: &dyn AccelerationSource,
+        ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(None)
+        }
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
