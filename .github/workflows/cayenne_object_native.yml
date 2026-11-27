@@ -2,23 +2,10 @@
 name: Cayenne object-native
 
 # Checks the object-native metastore model, stores, and conditional writes.
-# Pull requests and the merge queue run the quick set; trunk_tests.yml calls
-# this with `set: all` so a failure of the deep set counts toward Trunk Health.
+# The merge queue runs the quick set; trunk_tests.yml calls this with `set: all`
+# so a failure of the deep set counts toward Trunk Health. Pull requests do not
+# run it: dispatch it to check a branch before queueing.
 on:
-  pull_request:
-    paths:
-      - 'crates/cayenne-metastore-model/**'
-      - 'docs/design/object-native-metastore.md'
-      - 'docs/design/object-native-metastore-technical.md'
-      - 'crates/cayenne/**'
-      - 'crates/cayenne-metastore-actions/**'
-      - 'crates/accelerators/accelerator-cayenne/**'
-      - 'crates/object_store_occ/**'
-      - 'crates/object_store_sim/**'
-      - '.github/workflows/cayenne_object_native.yml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
   merge_group:
   workflow_call:
     inputs:
@@ -28,13 +15,13 @@ on:
         type: string
         default: ''
       set:
-        description: 'quick (the pull-request set) or all (the trunk tests set)'
+        description: 'quick (the merge-queue set) or all (the trunk tests set)'
         required: true
         type: string
   workflow_dispatch:
     inputs:
       set:
-        description: 'quick (the pull-request set) or all (the trunk tests set)'
+        description: 'quick (the merge-queue set) or all (the trunk tests set)'
         type: choice
         options: [quick, all]
         default: quick
@@ -73,11 +60,10 @@ jobs:
     runs-on: spiceai-dev-runners
     permissions:
       contents: read
-      pull-requests: read
     outputs:
-      model: ${{ (github.event_name != 'pull_request' && github.event_name != 'merge_group') || steps.paths.outputs.model == 'true' }}
-      stores: ${{ (github.event_name != 'pull_request' && github.event_name != 'merge_group') || steps.paths.outputs.stores == 'true' }}
-      object_store_occ: ${{ (github.event_name != 'pull_request' && github.event_name != 'merge_group') || steps.paths.outputs.object_store_occ == 'true' }}
+      model: ${{ github.event_name != 'merge_group' || steps.paths.outputs.model == 'true' }}
+      stores: ${{ github.event_name != 'merge_group' || steps.paths.outputs.stores == 'true' }}
+      object_store_occ: ${{ github.event_name != 'merge_group' || steps.paths.outputs.object_store_occ == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -85,9 +71,9 @@ jobs:
           fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: paths
-        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        if: github.event_name == 'merge_group'
         with:
-          base: ${{ github.event.merge_group.base_sha || github.event.repository.default_branch }}
+          base: ${{ github.event.merge_group.base_sha }}
           filters: |
             model:
               - 'crates/cayenne-metastore-model/**'
@@ -120,13 +106,7 @@ jobs:
   model:
     needs: changes
     name: Check the metastore model (${{ inputs.set == 'all' && 'all' || 'quick' }})
-    # Runs the change's code on persistent self-hosted runners, so fork and
-    # Dependabot pull requests run it only from the merge queue.
-    if: >-
-      needs.changes.outputs.model == 'true' &&
-      (github.event_name != 'pull_request' ||
-      (github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.user.login != 'dependabot[bot]'))
+    if: needs.changes.outputs.model == 'true'
     environment: secret-free
     runs-on: spiceai-dev-runners
     # Build included, on the dev runners: `quick` 14-20 min, `all` 55-62 min.
@@ -181,13 +161,7 @@ jobs:
   data-path:
     needs: changes
     name: Object-native (${{ matrix.store }})
-    # Runs the change's code on persistent self-hosted runners, so fork and
-    # Dependabot pull requests run it only from the merge queue.
-    if: >-
-      needs.changes.outputs.stores == 'true' &&
-      (github.event_name != 'pull_request' ||
-      (github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.user.login != 'dependabot[bot]'))
+    if: needs.changes.outputs.stores == 'true'
     environment: secret-free
     runs-on: spiceai-dev-runners
     strategy:
@@ -199,7 +173,7 @@ jobs:
     timeout-minutes: ${{ inputs.set == 'all' && 180 || 120 }}
     env:
       CAYENNE_TEST_DATA_STORE: ${{ matrix.store }}
-      # Bounded seeds on pull requests and the merge queue; full depth in `all`.
+      # Bounded seeds in the merge queue; full depth in `all`.
       CAYENNE_PROPTEST_SCALE: ${{ inputs.set == 'all' && '1' || '0.25' }}
       CAYENNE_PROPTEST_OPS_SCALE: ${{ inputs.set == 'all' && '1' || '0.25' }}
       RUSTFS_CONTAINER: cayenne-data-${{ github.run_id }}-${{ github.run_attempt }}
@@ -269,13 +243,7 @@ jobs:
   object_store_occ:
     needs: changes
     name: Object store OCC
-    # Runs the change's code on persistent self-hosted runners, so fork and
-    # Dependabot pull requests run it only from the merge queue.
-    if: >-
-      needs.changes.outputs.object_store_occ == 'true' &&
-      (github.event_name != 'pull_request' ||
-      (github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.user.login != 'dependabot[bot]'))
+    if: needs.changes.outputs.object_store_occ == 'true'
     environment: secret-free
     runs-on: spiceai-dev-runners
     timeout-minutes: 60
