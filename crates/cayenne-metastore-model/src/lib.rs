@@ -104,7 +104,15 @@ const RULE_NOT_REQUIRED: [&str; 14] = [
 const STRONGER_PROPERTIES: [&str; 1] = ["replicas-readers-adoption-all-present"];
 
 /// Runs that model the current code and reproduce a known defect in it.
-const CURRENT_DEFECTS: [&str; 1] = ["mem-tier-current-3-exhaust"];
+const CURRENT_DEFECTS: [&str; 3] = [
+    "mem-tier-current-3-exhaust",
+    // A writer cut off from the location keeps the source consumer until it
+    // reaches the location again and learns it was demoted (#16757).
+    "standby-partition-current",
+    // A demoted writer keeps serving the rows it applied but never committed
+    // beside the new writer's committed rows: duplicate rows.
+    "standby-demoted-keeps-buffer",
+];
 
 /// Runs whose traces are replayed against the implementation: the trace files
 /// under `crates/cayenne/tests/traces` and `crates/object_store_occ/tests/traces`
@@ -363,6 +371,30 @@ pub fn runs() -> Vec<Run> {
             failure: "I10 source append prefix exactly once",
         },
         Run {
+            name: "source-positions-idle",
+            family: "source-positions",
+            mode: "source-idle",
+            bound: 3,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "source-idle-ack-applied",
+            family: "source-positions",
+            mode: "source-idle-ack-applied",
+            bound: 3,
+            seed: None,
+            failure: "I2 source acknowledgement covered",
+        },
+        Run {
+            name: "source-idle-reconnect-applied",
+            family: "source-positions",
+            mode: "source-idle-reconnect-applied",
+            bound: 3,
+            seed: None,
+            failure: "I2 source acknowledgement covered",
+        },
+        Run {
             name: "object-names",
             family: "object-names",
             mode: "object-names",
@@ -489,6 +521,41 @@ pub fn runs() -> Vec<Run> {
             bound: 0,
             seed: None,
             failure: "healthy holder keeps its lease",
+        },
+        Run {
+            name: "standby-partition",
+            family: "standby",
+            mode: "standby-partition",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "standby-partition-no-self-fence",
+            family: "standby",
+            mode: "standby-partition-no-self-fence",
+            bound: 0,
+            seed: None,
+            failure: "new lease holder not blocked from the source consumer",
+        },
+        // The same graph as `standby-partition-no-self-fence`, declared as the
+        // current code: a cut-off writer releases the consumer only on
+        // reaching the location again (#16757).
+        Run {
+            name: "standby-partition-current",
+            family: "standby",
+            mode: "standby-partition-no-self-fence",
+            bound: 0,
+            seed: None,
+            failure: "new lease holder not blocked from the source consumer",
+        },
+        Run {
+            name: "standby-demoted-keeps-buffer",
+            family: "standby",
+            mode: "standby-demoted-keeps-buffer",
+            bound: 0,
+            seed: None,
+            failure: "every instance reads a source prefix, with no row twice",
         },
         Run {
             name: "commits-restart-turnover",
@@ -3201,6 +3268,7 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
             && match run.name {
                 "dataset-lifecycle"
                 | "source-positions"
+                | "source-positions-idle"
                 | "retention"
                 | "replicas"
                 | "replicas-readers"

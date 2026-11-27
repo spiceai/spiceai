@@ -5,6 +5,23 @@
 //! expiry on a discrete clock, renewal by the holder, crash, pause and resume,
 //! and takeover by a head commit that raises the writer generation. Only the
 //! generation in the head fences writers; lease timing decides availability.
+//!
+//! Every instance serves reads: a writer from its local table, which includes
+//! the changes it applied but has not committed, and any other instance from
+//! the committed head. A writer discards that uncommitted buffer the moment it
+//! is demoted, so a former writer serves only committed rows.
+//!
+//! The `partition` modes cut one instance off from the location but not from
+//! the source: it cannot renew or commit, and it keeps the source's single
+//! exclusive consumer (a replication slot is active for one connection), which
+//! an instance needs to ingest. An instance releases the consumer when it
+//! crashes, when contact with the location tells it it was fenced, and, under
+//! the design rule, when its own lease has expired by its own clock while it
+//! cannot renew (self-fencing).
+//!
+//! The consumer property checks that the new lease holder is not blocked from
+//! the consumer, not that it makes ingestion progress. A paused (frozen)
+//! partitioned holder is excluded: source-side consumer timeout is not modeled.
 use stateright::{Model, Property};
 
 /// Ticks a lease lasts after acquisition or renewal.
@@ -14,6 +31,10 @@ const CHANGES: usize = 2;
 /// Lease acquisitions are bounded so churning controls stay finite. Safe runs
 /// never reach it: each acquisition there follows a crash or a pause.
 const EPOCHS: usize = 4;
+/// Ticks a new lease holder may wait for the source consumer once it is the
+/// ingester. The model's clocks do not drift, so the design never waits a tick;
+/// the grace stands for the clock skew a real deployment allows.
+const CONSUMER_GRACE: usize = 1;
 #[derive(Clone, Debug)]
 pub(crate) struct Protocol {
     mode: String,
@@ -54,6 +75,14 @@ struct Instance {
     to_ack: Option<usize>,
     /// Paused and resumed since it last acquired the lease.
     resumed: bool,
+    /// Changes it applied to its local table but has not committed.
+    buffer: Vec<usize>,
+    /// It discarded a nonempty uncommitted buffer when it was demoted.
+    discarded: bool,
+    /// Cut off from the location (head and lease object) but not the source.
+    partitioned: bool,
+    /// Generation at partition time, only if it held the source consumer.
+    partitioned_consumer_generation: Option<usize>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Lease {
@@ -97,6 +126,23 @@ pub(crate) struct State {
     local_files: Vec<(usize, usize)>,
     /// A standby read or a takeover needed a file on another instance's disk.
     unreadable_file: bool,
+    /// A read showed a row twice or rows that are not a source prefix.
+    duplicate_read: bool,
+    /// An instance without a writer generation read rows not in the head.
+    uncommitted_read: bool,
+    /// A writer read its own uncommitted change.
+    writer_read: bool,
+    /// An instance that discarded its buffer at demotion served a read.
+    demoted_read: bool,
+    /// Partition modes: the instance holding the source's exclusive consumer.
+    consumer: Option<usize>,
+    /// Ticks during which the ingester could not attach the source consumer.
+    blocked: usize,
+    partitions: u8,
+    /// A partitioned writer released the consumer at its own lease expiry.
+    self_fenced: bool,
+    /// A new writer committed while the old one was partitioned.
+    partition_commit: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
@@ -112,6 +158,9 @@ pub(crate) enum Action {
     Pause(usize),
     Resume(usize),
     Serve(usize),
+    Partition(usize),
+    Heal(usize),
+    SelfFence(usize),
 }
 impl Protocol {
     pub(crate) fn new(mode: &str) -> Self {
@@ -132,24 +181,145 @@ impl Protocol {
         let n = &s.instances[i];
         n.status == Status::Running && n.generation != 0 && n.generation == s.fenced && n.left > 0
     }
+    /// An ingester that can commit and can attach the source consumer.
+    /// Outside the partition modes no instance is partitioned and no consumer
+    /// is held, so this is any ingester.
     fn ingesting(s: &State) -> bool {
-        (0..s.instances.len()).any(|i| Self::ingester(s, i))
+        (0..s.instances.len()).any(|i| {
+            Self::ingester(s, i) && !s.instances[i].partitioned && s.consumer.is_none_or(|c| c == i)
+        })
+    }
+    /// Whether instance `i` releases the consumer at its own lease expiry.
+    fn self_fences(&self, s: &State, i: usize) -> bool {
+        let n = &s.instances[i];
+        !self.has("no-self-fence")
+            && n.status == Status::Running
+            && n.partitioned
+            && n.epoch > 0
+            && n.left == 0
+    }
+    /// What instance `i` serves: a writer its local table (its committed
+    /// rows and its uncommitted buffer); any other instance the committed head,
+    /// plus whatever buffer it kept.
+    fn view(s: &State, i: usize) -> Vec<usize> {
+        let n = &s.instances[i];
+        let mut v = match n.base {
+            Some(b) if n.generation != 0 => s.rows.get(..b.pos).unwrap_or(&s.rows).to_vec(),
+            _ => s.rows.clone(),
+        };
+        v.extend(&n.buffer);
+        v
     }
     /// An action no tick may overtake: a due renewal, an acquisition of an
     /// expired lease, or a takeover commit after acquisition.
+    /// A partitioned instance can do none of these; under the design rule its
+    /// self-fencing at expiry is urgent instead.
     fn urgent(&self, s: &State) -> bool {
-        s.instances.iter().any(|n| {
-            n.status == Status::Running
-                && (n.epoch > 0 && n.left <= 1 && !self.has("no-renew")
-                    || n.epoch > 0 && n.generation == 0
-                    || s.lease.left == 0 && n.epoch != s.lease.epoch && s.lease.epoch < EPOCHS)
+        s.instances.iter().enumerate().any(|(i, n)| {
+            self.self_fences(s, i)
+                || n.status == Status::Running
+                    && !n.partitioned
+                    && (n.epoch > 0 && n.left <= 1 && !self.has("no-renew")
+                        || n.epoch > 0 && n.generation == 0
+                        || s.lease.left == 0 && n.epoch != s.lease.epoch && s.lease.epoch < EPOCHS)
         })
     }
-    fn step_down(n: &mut Instance) {
+    /// Instance `i` stops writing: it forgets its lease and generation,
+    /// discards its uncommitted buffer (the current-code control keeps it),
+    /// and releases the source consumer.
+    fn step_down(&self, s: &mut State, i: usize) {
+        let n = &mut s.instances[i];
         n.epoch = 0;
         n.left = 0;
         n.generation = 0;
         n.base = None;
+        if !self.has("keeps-buffer") && !n.buffer.is_empty() {
+            n.buffer.clear();
+            n.discarded = true;
+        }
+        Self::release(s, i);
+    }
+    /// Instance `i` detaches the source consumer; an acknowledgement it still
+    /// owed is lost with it, and the next consumer resumes from the source's
+    /// acknowledged position.
+    fn release(s: &mut State, i: usize) {
+        if s.consumer == Some(i) {
+            s.consumer = None;
+            s.instances[i].to_ack = None;
+        }
+    }
+    /// Reads, resumption and the partition steps of `next_state`, applied to
+    /// `next`; `None` when `action` is disabled in `s`.
+    fn serve_or_partition(&self, s: &State, next: &mut State, action: &Action) -> Option<()> {
+        match *action {
+            Action::Resume(i) => {
+                if s.instances[i].status != Status::Paused {
+                    return None;
+                }
+                next.instances[i].status = Status::Running;
+                next.instances[i].resumed = true;
+            }
+            Action::Serve(i) => {
+                let n = &s.instances[i];
+                // A writer serves its local table; any other instance reads the head.
+                let from_head = n.generation == 0 || n.base.is_none();
+                if s.instances[i].status != Status::Running || from_head && n.partitioned {
+                    return None;
+                }
+                let v = Self::view(s, i);
+                if !Self::ingester(s, i) && Self::ingesting(s) {
+                    next.standby_read = true;
+                }
+                next.bad_read |= s.rows != (1..=s.head.pos).collect::<Vec<_>>();
+                next.duplicate_read |= v != (1..=v.len()).collect::<Vec<_>>();
+                next.uncommitted_read |= from_head && v.len() > s.head.pos;
+                next.writer_read |= !from_head && !n.buffer.is_empty();
+                next.demoted_read |= from_head && n.discarded;
+                if from_head {
+                    next.unreadable_file |= s.local_files.iter().any(|&(_, o)| o != i);
+                }
+            }
+            Action::Partition(i) => {
+                if s.instances[i].status != Status::Running
+                    || s.instances[i].partitioned
+                    || s.partitions >= 1
+                {
+                    return None;
+                }
+                if s.lease.holder == i && s.lease.epoch == s.instances[i].epoch {
+                    next.lease.lost = 3;
+                    next.waiting = 0;
+                }
+                next.partitions += 1;
+                next.instances[i].partitioned = true;
+                next.instances[i].partitioned_consumer_generation =
+                    (s.consumer == Some(i)).then_some(s.instances[i].generation);
+            }
+            Action::Heal(i) => {
+                let n = &s.instances[i];
+                if !n.partitioned {
+                    return None;
+                }
+                next.instances[i].partitioned = false;
+                // Contact with the location: a lease or head generation that
+                // moved on tells the instance it was fenced.
+                if n.epoch != 0
+                    && (s.lease.epoch != n.epoch
+                        || n.generation != 0 && s.head.generation > n.generation)
+                {
+                    self.step_down(next, i);
+                }
+            }
+            Action::SelfFence(i) => {
+                if !self.self_fences(s, i) {
+                    return None;
+                }
+                next.self_fenced |= s.consumer == Some(i);
+                self.step_down(next, i);
+            }
+            _ => return None,
+        }
+        Some(())
     }
 }
 impl Model for Protocol {
@@ -193,6 +363,15 @@ impl Model for Protocol {
             bad_read: false,
             local_files: vec![],
             unreadable_file: false,
+            duplicate_read: false,
+            uncommitted_read: false,
+            writer_read: false,
+            demoted_read: false,
+            consumer: None,
+            blocked: 0,
+            partitions: 0,
+            self_fenced: false,
+            partition_commit: false,
         }]
     }
     fn actions(&self, s: &State, a: &mut Vec<Action>) {
@@ -211,6 +390,9 @@ impl Model for Protocol {
                 Action::Resume(i),
                 Action::Serve(i),
             ]);
+            if self.has("partition") {
+                a.extend([Action::Partition(i), Action::Heal(i), Action::SelfFence(i)]);
+            }
         }
         crate::prune_for_simulation(self, s, a);
     }
@@ -222,9 +404,22 @@ impl Model for Protocol {
                 if self.urgent(s) {
                     return None;
                 }
-                if !Self::ingesting(s) && (0..self.instances).any(running) {
+                // Availability needs an instance that runs and reaches the location.
+                if !Self::ingesting(s)
+                    && (0..self.instances).any(|i| running(i) && !s.instances[i].partitioned)
+                {
                     next.waiting = (s.waiting + 1).min(DURATION + 1);
                 }
+                let blocked = (0..self.instances).any(|i| {
+                    Self::ingester(s, i)
+                        && !s.instances[i].partitioned
+                        && s.consumer.is_some_and(|c| c != i)
+                });
+                next.blocked = if blocked {
+                    (s.blocked + 1).min(CONSUMER_GRACE + 1)
+                } else {
+                    0
+                };
                 next.lease.left = s.lease.left.saturating_sub(1);
                 for n in &mut next.instances {
                     n.left = n.left.saturating_sub(1);
@@ -235,6 +430,7 @@ impl Model for Protocol {
                 // The lease object's conditional write admits one acquirer per
                 // epoch, and only after expiry.
                 if !running(i)
+                    || n.partitioned
                     || n.epoch == s.lease.epoch
                     || s.lease.epoch >= EPOCHS
                     || s.lease.left > 0 && !self.has("early")
@@ -249,15 +445,20 @@ impl Model for Protocol {
                     lost: 0,
                     cause: s.lease.lost,
                 };
+                self.step_down(&mut next, i);
                 let m = &mut next.instances[i];
-                Self::step_down(m);
                 m.epoch = s.lease.epoch + 1;
                 m.left = DURATION;
                 m.resumed = false;
             }
             Action::Renew(i) => {
                 let n = &s.instances[i];
-                if !running(i) || n.epoch == 0 || n.left >= DURATION || self.has("no-renew") {
+                if !running(i)
+                    || n.partitioned
+                    || n.epoch == 0
+                    || n.left >= DURATION
+                    || self.has("no-renew")
+                {
                     return None;
                 }
                 if s.lease.epoch == n.epoch {
@@ -266,19 +467,19 @@ impl Model for Protocol {
                     next.instances[i].left = DURATION;
                 } else {
                     // The conditional renewal fails: another instance holds the lease.
-                    Self::step_down(&mut next.instances[i]);
+                    self.step_down(&mut next, i);
                 }
             }
             Action::Takeover(i) => {
                 let n = &s.instances[i];
-                if !running(i) || n.epoch == 0 || n.generation != 0 {
+                if !running(i) || n.partitioned || n.epoch == 0 || n.generation != 0 {
                     return None;
                 }
                 if self.has("no-generation") {
                     // Fencing by the lease object only: the head is read, not written.
                 } else if s.head.generation >= n.epoch {
                     // The takeover CAS requires a lower generation in the head.
-                    Self::step_down(&mut next.instances[i]);
+                    self.step_down(&mut next, i);
                     return Some(next);
                 } else {
                     next.head.generation = n.epoch;
@@ -302,15 +503,24 @@ impl Model for Protocol {
                 {
                     return None;
                 }
+                if self.has("partition") {
+                    // Ingesting needs the source's single exclusive consumer.
+                    if s.consumer.is_some_and(|c| c != i) {
+                        return None;
+                    }
+                    next.consumer = Some(i);
+                }
                 next.instances[i].pending = Some(Commit {
                     base,
                     generation: n.generation,
                     change: base.pos + 1,
                 });
+                // The change is applied to the local table before it commits.
+                next.instances[i].buffer.push(base.pos + 1);
             }
             Action::Commit(i) => {
                 let c = s.instances[i].pending?;
-                if !running(i) {
+                if !running(i) || s.instances[i].partitioned {
                     return None;
                 }
                 next.instances[i].pending = None;
@@ -326,25 +536,34 @@ impl Model for Protocol {
                         next.committers.sort_unstable();
                     }
                     next.stale |= c.generation < s.fenced;
+                    next.partition_commit |= s.instances.iter().any(|n| {
+                        n.partitioned
+                            && n.partitioned_consumer_generation
+                                .is_some_and(|generation| c.generation > generation)
+                    });
+                    // An instance acknowledges only through the consumer it reads with.
+                    let owes = !self.has("partition") || s.consumer == Some(i);
                     let m = &mut next.instances[i];
                     m.base = Some(next.head);
-                    m.to_ack = Some(c.change);
+                    m.to_ack = owes.then_some(c.change);
+                    m.buffer.retain(|&b| b != c.change);
                 } else if s.head.generation == c.generation
                     && s.instances[i].generation == c.generation
                 {
-                    // Same generation: rebase on the current head.
+                    // Same generation: rebase on the current head and re-read.
                     next.instances[i].base = Some(s.head);
+                    next.instances[i].buffer.clear();
                 } else if s.instances[i].generation == c.generation {
                     // A newer generation is in the head: this writer is fenced.
                     next.fenced_resume |= s.instances[i].resumed;
-                    Self::step_down(&mut next.instances[i]);
+                    self.step_down(&mut next, i);
                 }
                 // Otherwise the request predates the instance's current lease;
                 // its rejection says nothing about that lease.
             }
             Action::Ack(i) => {
                 let c = s.instances[i].to_ack?;
-                if !running(i) {
+                if !running(i) || self.has("partition") && s.consumer != Some(i) {
                     return None;
                 }
                 next.acknowledged = s.acknowledged.max(c);
@@ -359,6 +578,7 @@ impl Model for Protocol {
                     next.waiting = 0;
                 }
                 next.crashes += 1;
+                Self::release(&mut next, i);
                 next.instances[i] = Instance {
                     status: Status::Crashed,
                     ..Instance::default()
@@ -371,7 +591,9 @@ impl Model for Protocol {
                 next.instances[i].status = Status::Running;
             }
             Action::Pause(i) => {
-                if !running(i) || s.pauses >= 1 {
+                // A paused process cannot release the consumer; the partition
+                // modes leave the source's own timeout of a silent consumer out.
+                if !running(i) || s.pauses >= 1 || self.has("partition") {
                     return None;
                 }
                 if s.lease.holder == i && s.lease.epoch == s.instances[i].epoch {
@@ -381,21 +603,12 @@ impl Model for Protocol {
                 next.pauses += 1;
                 next.instances[i].status = Status::Paused;
             }
-            Action::Resume(i) => {
-                if s.instances[i].status != Status::Paused {
-                    return None;
-                }
-                next.instances[i].status = Status::Running;
-                next.instances[i].resumed = true;
-            }
-            Action::Serve(i) => {
-                if !running(i) || Self::ingester(s, i) || !Self::ingesting(s) || s.standby_read {
-                    return None;
-                }
-                // A standby reads the committed head without writing.
-                next.standby_read = true;
-                next.bad_read |= s.rows != (1..=s.head.pos).collect::<Vec<_>>();
-                next.unreadable_file |= s.local_files.iter().any(|&(_, o)| o != i);
+            Action::Resume(_)
+            | Action::Serve(_)
+            | Action::Partition(_)
+            | Action::Heal(_)
+            | Action::SelfFence(_) => {
+                self.serve_or_partition(s, &mut next, &action)?;
             }
         }
         if Self::ingesting(&next) {
@@ -423,7 +636,14 @@ impl Model for Protocol {
             Action::Restart(i) => format!("instance {i} restarts"),
             Action::Pause(i) => format!("instance {i} pauses (GC pause, VM freeze)"),
             Action::Resume(i) => format!("instance {i} resumes"),
-            Action::Serve(i) => format!("instance {i} serves a read from the head"),
+            Action::Serve(i) => format!("instance {i} serves a read"),
+            Action::Partition(i) => {
+                format!("instance {i} is cut off from the location (it still reaches the source)")
+            }
+            Action::Heal(i) => format!("instance {i} reaches the location again"),
+            Action::SelfFence(i) => format!(
+                "instance {i}'s own lease expired while cut off: it releases the source consumer"
+            ),
         }
     }
     fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
@@ -446,6 +666,15 @@ impl Model for Protocol {
                 "ticks with no ingester since the last holder failure: {}",
                 s.waiting
             ),
+            format!(
+                "uncommitted buffers {:?}; source consumer {:?} (ingester blocked {} ticks)",
+                s.instances
+                    .iter()
+                    .map(|n| n.buffer.clone())
+                    .collect::<Vec<_>>(),
+                s.consumer,
+                s.blocked
+            ),
             crate::explorer::flags(&[
                 ("stale commit attempted", s.stale),
                 ("lease churn", s.churn),
@@ -453,6 +682,18 @@ impl Model for Protocol {
                 ("paused writer resumed and was fenced", s.fenced_resume),
                 ("standby served a read", s.standby_read),
                 ("BAD read", s.bad_read),
+                ("BAD read: duplicate or non-prefix rows", s.duplicate_read),
+                (
+                    "BAD read: uncommitted rows off the head",
+                    s.uncommitted_read,
+                ),
+                ("writer read its uncommitted change", s.writer_read),
+                ("demoted writer served committed rows", s.demoted_read),
+                ("partitioned writer self-fenced", s.self_fenced),
+                (
+                    "committed while the old writer was partitioned",
+                    s.partition_commit,
+                ),
                 ("file unreadable from another instance", s.unreadable_file),
             ]),
         ]))
@@ -511,9 +752,32 @@ impl Model for Protocol {
                 Action::Restart(i) => Event::on(i, "restart"),
                 Action::Pause(i) => Event::on(i, "PAUSE").tone(Tone::Bad),
                 Action::Resume(i) => Event::on(i, "resume"),
-                Action::Serve(i) => Event::on(head, format!("instance {i} reads the head"))
-                    .to(i)
-                    .tone(Tone::Actor),
+                Action::Serve(i) if before.instances[i].generation != 0 => {
+                    Event::on(i, format!("serve local rows {:?}", Self::view(&before, i)))
+                        .tone(Tone::Actor)
+                }
+                Action::Serve(i) => Event::on(
+                    head,
+                    format!("instance {i} serves {:?}", Self::view(&before, i)),
+                )
+                .to(i)
+                .tone(Tone::Actor),
+                Action::Partition(i) => Event::on(i, "CUT OFF from the location").tone(Tone::Bad),
+                Action::Heal(i) => {
+                    let fenced = after.instances[i].epoch == 0 && before.instances[i].epoch != 0;
+                    Event::on(
+                        i,
+                        if fenced {
+                            "reaches the location: fenced, steps down"
+                        } else {
+                            "reaches the location"
+                        },
+                    )
+                    .to(lease)
+                }
+                Action::SelfFence(i) => {
+                    Event::on(i, "own lease expired: release source consumer").tone(Tone::Gone)
+                }
             };
             events.push(ev.breaking(&crate::explorer::broken(self, &before, &after)));
         }
@@ -539,6 +803,15 @@ impl Model for Protocol {
                         format!("ingester at generation {}", inst.generation)
                     },
                 ];
+                if inst.partitioned {
+                    lines.push("CUT OFF from the location".into());
+                }
+                if last.consumer == Some(i) {
+                    lines.push("holds the source consumer".into());
+                }
+                if !inst.buffer.is_empty() {
+                    lines.push(format!("uncommitted local rows {:?}", inst.buffer));
+                }
                 if let Some(c) = inst.pending {
                     lines.push(format!(
                         "prepared commit of change {} on (gen {}, pos {})",
@@ -606,14 +879,19 @@ impl Model for Protocol {
                 !s.bad_read
             }),
             Property::always(
+                "every instance reads a source prefix, with no row twice",
+                |_, s: &State| !s.duplicate_read,
+            ),
+            Property::always(
+                "only a writer reads its uncommitted rows",
+                |_, s: &State| !s.uncommitted_read,
+            ),
+            Property::always(
                 "standbys and new owners read every committed file",
                 |_, s: &State| !s.unreadable_file,
             ),
             Property::sometimes("takeover after holder crash", |_, s: &State| {
                 s.crash_takeover
-            }),
-            Property::sometimes("paused writer resumes and is fenced", |_, s: &State| {
-                s.fenced_resume
             }),
             Property::sometimes(
                 "standby serves reads while another ingests",
@@ -623,7 +901,36 @@ impl Model for Protocol {
                 "all source changes acknowledged across a takeover",
                 |_, s: &State| s.acknowledged == CHANGES && s.fenced >= 2,
             ),
+            Property::sometimes("writer reads its uncommitted change", |_, s: &State| {
+                s.writer_read
+            }),
+            Property::sometimes(
+                "demoted writer discards its buffer and serves committed rows",
+                |_, s: &State| s.demoted_read,
+            ),
         ];
+        if self.has("partition") {
+            p.extend([
+                Property::always(
+                    "new lease holder not blocked from the source consumer",
+                    |_, s: &State| s.blocked <= CONSUMER_GRACE,
+                ),
+                Property::sometimes(
+                    "partitioned writer releases the consumer at its lease expiry",
+                    |_, s: &State| s.self_fenced,
+                ),
+                Property::sometimes(
+                    "new writer commits while the old one is partitioned",
+                    |_, s: &State| s.partition_commit,
+                ),
+            ]);
+        } else {
+            // Pausing is outside the partition graphs.
+            p.push(Property::sometimes(
+                "paused writer resumes and is fenced",
+                |_, s: &State| s.fenced_resume,
+            ));
+        }
         if self.timed() {
             p.extend([
                 Property::always("lease exclusive until expiry", |_, s: &State| {
