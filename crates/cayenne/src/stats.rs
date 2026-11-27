@@ -734,27 +734,26 @@ pub(crate) fn restore_persisted_statistics(
     })
 }
 
-/// A stable identity of `schema` for the statistics laid out as it: the first
-/// eight bytes of a BLAKE3 digest over each column's name, type and
-/// nullability, in order, which are what the layout and decoding of statistics
-/// depend on. Field metadata is left out. A build whose types print differently
-/// gives a schema another identity, which only sends a file's scans to its
-/// footer.
+/// The identity of `schema` that recorded file statistics carry: the first
+/// eight bytes of the BLAKE3 digest of its fields' Arrow IPC serialization, the
+/// serialization and digest the metastore stores a table schema under. The
+/// columns' metadata is cleared first: it cannot change statistics, and its
+/// map order is not stable. `None` when the schema does not serialize.
 #[must_use]
-pub(crate) fn schema_identity(schema: &Schema) -> u64 {
-    let mut hasher = blake3::Hasher::new();
-    for field in schema.fields() {
-        let data_type = format!("{:?}", field.data_type());
-        for part in [field.name().as_bytes(), data_type.as_bytes()] {
-            hasher.update(&(part.len() as u64).to_le_bytes());
-            hasher.update(part);
-        }
-        hasher.update(&[u8::from(field.is_nullable())]);
-    }
-    let digest = hasher.finalize();
-    let mut identity = [0_u8; 8];
-    identity.copy_from_slice(&digest.as_bytes()[..8]);
-    u64::from_le_bytes(identity)
+pub(crate) fn schema_identity(schema: &Schema) -> Option<u64> {
+    let fields: Vec<arrow_schema::Field> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            field
+                .as_ref()
+                .clone()
+                .with_metadata(std::collections::HashMap::new())
+        })
+        .collect();
+    let ipc = crate::cayenne_catalog::serialize_schema_ipc_base64(&Schema::new(fields)).ok()?;
+    let digest = cayenne_metastore_actions::ObjRef::of(ipc.as_bytes()).digest;
+    Some(u64::from_le_bytes(digest.get(..8)?.try_into().ok()?))
 }
 
 /// Whether a restored blob was written by a build that persists per-column byte

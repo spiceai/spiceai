@@ -84,7 +84,7 @@ use crate::catalog::{
 use crate::maintained_aggregate::{MaintainedAggregateRegistry, MaintainedAggregateSpec};
 use crate::metadata::{
     CreateTableOptions, InlinedData, InlinedDataStats, InlinedDelete, PkConflictDetection,
-    SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
+    RecordedFileStatistics, SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
 use crate::provider::scan::{
     CayenneAccelerationExec, SnapshotScanRef, round_robin_repartition_if_needed,
@@ -4987,6 +4987,9 @@ struct ScanFileStatisticsRequest<'a> {
     table_schema: &'a SchemaRef,
     schema_fingerprint: &'a Arc<SchemaFingerprint>,
     generation: u64,
+    /// [`crate::stats::schema_identity`] of `table_schema` when the table
+    /// records file statistics with its files.
+    recorded_schema: Option<u64>,
 }
 
 /// What a data-bearing mem-tier checkpoint commits beside its tombstones and
@@ -10020,17 +10023,18 @@ impl CayenneTableProvider {
         let rows: Vec<SnapshotFile> = files
             .iter()
             .map(|(file_path, size)| {
-                let recorded = self.recorded_file_statistics(file_path);
+                let (row_count, recorded_statistics) =
+                    self.file_statistics_to_record(file_path, None);
                 SnapshotFile {
                     table_id: table_id.clone(),
                     snapshot_id: snapshot_id.to_string(),
                     file_path: file_path.clone(),
-                    row_count: recorded.as_ref().map_or(0, |(rows, _)| *rows),
+                    row_count,
                     file_size_bytes: i64::try_from(*size).unwrap_or(i64::MAX),
                     min_sequence: 0,
                     max_sequence,
                     digest: None,
-                    recorded_statistics: recorded.map(|(_, recorded)| recorded),
+                    recorded_statistics,
                 }
             })
             .collect();
@@ -13901,6 +13905,7 @@ impl CayenneTableProvider {
                     files: Arc::clone(&self.uncommitted_files),
                     snapshot_id: snapshot_id.to_string(),
                     session: write_format.session().clone(),
+                    schema_identity: crate::stats::schema_identity(&self.table_schema()),
                     schema: self.table_schema(),
                 },
             ));
@@ -28263,30 +28268,21 @@ impl CayenneTableProvider {
     ) -> SnapshotFile {
         let table_id = self.table_metadata.table_id.clone();
         let existing_digest = existing.and_then(|row| row.digest.clone());
-        // The footer statistics the file's writer computed, or that the
-        // snapshot already records with it, with the footer's row count.
-        let recorded = self.recorded_file_statistics(file_name).or_else(|| {
-            existing.and_then(|row| {
-                row.recorded_statistics
-                    .clone()
-                    .map(|recorded| (row.row_count, recorded))
-            })
-        });
-        // A table whose writers record statistics keeps `row_count` the footer's
-        // count, and 0 for a file recorded without them. Any other reuses the
-        // count the scan path persisted for this exact (snapshot, file); the
-        // manifest entry is a hint until the manifest becomes the scan's file
-        // source, so a 0 here is correct-but-imprecise, never wrong.
-        let row_count = match &recorded {
-            Some((rows, _)) => *rows,
-            None if self.records_file_statistics() => 0,
-            None => self
+        // Any table but one whose writers record statistics reuses the count
+        // the scan path persisted for this exact (snapshot, file); the manifest
+        // entry is a hint until the manifest becomes the scan's file source, so
+        // a 0 here is correct-but-imprecise, never wrong.
+        let (row_count, recorded_statistics) = if self.records_file_statistics() {
+            self.file_statistics_to_record(file_name, existing)
+        } else {
+            let row_count = self
                 .catalog
                 .get_snapshot_file_statistics(&table_id, snapshot_id, file_name)
                 .await
                 .ok()
                 .flatten()
-                .map_or(0, |stats| stats.num_rows),
+                .map_or(0, |stats| stats.num_rows);
+            (row_count, None)
         };
 
         // Reuse a digest a prior flush already recorded for this immutable
@@ -28325,7 +28321,7 @@ impl CayenneTableProvider {
             min_sequence,
             max_sequence,
             digest,
-            recorded_statistics: recorded.map(|(_, recorded)| recorded),
+            recorded_statistics,
         }
     }
 
@@ -28338,19 +28334,28 @@ impl CayenneTableProvider {
         self.data_in_object_native_location() && self.catalog.records_file_statistics_with_files()
     }
 
-    /// The footer statistics the writer of `file_name`, a file this process
-    /// wrote and no commit names yet, computed for its commit to record, with
-    /// the footer's row count.
-    pub(crate) fn recorded_file_statistics(
+    /// The row count and footer statistics a manifest row of `file_name`
+    /// records on a table whose writers record statistics: those the file's
+    /// writer computed, if this process wrote it and no commit names it yet,
+    /// else those of `existing`, the snapshot's committed row for it. Without
+    /// statistics the count is `existing`'s, which an earlier build recorded,
+    /// or 0.
+    pub(crate) fn file_statistics_to_record(
         &self,
         file_name: &str,
-    ) -> Option<(i64, crate::metadata::RecordedFileStatistics)> {
-        if !self.records_file_statistics() {
-            return None;
-        }
-        self.uncommitted_files
-            .statistics(file_name)
-            .map(|statistics| (statistics.rows, statistics.recorded))
+        existing: Option<&SnapshotFile>,
+    ) -> (i64, Option<RecordedFileStatistics>) {
+        let recorded = self
+            .records_file_statistics()
+            .then(|| self.uncommitted_files.statistics(file_name))
+            .flatten()
+            .or_else(|| existing.and_then(|row| row.recorded_statistics.clone()));
+        let rows = recorded
+            .as_ref()
+            .map(|recorded| recorded.rows)
+            .or_else(|| existing.map(|row| row.row_count))
+            .unwrap_or(0);
+        (rows, recorded)
     }
 
     /// The manifest rows of `files`, written at their final keys into
@@ -33797,7 +33802,12 @@ impl CayenneTableProvider {
                 &store,
                 self.context.file_format().as_ref(),
                 file,
-                &self.table_schema(),
+                (
+                    &self.table_schema(),
+                    self.records_file_statistics()
+                        .then(|| crate::stats::schema_identity(&self.table_schema()))
+                        .flatten(),
+                ),
             )
             .await?;
         Ok(match statistics.num_rows {
@@ -46334,7 +46344,11 @@ impl CayenneTableProvider {
                 );
                 // Same conversion `pruned_partition_list` uses for the
                 // unpartitioned case (`object_meta.into()`).
-                PartitionedFile::from(object_meta)
+                let mut partitioned = PartitionedFile::from(object_meta);
+                if let Some(recorded) = file.recorded_statistics {
+                    partitioned.extensions.insert(recorded);
+                }
+                partitioned
             })
             .collect()
     }
@@ -46623,6 +46637,13 @@ impl CayenneTableProvider {
                 self.snapshot_file_list(request, &store).await?
             };
 
+        // Computed once for the scan; a file's recorded statistics are used
+        // only when they carry it.
+        let recorded_schema = if collect_stats && self.records_file_statistics() {
+            crate::stats::schema_identity(&request.file_statistics_schema)
+        } else {
+            None
+        };
         let files = file_list
             .map(|part_file| async {
                 let part_file = part_file?;
@@ -46633,7 +46654,7 @@ impl CayenneTableProvider {
                         &store,
                         request.options.listing.format.as_ref(),
                         &part_file,
-                        &request.file_statistics_schema,
+                        (&request.file_statistics_schema, recorded_schema),
                     )
                     .await?
                 } else if collect_stats {
@@ -46732,7 +46753,7 @@ impl CayenneTableProvider {
         store: &Arc<dyn ObjectStore>,
         format: &dyn FileFormat,
         part_file: &PartitionedFile,
-        table_schema: &SchemaRef,
+        (table_schema, recorded_schema): (&SchemaRef, Option<u64>),
     ) -> datafusion_common::Result<Arc<Statistics>> {
         // The statistics below are computed against the table schema, so a cached
         // entry is valid only for the schema it was computed with.
@@ -46764,6 +46785,7 @@ impl CayenneTableProvider {
             table_schema,
             schema_fingerprint: &schema_fingerprint,
             generation,
+            recorded_schema,
         };
         flight
             .cell()
@@ -46825,38 +46847,25 @@ impl CayenneTableProvider {
         // not used. Footer I/O below stays outside the lock.
         //
         // A table whose writers record each file's footer statistics in the
-        // commit that adds it serves those, by the file's manifest name, when
-        // they are laid out as this scan's schema, and this scan writes nothing:
-        // any other file is read from its footer.
+        // commit that adds it serves those, which its manifest listing attached
+        // to the file, when they are laid out as this scan's schema, and this
+        // scan writes nothing: any other file is read from its footer.
         let recorded_with_files = self.records_file_statistics();
-        let persisted =
+        let restored =
             if written_since_open || table_schema.as_ref() != self.table_schema().as_ref() {
                 None
             } else if recorded_with_files {
-                match part_file.object_meta.location.filename() {
-                    Some(file_name) => self
-                        .catalog
-                        .get_recorded_file_statistics(
-                            &self.table_metadata.table_id,
-                            request.snapshot_id,
-                            file_name,
+                part_file
+                    .extensions
+                    .get::<RecordedFileStatistics>()
+                    .filter(|recorded| Some(recorded.schema) == request.recorded_schema)
+                    .and_then(|recorded| {
+                        crate::stats::restore_persisted_statistics(
+                            &recorded.blob,
+                            table_schema,
+                            recorded.rows,
                         )
-                        .await
-                        .ok()
-                        .flatten()
-                        .filter(|(_, recorded)| {
-                            recorded.schema == crate::stats::schema_identity(table_schema)
-                        })
-                        .map(|(num_rows, recorded)| SnapshotFileStatistics {
-                            table_id: self.table_metadata.table_id.clone(),
-                            snapshot_id: request.snapshot_id.to_string(),
-                            file_path: file_path.clone(),
-                            file_size_bytes,
-                            num_rows,
-                            statistics_blob: recorded.blob.to_vec(),
-                        }),
-                    None => None,
-                }
+                    })
             } else {
                 self.catalog
                     .get_snapshot_file_statistics(
@@ -46867,15 +46876,19 @@ impl CayenneTableProvider {
                     .await
                     .ok()
                     .flatten()
-                    .filter(|_| table_schema.as_ref() == self.table_schema().as_ref())
+                    .filter(|persisted| {
+                        table_schema.as_ref() == self.table_schema().as_ref()
+                            && persisted.file_size_bytes == file_size_bytes
+                    })
+                    .and_then(|persisted| {
+                        crate::stats::restore_persisted_statistics(
+                            &persisted.statistics_blob,
+                            table_schema,
+                            persisted.num_rows,
+                        )
+                    })
             };
-        if let Some(persisted) = persisted
-            && persisted.file_size_bytes == file_size_bytes
-            && let Some(restored) = crate::stats::restore_persisted_statistics(
-                &persisted.statistics_blob,
-                table_schema,
-                persisted.num_rows,
-            )
+        if let Some(restored) = restored
             // A blob written before NaN was accounted for has its float bounds
             // ignored; re-inferring from the footer restores them.
             && restored.accounts_for_nan

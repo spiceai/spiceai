@@ -4617,15 +4617,6 @@ impl MetadataCatalog for CayenneCatalog {
         false
     }
 
-    async fn get_recorded_file_statistics(
-        &self,
-        _table_id: &str,
-        _snapshot_id: &str,
-        _file_name: &str,
-    ) -> CatalogResult<Option<(i64, crate::metadata::RecordedFileStatistics)>> {
-        Ok(None)
-    }
-
     async fn upsert_snapshot_file(&self, file: &SnapshotFile) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {

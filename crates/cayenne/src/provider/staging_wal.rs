@@ -755,17 +755,18 @@ impl PreparedStagedAppend {
                 .iter()
                 .filter(|(name, _)| source_names.contains(name) && !manifest_names.contains(name))
                 .map(|(file_path, file_size_bytes)| {
-                    let recorded = self.table.recorded_file_statistics(file_path);
+                    let (row_count, recorded_statistics) =
+                        self.table.file_statistics_to_record(file_path, None);
                     SnapshotFile {
                         table_id: self.table.table_id().to_string(),
                         snapshot_id: self.target_snapshot_id.clone(),
                         file_path: file_path.clone(),
-                        row_count: recorded.as_ref().map_or(0, |(rows, _)| *rows),
+                        row_count,
                         file_size_bytes: i64::try_from(*file_size_bytes).unwrap_or(i64::MAX),
                         min_sequence: 0,
                         max_sequence: new_sequence,
                         digest: None,
-                        recorded_statistics: recorded.map(|(_, recorded)| recorded),
+                        recorded_statistics,
                     }
                 }),
         );
@@ -774,17 +775,18 @@ impl PreparedStagedAppend {
                 .into_iter()
                 .filter(|(name, _)| !source_names.contains(name))
                 .map(|(file_path, file_size_bytes)| {
-                    let recorded = self.table.recorded_file_statistics(&file_path);
+                    let (row_count, recorded_statistics) =
+                        self.table.file_statistics_to_record(&file_path, None);
                     SnapshotFile {
                         table_id: self.table.table_id().to_string(),
                         snapshot_id: self.target_snapshot_id.clone(),
-                        row_count: recorded.as_ref().map_or(0, |(rows, _)| *rows),
+                        row_count,
                         file_path,
                         file_size_bytes: i64::try_from(file_size_bytes).unwrap_or(i64::MAX),
                         min_sequence: new_sequence,
                         max_sequence: new_sequence,
                         digest: None,
-                        recorded_statistics: recorded.map(|(_, recorded)| recorded),
+                        recorded_statistics,
                     }
                 }),
         );

@@ -60,8 +60,8 @@ pub struct FileEntry {
     #[prost(string, optional, tag = "6")]
     pub digest: Option<String>,
     /// The file's footer statistics, recorded by the writer that wrote it. With
-    /// them, `rows` is the footer's row count. Absent for a file recorded
-    /// without them, whose scans read its footer.
+    /// them, `rows` is the footer's row count; without them, `rows` is a count
+    /// an earlier build recorded, or 0, and the file's scans read its footer.
     #[prost(message, optional, tag = "7")]
     pub stats: Option<RecordedStats>,
 }

@@ -349,32 +349,12 @@ impl DatasetStateReader {
                 max_sequence: f.max_seq,
                 digest: f.digest.clone(),
                 recorded_statistics: f.stats.as_ref().map(|recorded| RecordedFileStatistics {
+                    rows: f.rows,
                     blob: recorded.blob.clone(),
                     schema: recorded.schema,
                 }),
             })
             .collect()
-    }
-    /// The footer statistics recorded with `file_name` in `snapshot_id`, from the
-    /// commit that added it, with the footer's row count.
-    pub(crate) fn get_recorded_file_statistics(
-        &self,
-        table_id: &str,
-        snapshot_id: &str,
-        file_name: &str,
-    ) -> Option<(i64, RecordedFileStatistics)> {
-        let file = self
-            .rows(table_id)
-            .files
-            .get(&(Arc::from(snapshot_id), Arc::from(file_name)))?;
-        let recorded = file.stats.as_ref()?;
-        Some((
-            file.rows,
-            RecordedFileStatistics {
-                blob: recorded.blob.clone(),
-                schema: recorded.schema,
-            },
-        ))
     }
     pub(crate) fn get_snapshot_files(
         &self,

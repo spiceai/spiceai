@@ -38,9 +38,8 @@ limitations under the License.
 //! releases them, or the orphan sweep finds a commit naming them.
 //!
 //! Each data file the sink closes is held with the footer statistics its writer
-//! computed from the footer it wrote ([`WrittenFileStatistics`]), so the commit
-//! that names the file records them with it and no scan has to read the footer
-//! or write them.
+//! computed from the footer it wrote, so the commit that names the file records
+//! them with it and no scan reads the footer or writes them.
 //!
 //! The same record is the writer's intent for the orphan sweep: a file listed
 //! under the table's prefix that no retained snapshot names is reclaimed only
@@ -63,26 +62,14 @@ use vortex_datafusion::VortexWriteObserver;
 use crate::metadata::RecordedFileStatistics;
 
 /// Files written into snapshot directories and not yet named by a commit, by
-/// snapshot id, then file name, with their size in bytes.
+/// snapshot id, then file name.
 #[derive(Debug, Default)]
 pub(crate) struct UncommittedFiles {
-    by_snapshot: Mutex<HashMap<String, BTreeMap<String, u64>>>,
+    by_snapshot: Mutex<HashMap<String, BTreeMap<String, HeldFile>>>,
     /// Appends writing at their final keys, by the write's own key.
     final_key_writes: Mutex<HashMap<String, FinalKeyWrite>>,
     /// Names of deletion-vector files written and not known to be committed.
     deletion_files: Mutex<HashSet<String>>,
-    /// The footer statistics of the data files held above, by file name: a data
-    /// file's name is unique to the write that made it.
-    statistics: Mutex<HashMap<String, WrittenFileStatistics>>,
-}
-
-/// A written file's footer statistics as its commit records them
-/// ([`crate::metadata::SnapshotFile::recorded_statistics`]), with the footer's
-/// row count.
-#[derive(Clone, Debug)]
-pub(crate) struct WrittenFileStatistics {
-    pub(crate) rows: i64,
-    pub(crate) recorded: RecordedFileStatistics,
 }
 
 /// One append writing its files at their final keys in `directory`.
@@ -90,10 +77,18 @@ pub(crate) struct WrittenFileStatistics {
 struct FinalKeyWrite {
     /// The snapshot directory the files are written into and committed to.
     directory: String,
-    files: BTreeMap<String, u64>,
+    files: BTreeMap<String, HeldFile>,
     /// The commit naming the files was accepted: discarding the write must
     /// not delete them.
     committed: bool,
+}
+
+/// One held data file.
+#[derive(Debug)]
+struct HeldFile {
+    size: u64,
+    /// The footer statistics its writer computed, for its commit to record.
+    statistics: Option<RecordedFileStatistics>,
 }
 
 /// What discarding a write at final keys leaves to delete.
@@ -111,18 +106,44 @@ pub(crate) enum DiscardedFinalKeyWrite {
 }
 
 impl UncommittedFiles {
-    /// Records `name` (`size` bytes) as written into `snapshot_id`, or into the
-    /// write at final keys whose key `snapshot_id` is.
-    pub(crate) fn note(&self, snapshot_id: &str, name: &str, size: u64) {
+    /// Records `name` (`size` bytes, with the footer `statistics` its writer
+    /// computed) as written into `snapshot_id`, or into the write at final keys
+    /// whose key `snapshot_id` is.
+    pub(crate) fn note(
+        &self,
+        snapshot_id: &str,
+        name: &str,
+        size: u64,
+        statistics: Option<RecordedFileStatistics>,
+    ) {
+        let held = HeldFile { size, statistics };
         if let Some(write) = self.final_key_writes.lock().get_mut(snapshot_id) {
-            write.files.insert(name.to_string(), size);
+            write.files.insert(name.to_string(), held);
             return;
         }
         self.by_snapshot
             .lock()
             .entry(snapshot_id.to_string())
             .or_default()
-            .insert(name.to_string(), size);
+            .insert(name.to_string(), held);
+    }
+
+    /// The footer statistics the writer of `name`, a data file still held,
+    /// computed. A data file's name is unique to the write that made it.
+    pub(crate) fn statistics(&self, name: &str) -> Option<RecordedFileStatistics> {
+        let found = self
+            .by_snapshot
+            .lock()
+            .values()
+            .find_map(|files| files.get(name).map(|held| held.statistics.clone()));
+        found
+            .or_else(|| {
+                self.final_key_writes
+                    .lock()
+                    .values()
+                    .find_map(|write| write.files.get(name).map(|held| held.statistics.clone()))
+            })
+            .flatten()
     }
 
     /// The files written into `snapshot_id`, or by the write at final keys whose
@@ -133,7 +154,7 @@ impl UncommittedFiles {
             return write
                 .files
                 .iter()
-                .map(|(name, size)| (name.clone(), *size))
+                .map(|(name, held)| (name.clone(), held.size))
                 .collect();
         }
         self.by_snapshot
@@ -142,7 +163,7 @@ impl UncommittedFiles {
             .map(|files| {
                 files
                     .iter()
-                    .map(|(name, size)| (name.clone(), *size))
+                    .map(|(name, held)| (name.clone(), held.size))
                     .collect()
             })
             .unwrap_or_default()
@@ -195,11 +216,7 @@ impl UncommittedFiles {
     /// whose commit failed must end with [`Self::end_final_key_write`] instead,
     /// since its commit may have landed.
     pub(crate) fn discard_final_key_write(&self, write_key: &str) -> DiscardedFinalKeyWrite {
-        let removed = self.final_key_writes.lock().remove(write_key);
-        if let Some(write) = &removed {
-            self.forget_statistics(write.files.keys());
-        }
-        match removed {
+        match self.final_key_writes.lock().remove(write_key) {
             None => DiscardedFinalKeyWrite::Unknown,
             Some(write) if write.committed => DiscardedFinalKeyWrite::Committed,
             Some(write) => DiscardedFinalKeyWrite::Uncommitted {
@@ -214,10 +231,7 @@ impl UncommittedFiles {
     /// state from here on (the orphan sweep reclaims them if it never named
     /// them).
     pub(crate) fn end_final_key_write(&self, write_key: &str) {
-        let removed = self.final_key_writes.lock().remove(write_key);
-        if let Some(write) = removed {
-            self.forget_statistics(write.files.keys());
-        }
+        self.final_key_writes.lock().remove(write_key);
     }
 
     /// Holds the deletion-vector files `names` a write is about to upload.
@@ -250,10 +264,8 @@ impl UncommittedFiles {
         names: impl IntoIterator<Item = &'a str>,
     ) {
         if let Some(files) = self.by_snapshot.lock().get_mut(snapshot_id) {
-            let mut statistics = self.statistics.lock();
             for name in names {
                 files.remove(name);
-                statistics.remove(name);
             }
         }
     }
@@ -262,28 +274,7 @@ impl UncommittedFiles {
     /// writer discarded the snapshot. A write at final keys into its directory
     /// is not touched: only that write's own commit or discard ends it.
     pub(crate) fn forget(&self, snapshot_id: &str) {
-        let forgotten = self.by_snapshot.lock().remove(snapshot_id);
-        if let Some(files) = forgotten {
-            self.forget_statistics(files.keys());
-        }
-    }
-
-    /// Records the footer statistics of `name`, a data file just written.
-    pub(crate) fn note_statistics(&self, name: &str, statistics: WrittenFileStatistics) {
-        self.statistics.lock().insert(name.to_string(), statistics);
-    }
-
-    /// The footer statistics of `name`, a data file written and not yet
-    /// forgotten, when its writer computed them.
-    pub(crate) fn statistics(&self, name: &str) -> Option<WrittenFileStatistics> {
-        self.statistics.lock().get(name).cloned()
-    }
-
-    fn forget_statistics<'a>(&self, names: impl IntoIterator<Item = &'a String>) {
-        let mut statistics = self.statistics.lock();
-        for name in names {
-            statistics.remove(name);
-        }
+        self.by_snapshot.lock().remove(snapshot_id);
     }
 
     /// Every `(snapshot directory, file name)` still held, for the orphan sweep.
@@ -324,13 +315,16 @@ impl UncommittedFiles {
 }
 
 /// Records every file one write closes into [`UncommittedFiles`] under the
-/// snapshot it writes, with the footer statistics of `schema`, the table's.
+/// snapshot it writes, with the footer statistics of `schema`, the table's,
+/// whose [`crate::stats::schema_identity`] is `schema_identity`.
 pub(crate) struct UncommittedFilesObserver {
     pub(crate) files: Arc<UncommittedFiles>,
     pub(crate) snapshot_id: String,
     /// The session the write's format converts types with, as its scans do.
     pub(crate) session: VortexSession,
     pub(crate) schema: SchemaRef,
+    /// `None` records no statistics.
+    pub(crate) schema_identity: Option<u64>,
 }
 
 impl std::fmt::Debug for UncommittedFilesObserver {
@@ -349,7 +343,8 @@ impl UncommittedFilesObserver {
         &self,
         file_path: &object_store::path::Path,
         footer: &Footer,
-    ) -> Option<WrittenFileStatistics> {
+    ) -> Option<RecordedFileStatistics> {
+        let schema = self.schema_identity?;
         let statistics = match vortex_datafusion::footer_statistics(
             &self.session,
             file_path,
@@ -366,13 +361,13 @@ impl UncommittedFilesObserver {
                 return None;
             }
         };
-        let blob = crate::stats::statistics_to_persisted_blob(&statistics, &self.schema)?;
-        Some(WrittenFileStatistics {
+        Some(RecordedFileStatistics {
             rows: i64::try_from(footer.row_count()).ok()?,
-            recorded: RecordedFileStatistics {
-                blob: bytes::Bytes::from(blob),
-                schema: crate::stats::schema_identity(&self.schema),
-            },
+            blob: bytes::Bytes::from(crate::stats::statistics_to_persisted_blob(
+                &statistics,
+                &self.schema,
+            )?),
+            schema,
         })
     }
 }
@@ -388,10 +383,8 @@ impl VortexWriteObserver for UncommittedFilesObserver {
 
     fn file_written(&self, file_path: &object_store::path::Path, size: u64, footer: &Footer) {
         if let Some(name) = file_path.filename() {
-            if let Some(statistics) = self.recorded_statistics(file_path, footer) {
-                self.files.note_statistics(name, statistics);
-            }
-            self.files.note(&self.snapshot_id, name, size);
+            let statistics = self.recorded_statistics(file_path, footer);
+            self.files.note(&self.snapshot_id, name, size, statistics);
         }
     }
 }
@@ -403,9 +396,9 @@ mod tests {
     #[test]
     fn a_closed_file_is_held_under_its_snapshot_until_forgotten() {
         let files = Arc::new(UncommittedFiles::default());
-        files.note("s1", "w_00001.vortex", 20);
-        files.note("s1", "w_00000.vortex", 10);
-        files.note("s2", "c.vortex", 5);
+        files.note("s1", "w_00001.vortex", 20, None);
+        files.note("s1", "w_00000.vortex", 10, None);
+        files.note("s2", "c.vortex", 5, None);
         assert_eq!(
             files.files("s1"),
             vec![
@@ -430,9 +423,9 @@ mod tests {
     #[test]
     fn a_final_key_write_is_held_apart_from_the_snapshot_it_writes_into() {
         let files = Arc::new(UncommittedFiles::default());
-        files.note("cur", "flush.vortex", 1);
+        files.note("cur", "flush.vortex", 1, None);
         files.begin_final_key_write("_staging/w1", "cur");
-        files.note("_staging/w1", "w1_00000.vortex", 7);
+        files.note("_staging/w1", "w1_00000.vortex", 7, None);
         assert_eq!(files.files("cur"), vec![("flush.vortex".to_string(), 1)]);
         assert_eq!(
             files.files("_staging/w1"),
@@ -460,7 +453,7 @@ mod tests {
         assert!(files.held().is_empty());
 
         files.begin_final_key_write("_staging/w2", "cur");
-        files.note("_staging/w2", "w2_00000.vortex", 3);
+        files.note("_staging/w2", "w2_00000.vortex", 3, None);
         files.mark_final_key_write_committed("_staging/w2");
         assert_eq!(
             files.discard_final_key_write("_staging/w2"),

@@ -183,17 +183,6 @@ impl MetadataCatalog for Domain {
             .get_snapshot_file_statistics(table_id, snapshot_id, file_path)
             .await
     }
-    async fn get_recorded_file_statistics(
-        &self,
-        table_id: &str,
-        snapshot_id: &str,
-        file_name: &str,
-    ) -> CatalogResult<Option<(i64, crate::metadata::RecordedFileStatistics)>> {
-        Ok(self
-            .read()
-            .await?
-            .get_recorded_file_statistics(table_id, snapshot_id, file_name))
-    }
     async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>> {
         Ok(self.read().await?.get_all_snapshot_files(table_id))
     }

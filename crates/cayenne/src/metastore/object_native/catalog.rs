@@ -568,16 +568,6 @@ impl MetadataCatalog for ObjectNativeCatalog {
     fn records_file_statistics_with_files(&self) -> bool {
         true
     }
-    async fn get_recorded_file_statistics(
-        &self,
-        table_id: &str,
-        snapshot_id: &str,
-        file_name: &str,
-    ) -> CatalogResult<Option<(i64, crate::metadata::RecordedFileStatistics)>> {
-        self.for_table(table_id)
-            .get_recorded_file_statistics(table_id, snapshot_id, file_name)
-            .await
-    }
     async fn upsert_snapshot_file(&self, file: &SnapshotFile) -> CatalogResult<()> {
         self.for_table(&file.table_id)
             .upsert_snapshot_file(file)

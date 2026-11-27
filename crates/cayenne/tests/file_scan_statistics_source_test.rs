@@ -45,7 +45,8 @@ type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 const TABLE: &str = "file_stats_source";
 
 test_on_data_store!(file_scan_byte_size_statistics_do_not_depend_on_their_source);
-test_on_data_store!(compaction_persists_no_statistics_for_the_files_it_replaces);
+// The object-native metastore records statistics with each file instead.
+test_with_backends!(compaction_persists_no_statistics_for_the_files_it_replaces);
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -243,7 +244,8 @@ async fn file_scan_byte_size_statistics_do_not_depend_on_their_source(
     Ok(())
 }
 
-test_on_data_store!(a_blob_without_byte_sizes_is_re_inferred_from_its_footer);
+// The object-native metastore records statistics with each file instead.
+test_with_backends!(a_blob_without_byte_sizes_is_re_inferred_from_its_footer);
 
 /// Build a blob shaped like one written before per-column byte sizes were
 /// persisted: every column's `byte_size` absent, so the restored total is too.
@@ -276,10 +278,6 @@ fn legacy_blob(num_rows: i64) -> Vec<u8> {
 async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
-    // An object-native table's scans neither read nor rewrite such a row.
-    if fixture.backend_type == common::BackendType::ObjectNative {
-        return Ok(());
-    }
     let ctx = SessionContext::new();
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
@@ -414,7 +412,8 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
     Ok(())
 }
 
-test_on_data_store!(a_widened_table_still_serves_its_files_from_the_persisted_blob);
+// The object-native metastore records statistics with each file instead.
+test_with_backends!(a_widened_table_still_serves_its_files_from_the_persisted_blob);
 
 const EVOLVED_TABLE: &str = "file_stats_source_evolved";
 
@@ -440,11 +439,6 @@ fn evolved_schema() -> Arc<Schema> {
 async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
-    // An object-native table's older files read their footers after a widening
-    // (`a_statistics_row_read_across_a_schema_widening_is_not_used`).
-    if fixture.backend_type == common::BackendType::ObjectNative {
-        return Ok(());
-    }
     let ctx = SessionContext::new();
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
@@ -995,6 +989,52 @@ async fn concurrent_cold_scans_share_one_footer_read_and_upsert_per_file(
     Ok(())
 }
 
+/// Ids below this are deleted by position, from the first file only.
+const DELETED_IDS: i64 = 10;
+
+/// Delete the ids below [`DELETED_IDS`] by position.
+async fn delete_first_ids(
+    table: &Arc<CayenneTableProvider>,
+    ctx: &SessionContext,
+) -> TestResult<()> {
+    let delete = table
+        .delete_from(&ctx.state(), vec![col("id").lt(lit(DELETED_IDS))])
+        .await?;
+    datafusion::physical_plan::collect(delete, ctx.task_ctx()).await?;
+    table.drain_in_flight_maintenance().await?;
+    Ok(())
+}
+
+/// A scan's statistics after [`delete_first_ids`], as a footer read reports
+/// them (a SQLite table's cold scan reports exactly these): the row count leaves out the deleted rows (inexact, as the scan marks
+/// every count while a delete is pending), the first file's bounds still cover
+/// them and so are no longer exact, and no sum survives it.
+fn assert_deletes_adjusted(statistics: &Statistics) -> TestResult<()> {
+    let rows = i64::try_from(SINGLE_FLIGHT_FILES)? * ROWS_PER_FILE;
+    assert_eq!(
+        statistics.num_rows,
+        Precision::Inexact(usize::try_from(rows - DELETED_IDS)?),
+        "the row count leaves out the deleted rows: {statistics:?}"
+    );
+    let id = &statistics.column_statistics[0];
+    assert_eq!(
+        (&id.min_value, &id.max_value),
+        (
+            &Precision::Inexact(datafusion_common::ScalarValue::Int64(Some(0))),
+            &Precision::Inexact(datafusion_common::ScalarValue::Int64(Some(rows - 1)))
+        ),
+        "the bounds still cover the deleted rows, and are inexact: {statistics:?}"
+    );
+    for column in &statistics.column_statistics {
+        assert_eq!(
+            column.sum_value,
+            Precision::Absent,
+            "no sum survives a delete: {statistics:?}"
+        );
+    }
+    Ok(())
+}
+
 /// The provider's own accounting agrees with what the store and the metastore
 /// observed.
 async fn scan_file_statistics_counters_match_the_store_and_the_metastore(
@@ -1051,7 +1091,7 @@ async fn scan_file_statistics_counters_match_the_store_and_the_metastore(
 /// statistics in the commit that adds it. The first cold scan after a restart
 /// is served from those for every file: the store's log shows it read no footer
 /// and wrote nothing, the dataset's log gained no commit, and the scan plans
-/// with exactly the statistics the files' footers give.
+/// with the statistics a footer read gives after the position delete.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scan_file_statistics_counters_match_the_store_and_the_metastore_object_native()
 -> TestResult<()> {
@@ -1064,6 +1104,7 @@ async fn scan_file_statistics_counters_match_the_store_and_the_metastore_object_
     .await?;
     let faults = faults.expect("the fixture wraps its store");
     let (table_id, writer, writer_ctx) = write_multi_file_table(&fixture).await?;
+    delete_first_ids(&writer, &writer_ctx).await?;
     fixture
         .catalog
         .clear_snapshot_file_statistics(&table_id)
@@ -1125,21 +1166,10 @@ async fn scan_file_statistics_counters_match_the_store_and_the_metastore_object_
         "a scan commits nothing to the dataset's log"
     );
 
-    // The writer's own process reads the footers it just wrote, which is what
-    // the recorded statistics must reproduce.
-    let reference = plan_statistics(&writer, &writer_ctx).await?;
-    let expected_rows = usize::try_from(i64::try_from(SINGLE_FLIGHT_FILES)? * ROWS_PER_FILE)?;
-    assert_eq!(reference.num_rows, Precision::Exact(expected_rows));
-    assert!(
-        matches!(reference.total_byte_size, Precision::Exact(_)),
-        "the footer path reports an exact size: {:?}",
-        reference.total_byte_size
-    );
-    for (scan, statistics) in cold.iter().enumerate() {
-        assert_eq!(
-            statistics, &reference,
-            "cold scan {scan} must plan with exactly the statistics the footers give"
-        );
+    // The writer recorded its files' statistics with no delete applied; the scan
+    // adjusts them for the delete as the SQLite leg's footer reads are adjusted.
+    for statistics in &cold {
+        assert_deletes_adjusted(statistics)?;
     }
     Ok(())
 }
@@ -1243,9 +1273,8 @@ async fn compaction_persists_no_statistics_for_the_files_it_replaces(
          SQLite statistics writes {pass_writes:?}, object-native commits {pass_commits:?}",
         fixture.backend_type.name()
     );
-    // From their footers, or from the statistics their writers recorded.
     assert_eq!(
-        after_pass.footer_reads + after_pass.persisted_hits,
+        after_pass.footer_reads,
         u64::try_from(REPLACED_FILES)?,
         "the pass read each input file's statistics"
     );
@@ -1263,11 +1292,7 @@ async fn compaction_persists_no_statistics_for_the_files_it_replaces(
         );
     }
 
-    // A query's scan of the merged file still persists its statistics, on a
-    // metastore whose writers do not record them.
-    if fixture.backend_type == common::BackendType::ObjectNative {
-        return Ok(());
-    }
+    // A query's scan of the merged file still persists its statistics.
     let query = SessionContext::new();
     query.register_table(REPLACED_TABLE, Arc::clone(&table) as Arc<dyn TableProvider>)?;
     let batches = query

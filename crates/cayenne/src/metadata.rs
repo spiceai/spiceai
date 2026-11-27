@@ -2074,13 +2074,15 @@ pub struct SnapshotFile {
     /// The file's footer statistics as its writer recorded them. Only a
     /// metastore whose writers record them keeps them
     /// ([`crate::MetadataCatalog::records_file_statistics_with_files`]); `None`
-    /// for a file written without them. With them, `row_count` is the footer's.
+    /// for a file written without them. With them, `row_count` is their `rows`.
     pub recorded_statistics: Option<RecordedFileStatistics>,
 }
 
 /// A data file's footer statistics as the writer that wrote it computed them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedFileStatistics {
+    /// The footer's row count.
+    pub rows: i64,
     /// Serialized as [`SnapshotFileStatistics::statistics_blob`] is, with no
     /// deletion applied.
     pub blob: bytes::Bytes,
