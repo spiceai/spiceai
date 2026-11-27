@@ -53,6 +53,7 @@ use cayenne::json_shred::{
     top_level_value,
 };
 use cayenne::metadata::{CdcDurability, CreateTableOptions, VortexConfig};
+use cayenne::LastSmallFileCompactPath;
 use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, SlotAdvancer};
 use common::TestFixture;
 use datafusion::catalog::Session;
@@ -968,7 +969,9 @@ async fn json_keys_stored_by_every_write_path(fixture: TestFixture) -> TestResul
                 base_path: base_path.to_string_lossy().to_string(),
                 partition_column: None,
                 vortex_config: VortexConfig {
+                    // Two small files are a compaction's pick, whatever their bytes.
                     compaction_trigger_files: 2,
+                    compaction_max_files_per_pick: 2,
                     compaction_background_interval_ms: 3_600_000,
                     ..VortexConfig::default()
                 },
@@ -1004,6 +1007,8 @@ async fn json_keys_stored_by_every_write_path(fixture: TestFixture) -> TestResul
         0,
         "the inline flush must write every inline row to a file"
     );
+    // A compaction the writes scheduled finishes before the files are read.
+    table.drain_in_flight_maintenance().await?;
     let mut all_rows = vec![overwrite, append, inline_http, inline_k8s];
 
     assert_status_by_path_reads_keys(Arc::clone(&table)).await?;
@@ -1021,16 +1026,20 @@ async fn json_keys_stored_by_every_write_path(fixture: TestFixture) -> TestResul
     assert!(written.values >= 5000, "too few stored values compared: {written:?}");
     assert_served_scan_reads_stored_values(&table, &written).await?;
 
-    // A compaction rewrites the files, storing the keys its own rows choose.
+    // A compaction rewrites the files, storing the keys its own rows choose: this
+    // one, or one a write already scheduled, whose end is awaited.
     let mut compacted = false;
-    for _ in 0..20 {
-        if table.compact_current_snapshot_small_files().await? {
+    for _ in 0..100 {
+        if table.compact_current_snapshot_small_files().await?
+            || table.last_small_file_compact_path() != LastSmallFileCompactPath::None
+        {
             compacted = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(compacted, "the files were never compacted");
+    table.drain_in_flight_maintenance().await?;
     assert_rewrite_changes_no_answer(
         Arc::clone(&table),
         oracle(&schema, all_rows.clone())?,
@@ -1038,6 +1047,20 @@ async fn json_keys_stored_by_every_write_path(fixture: TestFixture) -> TestResul
     )
     .await?;
     let after_compaction = assert_stored_columns_exact(&base_path).await?;
+    // The compaction's outputs are among the current files, and every current
+    // file stores key columns.
+    let current: Vec<String> = table
+        .list_snapshot_files_with_sizes(&table.current_snapshot_id())
+        .await?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert!(
+        current
+            .iter()
+            .all(|name| after_compaction.storing.contains_key(name)),
+        "every current file, the compaction's among them, must store key columns: {current:?}, {after_compaction:?}"
+    );
     assert_served_scan_reads_stored_values(&table, &after_compaction).await?;
 
     // A file whose first stored column has no NULL, then the table widens: a
