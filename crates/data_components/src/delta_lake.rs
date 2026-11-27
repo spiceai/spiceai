@@ -1747,7 +1747,7 @@ fn handle_scan_file(scan_context: &mut ScanContext, scan_file: ScanFile) {
             scan_context
                 .errs
                 .push(datafusion::error::DataFusionError::Execution(format!(
-                    "Error getting selection vector: {e}",
+                    "Error reading the deletion vector of Delta Lake data file '{path}': {e}",
                 )));
             return;
         }
@@ -1833,7 +1833,8 @@ fn row_group_accesses(
             .and_then(|num_rows| total_rows.checked_add(num_rows))
             .ok_or_else(|| {
                 DataFusionError::Execution(format!(
-                    "Delta Lake data file '{file}' is corrupt: a row group has {num_rows} rows."
+                    "Delta Lake data file '{file}' is corrupt: its row group row counts are not \
+                     valid."
                 ))
             })?;
         row_groups.push(total_rows..end);
@@ -3296,6 +3297,26 @@ mod tests {
     }
 
     #[test]
+    fn a_row_group_that_starts_in_a_block_of_2_pow_32_rows_with_no_deleted_row_keeps_its_deletions()
+    {
+        // The deleted row is in the second block of 2^32 rows, at a lower offset in its block than
+        // where its row group starts in the first block.
+        const BLOCK: u64 = 1 << 32;
+        let first_row_group = i64::try_from(BLOCK - 10).expect("row count");
+        assert_eq!(
+            accesses(&[BLOCK + 3], &[first_row_group, 30]).expect("plan"),
+            [
+                RowGroupAccess::Scan,
+                selection(vec![
+                    RowSelector::select(13),
+                    RowSelector::skip(1),
+                    RowSelector::select(16),
+                ]),
+            ]
+        );
+    }
+
+    #[test]
     fn a_deleted_row_past_the_end_of_its_file_is_refused() {
         // Ten rows: row 9 is the last one, and row 10 does not exist.
         assert_eq!(
@@ -3315,13 +3336,20 @@ mod tests {
     }
 
     #[test]
-    fn a_row_group_with_a_negative_row_count_is_refused() {
+    fn a_row_group_with_a_negative_or_overflowing_row_count_is_refused() {
+        let refusal = "Execution error: Delta Lake data file 'part-0.parquet' is corrupt: its row \
+                       group row counts are not valid.";
+        assert_eq!(
+            accesses(&[1], &[i64::MAX, i64::MAX, i64::MAX])
+                .expect_err("the row counts add up to more than u64::MAX")
+                .to_string(),
+            refusal
+        );
         assert_eq!(
             accesses(&[1], &[5, -1])
                 .expect_err("a row group cannot have -1 rows")
                 .to_string(),
-            "Execution error: Delta Lake data file 'part-0.parquet' is corrupt: a row group has -1 \
-             rows."
+            refusal
         );
     }
 
