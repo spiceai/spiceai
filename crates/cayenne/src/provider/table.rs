@@ -1375,7 +1375,10 @@ pub(crate) struct CapturedSnapshotFiles {
     /// The position deletes as they stood when `files` was captured. A scan of
     /// these files applies these, not the live cache: a compaction committing
     /// after the capture clears that cache, and the files would be read
-    /// without their deletes.
+    /// without their deletes. Deletion memory accounting counts only the live
+    /// cache; vectors the live cache has dropped stay resident only while the
+    /// table's one cached scan view, a view still being built, or a running
+    /// scan holds them.
     positions: CapturedPositionDeletions,
     /// Whether `files` is the snapshot's whole file set. Only a whole one may
     /// become [`CayenneTableProvider::cached_snapshot_listing`], which every
@@ -1436,9 +1439,15 @@ impl CapturedSnapshotFiles {
 /// file-statistics cache generation they were read at.
 #[derive(Clone)]
 pub(crate) struct CapturedPositionDeletions {
-    /// Statistics adjusted for [`Self::vectors`] are published to the shared
-    /// file-statistics cache only while it is still at this generation: every
-    /// change to the vectors advances it.
+    /// Once the live vectors differ from [`Self::vectors`], statistics adjusted
+    /// for them are published to the shared file-statistics cache only while it
+    /// is still at this generation (see
+    /// [`CayenneTableProvider::scan_statistics_generation`]). Not every change
+    /// to the vectors advances it, nor only after publishing them: a buffered
+    /// `DELETE` clears the cache before its vectors are published. Statistics
+    /// adjusted for older vectors can therefore still reach the cache; they are
+    /// trusted as exact only when no position delete is pending, captured or
+    /// live, which keeps `COUNT(*)` and the `LIMIT` early stop correct.
     statistics_generation: u64,
     vectors: Arc<PositionBitmap>,
 }
@@ -17285,12 +17294,6 @@ impl CayenneTableProvider {
                 message: format!("Position capture: invalid snapshot URL: {err}"),
             }
         })?;
-        let options = Self::create_listing_options(
-            self.context.file_format(),
-            &self.pk_deletion_strategy,
-            state.config(),
-        );
-        let scan_schema = Self::snapshot_scan_schema(&self.table_schema(), &options);
         // Listed under the fence (see `snapshot_file_list`); a file missed here
         // only keeps its key deletes, but the listing would fill the cache entry
         // queries read.
@@ -17300,6 +17303,12 @@ impl CayenneTableProvider {
             .map_err(|err| CatalogError::InvalidOperationNoSource {
                 message: format!("Position capture: failed to list snapshot files: {err}"),
             })?;
+        let options = Self::snapshot_scan_options(
+            self.context.file_format(),
+            self.scan_position_deletion_plans(Some(&captured)),
+            state.config(),
+        );
+        let scan_schema = Self::snapshot_scan_schema(&self.table_schema(), &options);
         let listed = self
             .list_files_for_snapshot_scan(&SnapshotScanListingRequest {
                 state: &state,
@@ -39208,9 +39217,9 @@ impl CayenneTableProvider {
         ))
     }
 
-    /// The live position deletes, with the statistics generation read first: a
-    /// change to the vectors advances the generation after it publishes them,
-    /// so the generation read here is never newer than the vectors.
+    /// The live position deletes, with the statistics generation read first so
+    /// a cache clear that follows a publish of the vectors is never paired with
+    /// the vectors from before it.
     fn capture_position_deletions(&self) -> CapturedPositionDeletions {
         let statistics_generation = self.scan_file_statistics_flights.generation();
         CapturedPositionDeletions {
@@ -46556,10 +46565,7 @@ impl CayenneTableProvider {
                 .meta_fetch_concurrency,
         );
 
-        let statistics_generation = request.captured_files.map_or_else(
-            || self.scan_file_statistics_flights.generation(),
-            |captured| captured.positions.statistics_generation,
-        );
+        let statistics_generation = self.scan_statistics_generation(request.captured_files);
         let file_list: futures::stream::BoxStream<'_, DataFusionResult<PartitionedFile>> =
             if let Some(captured) = request.captured_files {
                 stream::iter(captured.files.iter().cloned().map(Ok)).boxed()
@@ -46654,6 +46660,27 @@ impl CayenneTableProvider {
             }
         }
         (file_group, truncated)
+    }
+
+    /// The file-statistics cache generation a scan of `captured` collects under.
+    /// While the live position deletes are still the captured ones, statistics
+    /// adjusted for them are as current as a fresh capture's, so a reused view
+    /// keeps filling the cache; otherwise they are published only if the cache
+    /// has not moved since the capture. The live generation is read before the
+    /// vectors are compared, so it is never newer than them.
+    fn scan_statistics_generation(&self, captured: Option<&CapturedSnapshotFiles>) -> u64 {
+        let live = self.scan_file_statistics_flights.generation();
+        match captured {
+            Some(captured)
+                if !Arc::ptr_eq(
+                    &captured.positions.vectors,
+                    &self.pk_deletion_strategy.position_cache().load(),
+                ) =>
+            {
+                captured.positions.statistics_generation
+            }
+            _ => live,
+        }
     }
 
     /// `generation` is the file-statistics cache generation the deletes `format`
