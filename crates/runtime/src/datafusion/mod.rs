@@ -6804,7 +6804,9 @@ impl DataFusion {
             Arc::clone(&refresh_schema),
         )
         .context(RefreshSqlSnafu)?;
-        if selected_schema != refresh_schema {
+        // Compare the columns only: the acceleration's schema metadata (such as the
+        // accelerator name) is not something the refresh SQL selects.
+        if selected_schema.fields() != refresh_schema.fields() {
             return RefreshSqlSchemaChangeDisallowedSnafu {
                 dataset_name: Arc::from(dataset_name.to_string()),
                 selected_columns: Arc::from(
@@ -9126,6 +9128,51 @@ mod tests {
             resolved.is::<MemTable>(),
             "get_accelerated_table_provider must peel the metadata layer to reach the inner provider"
         );
+    }
+
+    /// A Cayenne acceleration's schema carries `spice.accelerator` metadata, which a refresh
+    /// SQL's column list does not. Selecting the acceleration's columns must still be
+    /// accepted, and any other column list refused.
+    #[tokio::test]
+    async fn update_refresh_sql_compares_columns_not_schema_metadata() {
+        let runtime = RuntimeBuilder::new().build().await;
+        let df = DataFusion::builder(
+            status::RuntimeStatus::new(),
+            runtime.accelerator_engine_registry(),
+            Handle::current(),
+        )
+        .build();
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("kind", DataType::Utf8, true),
+            ],
+            HashMap::from([("spice.accelerator".to_string(), "cayenne".to_string())]),
+        ));
+        df.ctx
+            .register_table(
+                TableReference::bare("events"),
+                Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("mem table")),
+            )
+            .expect("table should register");
+
+        for sql in [
+            "SELECT id, kind FROM events WHERE id > 1",
+            "SELECT * FROM events",
+        ] {
+            df.update_refresh_sql(TableReference::bare("events"), sql.to_string())
+                .await
+                .unwrap_or_else(|e| panic!("{sql} selects the acceleration's columns: {e}"));
+        }
+        for sql in ["SELECT id FROM events", "SELECT kind, id FROM events"] {
+            let result = df
+                .update_refresh_sql(TableReference::bare("events"), sql.to_string())
+                .await;
+            assert!(
+                matches!(result, Err(Error::RefreshSqlSchemaChangeDisallowed { .. })),
+                "{sql} must be refused: {result:?}"
+            );
+        }
     }
 
     #[tokio::test]

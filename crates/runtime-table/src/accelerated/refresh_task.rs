@@ -1523,6 +1523,11 @@ impl RefreshTask {
             ));
         }
 
+        if data_update.update_type == UpdateType::Overwrite {
+            self.runtime_status
+                .clear_changes_decode_degraded(&self.dataset_name);
+        }
+
         self.set_refresh_status(sql, status::ComponentStatus::Ready)
             .await;
 
@@ -2593,6 +2598,8 @@ impl RefreshTask {
             );
         }
 
+        self.runtime_status
+            .clear_changes_decode_degraded(&self.dataset_name);
         self.set_refresh_status(None, status::ComponentStatus::Ready)
             .await;
         Ok(RefreshOutcome::Refreshed)
