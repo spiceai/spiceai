@@ -1,4 +1,5 @@
 name: snapshot-source-projected-publisher
+duration: 35s
 description: >
   A file_format snapshot dataset over snapshots whose publisher's refresh_sql
   stores only some of its source's columns is refused by name. The publisher

@@ -58,7 +58,7 @@ const SWEEP_MIN_FILES: usize = 20;
 /// trigger fires and each test drives the floor-advancing pass itself.
 const NO_AUTOMATIC_COMPACTION: usize = 1_000_000;
 
-test_with_backends!(bake_publication_schedules_orphan_dv_cleanup_impl);
+test_on_data_store!(bake_publication_schedules_orphan_dv_cleanup_impl);
 test_on_data_store!(protected_subset_merge_schedules_orphan_dv_cleanup_impl);
 test_on_data_store!(scheduled_cleanup_keeps_a_deletion_vector_still_needed_impl);
 test_with_backends!(provider_open_replays_an_orphan_backlog_left_by_a_crash_impl);

@@ -1,4 +1,5 @@
 name: snapshots-kill-during-upload
+duration: 97s
 description: >
   spiced killed (SIGKILL) at delays after a refresh completes never leaves
   a snapshot that restores

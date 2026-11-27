@@ -1,0 +1,67 @@
+# A sidecar sends a lookup that differs from an earlier one only in its key
+# values as the same Substrait plan with different parameter bindings
+# (`ParameterizedSubstraitPlan`): it plans each query shape once
+# (crates/runtime/src/datafusion/federated_template.rs) and the upstream decodes
+# each template once. Every answer must still be the one the source gives for
+# that lookup's own values.
+name: sidecar-parameterized-lookups
+duration: 6s
+description: >
+  Through a sidecar, lookups that differ only in their key values answer as
+  PostgreSQL does, and the upstream receives them as parameterized Substrait
+  plans.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: sidecar-parameterized-lookups-upstream
+  datasets:
+    - { from: 'postgres:public.orders', name: orders, params: '${sources.src.params}' }
+
+sidecar:
+  spicepod:
+    version: v1
+    kind: Spicepod
+    name: sidecar-parameterized-lookups-app
+    datasets:
+      - from: spice.ai:orders
+        name: orders
+        params: { spiceai_endpoint: 'http://127.0.0.1:${instance.flight_port}' }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - generate:
+      src:
+        table: orders
+        rows: 5000
+        seed: 15728
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: customer_id, int: [1, 320], nulls: 0.05 }
+          - { name: status, choice: [open, shipped, returned] }
+  - start: {}
+  - mark-metrics: before
+    on: upstream
+  # One shape, three key values: each answers its own rows, a miss included.
+  - query: SELECT 1 AS present FROM orders WHERE id = 17 LIMIT 1
+  - query: SELECT 1 AS present FROM orders WHERE id = 4242 LIMIT 1
+  - query: SELECT 1 AS present FROM orders WHERE id = 999999 LIMIT 1
+    expect-empty: true
+  - query: SELECT id, customer_id FROM orders WHERE status = 'open' AND customer_id = 7 ORDER BY id
+  - query: SELECT id, customer_id FROM orders WHERE status = 'returned' AND customer_id = 300 ORDER BY id
+  - query: SELECT id, status FROM orders WHERE id IN (3, 30, 300) ORDER BY id
+  - query: SELECT id, status FROM orders WHERE id IN (4, 40, 400) ORDER BY id
+  # Each of the seven reached the upstream as a parameterized plan.
+  - wait-metric:
+      name: flight_requests
+      labels: { method: do_get, command: statement_substrait_plan_parameterized }
+      increased-by: 7
+      since: before
+      timeout: 30s
+    on: upstream

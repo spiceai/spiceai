@@ -1,4 +1,5 @@
 name: flight-auth-handshake-limit
+duration: 10s
 description: >
   With API keys required, a client that authenticates with a handshake before
   each query, as `flight_client` does (and so the `spice.ai` connector a

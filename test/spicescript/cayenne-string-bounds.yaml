@@ -1,4 +1,5 @@
 name: cayenne-string-bounds
+duration: 5s
 description: >
   MIN and MAX of strings longer than the 64 bytes a Vortex file keeps of a
   string column's bounds answer with the whole value, right after the load and

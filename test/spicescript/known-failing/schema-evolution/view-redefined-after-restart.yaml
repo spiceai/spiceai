@@ -3,6 +3,7 @@
 # served, by the view or by a view reading it.
 # Move this script to test/spicescript/ once it passes.
 name: view-redefined-after-restart
+duration: 68s
 description: >
   An accelerated view whose SQL changes between restarts answers from its new
   definition: a column the new SQL adds is served, by the view and by a view

@@ -515,6 +515,16 @@ fn session(config: SessionConfig) -> SessionContext {
     )
 }
 
+/// The key a test table is created with.
+#[derive(Clone, Copy, Debug)]
+enum Keys {
+    None,
+    /// Keyed on `id`; a write of a key the table holds is refused.
+    Unique,
+    /// Keyed on `id`; a write of a key the table holds replaces its row.
+    Upsert,
+}
+
 impl Location {
     async fn new_with_catalog_config(
         name: &str,
@@ -600,6 +610,17 @@ impl Location {
         vortex: &VortexConfig,
         catalog_config: NativeCatalogConfig,
     ) -> (Self, Process) {
+        let keys = if keyed { Keys::Upsert } else { Keys::None };
+        Self::create_with_keys(name, keys, config, vortex, catalog_config).await
+    }
+
+    async fn create_with_keys(
+        name: &str,
+        keys: Keys,
+        config: SessionConfig,
+        vortex: &VortexConfig,
+        catalog_config: NativeCatalogConfig,
+    ) -> (Self, Process) {
         let (location, catalog, instance, faults) =
             Self::new_with_catalog_config(name, catalog_config).await;
         let catalog: Arc<dyn MetadataCatalog> = Arc::new(catalog);
@@ -616,12 +637,12 @@ impl Location {
                 .create(CreateTableOptions {
                     table_name: name.to_string(),
                     schema: schema(),
-                    primary_key: if keyed {
-                        vec!["id".to_string()]
-                    } else {
+                    primary_key: if matches!(keys, Keys::None) {
                         vec![]
+                    } else {
+                        vec!["id".to_string()]
                     },
-                    on_conflict: keyed
+                    on_conflict: matches!(keys, Keys::Upsert)
                         .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
                     base_path: location.data_url.clone(),
                     partition_column: None,
@@ -2025,13 +2046,28 @@ enum Step {
     /// [`Self::Upsert`] as a change stream applies it, durable on its own: the
     /// write publishes a new protected snapshot when it finishes.
     ChangeStreamUpsert,
+    /// [`Self::Upsert`] committed by a transaction.
+    TransactionUpsert,
+    /// Insert new keys into a keyed table that does not upsert and has deleted
+    /// keys: the rows go to a new protected snapshot.
+    InsertAfterKeyDelete,
+    /// Move a keyed table's inline rows into a new protected snapshot.
+    InlineCheckpoint,
 }
+
+/// Keys [`Step::InsertAfterKeyDelete`] deletes before it starts.
+const DELETED_KEYS: i64 = 10;
 
 impl Step {
     fn keyed(self) -> bool {
         matches!(
             self,
-            Self::Merge | Self::Bake | Self::Upsert | Self::ChangeStreamUpsert
+            Self::Merge
+                | Self::Bake
+                | Self::Upsert
+                | Self::ChangeStreamUpsert
+                | Self::TransactionUpsert
+                | Self::InlineCheckpoint
         )
     }
 
@@ -2041,7 +2077,14 @@ impl Step {
     fn config(self) -> VortexConfig {
         match self {
             Self::Merge | Self::Bake | Self::Overwrite => armed(),
-            Self::Append | Self::Upsert => parked(),
+            Self::Append | Self::Upsert | Self::TransactionUpsert | Self::InsertAfterKeyDelete => {
+                parked()
+            }
+            Self::InlineCheckpoint => VortexConfig {
+                inline_max_rows: 1_000,
+                inline_max_bytes: 1 << 20,
+                ..parked()
+            },
             Self::ChangeStreamUpsert => VortexConfig {
                 cdc_durability: CdcDurability::File,
                 ..parked()
@@ -2050,6 +2093,25 @@ impl Step {
     }
 
     async fn start(self) -> (Location, Process) {
+        if matches!(self, Self::InlineCheckpoint) {
+            // A fifth upsert that the reopened table holds inline.
+            let (location, process) =
+                keyed_table_reopened_with("orders", 4, KEYS, SessionConfig::new(), &self.config())
+                    .await;
+            common::insert_batch(&process.table, batch(0..KEYS, |id| id * 1000 + 4))
+                .await
+                .expect("inline upsert");
+            assert_eq!(
+                process
+                    .catalog
+                    .get_inlined_data_count(process.table.table_id())
+                    .await
+                    .expect("inline rows"),
+                KEYS,
+                "the upsert is held inline"
+            );
+            return (location, process);
+        }
         if self.keyed() {
             return keyed_table_reopened_with(
                 "orders",
@@ -2059,6 +2121,38 @@ impl Step {
                 &self.config(),
             )
             .await;
+        }
+        if matches!(self, Self::InsertAfterKeyDelete) {
+            let (location, process) = Location::create_with_keys(
+                "orders",
+                Keys::Unique,
+                SessionConfig::new(),
+                &self.config(),
+                NativeCatalogConfig::default(),
+            )
+            .await;
+            common::insert_batch(&process.table, batch(0..KEYS, |id| id))
+                .await
+                .expect("insert");
+            let deleted: Vec<datafusion::prelude::Expr> =
+                (0..DELETED_KEYS).map(datafusion::prelude::lit).collect();
+            process
+                .table
+                .delete_from_cdc_fast(&[datafusion::prelude::col("id").in_list(deleted, false)])
+                .await
+                .expect("delete")
+                .expect("a key delete");
+            process
+                .table
+                .drain_in_flight_maintenance()
+                .await
+                .expect("drain");
+            process.table.quiesce().await;
+            drop(process);
+            let process = location
+                .open("orders", &self.config(), SessionConfig::new())
+                .await;
+            return (location, process);
         }
         let (location, process) = Location::create("orders", false, SessionConfig::new()).await;
         for append in 0..4 {
@@ -2089,13 +2183,21 @@ impl Step {
         match self {
             Self::Overwrite => &["RemoveGroups", "SetCurrentSnapshot"],
             Self::Merge | Self::Bake => &["RemoveGroups", "SetGroup"],
-            Self::Upsert | Self::ChangeStreamUpsert => &["SetGroup"],
+            Self::Upsert
+            | Self::ChangeStreamUpsert
+            | Self::TransactionUpsert
+            | Self::InsertAfterKeyDelete
+            | Self::InlineCheckpoint => &["SetGroup"],
             Self::Append => &[],
         }
     }
 
     fn before(self) -> Vec<(i64, i64)> {
-        if self.keyed() {
+        if matches!(self, Self::InlineCheckpoint) {
+            upserted(5)
+        } else if matches!(self, Self::InsertAfterKeyDelete) {
+            (DELETED_KEYS..KEYS).map(|id| (id, id)).collect()
+        } else if self.keyed() {
             upserted(4)
         } else {
             (0..2_000).map(|id| (id, id)).collect()
@@ -2105,13 +2207,18 @@ impl Step {
     fn after(self) -> Vec<(i64, i64)> {
         match self {
             Self::Overwrite => (5_000..5_700).map(|id| (id, -id)).collect(),
-            Self::Merge | Self::Bake => self.before(),
+            Self::Merge | Self::Bake | Self::InlineCheckpoint => self.before(),
+            Self::InsertAfterKeyDelete => {
+                let mut rows = self.before();
+                rows.extend((5_000..5_000 + KEYS).map(|id| (id, id)));
+                rows
+            }
             Self::Append => {
                 let mut rows = self.before();
                 rows.extend((5_000..5_500).map(|id| (id, id)));
                 rows
             }
-            Self::Upsert | Self::ChangeStreamUpsert => upserted(5),
+            Self::Upsert | Self::ChangeStreamUpsert | Self::TransactionUpsert => upserted(5),
         }
     }
 
@@ -2143,6 +2250,43 @@ impl Step {
                 .await
                 .map(|_| true)
                 .map_err(|error| error.to_string()),
+            Self::InsertAfterKeyDelete => {
+                common::insert_batch(&table, batch(5_000..5_000 + KEYS, |id| id))
+                    .await
+                    .map(|_| true)
+                    .map_err(|error| error.to_string())
+            }
+            Self::InlineCheckpoint => table
+                .checkpoint_inlined_data()
+                .await
+                .map(|_| true)
+                .map_err(|error| error.to_string()),
+            Self::TransactionUpsert => {
+                let txn = cayenne::CayenneTransaction::new();
+                let token = table.transaction_write_token().await;
+                txn.register(
+                    table.table_id().to_string(),
+                    token,
+                    table.clone_for_write_operations(),
+                );
+                match table
+                    .begin_staged_upsert_occ(
+                        token,
+                        common::single_batch_stream(batch(0..KEYS, |id| id * 1000 + 4)),
+                        1,
+                    )
+                    .await
+                {
+                    Ok(staged) => {
+                        txn.set_staged(table.table_id(), staged);
+                        txn.commit()
+                            .await
+                            .map(|_| true)
+                            .map_err(|error| error.to_string())
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            }
             Self::ChangeStreamUpsert => {
                 let rows = batch(0..KEYS, |id| id * 1000 + 4);
                 let input: datafusion::execution::SendableRecordBatchStream = Box::pin(
@@ -2464,4 +2608,61 @@ async fn a_kill_at_any_storage_request_of_an_append_leaves_only_orphans() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kill_at_any_storage_request_of_an_upsert_leaves_only_orphans() {
     kill_at_every_request(Step::Upsert).await;
+}
+
+/// A transaction that aborts deletes the files its keyed write staged: the
+/// writer holds them from the orphan sweep, so nothing else would before a
+/// restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aborted_transaction_deletes_the_files_it_staged() {
+    let (location, process) = Step::TransactionUpsert.start().await;
+    let before = location.data_files().await;
+    let table = &process.table;
+    let txn = cayenne::CayenneTransaction::new();
+    let token = table.transaction_write_token().await;
+    txn.register(
+        table.table_id().to_string(),
+        token,
+        table.clone_for_write_operations(),
+    );
+    let staged = table
+        .begin_staged_upsert_occ(
+            token,
+            common::single_batch_stream(batch(0..KEYS, |id| id * 1000 + 4)),
+            1,
+        )
+        .await
+        .expect("stage the upsert");
+    let written = location
+        .data_files()
+        .await
+        .into_keys()
+        .filter(|key| !before.contains_key(key))
+        .count();
+    assert_ne!(written, 0, "the upsert staged its files");
+    txn.set_staged(table.table_id(), staged);
+    txn.abort().await;
+    assert_eq!(
+        location.data_files().await,
+        before,
+        "the abort deletes the {written} files the upsert staged"
+    );
+    let mut rows = process.rows("orders").await;
+    rows.sort_unstable();
+    assert_eq!(rows, upserted(4), "the abort changes no row");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_at_any_storage_request_of_a_transaction_upsert_is_all_or_nothing() {
+    kill_at_every_request(Step::TransactionUpsert).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_at_any_storage_request_of_an_insert_after_a_key_delete_is_all_or_nothing() {
+    kill_at_every_request(Step::InsertAfterKeyDelete).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_at_any_storage_request_of_an_inline_checkpoint_loses_nothing() {
+    kill_at_every_request(Step::InlineCheckpoint).await;
 }

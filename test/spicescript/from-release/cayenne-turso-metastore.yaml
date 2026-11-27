@@ -1,4 +1,5 @@
 name: cayenne-turso-metastore
+duration: 3s
 description: >
   Run with `--from` a release that has the Turso Cayenne metastore (v2.4 or
   earlier). The release loads a dataset with `cayenne_metastore: turso`; the

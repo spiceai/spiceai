@@ -1,4 +1,5 @@
 name: http-host-policy
+duration: 6s
 description: >
   A runtime without authentication, bound to loopback or to every interface,
   answers only requests whose Host is an IP address, localhost, a name under

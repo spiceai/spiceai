@@ -1,5 +1,6 @@
 # Known failing (#15546).
 name: connector-errors-gaps
+duration: 153s
 description: >
   What the other connectors already do when a source is misconfigured: a
   ClickHouse table that does not exist puts the dataset in Error naming the

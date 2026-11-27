@@ -1,4 +1,5 @@
 name: postgres-cdc-atomicity
+duration: 73s
 tags: [long]
 description: >
   A reader never sees part of a source transaction. While PostgreSQL commits
@@ -12,12 +13,18 @@ description: >
 
 sources:
   src: { kind: postgres }
+  # The state locations of the object-native-s3 variants.
+  lake: { kind: rustfs }
+  slow-lake: { kind: rustfs, latency: 20ms }
 
 # The spicepod as written, and the same with the prototype object-native Cayenne
-# metastore in place of SQLite.
+# metastore in place of SQLite: its data in the default local state location,
+# and in an S3-compatible one with and without 20 ms of latency.
 variants:
   as-written: federated
   object-native: object-native
+  object-native-s3: object-native-s3
+  object-native-s3-latency: object-native-s3-latency
 
 spicepod:
   version: v1

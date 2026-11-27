@@ -1,0 +1,108 @@
+name: dynamodb-upgrade
+duration: 34s
+description: >
+  DynamoDB Streams change capture resumes across an upgrade in place from each
+  of the last two releases: a `refresh_mode: changes` acceleration applies
+  every change made while the runtime was down, each once, resuming from the
+  stream position the release recorded rather than initializing again, and
+  keeps following afterwards. With the object-native metastore the
+  acceleration loads from its source instead: it initializes from the table
+  again, and follows the stream from there.
+
+matrix:
+  from: [2.3.x, 2.4.x]
+from: '${matrix.from}'
+
+sources:
+  ddb:
+    kind: docker
+    image: docker.io/localstack/localstack:4.9
+    ports: [4566]
+    env: { SERVICES: dynamodb, AWS_DEFAULT_REGION: us-east-1 }
+    ready: awslocal dynamodb list-tables
+  ref: { kind: postgres }
+
+# The DynamoDB connector's lines about its stream position are at `info` under
+# its own target, which the default log filter leaves out.
+variants:
+  sqlite: { env: { SPICED_LOG: info } }
+  object-native: { env: { SPICED_LOG: info }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: dynamodb-upgrade
+  datasets:
+    - from: dynamodb:t_${sources.ddb.namespace}
+      name: t
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes }
+
+defaults:
+  expect: { oracle: ref }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      ddb: |
+        python3 - <<'PY'
+        import boto3
+        d = boto3.resource('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+        t = d.create_table(TableName='t_${sources.ddb.namespace}', KeySchema=[{'AttributeName': 'id', 'KeyType': 'HASH'}],
+            AttributeDefinitions=[{'AttributeName': 'id', 'AttributeType': 'N'}], BillingMode='PAY_PER_REQUEST',
+            StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'NEW_AND_OLD_IMAGES'})
+        t.wait_until_exists()
+        with t.batch_writer() as w:
+            for g in range(1, 301):
+                w.put_item(Item={'id': g, 'i': g % 17 - 8, 's': 'v%d' % g})
+        PY
+  - source-exec:
+      ref: >-
+        CREATE TABLE t (id bigint PRIMARY KEY, i bigint, s text);
+        INSERT INTO t SELECT g, g % 17 - 8, 'v' || g FROM generate_series(1, 300) g;
+  - start: {}
+  - query: SELECT id, i, s FROM t
+    oracle-sql: SELECT id, i, s FROM t
+    eventually: 60s
+
+  # Down, the source changes; then up on the binary under test.
+  - stop: {}
+  - source-exec:
+      ddb: |
+        python3 - <<'PY'
+        import boto3
+        t = boto3.resource('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test').Table('t_${sources.ddb.namespace}')
+        t.put_item(Item={'id': 1001, 'i': 0, 's': 'while down'})
+        for g in range(1, 301, 7):
+            t.update_item(Key={'id': g}, UpdateExpression='SET s = :s', ExpressionAttributeValues={':s': 'while down'})
+        for g in range(5, 301, 11):
+            t.delete_item(Key={'id': g})
+        PY
+  - source-exec:
+      ref: >-
+        INSERT INTO t VALUES (1001, 0, 'while down');
+        UPDATE t SET s = 'while down' WHERE id % 7 = 1 AND id <= 300;
+        DELETE FROM t WHERE id % 11 = 5 AND id <= 300;
+  - upgrade: {}
+  - query: SELECT id, i, s FROM t
+    oracle-sql: SELECT id, i, s FROM t
+    eventually: 60s
+  - query: SELECT count(*) - count(DISTINCT id) AS duplicates FROM t
+    expect: { rows: [['0']] }
+  # Resumed from the recorded position: initialized once, by the release's
+  # first start.
+  - assert-log:
+      count:
+        'No existing checkpoint found for DynamoDB Streams table': 1
+        'Found existing lag for DynamoDB Streams table, resuming': '>=1'
+    except: object-native
+  # Loaded from the source: initialized again, by the binary under test's first
+  # start.
+  - assert-log:
+      count: { 'No existing checkpoint found for DynamoDB Streams table': 2 }
+    only: object-native

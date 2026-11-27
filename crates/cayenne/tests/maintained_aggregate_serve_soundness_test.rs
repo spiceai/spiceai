@@ -42,6 +42,7 @@ limitations under the License.
 use crate::common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -265,12 +266,21 @@ async fn unfiltered_view_answers_only_whole_table_queries(
     reference.register_table(&name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
     // The rewrite must still fire where it is sound, or the comparisons below
-    // would pass without ever exercising it.
+    // would pass without ever exercising it. A CDC write publishes its rows before
+    // a background applier folds them into the view, and until then the rewriter
+    // declines, so poll for the view to catch up.
     let unfiltered = format!("SELECT k, SUM(v) FROM {name} GROUP BY k");
-    assert!(
-        served_by_view(&rewriter, &unfiltered).await?,
-        "{shape:?}: the unfiltered query must be answered by the maintained view"
-    );
+    common::lookup_index::poll_until(
+        Duration::from_secs(30),
+        Duration::from_millis(10),
+        async || match served_by_view(&rewriter, &unfiltered).await {
+            Ok(true) => Ok(Ok(())),
+            Ok(false) => Err(()),
+            Err(error) => Ok(Err(error)),
+        },
+        |()| format!("{shape:?}: the unfiltered query must be answered by the maintained view"),
+    )
+    .await?;
     assert_eq!(
         sorted_rows(&rewriter, &unfiltered).await?,
         sorted_rows(&reference, &unfiltered).await?,

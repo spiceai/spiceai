@@ -30,9 +30,9 @@ use crate::{compare, template};
 
 use super::{
     DEFAULT_READY_TIMEOUT, Instance, POLL, STOP_TIMEOUT, SourceState, Sources, apply_patch,
-    assert_files, assert_log, assert_status, check_error_text, explain, http_step, namespace,
-    random_queries, refresh, run_query, run_slt, source_query, spice_cli, start_background,
-    start_executors, stop_background, tlp, wait_metric,
+    assert_files, assert_log, assert_status, check_error_text, explain, http_step, mark_files,
+    namespace, random_queries, refresh, run_query, run_slt, source_query, spice_cli,
+    start_background, start_executors, stop_background, tlp, wait_metric,
 };
 
 pub(super) fn describe(action: &Action) -> String {
@@ -40,8 +40,19 @@ pub(super) fn describe(action: &Action) -> String {
         Action::Start { .. } => "start".into(),
         Action::Stop => "stop".into(),
         Action::Kill { signal } => format!("kill-spiced ({signal:?})"),
-        Action::Restart { kill, upgrade, .. } => {
-            let name = if *upgrade { "upgrade" } else { "restart" };
+        Action::Restart {
+            kill,
+            upgrade,
+            downgrade,
+            ..
+        } => {
+            let name = if *upgrade {
+                "upgrade"
+            } else if *downgrade {
+                "downgrade"
+            } else {
+                "restart"
+            };
             match kill {
                 Some(signal) => format!("{name} (kill {signal:?})"),
                 None => name.into(),
@@ -106,6 +117,7 @@ pub(super) fn describe(action: &Action) -> String {
         ),
         Action::SpiceCli { args, .. } => format!("spice {}", one_line(&args.join(" "), 80)),
         Action::MarkMetrics(m) => format!("mark-metrics {m}"),
+        Action::MarkFiles { id, .. } => format!("mark-files {id}"),
         Action::AssertObjects {
             source,
             prefix,
@@ -268,7 +280,7 @@ pub(super) async fn run_instance_step(
         return super::load::run_load(script, instance, load, tier, sources).await;
     }
     match tier {
-        Tier::Upstream => run_step(script, instance, step, sources).await,
+        Tier::Upstream => run_step(script, instance, step, sources, tier).await,
         Tier::Sidecar if step.action.is_lifecycle() => {
             let started = Instant::now();
             sidecar_lifecycle(script, instance, step).await?;
@@ -276,7 +288,7 @@ pub(super) async fn run_instance_step(
         }
         Tier::Sidecar => {
             swap_sidecar(instance);
-            let outcome = run_step(script, instance, step, sources).await;
+            let outcome = run_step(script, instance, step, sources, tier).await;
             swap_sidecar(instance);
             outcome
         }
@@ -375,6 +387,7 @@ async fn run_step(
     instance: &mut Instance,
     step: &Step,
     sources: &Sources,
+    tier: Tier,
 ) -> Result<String> {
     let ready_default = ready_default(script);
     let started = Instant::now();
@@ -436,6 +449,7 @@ async fn run_step(
             wait_ready,
             patch,
             upgrade,
+            downgrade,
         } => {
             match kill {
                 Some(signal) => {
@@ -446,11 +460,18 @@ async fn run_step(
                 }
                 None => instance.spiced.stop(STOP_TIMEOUT).await?,
             }
-            if *upgrade {
-                instance.spiced.binary.clone_from(&instance.target_binary);
+            let binary = if *upgrade {
+                Some(instance.target_binary.clone())
+            } else if *downgrade {
+                Some(instance.first_binary.clone())
+            } else {
+                None
+            };
+            if let Some(binary) = binary {
+                instance.spiced.binary.clone_from(&binary);
                 for executor in &mut instance.executors {
                     executor.stop(STOP_TIMEOUT).await?;
-                    executor.binary.clone_from(&instance.target_binary);
+                    executor.binary.clone_from(&binary);
                 }
             }
             apply_patch(instance, patch.as_ref())?;
@@ -800,6 +821,19 @@ async fn run_step(
             let text = instance.spiced.metrics().await?;
             instance.metric_marks.insert(id.clone(), text);
         }
+        Action::MarkFiles { id, matching } => {
+            let mut marks = mark_files(&instance.spiced.dir)?;
+            if !matching.is_empty() {
+                marks.retain(|file, _| matching.iter().any(|pattern| pattern.is_match(file)));
+            }
+            ensure!(
+                !marks.is_empty(),
+                "`mark-files: {id}` found no file to record"
+            );
+            let shown = format!(" {} files", marks.len());
+            instance.file_marks.insert(id.clone(), marks);
+            return Ok(shown);
+        }
         Action::WaitMetric(w) => {
             let shown = wait_metric(instance, w, sources).await?;
             return Ok(format!(
@@ -823,11 +857,19 @@ async fn run_step(
         }
         Action::SpiceCli {
             args,
+            input,
             output_contains,
             expect_error,
         } => {
-            let shown =
-                spice_cli(instance, args, output_contains.as_deref(), *expect_error).await?;
+            let shown = spice_cli(
+                instance,
+                tier,
+                args,
+                input.as_deref(),
+                output_contains.as_deref(),
+                *expect_error,
+            )
+            .await?;
             return Ok(format!(
                 " ({:.1}s) {shown}",
                 started.elapsed().as_secs_f64()
@@ -891,8 +933,17 @@ async fn run_step(
             contains,
             lacks,
             lacks_dirs,
+            unchanged_since,
         } => {
-            let shown = assert_files(&instance.spiced.dir, contains, lacks, lacks_dirs)?;
+            let unchanged = unchanged_since
+                .as_ref()
+                .map(|id| {
+                    instance.file_marks.get(id).with_context(|| {
+                        format!("`unchanged-since: {id}` names no earlier `mark-files: {id}`")
+                    })
+                })
+                .transpose()?;
+            let shown = assert_files(&instance.spiced.dir, contains, lacks, lacks_dirs, unchanged)?;
             return Ok(format!(
                 " ({:.1}s) {shown}",
                 started.elapsed().as_secs_f64()
