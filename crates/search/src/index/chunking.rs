@@ -150,6 +150,10 @@ impl Index for ChunkedSearchIndex {
         self.inner.on_write_failed().await
     }
 
+    async fn truncate(&self) -> Result<(), DataFusionError> {
+        self.inner.truncate().await
+    }
+
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
         self.replace_window.store(false, Ordering::Release);
         self.inner.on_write_complete().await
@@ -1242,6 +1246,10 @@ impl Index for ChunkedVectorIndex {
         self.delegate.on_write_failed().await
     }
 
+    async fn truncate(&self) -> Result<(), DataFusionError> {
+        self.delegate.truncate().await
+    }
+
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
         self.delegate.on_write_complete().await
     }
@@ -1569,6 +1577,8 @@ mod tests {
         group_remainder_unsupported: bool,
         /// Member batches handed to [`Index::delete_group_remainder`].
         remainders: std::sync::Mutex<Vec<RecordBatch>>,
+        /// How many times [`Index::truncate`] was called.
+        truncates: AtomicUsize,
     }
 
     impl RecordingInner {
@@ -1589,6 +1599,7 @@ mod tests {
                 listings: AtomicUsize::new(0),
                 group_remainder_unsupported: false,
                 remainders: std::sync::Mutex::new(Vec::new()),
+                truncates: AtomicUsize::new(0),
             }
         }
 
@@ -1673,6 +1684,10 @@ mod tests {
         }
         async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
             self.deleted.lock().expect("mutex").push(keys);
+            Ok(())
+        }
+        async fn truncate(&self) -> DataFusionResult<()> {
+            self.truncates.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         fn deletes_by_partial_key(&self) -> bool {
@@ -1888,6 +1903,26 @@ mod tests {
             chunker(),
         );
         assert!(fatal.write_complete_failure_is_fatal());
+    }
+
+    /// A CDC truncate reaches the index a chunked wrapper holds, so its entries go too.
+    #[tokio::test]
+    async fn chunked_indexes_forward_a_truncate() {
+        let chunker = || Arc::new(DelimChunker { delim: ' ' }) as Arc<dyn Chunker>;
+
+        let inner = Arc::new(RecordingInner::new("content"));
+        ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker())
+            .truncate()
+            .await
+            .expect("truncate");
+        assert_eq!(inner.truncates.load(Ordering::SeqCst), 1);
+
+        let inner = Arc::new(RecordingInner::new("content"));
+        ChunkedVectorIndex::new(Arc::clone(&inner) as Arc<dyn VectorIndex>, chunker())
+            .truncate()
+            .await
+            .expect("truncate");
+        assert_eq!(inner.truncates.load(Ordering::SeqCst), 1);
     }
 
     /// The start-fatality flag has to forward on its own, not ride along with the

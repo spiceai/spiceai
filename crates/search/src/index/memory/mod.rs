@@ -24,7 +24,11 @@ limitations under the License.
 //! contents as `LogicalPlan`s. Nearest-neighbor search is brute-force exact
 //! k-NN over the SIMD distance kernels in `runtime-datafusion-udfs`.
 
-use std::{any::Any, collections::HashSet, sync::Arc};
+use std::{
+    any::Any,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use arrow::array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow::compute::filter;
@@ -237,18 +241,26 @@ impl MemoryVectorIndex {
 
         let evicted = write_util::keys_to_evict(rows.iter().flatten().copied());
         let evicted_keys: HashSet<&str> = evicted.iter().map(String::as_str).collect();
+        let deciding_rows: HashMap<&str, usize> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(position, row)| row.as_ref().map(|(key, _)| (*key, position)))
+            .collect();
 
         // An indexable row is still dropped when a later row of the same batch decided its
         // key against it: `upsert` deletes `evicted` and then stores this batch, so keeping
         // the row here would write the stale entry straight back over its own eviction.
+        // Only the key's deciding row is stored: `upsert` deletes a key's earlier entries
+        // once and then appends every row it is given.
         let mut keys = Vec::with_capacity(rows.len());
         let mask: BooleanArray = rows
             .iter()
-            .map(|row| {
+            .enumerate()
+            .map(|(position, row)| {
                 let Some((key, write_util::RowOutcome::Indexed)) = row else {
                     return Some(false);
                 };
-                if evicted_keys.contains(key) {
+                if evicted_keys.contains(key) || deciding_rows.get(key) != Some(&position) {
                     return Some(false);
                 }
                 keys.push((*key).to_string());
@@ -1005,6 +1017,21 @@ mod tests {
             None,
             "the vector of the text the same batch replaced is exactly what must not survive"
         );
+    }
+
+    /// Two indexable rows for one key in one batch (a source transaction that updates a row
+    /// twice) leave one entry, the last row's, as the table keeps.
+    #[tokio::test]
+    async fn a_key_written_twice_in_one_batch_keeps_only_its_last_vector() {
+        let index = memory_index();
+        write_batch(
+            &index,
+            batch_with_contents(&[1, 2, 1], &[Some("first"), Some("other"), Some("last")]),
+        )
+        .await;
+
+        assert_eq!(indexed_ids(&index), vec![1, 2]);
+        assert_eq!(stored_vector(&index, 1), Some(byte_vector("last")));
     }
 
     /// The other direction: the key is rejected first and stored after, so the row that

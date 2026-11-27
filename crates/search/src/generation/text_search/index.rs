@@ -18,9 +18,19 @@ use std::cmp::min;
 use std::path::{Path, PathBuf};
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{any::Any, collections::HashSet, sync::Arc};
+use std::{
+    any::Any,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
-use arrow::{array::RecordBatch, datatypes::DataType};
+use arrow::{
+    array::{ArrayRef, BooleanArray, RecordBatch},
+    compute::filter_record_batch,
+    datatypes::DataType,
+    error::ArrowError,
+    row::{RowConverter, SortField},
+};
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
@@ -202,6 +212,66 @@ fn rollback_writer(writer: &mut tantivy::IndexWriter) -> Result<(), TantivyError
     Ok(())
 }
 
+/// `batches` with only the last row for each primary key, in order: the row an upsert or a
+/// CDC change keeps, and the rule the index already follows across writes. A tantivy delete
+/// removes only the documents added before it, so two rows for one key in one write would
+/// both stay searchable. Batches without every key column are returned unchanged.
+fn last_row_per_key(
+    batches: &[RecordBatch],
+    primary_key: &[String],
+) -> Result<Vec<RecordBatch>, ArrowError> {
+    let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    let Some(first) = batches.first() else {
+        return Ok(Vec::new());
+    };
+    let key_columns = |batch: &RecordBatch| {
+        primary_key
+            .iter()
+            .map(|name| batch.column_by_name(name).map(Arc::clone))
+            .collect::<Option<Vec<ArrayRef>>>()
+    };
+    let Some(first_keys) = key_columns(first) else {
+        return Ok(batches.to_vec());
+    };
+    if total < 2 || primary_key.is_empty() {
+        return Ok(batches.to_vec());
+    }
+    let converter = RowConverter::new(
+        first_keys
+            .iter()
+            .map(|column| SortField::new(column.data_type().clone()))
+            .collect(),
+    )?;
+    let mut rows = converter.empty_rows(total, 0);
+    for batch in batches {
+        let Some(keys) = key_columns(batch) else {
+            return Ok(batches.to_vec());
+        };
+        converter.append(&mut rows, &keys)?;
+    }
+
+    let mut keep = vec![true; total];
+    let mut last_occurrence = HashMap::with_capacity(total);
+    for row in 0..total {
+        if let Some(earlier) = last_occurrence.insert(rows.row(row), row) {
+            keep[earlier] = false;
+        }
+    }
+    if keep.iter().all(|&kept| kept) {
+        return Ok(batches.to_vec());
+    }
+
+    let mut offset = 0;
+    batches
+        .iter()
+        .map(|batch| {
+            let mask = BooleanArray::from(keep[offset..offset + batch.num_rows()].to_vec());
+            offset += batch.num_rows();
+            filter_record_batch(batch, &mask)
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct FullTextDatabaseIndex {
     pub search_fields: Vec<String>,
@@ -272,6 +342,12 @@ impl Index for FullTextDatabaseIndex {
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
         self.delete_terms_for(&keys)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))
+    }
+
+    async fn truncate(&self) -> Result<(), DataFusionError> {
+        self.delete_all()
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
@@ -576,6 +652,13 @@ impl FullTextDatabaseIndex {
     /// an additional column is used in the [`tantivy::Index`] for unique lookup (required since
     /// updates = deletion -> insertion).
     async fn update_index(&self, rb: &[RecordBatch]) -> Result<(), super::Error> {
+        let rb = last_row_per_key(rb, &self.primary_key)
+            .boxed()
+            .context(InvalidIndexingSnafu {
+                context: "Failed to resolve repeated primary keys for the full text search index"
+                    .to_string(),
+            })?;
+
         // Construct column for `INDEX_UNIQUE_FIELD_NAME` if needed.
         let rb = if needs_unique_field(&self.primary_key, &self.search_fields) {
             rb.iter()
@@ -585,7 +668,7 @@ impl FullTextDatabaseIndex {
                     context: "An error occured creating the a unique column for the full text search index".to_string(),
                 })?
         } else {
-            rb.to_vec()
+            rb
         };
 
         // Updates in tantivy are a deletion then insertion.
@@ -721,7 +804,27 @@ impl FullTextDatabaseIndex {
             return Ok(());
         }
 
-        // delete_term/commit and the reader reload are synchronous tantivy work
+        self.commit_delete(move |index_writer| {
+            for t in terms_to_delete {
+                index_writer.delete_term(t);
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Deletes every document (a CDC truncate).
+    async fn delete_all(&self) -> Result<(), super::Error> {
+        self.commit_delete(|index_writer| index_writer.delete_all_documents().map(|_| ()))
+            .await
+    }
+
+    /// Stages `delete` on the writer and commits it, unless a sink write window is open.
+    async fn commit_delete(
+        &self,
+        delete: impl FnOnce(&mut tantivy::IndexWriter) -> Result<(), TantivyError> + Send + 'static,
+    ) -> Result<(), super::Error> {
+        // delete/commit and the reader reload are synchronous tantivy work
         // (commit fsyncs), so run them off the async runtime thread. The deferral
         // flag is read under the writer lock inside the task, exactly as
         // `update_index` does.
@@ -735,9 +838,7 @@ impl FullTextDatabaseIndex {
             // clear that `on_write_start` stages for a `WriteWindow::ReplaceAll`. Stage the
             // deletes and let the window's own `on_write_complete` commit publish them together.
             let defer_commit = defer_commit_flag.load(Ordering::Acquire);
-            for t in terms_to_delete {
-                index_writer.delete_term(t);
-            }
+            delete(&mut index_writer).context(FailedToInsertDataIntoIndexSnafu)?;
             if defer_commit {
                 // The reader is reloaded once in `on_write_complete`, after the commit.
                 return Ok(());
@@ -748,7 +849,7 @@ impl FullTextDatabaseIndex {
                 .context(FailedToInsertDataIntoIndexSnafu);
             if let Err(e) = &commit_result {
                 tracing::warn!("Rolling back index writer after failed delete commit: {e}");
-                if let Err(rb_err) = index_writer.rollback() {
+                if let Err(rb_err) = rollback_writer(&mut index_writer) {
                     tracing::error!("Failed to rollback index writer: {rb_err}");
                 }
             }
@@ -1133,6 +1234,61 @@ mod tests {
             false,
         )
         .expect("Failed to create FullTextDatabaseIndex")
+    }
+
+    /// One write that carries a key twice (two updates of one row in a source transaction)
+    /// leaves one document for the key, with its last text, as the table keeps.
+    #[tokio::test]
+    async fn a_key_written_twice_in_one_write_keeps_only_its_last_text() {
+        let index = new_test_index();
+        index
+            .compute_index(vec![
+                record_batch!(
+                    ("id", Int32, [1, 2]),
+                    ("content", Utf8, ["apple", "banana"])
+                )
+                .expect("Failed to create test batch"),
+            ])
+            .await
+            .expect("failed to compute_index");
+
+        index
+            .compute_index(vec![
+                record_batch!(
+                    ("id", Int32, [2, 1, 2]),
+                    ("content", Utf8, ["cherry", "plum", "damson"])
+                )
+                .expect("Failed to create test batch"),
+            ])
+            .await
+            .expect("failed to compute_index");
+
+        assert_eq!(search_ids(&index, "cherry").await, Vec::<i32>::new());
+        assert_eq!(search_ids(&index, "damson").await, vec![2]);
+        assert_eq!(search_ids(&index, "cherry damson banana").await, vec![2]);
+        assert_eq!(search_ids(&index, "plum").await, vec![1]);
+        assert_eq!(index.reader.searcher().num_docs(), 2);
+    }
+
+    /// A CDC truncate leaves nothing searchable.
+    #[tokio::test]
+    async fn a_truncate_removes_every_document() {
+        let index = new_test_index();
+        index
+            .compute_index(vec![
+                record_batch!(
+                    ("id", Int32, [1, 2]),
+                    ("content", Utf8, ["apple", "banana"])
+                )
+                .expect("Failed to create test batch"),
+            ])
+            .await
+            .expect("failed to compute_index");
+
+        index.truncate().await.expect("failed to truncate");
+
+        assert_eq!(search_ids(&index, "apple banana").await, Vec::<i32>::new());
+        assert_eq!(index.reader.searcher().num_docs(), 0);
     }
 
     /// Regression test for #14618: an index holding no documents asks to be rebuilt from its
