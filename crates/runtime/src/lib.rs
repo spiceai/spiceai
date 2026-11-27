@@ -29,7 +29,7 @@ use ::tools::rename::with_name;
 use async_stream::stream;
 use datafusion_expr::Expr;
 use datafusion_proto::bytes::Serializeable;
-use init::scheduler::ScheduleRegistry;
+use init::scheduler::{DatasetScheduleWaiters, ScheduleRegistry};
 use spicepod::component::runtime::TelemetryConfig;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -789,6 +789,7 @@ pub struct Runtime {
     token_provider_registry: Arc<TokenProviderRegistry>,
 
     schedulers: Arc<ScheduleRegistry>,
+    dataset_schedule_waiters: Arc<DatasetScheduleWaiters>,
 
     /// When the runtime is part of a distributed cluster, this holds the node-specific information. It is `None` for stand-alone runtimes.
     distributed: Option<DistributedNode>,
@@ -1752,6 +1753,16 @@ impl Runtime {
         tls_config: Option<Arc<TlsConfig>>,
         endpoint_auth: EndpointAuth,
     ) -> Result<()> {
+        // A request with no principal may call read-write tools only when the runtime
+        // authenticates no caller, as it may then write through `/v1/sql`.
+        ::tools::set_runtime_authenticates_callers(
+            endpoint_auth.http_auth.is_some()
+                || !matches!(
+                    endpoint_auth.identity_source,
+                    runtime_auth::IdentitySource::Anonymous
+                ),
+        );
+
         // Executors: mark cluster status Initializing before any await so a
         // concurrent `load_components` cannot report ready from dataset-only
         // status while task slots are still closed (Fix B for #11758).
@@ -2226,6 +2237,10 @@ impl Runtime {
     pub async fn load_components(self: Arc<Self>) {
         self.secrets_preflight().await;
 
+        if let Some(app) = self.read_app().await {
+            log_refused_components(&app, None);
+        }
+
         let hold_ready_for_warmup = self.df.results_cache_warmup_holds_ready();
         if hold_ready_for_warmup {
             tracing::info!(
@@ -2588,7 +2603,12 @@ impl Runtime {
             && let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(&catalog_name)
             && let Some(tool) = catalog.get(&name).await
         {
-            return Some(tool);
+            // Under the name it is listed as, as `list_all_tools` returns it, so the tool is
+            // named the same in its errors and `task_history` whichever path called it.
+            return Some(with_name(
+                &tool,
+                encode_tool_name(&catalog_name, &name).as_str(),
+            ));
         }
         // Fall back to a direct (non-catalog) lookup — covers top-level tools
         // whose names legitimately contain the `__` catalog separator.
@@ -2621,5 +2641,18 @@ impl From<runtime_acceleration::AccelerationParseError> for Error {
         Error::InvalidAccelerationConfiguration {
             source: Box::new(err),
         }
+    }
+}
+
+/// Log each component a Spicepod dependency declared but may not load because
+/// `spicepod.yaml` does not trust it to run programs on the host. Each is
+/// logged once: `previous` is the app already loaded, whose refusals were
+/// logged when it loaded.
+pub(crate) fn log_refused_components(app: &App, previous: Option<&App>) {
+    for refused in &app.refused_components {
+        if previous.is_some_and(|previous| previous.refused_components.contains(refused)) {
+            continue;
+        }
+        tracing::error!("{}", refused.message());
     }
 }

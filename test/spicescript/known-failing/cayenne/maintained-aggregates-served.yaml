@@ -3,6 +3,7 @@
 # spiced, under full refresh or change capture; the answers are right because
 # the scan and aggregate run as usual.
 name: maintained-aggregates-served
+duration: 12s
 description: >
   A Cayenne acceleration with maintained aggregates (MIN, MAX, SUM, COUNT and
   AVG by customer, and SUM and COUNT by region over a filter) answers

@@ -1,4 +1,6 @@
 name: debezium-offset-recovery
+duration: 103s
+tags: [long]
 description: >
   Debezium Server posting PostgreSQL changes straight to Spice (`from: cdc:`)
   loses and duplicates nothing through faults: spiced killed while changes

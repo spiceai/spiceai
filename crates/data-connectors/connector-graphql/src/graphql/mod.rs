@@ -36,10 +36,43 @@ pub use response::ResponseBodyFormat;
 /// Maximum number of retry attempts for a single page fetch during pagination.
 pub const PAGE_RETRY_MAX_ATTEMPTS: u32 = 5;
 
+/// The reasons reqwest's display of a redirect error leaves out, such as why a redirect was refused.
+fn redirect_reasons(error: &reqwest::Error) -> String {
+    if !error.is_redirect() {
+        return String::new();
+    }
+    let mut reasons = String::new();
+    let mut reason = std::error::Error::source(error);
+    while let Some(next) = reason {
+        reasons.push_str(": ");
+        reasons.push_str(&next.to_string());
+        reason = next.source();
+    }
+    reasons
+}
+
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to send GraphQL HTTP request: {source}"))]
+    #[snafu(display(
+        "Failed to send GraphQL HTTP request: {source}{}",
+        redirect_reasons(source)
+    ))]
     ReqwestInternal { source: reqwest::Error },
+
+    /// The response body could not be read: refused as a compression bomb, or because the
+    /// query memory pool could not hold it, or it could not be read as sent.
+    #[snafu(display(
+        "Failed to read the GraphQL response from {endpoint} for {dataset}: {source}{}",
+        response_body_remedy(source, connector)
+    ))]
+    ResponseBody {
+        endpoint: String,
+        /// `dataset 'name'`, or `this dataset` when the client has no dataset name.
+        dataset: String,
+        /// The connector whose documentation page the error links.
+        connector: &'static str,
+        source: http_body_limit::Error,
+    },
 
     #[snafu(display("HTTP {status}: {message}"))]
     InvalidReqwestStatus {
@@ -115,6 +148,12 @@ pub enum Error {
         query: String,
     },
 
+    /// The server answered with a GraphQL `errors` body that does not point at
+    /// the query: no source location and no validation-style `extensions.code`.
+    /// Timeouts and upstream failures take this shape, so it is retriable.
+    #[snafu(display("Server returned an error: {message}"))]
+    ServerReportedError { message: String },
+
     #[snafu(display(
         "Failed to build a valid regex from pagination parameters due to the resource name {resource_name}. {source}"
     ))]
@@ -144,6 +183,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// - Connection/timeout errors from reqwest
 /// - Empty or incomplete HTTP 200 bodies (GitHub GraphQL does this intermittently)
 /// - JSON decode errors on a JSON-classified body (truncated payloads)
+/// - A GraphQL `errors` body that does not point at the query (`ServerReportedError`)
 ///
 /// `Error::RateLimited` is retriable: GitHub's secondary/CPU cap is reported on
 /// the response (`retry-after` + HTTP 403), after `check_rate_limit()` already
@@ -156,7 +196,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[must_use]
 pub fn is_retriable_error(error: &Error) -> bool {
     match error {
-        Error::RateLimited { .. } => true,
+        Error::RateLimited { .. } | Error::ServerReportedError { .. } => true,
         Error::InvalidCredentialsOrPermissions { kind, .. } => *kind == RefusalKind::Inferred,
         Error::InvalidReqwestStatus { status, .. } => {
             status.is_server_error()
@@ -175,6 +215,12 @@ pub fn is_retriable_error(error: &Error) -> bool {
         Error::UnexpectedResponse { status, format, .. } => {
             response::is_retryable_unexpected_response(*status, *format)
         }
+        // A body that could not be read may have been cut short in transit, as a failed
+        // read is; one the query memory pool could not hold is not asked for again.
+        Error::ResponseBody { source, .. } => matches!(
+            source,
+            http_body_limit::Error::Decode { .. } | http_body_limit::Error::Io { .. }
+        ),
         Error::ReqwestInternal { source } => {
             // Check for transient network/connection errors:
             // - is_timeout(): Connection or request timeouts
@@ -194,6 +240,22 @@ pub fn is_retriable_error(error: &Error) -> bool {
                 })
         }
         _ => false,
+    }
+}
+
+/// What to do about a GraphQL response body that was refused, as the end of the
+/// sentence that names it. A compression bomb's cause already names its fix.
+fn response_body_remedy(source: &http_body_limit::Error, connector: &str) -> String {
+    match source {
+        http_body_limit::Error::MemoryLimit { .. } => {
+            ". Raise `runtime.query.memory_limit`, or request fewer rows per page. \
+             See: https://spiceai.org/docs/reference/memory"
+                .to_string()
+        }
+        http_body_limit::Error::CompressionRatio { .. } => {
+            format!(" See: https://spiceai.org/docs/components/data-connectors/{connector}")
+        }
+        _ => String::new(),
     }
 }
 

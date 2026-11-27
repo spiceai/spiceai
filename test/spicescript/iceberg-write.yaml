@@ -1,4 +1,6 @@
 name: iceberg-write
+duration: 16s
+tags: [long]
 description: >
   Writes through Spice to an Iceberg table — INSERT through a dataset and
   through the Iceberg catalog connector, DELETE with and without matching rows

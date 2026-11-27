@@ -1,4 +1,5 @@
 name: builtins
+duration: 8s
 description: >
   DataFusion's built-in functions (trims, hex, digests, regular expressions,
   ordered aggregates, windows ignoring NULLs, approximate and statistical

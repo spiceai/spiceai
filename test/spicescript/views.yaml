@@ -1,4 +1,6 @@
 name: views
+duration: 12s
+tags: [long]
 description: >
   Views answer as their SQL does over the source tables: a join across
   datasets, a view over another view, several views over one dataset, and an

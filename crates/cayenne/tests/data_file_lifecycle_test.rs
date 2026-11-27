@@ -263,6 +263,14 @@ impl Instance {
     fn take_deletes(&self) -> Vec<Vec<String>> {
         std::mem::take(&mut *self.state.deletes.lock())
     }
+
+    /// The delete requests since the last call that carried a deletion vector.
+    fn take_deletion_vector_deletes(&self) -> Vec<Vec<String>> {
+        self.take_deletes()
+            .into_iter()
+            .filter(|paths| paths.iter().any(|path| has_extension(path, "arrow")))
+            .collect()
+    }
 }
 
 impl InstanceState {
@@ -507,6 +515,16 @@ fn session(config: SessionConfig) -> SessionContext {
     )
 }
 
+/// The key a test table is created with.
+#[derive(Clone, Copy, Debug)]
+enum Keys {
+    None,
+    /// Keyed on `id`; a write of a key the table holds is refused.
+    Unique,
+    /// Keyed on `id`; a write of a key the table holds replaces its row.
+    Upsert,
+}
+
 impl Location {
     async fn new_with_catalog_config(
         name: &str,
@@ -592,6 +610,17 @@ impl Location {
         vortex: &VortexConfig,
         catalog_config: NativeCatalogConfig,
     ) -> (Self, Process) {
+        let keys = if keyed { Keys::Upsert } else { Keys::None };
+        Self::create_with_keys(name, keys, config, vortex, catalog_config).await
+    }
+
+    async fn create_with_keys(
+        name: &str,
+        keys: Keys,
+        config: SessionConfig,
+        vortex: &VortexConfig,
+        catalog_config: NativeCatalogConfig,
+    ) -> (Self, Process) {
         let (location, catalog, instance, faults) =
             Self::new_with_catalog_config(name, catalog_config).await;
         let catalog: Arc<dyn MetadataCatalog> = Arc::new(catalog);
@@ -608,12 +637,12 @@ impl Location {
                 .create(CreateTableOptions {
                     table_name: name.to_string(),
                     schema: schema(),
-                    primary_key: if keyed {
-                        vec!["id".to_string()]
-                    } else {
+                    primary_key: if matches!(keys, Keys::None) {
                         vec![]
+                    } else {
+                        vec!["id".to_string()]
                     },
-                    on_conflict: keyed
+                    on_conflict: matches!(keys, Keys::Upsert)
                         .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
                     base_path: location.data_url.clone(),
                     partition_column: None,
@@ -691,6 +720,16 @@ impl Location {
             .collect()
     }
 
+    /// Every deletion vector stored under the dataset, by object key.
+    async fn arrow_objects(&self) -> BTreeSet<String> {
+        self.probe
+            .objects(&self.data_prefix)
+            .await
+            .into_keys()
+            .filter(|key| has_extension(key, "arrow"))
+            .collect()
+    }
+
     /// The stored data files of table `table_id` that `keys` (paths relative to
     /// the table) name, by object key.
     async fn files_of(&self, table_id: &str, keys: &[String]) -> BTreeSet<String> {
@@ -729,15 +768,44 @@ impl Process {
             .filter(|file| !retired.contains(&file.file_path))
             .map(|file| format!("{}/{table_id}/{}", location.data_prefix, file.file_path))
             .collect();
-        for dv in self
-            .catalog
-            .get_table_delete_files(&table_id)
+        named.extend(self.deletion_vector_keys().await);
+        named
+    }
+
+    /// The deletion vectors the committed state names, by object key.
+    async fn deletion_vector_keys(&self) -> BTreeSet<String> {
+        self.catalog
+            .get_table_delete_files(self.table.table_id())
             .await
             .expect("read the deletion vectors")
-        {
-            named.insert(dv.path.trim_start_matches("s3://bucket/").to_string());
-        }
-        named
+            .into_iter()
+            .map(|dv| dv.path.trim_start_matches("s3://bucket/").to_string())
+            .collect()
+    }
+
+    /// The manifest rows of snapshots the table does not serve, as
+    /// `<snapshot>/<file>`: rows of neither the current snapshot nor a
+    /// protected one. A sweep reclaims the files of a snapshot only once a
+    /// commit takes it out of the live set, so a snapshot no commit made live
+    /// keeps its files for as long as its rows are named.
+    async fn rows_outside_live_snapshots(&self) -> Vec<String> {
+        let table_id = self.table.table_id().to_string();
+        let mut live: BTreeSet<String> = self
+            .catalog
+            .get_all_snapshot_sequences(&table_id)
+            .await
+            .expect("read the protected snapshots")
+            .into_keys()
+            .collect();
+        live.insert(self.table.current_snapshot_id());
+        self.catalog
+            .get_all_snapshot_files(&table_id)
+            .await
+            .expect("read the manifest")
+            .into_iter()
+            .filter(|file| !live.contains(&file.snapshot_id))
+            .map(|file| format!("{}/{}", file.snapshot_id, file.file_path))
+            .collect()
     }
 
     /// Every file the committed state names is stored.
@@ -769,6 +837,20 @@ impl Process {
                     .into_iter()
                     .collect()
             })
+    }
+
+    /// The retired deletion vectors, by object key.
+    async fn retired_deletion_vectors(&self, location: &Location) -> BTreeSet<String> {
+        self.catalog
+            .retired_files(self.table.table_id())
+            .await
+            .expect("read the retired files")
+            .expect("the retired files are settled")
+            .into_iter()
+            // A retired key is `<snapshot>/deletions/<file>`, under the data prefix.
+            .filter(|key| key.contains("deletions/"))
+            .map(|key| format!("{}/{key}", location.data_prefix))
+            .collect()
     }
 
     async fn rows(&self, name: &str) -> Vec<(i64, i64)> {
@@ -977,80 +1059,45 @@ async fn retired_files_are_deleted_in_batched_requests_after_the_retiring_commit
     // reclaim only commits their removal, which retires them: each stays
     // stored for the retention, like a data file, so a query that loaded them
     // before still finds them.
-    let arrow_objects = async || -> BTreeSet<String> {
-        location
-            .probe
-            .objects(&location.data_prefix)
-            .await
-            .into_keys()
-            .filter(|key| has_extension(key, "arrow"))
-            .collect()
-    };
-    let retired_dvs = async || -> Vec<String> {
-        process
-            .catalog
-            .retired_files(process.table.table_id())
-            .await
-            .expect("read the retired files")
-            .expect("the retired files are settled")
-            .into_iter()
-            .filter(|key| key.contains("deletions/"))
-            .collect()
-    };
-    let dvs_before = arrow_objects().await;
+    let dvs_before = location.arrow_objects().await;
     process.table.drain_orphan_dv_sweep(1).await;
-    let removed_dvs = retired_dvs().await;
+    let removed_dvs = process.retired_deletion_vectors(&location).await;
     assert!(
         removed_dvs.len() >= 2,
         "the orphaned deletion vectors are removed and retired: {removed_dvs:?}"
     );
-    let removed_objects: BTreeSet<String> = dvs_before
-        .iter()
-        .filter(|key| {
-            removed_dvs
-                .iter()
-                .any(|removed| key.ends_with(&format!("/{removed}")))
-        })
-        .cloned()
-        .collect();
-    assert_eq!(
-        removed_objects.len(),
-        removed_dvs.len(),
+    assert!(
+        removed_dvs.is_subset(&dvs_before),
         "each retired deletion vector is a stored object: {removed_dvs:?} in {dvs_before:?}"
     );
     process.table.sweep_retired_files_now().await;
     assert_eq!(
-        arrow_objects().await,
+        location.arrow_objects().await,
         dvs_before,
         "a removed deletion vector is kept until the retention has passed"
     );
-    assert!(
-        process
-            .instance
-            .take_deletes()
-            .iter()
-            .all(|paths| paths.iter().all(|path| !has_extension(path, "arrow"))),
+    assert_eq!(
+        process.instance.take_deletion_vector_deletes(),
+        Vec::<Vec<String>>::new(),
         "nothing deletes a deletion vector inside the retention"
     );
 
     process.table.elapse_data_file_retention();
     process.table.sweep_retired_files_now().await;
-    let dvs_after = arrow_objects().await;
     assert_eq!(
-        dvs_after,
+        location.arrow_objects().await,
         dvs_before
-            .difference(&removed_objects)
+            .difference(&removed_dvs)
             .cloned()
             .collect::<BTreeSet<String>>(),
         "the retired deletion vectors, and only they, are deleted once the retention has passed"
     );
-    assert_eq!(retired_dvs().await, Vec::<String>::new(), "and forgotten");
-    let dv_requests: Vec<Vec<String>> = process
-        .instance
-        .take_deletes()
-        .into_iter()
-        .filter(|paths| paths.iter().any(|path| has_extension(path, "arrow")))
-        .collect();
+    assert_eq!(
+        process.retired_deletion_vectors(&location).await,
+        BTreeSet::new(),
+        "and forgotten"
+    );
+    let dv_requests = process.instance.take_deletion_vector_deletes();
     assert_eq!(
         dv_requests.len(),
         1,
@@ -1328,6 +1375,249 @@ async fn a_retired_file_is_kept_until_the_retention_elapses() {
         .await;
 }
 
+/// A full rewrite folds the key deletion vectors into its output and clears
+/// their rows in its commit, which retires them. Each stays stored for the
+/// retention, like a retired data file, so a query that loaded the head before
+/// the rewrite still finds it; once the retention has passed, the sweep deletes
+/// them in one batched request and forgets them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cleared_deletion_vector_is_kept_until_the_retention_elapses() {
+    let (location, process) = keyed_with_protected_snapshots("orders", UPSERTS).await;
+    let named_dvs = process.deletion_vector_keys().await;
+    let dvs_before = location.arrow_objects().await;
+    assert!(
+        named_dvs.len() >= 2 && named_dvs == dvs_before,
+        "the upserts wrote key deletion vectors, each a stored object: {named_dvs:?} in {dvs_before:?}"
+    );
+
+    process.instance.take_deletes();
+    assert!(
+        process
+            .table
+            .force_full_compaction()
+            .await
+            .expect("full rewrite"),
+        "the full rewrite commits"
+    );
+    assert_eq!(process.rows("orders").await, upserted(UPSERTS));
+    assert_eq!(
+        process.deletion_vector_keys().await,
+        BTreeSet::new(),
+        "the rewrite cleared every deletion vector row"
+    );
+    assert_eq!(
+        process.retired_deletion_vectors(&location).await,
+        named_dvs,
+        "the commit that cleared the deletion vectors retired them"
+    );
+
+    // Any delete of a cleared vector is fenced like the sweep's: once a hold
+    // is granted, no such delete is still running.
+    drop(process.table.hold_file_deletions().await);
+    process.table.sweep_retired_files_now().await;
+    assert_eq!(
+        location.arrow_objects().await,
+        dvs_before,
+        "a cleared deletion vector is kept until the retention has passed"
+    );
+    assert_eq!(
+        process.instance.take_deletion_vector_deletes(),
+        Vec::<Vec<String>>::new(),
+        "nothing deletes a deletion vector inside the retention"
+    );
+
+    process.table.elapse_data_file_retention();
+    process.table.sweep_retired_files_now().await;
+    assert_eq!(
+        location.arrow_objects().await,
+        BTreeSet::new(),
+        "the cleared deletion vectors are deleted once the retention has passed"
+    );
+    assert_eq!(
+        process.retired_deletion_vectors(&location).await,
+        BTreeSet::new(),
+        "and forgotten"
+    );
+    let dv_requests = process.instance.take_deletion_vector_deletes();
+    assert_eq!(
+        dv_requests.len(),
+        1,
+        "{} cleared deletion vectors go out in one delete request: {dv_requests:?}",
+        named_dvs.len()
+    );
+    assert_eq!(process.rows("orders").await, upserted(UPSERTS));
+    process
+        .assert_named_files_stored(&location, "after the sweep")
+        .await;
+}
+
+/// A second position delete in a data file writes one vector holding every
+/// deleted position of the file, and its commit drops the earlier vector's row,
+/// which retires it. The earlier vector stays stored for the retention, so a
+/// query planned before the second delete still reads it, and the sweep deletes
+/// it once the retention has passed; the newer vector is live and kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_superseded_deletion_vector_is_kept_until_the_retention_elapses() {
+    let position = VortexConfig {
+        deletion_mode: DeletionMode::Position,
+        ..parked()
+    };
+    let (location, process) =
+        Location::create_with("events", false, SessionConfig::new(), &position).await;
+    common::insert_batch(&process.table, batch(0..KEYS, |id| id))
+        .await
+        .expect("load");
+    let delete = async |sql: &str| {
+        process
+            .ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("delete");
+    };
+
+    delete("DELETE FROM events WHERE id < 10").await;
+    let first = process.deletion_vector_keys().await;
+    assert_eq!(first.len(), 1, "one position vector: {first:?}");
+    delete("DELETE FROM events WHERE id < 20").await;
+    let second = process.deletion_vector_keys().await;
+    assert_eq!(second.len(), 1, "one position vector: {second:?}");
+    assert!(
+        first.is_disjoint(&second),
+        "the second delete replaced the vector"
+    );
+    assert_eq!(
+        process.retired_deletion_vectors(&location).await,
+        first,
+        "the commit that dropped the earlier vector retired it"
+    );
+    let expected: Vec<(i64, i64)> = (20..KEYS).map(|id| (id, id)).collect();
+    assert_eq!(process.rows("events").await, expected);
+
+    process.instance.take_deletes();
+    // Any delete of a dropped vector is fenced like the sweep's: once a hold
+    // is granted, no such delete is still running.
+    drop(process.table.hold_file_deletions().await);
+    process.table.sweep_retired_files_now().await;
+    assert_eq!(
+        location.arrow_objects().await,
+        first.union(&second).cloned().collect(),
+        "a superseded deletion vector is kept until the retention has passed"
+    );
+    assert_eq!(
+        process.instance.take_deletion_vector_deletes(),
+        Vec::<Vec<String>>::new(),
+        "nothing deletes a deletion vector inside the retention"
+    );
+
+    process.table.elapse_data_file_retention();
+    process.table.sweep_retired_files_now().await;
+    assert_eq!(
+        location.arrow_objects().await,
+        second,
+        "the superseded vector is deleted once the retention has passed, and the live one kept"
+    );
+    assert_eq!(
+        process.retired_deletion_vectors(&location).await,
+        BTreeSet::new(),
+        "and forgotten"
+    );
+    assert_eq!(process.rows("events").await, expected);
+    process
+        .assert_named_files_stored(&location, "after the sweep")
+        .await;
+}
+
+/// The vector a position delete supersedes is deleted once the retention has
+/// passed even when the table takes no further write and no sweep was pending:
+/// the delete's own commit starts the retention. The table is reopened before
+/// the deletes so no earlier write's sweep is waiting, and nothing runs a sweep
+/// by hand; only the retention clock is moved.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_superseded_deletion_vector_of_an_idle_table_is_deleted_after_the_retention() {
+    let position = VortexConfig {
+        deletion_mode: DeletionMode::Position,
+        // The background maintenance tick runs, as it does in the runtime.
+        compaction_background_interval_ms: 100,
+        ..parked()
+    };
+    let (location, process) =
+        Location::create_with("events", false, SessionConfig::new(), &position).await;
+    common::insert_batch(&process.table, batch(0..KEYS, |id| id))
+        .await
+        .expect("load");
+    process
+        .table
+        .drain_in_flight_maintenance()
+        .await
+        .expect("drain");
+    process.table.quiesce().await;
+    drop(process);
+    let process = location
+        .open("events", &position, SessionConfig::new())
+        .await;
+    // Background maintenance, as the accelerator starts it for every table.
+    assert!(
+        process
+            .table
+            .spawn_background_compaction(Arc::new(tokio::sync::Semaphore::new(1))),
+        "background compaction"
+    );
+    let delete = async |sql: &str| {
+        process
+            .ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("delete");
+    };
+
+    delete("DELETE FROM events WHERE id < 10").await;
+    let first = process.deletion_vector_keys().await;
+    assert_eq!(first.len(), 1, "one position vector: {first:?}");
+    delete("DELETE FROM events WHERE id < 20").await;
+    let second = process.deletion_vector_keys().await;
+    assert_eq!(second.len(), 1, "one position vector: {second:?}");
+    assert!(
+        first.is_disjoint(&second),
+        "the second delete replaced the vector"
+    );
+    assert_eq!(
+        process.retired_deletion_vectors(&location).await,
+        first,
+        "the commit that dropped the earlier vector retired it"
+    );
+
+    eventually(
+        Duration::from_secs(30),
+        "the idle table deletes the superseded vector once the retention has passed",
+        async || {
+            process.table.elapse_data_file_retention();
+            let stored = location.arrow_objects().await;
+            (stored == second, stored)
+        },
+    )
+    .await;
+    eventually(
+        Duration::from_secs(10),
+        "the deleted vector leaves the retirement record",
+        async || {
+            let retired = process.retired_deletion_vectors(&location).await;
+            (retired.is_empty(), retired)
+        },
+    )
+    .await;
+    let expected: Vec<(i64, i64)> = (20..KEYS).map(|id| (id, id)).collect();
+    assert_eq!(process.rows("events").await, expected);
+    process
+        .assert_named_files_stored(&location, "after the sweep")
+        .await;
+}
+
 /// A captured file list has the same retention bound as a remote reader:
 /// after T, reading a retired file fails rather than returning other rows.
 #[tokio::test(flavor = "multi_thread")]
@@ -1354,6 +1644,7 @@ async fn a_scan_past_retention_gets_the_data_file_missing_error() {
         &location.data_url,
         &table_id,
         Arc::clone(&process.instance) as Arc<dyn ObjectStore>,
+        cayenne::catalog::DataWriteGate::open(),
     )
     .expect("dataset storage");
     for key in &captured {
@@ -1518,6 +1809,100 @@ async fn a_rolled_back_overwrite_deletes_its_files_and_deletion_vectors() {
     );
 }
 
+/// An overwrite whose commit the store refuses leaves its files to the orphan
+/// sweep of the same process: no commit names them, and the writer no longer
+/// holds them once the commit has failed. The rows are the ones before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_overwrite_commit_leaves_its_files_to_the_orphan_sweep() {
+    let (location, process) = Location::create("orders", false, SessionConfig::new()).await;
+    common::insert_batch(&process.table, batch(0..KEYS, |id| id))
+        .await
+        .expect("load");
+    process
+        .table
+        .drain_in_flight_maintenance()
+        .await
+        .expect("drain");
+    let before = location.data_files().await;
+
+    let replacement: datafusion::execution::SendableRecordBatchStream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            schema(),
+            stream::iter([Ok(batch(5_000..5_000 + KEYS, |id| -id))]),
+        ),
+    );
+    let prepared = process
+        .table
+        .begin_overwrite(replacement, 1)
+        .await
+        .expect("prepare the overwrite");
+    let written: BTreeSet<String> = location
+        .data_files()
+        .await
+        .into_keys()
+        .filter(|key| !before.contains_key(key))
+        .collect();
+    assert!(
+        !written.is_empty(),
+        "the overwrite wrote its snapshot's files"
+    );
+
+    // Every commit to a log fails before it reaches storage.
+    for op in [Op::Cas, Op::Create] {
+        process
+            .faults
+            .fail_while(op, |path: &Path| path.as_ref().ends_with("/head"));
+    }
+    let committed = tokio::time::timeout(Duration::from_mins(2), prepared.apply_owned_txn())
+        .await
+        .expect("the refused commit returns");
+    assert!(
+        committed.is_err(),
+        "the store refused every commit, yet the overwrite committed"
+    );
+    // As the sink does on a failed commit: the prepared overwrite is dropped.
+    drop(prepared);
+    process.faults.clear_rules();
+
+    assert_eq!(
+        process.rows("orders").await,
+        (0..KEYS).map(|id| (id, id)).collect::<Vec<_>>(),
+        "the failed overwrite changed the rows"
+    );
+    let named = process.named_files(&location).await;
+    assert!(
+        written.iter().all(|key| !named.contains(key)),
+        "a commit names the failed overwrite's files: {written:?}"
+    );
+
+    process.table.set_orphan_age_floor(Duration::ZERO);
+    let report = process
+        .table
+        .sweep_orphan_files_now()
+        .await
+        .expect("the orphan sweep");
+    assert_eq!(report.skipped, None, "the orphan sweep ran");
+    let left: Vec<String> = location
+        .data_files()
+        .await
+        .into_keys()
+        .filter(|key| written.contains(key))
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the orphan sweep left the failed overwrite's files: {left:?} (it deleted {:?})",
+        report.deleted
+    );
+    process
+        .assert_named_files_stored(&location, "after the orphan sweep")
+        .await;
+    assert_eq!(
+        process.rows("orders").await,
+        (0..KEYS).map(|id| (id, id)).collect::<Vec<_>>(),
+        "the orphan sweep changed the rows"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Dropped datasets
 // ---------------------------------------------------------------------------
@@ -1649,6 +2034,9 @@ async fn a_dropped_dataset_with_no_reader_is_deleted_after_the_grace() {
 enum Step {
     /// Merge the protected snapshots of a keyed table.
     Merge,
+    /// [`Self::Merge`] by the sequence-prefix bake, which also prunes the
+    /// deletes the merged snapshot has applied.
+    Bake,
     /// Replace an append-only table's rows.
     Overwrite,
     /// Append rows to an append-only table.
@@ -1658,11 +2046,29 @@ enum Step {
     /// [`Self::Upsert`] as a change stream applies it, durable on its own: the
     /// write publishes a new protected snapshot when it finishes.
     ChangeStreamUpsert,
+    /// [`Self::Upsert`] committed by a transaction.
+    TransactionUpsert,
+    /// Insert new keys into a keyed table that does not upsert and has deleted
+    /// keys: the rows go to a new protected snapshot.
+    InsertAfterKeyDelete,
+    /// Move a keyed table's inline rows into a new protected snapshot.
+    InlineCheckpoint,
 }
+
+/// Keys [`Step::InsertAfterKeyDelete`] deletes before it starts.
+const DELETED_KEYS: i64 = 10;
 
 impl Step {
     fn keyed(self) -> bool {
-        matches!(self, Self::Merge | Self::Upsert | Self::ChangeStreamUpsert)
+        matches!(
+            self,
+            Self::Merge
+                | Self::Bake
+                | Self::Upsert
+                | Self::ChangeStreamUpsert
+                | Self::TransactionUpsert
+                | Self::InlineCheckpoint
+        )
     }
 
     /// The settings a process runs the step with: a merge and an overwrite with
@@ -1670,8 +2076,15 @@ impl Step {
     /// parked, so the step's requests are its own.
     fn config(self) -> VortexConfig {
         match self {
-            Self::Merge | Self::Overwrite => armed(),
-            Self::Append | Self::Upsert => parked(),
+            Self::Merge | Self::Bake | Self::Overwrite => armed(),
+            Self::Append | Self::Upsert | Self::TransactionUpsert | Self::InsertAfterKeyDelete => {
+                parked()
+            }
+            Self::InlineCheckpoint => VortexConfig {
+                inline_max_rows: 1_000,
+                inline_max_bytes: 1 << 20,
+                ..parked()
+            },
             Self::ChangeStreamUpsert => VortexConfig {
                 cdc_durability: CdcDurability::File,
                 ..parked()
@@ -1680,6 +2093,25 @@ impl Step {
     }
 
     async fn start(self) -> (Location, Process) {
+        if matches!(self, Self::InlineCheckpoint) {
+            // A fifth upsert that the reopened table holds inline.
+            let (location, process) =
+                keyed_table_reopened_with("orders", 4, KEYS, SessionConfig::new(), &self.config())
+                    .await;
+            common::insert_batch(&process.table, batch(0..KEYS, |id| id * 1000 + 4))
+                .await
+                .expect("inline upsert");
+            assert_eq!(
+                process
+                    .catalog
+                    .get_inlined_data_count(process.table.table_id())
+                    .await
+                    .expect("inline rows"),
+                KEYS,
+                "the upsert is held inline"
+            );
+            return (location, process);
+        }
         if self.keyed() {
             return keyed_table_reopened_with(
                 "orders",
@@ -1689,6 +2121,38 @@ impl Step {
                 &self.config(),
             )
             .await;
+        }
+        if matches!(self, Self::InsertAfterKeyDelete) {
+            let (location, process) = Location::create_with_keys(
+                "orders",
+                Keys::Unique,
+                SessionConfig::new(),
+                &self.config(),
+                NativeCatalogConfig::default(),
+            )
+            .await;
+            common::insert_batch(&process.table, batch(0..KEYS, |id| id))
+                .await
+                .expect("insert");
+            let deleted: Vec<datafusion::prelude::Expr> =
+                (0..DELETED_KEYS).map(datafusion::prelude::lit).collect();
+            process
+                .table
+                .delete_from_cdc_fast(&[datafusion::prelude::col("id").in_list(deleted, false)])
+                .await
+                .expect("delete")
+                .expect("a key delete");
+            process
+                .table
+                .drain_in_flight_maintenance()
+                .await
+                .expect("drain");
+            process.table.quiesce().await;
+            drop(process);
+            let process = location
+                .open("orders", &self.config(), SessionConfig::new())
+                .await;
+            return (location, process);
         }
         let (location, process) = Location::create("orders", false, SessionConfig::new()).await;
         for append in 0..4 {
@@ -1712,8 +2176,28 @@ impl Step {
         (location, process)
     }
 
+    /// The actions besides `AddFiles` of the record that makes the step's new
+    /// files live. An append adds its files to the current snapshot, which is
+    /// live already.
+    fn live_actions(self) -> &'static [&'static str] {
+        match self {
+            Self::Overwrite => &["RemoveGroups", "SetCurrentSnapshot"],
+            Self::Merge | Self::Bake => &["RemoveGroups", "SetGroup"],
+            Self::Upsert
+            | Self::ChangeStreamUpsert
+            | Self::TransactionUpsert
+            | Self::InsertAfterKeyDelete
+            | Self::InlineCheckpoint => &["SetGroup"],
+            Self::Append => &[],
+        }
+    }
+
     fn before(self) -> Vec<(i64, i64)> {
-        if self.keyed() {
+        if matches!(self, Self::InlineCheckpoint) {
+            upserted(5)
+        } else if matches!(self, Self::InsertAfterKeyDelete) {
+            (DELETED_KEYS..KEYS).map(|id| (id, id)).collect()
+        } else if self.keyed() {
             upserted(4)
         } else {
             (0..2_000).map(|id| (id, id)).collect()
@@ -1723,13 +2207,18 @@ impl Step {
     fn after(self) -> Vec<(i64, i64)> {
         match self {
             Self::Overwrite => (5_000..5_700).map(|id| (id, -id)).collect(),
-            Self::Merge => self.before(),
+            Self::Merge | Self::Bake | Self::InlineCheckpoint => self.before(),
+            Self::InsertAfterKeyDelete => {
+                let mut rows = self.before();
+                rows.extend((5_000..5_000 + KEYS).map(|id| (id, id)));
+                rows
+            }
             Self::Append => {
                 let mut rows = self.before();
                 rows.extend((5_000..5_500).map(|id| (id, id)));
                 rows
             }
-            Self::Upsert | Self::ChangeStreamUpsert => upserted(5),
+            Self::Upsert | Self::ChangeStreamUpsert | Self::TransactionUpsert => upserted(5),
         }
     }
 
@@ -1739,6 +2228,10 @@ impl Step {
         let committed = match self {
             Self::Merge => table
                 .compact_protected_snapshots_subset(usize::MAX)
+                .await
+                .map_err(|error| error.to_string()),
+            Self::Bake => table
+                .bake_seq_prefix_protected_snapshots()
                 .await
                 .map_err(|error| error.to_string()),
             Self::Overwrite => common::write_batches(
@@ -1757,6 +2250,43 @@ impl Step {
                 .await
                 .map(|_| true)
                 .map_err(|error| error.to_string()),
+            Self::InsertAfterKeyDelete => {
+                common::insert_batch(&table, batch(5_000..5_000 + KEYS, |id| id))
+                    .await
+                    .map(|_| true)
+                    .map_err(|error| error.to_string())
+            }
+            Self::InlineCheckpoint => table
+                .checkpoint_inlined_data()
+                .await
+                .map(|_| true)
+                .map_err(|error| error.to_string()),
+            Self::TransactionUpsert => {
+                let txn = cayenne::CayenneTransaction::new();
+                let token = table.transaction_write_token().await;
+                txn.register(
+                    table.table_id().to_string(),
+                    token,
+                    table.clone_for_write_operations(),
+                );
+                match table
+                    .begin_staged_upsert_occ(
+                        token,
+                        common::single_batch_stream(batch(0..KEYS, |id| id * 1000 + 4)),
+                        1,
+                    )
+                    .await
+                {
+                    Ok(staged) => {
+                        txn.set_staged(table.table_id(), staged);
+                        txn.commit()
+                            .await
+                            .map(|_| true)
+                            .map_err(|error| error.to_string())
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            }
             Self::ChangeStreamUpsert => {
                 let rows = batch(0..KEYS, |id| id * 1000 + 4);
                 let input: datafusion::execution::SendableRecordBatchStream = Box::pin(
@@ -1921,6 +2451,9 @@ async fn kill_at_every_request(step: Step) {
         }
     }
 
+    // The clean run's records, read before the kill runs replace the location.
+    let records = log_records_after(&log_store, "orders", before).await;
+
     let mut acknowledged = 0;
     let mut killed = 0;
     let mut unnamed_total = 0;
@@ -2014,6 +2547,11 @@ async fn kill_at_every_request(step: Step) {
         );
         next.assert_named_files_stored(&location, &format!("{what}, after the orphan sweep"))
             .await;
+        let stranded = next.rows_outside_live_snapshots().await;
+        assert!(
+            stranded.is_empty(),
+            "{what}: after every sweep the state still names files of snapshots the table does not serve: {stranded:?}"
+        );
         let mut swept = next.rows("orders").await;
         swept.sort_unstable();
         assert_eq!(swept, rows, "{what}: the orphan sweep changed the rows");
@@ -2023,6 +2561,23 @@ async fn kill_at_every_request(step: Step) {
         "{step:?}: {} kill points: {killed} killed mid-step, {acknowledged} acknowledged before the kill, {unnamed_total} data files no commit names left in all",
         steps.len()
     );
+    // A step names its new files in the record that makes them live, so no
+    // crash leaves files named that never became live.
+    let with_files: Vec<&Vec<String>> = records
+        .iter()
+        .filter(|record| record.iter().any(|action| action == "AddFiles"))
+        .collect();
+    assert_eq!(
+        with_files.len(),
+        1,
+        "{step:?}: one record names the new snapshot's files: {records:?}"
+    );
+    for kind in step.live_actions() {
+        assert!(
+            with_files[0].iter().any(|action| action == kind),
+            "{step:?}: the record that names the files has no {kind}: {records:?}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2033,6 +2588,11 @@ async fn a_kill_at_any_storage_request_of_a_change_stream_upsert_is_all_or_nothi
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kill_at_any_storage_request_of_a_protected_merge_loses_nothing() {
     kill_at_every_request(Step::Merge).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_at_any_storage_request_of_a_sequence_prefix_bake_loses_nothing() {
+    kill_at_every_request(Step::Bake).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2048,4 +2608,61 @@ async fn a_kill_at_any_storage_request_of_an_append_leaves_only_orphans() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kill_at_any_storage_request_of_an_upsert_leaves_only_orphans() {
     kill_at_every_request(Step::Upsert).await;
+}
+
+/// A transaction that aborts deletes the files its keyed write staged: the
+/// writer holds them from the orphan sweep, so nothing else would before a
+/// restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aborted_transaction_deletes_the_files_it_staged() {
+    let (location, process) = Step::TransactionUpsert.start().await;
+    let before = location.data_files().await;
+    let table = &process.table;
+    let txn = cayenne::CayenneTransaction::new();
+    let token = table.transaction_write_token().await;
+    txn.register(
+        table.table_id().to_string(),
+        token,
+        table.clone_for_write_operations(),
+    );
+    let staged = table
+        .begin_staged_upsert_occ(
+            token,
+            common::single_batch_stream(batch(0..KEYS, |id| id * 1000 + 4)),
+            1,
+        )
+        .await
+        .expect("stage the upsert");
+    let written = location
+        .data_files()
+        .await
+        .into_keys()
+        .filter(|key| !before.contains_key(key))
+        .count();
+    assert_ne!(written, 0, "the upsert staged its files");
+    txn.set_staged(table.table_id(), staged);
+    txn.abort().await;
+    assert_eq!(
+        location.data_files().await,
+        before,
+        "the abort deletes the {written} files the upsert staged"
+    );
+    let mut rows = process.rows("orders").await;
+    rows.sort_unstable();
+    assert_eq!(rows, upserted(4), "the abort changes no row");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_at_any_storage_request_of_a_transaction_upsert_is_all_or_nothing() {
+    kill_at_every_request(Step::TransactionUpsert).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_at_any_storage_request_of_an_insert_after_a_key_delete_is_all_or_nothing() {
+    kill_at_every_request(Step::InsertAfterKeyDelete).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_at_any_storage_request_of_an_inline_checkpoint_loses_nothing() {
+    kill_at_every_request(Step::InlineCheckpoint).await;
 }

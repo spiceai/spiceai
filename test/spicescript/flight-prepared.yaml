@@ -1,4 +1,5 @@
 name: flight-prepared
+duration: 9s
 description: >
   Flight SQL prepared statements bind their parameters as PostgreSQL binds
   the same values written into the SQL: `$n` and `?` placeholders, one and

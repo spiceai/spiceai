@@ -1,4 +1,6 @@
 name: freshness-status
+duration: 37s
+tags: [long]
 description: >
   /v1/datasets reports when each acceleration last refreshed and will refresh
   next: a cron schedule's next tick (at the top of the hour for an hourly

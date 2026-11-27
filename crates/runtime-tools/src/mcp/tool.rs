@@ -28,8 +28,8 @@ use tracing::Span;
 use tracing_futures::Instrument;
 use util::security::{MAX_SAFE_JSON_DEPTH, get_json_depth};
 
-use tools::SpiceModelTool;
 use tools::naming::encode_tool_name;
+use tools::{SpiceModelTool, ToolAccess};
 
 use super::{
     MAX_TOOL_RESULT_SIZE, McpCallTimeout, Result,
@@ -86,9 +86,7 @@ impl McpToolWrapper {
     /// Both are the name the tool is exposed under. That qualification is
     /// applied *outside* this wrapper — `with_name` in `tooling.rs` /
     /// `runtime::tools::utils` — so [`Self::name`] is still the bare upstream
-    /// name and the exposed name has to be recomputed from its parts. It cannot
-    /// be read off the caller either: a `POST /v1/tools/{name}` request resolves
-    /// through `Runtime::get_tool`, which hands back the tool un-renamed.
+    /// name and the exposed name has to be recomputed from its parts.
     ///
     /// The qualification is recomputed *unconditionally*, which matches the
     /// exposure layer only because a tool catalog is exempted from it when it is
@@ -133,7 +131,14 @@ impl SpiceModelTool for McpToolWrapper {
         Some(self)
     }
 
-    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    /// The tool can do anything its MCP server can, with the credentials Spice holds for it, and
+    /// its annotations (`readOnlyHint`) are the server's own claims, so calling it needs write
+    /// access.
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadWrite
+    }
+
+    async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         // Security: Validate input size to prevent excessive memory consumption or processing overhead
         const MAX_INPUT_SIZE: usize = 1024 * 1024; // 1 MB
         if arg.len() > MAX_INPUT_SIZE {

@@ -1,4 +1,6 @@
 name: postgres-catalog
+duration: 64s
+tags: [long]
 description: >
   A PostgreSQL catalog registers exactly the tables its include and exclude
   patterns select (a partitioned table by its parent, a materialized view, a

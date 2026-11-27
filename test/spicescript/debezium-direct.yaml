@@ -1,4 +1,6 @@
 name: debezium-direct
+duration: 55s
+tags: [long]
 description: >
   Debezium Server reading PostgreSQL posts its change events straight to
   Spice (`from: cdc:`, `POST /v1/datasets/{name}/cdc`, no Kafka): the initial

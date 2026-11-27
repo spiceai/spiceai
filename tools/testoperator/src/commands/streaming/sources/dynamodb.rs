@@ -73,6 +73,7 @@ use crate::commands::streaming::traits::StreamingSource;
 /// - `DYNAMODB_AWS_REGION`: AWS region (required)
 /// - `DYNAMODB_AWS_ACCESS_KEY_ID`: AWS access key ID (required)
 /// - `DYNAMODB_AWS_SECRET_ACCESS_KEY`: AWS secret access key (required)
+/// - `DYNAMODB_AWS_SESSION_TOKEN`: AWS session token (optional, for temporary credentials)
 /// - `DYNAMODB_AWS_ENDPOINT_URL`: Custom endpoint URL (optional, for `LocalStack`)
 #[derive(Debug, Clone)]
 pub struct DynamoDbConfig {
@@ -82,6 +83,8 @@ pub struct DynamoDbConfig {
     pub access_key_id: String,
     /// AWS secret access key
     pub secret_access_key: String,
+    /// AWS session token of temporary credentials
+    pub session_token: Option<String>,
     /// Optional custom endpoint URL (for `LocalStack`, testing, etc.)
     pub endpoint_url: Option<String>,
 }
@@ -98,12 +101,14 @@ impl DynamoDbConfig {
             .context("DYNAMODB_AWS_ACCESS_KEY_ID environment variable is required")?;
         let secret_access_key = std::env::var("DYNAMODB_AWS_SECRET_ACCESS_KEY")
             .context("DYNAMODB_AWS_SECRET_ACCESS_KEY environment variable is required")?;
+        let session_token = std::env::var("DYNAMODB_AWS_SESSION_TOKEN").ok();
         let endpoint_url = std::env::var("DYNAMODB_AWS_ENDPOINT_URL").ok();
 
         Ok(Self {
             region,
             access_key_id,
             secret_access_key,
+            session_token,
             endpoint_url,
         })
     }
@@ -164,7 +169,7 @@ impl DynamoDbStreamsSource {
         let credentials = Credentials::new(
             config.access_key_id.clone(),
             config.secret_access_key.clone(),
-            None,
+            config.session_token.clone(),
             None,
             "testoperator-aws-dynamodb",
         );
@@ -1218,6 +1223,14 @@ pub fn transform_spicepod(
                     },
                 ],
             });
+
+            // Temporary credentials carry a session token; static keys have none.
+            if std::env::var("DYNAMODB_AWS_SESSION_TOKEN").is_ok() {
+                d.params.get_or_insert_with(Params::default).data.insert(
+                    "dynamodb_aws_session_token".to_string(),
+                    ParamValue::String("${secrets:DYNAMODB_AWS_SESSION_TOKEN}".to_string()),
+                );
+            }
         }
     }
 
@@ -1243,6 +1256,13 @@ pub fn transform_spicepod(
                 "s3_secret".to_string(),
                 ParamValue::String("${secrets:SNAPSHOT_S3_SECRET_ACCESS_KEY}".to_string()),
             );
+
+            if std::env::var("SNAPSHOT_S3_SESSION_TOKEN").is_ok() {
+                params.data.insert(
+                    "s3_session_token".to_string(),
+                    ParamValue::String("${secrets:SNAPSHOT_S3_SESSION_TOKEN}".to_string()),
+                );
+            }
 
             if let Ok(region) = std::env::var("SNAPSHOT_S3_REGION") {
                 params

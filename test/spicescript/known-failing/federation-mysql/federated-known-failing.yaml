@@ -1,6 +1,7 @@
 # Known failing (#15538): the queries in corpus/pushdown-known-failing.sql, each with
 # its cause. Move a query back to pushdown.sql once it passes.
 name: federated-known-failing
+duration: 19s
 description: >
   A query corpus answers the same through Spice as on the source itself, for
   PostgreSQL and MySQL, both federated (each query rewritten and pushed to the

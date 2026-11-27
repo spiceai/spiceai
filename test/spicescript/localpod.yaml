@@ -1,4 +1,6 @@
 name: localpod
+duration: 13s
+tags: [long]
 description: >
   `localpod:` datasets over a Cayenne parent load its rows at startup —
   an accelerated child, a passthrough child, a sibling and a grandchild

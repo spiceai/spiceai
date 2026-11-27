@@ -83,6 +83,7 @@ pub mod postgres;
 #[cfg(feature = "postgres")]
 pub mod postgres_replication;
 pub mod refresh_skip;
+pub mod refusal;
 pub mod resilient_http;
 pub mod s3_single_file_cached;
 #[cfg(feature = "s3_vectors")]
@@ -99,8 +100,6 @@ pub mod snowflake;
 #[cfg(feature = "spark_connect")]
 pub mod spark_connect;
 pub mod spice_cloud;
-#[cfg(feature = "sqlite")]
-pub mod sqlite;
 pub mod unity_catalog;
 
 pub mod catalog_filter;

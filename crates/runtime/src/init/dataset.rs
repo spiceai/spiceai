@@ -787,8 +787,8 @@ impl Runtime {
             let ds_for_lazy = Arc::clone(&ds);
             let connector_builder: crate::init::dataset_initialization::LazyConnectorBuilder =
                 Box::new(move || {
-                    let runtime = runtime_for_lazy;
-                    let ds = ds_for_lazy;
+                    let runtime = Arc::clone(&runtime_for_lazy);
+                    let ds = Arc::clone(&ds_for_lazy);
                     Box::pin(async move {
                         runtime
                             .get_dataconnector_from_dataset(ds)
@@ -2694,19 +2694,24 @@ impl Runtime {
             });
 
             // The schedule waits only for the initial load to end, so a scheduled refresh
-            // can still recover a dataset whose initial load failed.
+            // can still recover a dataset whose initial load failed. Removing the dataset's
+            // schedule during the load cancels the wait.
             let runtime = ds.runtime();
             let runtime_status = Arc::clone(&self.status);
+            let waiter = self.register_dataset_schedule_waiter(&ds.name);
             tokio::task::spawn(async move {
-                if runtime_status
-                    .wait_for_dataset_loaded_or_failed(&ds.name)
-                    .await
-                    == runtime_status::WaitOutcome::ShuttingDown
-                {
+                let outcome = tokio::select! {
+                    () = waiter.cancelled() => return,
+                    outcome = runtime_status.wait_for_dataset_loaded_or_failed(&ds.name) => outcome,
+                };
+                if outcome == runtime_status::WaitOutcome::ShuttingDown {
                     return;
                 }
                 let dataset_name = ds.name.to_string();
-                if let Err(e) = runtime.create_dataset_or_view_schedule(ds).await {
+                if let Err(e) = runtime
+                    .create_dataset_schedule_after_initial_load(ds, &waiter)
+                    .await
+                {
                     tracing::error!("Failed to create dataset schedule for '{dataset_name}': {e}");
                 }
             });
@@ -4272,8 +4277,8 @@ mod tests {
     #[test]
     fn the_last_arrival_warning_says_which_rows_are_missed_and_how_to_load_them() {
         assert_eq!(
-            last_arrival_without_overlap_warning("acc", Engine::Sqlite),
-            "Dataset 'acc' (`engine: sqlite`) has no `refresh_append_overlap`, so a row that arrives after a newer one is never loaded. Use `engine: cayenne` to load every new row, or set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+            last_arrival_without_overlap_warning("acc", Engine::Arrow),
+            "Dataset 'acc' (`engine: arrow`) has no `refresh_append_overlap`, so a row that arrives after a newer one is never loaded. Use `engine: cayenne` to load every new row, or set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
         );
     }
 
@@ -4293,11 +4298,11 @@ mod tests {
         let (keyed, time_keyed) = (Some(&key), Some(&with_time));
         let (append, full) = (RefreshMode::Append, RefreshMode::Full);
         for (engine, key, mode, expected, what) in [
-            (Engine::Sqlite, keyed, append, true, "keyed"),
-            (Engine::Sqlite, None, append, false, "unkeyed"),
-            (Engine::Sqlite, keyed, full, false, "full"),
+            (Engine::Arrow, keyed, append, true, "keyed"),
+            (Engine::Arrow, None, append, false, "unkeyed"),
+            (Engine::Arrow, keyed, full, false, "full"),
             (Engine::Cayenne, keyed, append, false, "keeps newest"),
-            (Engine::Sqlite, time_keyed, append, false, "key holds time"),
+            (Engine::Arrow, time_keyed, append, false, "key holds time"),
         ] {
             assert_eq!(
                 reads_by_time_despite_commits(&acceleration(engine, key), ts, mode),
@@ -4915,7 +4920,7 @@ mod tests {
         }
 
         let not_cayenne = Acceleration {
-            engine: Engine::Sqlite,
+            engine: Engine::Arrow,
             ..acceleration_with_params(WriteMode::WriteThrough, &none)
         };
         assert_eq!(

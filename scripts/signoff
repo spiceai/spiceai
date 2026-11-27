@@ -132,11 +132,11 @@ readonly REQUIRED_CHECKS=(
   "enforce-pull-with-spice"  # PR hygiene (enforce-pulls-with-spice.yml)
   "Rust Lint"                # pr.yml
   "Build and Test"           # pr.yml
-  "Build (release profile)"  # pr.yml
   "Integration Tests (part 1)"
   "Integration Tests (part 2)"
   "Integration Tests (part 3)"
   "ADBC Integration Tests"   # integration_adbc.yml
+  "Trunk Health"             # trunk_health.yml — blocks merging while a post-merge failure goes unaddressed
   # `Features Check` (features.yml) is deliberately absent. That workflow is
   # disabled, so no run reports the context, and a required check nothing
   # reports blocks every pull request rather than passing it — which is what
@@ -841,7 +841,7 @@ post_pending_status() {
 # sync with `rustAffecting` in .github/workflows/pr.yml and covered by the
 # check-code-changes filter; `scripts/check_rust_gate_paths.py` enforces both,
 # and docs/dev/ci_signoff.md explains why each path is here.
-RUST_AFFECTING_PATH_PATTERN='(^(crates|bin|tools|vendor)/|\.(rs|snap|proto)$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/|(^|/)\.?(clippy|rustfmt)\.toml$|(^|/)nextest\.toml$|(^|/)layers\.toml$|^scripts/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches|bench_mysql_load_nulls|cayenne_data_path_fs)\.py$|^scripts/cayenne_data_path_fs_allowlist\.json$|^scripts/(test_)?rust_guard_common\.py$|^scripts/(test_)?nextest_build_targets\.py$|^docs/dev/fork_patches\.md$|^(Makefile|version\.txt)$|^test/tpc-bench/(Makefile|mysql-null-spec\.awk)$|^test/tls/|^test/spicepods/tpch/sf1/accelerated/postgres\[catalog\]\[changes\]\.yaml$|^test/source_versions\.json$)'
+RUST_AFFECTING_PATH_PATTERN='(^(crates|bin|tools|vendor)/|\.(rs|snap|proto)$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/|(^|/)\.?(clippy|rustfmt)\.toml$|(^|/)nextest\.toml$|(^|/)layers\.toml$|^scripts/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches|bench_mysql_load_nulls|cayenne_data_path_fs)\.py$|^scripts/cayenne_data_path_fs_allowlist\.json$|^scripts/(test_)?rust_guard_common\.py$|^scripts/(test_)?nextest_build_targets\.py$|^docs/dev/fork_patches\.md$|^(Makefile|version\.txt)$|^test/tpc-bench/(Makefile|mysql-null-spec\.awk)$|^test/tls/|^test/spicepods/tpch/sf1/accelerated/postgres\[catalog\]\[changes\]\.yaml$|^test/source_versions\.json$|^\.schema/spicepod\.schema\.json$)'
 
 # True when the branch delta vs trunk can affect Rust lint/build/tests.
 # Prints nothing. Exit 0 = has Rust-affecting changes (or unknown — run checks).
@@ -2079,9 +2079,10 @@ run_checks() {
   # the graph at a selection no other phase shares, to relink a binary that was
   # already there. `verify-cli` asserts it exists and runs, so the day cargo stops
   # producing it the gate says so instead of quietly dropping CLI coverage.
-  # The merge queue's required `Build (release profile)` job builds the CLI,
-  # spiced, and the release install for real, so release-only breakage — and the
-  # `-p spice` resolution this no longer exercises — is still caught before trunk.
+  # The merge queue's required `E2E Test CI` builds the CLI and spiced in the
+  # release profile for real (`build_linux` and `build_macos`), so release-only
+  # breakage — and the `-p spice` resolution this no longer exercises — is still
+  # caught before trunk.
   info "Running unit tests and verifying the CLI (make nextest verify-cli)…"
   # Lighter Cayenne fuzz/race depth for the PR gate (see
   # crates/cayenne/tests/mutation_property_test.rs and common::env_scale); both
@@ -3026,9 +3027,21 @@ cmd_remote() {
   info "Dispatching GitHub Actions Remote Sign-off for ${branch} on ${repo}…"
   # --repo so non-colocated JJ workspaces (no .git) still resolve the remote;
   # --raw-field avoids shell re-quoting pitfalls; the branch was validated above.
-  gh workflow run signoff.yml --repo "$repo" --ref "${branch}" --raw-field "branch=${branch}" \
-    || fail "failed to dispatch signoff.yml"
-  echo "${OK} Dispatched. Watch with: gh run watch --repo ${repo} --workflow signoff.yml"
+  local dispatched run_id
+  if ! dispatched=$(gh workflow run signoff.yml --repo "$repo" --ref "${branch}" --raw-field "branch=${branch}" 2>&1); then
+    printf '%s\n' "$dispatched" >&2
+    fail "failed to dispatch signoff.yml"
+  fi
+  [[ -z "$dispatched" ]] || printf '%s\n' "$dispatched"
+  # `gh run watch` takes a run ID, not a workflow. `gh workflow run` prints the
+  # created run's URL when GitHub returns it; otherwise find the newest run by
+  # the title `signoff.yml` gives a branch dispatch.
+  run_id=$(grep -oE '/actions/runs/[0-9]+' <<<"$dispatched" | head -n 1 | grep -oE '[0-9]+$' || true)
+  if [[ -n "$run_id" ]]; then
+    echo "${OK} Dispatched. Watch with: gh run watch --repo ${repo} ${run_id}"
+  else
+    echo "${OK} Dispatched. Watch with: gh run watch --repo ${repo} \"\$(gh run list --repo ${repo} --workflow signoff.yml --limit 50 --json databaseId,displayTitle --jq '[.[] | select(.displayTitle == \"Remote Sign-off (${branch})\")][0].databaseId')\""
+  fi
 }
 
 cmd_help() {

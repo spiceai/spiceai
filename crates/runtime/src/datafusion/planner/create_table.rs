@@ -145,8 +145,7 @@ fn extract_and_store_extensions(
         if recognized.is_empty() {
             CreateTableStatementExtension::default()
         } else {
-            let cleaned = clean_option_values(recognized);
-            parse_ddl_table_options(&cleaned)?
+            parse_ddl_table_options(&recognized)?
         }
     } else {
         CreateTableStatementExtension::default()
@@ -470,8 +469,13 @@ fn classify_with_options(options: &[SqlOption]) -> OptionsClassification {
         match opt {
             SqlOption::KeyValue { key, value } => {
                 let key_str = key.value.clone();
+                // A string option is its value, not its SQL text: `'a''b'` is `a'b`.
                 let value_str = match value {
-                    datafusion::sql::sqlparser::ast::Expr::Value(v) => v.to_string(),
+                    datafusion::sql::sqlparser::ast::Expr::Value(v) => v
+                        .value
+                        .clone()
+                        .into_string()
+                        .unwrap_or_else(|| v.to_string()),
                     datafusion::sql::sqlparser::ast::Expr::Identifier(ident) => ident.value.clone(),
                     other => other.to_string(),
                 };
@@ -489,21 +493,6 @@ fn classify_with_options(options: &[SqlOption]) -> OptionsClassification {
     }
 
     (recognized, other)
-}
-
-/// Strip surrounding quotes from option values.
-fn clean_option_values(opts: Vec<(String, String)>) -> Vec<(String, String)> {
-    opts.into_iter()
-        .map(|(k, v)| {
-            let v = v
-                .trim_start_matches('\'')
-                .trim_end_matches('\'')
-                .trim_start_matches('"')
-                .trim_end_matches('"')
-                .to_string();
-            (k, v)
-        })
-        .collect()
 }
 
 /// Validate that partition key columns are included in the primary key.
@@ -682,6 +671,25 @@ mod tests {
         let accel = ext.acceleration.expect("should have acceleration");
         assert_eq!(accel.engine.as_deref(), Some("arrow"));
         assert_eq!(accel.mode, spicepod::acceleration::Mode::Memory);
+    }
+
+    #[test]
+    fn test_extract_refresh_sql_with_quotes() {
+        let ct = parse_create_table(
+            r#"CREATE TABLE foo (id INT, s VARCHAR) WITH ("acceleration.engine" = 'arrow', "acceleration.refresh_sql" = 'SELECT * FROM foo WHERE s <> '''' AND s <> ''us''')"#,
+        );
+        let store = new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+        extract_and_store_extensions(ct, &store).expect("should succeed");
+        let ext = store
+            .write()
+            .expect("store lock should not be poisoned")
+            .remove(&TableReference::parse_str("foo"))
+            .expect("should have entry");
+        let accel = ext.acceleration.expect("should have acceleration");
+        assert_eq!(
+            accel.refresh_sql.as_deref(),
+            Some("SELECT * FROM foo WHERE s <> '' AND s <> 'us'")
+        );
     }
 
     #[test]

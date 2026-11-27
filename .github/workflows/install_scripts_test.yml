@@ -12,6 +12,7 @@ on:
       - 'test/scripts/install-scripts-test.sh'
       - 'test/scripts/install-ps1-test.ps1'
       - 'test/scripts/install-ps1-path-test.ps1'
+      - 'test/scripts/install-ps1-skills-test.ps1'
       - 'test/scripts/install-download-test.py'
       - 'test/scripts/install-fake-github.py'
       - 'test/scripts/install-release-check.sh'
@@ -24,6 +25,7 @@ on:
       - 'test/scripts/install-scripts-test.sh'
       - 'test/scripts/install-ps1-test.ps1'
       - 'test/scripts/install-ps1-path-test.ps1'
+      - 'test/scripts/install-ps1-skills-test.ps1'
       - 'test/scripts/install-download-test.py'
       - 'test/scripts/install-fake-github.py'
       - 'test/scripts/install-release-check.sh'
@@ -168,27 +170,31 @@ jobs:
           unset GITHUB_TOKEN
           "$HOME/.spice/bin/spice" version
 
-      - name: Verify PATH instructions
+      # The profiles the installer writes: for bash, .bashrc and the login file on Linux and the
+      # login file on macOS; for zsh, .zshrc on Linux and .zprofile on macOS. A new shell of the
+      # same kind must then find spice.
+      - name: Verify PATH setup
+        env:
+          RUNNER_OS_NAME: ${{ runner.os }}
+          SHELL_NAME: ${{ matrix.shell }}
+        shell: bash
         run: |
-          # Check that the shell profile was updated with PATH
-          profile_file=""
-          if [ "${{ matrix.shell }}" = "bash" ]; then
-            if [ -f ~/.bash_profile ]; then
-              profile_file=~/.bash_profile
-            elif [ -f ~/.bashrc ]; then
-              profile_file=~/.bashrc
-            fi
-          elif [ "${{ matrix.shell }}" = "zsh" ]; then
-            profile_file=~/.zshrc
+          case "$RUNNER_OS_NAME:$SHELL_NAME" in
+            Linux:bash) profiles=(~/.bashrc ~/.bash_profile); new_shell=(bash -ic) ;;
+            macOS:bash) profiles=(~/.bash_profile); new_shell=(bash -lc) ;;
+            Linux:zsh) profiles=(~/.zshrc); new_shell=(zsh -ic) ;;
+            macOS:zsh) profiles=(~/.zprofile); new_shell=(zsh -lc) ;;
+          esac
+          for profile in "${profiles[@]}"; do
+            grep -qxF "# >>> spice installer >>>" "$profile" || { echo "::error::No PATH block in $profile"; cat "$profile"; exit 1; }
+            echo "PATH block found in $profile"
+          done
+          found=$(env -i HOME="$HOME" PATH=/usr/bin:/bin "${new_shell[@]}" 'command -v spice' 2>/dev/null | tail -n 1)
+          if [ "$found" != "$HOME/.spice/bin/spice" ]; then
+            echo "::error::A new $SHELL_NAME shell found '$found', not $HOME/.spice/bin/spice"
+            exit 1
           fi
-
-          if [ -n "$profile_file" ] && [ -f "$profile_file" ]; then
-            if grep -q ".spice/bin" "$profile_file"; then
-              echo "✓ PATH configuration found in $profile_file"
-            else
-              echo "⚠ PATH configuration not found in $profile_file (may require manual setup)"
-            fi
-          fi
+          echo "A new $SHELL_NAME shell finds $found"
 
   # Test custom install directories
   test-custom-install-dir:
@@ -500,19 +506,21 @@ jobs:
           unset GITHUB_TOKEN
           "$SPICE_CLI_INSTALL_DIR/spice" version
 
+      # GITHUB_TOKEN goes to the GitHub API, which rejects an invalid one; release downloads
+      # ignore it. 2.4.1 publishes no SHA256SUMS, so verifying it needs the API.
       - name: Reject invalid release credentials with ${{ matrix.client }}
         env:
           GITHUB_TOKEN: invalid-installer-test-token
           LC_ALL: C
           SPICED_INSTALL_DIR: ${{ runner.temp }}/spiced-bin
         run: |
-          if bash install/install-spiced.sh > "${{ runner.temp }}/invalid-token.log" 2>&1; then
+          if bash install/install-spiced.sh 2.4.1 > "${{ runner.temp }}/invalid-token.log" 2>&1; then
             echo "ERROR: Runtime installer accepted invalid release credentials"
             exit 1
           fi
           cat "${{ runner.temp }}/invalid-token.log"
           grep -E '(^|[^0-9])401([^0-9]|$)|Username/Password Authentication Failed\.' "${{ runner.temp }}/invalid-token.log"
-          grep -F "Failed to get latest release information" "${{ runner.temp }}/invalid-token.log"
+          grep -F "the GitHub API request for its asset sha256 failed" "${{ runner.temp }}/invalid-token.log"
 
       - name: Test install-spiced.sh with ${{ matrix.client }}
         env:
@@ -826,6 +834,14 @@ jobs:
       - name: Test Install.ps1 PATH update
         shell: pwsh
         run: ./test/scripts/install-ps1-path-test.ps1
+
+      - name: Test Install.ps1 skills offer
+        shell: pwsh
+        run: ./test/scripts/install-ps1-skills-test.ps1
+
+      - name: Test Install.ps1 skills offer (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./test/scripts/install-ps1-skills-test.ps1
 
       - name: PSScriptAnalyzer
         shell: pwsh

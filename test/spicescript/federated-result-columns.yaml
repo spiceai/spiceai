@@ -1,4 +1,6 @@
 name: federated-result-columns
+duration: 14s
+tags: [long]
 description: >
   Federated result columns keep their planned types and nullability by position,
   including repeated names on the nullable side of an outer join, over

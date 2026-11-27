@@ -175,31 +175,40 @@ fn print_unequal_range_effectiveness() {
 
 fn bench_kernel(c: &mut Criterion) {
     let n = 100_000i64;
-    let d0: Vec<i64> = (0..n).collect();
-    let d1: Vec<i64> = (0..n).map(|i| (i * 7) % 1000).collect();
-    let d2: Vec<i64> = (0..n).map(|i| i % 50).collect();
-    let two_bounds = vec![bounds_of(&d0), bounds_of(&d1)];
-    let three_bounds = vec![bounds_of(&d0), bounds_of(&d1), bounds_of(&d2)];
-    let two: Vec<ArrayRef> = vec![
-        Arc::new(Int64Array::from(d0.clone())),
-        Arc::new(Int64Array::from(d1.clone())),
-    ];
-    let three: Vec<ArrayRef> = vec![
-        Arc::new(Int64Array::from(d0)),
-        Arc::new(Int64Array::from(d1)),
-        Arc::new(Int64Array::from(d2)),
+    // One column per clustering key, with distinct cardinalities so every axis
+    // contributes bits: a unique id, then 1000, 50, 20, 8, 3, 500, 30 and 12
+    // distinct values.
+    let axes: Vec<Vec<i64>> = vec![
+        (0..n).collect(),
+        (0..n).map(|i| (i * 7) % 1000).collect(),
+        (0..n).map(|i| i % 50).collect(),
+        (0..n).map(|i| (i * 3) % 20).collect(),
+        (0..n).map(|i| (i * 5) % 8).collect(),
+        (0..n).map(|i| i % 3).collect(),
+        (0..n).map(|i| (i * 11) % 500).collect(),
+        (0..n).map(|i| (i * 13) % 30).collect(),
+        (0..n).map(|i| (i * 17) % 12).collect(),
     ];
 
     let mut group = c.benchmark_group("cluster_keys");
     group.throughput(Throughput::Elements(n as u64));
-    group.bench_function("2cols_100k", |b| {
-        b.iter(|| black_box(cluster_keys(black_box(&two), black_box(&two_bounds)).expect("keys")));
-    });
-    group.bench_function("3cols_100k", |b| {
-        b.iter(|| {
-            black_box(cluster_keys(black_box(&three), black_box(&three_bounds)).expect("keys"))
+    // 1 column skips the Hilbert transform, 1-8 columns use the byte-spread
+    // interleave, and 9 columns takes the generic bitwise interleave.
+    for k in 1..=axes.len() {
+        let bounds: Vec<_> = axes[..k].iter().map(|axis| bounds_of(axis)).collect();
+        let cols: Vec<ArrayRef> = axes[..k]
+            .iter()
+            .map(|axis| Arc::new(Int64Array::from(axis.clone())) as ArrayRef)
+            .collect();
+        let name = if k == 1 {
+            "1col_100k".to_string()
+        } else {
+            format!("{k}cols_100k")
+        };
+        group.bench_function(name, |b| {
+            b.iter(|| black_box(cluster_keys(black_box(&cols), black_box(&bounds)).expect("keys")));
         });
-    });
+    }
     group.finish();
 }
 

@@ -1,4 +1,6 @@
 name: settings-evolution
+duration: 76s
+tags: [long]
 description: >
   Changing a Cayenne acceleration's settings between restarts never changes
   its answers: after each change (sort order, clustering, compression, delta

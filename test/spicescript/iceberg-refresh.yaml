@@ -1,4 +1,6 @@
 name: iceberg-refresh
+duration: 60s
+tags: [long]
 description: >
   An Iceberg table behind a REST catalog answers through Spice like DuckDB
   reading the same table: federated and accelerated by full refresh into Cayenne, after the first snapshot and after inserts, deletes and

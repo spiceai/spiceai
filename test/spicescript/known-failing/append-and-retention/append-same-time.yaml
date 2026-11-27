@@ -1,4 +1,5 @@
 name: append-same-time
+duration: 7s
 description: >
   Known failing (#15542): silent row loss. Append refresh reads rows strictly newer
   than the stored maximum time, so a row committed after a refresh with the

@@ -1638,7 +1638,16 @@ impl CayenneCatalog {
         memory_mode: bool,
         settings_change: SettingsChangeAction,
     ) -> CatalogResult<()> {
-        verify_stored_data_files_in(self, table, memory_mode, settings_change).await
+        verify_stored_data_files_in(
+            table,
+            memory_mode,
+            settings_change,
+            self.get_all_snapshot_sequences(&table.table_id),
+            |snapshot_id| async move {
+                self.get_snapshot_files(&table.table_id, &snapshot_id).await
+            },
+        )
+        .await
     }
 
     async fn validate_existing_table_configuration(
@@ -1705,7 +1714,12 @@ impl CayenneCatalog {
                     );
                 }
 
-                if configuration_schemas_match(&stored_metadata.schema, &options.schema) {
+                if configuration_schemas_match(&stored_metadata.schema, &options.schema)
+                    || lacks_only_optional_trailing_columns(
+                        &stored_metadata.schema,
+                        &options.schema,
+                    )
+                {
                     return Ok(stored_metadata);
                 }
 
@@ -2602,6 +2616,16 @@ impl MetadataCatalog for CayenneCatalog {
         crate::provider::append_commit::commit_transaction(txn, publications[0].table_id).await
     }
 
+    fn data_write_gate(&self, _table_id: &str) -> crate::catalog::DataWriteGate {
+        // One process writes a SQLite metastore's tables.
+        crate::catalog::DataWriteGate::open()
+    }
+
+    async fn follow_commits(&self, _table_id: &str) -> CatalogResult<u64> {
+        // One process writes a SQLite metastore; its state is always current.
+        Ok(0)
+    }
+
     async fn init(&self) -> CatalogResult<()> {
         // Create database directory if it doesn't exist.
         //
@@ -3285,6 +3309,10 @@ impl MetadataCatalog for CayenneCatalog {
                 .inline_data
                 .iter()
                 .any(|data| data.table_id != *table_id)
+            || commit
+                .table_statistics
+                .as_ref()
+                .is_some_and(|stats| stats.table_id != *table_id)
         {
             return Err(CatalogError::InvalidOperationNoSource {
                 message: format!("Mem-tier commit rows must belong to table '{table_id}'"),
@@ -3330,6 +3358,49 @@ impl MetadataCatalog for CayenneCatalog {
                             })
                             .await?;
                         }
+                    }
+                    // Three parameters per row, below SQLite's 32 766 limit.
+                    for chunk in commit.insert_records.chunks(32_000 / 3) {
+                        let (sql, params) = Self::build_insert_records_chunk_sql(
+                            table_id,
+                            chunk,
+                            commit.sequence_number,
+                        );
+                        tx.execute(ExecuteParams { sql: &sql, params }).await?;
+                    }
+                    if let Some(stats) = &commit.table_statistics {
+                        tx.execute(ExecuteParams {
+                            sql: TABLE_STATISTICS_UPSERT_SQL,
+                            params: vec![
+                                MetastoreValue::Text(stats.table_id.clone()),
+                                MetastoreValue::Blob(stats.statistics_blob.clone()),
+                                MetastoreValue::Integer(stats.num_rows),
+                                stats
+                                    .ndv_sketches
+                                    .clone()
+                                    .map_or(MetastoreValue::Null, MetastoreValue::Blob),
+                                MetastoreValue::Integer(i64::from(stats.num_rows_exact)),
+                            ],
+                        })
+                        .await?;
+                    }
+                    for file in &commit.manifest_files {
+                        tx.execute(ExecuteParams {
+                            sql: SNAPSHOT_FILE_UPSERT_SQL,
+                            params: snapshot_file_params(file),
+                        })
+                        .await?;
+                    }
+                    if let Some(snapshot_id) = &commit.keep_file_statistics_of {
+                        tx.execute(ExecuteParams {
+                            sql: "DELETE FROM cayenne_snapshot_file_statistics \
+                                  WHERE table_id = ?1 AND snapshot_id != ?2",
+                            params: vec![
+                                MetastoreValue::Text(table_id.clone()),
+                                MetastoreValue::Text(snapshot_id.clone()),
+                            ],
+                        })
+                        .await?;
                     }
                     CatalogResult::Ok(())
                 }
@@ -3746,7 +3817,35 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         snapshot_id: &str,
         sequence_number: i64,
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()> {
+        if let Some(files) = files {
+            let mut tx =
+                self.begin_transaction()
+                    .await
+                    .map_err(|e| CatalogError::InvalidOperation {
+                        message: "Failed to set snapshot sequence".to_string(),
+                        source: Box::new(e),
+                    })?;
+            self.replace_snapshot_files_in_txn(&mut *tx, table_id, snapshot_id, files)
+                .await?;
+            tx.execute(ExecuteParams {
+                sql: SNAPSHOT_SEQUENCE_UPSERT_SQL,
+                params: vec![
+                    MetastoreValue::Text(table_id.to_string()),
+                    MetastoreValue::Text(snapshot_id.to_string()),
+                    MetastoreValue::Integer(sequence_number),
+                ],
+            })
+            .await?;
+            return tx
+                .commit()
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to set snapshot sequence".to_string(),
+                    source: Box::new(e),
+                });
+        }
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: SNAPSHOT_SEQUENCE_UPSERT_SQL,
@@ -4014,6 +4113,7 @@ impl MetadataCatalog for CayenneCatalog {
         old_snapshot_ids: &[String],
         new_snapshot_id: &str,
         new_sequence_number: i64,
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<bool> {
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
         if max_attempts == 0 {
@@ -4029,8 +4129,12 @@ impl MetadataCatalog for CayenneCatalog {
                 }
             })?;
 
-            match self
-                .swap_protected_snapshots_in_txn(
+            let swapped = async {
+                if let Some(files) = files {
+                    self.replace_snapshot_files_in_txn(&mut *tx, table_id, new_snapshot_id, files)
+                        .await?;
+                }
+                self.swap_protected_snapshots_in_txn(
                     &mut *tx,
                     table_id,
                     old_snapshot_ids,
@@ -4038,9 +4142,12 @@ impl MetadataCatalog for CayenneCatalog {
                     new_sequence_number,
                 )
                 .await
-            {
+            }
+            .await;
+            match swapped {
                 // CAS guard failed — an input snapshot is no longer active.
-                // The transaction made no changes; nothing to commit.
+                // Nothing commits: dropping the transaction rolls back any
+                // manifest rows it wrote.
                 Ok(false) => return Ok(false),
                 Ok(true) => match tx.commit().await {
                     Ok(()) => return Ok(true),
@@ -4092,6 +4199,7 @@ impl MetadataCatalog for CayenneCatalog {
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
         delete_files: &[crate::metadata::DeleteFile],
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()> {
         // Same retry-on-conflict shape as commit_compaction; the only
         // additional work happens inside the transaction via
@@ -4113,10 +4221,22 @@ impl MetadataCatalog for CayenneCatalog {
                 }
             })?;
 
-            match self
-                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id, inlined, delete_files)
+            let applied = async {
+                if let Some(files) = files {
+                    self.replace_snapshot_files_in_txn(&mut *tx, table_id, new_snapshot_id, files)
+                        .await?;
+                }
+                self.commit_overwrite_in_txn(
+                    &mut *tx,
+                    table_id,
+                    new_snapshot_id,
+                    inlined,
+                    delete_files,
+                )
                 .await
-            {
+            }
+            .await;
+            match applied {
                 Ok(()) => match tx.commit().await {
                     Ok(()) => return Ok(()),
                     Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
@@ -6563,12 +6683,17 @@ fn stored_snapshot_dir(table_path: &str, table_id: &str, snapshot_id: &str) -> s
 /// catalog's reads, and decide by `settings_change` whether a mismatch rebuilds
 /// the table, holds it, refuses it, or is served with a warning. See
 /// [`CayenneCatalog::verify_stored_data_files`] for the rules.
-pub(crate) async fn verify_stored_data_files_in<C: MetadataCatalog + ?Sized>(
-    catalog: &C,
+pub(crate) async fn verify_stored_data_files_in<F, Fut>(
     table: &TableMetadata,
     memory_mode: bool,
     settings_change: SettingsChangeAction,
-) -> CatalogResult<()> {
+    snapshot_sequences: impl std::future::Future<Output = CatalogResult<HashMap<String, i64>>> + Send,
+    snapshot_files: F,
+) -> CatalogResult<()>
+where
+    F: Fn(String) -> Fut + Send,
+    Fut: std::future::Future<Output = CatalogResult<Vec<SnapshotFile>>> + Send,
+{
     // A table whose data is in the object-native location has no folder per
     // snapshot to compare, and its committed state is its only file record.
     if table.path.starts_with("s3://")
@@ -6581,8 +6706,7 @@ pub(crate) async fn verify_stored_data_files_in<C: MetadataCatalog + ?Sized>(
     // by CDC upserts and checkpoints live in their own snapshots), so every
     // live snapshot is checked before deciding: a tolerated mismatch in one
     // must not hide unreadable rows in another.
-    let mut protected: Vec<String> = catalog
-        .get_all_snapshot_sequences(&table.table_id)
+    let mut protected: Vec<String> = snapshot_sequences
         .await?
         .into_keys()
         .filter(|snapshot_id| *snapshot_id != table.current_snapshot_id)
@@ -6590,9 +6714,7 @@ pub(crate) async fn verify_stored_data_files_in<C: MetadataCatalog + ?Sized>(
     protected.sort();
     let mut damages = Vec::new();
     for snapshot_id in std::iter::once(table.current_snapshot_id.clone()).chain(protected) {
-        let manifest = catalog
-            .get_snapshot_files(&table.table_id, &snapshot_id)
-            .await?;
+        let manifest = snapshot_files(snapshot_id.clone()).await?;
         if let Some(damage) = inspect_stored_data_files(table, &snapshot_id, manifest).await? {
             damages.push(damage);
         }
@@ -6754,7 +6876,7 @@ fn configuration_schemas_match(left: &arrow_schema::Schema, right: &arrow_schema
                 | INFERRED_TABLE_BYTES_METADATA_KEY
         )
     };
-    left.fields() == right.fields()
+    fields_match_ignoring_optional_marker(left.fields(), right.fields())
         && left
             .metadata()
             .iter()
@@ -6763,6 +6885,53 @@ fn configuration_schemas_match(left: &arrow_schema::Schema, right: &arrow_schema
             .metadata()
             .iter()
             .all(|(key, value)| is_statistic(key) || left.metadata().get(key) == Some(value))
+}
+
+/// Whether two field lists are equal once the optional-trailing-column marker
+/// is ignored, so a table created with that marker matches whether or not the
+/// stored schema kept the field's metadata.
+fn fields_match_ignoring_optional_marker(
+    left: &arrow_schema::Fields,
+    right: &arrow_schema::Fields,
+) -> bool {
+    use arrow_tools::metadata_keys::OPTIONAL_TRAILING_COLUMN_METADATA_KEY;
+    let unmarked = |field: &arrow_schema::FieldRef| {
+        let mut metadata = field.metadata().clone();
+        metadata.remove(OPTIONAL_TRAILING_COLUMN_METADATA_KEY);
+        field.as_ref().clone().with_metadata(metadata)
+    };
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| left == right || unmarked(left) == unmarked(right))
+}
+
+/// Whether `requested` is `stored` with only optional trailing columns added:
+/// nullable fields marked with
+/// [`arrow_tools::metadata_keys::OPTIONAL_TRAILING_COLUMN_METADATA_KEY`],
+/// after every stored field. Such a table is opened with its stored schema and
+/// no schema change is reported; the caller works without those columns.
+fn lacks_only_optional_trailing_columns(
+    stored: &arrow_schema::Schema,
+    requested: &arrow_schema::Schema,
+) -> bool {
+    use arrow_tools::metadata_keys::OPTIONAL_TRAILING_COLUMN_METADATA_KEY;
+    let kept = stored.fields().len();
+    if requested.fields().len() <= kept {
+        return false;
+    }
+    let (head, tail) = requested.fields().split_at(kept);
+    tail.iter().all(|field| {
+        field.is_nullable()
+            && field
+                .metadata()
+                .get(OPTIONAL_TRAILING_COLUMN_METADATA_KEY)
+                .is_some_and(|value| value == "true")
+    }) && configuration_schemas_match(
+        stored,
+        &arrow_schema::Schema::new_with_metadata(head.to_vec(), requested.metadata().clone()),
+    )
 }
 
 /// One setting whose stored value differs from the requested one, named the way an
@@ -7426,11 +7595,11 @@ mod tests {
         );
 
         catalog
-            .set_snapshot_sequence(&table_id, &snapshot_id, 5)
+            .set_snapshot_sequence(&table_id, &snapshot_id, 5, None)
             .await
             .expect("first sequence upsert");
         catalog
-            .set_snapshot_sequence(&table_id, &snapshot_id, 9)
+            .set_snapshot_sequence(&table_id, &snapshot_id, 9, None)
             .await
             .expect("second sequence upsert");
         assert_eq!(
@@ -7440,6 +7609,50 @@ mod tests {
                 .expect("read sequence"),
             Some(9)
         );
+
+        // Named files commit with the sequence.
+        let file = SnapshotFile {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.clone(),
+            file_path: "b.vortex".to_string(),
+            row_count: 3,
+            file_size_bytes: 30,
+            min_sequence: 11,
+            max_sequence: 11,
+            digest: None,
+        };
+        catalog
+            .set_snapshot_sequence(
+                &table_id,
+                &snapshot_id,
+                11,
+                Some(std::slice::from_ref(&file)),
+            )
+            .await
+            .expect("sequence with files");
+        assert_eq!(
+            catalog
+                .get_snapshot_sequence(&table_id, &snapshot_id)
+                .await
+                .expect("read sequence"),
+            Some(11)
+        );
+        let named: Vec<(String, i64, i64, i64, i64)> = catalog
+            .get_snapshot_files(&table_id, &snapshot_id)
+            .await
+            .expect("read manifest")
+            .into_iter()
+            .map(|f| {
+                (
+                    f.file_path,
+                    f.row_count,
+                    f.file_size_bytes,
+                    f.min_sequence,
+                    f.max_sequence,
+                )
+            })
+            .collect();
+        assert_eq!(named, vec![("b.vortex".to_string(), 3, 30, 11, 11)]);
     }
 
     /// Both manifest rewrites write the whole manifest in one batch; every row
@@ -10107,15 +10320,15 @@ mod tests {
                 .expect("Failed to create table");
 
             catalog
-                .set_snapshot_sequence(&table_id, &snapshot_1, 10)
+                .set_snapshot_sequence(&table_id, &snapshot_1, 10, None)
                 .await
                 .expect("Failed to set snapshot seq");
             catalog
-                .set_snapshot_sequence(&table_id, &snapshot_2, 20)
+                .set_snapshot_sequence(&table_id, &snapshot_2, 20, None)
                 .await
                 .expect("Failed to set snapshot seq");
             catalog
-                .set_snapshot_sequence(&table_id, &snapshot_3, 30)
+                .set_snapshot_sequence(&table_id, &snapshot_3, 30, None)
                 .await
                 .expect("Failed to set snapshot seq");
 
@@ -10736,7 +10949,7 @@ mod tests {
         let protected_snapshot_id = uuid::Uuid::now_v7().to_string();
         let dead_snapshot_id = uuid::Uuid::now_v7().to_string();
         catalog
-            .set_snapshot_sequence(&table_id, &protected_snapshot_id, 7)
+            .set_snapshot_sequence(&table_id, &protected_snapshot_id, 7, None)
             .await
             .expect("register the protected snapshot");
 
@@ -10990,13 +11203,19 @@ mod tests {
         // `p_new` is placed on the roster by the swap itself, so it is not seeded here.
         for (snapshot_id, seq) in [(&input_a, 1), (&input_b, 2), (&survivor, 3)] {
             catalog
-                .set_snapshot_sequence(&table_id, snapshot_id, seq)
+                .set_snapshot_sequence(&table_id, snapshot_id, seq, None)
                 .await
                 .expect("seed roster row");
         }
 
         let swapped = catalog
-            .swap_protected_snapshots(&table_id, &[input_a.clone(), input_b.clone()], &p_new, 4)
+            .swap_protected_snapshots(
+                &table_id,
+                &[input_a.clone(), input_b.clone()],
+                &p_new,
+                4,
+                None,
+            )
             .await
             .expect("swap protected snapshots");
         assert!(
@@ -11286,12 +11505,18 @@ mod tests {
             .await
             .expect("seed stats-cache row");
         catalog
-            .set_snapshot_sequence(&table_id, &input_a, 1)
+            .set_snapshot_sequence(&table_id, &input_a, 1, None)
             .await
             .expect("seed roster row");
 
         let swapped = catalog
-            .swap_protected_snapshots(&table_id, &[input_a.clone(), input_b.clone()], &p_new, 4)
+            .swap_protected_snapshots(
+                &table_id,
+                &[input_a.clone(), input_b.clone()],
+                &p_new,
+                4,
+                None,
+            )
             .await
             .expect("swap protected snapshots");
         assert!(
@@ -11630,7 +11855,7 @@ mod tests {
         for (idx, id) in folded.iter().chain(std::iter::once(&late)).enumerate() {
             let seq = i64::try_from(idx).expect("test index fits in i64") + 1;
             catalog
-                .set_snapshot_sequence(&table_id, id, seq)
+                .set_snapshot_sequence(&table_id, id, seq, None)
                 .await
                 .expect("Failed to register protected snapshot");
         }
@@ -13665,7 +13890,7 @@ mod tests {
         let table = catalog.get_table("protected").await.expect("get table");
         let protected_id = "protected-snapshot";
         catalog
-            .set_snapshot_sequence(&table.table_id, protected_id, 7)
+            .set_snapshot_sequence(&table.table_id, protected_id, 7, None)
             .await
             .expect("register the protected snapshot");
         catalog

@@ -1,4 +1,6 @@
 name: postgres-write-back-roundtrip
+duration: 21s
+tags: [long]
 description: >
   Writes made through spiced reach Postgres exactly once and the accelerated copy
   agrees with the source, across a clean restart and a kill straight after an

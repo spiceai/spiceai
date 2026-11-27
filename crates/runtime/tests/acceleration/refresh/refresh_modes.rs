@@ -107,23 +107,6 @@ struct Answer {
     rows: Vec<Vec<Cell>>,
 }
 
-/// Get acceleration parameters for postgres engine
-fn get_postgres_acceleration_params(port: usize) -> Params {
-    let mut params = common::get_pg_params(port);
-    // Override pg_db to use the acceleration database instead of the default
-    params.insert(
-        "pg_db".to_string(),
-        secrecy::SecretString::from("acceleration".to_string()),
-    );
-
-    Params::from_string_map(
-        params
-            .into_iter()
-            .map(|(k, v)| (k, secrecy::ExposeSecret::expose_secret(&v).to_string()))
-            .collect(),
-    )
-}
-
 async fn test_refresh_append_for_engine(engine: &str) -> Result<(), anyhow::Error> {
     test_refresh_matches_source(engine, RefreshCase::Append).await
 }
@@ -133,19 +116,13 @@ async fn test_refresh_full_for_engine(engine: &str) -> Result<(), anyhow::Error>
 }
 
 async fn test_refresh_matches_source(engine: &str, mode: RefreshCase) -> Result<(), anyhow::Error> {
-    refresh_matches_postgres_source(engine, mode, |port| {
-        let acceleration_params =
-            (engine == "postgres").then(|| get_postgres_acceleration_params(port));
-        acceleration_for(engine, mode, acceleration_params)
-    })
-    .await
+    refresh_matches_postgres_source(engine, mode, |_port| acceleration_for(engine, mode, None))
+        .await
 }
 
 async fn test_upsert_history_for_engine(engine: &str) -> Result<(), anyhow::Error> {
-    upsert_history_matches_postgres_source(engine, |port| {
-        let acceleration_params =
-            (engine == "postgres").then(|| get_postgres_acceleration_params(port));
-        get_acceleration_config_append(engine, acceleration_params)
+    upsert_history_matches_postgres_source(engine, |_port| {
+        get_acceleration_config_append(engine, None)
     })
     .await
 }
@@ -1291,43 +1268,6 @@ fn text_cells(name: &str, array: &ArrayRef) -> Result<Vec<Cell>, anyhow::Error> 
 // Test variants for each accelerator engine
 // ============================================================================
 
-// Arrow (always available)
-#[tokio::test]
-async fn test_acceleration_refresh_arrow_append_variant() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_append_for_engine("arrow").await
-}
-
-#[tokio::test]
-async fn test_acceleration_refresh_arrow_append_timestamp() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_time_format_for_engine("arrow", TimeFormatCase::Timestamp).await
-}
-
-#[tokio::test]
-async fn test_acceleration_refresh_arrow_append_unix_seconds() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_time_format_for_engine("arrow", TimeFormatCase::UnixSeconds).await
-}
-
-#[tokio::test]
-async fn test_acceleration_refresh_arrow_append_iso8601() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_time_format_for_engine("arrow", TimeFormatCase::Iso8601).await
-}
-
-#[tokio::test]
-async fn test_acceleration_refresh_arrow_append_upsert_history() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_upsert_history_for_engine("arrow").await
-}
-
-#[tokio::test]
-async fn test_acceleration_refresh_arrow_full_variant() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_full_for_engine("arrow").await
-}
-
 // Cayenne memory-mode refreshes
 #[tokio::test]
 async fn test_acceleration_refresh_cayenne_memory_append_variant() -> Result<(), anyhow::Error> {
@@ -1365,71 +1305,6 @@ async fn test_acceleration_refresh_cayenne_memory_append_unix_seconds() -> Resul
 async fn test_acceleration_refresh_cayenne_memory_append_iso8601() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_time_format_for_engine("cayenne", TimeFormatCase::Iso8601).await
-}
-
-// SQLite (feature-gated)
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn test_acceleration_refresh_sqlite_append_variant() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_append_for_engine("sqlite").await
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn test_acceleration_refresh_sqlite_append_upsert_history() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_upsert_history_for_engine("sqlite").await
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn test_acceleration_refresh_sqlite_append_timestamp() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_time_format_for_engine("sqlite", TimeFormatCase::Timestamp).await
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn test_acceleration_refresh_sqlite_append_unix_seconds() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_time_format_for_engine("sqlite", TimeFormatCase::UnixSeconds).await
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn test_acceleration_refresh_sqlite_append_iso8601() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_time_format_for_engine("sqlite", TimeFormatCase::Iso8601).await
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn test_acceleration_refresh_sqlite_full_variant() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_full_for_engine("sqlite").await
-}
-
-// Postgres (feature-gated)
-#[cfg(feature = "postgres-accel")]
-#[tokio::test]
-async fn test_acceleration_refresh_postgres_append_variant() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_append_for_engine("postgres").await
-}
-
-#[cfg(feature = "postgres-accel")]
-#[tokio::test]
-async fn test_acceleration_refresh_postgres_append_upsert_history() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_upsert_history_for_engine("postgres").await
-}
-
-#[cfg(feature = "postgres-accel")]
-#[tokio::test]
-async fn test_acceleration_refresh_postgres_full_variant() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_full_for_engine("postgres").await
 }
 
 // Cayenne

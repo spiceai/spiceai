@@ -27,6 +27,7 @@ limitations under the License.
 
 use crate::common;
 
+#[cfg(target_os = "linux")]
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,7 +37,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::{CayenneTableProvider, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::{col, lit};
 
@@ -146,13 +147,29 @@ fn value_payload(prefix: &str, row_id: i64) -> String {
     )
 }
 
-/// Count `.vortex` files in `<data_path>/<table_id>/<current_snapshot_id>`.
+/// Count the `.vortex` files of `table`'s snapshot `snapshot_id`.
 ///
-/// A snapshot dir that does not exist yet holds no files, so that reads as 0. Any
-/// other error is raised: treating it as 0 would read as "compaction consolidated
-/// everything" and pass the very assertions that call this.
-async fn count_vortex_files(data_path: &Path, table_id: &str, snapshot_id: &str) -> usize {
-    let snapshot_dir = data_path.join(table_id).join(snapshot_id);
+/// With local data files this lists `<data_path>/<table_id>/<snapshot_id>`, so the
+/// count does not depend on the table's own listing; a snapshot dir that does not
+/// exist yet holds no files, so that reads as 0. Any other error is raised:
+/// treating it as 0 would read as "compaction consolidated everything" and pass
+/// the very assertions that call this. A table in an object-native location never
+/// lists its data files: its snapshot holds the files its commits name.
+async fn count_vortex_files(
+    fixture: &common::TestFixture,
+    table: &CayenneTableProvider,
+    snapshot_id: &str,
+) -> usize {
+    if fixture.data_store.config.is_some() {
+        return table
+            .list_snapshot_files_with_sizes(snapshot_id)
+            .await
+            .expect("snapshot files")
+            .iter()
+            .filter(|(name, _)| name.ends_with(".vortex") && !name.starts_with('.'))
+            .count();
+    }
+    let snapshot_dir = fixture.data_path.join(table.table_id()).join(snapshot_id);
     let mut entries = match tokio::fs::read_dir(&snapshot_dir).await {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
@@ -234,8 +251,7 @@ async fn drain_in_flight_maintenance_bounded(
     else {
         let table_meta = fixture.catalog.get_table(table_name).await?;
         let snapshot_id = table_meta.current_snapshot_id;
-        let files =
-            count_vortex_files(&fixture.data_path, &table_meta.table_id, &snapshot_id).await;
+        let files = count_vortex_files(fixture, table, &snapshot_id).await;
         panic!(
             "draining {table_name}'s in-flight maintenance did not finish within \
              {DRAIN_TIMEOUT:?} before {context} (snapshot {snapshot_id}, {files} files)"
@@ -298,8 +314,7 @@ async fn wait_until_current_snapshot_compacts(
     loop {
         let table_meta = fixture.catalog.get_table(table_name).await?;
         let snapshot_id = table_meta.current_snapshot_id;
-        let file_count =
-            count_vortex_files(&fixture.data_path, &table_meta.table_id, &snapshot_id).await;
+        let file_count = count_vortex_files(fixture, table, &snapshot_id).await;
         if file_count < uncompacted_file_count {
             return Ok(Some((snapshot_id, file_count)));
         }
@@ -307,8 +322,7 @@ async fn wait_until_current_snapshot_compacts(
         if table.compact_current_snapshot_small_files().await? {
             let table_meta = fixture.catalog.get_table(table_name).await?;
             let snapshot_id = table_meta.current_snapshot_id;
-            let file_count =
-                count_vortex_files(&fixture.data_path, &table_meta.table_id, &snapshot_id).await;
+            let file_count = count_vortex_files(fixture, table, &snapshot_id).await;
             return Ok(Some((snapshot_id, file_count)));
         }
 
@@ -336,14 +350,16 @@ async fn build_table(
         schema: Arc::clone(&schema),
         primary_key,
         on_conflict,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(name),
         partition_column: None,
         vortex_config,
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table = CayenneTableProvider::create_table(catalog_arc, options, ctx.runtime_env())
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), options)
         .await
         .expect("create_table");
     let table = Arc::new(table);
@@ -361,12 +377,12 @@ async fn build_table(
     (table, ctx, table_id)
 }
 
-test_with_backends!(compaction_reduces_file_count_after_n_small_appends);
+test_on_data_store!(compaction_reduces_file_count_after_n_small_appends);
 async fn compaction_reduces_file_count_after_n_small_appends(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = pk_schema();
-    let (table, ctx, table_id) = build_table(
+    let (table, ctx, _) = build_table(
         &fixture,
         "compaction_files",
         Arc::clone(&schema),
@@ -394,7 +410,7 @@ async fn compaction_reduces_file_count_after_n_small_appends(
         .get_table("compaction_files")
         .await?
         .current_snapshot_id;
-    let file_count = count_vortex_files(&fixture.data_path, &table_id, &snapshot_id).await;
+    let file_count = count_vortex_files(&fixture, &table, &snapshot_id).await;
 
     // The exact post-compaction count depends on the light delta-encoding's
     // file sizes (they set how many folded outputs graduate at the 1 MiB
@@ -413,7 +429,7 @@ async fn compaction_reduces_file_count_after_n_small_appends(
     Ok(())
 }
 
-test_with_backends!(compaction_runs_for_sort_column_tables);
+test_on_data_store!(compaction_runs_for_sort_column_tables);
 async fn compaction_runs_for_sort_column_tables(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -463,7 +479,7 @@ async fn compaction_runs_for_sort_column_tables(
     Ok(())
 }
 
-test_with_backends!(compaction_preserves_pk_upsert_semantics);
+test_on_data_store!(compaction_preserves_pk_upsert_semantics);
 async fn compaction_preserves_pk_upsert_semantics(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -548,7 +564,7 @@ async fn compaction_preserves_pk_upsert_semantics(
     Ok(())
 }
 
-test_with_backends!(compaction_collapses_tiny_protected_snapshots);
+test_on_data_store!(compaction_collapses_tiny_protected_snapshots);
 async fn compaction_collapses_tiny_protected_snapshots(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -608,7 +624,7 @@ async fn compaction_collapses_tiny_protected_snapshots(
     Ok(())
 }
 
-test_with_backends!(current_snapshot_publish_preserves_protected_snapshot_visibility);
+test_on_data_store!(current_snapshot_publish_preserves_protected_snapshot_visibility);
 async fn current_snapshot_publish_preserves_protected_snapshot_visibility(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -648,7 +664,7 @@ async fn current_snapshot_publish_preserves_protected_snapshot_visibility(
     Ok(())
 }
 
-test_with_backends!(compaction_idempotent_when_no_candidates);
+test_on_data_store!(compaction_idempotent_when_no_candidates);
 async fn compaction_idempotent_when_no_candidates(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -662,7 +678,7 @@ async fn compaction_idempotent_when_no_candidates(
         ..Default::default()
     };
 
-    let (table, _ctx, table_id) = build_table(
+    let (table, _ctx, _) = build_table(
         &fixture,
         "compaction_noop",
         Arc::clone(&schema),
@@ -699,7 +715,7 @@ async fn compaction_idempotent_when_no_candidates(
     // Second call also a no-op.
     assert!(!run_compaction(&table).await);
 
-    let file_count = count_vortex_files(&fixture.data_path, &table_id, &snapshot_after_first).await;
+    let file_count = count_vortex_files(&fixture, &table, &snapshot_after_first).await;
     assert_eq!(
         file_count, 1,
         "snapshot should still hold the original file"
@@ -708,7 +724,7 @@ async fn compaction_idempotent_when_no_candidates(
     Ok(())
 }
 
-test_with_backends!(compaction_disabled_when_trigger_unreachable);
+test_on_data_store!(compaction_disabled_when_trigger_unreachable);
 async fn compaction_disabled_when_trigger_unreachable(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -723,7 +739,7 @@ async fn compaction_disabled_when_trigger_unreachable(
         ..Default::default()
     };
 
-    let (table, ctx, table_id) = build_table(
+    let (table, ctx, _) = build_table(
         &fixture,
         "compaction_off",
         Arc::clone(&schema),
@@ -744,7 +760,7 @@ async fn compaction_disabled_when_trigger_unreachable(
         .get_table("compaction_off")
         .await?
         .current_snapshot_id;
-    let file_count = count_vortex_files(&fixture.data_path, &table_id, &snapshot_id).await;
+    let file_count = count_vortex_files(&fixture, &table, &snapshot_id).await;
     assert!(
         file_count >= 6,
         "expected at least 6 files when compaction trigger is unreachable, found {file_count}"
@@ -756,7 +772,7 @@ async fn compaction_disabled_when_trigger_unreachable(
     Ok(())
 }
 
-test_with_backends!(compaction_handles_concurrent_compaction_triggers);
+test_on_data_store!(compaction_handles_concurrent_compaction_triggers);
 async fn compaction_handles_concurrent_compaction_triggers(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -808,7 +824,7 @@ async fn compaction_handles_concurrent_compaction_triggers(
 // directly and assert it consolidates small files on a table with ZERO protected
 // snapshots, and that a concurrent append can never lose rows.
 
-test_with_backends!(production_trigger_compacts_append_only_table);
+test_on_data_store!(production_trigger_compacts_append_only_table);
 async fn production_trigger_compacts_append_only_table(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -867,7 +883,7 @@ async fn production_trigger_compacts_append_only_table(
     Ok(())
 }
 
-test_with_backends!(concurrent_append_during_compaction_loses_no_rows);
+test_on_data_store!(concurrent_append_during_compaction_loses_no_rows);
 async fn concurrent_append_during_compaction_loses_no_rows(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -923,12 +939,12 @@ async fn concurrent_append_during_compaction_loses_no_rows(
     Ok(())
 }
 
-test_with_backends!(compaction_survives_provider_reopen);
+test_on_data_store!(compaction_survives_provider_reopen);
 async fn compaction_survives_provider_reopen(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = pk_schema();
-    let (table, _ctx, table_id) = build_table(
+    let (table, _ctx, _) = build_table(
         &fixture,
         "compaction_reopen",
         Arc::clone(&schema),
@@ -966,8 +982,13 @@ async fn compaction_survives_provider_reopen(
     drop(table);
     let reopen_ctx = SessionContext::new();
     let reopened = Arc::new(
-        CayenneTableProviderBuilder::new(fixture.catalog.clone(), reopen_ctx.runtime_env())
-            .open("compaction_reopen")
+        fixture
+            .data_store
+            .open(
+                fixture.catalog.clone(),
+                reopen_ctx.runtime_env(),
+                "compaction_reopen",
+            )
             .await?,
     );
     reopen_ctx.register_table(
@@ -990,8 +1011,7 @@ async fn compaction_survives_provider_reopen(
         "all rows must survive the compaction + reopen"
     );
     // Sanity: the committed snapshot dir physically exists and is consolidated.
-    let file_count =
-        count_vortex_files(&fixture.data_path, &table_id, &committed_snapshot_id).await;
+    let file_count = count_vortex_files(&fixture, &reopened, &committed_snapshot_id).await;
     assert!(
         file_count < usize::try_from(batches).expect("batch count fits usize"),
         "consolidated snapshot should reduce file count below {batches}, found {file_count}"
@@ -1027,7 +1047,7 @@ fn file_inode(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|m| m.ino())
 }
 
-test_with_backends!(compact_current_after_seed_then_more_preserves_all_rows);
+test_on_data_store!(compact_current_after_seed_then_more_preserves_all_rows);
 async fn compact_current_after_seed_then_more_preserves_all_rows(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1035,7 +1055,7 @@ async fn compact_current_after_seed_then_more_preserves_all_rows(
     // Covers the production `compact_current_snapshot_small_files` entry
     // (including write_amp logging + subset/full dispatch) end-to-end.
     let schema = pk_schema();
-    let (table, ctx, table_id) = build_table(
+    let (table, ctx, _) = build_table(
         &fixture,
         "two_phase_compact",
         Arc::clone(&schema),
@@ -1078,7 +1098,7 @@ async fn compact_current_after_seed_then_more_preserves_all_rows(
         .get_table("two_phase_compact")
         .await?
         .current_snapshot_id;
-    let files_before = count_vortex_files(&fixture.data_path, &table_id, &snap_before).await;
+    let files_before = count_vortex_files(&fixture, &table, &snap_before).await;
 
     // Phase B: either an explicit compact reduces the file count, or post-write
     // maintenance already consolidated during the inserts (common when the
@@ -1113,6 +1133,7 @@ async fn compact_current_after_seed_then_more_preserves_all_rows(
     Ok(())
 }
 
+// Object-native exception (local hard links); see `test_with_backends!` in `common`.
 test_with_backends!(link_or_copy_snapshot_files_hardlinks_locally);
 async fn link_or_copy_snapshot_files_hardlinks_locally(
     fixture: common::TestFixture,
@@ -1184,7 +1205,7 @@ async fn link_or_copy_snapshot_files_hardlinks_locally(
     Ok(())
 }
 
-test_with_backends!(sorted_table_still_compacts_via_full_rewrite);
+test_on_data_store!(sorted_table_still_compacts_via_full_rewrite);
 async fn sorted_table_still_compacts_via_full_rewrite(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1249,14 +1270,16 @@ async fn build_append_only_key_delete_table(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(name),
         partition_column: None,
         vortex_config: aggressive_key_deletion_compaction_config(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table = CayenneTableProvider::create_table(catalog_arc, options, ctx.runtime_env())
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), options)
         .await
         .expect("create_table");
     let table = Arc::new(table);
@@ -1274,7 +1297,7 @@ async fn build_append_only_key_delete_table(
     (table, ctx, table_id)
 }
 
-test_with_backends!(key_delete_survives_compaction_and_reseed);
+test_on_data_store!(key_delete_survives_compaction_and_reseed);
 async fn key_delete_survives_compaction_and_reseed(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1289,7 +1312,7 @@ async fn key_delete_survives_compaction_and_reseed(
     // the key-delete topology — a PK-less table resolves to position-based
     // deletion and a different MoR path.
     let schema = pk_schema();
-    let (table, ctx, table_id) =
+    let (table, ctx, _) =
         build_append_only_key_delete_table(&fixture, "key_delete_survives", Arc::clone(&schema))
             .await;
 
@@ -1371,7 +1394,7 @@ async fn key_delete_survives_compaction_and_reseed(
         .get_table("key_delete_survives")
         .await?
         .current_snapshot_id;
-    let files_after = count_vortex_files(&fixture.data_path, &table_id, &snap_after).await;
+    let files_after = count_vortex_files(&fixture, &table, &snap_after).await;
     assert!(
         phase_b_compacted || snap_after != snap_after_delete,
         "phase B must compact under the pending key delete \
@@ -1403,14 +1426,14 @@ async fn key_delete_survives_compaction_and_reseed(
 // what makes this deterministic: from here a premise listed off the store can
 // never be beaten, because the pass that produced it also spent the one-shot
 // `new_files_since_last_compaction` credit the explicit trigger needs.
-test_with_backends!(a_seed_is_consolidated_before_its_fanout_can_be_listed);
+test_on_data_store!(a_seed_is_consolidated_before_its_fanout_can_be_listed);
 async fn a_seed_is_consolidated_before_its_fanout_can_be_listed(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = pk_schema();
     // A real PK (and no `OnConflict`), so the table is not silently resolved to
     // the position-based strategy the way a PK-less one is.
-    let (table, ctx, table_id) =
+    let (table, ctx, _) =
         build_append_only_key_delete_table(&fixture, "consolidated_seed", Arc::clone(&schema))
             .await;
 
@@ -1442,7 +1465,7 @@ async fn a_seed_is_consolidated_before_its_fanout_can_be_listed(
         .get_table("consolidated_seed")
         .await?
         .current_snapshot_id;
-    let settled_files = count_vortex_files(&fixture.data_path, &table_id, &settled_snapshot).await;
+    let settled_files = count_vortex_files(&fixture, &table, &settled_snapshot).await;
     assert!(
         settled_files < seeded_appends,
         "a post-write pass must consolidate the seed unprompted, which is what makes a \
@@ -1473,7 +1496,7 @@ async fn a_seed_is_consolidated_before_its_fanout_can_be_listed(
     Ok(())
 }
 
-test_with_backends!(full_rewrite_reduces_small_file_fanout);
+test_on_data_store!(full_rewrite_reduces_small_file_fanout);
 async fn full_rewrite_reduces_small_file_fanout(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {

@@ -1,4 +1,5 @@
 name: tls
+duration: 6s
 description: >
   With TLS enabled, HTTP, Flight and the metrics endpoint serve TLS with the
   configured certificate: queries, readiness, refreshes and metrics all work

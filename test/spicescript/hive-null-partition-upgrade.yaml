@@ -1,4 +1,5 @@
 name: hive-null-partition-upgrade
+duration: 2s
 description: >
   A Cayenne file acceleration of a Hive-partitioned dataset written by the 2.4
   release, which reads the `__HIVE_DEFAULT_PARTITION__` directory as that
@@ -7,7 +8,10 @@ description: >
   replaces the marker with NULL in a nullable column, as a fresh acceleration
   reads it (apache/datafusion#26310).
 
-from: 2.4.x
+# The last release that reads the marker as the literal string. From 2.4.3 on,
+# a release reads it as NULL, so it writes no acceleration for the upgrade to
+# migrate.
+from: 2.4.2
 
 sources:
   lake: { kind: files }

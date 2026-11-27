@@ -28,6 +28,7 @@ use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::metadata::CreateTableOptions;
 use cayenne::{CayenneTableProvider, MetadataCatalog};
+use datafusion::common::stats::Precision;
 use datafusion::prelude::*;
 use std::sync::Arc;
 
@@ -37,17 +38,18 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 // Column Statistics Edge Cases
 // ============================================================================
 
-test_with_backends!(test_stats_correct_after_overwrite);
+test_on_data_store!(test_stats_correct_after_overwrite);
+test_on_data_store!(test_stats_correct_after_full_rewrite_with_a_queued_delta);
 
 // ============================================================================
 // Data Inlining Edge Cases
 // ============================================================================
 
-test_with_backends!(test_large_insert_bypasses_inline);
-test_with_backends!(test_multiple_small_inserts_accumulate_inline);
-test_with_backends!(test_scan_unions_inlined_and_vortex);
-test_with_backends!(test_overwrite_clears_inlined_data);
-test_with_backends!(test_delete_removes_row_from_pk_table);
+test_on_data_store!(test_large_insert_bypasses_inline);
+test_on_data_store!(test_multiple_small_inserts_accumulate_inline);
+test_on_data_store!(test_scan_unions_inlined_and_vortex);
+test_on_data_store!(test_overwrite_clears_inlined_data);
+test_on_data_store!(test_delete_removes_row_from_pk_table);
 
 // ============================================================================
 // Helpers
@@ -61,21 +63,23 @@ async fn create_table_no_pk(
     let ctx = SessionContext::new();
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = CayenneTableProvider::create_table(
-        catalog,
-        CreateTableOptions {
-            table_name: name.to_string(),
-            schema,
-            primary_key: vec![],
-            on_conflict: None,
-            base_path: fixture.data_path.to_string_lossy().to_string(),
-            partition_column: None,
-            vortex_config: cayenne::metadata::VortexConfig::default(),
-        },
-        ctx.runtime_env(),
-    )
-    .await
-    .expect("create table");
+    let table = fixture
+        .data_store
+        .create(
+            catalog,
+            ctx.runtime_env(),
+            CreateTableOptions {
+                table_name: name.to_string(),
+                schema,
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: fixture.data_store.base_path(name),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            },
+        )
+        .await
+        .expect("create table");
 
     (table, ctx)
 }
@@ -89,21 +93,23 @@ async fn create_table_with_pk(
     let ctx = SessionContext::new();
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = CayenneTableProvider::create_table(
-        catalog,
-        CreateTableOptions {
-            table_name: name.to_string(),
-            schema,
-            primary_key: pk,
-            on_conflict: None,
-            base_path: fixture.data_path.to_string_lossy().to_string(),
-            partition_column: None,
-            vortex_config: cayenne::metadata::VortexConfig::default(),
-        },
-        ctx.runtime_env(),
-    )
-    .await
-    .expect("create table");
+    let table = fixture
+        .data_store
+        .create(
+            catalog,
+            ctx.runtime_env(),
+            CreateTableOptions {
+                table_name: name.to_string(),
+                schema,
+                primary_key: pk,
+                on_conflict: None,
+                base_path: fixture.data_store.base_path(name),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            },
+        )
+        .await
+        .expect("create table");
 
     (table, ctx)
 }
@@ -136,36 +142,133 @@ async fn query_count(ctx: &SessionContext, table_name: &str) -> usize {
 // Stats Tests
 // ============================================================================
 
-/// After overwrite, stats should reflect only the new data.
+/// After overwrite, stats should reflect only the new data, including once the
+/// post-write maintenance queued by the replaced writes has drained. Covers an
+/// overwrite that lands in the inline tier and one written to data files.
+///
+/// The insert's statistics reach the metastore on a debounced maintenance pass,
+/// so whether that pass runs before, during or after the overwrite depends on
+/// timing; on a fast run it usually comes after. The crate's unit tests
+/// `overwrite_discards_*` hold the pass and the publish at fixed points.
 async fn test_stats_correct_after_overwrite(fixture: common::TestFixture) -> TestResult {
     let schema = simple_schema();
     let (table, ctx) = create_table_no_pk(&fixture, "stats_overwrite", Arc::clone(&schema)).await;
+    let handle = table.clone_for_write_operations();
     let table_id = fixture.catalog.get_table("stats_overwrite").await?.table_id;
 
     ctx.register_table("stats_overwrite", Arc::new(table))?;
 
-    // Insert 3 rows
-    ctx.sql("INSERT INTO stats_overwrite SELECT * FROM (VALUES (1,10),(2,20),(3,30))")
-        .await?
-        .collect()
-        .await?;
+    // Rows resident in the inline tier keep the served count inexact.
+    let overwrites = [
+        (
+            "INSERT OVERWRITE stats_overwrite SELECT * FROM (VALUES (99,990),(100,1000))",
+            2,
+            Precision::Inexact(2),
+        ),
+        // Above the inline row cap, so the replacement is written to data files.
+        (
+            "INSERT OVERWRITE stats_overwrite \
+             SELECT v AS id, v AS value FROM (SELECT UNNEST(range(0, 2000)) AS v)",
+            2000,
+            Precision::Exact(2000),
+        ),
+    ];
+    for (overwrite, expected_rows, expected_served) in overwrites {
+        ctx.sql("INSERT INTO stats_overwrite SELECT * FROM (VALUES (1,10),(2,20),(3,30))")
+            .await?
+            .collect()
+            .await?;
+        ctx.sql(overwrite).await?.collect().await?;
 
-    // Overwrite with just 2 rows
-    ctx.sql("INSERT OVERWRITE stats_overwrite SELECT * FROM (VALUES (99,990),(100,1000))")
-        .await?
-        .collect()
-        .await?;
+        let stats = fixture
+            .catalog
+            .get_table_statistics(&table_id)
+            .await?
+            .expect("stats after overwrite");
+        assert_eq!(
+            stats.num_rows, expected_rows,
+            "After overwrite, stats should reflect only the new {expected_rows}-row data"
+        );
 
-    let stats = fixture.catalog.get_table_statistics(&table_id).await?;
-    assert!(stats.is_some(), "Stats should exist after overwrite");
-    let stats = stats.expect("stats");
-    assert_eq!(
-        stats.num_rows, 2,
-        "After overwrite, stats should reflect only the new 2-row data"
+        handle.drain_in_flight_maintenance().await?;
+        let stats = fixture
+            .catalog
+            .get_table_statistics(&table_id)
+            .await?
+            .expect("stats after maintenance");
+        assert_eq!(
+            (stats.num_rows, stats.num_rows_exact),
+            (expected_rows, true),
+            "maintenance queued before the overwrite must not add the replaced rows"
+        );
+        let optimizer = handle
+            .optimizer_table_statistics()
+            .expect("optimizer statistics");
+        assert_eq!(
+            optimizer.num_rows, expected_served,
+            "the table statistics the planner reads count only the new rows"
+        );
+
+        assert_eq!(
+            query_count(&ctx, "stats_overwrite").await,
+            usize::try_from(expected_rows)?
+        );
+    }
+
+    Ok(())
+}
+
+/// A full rewrite counts the rows it read, which include those of a write whose
+/// statistics are still queued for maintenance; once maintenance runs, that
+/// write must not be counted a second time.
+async fn test_stats_correct_after_full_rewrite_with_a_queued_delta(
+    fixture: common::TestFixture,
+) -> TestResult {
+    const TABLE: &str = "stats_rewrite_queued_delta";
+    let (table, ctx) = create_table_no_pk(&fixture, TABLE, simple_schema()).await;
+    let handle = table.clone_for_write_operations();
+    let table_id = fixture.catalog.get_table(TABLE).await?.table_id;
+    ctx.register_table(TABLE, Arc::new(table))?;
+
+    // Both writes are above the inline row cap, so they are written to data files.
+    ctx.sql(&format!(
+        "INSERT INTO {TABLE} SELECT v AS id, v AS value FROM (SELECT UNNEST(range(0, 2000)) AS v)"
+    ))
+    .await?
+    .collect()
+    .await?;
+    handle.drain_in_flight_maintenance().await?;
+    let held = handle
+        .hold_post_write_maintenance()
+        .expect("no maintenance pass is scheduled");
+    ctx.sql(&format!(
+        "INSERT INTO {TABLE} SELECT v AS id, v AS value FROM (SELECT UNNEST(range(2000, 3500)) AS v)"
+    ))
+    .await?
+    .collect()
+    .await?;
+    assert!(
+        handle.force_full_compaction().await?,
+        "the full rewrite commits"
     );
+    drop(held);
+    handle.drain_in_flight_maintenance().await?;
 
-    // Verify scan also returns 2 rows
-    assert_eq!(query_count(&ctx, "stats_overwrite").await, 2);
+    let stats = fixture
+        .catalog
+        .get_table_statistics(&table_id)
+        .await?
+        .expect("stats after the rewrite");
+    assert_eq!(
+        (stats.num_rows, stats.num_rows_exact),
+        (3500, true),
+        "the rewrite's count already includes the second write"
+    );
+    let optimizer = handle
+        .optimizer_table_statistics()
+        .expect("optimizer statistics");
+    assert_eq!(optimizer.num_rows, Precision::Exact(3500));
+    assert_eq!(query_count(&ctx, TABLE).await, 3500);
 
     Ok(())
 }

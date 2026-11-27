@@ -693,10 +693,9 @@ impl AckSlot {
         advance_monotonic(&self.delivered, lsn);
     }
 
-    /// Whether the member has already durably applied this commit — used to
-    /// suppress re-delivery of envelopes during a reconnect replay (the replay
-    /// always starts at the *minimum* floor, so caught-up members would
-    /// otherwise see every commit since the slowest member's position again).
+    /// Whether the member has already durably applied this commit. A reconnect
+    /// replay must not send it again; see [`deliver_commit`], which also skips
+    /// what the member's current mailbox already received.
     fn already_committed(&self, lsn: u64) -> bool {
         self.committed.load(Ordering::Acquire) >= lsn
     }
@@ -1434,6 +1433,15 @@ struct MemberMailbox {
     /// operand's — and decremented on `pop` by the item's final `encoded_len`, so
     /// the two always agree.
     buffered_bytes: AtomicUsize,
+    /// Highest commit LSN placed in this mailbox. Its receiver applies what it
+    /// holds in order whether or not the pump reconnects, so a reconnect replay
+    /// must not send those commits again (see [`deliver_commit`]).
+    ///
+    /// It belongs to the mailbox, not to the member's ack slot: a member that
+    /// re-subscribes keeps its slot but gets a new mailbox, and a publish into
+    /// the old one, which the old receiver then discards, must not count as
+    /// held by the new one.
+    handed: AtomicU64,
     max_items: usize,
     limits: CoalescingLimits,
 }
@@ -1463,6 +1471,12 @@ struct MemberMailboxSender {
 }
 
 impl MemberMailboxSender {
+    /// Whether this mailbox has already received this commit's changes, which
+    /// its receiver applies in order.
+    fn holds(&self, lsn: u64) -> bool {
+        self.shared.handed.load(Ordering::Acquire) >= lsn
+    }
+
     fn is_closed(&self) -> bool {
         !self.shared.receiver_alive.load(Ordering::Acquire)
     }
@@ -1511,6 +1525,8 @@ impl MemberMailboxSender {
                         self.shared
                             .buffered_bytes
                             .fetch_add(merged_bytes, Ordering::AcqRel);
+                        // `flush_to` is now the later of the two commits.
+                        advance_monotonic(&self.shared.handed, current.flush_to);
                         return MailboxSendOutcome::Merged;
                     }
                     MergeOutcome::Limited(returned) => {
@@ -1533,6 +1549,7 @@ impl MemberMailboxSender {
 
         let bytes = envelope.rows.encoded_len();
         let wake_receiver = incoming.is_empty();
+        advance_monotonic(&self.shared.handed, envelope.flush_to);
         incoming.push(PendingItem::Changes(envelope));
         self.shared.buffered_items.fetch_add(1, Ordering::AcqRel);
         self.shared
@@ -1703,14 +1720,16 @@ impl MemberMailboxReceiver {
             .fetch_sub(item.buffered_bytes(), Ordering::AcqRel);
         self.shared.capacity_notify.notify_one();
         // Echo suppression, decided here rather than in the shared pump: drop
-        // every chunk of this envelope whose xid this member's own registry
-        // recognizes as one of its own write-back deliveries. `contains` is a
+        // the changes of this envelope whose xid this member's own registry
+        // recognizes as one of its own write-back deliveries, except those to a
+        // key that changed through the stream after the delivery read it
+        // (#16505, see `PgChangeRows::drop_echoed`). `contains` is a
         // lock-free mirror read, so this never blocks; a member with no
         // registry (the overwhelming majority of datasets) skips straight past.
         if let (PendingItem::Changes(pending), Some(filter)) =
             (&mut item, self.echo_filter.as_mut())
         {
-            let scan = pending.rows.drop_echoed(&filter.registry);
+            let scan = pending.rows.drop_echoed(&filter.registry, pending.flush_to);
             // A change from a transaction this dataset did not issue means the
             // accelerator is not the only writer of this table, the one condition
             // durable write-back cannot make safe. Report it once: every later
@@ -1826,6 +1845,7 @@ fn member_mailbox_with_limits(
         sender_closed: AtomicBool::new(false),
         buffered_items: AtomicUsize::new(0),
         buffered_bytes: AtomicUsize::new(0),
+        handed: AtomicU64::new(0),
         max_items: capacity,
         limits,
     });
@@ -4629,9 +4649,15 @@ async fn deliver_commit(
         if !slot.has(STREAMING) {
             continue;
         }
-        if slot.already_committed(boundary.end_lsn) {
-            // Reconnect replay of a commit this member already durably
-            // applied (replays start at the minimum floor across members).
+        if slot.already_committed(boundary.end_lsn) || member.sender.holds(boundary.end_lsn) {
+            // Reconnect replay of a commit this member already holds: durably
+            // applied, or in its mailbox to be applied in order. Replays start
+            // at the minimum floor across members, and at or below this
+            // member's own `committed`, which trails what it has applied until
+            // a checkpoint. Sending it again would apply an older change after
+            // newer ones; and once a checkpoint moved `committed` past those,
+            // their own resend would be skipped, leaving the older change in
+            // place: a deleted key kept, a row back to an older value (#16625).
             continue;
         }
         let Some(rel) = decoder.relation(relation_id) else {
@@ -7394,6 +7420,221 @@ mod tests {
         txn
     }
 
+    /// The rows of every envelope waiting in `receiver`, without blocking.
+    /// Counted in rows rather than envelopes, since the mailbox folds
+    /// consecutive commits into one envelope.
+    fn drain_ready(receiver: &mut MemberMailboxReceiver) -> usize {
+        let mut rows = 0;
+        while let Some(item) = futures::FutureExt::now_or_never(receiver.next()) {
+            rows += item
+                .expect("mailbox still open")
+                .expect("envelope is not an error")
+                .num_rows_hint();
+        }
+        rows
+    }
+
+    /// Re-subscribe `table` (relation `relation_id`) the way a member that
+    /// detached and rejoined does: a new handle and mailbox under the same key,
+    /// on the same ack slot, registered again and routed to by the next
+    /// connection. Returns the new mailbox's receiver.
+    fn resubscribe(
+        source: &Arc<SharedSource>,
+        routes: &mut RouteMap,
+        table: &str,
+        relation_id: RelationId,
+        registry: Option<Arc<XidRegistry>>,
+    ) -> MemberMailboxReceiver {
+        let (sender, mut receiver) = member_mailbox(8);
+        receiver.echo_filter = registry
+            .clone()
+            .map(|registry| EchoFilter::new(registry, table.to_string()));
+        lock(&source.members).insert(
+            key(table),
+            Arc::new(MemberHandle {
+                applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
+                watermark_notify: Arc::new(Notify::new()),
+                dataset_name: table.to_string(),
+                schema: tiny_schema(),
+                primary_keys: vec!["id".into()],
+                generated_columns: vec![],
+                column_type_oids: HashMap::new(),
+                policy: SchemaEvolutionPolicy::Block,
+                sender,
+                metrics: ReplicationMetricsCollector::new(),
+                ready_lag: crate::cdc::DEFAULT_READY_LAG,
+                write_back_registry: registry,
+            }),
+        );
+        source.ack.register(&key(table), false);
+        source.ack.promote_ready_members();
+        routes.insert(
+            relation_id,
+            Route {
+                key: key(table),
+                member: source.member(&key(table)).expect("member present"),
+                slot: source.ack.slot(&key(table)).expect("ack slot present"),
+                working_schema: tiny_schema(),
+            },
+        );
+        receiver
+    }
+
+    /// A reconnect replay must not send a member a commit it already holds.
+    ///
+    /// The member below has applied the insert of a key (LSN 100) and its later
+    /// delete (LSN 300), but checkpointed neither, so the replay that follows a
+    /// reconnect starts below both. If the replay sends the insert again, it is
+    /// applied after the delete; and if the member's checkpoint then acknowledges
+    /// the delete before the replay reaches it, the delete is not sent again, so
+    /// the key stays inserted for good (regression test for #16625). Nothing it
+    /// already holds may be sent again, whatever its checkpoint does meanwhile.
+    #[tokio::test]
+    async fn reconnect_replay_skips_commits_the_member_already_holds() {
+        let (source, decoder, mut routes, mut receivers) = echo_scenario(None);
+        let t0 = source.ack.slot(&key("t0")).expect("t0 ack slot");
+
+        // First delivery: t0's insert, t1's change, t0's delete. t0 applies both
+        // of its own and checkpoints neither.
+        for (relation_id, end_lsn) in [(100, 100), (101, 200), (100, 300)] {
+            deliver_one_commit(
+                &source,
+                &decoder,
+                &routes,
+                txn_with(&[(relation_id, "x")]),
+                end_lsn,
+                None,
+            )
+            .await;
+        }
+        assert_eq!(
+            drain_ready(&mut receivers[0]),
+            2,
+            "t0 applied the rows of 100 and 300"
+        );
+        assert_eq!(drain_ready(&mut receivers[1]), 1, "t1 applied 200");
+        assert_eq!(t0.committed(), 0, "t0 has checkpointed nothing");
+
+        // The pump reconnects at the floor and the source sends the same commits
+        // again. t0's checkpoint acknowledges the delete partway through.
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "x")]),
+            100,
+            None,
+        )
+        .await;
+        t0.commit(300);
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(101, "x")]),
+            200,
+            None,
+        )
+        .await;
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "x")]),
+            300,
+            None,
+        )
+        .await;
+        assert_eq!(
+            drain_ready(&mut receivers[0]),
+            0,
+            "t0 must not receive its insert again after it applied the delete"
+        );
+        assert_eq!(
+            drain_ready(&mut receivers[1]),
+            0,
+            "t1 must not receive its change again"
+        );
+
+        // A commit staged for t0 but never placed in its mailbox (an eager hold a
+        // reconnect discards) is still sent when the replay reaches it.
+        t0.deliver(400);
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "x")]),
+            400,
+            None,
+        )
+        .await;
+        assert_eq!(
+            drain_ready(&mut receivers[0]),
+            1,
+            "a commit t0 never received is sent"
+        );
+
+        // After t0 rejoins with a new stream, everything above its checkpoint is
+        // sent again: its old mailbox went with the old stream.
+        let mut rejoined = resubscribe(&source, &mut routes, "t0", 100, None);
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "x")]),
+            400,
+            None,
+        )
+        .await;
+        assert_eq!(
+            drain_ready(&mut rejoined),
+            1,
+            "a rejoined member is sent what it held before"
+        );
+    }
+
+    /// What a member's previous stream was handed says nothing about what its
+    /// replacement holds. A member that re-subscribes gets a new mailbox but
+    /// keeps its ack slot, and the pump can still be publishing into the old
+    /// mailbox (which its dropped receiver then discards) after the replacement
+    /// registered. The replay must still send the replacement that commit.
+    #[tokio::test]
+    async fn replacement_member_is_sent_what_its_old_mailbox_received_late() {
+        let (source, decoder, mut routes, mut receivers) = echo_scenario(None);
+        let old_member = source.member(&key("t0")).expect("t0 member");
+        let slot = source.ack.slot(&key("t0")).expect("t0 ack slot");
+
+        // t0 re-subscribes: a new mailbox and handle under the same key, on the
+        // same ack slot.
+        let mut replacement = resubscribe(&source, &mut routes, "t0", 100, None);
+
+        // A publish the pump began before the re-subscribe lands in the old
+        // mailbox afterwards, and goes with it.
+        assert!(
+            old_member
+                .sender
+                .try_publish(pending_change(&slot, 150, 0, false))
+                .is_delivered()
+        );
+        drop(receivers.remove(0));
+
+        // The pump reconnects with the replacement's route and replays commit 150.
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "x")]),
+            150,
+            None,
+        )
+        .await;
+        assert_eq!(
+            drain_ready(&mut replacement),
+            1,
+            "the replacement is sent the commit only the old mailbox received"
+        );
+    }
+
     /// A registered xid drops only the arbitrated member's changes; a second
     /// member's changes in the same transaction are delivered intact.
     #[tokio::test]
@@ -7495,6 +7736,309 @@ mod tests {
         assert!(
             !registry.contains(foreign_xid),
             "the foreign transaction was never a registry member"
+        );
+    }
+
+    /// The rows a write-back member's envelope builds to, as the `id` text values.
+    fn built_ids(envelope: &ChangeEnvelope) -> Vec<i32> {
+        use arrow::array::AsArray;
+        let batch = envelope.change_batch().expect("the envelope builds");
+        let data = batch
+            .record
+            .column_by_name("data")
+            .expect("a change batch carries a data column")
+            .as_struct()
+            .clone();
+        let ids = data
+            .column_by_name("id")
+            .expect("the data struct carries id")
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .clone();
+        (0..ids.len()).map(|row| ids.value(row)).collect()
+    }
+
+    /// #16505: a write at the source reaches the stream *before* the echo of a
+    /// write-back delivery to the same key. Postgres ends with the delivered row
+    /// (its transaction committed last), but the accelerator applied the source's
+    /// write over its own copy, so it no longer holds what the delivery wrote. The
+    /// echo is then the only change that can bring it back in line with the
+    /// source, and dropping it leaves the two holding different rows for good.
+    #[tokio::test]
+    async fn echo_after_a_source_write_to_the_same_key_is_applied() {
+        let delivery_xid = 4242u32;
+        let source_xid = 7777u32;
+        let registry = registry_with_xid(delivery_xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+
+        // The direct source write to id 5 commits first ...
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            200,
+            Some(source_xid),
+        )
+        .await;
+        let foreign = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(built_ids(&foreign), vec![5], "the source write is applied");
+        foreign.commit().await.expect("commit the source write");
+
+        // ... then the write-back delivery to the same key, carrying the row
+        // Postgres now holds.
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            300,
+            Some(delivery_xid),
+        )
+        .await;
+        let echo = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(
+            built_ids(&echo),
+            vec![5],
+            "the delivery's row for the key the source wrote in between must be applied, or the accelerator keeps the source's older write"
+        );
+    }
+
+    /// The other order needs nothing: the echo of a delivery that reached the
+    /// source before any other write to its keys is dropped, and the later
+    /// source write is applied over it.
+    #[tokio::test]
+    async fn echo_before_a_source_write_is_dropped() {
+        let delivery_xid = 4242u32;
+        let source_xid = 7777u32;
+        let registry = registry_with_xid(delivery_xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            200,
+            Some(delivery_xid),
+        )
+        .await;
+        let echo = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(echo.num_rows_hint(), 0, "the echo is dropped");
+        echo.commit().await.expect("commit the ack");
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            300,
+            Some(source_xid),
+        )
+        .await;
+        let foreign = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(built_ids(&foreign), vec![5], "the source write is applied");
+    }
+
+    /// A source write to a *different* key does not make the echo of an unrelated
+    /// delivery necessary: only the keys the source wrote are re-applied.
+    #[tokio::test]
+    async fn echo_keeps_only_the_keys_the_source_wrote() {
+        let delivery_xid = 4242u32;
+        let source_xid = 7777u32;
+        let registry = registry_with_xid(delivery_xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "6")]),
+            200,
+            Some(source_xid),
+        )
+        .await;
+        let foreign = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        foreign.commit().await.expect("commit the source write");
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5"), (100, "6"), (100, "7")]),
+            300,
+            Some(delivery_xid),
+        )
+        .await;
+        let echo = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(
+            built_ids(&echo),
+            vec![6],
+            "only the key the source wrote in between is re-applied from the echo"
+        );
+    }
+
+    async fn empty_echo_registry() -> Arc<XidRegistry> {
+        XidRegistry::load(
+            Arc::new(EchoFakeStore::default()),
+            "localhost:5432/db/public.t0".to_string(),
+            "t0".to_string(),
+        )
+        .await
+        .expect("registry loads from an empty store")
+    }
+
+    /// A delivery whose accelerator read was taken after the source write was
+    /// durably applied read the source's row, so its echo carries nothing the
+    /// accelerator lacks and is dropped.
+    #[tokio::test]
+    async fn echo_is_dropped_when_the_read_observed_the_source_write() {
+        let delivery_xid = 4242u32;
+        let registry = empty_echo_registry().await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            200,
+            Some(7777),
+        )
+        .await;
+        let foreign = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        foreign.commit().await.expect("commit the source write");
+        registry.prune_acked(250).await;
+
+        let read = registry.begin_read();
+        assert_eq!(read.fence(), 250, "the read observes the applied position");
+        registry
+            .register_delivery(u64::from(delivery_xid), Some(&read))
+            .await
+            .expect("register the delivery");
+        drop(read);
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            300,
+            Some(delivery_xid),
+        )
+        .await;
+        let echo = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(echo.num_rows_hint(), 0, "the redundant echo is dropped");
+    }
+
+    /// An echo change that was kept is applied, so it is a change to its key that
+    /// a later delivery's read may not have observed either.
+    #[tokio::test]
+    async fn a_kept_echo_change_is_a_change_for_later_deliveries() {
+        let first = 4242u32;
+        let second = 4343u32;
+        let registry = empty_echo_registry().await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+
+        // The first delivery read before the source write to id 5 (fence 0).
+        let first_read = registry.begin_read();
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            200,
+            Some(7777),
+        )
+        .await;
+        receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error")
+            .commit()
+            .await
+            .expect("commit the source write");
+        registry
+            .register_delivery(u64::from(first), Some(&first_read))
+            .await
+            .expect("register the first delivery");
+        drop(first_read);
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            300,
+            Some(first),
+        )
+        .await;
+        let first_echo = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(built_ids(&first_echo), vec![5], "the first echo is applied");
+        first_echo.commit().await.expect("commit the first echo");
+
+        // The second read is fenced past the source write but before the
+        // first echo was applied.
+        registry.prune_acked(250).await;
+        let second_read = registry.begin_read();
+        registry
+            .register_delivery(u64::from(second), Some(&second_read))
+            .await
+            .expect("register the second delivery");
+        drop(second_read);
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            400,
+            Some(second),
+        )
+        .await;
+        let second_echo = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(
+            built_ids(&second_echo),
+            vec![5],
+            "the second echo is applied: its read did not observe the applied first echo"
         );
     }
 
@@ -7692,7 +8236,7 @@ mod tests {
             Some(0),
         );
 
-        let scan = rows.drop_echoed(&registry);
+        let scan = rows.drop_echoed(&registry, 0);
 
         assert!(
             scan.dropped.is_empty(),
@@ -7766,14 +8310,17 @@ mod tests {
         }
     }
 
-    /// Reconnect replay: replaying the same transaction without an intervening
-    /// `prune_acked` (the slot resends everything after `confirmed_flush` on any
-    /// reconnect) drops the echo again — the ordering regression the design guards.
+    /// Reconnect replay: the slot resends everything after `confirmed_flush` on
+    /// any reconnect. A member that still holds the echo's zero-row ack is not
+    /// sent the transaction again at all; one that rejoined (its old mailbox gone
+    /// with its old stream) is, and without an intervening `prune_acked` it drops
+    /// the echo again — the ordering regression the design guards.
     #[tokio::test]
     async fn reconnect_replay_without_prune_drops_echo_again() {
         let xid = 313u32;
         let registry = registry_with_xid(xid).await;
-        let (source, decoder, routes, mut receivers) = echo_scenario(Some(registry));
+        let (source, decoder, mut routes, mut receivers) =
+            echo_scenario(Some(Arc::clone(&registry)));
         let end_lsn = 800u64;
 
         // First delivery: echo dropped, zero-row ack produced. The ack is NOT
@@ -7799,7 +8346,26 @@ mod tests {
             .expect("first ack")
             .expect("not an error");
 
-        // Reconnect replay of the very same transaction, no prune in between.
+        // Reconnect replay of the very same transaction, no prune in between: t0
+        // already holds its ack, so nothing is sent.
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1")]),
+            end_lsn,
+            Some(xid),
+        )
+        .await;
+        assert!(
+            futures::FutureExt::now_or_never(receivers[0].next()).is_none(),
+            "a member that already holds the commit is not sent it again"
+        );
+
+        // After t0 rejoins with a new stream, the replay resends it, still with no
+        // prune in between.
+        let mut rejoined =
+            resubscribe(&source, &mut routes, "t0", 100, Some(Arc::clone(&registry)));
         deliver_one_commit(
             &source,
             &decoder,
@@ -7812,7 +8378,7 @@ mod tests {
 
         // Both passes produced a zero-row ack for t0, never a data envelope: the
         // echo was dropped on the replay just as on the first delivery.
-        let second = receivers[0]
+        let second = rejoined
             .next()
             .await
             .expect("replayed ack")

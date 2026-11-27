@@ -84,7 +84,7 @@ mod steps;
 
 use api::{http_step, refresh, source_query, spice_cli};
 use background::{start_background, stop_background};
-use checks::{assert_files, assert_log, assert_status, metric_value, wait_metric};
+use checks::{assert_files, assert_log, assert_status, mark_files, metric_value, wait_metric};
 use cluster::{
     bridge_address, check_bridged_sources, cluster_args, make_cluster_ready, published_to_bridge,
     spicepod_for_bridge, start_executors, undistributed_engine, unpartitionable_acceleration,
@@ -333,9 +333,11 @@ fn schedule(script: &Script, steps: &[Step]) -> Schedule {
 
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_mins(3);
 
-/// `--max-wait`: the longest any wait for a condition may take, whatever the
-/// script asks for. Scripts that are expected to fail pay every wait in full,
-/// so a run of them is bounded by this instead.
+/// `--max-wait`: the longest a check's wait for a condition (`eventually`, a
+/// refresh) may take, whatever the script asks for. Scripts that are expected
+/// to fail pay every such wait in full, so a run of them is bounded by this
+/// instead. Readiness waits after `start`, `restart` and `upgrade` keep their
+/// own limits: they are setup, not checks.
 static MAX_WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
 
 /// Sets `--max-wait` for this run.
@@ -369,7 +371,9 @@ pub struct Target {
     pub binary: PathBuf,
 }
 
+#[derive(Clone)]
 pub struct Options {
+    pub repetition: Option<u32>,
     pub targets: Vec<Target>,
     /// `--from`: the binary every instance starts on, in place of any
     /// script's `from:`; an `upgrade` step moves it to its target's.
@@ -386,6 +390,9 @@ pub struct Options {
     pub pki: PathBuf,
     /// `--log-capture`: where a script with a failure leaves its logs.
     pub log_capture: Option<PathBuf>,
+    /// `--executor-image`: the image cluster executors run in under
+    /// `defaults.cluster.containers`.
+    pub executor_image: String,
 }
 
 /// A failed check: where it ran, which step, and what went wrong.
@@ -485,6 +492,9 @@ struct Instance {
     spiced: Spiced,
     /// The binary under test, which an `upgrade` step starts.
     target_binary: PathBuf,
+    /// The binary the instance started on, which a `downgrade` step starts:
+    /// the release `from:` or `--from` names, or else the binary under test.
+    first_binary: PathBuf,
     base_release: Option<crate::release::BaseRelease>,
     /// The cluster executors started beside `spiced` (by `--cluster`,
     /// `defaults.cluster` or `defaults.executor-args`), spares last.
@@ -520,6 +530,8 @@ struct Instance {
     background: BTreeMap<String, Background>,
     /// `/metrics` scrapes taken by `mark-metrics`, by id.
     metric_marks: BTreeMap<String, String>,
+    /// Files recorded by `mark-files`, by id.
+    file_marks: BTreeMap<String, checks::FileMarks>,
     /// When this instance began each corpus's queries, by corpus position:
     /// the start of the `eventually` limit they share.
     corpus_started: BTreeMap<usize, Instant>,
@@ -549,9 +561,10 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(45);
 /// `STOP_TIMEOUT`; at the end of a script it only costs time.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The image cluster executors run in under `defaults.cluster.containers`:
-/// a Linux `spiced` needs nothing beyond its base libraries.
-const EXECUTOR_IMAGE: &str = "ubuntu:26.04";
+/// The image cluster executors run in under `defaults.cluster.containers`
+/// unless `--executor-image` names another: a Linux `spiced` built with the
+/// default features needs nothing beyond its base libraries.
+pub const DEFAULT_EXECUTOR_IMAGE: &str = "ubuntu:26.04";
 
 /// The partition assignment interval a cluster runs with (see
 /// `make_cluster_ready`).
@@ -658,8 +671,12 @@ pub async fn run_script(script: &Script, options: &Options, slots: &Slots) -> Re
             let script_busy = Arc::clone(&script_busy);
             async move {
                 let run_label = script.run_label(&combo);
+                let repetition = options
+                    .repetition
+                    .map(|index| format!("-repetition-{index}"))
+                    .unwrap_or_default();
                 let run_id = format!(
-                    "{}-{combo_index}-{}",
+                    "{}-{combo_index}{repetition}-{}",
                     sanitize(&script.name),
                     std::process::id()
                 );
@@ -811,25 +828,44 @@ async fn run_combination(
                     .map(|(name, _, kind, _)| (name.as_str(), kind.as_str())),
             )?;
         }
-        for (name, spec, kind, version) in resolved {
-            let src = crate::docker::publishing_also_on(
-                bridge.filter(|_| published_to_bridge(&kind)),
-                source::start(
-                    name,
-                    run_id,
-                    &kind,
-                    version.as_deref(),
-                    &options.work_dir.join(run_id).join("sources"),
-                    spec,
-                ),
-            )
-            .await
-            .with_context(|| format!("Failed to start source '{name}' ({kind})"))?;
+        // Every source at once: none depends on another. At the first that
+        // fails, the starts still running are dropped, which removes what
+        // they had started (a container removes itself when dropped, and one
+        // still being created is removed by the task creating it). Those
+        // that had started are registered first, so the removal below stops
+        // them.
+        let work = options.work_dir.join(run_id).join("sources");
+        let mut starting: futures::stream::FuturesUnordered<_> = resolved
+            .into_iter()
+            .map(|(name, spec, kind, version)| {
+                let work = &work;
+                async move {
+                    let began = Instant::now();
+                    let src = crate::docker::publishing_also_on(
+                        bridge.filter(|_| published_to_bridge(&kind)),
+                        source::start(name, run_id, &kind, version.as_deref(), work, spec),
+                    )
+                    .await
+                    .with_context(|| format!("Failed to start source '{name}' ({kind})"));
+                    (name, kind, src, began.elapsed())
+                }
+            })
+            .collect();
+        while let Some((name, kind, src, took)) = futures::StreamExt::next(&mut starting).await {
+            let src = src?;
+            // Starting a source (pulling, creating and waiting for its
+            // containers) is part of the time a combination runs, and is not
+            // a step, so it is reported on its own.
+            say!(
+                "   source {name} ({kind}) started ({:.1}s)",
+                took.as_secs_f64()
+            );
             sources.by_name.insert(name.clone(), Arc::from(src));
             sources.state.insert(name.clone(), SourceState::Running);
             key_room.release(source::containers(&kind));
             sources.kinds.insert(name.clone(), kind);
         }
+        drop(starting);
         let mut instances = create_instances(script, options, combo, run_id, &sources).await?;
         // Instances that were skipped start no executors: give their share
         // back, and let each remaining executor give back its own as it starts.
@@ -911,6 +947,7 @@ async fn run_combination(
             }
         }
         // Every process of every instance at once.
+        let stopping_started = Instant::now();
         let mut stopping = Vec::new();
         for instance in &mut instances {
             stopping.push(instance.spiced.stop(TEARDOWN_TIMEOUT));
@@ -922,6 +959,10 @@ async fn run_combination(
             }
         }
         let _ = futures::future::join_all(stopping).await;
+        say!(
+            "   instances stopped ({:.1}s)",
+            stopping_started.elapsed().as_secs_f64()
+        );
         for instance in &mut instances {
             if !instance.answers.is_empty() || instance.broken.is_some() {
                 say!(
@@ -948,12 +989,17 @@ async fn run_combination(
         let dir = combination_capture_dir(&capture_dir(root, script), script, run_label);
         capture_combination(&sources, run_id, &options.work_dir.join(run_id), &dir).await;
     }
-    if !options.keep {
+    if !options.keep && !sources.by_name.is_empty() {
+        let removing = Instant::now();
         for src in sources.by_name.values() {
             if let Err(e) = src.remove().await {
                 say!("warning: {e:#}");
             }
         }
+        say!(
+            "   sources removed ({:.1}s)",
+            removing.elapsed().as_secs_f64()
+        );
     }
     result
 }
@@ -1312,7 +1358,7 @@ async fn create_instances(
                     let work_dir = std::path::absolute(&options.work_dir)?;
                     let script_dir = std::path::absolute(&script.dir)?;
                     executor.set_container(ContainerRun {
-                        image: EXECUTOR_IMAGE.to_string(),
+                        image: options.executor_image.clone(),
                         name: format!("spicescript-{}-{run_id}-{index}-{name}", std::process::id())
                             .replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "-"),
                         volumes: vec![
@@ -1342,7 +1388,7 @@ async fn create_instances(
                 })
                 .transpose()
                 .context("the sidecar")?;
-            let mut spiced = Spiced::new(first_binary, dir, env)?;
+            let mut spiced = Spiced::new(first_binary.clone(), dir, env)?;
             let port = |name: &str| {
                 context["instance"][name]
                     .as_u64()
@@ -1366,6 +1412,7 @@ async fn create_instances(
                 variant: variant_name.clone(),
                 spiced,
                 target_binary: target.binary.clone(),
+                first_binary,
                 base_release: base_release.cloned(),
                 active_executors: executors.len().saturating_sub(spare_count),
                 executors,
@@ -1376,6 +1423,7 @@ async fn create_instances(
                 broken: None,
                 answers: BTreeMap::new(),
                 metric_marks: BTreeMap::new(),
+                file_marks: BTreeMap::new(),
                 named: BTreeMap::new(),
                 context: context_for_steps,
                 spice_cli: options.spice_cli.clone(),

@@ -17,12 +17,14 @@ limitations under the License.
 //! What Cayenne's data path needs from an S3-compatible store, checked on the
 //! store `CAYENNE_TEST_DATA_STORE=rustfs` names: ranged reads, including the
 //! short read of a range past the end that marks a truncated file, multipart
-//! uploads completed whole, and conditional writes. Skipped unless that
-//! store is selected; selected without its variables, the fixture fails.
+//! uploads completed whole or aborted without a trace, and conditional writes.
+//! Skipped unless that store is selected; selected without its variables, the
+//! fixture fails.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::TryStreamExt;
 use object_store::path::Path;
 use object_store::{
     GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
@@ -152,6 +154,44 @@ async fn a_multipart_upload_completes_whole() {
     assert!(
         read.as_ref() == bytes.as_slice(),
         "the completed object holds every part, in order"
+    );
+}
+
+/// An upload abandoned after a part, as a failed data-file write abandons it,
+/// leaves no object at its key: a reader or a listing never sees a part of it.
+#[tokio::test]
+async fn an_aborted_multipart_upload_leaves_no_object() {
+    const PART: usize = 5 << 20;
+    let Some((store, prefix)) = rustfs().await else {
+        return;
+    };
+    let directory = Path::from(format!("{prefix}/multipart-abort"));
+    let aborted = directory.clone().join("aborted.vortex");
+    let mut upload = store.put_multipart(&aborted).await.expect("start");
+    upload
+        .put_part(PutPayload::from(pattern(PART)))
+        .await
+        .expect("part");
+    upload.abort().await.expect("abort");
+    assert!(
+        matches!(
+            store.head(&aborted).await,
+            Err(object_store::Error::NotFound { .. })
+        ),
+        "no object at the aborted upload's key"
+    );
+    let listed: Vec<_> = store
+        .list(Some(&directory))
+        .try_collect()
+        .await
+        .expect("list");
+    assert_eq!(
+        listed
+            .iter()
+            .map(|meta| meta.location.to_string())
+            .collect::<Vec<_>>(),
+        Vec::<String>::new(),
+        "a listing shows no object for the aborted upload"
     );
 }
 

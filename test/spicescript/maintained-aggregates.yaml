@@ -1,4 +1,6 @@
 name: maintained-aggregates
+duration: 18s
+tags: [long]
 description: >
   A Cayenne acceleration with maintained aggregates (MIN, MAX, SUM, COUNT and
   AVG by customer, and SUM and COUNT by region over a filter) answers

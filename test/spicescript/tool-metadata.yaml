@@ -1,4 +1,5 @@
 name: tool-metadata
+duration: 1s
 description: >
   `list_datasets` returns datasets a page at a time ({"datasets", "total",
   "has_more"}), searchable by name, description and column names, with only

@@ -881,12 +881,32 @@ mod tests {
         .unwrap_or_else(|e| panic!("connect to the MCP server: {e}"))
     }
 
+    /// A request made with a read-write API key: an MCP server's tools need write access, and
+    /// these tests are about the transport, not about who may call.
+    fn read_write_request() -> std::sync::Arc<runtime_request_context::RequestContext> {
+        use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
+        let context = std::sync::Arc::new(
+            runtime_request_context::RequestContext::builder(
+                runtime_request_context::Protocol::Http,
+            )
+            .build(),
+        );
+        let principal: AuthPrincipalRef = std::sync::Arc::new(
+            spicepod::component::runtime::ApiKey::parse_str("transport-test:rw"),
+        );
+        context
+            .set_auth_principal(principal)
+            .expect("a new request has no principal yet");
+        context
+    }
+
     async fn call(catalog: &McpToolCatalog, tool: &str, args: &Value) -> Result<Value, String> {
         let tool = catalog
             .get(tool)
             .await
             .unwrap_or_else(|| panic!("tool '{tool}' is listed"));
-        tokio::time::timeout(CALL_TIMEOUT, tool.call(&args.to_string()))
+        let args = args.to_string();
+        tokio::time::timeout(CALL_TIMEOUT, read_write_request().scope(tool.call(&args)))
             .await
             .expect("the tool call finishes instead of hanging")
             .map_err(|e| e.to_string())
@@ -1066,8 +1086,10 @@ mod tests {
             let catalog = connect(url).await;
             let tool = catalog.get("hang").await.expect("tool 'hang' is listed");
 
-            let call =
-                tokio::spawn(async move { tool.call("{}").await.map_err(|e| e.to_string()) });
+            let call = tokio::spawn(
+                read_write_request()
+                    .scope(async move { tool.call("{}").await.map_err(|e| e.to_string()) }),
+            );
             wait_until_received(&upstream.hang_received, "the tool call").await;
             tokio::time::pause();
             let result = tokio::time::timeout(2 * MCP_CALL_TOOL_TIMEOUT, call)

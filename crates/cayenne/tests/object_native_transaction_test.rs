@@ -423,7 +423,7 @@ async fn a_sweep_waits_for_a_transaction_that_reserves_the_dataset() {
         .expect("publish a protected snapshot");
     assert!(
         catalog
-            .swap_protected_snapshots(&orders, std::slice::from_ref(&first), &merged, 4)
+            .swap_protected_snapshots(&orders, std::slice::from_ref(&first), &merged, 4, None)
             .await
             .expect("merge")
     );
@@ -559,6 +559,72 @@ async fn an_open_removes_the_logs_no_dataset_uses_and_keeps_the_others() {
         .commit_publications(&[publication(&audit_again, "audit-again", 1)])
         .await
         .expect("the new audit commits");
+}
+
+/// A log no dataset uses is aged on the store's clock alone: the time the
+/// store stamped on its `dropped` marker, or on its newest object when a create
+/// stopped before naming it, against the time it stamped on the registry's head
+/// when the open took it over. With the store's clock two hours behind the
+/// process's, an open keeps a log dropped moments ago, and removes it once two
+/// hours have passed on the store's clock.
+#[tokio::test]
+async fn an_open_ages_the_logs_no_dataset_uses_on_the_store_clock() {
+    let (faults, store, catalog, _orders, _audit) = setup().await;
+    faults.set_clock_back(std::time::Duration::from_hours(2));
+    let dropped_log = catalog.dataset_log("audit").expect("audit has a log");
+    assert!(catalog.drop_table("audit").await.expect("drop audit"));
+    faults.fail_while(Op::Cas, |path| path.as_ref() == "catalog/head");
+    create_fails(&catalog, "unnamed").await;
+    faults.clear_rules();
+    drop(catalog);
+    let unused_logs = async || -> Vec<String> {
+        objects_under(&store, "datasets")
+            .await
+            .into_iter()
+            .filter(|path| {
+                path.starts_with(&format!("{dropped_log}/"))
+                    || path.starts_with("datasets/unnamed-")
+            })
+            .collect()
+    };
+    let unused = unused_logs().await;
+    assert!(
+        unused.contains(&format!("{dropped_log}/dropped"))
+            && unused
+                .iter()
+                .any(|path| path.starts_with("datasets/unnamed-")),
+        "the drop wrote its marker and the stopped create its log: {unused:?}"
+    );
+
+    drop(
+        ObjectNativeCatalog::open(Arc::clone(&store), Path::from("catalog"))
+            .await
+            .expect("reopen"),
+    );
+    assert_eq!(
+        unused_logs().await,
+        unused,
+        "logs that stopped being used moments ago on the store's clock are kept"
+    );
+
+    faults.advance_clock(std::time::Duration::from_hours(2));
+    drop(
+        ObjectNativeCatalog::open(Arc::clone(&store), Path::from("catalog"))
+            .await
+            .expect("reopen"),
+    );
+    assert_eq!(
+        unused_logs().await,
+        Vec::<String>::new(),
+        "removed once older than `reclaim_after` on the store's clock"
+    );
+    assert!(
+        dataset_log_at(Arc::clone(&store), &Path::from("catalog"), "orders")
+            .await
+            .expect("read the registry")
+            .is_some(),
+        "the log of a dataset that exists is kept"
+    );
 }
 
 async fn create_fails(catalog: &ObjectNativeCatalog, name: &str) {

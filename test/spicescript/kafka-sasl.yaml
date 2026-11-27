@@ -1,4 +1,6 @@
 name: kafka-sasl
+duration: 28s
+tags: [long]
 description: >
   The Kafka connector against a Redpanda broker that requires SASL
   (SCRAM-SHA-256): JSON topics load into Cayenne with the right credentials,
