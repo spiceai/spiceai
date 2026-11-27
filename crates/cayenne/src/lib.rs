@@ -56,6 +56,7 @@ limitations under the License.
 //! - **Tables**: Metadata about table schemas and structure
 //! - **Data Files**: Metadata for virtual files (Vortex `ListingTables` at unique directories)
 
+pub(crate) mod boot_clock;
 pub mod catalog;
 pub mod catalog_provider;
 pub mod cayenne_catalog;

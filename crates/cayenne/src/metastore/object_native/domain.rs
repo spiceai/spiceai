@@ -41,12 +41,13 @@ use tokio::sync::Notify;
 
 /// What [`WriterLease::acquire`] found this instance may do with a log.
 pub(super) enum LeaseRole {
-    /// It holds the writer lease until `valid_until` unless it renews it.
+    /// Its gate closes at `valid_until_boot_ns` on the suspend-inclusive boot
+    /// clock, a twelfth of the lease early, unless it renews the lease.
     /// `continuous` when this process renewed a lease it already held; a
     /// lease it created or took over may have lapsed, and been held by
     /// another instance, since this process last wrote the log.
     Holder {
-        valid_until: std::time::Instant,
+        valid_until_boot_ns: u64,
         continuous: bool,
     },
     /// Another instance, `holder` when the lease names it, holds a live one.
@@ -82,8 +83,10 @@ impl WriterLease {
         let dataset = self.dataset.as_ref();
         // Another instance judges the lease lapsed only once the version this
         // call writes has stayed unchanged for the lease's duration since it
-        // received it, which is after this call started.
-        let started = std::time::Instant::now();
+        // received it, which is after this call started. The holder closes its
+        // gate early on a suspend-inclusive clock to cover clock rate differences.
+        // A failed clock read closes the gate until the next renewal retries.
+        let started_boot_ns = crate::boot_clock::now_ns();
         let role = self
             .lease
             .acquire(
@@ -105,7 +108,9 @@ impl WriterLease {
             })?;
         Ok(match role {
             object_store_occ::lease::Role::Holder { acquired, .. } => LeaseRole::Holder {
-                valid_until: started + self.lease.duration(),
+                valid_until_boot_ns: started_boot_ns
+                    .map(|started| holder_deadline_boot_ns(started, self.lease.duration()))
+                    .unwrap_or(0),
                 continuous: acquired
                     == object_store_occ::lease::Acquired::Renewed {
                         by_other_process: false,
@@ -171,7 +176,7 @@ impl Domain {
         });
         match role {
             LeaseRole::Holder {
-                valid_until,
+                valid_until_boot_ns,
                 continuous,
             } => {
                 // A lease this process did not hold throughout may have been
@@ -181,7 +186,7 @@ impl Domain {
                 if !continuous {
                     self.data_writes.set(false);
                 }
-                self.data_writes.hold_until(valid_until);
+                self.data_writes.hold_until_boot_ns(valid_until_boot_ns);
                 if continuous && self.data_writes.allows() {
                     return true;
                 }
@@ -414,14 +419,15 @@ impl Domain {
             Access::Writer | Access::Replica => None,
         };
         let mut config = config;
-        let mut valid_until = None;
+        let mut valid_until_boot_ns = None;
         let writer = tokio::sync::watch::Sender::new(None);
         if let Some(lease) = &lease {
             config.access = match lease.acquire().await? {
                 LeaseRole::Holder {
-                    valid_until: until, ..
+                    valid_until_boot_ns: until,
+                    ..
                 } => {
-                    valid_until = Some(until);
+                    valid_until_boot_ns = Some(until);
                     writer.send_replace(Some(lease.identity()));
                     Access::Writer
                 }
@@ -435,8 +441,8 @@ impl Domain {
             Access::Writer => crate::catalog::DataWriteGate::open(),
             Access::Replica | Access::Leased(_) => crate::catalog::DataWriteGate::closed(),
         };
-        if let Some(until) = valid_until {
-            data_writes.hold_until(until);
+        if let Some(until) = valid_until_boot_ns {
+            data_writes.hold_until_boot_ns(until);
         }
         let (inner, opened) = Inner::open(
             store,
@@ -1526,5 +1532,30 @@ impl Inner {
 fn replica_error(dataset: &str) -> CatalogError {
     CatalogError::InvalidOperationNoSource {
         message: replica_change_message(dataset),
+    }
+}
+
+/// Close a twelfth of the lease early to cover a clock rate difference of up to
+/// a twelfth between this instance and a standby over one lease. This is the
+/// rule in `standby-reads-boot-clock`; `-suspend-monotonic` and `-no-rate-margin`
+/// model runs demonstrate why both suspend-inclusive time and the margin matter.
+fn holder_deadline_boot_ns(started_boot_ns: u64, duration: std::time::Duration) -> u64 {
+    let duration_ns = duration.as_nanos();
+    let held_ns = u64::try_from(duration_ns - duration_ns / 12).unwrap_or(u64::MAX);
+    started_boot_ns.saturating_add(held_ns).min(u64::MAX - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn lease_holder_deadline_includes_rate_margin() {
+        assert_eq!(
+            super::holder_deadline_boot_ns(123, std::time::Duration::from_secs(30)),
+            123 + 27_500_000_000,
+        );
+        assert_eq!(
+            super::holder_deadline_boot_ns(u64::MAX - 2, std::time::Duration::from_secs(30)),
+            u64::MAX - 1,
+        );
     }
 }
