@@ -280,10 +280,10 @@ pub struct NodeCacheStats {
     pub evicted_bytes_unreferenced: u64,
     /// Block bytes dropped because their entry did not verify.
     pub evicted_bytes_corrupt: u64,
-    /// Cache errors, each served from the object store instead: block-store
-    /// read errors, entries that did not verify (checksum, length, key),
-    /// failed entry writes and evictions. [`NodeCache::last_error`] holds the
-    /// most recent error's message.
+    /// Cache errors: block-store read errors, entries that did not verify
+    /// (checksum, length, key), failed entry writes and failed evictions. A
+    /// read that hits one is served from the object store.
+    /// [`NodeCache::last_error`] holds the most recent error's message.
     pub fallbacks: u64,
     /// Reads passed to the object store untouched: HEAD requests, conditional
     /// reads, paths the `cacheable` predicate rejects, empty or invalid

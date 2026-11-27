@@ -169,11 +169,13 @@ async fn report_fallbacks(installed: Arc<Installed>) {
     }
 }
 
-/// The WARN for `count` cache errors in the last report period.
+/// The WARN for `count` cache errors in the last report period. An error can
+/// come from a read, a fill or an eviction; only a read that hits one goes to
+/// the object store.
 fn fallback_warning(dir: &str, count: u64, cause: Option<&str>) -> String {
     let cause = cause.unwrap_or("a cached block did not verify");
     format!(
-        "The Cayenne disk cache at '{dir}' failed {count} time(s) in the last minute, so those reads went to the object store instead: results are unchanged, but those queries were slower. Check the disk that holds '{dir}'. Last cause: {cause}. See: {CAYENNE_DOCS}"
+        "The Cayenne disk cache at '{dir}' had {count} error(s) in the last minute reading, writing or evicting cached blocks, so the reads it could not serve went to the object store: results are unchanged, but those queries were slower. Check the disk that holds '{dir}'. Last cause: {cause}. See: {CAYENNE_DOCS}"
     )
 }
 
@@ -709,7 +711,7 @@ mod tests {
                 3,
                 Some("Failed to read cache file x")
             ),
-            "The Cayenne disk cache at '/data/cache/objects' failed 3 time(s) in the last minute, so those reads went to the object store instead: results are unchanged, but those queries were slower. Check the disk that holds '/data/cache/objects'. Last cause: Failed to read cache file x. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+            "The Cayenne disk cache at '/data/cache/objects' had 3 error(s) in the last minute reading, writing or evicting cached blocks, so the reads it could not serve went to the object store: results are unchanged, but those queries were slower. Check the disk that holds '/data/cache/objects'. Last cause: Failed to read cache file x. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
         );
     }
 }

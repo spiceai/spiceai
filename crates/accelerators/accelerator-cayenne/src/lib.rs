@@ -664,7 +664,7 @@ const DISK_CACHE_INSTRUMENTS: &[DiskCacheInstrument] = &[
     DiskCacheInstrument {
         name: "cayenne_disk_cache_fallbacks",
         kind: DiskCacheInstrumentKind::Counter,
-        description: "Cumulative Cayenne disk cache errors, each read served from the object store instead.",
+        description: "Cumulative Cayenne disk cache errors reading, writing or evicting cached blocks; a read that hits one is served from the object store.",
         unit: None,
         series: &[(|stats| stats.fallbacks, None)],
     },
