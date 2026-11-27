@@ -144,16 +144,12 @@ fn top_level_value_ranges(json: &str, keys: &[&str], found: &mut [Option<Range<u
                     return;
                 };
                 let start = jiter.current_index();
-                match jiter.known_skip(peek) {
-                    Ok(()) => {
-                        let end = jiter.current_index();
-                        found[slot] = json.get(start..end).map(|_| start..end);
-                    }
-                    Err(_) => {
-                        found[slot] = json.get(start..).map(|_| start..json.len());
-                        return;
-                    }
+                if jiter.known_skip(peek).is_err() {
+                    found[slot] = json.get(start..).map(|_| start..json.len());
+                    return;
                 }
+                let end = jiter.current_index();
+                found[slot] = json.get(start..end).map(|_| start..end);
                 missing -= 1;
                 if missing == 0 {
                     return;
