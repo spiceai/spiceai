@@ -112,6 +112,11 @@ struct Replay {
     /// Extra lapse waits: a process that started after the lease was last
     /// written must watch it for a whole lease before it may take it over.
     waits: usize,
+    /// The instance the last handoff named, until it takes the lease over.
+    handed_to: Option<usize>,
+    /// Handoffs replayed, and data writes checked against the head.
+    handoffs: usize,
+    data_writes: usize,
 }
 
 impl Replay {
@@ -125,6 +130,9 @@ impl Replay {
             processes: (0..instances).map(|_| Process::default()).collect(),
             accepted: Vec::new(),
             waits: 0,
+            handed_to: None,
+            handoffs: 0,
+            data_writes: 0,
         };
         for i in 0..instances {
             replay.start(i);
@@ -303,6 +311,20 @@ impl Replay {
             StandbyStepKind::Tick => tokio::time::advance(TICK).await,
             StandbyStepKind::Acquire { instance: i, epoch } => {
                 let mut role = self.acquire(i).await?;
+                if self.handed_to.take() == Some(i) {
+                    // A handed-over lease is taken on the first read, with no
+                    // wait for it to lapse.
+                    require(
+                        matches!(
+                            role,
+                            Role::Holder {
+                                acquired: Acquired::TookOver { .. },
+                                ..
+                            }
+                        ),
+                        || format!("Acquire({i}) of the lease handed to it got {role:?}"),
+                    )?;
+                }
                 if matches!(role, Role::Standby { .. }) {
                     // This process has not watched the lease for a whole
                     // lease yet (it started after the lease was written).
@@ -454,6 +476,52 @@ impl Replay {
                     }
                 }
             }
+            StandbyStepKind::Handoff { instance: i, to } => {
+                let to = to.ok_or_else(|| format!("Handoff({i}) names no target"))?;
+                let released = self
+                    .lease(i)?
+                    .release_to(self.store.as_ref(), &lease_path(), Some(&format!("i{to}")))
+                    .await
+                    .map_err(|e| format!("Handoff({i}): {e}"))?;
+                require(released, || {
+                    format!("Handoff({i}) held no lease to hand over")
+                })?;
+                let process = &mut self.processes[i];
+                process.epoch = 0;
+                process.writer = None;
+                self.handed_to = Some(to);
+                self.handoffs += 1;
+                // Every other instance, the holder included, now stands by
+                // until the target takes the lease over.
+                self.observe(to).await?;
+                let holder = self.acquire(i).await?;
+                require(matches!(holder, Role::Standby { .. }), || {
+                    format!("the instance that handed its lease over got {holder:?}")
+                })?;
+            }
+            StandbyStepKind::DataWrite { instance: i } => {
+                // A data write is made only by the writer of the head's
+                // current generation, the generation its lease grants.
+                let head = self.head_generation().await?;
+                let lease = self.stored_lease().await?;
+                require(
+                    head == self.processes[i].epoch
+                        && lease.generation == head
+                        && lease.holder_identity == format!("i{i}"),
+                    || {
+                        format!(
+                            "instance {i} wrote data holding generation {} while the head is at {head} and the lease is {}'s at {}",
+                            self.processes[i].epoch, lease.holder_identity, lease.generation
+                        )
+                    },
+                )?;
+                self.data_writes += 1;
+            }
+            StandbyStepKind::StopWriting { instance: i } => {
+                return Err(format!(
+                    "StopWriting({i}) belongs to the release-first control, which is not replayed"
+                ));
+            }
             StandbyStepKind::Ack { .. }
             | StandbyStepKind::Pause { .. }
             | StandbyStepKind::Resume { .. }
@@ -506,10 +574,12 @@ fn instances(run: &str) -> usize {
     if run.contains("three") { 3 } else { 2 }
 }
 
-async fn replay(trace: &Trace, rule: Rule) -> TestResult<usize> {
+/// Replays `trace` on every backend: the lapse waits it needed, the handoffs it
+/// replayed and the data writes it checked.
+async fn replay(trace: &Trace, rule: Rule) -> TestResult<(usize, usize, usize)> {
     let steps = cayenne_metastore_model::standby_steps(&trace.run, &trace.actions)
         .ok_or_else(|| format!("{}: trace does not step the model", trace.run))?;
-    let mut waits = 0;
+    let mut counts = (0, 0, 0);
     let directory = tempfile::tempdir().map_err(|e| e.to_string())?;
     for (name, store) in backends(directory.path()) {
         let mut replay = Replay::new(store, instances(&trace.run), rule).await?;
@@ -521,27 +591,38 @@ async fn replay(trace: &Trace, rule: Rule) -> TestResult<usize> {
                 )
             })?;
         }
-        waits += replay.waits;
+        counts.0 += replay.waits;
+        counts.1 += replay.handoffs;
+        counts.2 += replay.data_writes;
     }
-    Ok(waits)
+    Ok(counts)
 }
 
 #[tokio::test(start_paused = true)]
 async fn standby_traces_replay_through_the_lease_and_head_log() {
     let mut all = traces(include_str!("traces/standby-retake.jsonl"));
     all.extend(traces(include_str!("traces/standby-retake-walk.jsonl")));
+    all.extend(traces(include_str!("traces/standby-handoff.jsonl")));
+    all.extend(traces(include_str!("traces/standby-handoff-walk.jsonl")));
     let mut runs = std::collections::BTreeMap::<String, usize>::new();
-    let mut waits = 0;
+    let (mut waits, mut handoffs, mut data_writes) = (0, 0, 0);
     for trace in all.iter().filter(|t| t.family == "standby") {
-        waits += replay(trace, Rule::LeaseGeneration)
+        let (w, h, d) = replay(trace, Rule::LeaseGeneration)
             .await
             .unwrap_or_else(|error| panic!("{error}"));
+        waits += w;
+        handoffs += h;
+        data_writes += d;
         *runs.entry(trace.run.clone()).or_default() += 1;
     }
     println!(
-        "REPLAYED {runs:?}; lapse waits for a process started after the lease was written: {waits}"
+        "REPLAYED {runs:?}; handoffs {handoffs}, data writes checked {data_writes}; lapse waits for a process started after the lease was written: {waits}"
     );
-    assert!(runs.values().sum::<usize>() >= 20, "{runs:?}");
+    assert!(runs.values().sum::<usize>() >= 60, "{runs:?}");
+    assert!(
+        handoffs > 0 && data_writes > 0,
+        "handoffs {handoffs}, data writes {data_writes}"
+    );
 }
 
 #[tokio::test(start_paused = true)]

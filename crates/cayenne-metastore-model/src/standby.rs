@@ -7,7 +7,17 @@
 //! generation in the head fences writers; lease timing decides availability.
 //!
 //! The lease grants the generation the head checks: every head takeover is at
-//! the generation of the lease its taker holds. In the `retake` runs a holder
+//! the generation of the lease its taker holds. In the `handoff` runs a holder
+//! hands its lease to the other instance at a commit boundary: it stops its
+//! data writes, then names that instance in the lease, which takes it over at
+//! once, without waiting for a lapse. A data write outside a commit (an upload,
+//! a delete) is made only while the writer's gate is open: it holds a
+//! generation and its own lease timer has not run out. The `release-first`
+//! control names the target before stopping its data writes; the `unnamed`
+//! control stops renewing without naming anyone, so the target waits for the
+//! lease to lapse.
+//!
+//! In the `retake` runs a holder
 //! also takes its head over again (after a commit whose outcome it could not
 //! learn, or a takeover that failed): it first moves its own lease to the next
 //! generation, then takes the head over at it. The `split` control keeps two
@@ -69,10 +79,14 @@ struct Lease {
     epoch: usize,
     /// Ticks until expiry; 0 means expired.
     left: usize,
-    /// How the holder failed since it acquired or renewed: 0 none, 1 crash, 2 pause.
+    /// How the holder failed since it acquired or renewed: 0 none, 1 crash, 2
+    /// pause, 3 let go on purpose (a handoff).
     lost: u8,
     /// `lost` of the previous holder when this lease was acquired.
     cause: u8,
+    /// The instance the holder handed the lease to, which may take it over
+    /// before it lapses.
+    handoff: Option<usize>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[expect(
@@ -107,6 +121,18 @@ pub(crate) struct State {
     head_epoch: usize,
     /// Retakes so far; at most one, to keep the runs finite.
     retakes: u8,
+    /// Handoffs so far; at most one.
+    handoffs: u8,
+    /// Ticks since a handoff whose running target has not taken the lease.
+    handoff_wait: Option<usize>,
+    /// A data write was made under a generation older than the head's.
+    stale_data: bool,
+    /// A handed-over lease was taken by the instance it names.
+    handed_over: bool,
+    /// Data writes so far; at most two, so each is a step of the trace.
+    data_writes: u8,
+    /// The instance a lease was handed to wrote data under it.
+    handed_write: bool,
     /// A standby read or a takeover needed a file on another instance's disk.
     unreadable_file: bool,
 }
@@ -120,6 +146,13 @@ pub(crate) enum Action {
     /// generation of its own lease, or, in the `split` control, at the head's
     /// next generation with the lease left as it is.
     Retake(usize),
+    /// The holder hands its lease to the next instance.
+    Handoff(usize),
+    /// In the `release-first` control: the holder, which named the target
+    /// while still writing, stops writing.
+    StopWriting(usize),
+    /// A data write outside a commit (an upload, a delete).
+    DataWrite(usize),
     Read(usize),
     Commit(usize),
     Ack(usize),
@@ -154,10 +187,11 @@ impl Protocol {
     /// An action no tick may overtake: a due renewal, an acquisition of an
     /// expired lease, or a takeover commit after acquisition.
     fn urgent(&self, s: &State) -> bool {
-        s.instances.iter().any(|n| {
+        s.instances.iter().enumerate().any(|(i, n)| {
             n.status == Status::Running
                 && (n.epoch > 0 && n.left <= 1 && !self.has("no-renew")
                     || n.epoch > 0 && n.generation == 0
+                    || s.lease.handoff == Some(i) && n.epoch != s.lease.epoch
                     || s.lease.left == 0 && n.epoch != s.lease.epoch && s.lease.epoch < EPOCHS)
         })
     }
@@ -194,6 +228,7 @@ impl Model for Protocol {
                 left: DURATION,
                 lost: 0,
                 cause: 0,
+                handoff: None,
             },
             fenced: 1,
             instances,
@@ -211,6 +246,12 @@ impl Model for Protocol {
             unreadable_file: false,
             head_epoch: 1,
             retakes: 0,
+            handoffs: 0,
+            handoff_wait: None,
+            stale_data: false,
+            handed_over: false,
+            data_writes: 0,
+            handed_write: false,
         }]
     }
     fn actions(&self, s: &State, a: &mut Vec<Action>) {
@@ -221,6 +262,9 @@ impl Model for Protocol {
                 Action::Renew(i),
                 Action::Takeover(i),
                 Action::Retake(i),
+                Action::Handoff(i),
+                Action::StopWriting(i),
+                Action::DataWrite(i),
                 Action::Read(i),
                 Action::Commit(i),
                 Action::Ack(i),
@@ -248,25 +292,40 @@ impl Model for Protocol {
                 for n in &mut next.instances {
                     n.left = n.left.saturating_sub(1);
                 }
+                // The wait counts only while the target runs: a handoff to an
+                // instance that stopped falls back to a lapse, as designed.
+                let target_runs = s
+                    .lease
+                    .handoff
+                    .is_some_and(|to| s.instances[to].status == Status::Running);
+                next.handoff_wait = s
+                    .handoff_wait
+                    .filter(|_| target_runs || self.has("unnamed"))
+                    .map(|w| (w + 1).min(DURATION + 1));
             }
             Action::Acquire(i) => {
                 let n = &s.instances[i];
                 // The lease object's conditional write admits one acquirer per
                 // epoch, and only after expiry.
+                let handed = s.lease.handoff == Some(i);
                 if !running(i)
                     || n.epoch == s.lease.epoch
                     || s.lease.epoch >= EPOCHS
-                    || s.lease.left > 0 && !self.has("early")
+                    || s.lease.left > 0 && !self.has("early") && !handed
                 {
                     return None;
                 }
-                next.churn |= s.lease.lost == 0;
+                // A lease handed over, or let go on purpose, is not churn.
+                next.churn |= s.lease.lost == 0 && !handed;
+                next.handed_over |= handed;
+                next.handoff_wait = None;
                 next.lease = Lease {
                     holder: i,
                     epoch: s.lease.epoch + 1,
                     left: DURATION,
                     lost: 0,
                     cause: s.lease.lost,
+                    handoff: None,
                 };
                 let m = &mut next.instances[i];
                 Self::step_down(m);
@@ -279,7 +338,7 @@ impl Model for Protocol {
                 if !running(i) || n.epoch == 0 || n.left >= DURATION || self.has("no-renew") {
                     return None;
                 }
-                if s.lease.epoch == n.epoch {
+                if s.lease.epoch == n.epoch && s.lease.handoff.is_none_or(|to| to == i) {
                     next.lease.left = DURATION;
                     next.lease.lost = 0;
                     next.instances[i].left = DURATION;
@@ -347,6 +406,69 @@ impl Model for Protocol {
                 let m = &mut next.instances[i];
                 m.generation = 0;
                 m.base = None;
+            }
+            Action::Handoff(i) => {
+                let n = &s.instances[i];
+                let to = (i + 1) % self.instances;
+                // At a commit boundary: nothing prepared, nothing to acknowledge.
+                if !self.has("handoff")
+                    || !running(i)
+                    || !running(to)
+                    || s.handoffs >= 1
+                    || n.generation == 0
+                    || n.left == 0
+                    || s.lease.epoch != n.epoch
+                    || n.pending.is_some()
+                    || n.to_ack.is_some()
+                {
+                    return None;
+                }
+                next.handoffs += 1;
+                next.handoff_wait = Some(0);
+                if self.has("unnamed") {
+                    // Stops writing and renewing, naming no one: the lease is
+                    // let go (not lost) and lapses after its duration.
+                    next.lease.lost = 3;
+                    Self::step_down(&mut next.instances[i]);
+                } else if self.has("release-first") {
+                    // Names the target while its own writes are still open.
+                    next.lease.handoff = Some(to);
+                    next.lease.lost = 3;
+                } else {
+                    // Stops its data writes, then names the target. The lease
+                    // is let go, not lost: if the target stops before taking
+                    // it, it lapses and anyone may take it.
+                    Self::step_down(&mut next.instances[i]);
+                    next.lease.handoff = Some(to);
+                    next.lease.lost = 3;
+                }
+            }
+            Action::StopWriting(i) => {
+                let n = &s.instances[i];
+                if !self.has("release-first")
+                    || !running(i)
+                    || n.generation == 0
+                    || s.lease.handoff.is_none_or(|to| to == i)
+                {
+                    return None;
+                }
+                Self::step_down(&mut next.instances[i]);
+            }
+            Action::DataWrite(i) => {
+                let n = &s.instances[i];
+                // The gate: a generation held and the instance's own lease
+                // timer still running.
+                if !self.has("handoff")
+                    || !running(i)
+                    || n.generation == 0
+                    || n.left == 0
+                    || s.data_writes >= 2
+                {
+                    return None;
+                }
+                next.data_writes += 1;
+                next.stale_data |= n.generation < s.head.generation;
+                next.handed_write |= s.handed_over && n.generation >= 2;
             }
             Action::Read(i) => {
                 let n = &s.instances[i];
@@ -485,6 +607,19 @@ impl Model for Protocol {
                     "instance {i} moves its lease to the next generation to take its head over again"
                 )
             }
+            Action::Handoff(i) if self.has("unnamed") => {
+                format!("instance {i} stops writing and renewing, naming no successor")
+            }
+            Action::Handoff(i) if self.has("release-first") => format!(
+                "instance {i} names instance {} in the lease while still writing",
+                (i + 1) % self.instances
+            ),
+            Action::Handoff(i) => format!(
+                "instance {i} stops writing, then hands its lease to instance {}",
+                (i + 1) % self.instances
+            ),
+            Action::StopWriting(i) => format!("instance {i} stops writing"),
+            Action::DataWrite(i) => format!("instance {i} writes a data object"),
             Action::Read(i) => format!("instance {i} reads a source change and prepares a commit"),
             Action::Commit(i) => format!("instance {i}'s commit CAS arrives at the head"),
             Action::Ack(i) => format!("instance {i} acknowledges the source"),
@@ -568,6 +703,13 @@ impl Model for Protocol {
                 Action::Retake(i) => {
                     Event::on(i, format!("retake (lease epoch {})", after.lease.epoch)).to(lease)
                 }
+                Action::Handoff(i) => Event::on(i, "hand over").to(lease),
+                Action::StopWriting(i) => Event::on(i, "stop writing"),
+                Action::DataWrite(i) => Event::on(i, "data write").tone(if after.stale_data {
+                    Tone::Bad
+                } else {
+                    Tone::Staged
+                }),
                 Action::Read(i) => Event::on(i, "read a change, prepare commit").tone(Tone::Staged),
                 Action::Commit(i) => {
                     let ok = after.head.pos > before.head.pos;
@@ -705,6 +847,29 @@ impl Model for Protocol {
                 |_, s: &State| s.acknowledged == CHANGES && s.fenced >= 2,
             ),
         ];
+        if self.has("handoff") {
+            p.extend([
+                Property::always(
+                    "no data write below the head's generation",
+                    |_, s: &State| !s.stale_data,
+                ),
+                Property::always(
+                    "a handed-over lease is taken without a lapse",
+                    |_, s: &State| s.handoff_wait.is_none_or(|wait| wait == 0),
+                ),
+                Property::sometimes(
+                    "the instance handed the lease writes data under it",
+                    |_, s: &State| s.handed_write,
+                ),
+                Property::sometimes(
+                    "a handoff completes and the new holder commits",
+                    |_, s: &State| {
+                        (s.handed_over || s.handoffs > 0 && s.fenced >= 2)
+                            && s.committers.iter().any(|&(g, _)| g >= 2)
+                    },
+                ),
+            ]);
+        }
         if self.has("retake") {
             p.push(Property::sometimes(
                 "a holder takes its head over again and commits",
@@ -778,6 +943,20 @@ pub enum StepKind {
         instance: usize,
         epoch: Option<usize>,
     },
+    /// The holder handed its lease over: to `to`, or (`None`, the `unnamed`
+    /// control) to no one.
+    Handoff {
+        instance: usize,
+        to: Option<usize>,
+    },
+    /// The holder stopped writing (the `release-first` control).
+    StopWriting {
+        instance: usize,
+    },
+    /// The instance wrote a data object outside a commit.
+    DataWrite {
+        instance: usize,
+    },
     /// The instance prepared a commit of source change `change`.
     Read {
         instance: usize,
@@ -842,6 +1021,9 @@ fn parse(text: &str) -> Option<Action> {
         ("Renew", Some(i)) => Action::Renew(i),
         ("Takeover", Some(i)) => Action::Takeover(i),
         ("Retake", Some(i)) => Action::Retake(i),
+        ("Handoff", Some(i)) => Action::Handoff(i),
+        ("StopWriting", Some(i)) => Action::StopWriting(i),
+        ("DataWrite", Some(i)) => Action::DataWrite(i),
         ("Read", Some(i)) => Action::Read(i),
         ("Commit", Some(i)) => Action::Commit(i),
         ("Ack", Some(i)) => Action::Ack(i),
@@ -883,6 +1065,12 @@ pub fn steps(mode: &str, actions: &[String]) -> Option<Vec<Step>> {
                 instance: i,
                 epoch: (!protocol.has("split")).then_some(next.lease.epoch),
             },
+            Action::Handoff(i) => StepKind::Handoff {
+                instance: i,
+                to: next.lease.handoff,
+            },
+            Action::StopWriting(i) => StepKind::StopWriting { instance: i },
+            Action::DataWrite(i) => StepKind::DataWrite { instance: i },
             Action::Read(i) => StepKind::Read {
                 instance: i,
                 change: next.instances[i].pending?.change,

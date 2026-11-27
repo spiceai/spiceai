@@ -295,6 +295,25 @@ delete the files first; the control file is then filtered to its `FAIL` line):
     EXHAUST=1 WALK=42:20:40 TRACE_JSON=$T/standby-retake-walk.jsonl $B run standby-retake
     EXHAUST=1 TRACE_JSON=$T/standby-split-generations.jsonl $B run standby-retake-split-generations
 
+`standby-handoff.jsonl` holds the witnesses of `standby-handoff` and
+`standby-handoff-three`, and `standby-handoff-walk.jsonl` 20 walks of each
+(seed 42, 40 steps):
+
+    for r in standby-handoff standby-handoff-three; do
+      EXHAUST=1 TRACE_JSON=$T/standby-handoff.jsonl $B run $r
+      EXHAUST=1 WALK=42:20:40 TRACE_JSON=$T/standby-handoff-walk.jsonl $B run $r
+    done
+
+A `Handoff` writes the holder's lease with `Lease::release_to` naming the
+target; every other instance, the holder included, must then stand by, and the
+target's next `Acquire` must take the lease over on its first read, with no
+clock advance. A `DataWrite` touches no storage; it checks that the instance
+writing holds the head's current generation and the stored lease. The two
+handoff controls (`standby-handoff-release-first`, `standby-handoff-unnamed`)
+are checked in the model only: the order they break is inside the Cayenne
+handover (data writes stop before the lease is written), which this crate does
+not drive.
+
 `../lease_replay.rs` replays each through a real `lease::Lease` per process
 (a new one, with a new process id, at each restart) and a real head-log
 `Writer`, on InMemory and LocalConditionalPut::new_durable, under tokio's

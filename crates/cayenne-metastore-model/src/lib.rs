@@ -28,6 +28,7 @@ mod standby;
 mod state_rules;
 mod transactions;
 mod window;
+mod write_units;
 
 /// A finite checker invocation with an explicit expected downstream failure.
 #[derive(Clone, Copy, Debug)]
@@ -112,7 +113,7 @@ const CURRENT_DEFECTS: [&str; 1] = ["mem-tier-current-3-exhaust"];
 /// (including the data-file replay),
 /// and the runs `crates/cayenne`'s mem-tier replay names directly. A test keeps
 /// this list equal to the runs those files name.
-const REPLAYED_AGAINST_CODE: [&str; 39] = [
+const REPLAYED_AGAINST_CODE: [&str; 41] = [
     "commits-restart-no-persist-before-send",
     "commits-restart-turnover",
     "data-files",
@@ -139,6 +140,8 @@ const REPLAYED_AGAINST_CODE: [&str; 39] = [
     "source-no-redelivery-skip",
     "source-position-before-data",
     "source-positions",
+    "standby-handoff",
+    "standby-handoff-three",
     "standby-retake",
     "standby-retake-split-generations",
     "transactions-txn-1-exhaust",
@@ -494,6 +497,38 @@ pub fn runs() -> Vec<Run> {
             bound: 0,
             seed: None,
             failure: "healthy holder keeps its lease",
+        },
+        Run {
+            name: "standby-handoff",
+            family: "standby",
+            mode: "standby-handoff",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "standby-handoff-three",
+            family: "standby",
+            mode: "standby-handoff-three",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "standby-handoff-release-first",
+            family: "standby",
+            mode: "standby-handoff-release-first",
+            bound: 0,
+            seed: None,
+            failure: "no data write below the head's generation",
+        },
+        Run {
+            name: "standby-handoff-unnamed",
+            family: "standby",
+            mode: "standby-handoff-unnamed",
+            bound: 0,
+            seed: None,
+            failure: "a handed-over lease is taken without a lapse",
         },
         Run {
             name: "standby-retake",
@@ -2714,6 +2749,23 @@ fn additional_runs() -> Vec<Run> {
             failure,
         });
     }
+    // Datasets that share a change source's consumer, leased as one unit.
+    for (name, failure) in [
+        ("write-units", ""),
+        (
+            "write-units-per-dataset",
+            "the slot never stalls on a change its consumer cannot apply",
+        ),
+    ] {
+        runs.push(Run {
+            name,
+            family: "write-units",
+            mode: name,
+            bound: 0,
+            seed: None,
+            failure,
+        });
+    }
     // Persisted lookup-index runs, named for the data files they cover.
     for (name, failure) in [
         ("index-runs", ""),
@@ -3500,6 +3552,7 @@ fn dispatch(r: Run, v: &mut impl Visitor) -> Option<bool> {
         "dataset-lifecycle" => v.visit(dataset_lifecycle::Protocol::new(r.mode, r.bound), r, None),
         "source-positions" => v.visit(source_positions::Protocol::new(r.mode, r.bound), r, None),
         "standby" => v.visit(standby::Protocol::new(r.mode), r, None),
+        "write-units" => v.visit(write_units::Protocol::new(r.mode), r, None),
         "object-names" => v.visit(object_names::Protocol::new(r.mode, r.bound), r, None),
         "reads" => v.visit(reads::Protocol::new(r.mode, r.bound), r, None),
         "data-files" => v.visit(data_files::Protocol::new(r.mode, r.bound), r, None),
@@ -3947,7 +4000,7 @@ mod explorer_tests {
             .filter(|f| !TEXT_ONLY.contains(f))
             .collect();
         assert_eq!(render.drawn, expected);
-        assert_eq!(render.families.len(), 26, "{:?}", render.families);
+        assert_eq!(render.families.len(), 27, "{:?}", render.families);
         assert!(
             render.steps > 10_000,
             "only {} steps rendered",
