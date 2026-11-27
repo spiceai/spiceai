@@ -190,7 +190,7 @@ replacement per round trip.
 **Local directories: each durable write does its own full flush.** A local
 directory is the local and on-prem path, for development, testing and getting
 started. Its state survives a process crash or kill, with no promise for an OS
-crash or a power loss ([#16134](https://github.com/spiceai/spiceai/issues/16134)).
+crash or a power loss.
 A local create or CAS syncs its
 staged file, links or renames it into place, then syncs the directory, both with
 `sync_all`, which Rust's standard library implements with `F_FULLFSYNC` on

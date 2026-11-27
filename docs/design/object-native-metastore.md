@@ -48,8 +48,7 @@ runs unchanged on a local directory.
   needs no object store or credentials and runs the same code path as a
   bucket. It is for development, testing and getting started: its state
   survives a process crash or kill, with no promise for an OS crash, a power
-  loss or the loss of the disk
-  ([#16134](https://github.com/spiceai/spiceai/issues/16134)).
+  loss or the loss of the disk.
 - **The data moves too.** Today a file-mode dataset keeps its Vortex and
   deletion files on the instance's disk, or in S3 Express where configured.
   Here every file a commit references is in the destination before the
