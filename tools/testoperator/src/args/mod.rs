@@ -18,11 +18,8 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
 
-/// The test duration of the commands that run for a time, when `--duration` is not set.
-const DEFAULT_DURATION_SECS: u64 = 60;
-
-mod bench;
-pub use bench::{BenchArgs, BenchRuns};
+mod runs;
+pub use runs::{BenchArgs, DurationArgs, Runs, RunsArgs, ThroughputArgs};
 
 mod dataset;
 pub use dataset::{
@@ -71,7 +68,7 @@ pub enum Commands {
 #[derive(Subcommand)]
 pub enum TestCommands {
     /// Run a throughput test
-    Throughput(DatasetTestArgs),
+    Throughput(ThroughputArgs),
     /// Run an extended load test
     Load(LoadTestArgs),
     /// Run a single-run benchmark
@@ -84,7 +81,7 @@ pub enum TestCommands {
     Append(AppendTestArgs),
     Search(SearchTestArgs),
     /// Execute benchmark queries against a pre-existing spiced instance
-    Query(DatasetTestArgs),
+    Query(BenchArgs),
     /// Run a text-to-sql test
     TextToSql(TextToSqlArgs),
     /// Run a streaming ingestion performance benchmark for `DynamoDB` Streams
@@ -107,10 +104,6 @@ pub struct CommonArgs {
     #[arg(short('z'), long)]
     pub(crate) spicepod_dependencies: Option<PathBuf>,
 
-    /// The number of clients to run simultaneously. Each client will send a query, wait for a response, then send another query.
-    #[arg(long, default_value = "1")]
-    pub(crate) concurrency: usize,
-
     /// Path to the spiced binary, or URL to an already-running spiced instance's Flight endpoint
     /// (e.g., `http://localhost:50051` to connect to an external instance)
     #[arg(short, long, default_value = "spiced")]
@@ -119,11 +112,6 @@ pub struct CommonArgs {
     /// The number of seconds to wait for the spiced instance to become ready
     #[arg(long, default_value = "30")]
     pub(crate) ready_wait: u64,
-
-    /// The duration of the test in seconds [default: 60]. `run bench` runs `--iterations`
-    /// passes instead, unless this is set.
-    #[arg(long)]
-    pub(crate) duration: Option<u64>,
 
     /// Whether to disable progress bars, for CI or non-interactive environments
     #[arg(long)]
@@ -196,12 +184,6 @@ pub struct CommonArgs {
 }
 
 impl CommonArgs {
-    /// `--duration`, or 60 seconds when it is not set.
-    #[must_use]
-    pub fn duration_or_default(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.duration.unwrap_or(DEFAULT_DURATION_SECS))
-    }
-
     /// Check if `spiced_path` is a URL to an external instance
     #[must_use]
     pub fn is_external_instance(&self) -> bool {

@@ -30,6 +30,10 @@ pub struct TextToSqlArgs {
     #[clap(flatten)]
     pub(crate) common: CommonArgs,
 
+    /// The number of clients to run simultaneously. Each client will send a query, wait for a response, then send another query.
+    #[arg(long, default_value = "1")]
+    pub(crate) concurrency: usize,
+
     /// The language model (named in spicepod) to perform text-to-sql
     #[arg(long)]
     pub(crate) model: String,

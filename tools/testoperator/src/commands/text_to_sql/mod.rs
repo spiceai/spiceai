@@ -76,7 +76,7 @@ pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
                 args.construct_requests()
                     .context("Cannot make text-to-SQL test cases")?,
             )
-            .with_parallel_count(args.common.concurrency),
+            .with_parallel_count(args.concurrency),
     )
     .with_spiced_instance(spiced_instance)
     .start()

@@ -143,9 +143,13 @@ For more examples, see `test/spicepods/http/queries.yaml`.
 
 ### Running Throughput Tests
 
-A throughput test replicates a benchmark test, but runs with multiple concurrent query executors. A throughput test uses the same command options as a benchmark test, except `--iterations`, with the additional options:
+A throughput test replicates a benchmark test, but runs with multiple concurrent query executors. It first runs a baseline phase with one client, then a measured phase with `--concurrency` clients. A throughput test uses the same command options as a benchmark test, except `--duration`, with these differences:
 
-- `--concurrency <CONCURRENCY>`: The number of concurrent query workers to execute the test.
+- `--concurrency <CONCURRENCY>`: The number of clients in the measured phase (default: 1).
+- `--iterations <N>`: The number of timed runs of each query by each client in the measured phase (default: 2).
+- `--baseline-iterations <N>`: The number of timed runs of each query in the baseline phase (default: 6).
+
+A throughput test has no `--duration`: its throughput metric is computed from a fixed number of runs. Use a load test to run for a time.
 
 A throughput test can specify both `--validate` and `--metrics`, but the effects of these options are ignored. Throughput tests disable snapshotting functionality, and do not support data validation.
 
@@ -169,9 +173,9 @@ testoperator run throughput -p ./benchmarks/file_tpch.yaml -s spiced -d ./.data 
 
 ### Running Load Tests
 
-A load test replicates a throughput test, but instead of running for a set number of query executions (2 by default for throughput tests) load tests run for a specified duration. A load test uses the same command options as a throughput test, with the additional options:
+A load test replicates a throughput test, but instead of running for a set number of query executions (`--iterations`, 2 by default for throughput tests) load tests run for a specified duration. A load test uses the same command options as a throughput test, except `--iterations` and `--baseline-iterations`, with the additional options:
 
-- `--duration <SECONDS>`: The duration of the load test to run in seconds.
+- `--duration <SECONDS>`: The duration of the load test to run in seconds (default: 60).
 - `--run-until-stopped`: Continue the load phase until manually interrupted (Ctrl+C). Warm-up and baseline still use `--duration` to size their runs.
 - `--mark-query-failed-if-exceeds <DURATION>`: Mark queries as failed if they exceed this duration threshold (e.g., "500ms", "2s"). Useful for identifying slow queries that should be treated as failures in metrics.
 
@@ -314,7 +318,7 @@ Where `bodies.jsonl` might look like
 
 ### Running Search Tests
 
-Search tests send each query in the `test_queries` table to the runtime, then calculate NDCG, recall, MRR, and precision at each rank cutoff `k` against the `relevance_data` table. Search tests support the common options.
+Search tests send each query in the `test_queries` table to the runtime, then calculate NDCG, recall, MRR, and precision at each rank cutoff `k` against the `relevance_data` table. Search tests support the common options and `--concurrency` (default: 1), the number of clients that send queries at the same time.
 
 `testoperator run search [OPTIONS] -p <SPICEPOD>`
 
@@ -372,6 +376,7 @@ Where options are:
   ```
 - `--sample-data-enabled`: Whether to use the `sample_data_enabled` HTTP parameter in the `v1/nsql` endpoint. Options: true, false, both. When both, runs `queryset` for both options for `sample_data_enabled`.
 - `--return-sql`: Whether to use the `Accept: application/sql` HTTP header in the `v1/nsql` endpoint. Options: true, false, both. When both, runs `queryset` for both options for `Accept`. 
+- `--concurrency <CONCURRENCY>`: The number of clients that send questions at the same time (default: 1).
 
 ### Running Append Tests
 
@@ -423,6 +428,8 @@ To run queries on an existing `spiced` instance, ensure your `spiced` instance i
 ```sh
 testoperator run query --query-set tpch --query-overrides duckdb
 ```
+
+`run query` takes the same `--concurrency`, `--iterations` and `--duration` options as `run bench`.
 
 Testoperator will run without explain plan or result snapshotting. Result validation is supported with `--validate`. For TPC-DS (and TPC-H at scale factors other than 1) that requires the running instance to already register a complete reference schema covering every query table — testoperator cannot inject `__test_reference.*` clones into a process it did not start. Add those clones with `scripts/add_test_reference_datasets.py` before starting `spiced`, then pass `--validate` (and `--reference-schema __test_reference` if the spicepod does not already qualify the clones under that schema). Telemetry and metrics emission is not supported.
 

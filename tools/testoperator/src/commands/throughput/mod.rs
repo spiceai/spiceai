@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::{get_dataset_app_and_start_request, load_app};
-use crate::{args::DatasetTestArgs, health::HealthMonitor};
+use crate::{args::ThroughputArgs, health::HealthMonitor};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
@@ -31,7 +31,8 @@ use test_framework::{
     utils::observe_memory,
 };
 
-pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
+pub(crate) async fn run(throughput_args: &ThroughputArgs) -> anyhow::Result<()> {
+    let args = &throughput_args.test_args;
     // Surface a bad connection-topology combination now, not after the
     // ready-wait.
     args.validate_fleet()?;
@@ -55,7 +56,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
 
     // Mirror bench's finally-block pattern so adapter teardown runs even if
     // the inner flow bails on an error.
-    let result = run_inner(args, app, spiced_instance).await;
+    let result = run_inner(throughput_args, app, spiced_instance).await;
 
     if let Some(session) = system_adapter_session {
         session.teardown().await;
@@ -65,10 +66,11 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
 }
 
 async fn run_inner(
-    args: &DatasetTestArgs,
+    throughput_args: &ThroughputArgs,
     app: App,
     mut spiced_instance: SpicedInstance,
 ) -> anyhow::Result<()> {
+    let args = &throughput_args.test_args;
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
@@ -85,7 +87,9 @@ async fn run_inner(
         &app,
         NotStarted::new()
             .with_parallel_count(1)
-            .with_end_condition(EndCondition::QuerySetCompleted(6))
+            .with_end_condition(EndCondition::QuerySetCompleted(
+                throughput_args.baseline_iterations.get(),
+            ))
             .with_query_executor(executor.clone()),
     )
     .await?;
@@ -116,7 +120,9 @@ async fn run_inner(
 
     let mut builder = NotStarted::new()
         .with_parallel_count(concurrency)
-        .with_end_condition(EndCondition::QuerySetCompleted(2));
+        .with_end_condition(EndCondition::QuerySetCompleted(
+            throughput_args.iterations.get(),
+        ));
     if client_executors.is_empty() {
         builder = builder.with_query_executor(executor);
     } else {

@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::{RowCounts, get_dataset_app_and_start_request, load_app};
 use crate::{
-    args::{BenchRuns, DatasetTestArgs, SourceType},
+    args::{DatasetTestArgs, Runs, SourceType},
     health::HealthMonitor,
     spiced_metrics::MetricsScraper,
 };
@@ -67,7 +67,7 @@ pub(crate) fn emit_acceleration_size_if_applicable(
     Ok(())
 }
 
-pub(crate) async fn run(args: &DatasetTestArgs, runs: BenchRuns) -> anyhow::Result<RowCounts> {
+pub(crate) async fn run(args: &DatasetTestArgs, runs: Runs) -> anyhow::Result<RowCounts> {
     super::ensure_shared_client_connections(args, "bench")?;
     super::ensure_layout_applies(args)?;
     // Two SUT acquisition paths: when a system adapter is configured, delegate
@@ -109,7 +109,7 @@ pub(crate) async fn run(args: &DatasetTestArgs, runs: BenchRuns) -> anyhow::Resu
 
 async fn run_inner(
     args: &DatasetTestArgs,
-    runs: BenchRuns,
+    runs: Runs,
     app: App,
     mut spiced_instance: SpicedInstance,
 ) -> anyhow::Result<RowCounts> {
@@ -171,7 +171,7 @@ async fn run_inner(
     // baseline run
     println!(
         "Running benchmark test: {runs:?}, {} concurrent client(s)",
-        args.common.concurrency
+        args.concurrency
     );
 
     // Create the appropriate query executor based on args
@@ -181,7 +181,7 @@ async fn run_inner(
         args,
         &app,
         NotStarted::new()
-            .with_parallel_count(args.common.concurrency)
+            .with_parallel_count(args.concurrency)
             .with_end_condition(runs.into())
             .with_validate(args.validate)
             .with_scale_factor(args.scale_factor.unwrap_or(1.0))

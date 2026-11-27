@@ -21,7 +21,7 @@ use test_framework::anyhow;
 use test_framework::layout::Layout;
 use test_framework::queries::{QueryOverrides, QuerySet};
 
-use super::CommonArgs;
+use super::{CommonArgs, DurationArgs};
 
 #[derive(Parser, Debug, Clone)]
 #[expect(clippy::struct_excessive_bools)]
@@ -66,6 +66,10 @@ pub struct QueryArgs {
 pub struct DatasetTestArgs {
     #[command(flatten)]
     pub(crate) common: CommonArgs,
+
+    /// The number of clients to run simultaneously. Each client will send a query, wait for a response, then send another query.
+    #[arg(long, default_value = "1")]
+    pub(crate) concurrency: usize,
 
     /// The expected scale factor for the test, used in metrics calculation
     #[arg(long)]
@@ -399,8 +403,7 @@ impl DatasetTestArgs {
     /// configured, otherwise `--concurrency`.
     #[must_use]
     pub fn effective_concurrency(&self) -> usize {
-        self.fleet()
-            .map_or(self.common.concurrency, |f| f.total_queries())
+        self.fleet().map_or(self.concurrency, |f| f.total_queries())
     }
 
     /// Validate the fleet flags. Called at command entry so a bad combination
@@ -511,6 +514,9 @@ pub struct DataConsistencyArgs {
 pub struct LoadTestArgs {
     #[command(flatten)]
     pub(crate) test_args: DatasetTestArgs,
+
+    #[command(flatten)]
+    pub(crate) duration: DurationArgs,
 
     #[arg(long)]
     pub(crate) no_error: bool,

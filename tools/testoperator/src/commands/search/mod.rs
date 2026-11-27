@@ -112,7 +112,7 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         app.name.clone(),
         NotStarted::new()
             .with_config(config)
-            .with_parallel_count(args.common.concurrency),
+            .with_parallel_count(args.concurrency),
     )
     .with_spiced_instance(spiced_instance)
     .start()?;
