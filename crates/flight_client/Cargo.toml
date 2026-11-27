@@ -18,7 +18,7 @@ base64.workspace = true
 bytes.workspace = true
 futures.workspace = true
 http.workspace = true
-hyper-util = { version = "0.1.20", features = ["tokio"] }
+hyper-util = { version = "0.1.20", features = ["client-legacy", "tokio"] }
 parking_lot.workspace = true
 prost.workspace = true
 rand.workspace = true
@@ -26,7 +26,7 @@ sha2.workspace = true
 rustls-native-certs = "0.8.2"
 secrecy.workspace = true
 snafu.workspace = true
-tokio = { workspace = true, features = ["fs", "net"] }
+tokio = { workspace = true, features = ["fs"] }
 tonic = { workspace = true, features = [
     "transport",
     "tls-ring",

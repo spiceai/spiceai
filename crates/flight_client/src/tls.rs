@@ -15,16 +15,14 @@ limitations under the License.
 */
 
 use base64::{Engine as _, engine::general_purpose};
-use hyper_util::rt::TokioIo;
+use hyper_util::client::legacy::connect::{HttpConnector, dns::Name};
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
-use tokio::net::TcpStream;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint, Identity, Uri};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint, Identity};
 use url::Url;
 
 #[derive(Debug, Snafu)]
@@ -326,27 +324,17 @@ pub async fn new_tls_flight_channel_to_addresses(
     addresses: Vec<IpAddr>,
 ) -> Result<Channel> {
     let (endpoint, _) = flight_endpoint(endpoint_str, &ClientTlsOptions::default()).await?;
-    let addresses: Arc<[IpAddr]> = addresses.into();
-    let connector = tower::service_fn(move |uri: Uri| {
-        let addresses = Arc::clone(&addresses);
-        async move {
-            // The port `hyper`'s connector would use for this URI.
-            let port = uri
-                .port_u16()
-                .unwrap_or(if uri.scheme_str() == Some("https") {
-                    443
-                } else {
-                    80
-                });
-            let targets: Vec<SocketAddr> = addresses
-                .iter()
-                .map(|ip| SocketAddr::new(*ip, port))
-                .collect();
-            let stream = TcpStream::connect(targets.as_slice()).await?;
-            stream.set_nodelay(true)?;
-            Ok::<_, std::io::Error>(TokioIo::new(stream))
-        }
+    // Port 0 takes the URI's port, or its scheme's default.
+    let addresses: Vec<SocketAddr> = addresses
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, 0))
+        .collect();
+    let resolver = tower::service_fn(move |_: Name| {
+        std::future::ready(Ok::<_, std::io::Error>(addresses.clone().into_iter()))
     });
+    let mut connector = HttpConnector::new_with_resolver(resolver);
+    connector.enforce_http(false);
+    connector.set_nodelay(true);
     endpoint
         .connect_with_connector(connector)
         .await

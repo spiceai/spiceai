@@ -1265,13 +1265,16 @@ async fn guarded_do_get(
 /// the `FlightInfo`.
 const REUSE_CONNECTION_SCHEME: &str = "arrow-flight-reuse-connection";
 
+/// The location schemes a query connects to over TCP.
+const TCP_LOCATION_SCHEMES: [&str; 5] = ["grpc", "grpc+tcp", "grpc+tls", "http", "https"];
+
 /// Which `FlightEndpoint` locations a query connects to, carrying the connection's bearer token.
 ///
-/// A location on the configured endpoint's host is followed as the server names it. Any other
-/// location is refused when its host is a private, loopback, or link-local address, a well-known
-/// internal name, or a name that resolves to such an address, unless
-/// [`ssrf::ALLOW_PRIVATE_HOSTS_ENV`] allows it. Otherwise it connects only to the addresses that
-/// were checked, so a second lookup cannot move it to an internal address.
+/// Unless [`ssrf::ALLOW_PRIVATE_HOSTS_ENV`] allows every location, only a TCP location is
+/// followed. One on the configured endpoint's host is followed as the server names it. Any other
+/// is refused when its host is a private, loopback, or link-local address, a well-known internal
+/// name, or a name that resolves to such an address. Otherwise it connects only to the addresses
+/// that were checked, so a second lookup cannot move it to an internal address.
 #[derive(Clone, Debug, Default)]
 pub struct EndpointLocationGuard {
     /// The configured endpoint's host, as [`ssrf::redirect_host_key`] keys it.
@@ -1317,7 +1320,11 @@ impl EndpointLocationGuard {
         if self.allow_private_hosts {
             return LocationDestination::AsNamed;
         }
-        let Some(host) = url.as_ref().and_then(location_host) else {
+        let Some(host) = url
+            .as_ref()
+            .filter(|url| TCP_LOCATION_SCHEMES.contains(&url.scheme()))
+            .and_then(location_host)
+        else {
             return LocationDestination::OriginalConnection;
         };
         if self.endpoint_host.as_deref() == Some(ssrf::redirect_host_key(&host).as_str()) {
@@ -1354,8 +1361,8 @@ fn location_host(url: &Url) -> Option<String> {
 
 fn refused_location_warning(table_name: &str, host: &str) -> String {
     format!(
-        "Flight SQL table {table_name} did not connect to '{host}', an endpoint location the server returned, so it requests that endpoint's data from the configured endpoint instead. \
-        Cause: '{host}' is a private, loopback, or link-local address. \
+        "Flight SQL table {table_name} did not connect to '{host}', an endpoint location the server returned, so it requests that endpoint's data from the configured endpoint instead, and the query fails if that endpoint cannot serve it. \
+        Cause: '{host}' is, or resolves to, a private, loopback, or link-local address. \
         If the server intentionally serves data from an internal address, set `{}=true`. \
         See: https://spiceai.org/docs/components/data-connectors/flightsql",
         ssrf::ALLOW_PRIVATE_HOSTS_ENV
@@ -2570,6 +2577,11 @@ mod tests {
                 LocationDestination::OriginalConnection,
             ),
             ("not a location", LocationDestination::OriginalConnection),
+            // tonic connects to a Unix domain socket for a `unix:` URI.
+            (
+                "unix://flight.example.com/flight.sock",
+                LocationDestination::OriginalConnection,
+            ),
         ] {
             assert_eq!(guard.destination(location).await, expected, "{location}");
         }
@@ -2584,6 +2596,17 @@ mod tests {
                 .destination("arrow-flight-reuse-connection://?")
                 .await,
             LocationDestination::OriginalConnection
+        );
+    }
+
+    #[test]
+    fn refused_location_warning_names_the_host_its_impact_and_the_setting() {
+        assert_eq!(
+            super::refused_location_warning("\"sales\".\"orders\"", "10.0.0.5"),
+            "Flight SQL table \"sales\".\"orders\" did not connect to '10.0.0.5', an endpoint location the server returned, so it requests that endpoint's data from the configured endpoint instead, and the query fails if that endpoint cannot serve it. \
+            Cause: '10.0.0.5' is, or resolves to, a private, loopback, or link-local address. \
+            If the server intentionally serves data from an internal address, set `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true`. \
+            See: https://spiceai.org/docs/components/data-connectors/flightsql"
         );
     }
 
