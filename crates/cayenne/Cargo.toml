@@ -184,6 +184,10 @@ name = "in_list_query_e2e"
 
 [[bench]]
 harness = false
+name = "json_shred_store"
+
+[[bench]]
+harness = false
 name = "lookup_index_freshness"
 
 [[bench]]

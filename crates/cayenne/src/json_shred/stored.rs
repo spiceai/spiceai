@@ -70,7 +70,7 @@ const MAX_COUNTED_KEYS: usize = 16_384;
 /// The JSON key columns every file of one write stores, after the write's own
 /// columns.
 #[derive(Debug)]
-pub(crate) struct StoredJsonKeys {
+pub struct StoredJsonKeys {
     columns: Vec<StoredColumn>,
     fields: Vec<FieldRef>,
 }
@@ -149,7 +149,8 @@ impl KeyCounts {
 impl StoredJsonKeys {
     /// The columns of `write_schema` that may be JSON: string columns the table
     /// (`table_schema`) has.
-    pub(crate) fn candidates(write_schema: &Schema, table_schema: &Schema) -> Vec<usize> {
+    #[must_use]
+    pub fn candidates(write_schema: &Schema, table_schema: &Schema) -> Vec<usize> {
         write_schema
             .fields()
             .iter()
@@ -167,7 +168,8 @@ impl StoredJsonKeys {
     /// The keys a write of `write_schema` stores for its `candidates`, chosen from
     /// the first [`SAMPLE_ROWS`] rows of `head`, its first batches. `None` when it
     /// stores none.
-    pub(crate) fn choose(
+    #[must_use]
+    pub fn choose(
         write_schema: &Schema,
         candidates: &[usize],
         head: &[RecordBatch],
@@ -214,7 +216,8 @@ impl StoredJsonKeys {
     }
 
     /// `write_schema` followed by the stored key columns: the schema of each file.
-    pub(crate) fn file_schema(&self, write_schema: &Schema) -> SchemaRef {
+    #[must_use]
+    pub fn file_schema(&self, write_schema: &Schema) -> SchemaRef {
         let mut fields: Vec<FieldRef> = write_schema.fields().iter().cloned().collect();
         fields.extend(self.fields.iter().cloned());
         Arc::new(Schema::new_with_metadata(
@@ -224,7 +227,8 @@ impl StoredJsonKeys {
     }
 
     /// The stored key columns' `(JSON column, key)` pairs, in file order.
-    pub(crate) fn keys(&self, write_schema: &Schema) -> Vec<(String, String)> {
+    #[must_use]
+    pub fn keys(&self, write_schema: &Schema) -> Vec<(String, String)> {
         self.columns
             .iter()
             .flat_map(|column| {
@@ -239,7 +243,12 @@ impl StoredJsonKeys {
 
     /// `batch` (rows of the write's schema) followed by its stored key columns,
     /// under `file_schema` ([`Self::file_schema`]).
-    pub(crate) fn append(&self, batch: &RecordBatch, file_schema: &SchemaRef) -> Result<RecordBatch> {
+    ///
+    /// # Errors
+    ///
+    /// When `batch` does not hold the write's JSON columns as strings, or the
+    /// columns do not match `file_schema`.
+    pub fn append(&self, batch: &RecordBatch, file_schema: &SchemaRef) -> Result<RecordBatch> {
         let rows = batch.num_rows();
         let mut columns = batch.columns().to_vec();
         for column in &self.columns {

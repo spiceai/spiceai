@@ -69,7 +69,9 @@ use jiter::{Jiter, Peek};
 
 pub(crate) use adapter::JsonKeyExprAdapterFactory;
 pub use rewrite::{CayenneJsonKeyRewrite, JsonKeyScanResolver, JsonKeyScanTable};
-pub(crate) use stored::{SAMPLE_ROWS as STORED_KEYS_SAMPLE_ROWS, StoredJsonKeys, append_to_stream};
+#[doc(hidden)]
+pub use stored::StoredJsonKeys;
+pub(crate) use stored::{SAMPLE_ROWS as STORED_KEYS_SAMPLE_ROWS, append_to_stream};
 
 /// The text of the value under top-level `key` in `json`, as the `json_get_*`
 /// functions find it; `None` when they find nothing: `json` is not an object, it
