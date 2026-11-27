@@ -30,8 +30,10 @@ futures.workspace = true
 hex.workspace = true
 moka.workspace = true
 object_store.workspace = true
+object_store_spawn = { path = "../object_store_spawn" }
 percent-encoding.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
+runtime-object-store = { path = "../runtime-object-store" }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
