@@ -1,0 +1,225 @@
+name: object-native-read-cache
+tags: [long]
+description: >
+  Read latency and store traffic of a Cayenne dataset whose data files are in
+  an S3 state location 20 ms away: point lookups by primary key from 16
+  clients on the instance that loaded the data, after a restart and after a
+  kill, each answer checked against PostgreSQL, with the data-file and
+  metastore reads printed before and after each load; lookups through a 20 s
+  store outage, each answer checked against the formula the rows were written
+  with; and a full scan timed on a warm instance and right after a restart.
+
+sources:
+  src: { kind: postgres }
+  slow-lake: { kind: rustfs, latency: 20ms }
+
+# Every arm keeps its data files in the slow store, with a segment cache far
+# smaller than the decoded data in all but `segment-2g`, so lookups miss it
+# as they do on a dataset larger than memory: `cache-off` reads every miss
+# from the store, `disk-cache` from the disk cache at its default size, and
+# `segment-2g` holds the whole working set in memory.
+variants:
+  cache-off:
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled, cayenne_segment_cache_mb: '16', cayenne_disk_cache_mb: '0' }
+        state: &slow-lake
+          location: s3://${sources.slow-lake.bucket}/state/
+          params:
+            s3_endpoint: ${sources.slow-lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.slow-lake.key}
+            s3_secret: ${sources.slow-lake.secret}
+            allow_http: 'true'
+  disk-cache:
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled, cayenne_segment_cache_mb: '16' }
+        state: *slow-lake
+  segment-2g:
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled, cayenne_segment_cache_mb: '2048', cayenne_disk_cache_mb: '0' }
+        state: *slow-lake
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: object-native-read-cache
+  runtime:
+    # Every query reads the dataset rather than a cached answer.
+    caching: { sql_results: { enabled: false } }
+  datasets:
+    - from: postgres:public.kv
+      name: kv
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        primary_key: id
+        params:
+          # Several data files, and no compaction to merge them or to read
+          # the store between the marks below.
+          cayenne_target_file_size_mb: '8'
+          cayenne_compaction_trigger_files: '100000'
+
+defaults:
+  expect: { oracle: src }
+  query-timeout: 60s
+
+steps:
+  # 2,000,000 rows, each a function of its key, so a lookup can be checked
+  # without the source: grp = (id * 7919) % 1000,
+  # v = (id * 2654435761) % 1000000007, s = md5(id).
+  - source-exec:
+      src: |
+        CREATE TABLE kv (id bigint PRIMARY KEY, grp int NOT NULL, v bigint NOT NULL, s text NOT NULL);
+        INSERT INTO kv SELECT i, (i * 7919) % 1000, (i * 2654435761) % 1000000007, md5(i::text) FROM generate_series(1::bigint, 2000000::bigint) i;
+        ANALYZE kv;
+  - start: {}
+  - assert-log: { contains: ["Disk cache for data in 's3://[^']+' is on at '[^']+': .*sized from memory"] }
+    only: disk-cache
+  - assert-log: { lacks: ['Disk cache for data in'] }
+    except: disk-cache
+  - query: SELECT count(*) AS n, sum(v) AS sv, count(DISTINCT grp) AS g, min(s) AS lo, max(s) AS hi FROM kv
+  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/kv-, contains: .vortex, min: 4 }
+
+  # 1. Point lookups on the instance that loaded the data.
+  # The store reads so far: all of them, then the metastore's; the data-file
+  # reads are the difference. (The data-file series alone is absent until the
+  # first one, which `wait-metric` cannot print.)
+  - &store-reads
+    wait-metric: { name: state_store_request_duration_ms_count, labels: { operation: read }, above: -1, timeout: 5s }
+  - &metastore-reads
+    wait-metric: { name: state_store_request_duration_ms_count, labels: { feature: cayenne_metastore, operation: read }, above: -1, timeout: 5s }
+  - &lookups
+    load: { corpus: corpus/object-native-read-cache.sql, clients: 16, duration: 45s }
+  - *store-reads
+  - *metastore-reads
+  # What the scans did since the instance started: data files considered and
+  # pruned (the rest are opened), and decoded-segment cache lookups and hits.
+  - &files-listed
+    wait-metric: { name: cayenne_scan_files_listed_total, labels: { table: kv }, above: -1, timeout: 5s }
+  - &files-pruned
+    wait-metric: { name: cayenne_scan_files_pruned_total, labels: { table: kv }, above: -1, timeout: 5s }
+  - &segment-lookups
+    wait-metric: { name: cayenne_segment_cache_accesses, labels: { cache: shared }, above: -1, timeout: 5s }
+  - &segment-hits
+    wait-metric: { name: cayenne_segment_cache_hits, labels: { cache: shared }, above: -1, timeout: 5s }
+
+  # A full scan of a column outside the key, on the same warm instance.
+  - &scan
+    load:
+      queries: ['SELECT count(*) AS n, sum(v) AS sv FROM kv WHERE grp = 7']
+      clients: 1
+      count: 3
+  - *store-reads
+  - *metastore-reads
+
+  # 2. After a clean restart over the same location and data directory.
+  - restart: {}
+  - *store-reads
+  - *metastore-reads
+  - *lookups
+  - *store-reads
+  - *metastore-reads
+  # The disk cache served lookups since the restart; what it fetched for them
+  # (blocks its prefetch had not reached yet) and for its prefetch.
+  - wait-metric: { name: cayenne_disk_cache_hits, above: 0, timeout: 5s }
+    only: disk-cache
+  - &disk-fetched-query
+    wait-metric: { name: cayenne_disk_cache_fetched_bytes, labels: { cause: query }, above: -1, timeout: 5s }
+    only: disk-cache
+  - &disk-fetched-prefetch
+    wait-metric: { name: cayenne_disk_cache_fetched_bytes, labels: { cause: prefetch }, above: -1, timeout: 5s }
+    only: disk-cache
+  - &disk-used
+    wait-metric: { name: cayenne_disk_cache_used_bytes, above: -1, timeout: 5s }
+    only: disk-cache
+  - *files-listed
+  - *files-pruned
+  - *segment-lookups
+  - *segment-hits
+
+  # 3. After a kill.
+  - kill-spiced: {}
+  - start: {}
+  - *store-reads
+  - *metastore-reads
+  - *lookups
+  - *store-reads
+  - *metastore-reads
+  - *disk-fetched-query
+  - *disk-fetched-prefetch
+  - *disk-used
+  - *files-listed
+  - *files-pruned
+  - *segment-lookups
+  - *segment-hits
+
+  # 4. The store stops answering for 20 s while 16 clients look up the same
+  # keys. A paused store accepts connections and answers nothing, as a
+  # partitioned network does; queries that need it wait or fail. The store
+  # reads printed as the pause starts and ends show whether any query reached
+  # the store meanwhile: a request in flight is counted when it returns.
+  - background:
+      id: outage
+      concurrency: 16
+      query: >-
+        SELECT count(*) AS n,
+          sum(CASE WHEN grp = (id * 7919) % 1000 AND v = (id * 2654435761) % 1000000007 AND s = md5(CAST(id AS VARCHAR)) THEN 1 ELSE 0 END) AS ok
+        FROM kv WHERE id = ((${round} % 256) * 7919) % 2000000 + 1
+      expect: { n: '1', ok: '1' }
+  - sleep: 10s
+  - pause-source: slow-lake
+  - *store-reads
+  - sleep: 20s
+  - *store-reads
+  - unpause-source: slow-lake
+  - sleep: 15s
+  # The disk cache holds the working set, so no lookup there may fail.
+  - stop-background: { id: outage }
+    only: disk-cache
+  - stop-background: { id: outage, allow: ['^[45][0-9][0-9] ', 'error sending request', 'connection'] }
+    except: disk-cache
+  - *store-reads
+  - *metastore-reads
+  - query: SELECT count(*) AS n, sum(v) AS sv FROM kv WHERE grp = 7
+
+  # 5. The full scan right after a restart, then again.
+  - restart: {}
+  - *store-reads
+  - *metastore-reads
+  - load:
+      queries: ['SELECT count(*) AS n, sum(v) AS sv FROM kv WHERE grp = 7']
+      clients: 1
+      count: 1
+  - *store-reads
+  - *metastore-reads
+  # A full scan prunes no file, so the pruned series is absent here.
+  - *files-listed
+  - *scan
+  - *store-reads
+  - *metastore-reads
+  - *files-listed
+
+  # 6. On a new disk, as when a pod moves to another node: the location
+  # alone serves the dataset, and the disk cache fills itself from it when
+  # the dataset opens, so the lookups after it read no data file from the
+  # store once the prefetch is done.
+  - stop: {}
+  - wipe-instance-dir: {}
+  - start: {}
+  - wait-metric: { name: cayenne_disk_cache_fetched_bytes, labels: { cause: prefetch }, above: 0, timeout: 60s }
+    only: disk-cache
+  - *store-reads
+  - *metastore-reads
+  - *lookups
+  - *store-reads
+  - *metastore-reads
+  - *disk-fetched-query
+  - *disk-fetched-prefetch
+  - *disk-used

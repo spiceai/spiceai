@@ -113,7 +113,7 @@ fn detect_path_storage(path: &Path) -> ResolvedAccelerationStorage {
     classify_block_devices(&devices)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn is_in_memory_fstype(fstype: &str) -> bool {
     matches!(fstype, "tmpfs" | "ramfs")
 }
@@ -121,9 +121,67 @@ fn is_in_memory_fstype(fstype: &str) -> bool {
 /// A network-attached filesystem (as reported by `/proc/self/mountinfo`): NFS
 /// (`nfs`/`nfs4`) or SMB (`cifs`, or the legacy `smbfs`/`smb3`). These are the
 /// networked tier — higher, variable latency — treated like `Ebs`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn is_network_fstype(fstype: &str) -> bool {
     matches!(fstype, "nfs" | "nfs4" | "cifs" | "smbfs" | "smb3")
+}
+
+/// A filesystem whose files live on other machines, or outside the guest
+/// (as `/proc/self/mountinfo` reports it): Ceph, Lustre, 9p, virtiofs, and
+/// FUSE (`fuse`, or `fuse.<subtype>` such as `fuse.s3fs`, `fuse.gcsfuse`,
+/// `fuse.mountpoint-s3` and `fuse.glusterfs`). `fuseblk`, a FUSE filesystem on
+/// a local block device, is not one.
+#[cfg(any(target_os = "linux", test))]
+fn is_remote_fstype(fstype: &str) -> bool {
+    matches!(fstype, "ceph" | "lustre" | "9p" | "virtiofs" | "fuse") || fstype.starts_with("fuse.")
+}
+
+/// Why a node disk cache must not be kept on a volume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiskCacheVolumeRefusal {
+    /// The volume is in memory (`tmpfs`, `ramfs`): a cache there takes memory
+    /// the queries need.
+    InMemory { fstype: String },
+    /// The volume is a network or remote filesystem (NFS, SMB, Ceph, Lustre,
+    /// FUSE, 9p, virtiofs): a cache there is no faster than the object store
+    /// it caches.
+    Remote { fstype: String },
+}
+
+/// The refusal for a volume of filesystem type `fstype`, as
+/// `/proc/self/mountinfo` names it.
+#[cfg(any(target_os = "linux", test))]
+fn disk_cache_refusal_of_fstype(fstype: &str) -> Option<DiskCacheVolumeRefusal> {
+    let fstype_owned = || fstype.to_string();
+    if is_in_memory_fstype(fstype) {
+        Some(DiskCacheVolumeRefusal::InMemory {
+            fstype: fstype_owned(),
+        })
+    } else if is_network_fstype(fstype) || is_remote_fstype(fstype) {
+        Some(DiskCacheVolumeRefusal::Remote {
+            fstype: fstype_owned(),
+        })
+    } else {
+        None
+    }
+}
+
+/// Why a node disk cache must not be kept at `path`, or `None` when it may.
+/// Blocking: it reads `/proc` on Linux; on other platforms it refuses nothing.
+#[must_use]
+pub fn disk_cache_volume_refusal(path: &Path) -> Option<DiskCacheVolumeRefusal> {
+    #[cfg(target_os = "linux")]
+    {
+        let detection_path = normalize_detection_path(path);
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+        let mount = find_longest_matching_mount(&detection_path, &mountinfo)?;
+        disk_cache_refusal_of_fstype(&mount.fstype)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -507,6 +565,47 @@ pub async fn probe_storage_perf_async(path: &str) -> StoragePerf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disk_cache_refuses_memory_and_remote_filesystems() {
+        let refusal = |fstype: &str| disk_cache_refusal_of_fstype(fstype);
+        for fstype in ["tmpfs", "ramfs"] {
+            assert_eq!(
+                refusal(fstype),
+                Some(DiskCacheVolumeRefusal::InMemory {
+                    fstype: fstype.to_string()
+                }),
+                "{fstype}"
+            );
+        }
+        for fstype in [
+            "nfs",
+            "nfs4",
+            "cifs",
+            "smbfs",
+            "smb3",
+            "ceph",
+            "lustre",
+            "9p",
+            "virtiofs",
+            "fuse",
+            "fuse.s3fs",
+            "fuse.gcsfuse",
+            "fuse.mountpoint-s3",
+            "fuse.glusterfs",
+        ] {
+            assert_eq!(
+                refusal(fstype),
+                Some(DiskCacheVolumeRefusal::Remote {
+                    fstype: fstype.to_string()
+                }),
+                "{fstype}"
+            );
+        }
+        for fstype in ["ext4", "xfs", "btrfs", "zfs", "overlay", "fuseblk", "apfs"] {
+            assert_eq!(refusal(fstype), None, "{fstype}");
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

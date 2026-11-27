@@ -584,6 +584,164 @@ fn compaction_budget_snapshot() -> (u64, u64) {
     )
 }
 
+/// The node disk cache's counters and contents
+/// ([`cayenne::disk_cache::process_disk_cache`]), read at scrape time. A
+/// process without the cache reports none of them.
+fn register_disk_cache_metrics(meter: &opentelemetry::metrics::Meter) {
+    register_disk_cache_instruments(meter, || {
+        cayenne::disk_cache::process_disk_cache().map(|cache| cache.stats())
+    });
+}
+
+/// Whether a disk-cache instrument is an observable counter or gauge.
+#[derive(Clone, Copy)]
+enum DiskCacheInstrumentKind {
+    Counter,
+    Gauge,
+}
+
+/// One series of a disk-cache instrument: its value in the cache's stats, and
+/// its one label, if any.
+type DiskCacheSeries = (
+    fn(&object_store_cache::NodeCacheStats) -> u64,
+    Option<(&'static str, &'static str)>,
+);
+
+/// One disk-cache instrument and the series it reports.
+struct DiskCacheInstrument {
+    name: &'static str,
+    kind: DiskCacheInstrumentKind,
+    description: &'static str,
+    unit: Option<&'static str>,
+    series: &'static [DiskCacheSeries],
+}
+
+const DISK_CACHE_INSTRUMENTS: &[DiskCacheInstrument] = &[
+    DiskCacheInstrument {
+        name: "cayenne_disk_cache_accesses",
+        kind: DiskCacheInstrumentKind::Counter,
+        description: "Cumulative blocks requested by reads through the Cayenne disk cache.",
+        unit: Some("{block}"),
+        series: &[(|stats| stats.accesses, None)],
+    },
+    DiskCacheInstrument {
+        name: "cayenne_disk_cache_hits",
+        kind: DiskCacheInstrumentKind::Counter,
+        description: "Cumulative blocks the Cayenne disk cache served without a read of the object store.",
+        unit: Some("{block}"),
+        series: &[(|stats| stats.hits, None)],
+    },
+    DiskCacheInstrument {
+        name: "cayenne_disk_cache_fetched_bytes",
+        kind: DiskCacheInstrumentKind::Counter,
+        description: "Cumulative bytes the Cayenne disk cache fetched from the object store, by cause: a query's read, or prefetch.",
+        unit: Some("By"),
+        series: &[
+            (|stats| stats.fetched_bytes_query, Some(("cause", "query"))),
+            (
+                |stats| stats.fetched_bytes_prefetch,
+                Some(("cause", "prefetch")),
+            ),
+        ],
+    },
+    DiskCacheInstrument {
+        name: "cayenne_disk_cache_evicted_bytes",
+        kind: DiskCacheInstrumentKind::Counter,
+        description: "Cumulative bytes the Cayenne disk cache evicted, by reason: to stay within its capacity, because no table references the file any more, or because an entry did not verify.",
+        unit: Some("By"),
+        series: &[
+            (|stats| stats.evicted_bytes_size, Some(("reason", "size"))),
+            (
+                |stats| stats.evicted_bytes_unreferenced,
+                Some(("reason", "unreferenced")),
+            ),
+            (
+                |stats| stats.evicted_bytes_corrupt,
+                Some(("reason", "corrupt")),
+            ),
+        ],
+    },
+    DiskCacheInstrument {
+        name: "cayenne_disk_cache_fallbacks",
+        kind: DiskCacheInstrumentKind::Counter,
+        description: "Cumulative Cayenne disk cache errors, each read served from the object store instead.",
+        unit: None,
+        series: &[(|stats| stats.fallbacks, None)],
+    },
+    DiskCacheInstrument {
+        name: "cayenne_disk_cache_used_bytes",
+        kind: DiskCacheInstrumentKind::Gauge,
+        description: "Bytes on disk the Cayenne disk cache's files take.",
+        unit: Some("By"),
+        series: &[(|stats| stats.used_bytes, None)],
+    },
+    DiskCacheInstrument {
+        name: "cayenne_disk_cache_capacity_bytes",
+        kind: DiskCacheInstrumentKind::Gauge,
+        description: "Bytes the Cayenne disk cache may hold now: its budget, or less while its volume is short of free space.",
+        unit: Some("By"),
+        series: &[(|stats| stats.capacity_bytes, None)],
+    },
+    DiskCacheInstrument {
+        name: "cayenne_disk_cache_entries_count",
+        kind: DiskCacheInstrumentKind::Gauge,
+        description: "Blocks resident in the Cayenne disk cache.",
+        unit: Some("{block}"),
+        series: &[(|stats| stats.entries, None)],
+    },
+];
+
+/// Register [`DISK_CACHE_INSTRUMENTS`] on `meter`, each observing the stats
+/// `stats` reads at scrape time; none when it reads none.
+fn register_disk_cache_instruments(
+    meter: &opentelemetry::metrics::Meter,
+    stats: fn() -> Option<object_store_cache::NodeCacheStats>,
+) {
+    fn configure<'a, I>(
+        builder: opentelemetry::metrics::AsyncInstrumentBuilder<'a, I, u64>,
+        instrument: &'static DiskCacheInstrument,
+        stats: fn() -> Option<object_store_cache::NodeCacheStats>,
+    ) -> opentelemetry::metrics::AsyncInstrumentBuilder<'a, I, u64> {
+        let builder = builder.with_description(instrument.description);
+        let builder = match instrument.unit {
+            Some(unit) => builder.with_unit(unit),
+            None => builder,
+        };
+        builder.with_callback(move |obs| {
+            let Some(stats) = stats() else {
+                return;
+            };
+            for (value, label) in instrument.series {
+                if let Some((key, label)) = label {
+                    obs.observe(value(&stats), &[opentelemetry::KeyValue::new(*key, *label)]);
+                } else {
+                    obs.observe(value(&stats), &[]);
+                }
+            }
+        })
+    }
+    for instrument in DISK_CACHE_INSTRUMENTS {
+        match instrument.kind {
+            DiskCacheInstrumentKind::Counter => {
+                let _ = configure(
+                    meter.u64_observable_counter(instrument.name),
+                    instrument,
+                    stats,
+                )
+                .build();
+            }
+            DiskCacheInstrumentKind::Gauge => {
+                let _ = configure(
+                    meter.u64_observable_gauge(instrument.name),
+                    instrument,
+                    stats,
+                )
+                .build();
+            }
+        }
+    }
+}
+
 /// Register the Cayenne write-path backpressure gauges (pull-based observable
 /// gauges on the global `cayenne` meter) so `/metrics` localizes *where* the CDC
 /// apply path is stalling: the process-global encode budget, the in-memory CDC
@@ -603,6 +761,9 @@ pub fn register_cayenne_telemetry() {
     // installed, because the cache must exist before any table is registered —
     // well before the real meter provider replaces the startup noop one.
     vortex_datafusion::register_segment_cache_metrics();
+
+    // The node disk cache, when the runtime opened one: with no cache, no series.
+    register_disk_cache_metrics(&meter);
 
     // --- Process-global encode-concurrency budget ---
     let _ = meter
@@ -3152,7 +3313,9 @@ impl CayenneAccelerator {
         // goes through the durable local object store, so local and S3 run one code
         // path. With the flag off, local tables keep today's file I/O.
         let local_through_store = !memory_mode && Self::vnext_enabled(source)?;
+        let mut disk_cache = None;
         let (dir_path, object_store) = if let Some(placement) = placement {
+            disk_cache = placement.disk_cache;
             (placement.base_path, Some(placement.store))
         } else if local_through_store && object_store.is_none() && !dir_path.starts_with("s3://") {
             // A dataset that left the state location (a rebuild that now needs
@@ -3326,6 +3489,9 @@ impl CayenneAccelerator {
                 );
             }
             builder = builder.with_object_store(object_store);
+            if let Some(binding) = disk_cache {
+                builder = builder.with_disk_cache(binding);
+            }
         } else if is_s3_express {
             return Err(Error::AccelerationCreationFailed {
                 source: Box::new(std::io::Error::other(
@@ -5485,6 +5651,7 @@ impl CayenneAccelerator {
                 return Ok(Some(ObjectNativeDataPlacement {
                     base_path: stored.path,
                     store,
+                    disk_cache: native.disk_cache().cloned(),
                 }));
             }
             Err(cayenne::CatalogError::TableNotFound { .. }) => {}
@@ -5496,7 +5663,11 @@ impl CayenneAccelerator {
             target: "spiced::acceleration::cayenne",
             "Dataset '{table_name}' (cayenne) keeps its data files in '{base_path}', beside its metadata in the state location."
         );
-        Ok(Some(ObjectNativeDataPlacement { base_path, store }))
+        Ok(Some(ObjectNativeDataPlacement {
+            base_path,
+            store,
+            disk_cache: native.disk_cache().cloned(),
+        }))
     }
     /// Where `source`'s data files are: in the state location (stored there, or a
     /// new dataset that goes there) or at its data path. Decided as
@@ -5554,6 +5725,8 @@ struct ObjectNativeDataPlacement {
     base_path: String,
     /// The location's store, routed for every dataset folder.
     store: cayenne::metadata::ObjectStoreConfig,
+    /// The node disk cache `store` reads through, if any.
+    disk_cache: Option<cayenne::disk_cache::DiskCacheBinding>,
 }
 
 #[cfg(test)]

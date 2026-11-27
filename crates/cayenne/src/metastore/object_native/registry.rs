@@ -47,6 +47,8 @@ pub struct ObjectNativeCatalog {
     /// The location's store as the data files of datasets in the location use
     /// it: the same bucket, its requests measured apart from the logs'.
     data_store: Option<Arc<dyn ObjectStore>>,
+    /// The node disk cache `data_store` reads through, if any.
+    disk_cache: Option<crate::disk_cache::DiskCacheBinding>,
     pub(super) config: NativeCatalogConfig,
     /// The name registry's log, at the catalog's prefix. It also holds tables
     /// created before datasets had logs of their own, and positions whose key
@@ -71,6 +73,28 @@ pub struct ObjectNativeCatalog {
     /// and resolved against it on every read, so a copy of the location opened
     /// at another URL reads its own data.
     anchor: Option<Arc<str>>,
+}
+
+/// One file of a table's committed state, by its table-relative key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedFile {
+    /// The file's table-relative key.
+    pub key: String,
+    /// The file's size in bytes, as its commit recorded it.
+    pub size: u64,
+    /// The newest sequence the file holds.
+    pub seq: i64,
+}
+
+/// The files of a table's committed state ([`ObjectNativeCatalog::cacheable_files`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CacheableFiles {
+    /// The data files of the snapshots a scan reads.
+    pub data: Vec<CommittedFile>,
+    /// Every deletion vector.
+    pub deletions: Vec<CommittedFile>,
+    /// The keys of files that left the live set and are not deleted yet.
+    pub retired: Vec<String>,
 }
 
 /// Which log holds each table.
@@ -319,6 +343,7 @@ impl ObjectNativeCatalog {
         let catalog = Self {
             store,
             data_store: None,
+            disk_cache: None,
             config,
             registry,
             prefix,
@@ -745,6 +770,40 @@ impl ObjectNativeCatalog {
     pub fn data_store(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(self.data_store.as_ref().unwrap_or(&self.store))
     }
+    /// Datasets in the location read their data files through `cache`, which
+    /// holds them under `namespace`: [`Self::data_store`] becomes the store set
+    /// so far (by [`Self::with_data_store`]) wrapped by the cache, and the cache
+    /// holds only the committed data files and deletion vectors under
+    /// [`Self::datasets_prefix`].
+    #[must_use]
+    pub fn with_disk_cache(
+        mut self,
+        cache: Arc<object_store_cache::NodeCache>,
+        namespace: &str,
+    ) -> Self {
+        let binding =
+            crate::disk_cache::DiskCacheBinding::new(cache, namespace, self.datasets.clone());
+        self.data_store = Some(binding.wrap(self.data_store()));
+        self.disk_cache = Some(binding);
+        self
+    }
+    /// The node disk cache [`Self::data_store`] reads through, if any.
+    #[must_use]
+    pub fn disk_cache(&self) -> Option<&crate::disk_cache::DiskCacheBinding> {
+        self.disk_cache.as_ref()
+    }
+    /// The files of `table_id`'s committed state: the data files and deletion
+    /// vectors a scan reads, with their sizes, and the retired ones not yet
+    /// deleted. `None` while a change to the table is applied but not
+    /// committed, its last commit's outcome is unknown, or a transaction
+    /// reserves it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::TableNotFound`] for a table the catalog does not hold.
+    pub async fn cacheable_files(&self, table_id: &str) -> CatalogResult<Option<CacheableFiles>> {
+        self.for_table(table_id).cacheable_files(table_id).await
+    }
     /// Open the logs of datasets the registry names that this catalog has not
     /// opened yet: datasets another instance created since this one opened.
     async fn open_new_dataset_logs(&self) -> CatalogResult<()> {
@@ -946,9 +1005,17 @@ impl ObjectNativeCatalog {
         {
             return false;
         }
-        // `<folder>/data[/…]` under the datasets prefix.
-        key.prefix_match(&self.datasets).is_some_and(|mut rest| {
-            rest.next().is_some() && rest.next().is_some_and(|part| part.as_ref() == "data")
-        })
+        under_dataset_data(&self.datasets, &key).is_some()
+    }
+}
+
+/// The part of `key` under a dataset folder's data path,
+/// `<datasets>/<folder>/data`, without the separating `/`: empty for the data
+/// path itself, `None` when `key` is not under one.
+pub(crate) fn under_dataset_data<'a>(datasets: &Path, key: &'a Path) -> Option<&'a str> {
+    let (_folder, rest) = crate::object_relative(datasets, key)?.split_once('/')?;
+    match rest.strip_prefix("data")? {
+        "" => Some(""),
+        under => under.strip_prefix('/'),
     }
 }

@@ -2514,6 +2514,16 @@ impl Runtime {
             }
         }
 
+        // Closed after the compaction drain: compaction reads data files through
+        // the cache as queries do, and a read after the close still works but
+        // fills nothing. A clean close seals the slab being written, so the next
+        // start reads only indexes; a process killed instead rescans that slab
+        // on its next start.
+        cayenne::disk_cache::close_process_disk_cache(
+            shutdown_timeout.saturating_sub(start_time.elapsed()),
+        )
+        .await;
+
         // `dataconnector`, `catalogconnector`, and `document_parse` hold only
         // stateless factories (see the comments atop their `register_all()`)
         // — clearing them here would strip connectors/parsers out from

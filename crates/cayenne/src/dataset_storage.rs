@@ -47,6 +47,8 @@ use object_store::{
     ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
 };
 
+use crate::CAYENNE_DOCS_URL as CAYENNE_DOCS;
+
 /// The URL scheme each dataset's store is registered under in a `RuntimeEnv`.
 pub const DATASET_STORE_SCHEME: &str = "cayenne";
 
@@ -54,8 +56,6 @@ const STORE_NAME: &str = "cayenne";
 
 /// Deletes are passed to the inner store in batches of at most this many paths.
 pub(crate) const DELETE_BATCH: usize = 1_000;
-
-const CAYENNE_DOCS: &str = "https://spiceai.org/docs/components/data-accelerators/cayenne";
 
 /// Which of a dataset's files a [`DataFileError`] is about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

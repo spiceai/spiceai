@@ -1,0 +1,36 @@
+[package]
+name = "object-store-cache"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository.workspace = true
+description = "Node-local disk cache of immutable object-store byte blocks"
+autotests = false
+autobenches = false
+
+[dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+crc-fast.workspace = true
+fs4.workspace = true
+futures.workspace = true
+object_store.workspace = true
+parking_lot.workspace = true
+snafu.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "fs", "time"] }
+tokio-util.workspace = true
+
+[dev-dependencies]
+libc = "0.2"
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "fs", "process", "io-util"] }
+
+# One integration test binary for the crate (docs/dev/integration_test_layout.md).
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[lints]
+workspace = true

@@ -67,6 +67,7 @@ pub use ddl::CayenneDdlHandler;
 pub(crate) mod bounded_fifo;
 pub mod cte_materialization;
 pub mod dataset_storage;
+pub mod disk_cache;
 pub mod logical_optimizer;
 pub mod maintained_aggregate;
 pub mod metadata;
@@ -166,6 +167,38 @@ pub use provider::{
 };
 pub use schema::{CAYENNE_TYPE_REWRITE_RULES, transform_schema_for_vortex};
 
+/// Cayenne's documentation, linked from the messages it reports.
+pub const CAYENNE_DOCS_URL: &str = "https://spiceai.org/docs/components/data-accelerators/cayenne";
+
+/// `runtime.params` key that puts new file-mode Cayenne datasets on the
+/// object-native metastore: `enabled` or `disabled` (the default).
+pub const CAYENNE_VNEXT_PARAM: &str = "cayenne_vnext";
+
+/// A [`CAYENNE_VNEXT_PARAM`] value other than `enabled` or `disabled`.
+#[derive(Debug, snafu::Snafu)]
+#[snafu(display(
+    "`runtime.params.{CAYENNE_VNEXT_PARAM}` is '{value}'. Set it to 'enabled' or 'disabled'."
+))]
+pub struct InvalidVnextValue {
+    value: String,
+}
+
+/// Whether `params` (`runtime.params`) set [`CAYENNE_VNEXT_PARAM`] to
+/// `enabled`: new file-mode datasets then use the object-native metastore.
+///
+/// # Errors
+///
+/// Returns [`InvalidVnextValue`] for a value other than `enabled` or `disabled`.
+pub fn vnext_enabled<S: std::hash::BuildHasher>(
+    params: &std::collections::HashMap<String, String, S>,
+) -> Result<bool, InvalidVnextValue> {
+    match params.get(CAYENNE_VNEXT_PARAM).map(String::as_str) {
+        None | Some("disabled") => Ok(false),
+        Some("enabled") => Ok(true),
+        Some(other) => InvalidVnextValueSnafu { value: other }.fail(),
+    }
+}
+
 /// Whether a table path names an object-store location (`s3://`, a local
 /// directory addressed as `file://`, or a dataset's run-time URL `cayenne://`;
 /// see [`dataset_storage`]), so every data operation goes through the table's
@@ -203,6 +236,33 @@ pub(crate) fn object_relative<'a>(
         return Some(location.as_ref());
     }
     location.as_ref().strip_prefix(prefix)?.strip_prefix('/')
+}
+
+#[cfg(test)]
+mod vnext_tests {
+    use super::{CAYENNE_VNEXT_PARAM, vnext_enabled};
+    use std::collections::HashMap;
+
+    #[test]
+    fn vnext_accepts_enabled_and_disabled_and_names_the_fix_otherwise() {
+        let parse = |value: Option<&str>| {
+            let params: HashMap<String, String> = value
+                .map(|value| (CAYENNE_VNEXT_PARAM.to_string(), value.to_string()))
+                .into_iter()
+                .collect();
+            vnext_enabled(&params).map_err(|error| error.to_string())
+        };
+        assert_eq!(parse(None), Ok(false));
+        assert_eq!(parse(Some("disabled")), Ok(false));
+        assert_eq!(parse(Some("enabled")), Ok(true));
+        assert_eq!(
+            parse(Some("yes")),
+            Err(
+                "`runtime.params.cayenne_vnext` is 'yes'. Set it to 'enabled' or 'disabled'."
+                    .to_string()
+            )
+        );
+    }
 }
 
 #[cfg(test)]

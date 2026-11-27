@@ -293,6 +293,28 @@ impl S3ObjectStoreBuilder {
         self
     }
 
+    /// The endpoint the built store sends requests to when it is not AWS's
+    /// default for the region: the one set on this builder, or else the one
+    /// the environment sets (`AWS_ENDPOINT_URL`, `AWS_ENDPOINT`).
+    #[must_use]
+    pub fn effective_endpoint(&self) -> Option<String> {
+        self.base_s3_builder()
+            .get_config_value(&object_store::aws::AmazonS3ConfigKey::Endpoint)
+    }
+
+    /// The environment's `AmazonS3Builder` with this builder's bucket, region
+    /// and endpoint: what [`Self::build`] builds the store from.
+    fn base_s3_builder(&self) -> AmazonS3Builder {
+        let mut s3_builder = AmazonS3Builder::from_env().with_bucket_name(&self.bucket_name);
+        if let Some(region) = &self.region {
+            s3_builder = s3_builder.with_region(region);
+        }
+        if let Some(endpoint) = &self.endpoint {
+            s3_builder = s3_builder.with_endpoint(endpoint);
+        }
+        s3_builder
+    }
+
     /// Sets explicit AWS credentials.
     #[must_use]
     pub fn with_credentials(
@@ -363,24 +385,19 @@ impl S3ObjectStoreBuilder {
     /// - Credential loading from the environment fails
     /// - The object store cannot be built
     pub async fn build(self) -> Result<Arc<dyn ObjectStore>> {
-        let mut s3_builder = AmazonS3Builder::from_env()
-            .with_bucket_name(&self.bucket_name)
+        let mut s3_builder = self
+            .base_s3_builder()
             .with_http_connector(SpawnedReqwestConnector::new(self.io_runtime));
 
         let mut client_options = ClientOptions::default();
 
-        // Apply region
-        if let Some(region) = &self.region {
-            s3_builder = s3_builder.with_region(region);
-        }
-
-        // Apply endpoint
-        if let Some(endpoint) = &self.endpoint {
-            s3_builder = s3_builder.with_endpoint(endpoint);
-            // Automatically allow HTTP if endpoint uses HTTP
-            if endpoint.starts_with("http://") {
-                client_options = client_options.with_allow_http(true);
-            }
+        // Automatically allow HTTP if endpoint uses HTTP
+        if self
+            .endpoint
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.starts_with("http://"))
+        {
+            client_options = client_options.with_allow_http(true);
         }
 
         // Apply client timeout

@@ -31,7 +31,11 @@ mod publish;
 mod registry;
 mod slot;
 mod transactions;
-pub use registry::{ObjectNativeCatalog, TableDeletionHolds, dataset_log_at, new_dataset_folder};
+pub(crate) use registry::under_dataset_data;
+pub use registry::{
+    CacheableFiles, CommittedFile, ObjectNativeCatalog, TableDeletionHolds, dataset_log_at,
+    new_dataset_folder,
+};
 
 /// One head log: a serial writer and its last acknowledged state. The catalog
 /// keeps one for its name registry and one per dataset. No database is used.

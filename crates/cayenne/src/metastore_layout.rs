@@ -57,6 +57,20 @@ pub use util::spice_paths::fs_probe_path;
 /// folder, and the folder `file_create` replaces, stay as long.
 pub const DATA_FILE_RETENTION: std::time::Duration = std::time::Duration::from_hours(1);
 
+/// What is left of `retention` at `now` for a file first observed retired at
+/// `observed`; `None` once it has passed. The retired-file sweep deletes a file
+/// at that point, and the node disk cache stops keeping it.
+#[must_use]
+pub(crate) fn retention_left(
+    observed: std::time::Instant,
+    now: std::time::Instant,
+    retention: std::time::Duration,
+) -> Option<std::time::Duration> {
+    retention
+        .checked_sub(now.saturating_duration_since(observed))
+        .filter(|left| !left.is_zero())
+}
+
 /// Configuration error for data outside the object-native state location.
 #[must_use]
 pub fn object_native_data_path_refusal(dataset: &str) -> String {
