@@ -240,13 +240,20 @@ pub(super) async fn run_load(
         }
         tokio::time::sleep_until(tokio::time::Instant::from_std(shared.start + fault.at)).await;
         let began = shared.start.elapsed();
-        let mut outcome = Box::pin(super::steps::run_instance_step(
-            script,
-            instance,
-            &fault.step,
-            sources,
-        ))
-        .await;
+        // A source fault acts on the source every instance shares, as the
+        // step of that name does; run at once on several instances, the
+        // first changes it and the rest find it changed.
+        let mut outcome = if super::controls_source(&fault.step.action) {
+            super::steps::run_source_step(&fault.step.action, sources).await
+        } else {
+            Box::pin(super::steps::run_instance_step(
+                script,
+                instance,
+                &fault.step,
+                sources,
+            ))
+            .await
+        };
         note_broken(instance, &fault.step, &mut outcome).await;
         let what = super::steps::describe_step(&fault.step);
         if let Err(e) = outcome {

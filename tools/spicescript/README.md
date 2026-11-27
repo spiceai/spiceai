@@ -309,7 +309,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `downgrade: {}` | Like `restart`, but starts the binary the instance started on, the release `from:` or `--from` names: a rollback after an `upgrade`. |
 | `wait-ready: { timeout }` | Wait for `/v1/ready`. |
 | `edit-spicepod: <patch>` | Rewrite the running instance's spicepod (for `--pods-watcher-enabled`). |
-| `start-source`, `stop-source`, `pause-source`, `unpause-source: <name>` | Control a source container; it keeps its host port across a stop. |
+| `start-source`, `stop-source`, `pause-source`, `unpause-source: <name>` | Control a source container; it keeps its host port across a stop. On a `rustfs` source with `latency:`, a stop and start take its proxy with it, configured again; a pause freezes the store alone, so connections through the proxy open and get no answer. Each may also be a `load` fault. |
 | `source-exec: { <name>: <sql, list, or { file }> }` | Run statements on a source, in this instance's database. On an object store (`rustfs`), one command per line in the instance's bucket: `delete-first <prefix> <contains>` and `truncate-first <prefix> <contains>` delete, or keep the first half of, the first key in key order under the prefix that contains the text; `copy <from-prefix> <to-prefix>` copies every object under a prefix, and `delete-prefix <prefix>` deletes them. |
 | `write: { <source>: <sql or list> }` | Execute PostgreSQL DML on the required `mirror: <postgres source>` and apply its row images to the target. `key: <column>` defaults to `id`. |
 | `source-query: { <name>: <sql> }` | Ask a source directly and check `expect: { rows }`. |
@@ -331,7 +331,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `sample-objects: { source, prefix, contains, every, for, max-objects, max-bytes }` | Sample the count and total bytes of the objects under a prefix every `every` for `for` (at least six samples), as a series printed with the step. Fails when a sample is over `max-objects` or `max-bytes`, or when the series trends upward: the peak of its last third is more than a quarter (and at least one) above the peak of its middle third. Pair it with a `background` writer for a fixed-rate run. |
 | `mark-metrics: <id>` | Keep a `/metrics` scrape for a later `wait-metric … since:`. |
 | `mark-files: <id>` or `{ id, matching }` | Record the size and contents of every file under the instance's directory (but `spicepod.yaml` and `spiced.log`), or of those whose relative path matches a `matching` pattern, for a later `assert-files: { unchanged-since: <id> }`. Fails when it records nothing. |
-| `wait-metric: { name, labels, above \| below \| increases \| increased-by, since, timeout, drive }` | Wait for a series to meet a condition. `drive` writes new data each round while waiting, for conditions (such as a compaction) that need new data rather than time. |
+| `wait-metric: { name, labels, above \| below \| increases \| increased-by \| increased-at-most, since, timeout, drive }` | Wait for a series to meet a condition. `increased-by: n` waits for a rise of exactly `n` since `mark-metrics: since` (or since the step started); `increased-at-most: n` checks once that the series rose by at most `n` since its `since` mark, which it needs, an absent series counting as 0 at either end. Both print the rise beside the value (`reads = 14 (+4 since \`mark-metrics: before\`)`). `drive` writes new data each round while waiting, for conditions (such as a compaction) that need new data rather than time; `increased-at-most` takes none. |
 | `background: { id, query \| source-exec, concurrency, every, expect }` | Loop a query or a source write until `stop-background: <id>`. `expect: { column: value }` is an invariant every answer must keep. `${round}` counts iterations. |
 | `stop-background: { id, allow }` | Stop it; fails on any error not matching `allow`. Prints the iteration count, the P99 latency and the commonest allowed errors. |
 | `load: { queries \| corpus, clients, duration \| count, expect, faults, recover-within, … }` | Queries from many clients at once, every answer checked, with faults applied while they run (see [Load](#load)). |
@@ -574,9 +574,14 @@ instance (`on:` chooses).
   connection, which reconnects by itself.
 - **Faults** are steps (`start`, `stop`, `kill-spiced`, `restart`,
   `upgrade`, `wait-ready`, `kill-executor`, `start-executors`,
-  `add-executor`) with an `at:` offset, run in order of `at` (or once the
+  `add-executor`, `start-source`, `stop-source`, `pause-source`,
+  `unpause-source`) with an `at:` offset, run in order of `at` (or once the
   one before finishes), on the instance as the steps around the load see it;
-  each takes `on:`, `cluster:`, `when:`, `only:` and `except:`. Faults need a
+  each takes `cluster:`, `when:`, `only:` and `except:`, and those that reach
+  a `spiced` take `on:`. A source fault acts on the source the instances
+  share, as its step does, so a script with one runs its instances in
+  lockstep; when several instances run the load at once, the first to reach
+  the fault changes the source and the rest find it changed. Faults need a
   `duration` and `recover-within`. A fault that fails stops the load and
   fails the step.
 - **Output.** The step reports its queries, right answers per second, and

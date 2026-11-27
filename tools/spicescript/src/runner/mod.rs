@@ -316,13 +316,8 @@ fn schedule(script: &Script, steps: &[Step]) -> Schedule {
         Schedule::Exclusive
     } else if script.defaults.run_variants == RunVariants::SideBySide
         || steps.iter().any(|s| {
-            matches!(
-                s.action,
-                Action::StartSource(_)
-                    | Action::StopSource(_)
-                    | Action::PauseSource(_)
-                    | Action::UnpauseSource(_)
-            )
+            controls_source(&s.action)
+                || matches!(&s.action, Action::Load(load) if load.faults.iter().any(|f| controls_source(&f.step.action)))
         })
     {
         Schedule::Lockstep
@@ -617,7 +612,9 @@ enum SourceState {
 
 struct Sources {
     by_name: IndexMap<String, Arc<dyn Source>>,
-    state: BTreeMap<String, SourceState>,
+    /// Held across a change of state, so that a source the instances share
+    /// changes once when several loads' faults change it at once.
+    state: tokio::sync::Mutex<BTreeMap<String, SourceState>>,
     /// Each source's resolved kind (`postgres`, `mysql`).
     kinds: BTreeMap<String, String>,
 }
@@ -630,34 +627,35 @@ impl Sources {
             .ok_or_else(|| anyhow!("unknown source '{name}'"))
     }
 
-    async fn set(&mut self, name: &str, target: SourceState) -> Result<()> {
-        let current = *self
-            .state
+    async fn set(&self, name: &str, target: SourceState) -> Result<()> {
+        let mut state = self.state.lock().await;
+        let current = *state
             .get(name)
             .ok_or_else(|| anyhow!("unknown source '{name}'"))?;
         if current == target {
             return Ok(());
         }
-        let container = self
-            .get(name)?
-            .container()
-            .ok_or_else(|| anyhow!("source '{name}' has no server to stop, start or pause"))?;
+        let source = self.get(name)?;
+        ensure!(
+            source.container().is_some(),
+            "source '{name}' has no server to stop, start or pause"
+        );
         match (current, target) {
             (a, b) if a == b => {}
-            (SourceState::Running, SourceState::Stopped) => container.stop().await?,
-            (SourceState::Running, SourceState::Paused) => container.pause().await?,
-            (SourceState::Stopped, SourceState::Running) => container.start_stopped().await?,
-            (SourceState::Paused, SourceState::Running) => container.unpause().await?,
+            (SourceState::Running, SourceState::Stopped) => source.stop_server().await?,
+            (SourceState::Running, SourceState::Paused) => source.pause_server().await?,
+            (SourceState::Stopped, SourceState::Running) => source.start_server().await?,
+            (SourceState::Paused, SourceState::Running) => source.unpause_server().await?,
             (SourceState::Paused, SourceState::Stopped) => {
-                container.unpause().await?;
-                container.stop().await?;
+                source.unpause_server().await?;
+                source.stop_server().await?;
             }
             (SourceState::Stopped, SourceState::Paused) => {
                 bail!("source '{name}' is stopped; start it before pausing it")
             }
             _ => unreachable!("every pair of states is handled"),
         }
-        self.state.insert(name.to_string(), target);
+        state.insert(name.to_string(), target);
         Ok(())
     }
 }
@@ -814,7 +812,7 @@ async fn run_combination(
         .await?;
     let mut sources = Sources {
         by_name: IndexMap::new(),
-        state: BTreeMap::new(),
+        state: tokio::sync::Mutex::new(BTreeMap::new()),
         kinds: BTreeMap::new(),
     };
     let result = async {
@@ -861,7 +859,10 @@ async fn run_combination(
                 took.as_secs_f64()
             );
             sources.by_name.insert(name.clone(), Arc::from(src));
-            sources.state.insert(name.clone(), SourceState::Running);
+            sources
+                .state
+                .get_mut()
+                .insert(name.clone(), SourceState::Running);
             key_room.release(source::containers(&kind));
             sources.kinds.insert(name.clone(), kind);
         }
@@ -1488,15 +1489,19 @@ fn sidecar_args(spec: &SidecarSpec, context: &Value) -> Result<Vec<String>> {
 /// The variable a `spice.ai:` dataset's `spiceai_api_key` defaults to.
 const SPICEAI_API_KEY: &str = "SPICEAI_API_KEY";
 
-fn is_source_step(action: &Action) -> bool {
+/// Whether a step stops, starts or pauses a source.
+fn controls_source(action: &Action) -> bool {
     matches!(
         action,
         Action::StartSource(_)
             | Action::StopSource(_)
             | Action::PauseSource(_)
             | Action::UnpauseSource(_)
-            | Action::Sleep(_)
     )
+}
+
+fn is_source_step(action: &Action) -> bool {
+    controls_source(action) || matches!(action, Action::Sleep(_))
 }
 
 async fn run_lockstep(
@@ -2027,6 +2032,26 @@ mod tests {
         assert_eq!(reservation.remaining(), 1);
         room.executor_started(1);
         assert_eq!(reservation.remaining(), 0);
+    }
+
+    /// A load that stops a source runs its instances in lockstep, as the
+    /// step `stop-source` does: the source is shared by every instance.
+    #[test]
+    fn a_load_with_a_source_fault_runs_in_lockstep() {
+        let parse = |steps: &str| {
+            Script::parse(&format!(
+                "name: s\nspicepod: {{}}\nvariants: {{ a: {{}}, b: {{}} }}\nsteps: {steps}"
+            ))
+            .expect("script parses")
+        };
+        let with = parse(
+            "[{ load: { queries: [SELECT 1], duration: 5s, recover-within: 1s, faults: [{ at: 1s, stop-source: lake }] } }]",
+        );
+        assert!(schedule(&with, &with.steps) == Schedule::Lockstep);
+        let without = parse(
+            "[{ load: { queries: [SELECT 1], duration: 5s, recover-within: 1s, faults: [{ at: 1s, restart: {} }] } }]",
+        );
+        assert!(schedule(&without, &without.steps) == Schedule::Independent);
     }
 
     #[test]

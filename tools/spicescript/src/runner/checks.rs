@@ -303,10 +303,14 @@ pub(super) async fn wait_metric(
 ) -> Result<String> {
     let started = Instant::now();
     let read = |text: &str, name: &str| metric_value(text, name, &w.labels);
-    let baseline = match &w.condition {
-        MetricCondition::IncreasedBy {
-            since: Some(mark), ..
-        } => read(
+    // The conditions on a rise report it, from the mark or the step's start.
+    let (rise, since) = match &w.condition {
+        MetricCondition::IncreasedBy { since, .. } => (true, since.as_deref()),
+        MetricCondition::IncreasedAtMost { since, .. } => (true, Some(since.as_str())),
+        _ => (false, None),
+    };
+    let baseline = match since {
+        Some(mark) => read(
             instance
                 .metric_marks
                 .get(mark)
@@ -314,7 +318,7 @@ pub(super) async fn wait_metric(
             &w.name,
         )
         .unwrap_or(0.0),
-        _ => read(&instance.spiced.metrics().await?, &w.name).unwrap_or(0.0),
+        None => read(&instance.spiced.metrics().await?, &w.name).unwrap_or(0.0),
     };
     let mut round = 0u32;
     let mut last_drive = Instant::now();
@@ -339,6 +343,10 @@ pub(super) async fn wait_metric(
         let text = instance.spiced.metrics().await?;
         let value = read(&text, &w.name);
         let met = match (&w.condition, value) {
+            (MetricCondition::IncreasedAtMost { amount, since }, v) => {
+                rose_at_most(&w.name, v, baseline, *amount, since)?;
+                true
+            }
             (_, None) => false,
             (MetricCondition::Above(x), Some(v)) => v > *x,
             (MetricCondition::Below(x), Some(v)) => v < *x,
@@ -357,7 +365,11 @@ pub(super) async fn wait_metric(
                 (v - baseline - amount).abs() <= f64::EPSILON
             }
         };
-        let last = format!("{} = {value:?}", w.name);
+        let last = if rise {
+            rise_text(&w.name, value, baseline, since)
+        } else {
+            format!("{} = {value:?}", w.name)
+        };
         if met {
             return Ok(if round > 0 {
                 format!("{last} after {round} rounds")
@@ -373,6 +385,36 @@ pub(super) async fn wait_metric(
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Fails unless the series rose by at most `amount` from `baseline`, an
+/// absent series counting as 0.
+fn rose_at_most(
+    name: &str,
+    value: Option<f64>,
+    baseline: f64,
+    amount: f64,
+    since: &str,
+) -> Result<()> {
+    let now = value.unwrap_or(0.0);
+    let delta = now - baseline;
+    ensure!(
+        delta <= amount + f64::EPSILON,
+        "{name} rose by {delta} since `mark-metrics: {since}` (from {baseline} to {now}), more than {amount}"
+    );
+    Ok(())
+}
+
+/// A series and its rise since the mark, or since the step started, with an
+/// absent series shown as such and counted as 0.
+fn rise_text(name: &str, value: Option<f64>, baseline: f64, since: Option<&str>) -> String {
+    let now = value.map_or_else(|| "absent".to_string(), |v| format!("= {v}"));
+    let delta = value.unwrap_or(0.0) - baseline;
+    let from = since.map_or_else(
+        || "since the step started".to_string(),
+        |mark| format!("since `mark-metrics: {mark}`"),
+    );
+    format!("{name} {now} ({delta:+} {from})")
 }
 
 /// Checks a dataset's status until its timing is satisfied; returns what it saw.
@@ -429,7 +471,7 @@ pub(super) async fn assert_status(instance: &mut Instance, step: &StatusStep) ->
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::metric_value;
+    use super::{metric_value, rise_text, rose_at_most};
 
     #[test]
     fn metric_labels_are_read_as_quoted_escaped_values() {
@@ -464,6 +506,36 @@ mod tests {
         assert_eq!(
             metric_value(exposition, "m", &with(&[("dataset", "orders")])),
             None
+        );
+    }
+
+    #[test]
+    fn a_rise_is_bounded_with_an_absent_series_counted_as_zero() {
+        // Absent at the mark and now, absent at the mark only, and at the bound.
+        rose_at_most("reads", None, 0.0, 0.0, "m").expect("absent at both ends rose by 0");
+        rose_at_most("reads", Some(3.0), 0.0, 3.0, "m").expect("a rise of 3 is at most 3");
+        rose_at_most("reads", Some(10.0), 10.0, 0.0, "m").expect("no rise is at most 0");
+        let err = rose_at_most("reads", Some(14.0), 10.0, 3.0, "m")
+            .expect_err("a rise of 4 is more than 3");
+        assert_eq!(
+            err.to_string(),
+            "reads rose by 4 since `mark-metrics: m` (from 10 to 14), more than 3"
+        );
+    }
+
+    #[test]
+    fn a_rise_is_shown_beside_the_value() {
+        assert_eq!(
+            rise_text("reads", Some(14.0), 10.0, Some("before")),
+            "reads = 14 (+4 since `mark-metrics: before`)"
+        );
+        assert_eq!(
+            rise_text("reads", None, 0.0, Some("before")),
+            "reads absent (+0 since `mark-metrics: before`)"
+        );
+        assert_eq!(
+            rise_text("reads", Some(2.5), 0.5, None),
+            "reads = 2.5 (+2 since the step started)"
         );
     }
 }
