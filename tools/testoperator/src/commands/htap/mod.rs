@@ -94,7 +94,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let terminals = args
         .terminals
         .unwrap_or_else(|| ((scale_factor * 10.0) as usize).min(DEFAULT_TERMINALS_CAP));
-    let duration = Duration::from_secs(test_args.common.duration);
+    let duration = test_args.common.duration_or_default();
     // Seeding an SF1000 source runs for the better part of an hour and prints
     // little; without this, `/v1/ready` could not tell it apart from a run stuck
     // on the source connection.
@@ -254,9 +254,9 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         &app,
         NotStarted::new()
             .with_parallel_count(test_args.common.concurrency)
-            .with_end_condition(EndCondition::Duration(Duration::from_secs(
-                test_args.common.duration,
-            )))
+            .with_end_condition(EndCondition::Duration(
+                test_args.common.duration_or_default(),
+            ))
             .with_validate(test_args.validate)
             .with_scale_factor(test_args.scale_factor.unwrap_or(1.0))
             .with_query_executor(executor),

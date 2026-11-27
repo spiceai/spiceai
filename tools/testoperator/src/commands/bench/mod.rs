@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::{RowCounts, get_dataset_app_and_start_request, load_app};
 use crate::{
-    args::{DatasetTestArgs, SourceType},
+    args::{BenchRuns, DatasetTestArgs, SourceType},
     health::HealthMonitor,
     spiced_metrics::MetricsScraper,
 };
@@ -36,10 +36,7 @@ use test_framework::{
     snapshot::SnapshotMode,
     spiced::SpicedInstance,
     spicepod::acceleration::Mode,
-    spicetest::{
-        SpiceTest,
-        datasets::{EndCondition, NotStarted},
-    },
+    spicetest::{SpiceTest, datasets::NotStarted},
     tokio_util::sync::CancellationToken,
     utils::{observe_memory, recursively_get_dir_size},
 };
@@ -70,7 +67,7 @@ pub(crate) fn emit_acceleration_size_if_applicable(
     Ok(())
 }
 
-pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
+pub(crate) async fn run(args: &DatasetTestArgs, runs: BenchRuns) -> anyhow::Result<RowCounts> {
     super::ensure_shared_client_connections(args, "bench")?;
     super::ensure_layout_applies(args)?;
     // Two SUT acquisition paths: when a system adapter is configured, delegate
@@ -101,7 +98,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     // From here on, we may early-return on errors but must still run adapter
     // teardown if one was opened. Wrap the rest of the run in an inner helper
     // whose `Result` we hold onto, run teardown unconditionally, then return.
-    let result = run_inner(args, app, spiced_instance).await;
+    let result = run_inner(args, runs, app, spiced_instance).await;
 
     if let Some(session) = system_adapter_session {
         session.teardown().await;
@@ -112,6 +109,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
 async fn run_inner(
     args: &DatasetTestArgs,
+    runs: BenchRuns,
     app: App,
     mut spiced_instance: SpicedInstance,
 ) -> anyhow::Result<RowCounts> {
@@ -171,7 +169,10 @@ async fn run_inner(
     };
 
     // baseline run
-    println!("Running benchmark test");
+    println!(
+        "Running benchmark test: {runs:?}, {} concurrent client(s)",
+        args.common.concurrency
+    );
 
     // Create the appropriate query executor based on args
     let executor = super::create_query_executor(args, &spiced_instance).await?;
@@ -180,8 +181,8 @@ async fn run_inner(
         args,
         &app,
         NotStarted::new()
-            .with_parallel_count(1)
-            .with_end_condition(EndCondition::QuerySetCompleted(5))
+            .with_parallel_count(args.common.concurrency)
+            .with_end_condition(runs.into())
             .with_validate(args.validate)
             .with_scale_factor(args.scale_factor.unwrap_or(1.0))
             .with_query_executor(executor),

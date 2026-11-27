@@ -18,6 +18,12 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
 
+/// The test duration of the commands that run for a time, when `--duration` is not set.
+const DEFAULT_DURATION_SECS: u64 = 60;
+
+mod bench;
+pub use bench::{BenchArgs, BenchRuns};
+
 mod dataset;
 pub use dataset::{
     ClientConnectionsArg, DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, SourceType,
@@ -69,7 +75,7 @@ pub enum TestCommands {
     /// Run an extended load test
     Load(LoadTestArgs),
     /// Run a single-run benchmark
-    Bench(DatasetTestArgs),
+    Bench(BenchArgs),
     /// Measure how long a fresh spiced takes to load its accelerations and report ready
     ColdStart(ColdStartArgs),
     /// Run a data consistency test
@@ -114,9 +120,10 @@ pub struct CommonArgs {
     #[arg(long, default_value = "30")]
     pub(crate) ready_wait: u64,
 
-    /// The duration of the test in seconds
-    #[arg(long, default_value = "60")]
-    pub(crate) duration: u64,
+    /// The duration of the test in seconds [default: 60]. `run bench` runs `--iterations`
+    /// passes instead, unless this is set.
+    #[arg(long)]
+    pub(crate) duration: Option<u64>,
 
     /// Whether to disable progress bars, for CI or non-interactive environments
     #[arg(long)]
@@ -189,6 +196,12 @@ pub struct CommonArgs {
 }
 
 impl CommonArgs {
+    /// `--duration`, or 60 seconds when it is not set.
+    #[must_use]
+    pub fn duration_or_default(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.duration.unwrap_or(DEFAULT_DURATION_SECS))
+    }
+
     /// Check if `spiced_path` is a URL to an external instance
     #[must_use]
     pub fn is_external_instance(&self) -> bool {

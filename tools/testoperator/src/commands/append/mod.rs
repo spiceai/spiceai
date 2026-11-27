@@ -95,7 +95,7 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
             )
             .await?
             .with_parallel_count(args.test_args.common.concurrency)
-            .with_end_duration(Duration::from_secs(args.test_args.common.duration))
+            .with_end_duration(args.test_args.common.duration_or_default())
             .with_tempdir_path(start_request.get_tempdir_path())
             .with_load_interval(Duration::from_secs(args.load_interval))
             .with_load_steps(args.load_steps)

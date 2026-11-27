@@ -167,7 +167,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     let spiced_instance = warm_up.wait().await?.end()?;
 
-    let test_duration = Duration::from_secs(args.test_args.common.duration);
+    let test_duration = args.test_args.common.duration_or_default();
 
     // Calculate baseline duration: 10% of target time, min 1min, max 10min
     let baseline_duration_secs = (test_duration.as_secs() / 10).clamp(60, 600);
@@ -214,7 +214,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let load_end_condition = if args.run_until_stopped {
         EndCondition::Unlimited
     } else {
-        EndCondition::Duration(Duration::from_secs(args.test_args.common.duration))
+        EndCondition::Duration(args.test_args.common.duration_or_default())
     };
 
     // Create streaming OTLP exporter if OTLP endpoint is configured
