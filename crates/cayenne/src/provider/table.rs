@@ -32,7 +32,6 @@ limitations under the License.
 //! - maintained-aggregate state (`maintained_aggregates`) and the per-table memory account.
 
 use super::column_stats::{ColumnStatsAccumulator, RowCountUpdate};
-use crate::json_shred::{self, JsonKeyColumn, JsonKeyColumnScan};
 use super::constants::{
     LOOKUP_INDEX_DIR_NAME, STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
 };
@@ -81,6 +80,7 @@ use crate::bounded_fifo::BoundedFifoSet;
 use crate::catalog::{
     CatalogError, CatalogResult, MemTierDurableCommit, MetadataCatalog, SnapshotSequenceCommit,
 };
+use crate::json_shred::{self, JsonKeyColumn, JsonKeyColumnScan};
 use crate::maintained_aggregate::{MaintainedAggregateRegistry, MaintainedAggregateSpec};
 use crate::metadata::{
     CreateTableOptions, InlinedData, InlinedDataStats, InlinedDelete, PkConflictDetection,
@@ -44816,7 +44816,11 @@ impl CayenneTableProvider {
 
         let (file_source, projection_indices, expr_adapter) =
             match Self::json_key_file_source(&file_source, projection, json_keys, &[])? {
-                Some(source) => (source, None, json_shred::JsonKeyExprAdapterFactory::shared()),
+                Some(source) => (
+                    source,
+                    None,
+                    json_shred::JsonKeyExprAdapterFactory::shared(),
+                ),
                 None => (file_source, projection.cloned(), None),
             };
         let plan = plan_format
@@ -45113,7 +45117,11 @@ impl CayenneTableProvider {
         };
         let (file_source, scan_projection, expr_adapter) =
             match Self::json_key_file_source(&file_source, projection, json_keys, threshold)? {
-                Some(source) => (source, None, json_shred::JsonKeyExprAdapterFactory::shared()),
+                Some(source) => (
+                    source,
+                    None,
+                    json_shred::JsonKeyExprAdapterFactory::shared(),
+                ),
                 None => (file_source, scan_projection, None),
             };
 
@@ -47872,14 +47880,16 @@ impl CayenneTableProvider {
                     };
                     // No-op cheap reschema when the projection has no
                     // string/binary columns; casts Utf8/Binary -> view otherwise.
-                    let projected =
-                        arrow_tools::record_batch::try_cast_to(projected, Arc::clone(&proj_schema))
-                            .map_err(|e| {
-                                datafusion_common::DataFusionError::Execution(format!(
-                                    "Failed to cast inlined batch to view read schema for table {}: {e}",
-                                    self.table_metadata.table_name
-                                ))
-                            })?;
+                    let projected = arrow_tools::record_batch::try_cast_to(
+                        projected,
+                        Arc::clone(&proj_schema),
+                    )
+                    .map_err(|e| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to cast inlined batch to view read schema for table {}: {e}",
+                            self.table_metadata.table_name
+                        ))
+                    })?;
                     if json_keys.is_empty() {
                         return Ok(projected);
                     }
@@ -48022,14 +48032,17 @@ impl CayenneTableProvider {
         // Strip extra columns (PK or retention time column) added to the projection
         // but not originally requested by the query. Key columns follow the
         // extended projection, and are kept.
-        if need_projection_strip
-            && let Some(orig_proj) = projection
-            && let Some(extended) = effective_projection.as_ref()
-        {
-            let keys = extended.len()..extended.len() + json_keys.len();
+        if need_projection_strip && let Some(orig_proj) = projection {
+            let extended = effective_projection
+                .as_ref()
+                .map_or(orig_proj.len(), Vec::len);
+            let keys = extended..extended + json_keys.len();
             let plan = self.create_projection_strip(
                 plan,
-                (0..orig_proj.len()).chain(keys).collect::<Vec<_>>().into_iter(),
+                (0..orig_proj.len())
+                    .chain(keys)
+                    .collect::<Vec<_>>()
+                    .into_iter(),
             )?;
             return Ok(self.wrap_scan_plan_with_cayenne_metadata(
                 plan,
@@ -48157,7 +48170,8 @@ impl TableProvider for CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        self.query_scan(state, projection, filters, limit, &[]).await
+        self.query_scan(state, projection, filters, limit, &[])
+            .await
     }
 
     // Filter-pushdown exactness contract (read before changing the arms below):

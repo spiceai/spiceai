@@ -55,8 +55,8 @@ use datafusion::physical_expr::expressions::{Column, Literal};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion_functions_json::udfs::{
-    json_as_text_udf, json_get_array_udf, json_get_bool_udf, json_get_float_udf,
-    json_get_int_udf, json_get_json_udf, json_get_str_udf, json_get_udf, json_length_udf,
+    json_as_text_udf, json_get_array_udf, json_get_bool_udf, json_get_float_udf, json_get_int_udf,
+    json_get_json_udf, json_get_str_udf, json_get_udf, json_length_udf,
 };
 
 use super::{
@@ -205,7 +205,11 @@ impl CayenneJsonKeyRewrite {
             node = filter.input.as_ref();
         }
         for expr in exprs.iter().chain(filters).chain(&scan.filters) {
-            read.extend(expr.column_refs().into_iter().map(|column| column.name.as_str()));
+            read.extend(
+                expr.column_refs()
+                    .into_iter()
+                    .map(|column| column.name.as_str()),
+            );
         }
         let table_columns = table_schema.fields().len();
         let scanned: Vec<usize> = match &scan.projection {
@@ -392,8 +396,7 @@ fn is_path_literal(expr: &Expr) -> bool {
     let Expr::Literal(value, _) = expr else {
         return false;
     };
-    !value.is_null()
-        && (is_json_text_type(&value.data_type()) || value.data_type().is_integer())
+    !value.is_null() && (is_json_text_type(&value.data_type()) || value.data_type().is_integer())
 }
 
 /// A Cayenne table scanned with [`JsonKeyColumn`]s after its own columns: the
@@ -534,7 +537,11 @@ impl JsonKeyScanTable {
             .with_filters(args.filters())
             .with_limit(args.limit())
             .with_statistics_requests(args.statistics_requests());
-        let plan = self.inner.scan_with_args(state, scan_args).await?.into_inner();
+        let plan = self
+            .inner
+            .scan_with_args(state, scan_args)
+            .await?
+            .into_inner();
         let input = plan.schema();
         if input.fields().len() != scanned.len() {
             return internal_err!(
@@ -547,7 +554,10 @@ impl JsonKeyScanTable {
         let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
             Vec::with_capacity(projection.len() + keys.len());
         for (index, field) in input.fields().iter().enumerate().take(projection.len()) {
-            exprs.push((Arc::new(Column::new(field.name(), index)), field.name().clone()));
+            exprs.push((
+                Arc::new(Column::new(field.name(), index)),
+                field.name().clone(),
+            ));
         }
         for (key, &position) in keys.iter().zip(&sources) {
             let json: Arc<dyn PhysicalExpr> =
@@ -640,9 +650,13 @@ impl TableProvider for JsonKeyScanTable {
                 .with_filters(args.filters())
                 .with_limit(args.limit())
                 .with_statistics_requests(args.statistics_requests());
-            self.inner.scan_with_args(state, table_args).await?.into_inner()
+            self.inner
+                .scan_with_args(state, table_args)
+                .await?
+                .into_inner()
         } else {
-            self.scan_keys(state, &table_projection, &keys, &args).await?
+            self.scan_keys(state, &table_projection, &keys, &args)
+                .await?
         };
 
         // The plan holds the table columns, then the key columns; put them in the
@@ -731,12 +745,21 @@ mod tests {
             ScalarValue::Utf8(Some("a".into())),
             None
         )));
-        assert!(is_path_literal(&Expr::Literal(ScalarValue::Int64(Some(0)), None)));
-        assert!(!is_path_literal(&Expr::Literal(ScalarValue::Utf8(None), None)));
-        assert!(!is_path_literal(&Expr::Literal(ScalarValue::Float64(Some(0.0)), None)));
-        assert!(!is_path_literal(&Expr::Column(datafusion::common::Column::from_name(
-            "a"
-        ))));
+        assert!(is_path_literal(&Expr::Literal(
+            ScalarValue::Int64(Some(0)),
+            None
+        )));
+        assert!(!is_path_literal(&Expr::Literal(
+            ScalarValue::Utf8(None),
+            None
+        )));
+        assert!(!is_path_literal(&Expr::Literal(
+            ScalarValue::Float64(Some(0.0)),
+            None
+        )));
+        assert!(!is_path_literal(&Expr::Column(
+            datafusion::common::Column::from_name("a")
+        )));
     }
 
     #[test]

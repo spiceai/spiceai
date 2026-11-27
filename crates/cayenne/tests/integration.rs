@@ -85,6 +85,7 @@ mod inline_tombstone_reclaim_test;
 mod inline_with_pending_deletions_test;
 mod int64_pk_deletion_test;
 mod integration_test;
+mod json_key_rewrite_test;
 mod keybased_deletion_test;
 mod large_upsert_test;
 mod layout_pruning_ab_test;

@@ -39,6 +39,7 @@ use cayenne::optimizer_rules::{
 };
 use cayenne::{
     CayenneCteMaterialization, CayenneCteMaterializationPlanner, CayenneTableProvider,
+    json_shred::{CayenneJsonKeyRewrite, JsonKeyColumnScan, JsonKeyScanTable},
     logical_optimizer::{
         CayenneInListToRangeRewrite, CayennePropagateFilterAcrossEquiJoinKeys,
         CayennePushDownSemiJoin, CayenneReassociateCrossJoin,
@@ -1507,6 +1508,7 @@ fn with_spice_logical_optimizers(
         insert_cayenne_join_reorder_rule(&mut optimizer_rules);
     }
     runtime_datafusion::checked_arithmetic::install_checked_single_distinct(&mut optimizer_rules);
+    insert_cayenne_json_key_rewrite(&mut optimizer_rules);
     optimizer_rules.extend(trailing_rules);
     // Leaf-expression pushdown would move a model call below the filters that decide
     // which rows it runs on; the decision functions' own rule runs last and places it.
@@ -1680,7 +1682,46 @@ fn insert_cayenne_join_reorder_rule(rules: &mut Vec<Arc<dyn OptimizerRule + Send
     }
 }
 
+fn insert_cayenne_json_key_rewrite(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
+    // Runs after leaf-expression extraction has moved each `json_get_*` call
+    // over a column into a projection directly above its scan, and after
+    // `optimize_projections` has pruned that scan to the columns it reads.
+    if !rules
+        .iter()
+        .any(|rule| rule.name() == "cayenne_json_key_rewrite")
+    {
+        let insert_at = rules
+            .iter()
+            .position(|rule| rule.name() == "optimize_projections")
+            .map_or(rules.len(), |position| position + 1);
+        rules.insert(
+            insert_at,
+            Arc::new(CayenneJsonKeyRewrite::new_with_resolver(Arc::new(
+                cayenne_json_key_scan,
+            ))),
+        );
+    }
+}
+
+/// The table that serves JSON key columns for scans of `provider`: a Cayenne table
+/// read in its place, or an accelerated table read through layers that change no
+/// row, column or type.
+fn cayenne_json_key_scan(provider: &dyn TableProvider) -> Option<&dyn JsonKeyColumnScan> {
+    if let Some(table) = spice_table::find_concrete::<CayenneTableProvider>(
+        provider,
+        spice_table::LayerWalk::Passthrough,
+    ) {
+        return Some(table);
+    }
+    spice_table::find_layer::<AcceleratedTable>(provider, spice_table::LayerWalk::Passthrough)
+        .map(|table| table as &dyn JsonKeyColumnScan)
+}
+
 fn is_cayenne_accelerated_table_provider(provider: &dyn TableProvider) -> bool {
+    // A scan the JSON key rewrite planned reads the table it wraps.
+    if let Some(rewritten) = provider.downcast_ref::<JsonKeyScanTable>() {
+        return is_cayenne_accelerated_table_provider(rewritten.inner().as_ref());
+    }
     if is_cayenne_table_provider(provider) {
         return true;
     }

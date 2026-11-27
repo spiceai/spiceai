@@ -27,6 +27,7 @@ use ::cache::Caching;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use async_trait::async_trait;
+use cayenne::json_shred::{JsonKeyColumn, JsonKeyColumnScan};
 use data_accelerator_api::{BootstrapStatus, get_primary_keys_from_constraints};
 use data_components::cdc::ChangesStream;
 use data_connector_api::accelerated::{
@@ -2559,6 +2560,64 @@ impl AcceleratedTable {
                 metadata,
             )),
         }
+    }
+}
+
+impl AcceleratedTable {
+    /// The Cayenne table a scan of this layer reads right now, when the scan
+    /// returns exactly what that table does: the acceleration is ready, is not a
+    /// cache, and answers empty rather than asking the source. The scan reads it
+    /// through layers that change no row, column or type.
+    fn json_key_accelerator(&self) -> Option<&dyn JsonKeyColumnScan> {
+        if self.refresh_mode == RefreshMode::Caching
+            || !matches!(self.zero_results_action, ZeroResultsAction::ReturnEmpty)
+            || self.scan_readiness() != ScanReadiness::Accelerated
+        {
+            return None;
+        }
+        spice_table::find_concrete::<cayenne::CayenneTableProvider>(
+            self.accelerator.as_ref(),
+            LayerWalk::Passthrough,
+        )
+        .map(|table| table as &dyn JsonKeyColumnScan)
+    }
+}
+
+/// A scan of an accelerated Cayenne table can return JSON key columns while it
+/// reads the acceleration; while it reads the source (before the first load, on a
+/// scheduler) or may fall back to it, it cannot, and the caller computes them.
+#[async_trait]
+impl JsonKeyColumnScan for AcceleratedTable {
+    fn serves_json_keys(&self) -> bool {
+        self.json_key_accelerator().is_some()
+    }
+
+    async fn scan_with_json_keys(
+        &self,
+        state: &dyn Session,
+        projection: &[usize],
+        keys: &[JsonKeyColumn],
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
+        let Some(accelerator) = self.json_key_accelerator() else {
+            return Ok(None);
+        };
+        let Some(plan) = accelerator
+            .scan_with_json_keys(state, projection, keys, filters, limit)
+            .await?
+        else {
+            return Ok(None);
+        };
+        // Aligned to this layer's schema as its own scan is, with the key columns
+        // carried after the table columns.
+        let table = self.scan_output_schema(Some(&projection.to_vec()));
+        let mut fields: Vec<_> = table.fields().iter().cloned().collect();
+        fields.extend(keys.iter().map(JsonKeyColumn::field));
+        Ok(Some(Arc::new(SchemaCastScanExec::new(
+            plan,
+            Arc::new(Schema::new_with_metadata(fields, table.metadata().clone())),
+        ))))
     }
 }
 

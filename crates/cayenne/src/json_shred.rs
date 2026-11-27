@@ -289,7 +289,10 @@ pub(crate) fn file_projection_with_json_keys(
                 key.source
             );
         }
-        exprs.push(ProjectionExpr::new(key.computed(table_schema)?, key.name.clone()));
+        exprs.push(ProjectionExpr::new(
+            key.computed(table_schema)?,
+            key.name.clone(),
+        ));
     }
     exprs.extend(
         ProjectionExprs::from_indices(trailing, table_schema)
@@ -381,7 +384,9 @@ impl ScalarUDFImpl for JsonTopLevelValue {
             return exec_err!("{JSON_TOP_LEVEL_VALUE_NAME} takes a JSON column and a key");
         };
         let ColumnarValue::Scalar(ScalarValue::Utf8(Some(key))) = key else {
-            return plan_err!("{JSON_TOP_LEVEL_VALUE_NAME} takes its key as a non-NULL string literal");
+            return plan_err!(
+                "{JSON_TOP_LEVEL_VALUE_NAME} takes its key as a non-NULL string literal"
+            );
         };
         if !is_shreddable_key(key) {
             return plan_err!(
@@ -395,7 +400,9 @@ impl ScalarUDFImpl for JsonTopLevelValue {
             ColumnarValue::Scalar(scalar) => {
                 let array = scalar.to_array_of_size(1)?;
                 let values = top_level_values(array.as_ref(), key)?;
-                Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(&values, 0)?))
+                Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
+                    &values, 0,
+                )?))
             }
         }
     }
@@ -507,12 +514,22 @@ mod tests {
     ];
 
     fn value(rng: &mut Rng, depth: u32) -> String {
-        let choice = if depth > 2 { rng.below(8) } else { rng.below(11) };
+        let choice = if depth > 2 {
+            rng.below(8)
+        } else {
+            rng.below(11)
+        };
         match choice {
             0 => r#""plain""#.to_string(),
             1 => r#""esc\"aped\\ é \n""#.to_string(),
-            2 => (*rng.pick(&["0", "-7", "200", "9223372036854775807", "9223372036854775808"]))
-                .to_string(),
+            2 => (*rng.pick(&[
+                "0",
+                "-7",
+                "200",
+                "9223372036854775807",
+                "9223372036854775808",
+            ]))
+            .to_string(),
             3 => (*rng.pick(&["1.5", "-0.0", "1e5", "2E-3", "1.0"])).to_string(),
             4 => "true".to_string(),
             5 => "false".to_string(),
@@ -549,7 +566,10 @@ mod tests {
                 let full = object(rng, 0);
                 let cut = rng.below(full.len() + 1);
                 // Cut on a char boundary.
-                let cut = (0..=cut).rev().find(|&i| full.is_char_boundary(i)).unwrap_or(0);
+                let cut = (0..=cut)
+                    .rev()
+                    .find(|&i| full.is_char_boundary(i))
+                    .unwrap_or(0);
                 full[..cut].to_string()
             }
             7 => {
@@ -589,7 +609,8 @@ mod tests {
             let docs: Vec<Option<String>> = (0..1500).map(|_| document(&mut rng)).collect();
             let ctx = SessionContext::new();
             let mut ctx_state = ctx.state();
-            datafusion_functions_json::register_all(&mut ctx_state).expect("register json functions");
+            datafusion_functions_json::register_all(&mut ctx_state)
+                .expect("register json functions");
             let ctx = SessionContext::new_with_state(ctx_state);
             // Test-only: the function is never registered outside Cayenne's plans.
             ctx.register_udf(ScalarUDF::clone(&JSON_TOP_LEVEL_VALUE_UDF));
@@ -605,7 +626,10 @@ mod tests {
                 ]));
                 let batch = RecordBatch::try_new(
                     Arc::clone(&schema),
-                    vec![Arc::new(docs_array) as ArrayRef, Arc::new(values) as ArrayRef],
+                    vec![
+                        Arc::new(docs_array) as ArrayRef,
+                        Arc::new(values) as ArrayRef,
+                    ],
                 )
                 .expect("batch");
                 let table = MemTable::try_new(schema, vec![vec![batch]]).expect("table");
@@ -626,15 +650,15 @@ mod tests {
                             .unwrap_or_else(|e| panic!("run {sql}: {e}"));
                         for b in &batches {
                             for row in 0..b.num_rows() {
-                                let whole = ScalarValue::try_from_array(b.column(1), row)
-                                    .expect("whole");
+                                let whole =
+                                    ScalarValue::try_from_array(b.column(1), row).expect("whole");
                                 let extracted = ScalarValue::try_from_array(b.column(2), row)
                                     .expect("extracted");
                                 if !whole.is_null() {
                                     *answered.entry(f).or_default() += 1;
                                 }
-                                let via_udf = ScalarValue::try_from_array(b.column(3), row)
-                                    .expect("via_udf");
+                                let via_udf =
+                                    ScalarValue::try_from_array(b.column(3), row).expect("via_udf");
                                 assert_eq!(
                                     whole, via_udf,
                                     "seed {seed}: {f}(doc, '{key}'{rest}) differs through {JSON_TOP_LEVEL_VALUE_NAME}"
@@ -656,7 +680,10 @@ mod tests {
         // Every function answered, many times over, so the comparisons were not vacuous.
         for f in FUNCTIONS {
             let n = answered.get(f).copied().unwrap_or(0);
-            assert!(n >= 200, "{f} answered only {n} times: the documents exercise too little");
+            assert!(
+                n >= 200,
+                "{f} answered only {n} times: the documents exercise too little"
+            );
         }
     }
 
