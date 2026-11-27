@@ -1596,12 +1596,10 @@ impl Runtime {
                 tracing::info!("{}", key_rule_line(&dataset_name, key, rule));
             }
             if !acceleration.on_conflict.is_empty() {
-                let warning = if acceleration.engine == Engine::Cayenne {
+                tracing::warn!(
+                    "{}",
                     cayenne_on_conflict_warning(&dataset_name, acceleration, rule)
-                } else {
-                    deprecated_on_conflict_warning(&dataset_name, acceleration, refresh_mode)
-                };
-                tracing::warn!("{warning}");
+                );
             }
             if let Some(KeyRule::NewestByTime(time_column)) = rule
                 && refresh_mode == RefreshMode::Append
@@ -3456,24 +3454,6 @@ fn cayenne_on_conflict_warning(
     )
 }
 
-/// The warning for a dataset on another accelerator that sets `on_conflict`.
-fn deprecated_on_conflict_warning(
-    dataset_name: &str,
-    acceleration: &Acceleration,
-    refresh_mode: RefreshMode,
-) -> String {
-    let persistence = if matches!(acceleration.mode, Mode::Memory | Mode::FileCreate)
-        && refresh_mode == RefreshMode::Changes
-    {
-        " Set `mode: file` to preserve CDC data across restarts and resume replication."
-    } else {
-        ""
-    };
-    format!(
-        "Dataset '{dataset_name}' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it.{persistence}"
-    )
-}
-
 /// Warning for an append that keeps the newest version of each key by `time_column`
 /// but has no `refresh_append_overlap` and reads by time, so it never re-reads a late row.
 fn newest_by_time_without_overlap_warning(dataset_name: &str, time_column: &str) -> String {
@@ -4151,50 +4131,6 @@ mod tests {
                 ),
                 "Dataset 'events' sets `acceleration.on_conflict`, which Cayenne no longer uses. Remove `on_conflict`. See: https://spiceai.org/docs/features/data-acceleration/constraints"
             );
-        }
-
-        #[test]
-        fn other_engines_are_told_on_conflict_is_removed_in_3_0() {
-            let mut acceleration = acceleration("arrow", Some("upsert"));
-            for (mode, refresh_mode) in [
-                (Mode::File, None),
-                (Mode::File, Some(RefreshMode::Changes)),
-                (Mode::FileUpdate, None),
-                (Mode::FileUpdate, Some(RefreshMode::Changes)),
-                (Mode::Memory, None),
-                (Mode::Memory, Some(RefreshMode::Full)),
-                (Mode::Memory, Some(RefreshMode::Append)),
-            ] {
-                acceleration.mode = mode;
-                acceleration.refresh_mode = refresh_mode;
-                assert_eq!(
-                    deprecated_on_conflict_warning(
-                        "orders",
-                        &acceleration,
-                        refresh_mode.unwrap_or(RefreshMode::Full),
-                    ),
-                    "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it."
-                );
-            }
-        }
-
-        #[test]
-        fn changes_recommend_persistent_cayenne() {
-            let mut acceleration = acceleration("arrow", Some("upsert"));
-            assert_eq!(acceleration.mode, Mode::Memory);
-            for (mode, refresh_mode) in [
-                (Mode::Memory, None),
-                (Mode::Memory, Some(RefreshMode::Changes)),
-                (Mode::FileCreate, None),
-                (Mode::FileCreate, Some(RefreshMode::Changes)),
-            ] {
-                acceleration.mode = mode;
-                acceleration.refresh_mode = refresh_mode;
-                assert_eq!(
-                    deprecated_on_conflict_warning("orders", &acceleration, RefreshMode::Changes),
-                    "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it. Set `mode: file` to preserve CDC data across restarts and resume replication."
-                );
-            }
         }
     }
 
