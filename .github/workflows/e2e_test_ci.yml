@@ -1026,17 +1026,23 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
+      # This job only reads the fixture (the Delta source; the acceleration is local), so it reads
+      # trunk's copy, which only trunk writes: a merge-queue ref is new for every entry, and no
+      # run seeds a copy of its own for it.
+      - name: Prepare the spicepod
+        run: |
+          mkdir -p cold_start_app
+          cp 'test/spicepods/cold_start/delta_lake-cayenne[file]-append_unkeyed_sorted.yaml' cold_start_app/spicepod.yaml
+
       - name: Check for the fixture
         run: |
           if ! mc stat spice-minio/benchmarks/cold_start/audit_events_3m/_SEEDED >/dev/null 2>&1; then
-            echo "The cold-start fixture is missing from MinIO; run the 'testoperator run cold-start' workflow once to seed it."
+            echo "The cold-start fixture is missing from MinIO; run the 'testoperator run cold-start' workflow on trunk once to seed trunk's copy, which this job reads."
             exit 1
           fi
 
       - name: Start spiced
         run: |
-          mkdir -p cold_start_app
-          cp 'test/spicepods/cold_start/delta_lake-cayenne[file]-append_unkeyed_sorted.yaml' cold_start_app/spicepod.yaml
           cd cold_start_app
           spiced --cpu-cores 2 --metrics 127.0.0.1:9095 &> spice.log &
         env:
