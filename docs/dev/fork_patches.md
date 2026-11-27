@@ -120,7 +120,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion-ballista](#datafusion-ballista) | `6e7a8775a6deb99c2ebf924f1ff5b3111d38e615` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `c5f1094e4f5aa7bc0cb5d3bf0f7753a33e5fc39d` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `b0464de933ba5e0cf5e8847f5b4341b75908667f` | `spiceai-55` |
-| [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
+| [delta-kernel-rs](#delta-kernel-rs) | `bc4d1b867cd90272bc50aec81cfe968ebf24d287` | `spiceai-0.27` (TEMPORARY: spiceai/delta-kernel-rs#14) |
 | [docx-rs](#docx-rs) | `81faaf2187185b097710b9ee589bf039efdd74de` | `jeadie/render-zip-upgrade` |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `9aaad84db93327729964c647345a91da0d1d5943` | `spiceai-0.11.0-df-55` |
@@ -963,16 +963,17 @@ touches only the workspace manifest, so every row below is carried unchanged.
 Upstream [delta-io/delta-kernel-rs](https://github.com/delta-io/delta-kernel-rs),
 branch `spiceai-0.27`.
 
-**No Spice patches.** Both patches that existed on the earlier 0.18.x fork line —
-timestamp-column file skipping, and `ParquetObjectReader` Azure suffix-range handling
-— landed upstream and are still present in v0.27.1 (the Azure handling moved, with the
-default engine, into the `delta_kernel_default_engine` crate). The pin is upstream
+Both patches that existed on the earlier 0.18.x fork line — timestamp-column file
+skipping, and `ParquetObjectReader` Azure suffix-range handling — landed upstream and
+are still present in v0.27.1 (the Azure handling moved, with the default engine, into
+the `delta_kernel_default_engine` crate). Besides the patch below, the pin is upstream
 v0.27.1 plus the fork's own `SPICE_PATCHES.md`, a best-effort Codecov upload in its CI
 workflow, and two lint-only upstream commits cherry-picked ahead of v0.28.0
 (delta-io/delta-kernel-rs#3164, #3218), none of which changes behaviour.
 
-Re-confirm this at the next bump rather than assuming it: if a Spice patch becomes
-necessary again, it needs a row here and a guard.
+| Patch | What breaks if it is lost | Loss | Guard |
+|---|---|---|---|
+| `DvInfo::get_treemap` is public under the `internal-api` feature (fork PR #14) | A scan cannot read a deletion vector as its compact bitmap, and the kernel's other readers allocate by the largest deleted row index (`get_selection_vector`) or one `u64` per deleted row (`get_row_indexes`) | build | compile-guarded by `crates/data_components/src/delta_lake.rs::handle_scan_file`, which calls `dv_info.get_treemap(…)` |
 
 ## Dependency-only forks
 

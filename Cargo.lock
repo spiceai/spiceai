@@ -6380,6 +6380,7 @@ dependencies = [
  "redact",
  "regex",
  "reqwest 0.13.4",
+ "roaring",
  "runtime-checkpoint-api",
  "runtime-object-store",
  "runtime-rate-control",
@@ -7449,7 +7450,7 @@ checksum = "aafbece59594ed57696a1a69e8bb3ca1683fbc9cdb41d5c02726070b2cd8f19d"
 [[package]]
 name = "delta_kernel"
 version = "0.27.1"
-source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=16ac28606464d742b6837de4a51f41011c3f6dc0#16ac28606464d742b6837de4a51f41011c3f6dc0"
+source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=bc4d1b867cd90272bc50aec81cfe968ebf24d287#bc4d1b867cd90272bc50aec81cfe968ebf24d287"
 dependencies = [
  "arrow",
  "bytes",
@@ -7479,7 +7480,7 @@ dependencies = [
 [[package]]
 name = "delta_kernel_default_engine"
 version = "0.27.1"
-source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=16ac28606464d742b6837de4a51f41011c3f6dc0#16ac28606464d742b6837de4a51f41011c3f6dc0"
+source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=bc4d1b867cd90272bc50aec81cfe968ebf24d287#bc4d1b867cd90272bc50aec81cfe968ebf24d287"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -7499,7 +7500,7 @@ dependencies = [
 [[package]]
 name = "delta_kernel_derive"
 version = "0.27.1"
-source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=16ac28606464d742b6837de4a51f41011c3f6dc0#16ac28606464d742b6837de4a51f41011c3f6dc0"
+source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=bc4d1b867cd90272bc50aec81cfe968ebf24d287#bc4d1b867cd90272bc50aec81cfe968ebf24d287"
 dependencies = [
  "proc-macro2",
  "quote",
