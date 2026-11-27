@@ -128,19 +128,19 @@ fn authority_start(s: &str) -> Option<usize> {
 /// This is a string scan, not a URL parse, so it also fails closed for URLs a
 /// parser would reject (a bad port, an unknown scheme, a raw `?`, `#` or quote
 /// inside the password).
-fn redact_url_at(s: &str, embedded: bool) -> Option<(String, usize)> {
-    let authority_start = authority_start(s)?;
+fn redact_url_at(text: &str, embedded: bool) -> Option<(String, usize)> {
+    // A connector prefix written with `://` (`iceberg://https://u:p@h/...`):
+    // redact the innermost URL and keep the prefixes before it as written.
+    let mut prefix_len = 0;
+    let mut authority = authority_start(text)?;
+    while let Some(inner) = authority_start(&text[prefix_len + authority..]) {
+        prefix_len += authority;
+        authority = inner;
+    }
+    let (prefix, s) = text.split_at(prefix_len);
+    let authority_start = authority;
     let scheme = s[..s.find(':')?].to_ascii_lowercase();
     let ends_url = |c: char| embedded && ends_embedded_url(c);
-
-    // A connector prefix written with `://` (`iceberg://https://u:p@h/...`):
-    // redact the inner URL.
-    if let Some((inner, len)) = redact_url_at(&s[authority_start..], embedded) {
-        return Some((
-            format!("{}{inner}", &s[..authority_start]),
-            authority_start + len,
-        ));
-    }
 
     // The authority as a URL parser would read it ends at the path, query or
     // fragment. A password can hold a raw `?`, `#`, quote or tab, though
@@ -179,7 +179,8 @@ fn redact_url_at(s: &str, embedded: bool) -> Option<(String, usize)> {
     let authority_end = authority_start + authority_len;
     let authority = &s[authority_start..authority_end];
 
-    let mut out = String::with_capacity(s.len());
+    let mut out = String::with_capacity(text.len());
+    out.push_str(prefix);
     out.push_str(&s[..authority_start]);
     match authority.rfind('@') {
         Some(at) if !NON_CREDENTIAL_USERINFO_SCHEMES.contains(&scheme.as_str()) => {
@@ -212,7 +213,7 @@ fn redact_url_at(s: &str, embedded: bool) -> Option<(String, usize)> {
         }
         _ => out.push_str(fragment),
     }
-    Some((out, authority_end + url_len))
+    Some((out, prefix_len + authority_end + url_len))
 }
 
 /// Appends `&`-separated `key=value` pairs to `out`, with the values of
@@ -363,11 +364,12 @@ pub fn redact_message_credentials(message: &str) -> String {
 /// it closes (`https://h/wiki/Foo_(bar)`), the rule autolinkers use. Without this, a
 /// secret query value at the end of the URL would take the `)` with it when it is replaced.
 fn without_closing_parentheses(rest: &str, redacted: String, len: usize) -> (String, usize) {
+    let opened = rest[..len].matches('(').count();
+    let mut closed = rest[..len].matches(')').count();
     let mut end = len;
-    while rest[..end].ends_with(')')
-        && rest[..end].matches(')').count() > rest[..end].matches('(').count()
-    {
+    while rest[..end].ends_with(')') && closed > opened {
         end -= 1;
+        closed -= 1;
     }
     if end == len {
         return (redacted, len);
@@ -522,6 +524,19 @@ mod tests {
         ] {
             assert_eq!(redact_message_credentials(message), expected, "{message}");
         }
+    }
+
+    #[test]
+    fn redact_message_credentials_handles_a_long_chain_of_connector_prefixes() {
+        let chain = "a://".repeat(200_000);
+        assert_eq!(
+            redact_url_credentials(&format!("{chain}u:p@h/x")),
+            format!("{chain}h/x")
+        );
+        assert_eq!(
+            redact_message_credentials(&format!("Utf8(\"{chain}u:p@h/x\")")),
+            format!("Utf8(\"{chain}h/x\")")
+        );
     }
 
     #[test]
